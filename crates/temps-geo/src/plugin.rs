@@ -56,10 +56,12 @@ impl TempsPlugin for GeoPlugin {
             // concurrently with plugin registration. `GeoIpService::new()`
             // itself only opens whatever's on disk right now -- it doesn't
             // download -- so on a fresh instance with no pre-provisioned
-            // database, registration can race the download and fail even
-            // though the file appears moments later. Wait for it (bounded)
-            // before handing off to the sync constructor, unless mock mode
-            // is enabled (which never touches the filesystem).
+            // database, registration can race the download and start without
+            // a database even though the file appears moments later. Wait for
+            // it (bounded) before handing off to the sync constructor, unless
+            // mock mode is enabled (which never touches the filesystem). If it
+            // is still missing the service starts degraded and the file
+            // watcher below loads the file when it arrives.
             let use_mock = crate::geoip_service::geo_mock_requested();
             if !use_mock {
                 let city_db_path = crate::geoip_service::resolve_mmdb_path("GeoLite2-City.mmdb");

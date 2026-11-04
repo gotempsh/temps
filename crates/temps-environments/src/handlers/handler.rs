@@ -85,6 +85,14 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
                     .detail(err.to_string())
                     .build()
             }
+            EnvVarError::SecretValueRequiresAuditedReveal { .. } => {
+                temps_core::error_builder::forbidden()
+                    .title(
+                        "Secret environment variable must be revealed through the audited endpoint",
+                    )
+                    .detail(err.to_string())
+                    .build()
+            }
             EnvVarError::AmbiguousValue { .. } => temps_core::error_builder::conflict()
                 .title("Environment variable value is ambiguous")
                 .detail(err.to_string())
@@ -1619,7 +1627,7 @@ pub async fn update_environment_settings(
             settings.clone(),
             // An operator who can edit the instance-wide ceilings is not
             // meaningfully constrained by them.
-            temps_core::CeilingEnforcement::from_has_settings_write(
+            temps_config::CeilingEnforcement::from_has_settings_write(
                 auth.has_permission(&temps_auth::Permission::SettingsWrite),
             ),
         )
@@ -2968,9 +2976,12 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             if self.fail {
-                return Err(temps_core::anyhow::anyhow!("audit database unavailable"));
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit database unavailable",
+                ));
             }
             self.serialized_operations
                 .lock()
@@ -3032,6 +3043,30 @@ mod tests {
             error.body.get("action"),
             Some(&serde_json::json!("delete_environment"))
         );
+    }
+
+    #[test]
+    fn secret_reveal_through_the_legacy_service_maps_to_forbidden() {
+        let problem = Problem::from(
+            crate::services::env_var_service::EnvVarError::SecretValueRequiresAuditedReveal {
+                var_id: 7,
+                key: "API_KEY".to_string(),
+            },
+        );
+
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn empty_secret_value_maps_to_bad_request() {
+        let problem = Problem::from(
+            crate::services::env_var_service::EnvVarError::SecretValueRequired {
+                key: "API_KEY".to_string(),
+                omit_keeps_stored: true,
+            },
+        );
+
+        assert_eq!(problem.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -3270,8 +3305,8 @@ mod tests {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_config::{ConfigService, ServerConfig};
         use temps_core::docker_socket_grant::DockerSocketGrant;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         #[tokio::test]
         async fn health_probe_only_settings_enforce_granted_project_authority() {
@@ -3552,6 +3587,14 @@ mod tests {
         .expect_err("reveal must fail if the audit cannot be persisted");
 
         assert_eq!(
+            problem.body["title"],
+            "Environment variable could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
+        assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
@@ -3628,8 +3671,8 @@ mod tests {
         use sea_orm::{ActiveModelTrait, DatabaseBackend, EntityTrait, MockDatabase, Set};
         use temps_config::{ConfigService, ServerConfig};
         use temps_core::EncryptionService;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{env_vars, preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         use tower::ServiceExt;
 
         const ENCRYPTION_KEY: &str =

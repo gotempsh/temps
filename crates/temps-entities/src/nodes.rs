@@ -13,9 +13,11 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
+    #[serde(skip_serializing)]
     pub token_hash: String,
     /// Encrypted plaintext token (AES-256-GCM via EncryptionService)
     /// Used by control plane to authenticate with the agent for remote deployments
+    #[serde(skip_serializing)]
     pub token_encrypted: Option<String>,
     /// Agent API address, e.g. "https://203.0.113.50:3100"
     pub address: String,
@@ -365,6 +367,19 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn serializing_a_node_leaves_out_its_token_columns() {
+        let mut model = node("10.0.0.5", None);
+        model.token_hash = "stored-token-hash".into();
+        model.token_encrypted = Some("stored-token-ciphertext".into());
+
+        let json = serde_json::to_string(&model).expect("serializes");
+
+        assert!(!json.contains("stored-token-hash"), "{json}");
+        assert!(!json.contains("stored-token-ciphertext"), "{json}");
+        assert!(json.contains("worker-1"), "{json}");
     }
 
     #[test]

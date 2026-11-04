@@ -6,7 +6,7 @@
 # Docker containers left over from interrupted `cargo test` runs.
 #
 # testcontainers-rs (used by TestDatabase and friends, see
-# crates/temps-database/src/test_utils.rs) relies on a companion "Ryuk"
+# crates/temps-test-utils/src/lib.rs) relies on a companion "Ryuk"
 # reaper container to guarantee container cleanup even when the test
 # process dies ungracefully (crash, SIGKILL, a tool/CI timeout). Ryuk does
 # not reliably register/complete on every machine — notably Docker Desktop

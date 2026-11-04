@@ -2656,15 +2656,22 @@ async fn await_new_service_provision<T>(
 /// Map an engine error to a [`RestoreError`], keeping the one outcome the
 /// worker must act on rather than report: a staged download that could not be
 /// confirmed stopped.
-fn engine_error(run_id: i32, error: anyhow::Error, context: &str) -> RestoreError {
-    match error.downcast_ref::<temps_providers::externalsvc::StagedRestoreStillRunning>() {
-        Some(still_running) => RestoreError::StagedRestoreStillRunning {
-            restore_run_id: run_id,
-            target: still_running.target.clone(),
-            reason: still_running.reason.clone(),
-        },
-        None => RestoreError::ExternalService {
-            reason: format!("{}: {}", context, error),
+fn engine_error(
+    run_id: i32,
+    error: temps_providers::externalsvc::EngineError,
+    context: &str,
+) -> RestoreError {
+    use temps_providers::externalsvc::EngineError;
+    match error {
+        EngineError::StagedRestoreStillRunning(still_running) => {
+            RestoreError::StagedRestoreStillRunning {
+                restore_run_id: run_id,
+                target: still_running.target,
+                reason: still_running.reason,
+            }
+        }
+        other => RestoreError::ExternalService {
+            reason: format!("{}: {}", context, other),
         },
     }
 }
@@ -5060,11 +5067,11 @@ mod tests {
     /// keeps the run active), never as a plain failure or a cancellation.
     #[test]
     fn engine_error_keeps_an_unconfirmed_stop_typed() {
-        let still_running =
-            anyhow::Error::new(temps_providers::externalsvc::StagedRestoreStillRunning {
-                target: "postgres-orders".into(),
-                reason: "docker unreachable".into(),
-            });
+        use temps_providers::externalsvc::{EngineError, StagedRestoreStillRunning};
+        let still_running = EngineError::from(StagedRestoreStillRunning {
+            target: "postgres-orders".into(),
+            reason: "docker unreachable".into(),
+        });
         match engine_error(7, still_running, "in-place restore failed") {
             RestoreError::StagedRestoreStillRunning {
                 restore_run_id,
@@ -5078,8 +5085,13 @@ mod tests {
             other => panic!("expected StagedRestoreStillRunning, got {other:?}"),
         }
         assert!(matches!(
-            engine_error(7, anyhow::anyhow!("disk full"), "in-place restore failed"),
-            RestoreError::ExternalService { ref reason } if reason == "in-place restore failed: disk full"
+            engine_error(
+                7,
+                EngineError::engine_failure("restore", "disk full"),
+                "in-place restore failed",
+            ),
+            RestoreError::ExternalService { ref reason }
+                if reason == "in-place restore failed: restore: disk full"
         ));
     }
 
@@ -6061,7 +6073,7 @@ mod tests {
             println!("Docker not available, skipping");
             return;
         }
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");

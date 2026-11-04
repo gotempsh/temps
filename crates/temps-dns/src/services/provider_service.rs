@@ -29,7 +29,8 @@ use crate::providers::{
     PebbleDnsProvider, ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_config::AppSettings;
+use temps_core::PublicHostnameStrategy;
 
 /// Rows per `INSERT` when replacing generated-hostname record states.
 pub(crate) const GENERATED_RECORD_STATE_INSERT_BATCH: usize = 500;
@@ -2882,7 +2883,7 @@ mod upstream_tests {
 
     #[tokio::test]
     async fn hostname_mode_changes_fail_fast_while_a_zone_operation_runs() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!(

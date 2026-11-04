@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use temps_core::EncryptionService;
 use temps_entities::deployment_jobs;
 use thiserror::Error;
+use tracing::error;
 
 use super::log_redaction::{redact_common_secret_patterns, redact_known_secrets};
-use super::sensitive_envelope;
+use super::sensitive_envelope::{self, SensitiveEnvelopeError};
 use super::services::{DeploymentError, DeploymentService};
 
 /// Central endpoint deploy-failure reports are POSTed to. Deliberately a
@@ -129,6 +130,17 @@ pub enum FailureReportError {
 
     #[error("Deployment lookup failed: {0}")]
     Deployment(#[from] DeploymentError),
+
+    #[error(
+        "Cannot redact the failure report for deployment {deployment_id}: the stored '{field}' \
+         of job '{job_id}' could not be read ({reason}), so its secret values are unknown"
+    )]
+    SecretsUnavailable {
+        deployment_id: i32,
+        job_id: String,
+        field: String,
+        reason: String,
+    },
 
     #[error(
         "Outbound failure reporting is disabled on this instance (TEMPS_TELEMETRY opt-out); \
@@ -264,34 +276,13 @@ impl FailureReportService {
         Ok(jobs[..=idx].to_vec())
     }
 
-    /// Every known secret/env value configured for the jobs in `jobs` --
-    /// the redaction set for [`log_redaction::redact_known_secrets`].
-    fn known_secret_values(&self, jobs: &[deployment_jobs::Model]) -> Vec<String> {
-        let mut values = Vec::new();
-        for job in jobs {
-            let Some(job_config) = job.job_config.as_ref() else {
-                continue;
-            };
-            for field in SENSITIVE_JOB_CONFIG_FIELDS {
-                let map = sensitive_envelope::read_sealed_optional(
-                    job_config,
-                    Some(&self.encryption_service),
-                    field,
-                )
-                .unwrap_or(None)
-                .unwrap_or_default();
-                values.extend(map.into_values());
-            }
-        }
-        values
-    }
-
     /// Concatenated, redacted plain-text trace for the given failed job:
     /// every job's log up to and including it, each pass through both
     /// redaction layers.
     async fn build_redacted_log(
         &self,
         jobs: &[deployment_jobs::Model],
+        secrets: &[String],
     ) -> Result<String, FailureReportError> {
         let mut combined = String::new();
         for job in jobs {
@@ -319,8 +310,7 @@ impl FailureReportService {
             ));
         }
 
-        let secrets = self.known_secret_values(jobs);
-        let redacted = redact_known_secrets(&combined, &secrets);
+        let redacted = redact_known_secrets(&combined, secrets);
         // Bound it here so the preview shows exactly what would be sent: the
         // central endpoint rejects oversized reports outright.
         Ok(fit_report_text(&redact_common_secret_patterns(&redacted)))
@@ -328,6 +318,10 @@ impl FailureReportService {
 
     /// Build the redacted, editable preview shown to the user before they
     /// choose to send anything.
+    ///
+    /// When the known secrets cannot be read, the log and the job's error
+    /// message are withheld rather than shown without exact-match redaction.
+    /// The preview still answers, so the page can say why.
     pub async fn build_preview(
         &self,
         project_id: i32,
@@ -342,9 +336,21 @@ impl FailureReportService {
             job_id: job_id.to_string(),
         })?;
         let failed_job_type = failed_job.job_type.clone();
-        let error_message = failed_job.error_message.clone();
 
-        let redacted_log = self.build_redacted_log(&jobs).await?;
+        let (redacted_log, error_message) =
+            match known_secret_values(&self.encryption_service, &jobs) {
+                Ok(secrets) => (
+                    self.build_redacted_log(&jobs, &secrets).await?,
+                    failed_job.error_message.clone(),
+                ),
+                Err(error) => (
+                    format!(
+                        "[Log withheld from this report. {error}. Check that this instance still \
+                         has the encryption key this deployment was created with.]"
+                    ),
+                    None,
+                ),
+            };
 
         // Only ever included when the project's repo is public -- a private
         // repo's URL/branch must never be pasted into an issue on the
@@ -394,6 +400,9 @@ impl FailureReportService {
     /// submits — defense in depth against an accidentally-reintroduced
     /// literal secret value — but NOT the heuristic pattern pass, which
     /// could otherwise mangle text the user added themselves.
+    ///
+    /// Refused when the known secrets cannot be read: nothing could then check
+    /// the submitted text for them, and this path is the one that leaves the box.
     pub async fn send_report(
         &self,
         project_id: i32,
@@ -418,7 +427,7 @@ impl FailureReportService {
             deployment_id,
             job_id: job_id.to_string(),
         })?;
-        let secrets = self.known_secret_values(&jobs);
+        let secrets = known_secret_values(&self.encryption_service, &jobs)?;
         let safe_text = prepare_report_text(report_text, &secrets)?;
 
         let payload = FailureReportPayload {
@@ -432,6 +441,59 @@ impl FailureReportService {
 
         post_report(&self.client, &self.endpoint, deployment_id, &payload).await
     }
+}
+
+/// Every known secret/env value configured for the jobs in `jobs` -- the
+/// redaction set for [`redact_known_secrets`].
+///
+/// A sensitive field that cannot be read (a rotated encryption key, a corrupted
+/// envelope) is an error, never an empty list: redacting against a partial set
+/// would leave real secret values in the report with nothing to show for it.
+fn known_secret_values(
+    encryption_service: &Arc<EncryptionService>,
+    jobs: &[deployment_jobs::Model],
+) -> Result<Vec<String>, FailureReportError> {
+    let mut values = Vec::new();
+    for job in jobs {
+        let Some(job_config) = job.job_config.as_ref() else {
+            continue;
+        };
+        for field in SENSITIVE_JOB_CONFIG_FIELDS {
+            let map = sensitive_envelope::read_sealed_optional(
+                job_config,
+                Some(encryption_service),
+                field,
+            )
+            .map_err(|source| {
+                // A JSON parse error can quote what it choked on, which here is
+                // decrypted secret material, so only a decrypt failure's own
+                // text is passed on.
+                let reason = match source {
+                    SensitiveEnvelopeError::Decrypt { reason, .. } => reason,
+                    SensitiveEnvelopeError::Serialize(_)
+                    | SensitiveEnvelopeError::Encrypt(_) => {
+                        "the decrypted content is not a map of strings".to_string()
+                    }
+                };
+                error!(
+                    deployment_id = job.deployment_id,
+                    job_id = %job.job_id,
+                    field = %field,
+                    reason = %reason,
+                    "Withholding deployment log from failure report: stored secrets cannot be read for redaction"
+                );
+                FailureReportError::SecretsUnavailable {
+                    deployment_id: job.deployment_id,
+                    job_id: job.job_id.clone(),
+                    field: field.to_string(),
+                    reason,
+                }
+            })?
+            .unwrap_or_default();
+            values.extend(map.into_values());
+        }
+    }
+    Ok(values)
 }
 
 /// Redact known secrets from user-submitted text, refuse a blank report and
@@ -529,6 +591,167 @@ mod tests {
         assert_eq!(
             problem.into_response().status(),
             axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    fn encryption_service(key: &str) -> Arc<EncryptionService> {
+        Arc::new(EncryptionService::new(key).unwrap())
+    }
+
+    fn job_with_config(
+        deployment_id: i32,
+        job_config: serde_json::Value,
+    ) -> deployment_jobs::Model {
+        deployment_jobs::Model {
+            id: 1,
+            deployment_id,
+            job_id: "build_image".to_string(),
+            job_type: "BuildImageJob".to_string(),
+            name: "Build Image".to_string(),
+            description: None,
+            dependencies: None,
+            job_config: Some(job_config),
+            outputs: None,
+            status: temps_entities::types::JobStatus::Failure,
+            log_id: "log".to_string(),
+            error_message: None,
+            started_at: None,
+            finished_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            execution_order: Some(0),
+        }
+    }
+
+    /// Collects what a `fmt` subscriber writes, so a test can assert a log line.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Falling back to an empty list here is how a rotated key put real secret
+    /// values into a report with nothing to show that it happened.
+    #[test]
+    fn known_secret_values_fails_closed_and_logs_on_an_undecryptable_envelope() {
+        let rotated_away =
+            encryption_service("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let current =
+            encryption_service("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210");
+        let secret = "super-secret-value";
+        let mut config = serde_json::Map::new();
+        sensitive_envelope::write_sealed(
+            &mut config,
+            rotated_away.as_ref(),
+            "secrets",
+            &std::collections::HashMap::from([("DB_PASSWORD".to_string(), secret.to_string())]),
+        )
+        .unwrap();
+        let jobs = [job_with_config(77, serde_json::Value::Object(config))];
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let result =
+            tracing::subscriber::with_default(subscriber, || known_secret_values(&current, &jobs));
+
+        match result {
+            Err(FailureReportError::SecretsUnavailable {
+                deployment_id,
+                job_id,
+                field,
+                ..
+            }) => {
+                assert_eq!(deployment_id, 77);
+                assert_eq!(job_id, "build_image");
+                assert_eq!(field, "secrets");
+            }
+            other => panic!("expected SecretsUnavailable, got {other:?}"),
+        }
+
+        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("deployment_id=77"), "{logged}");
+        assert!(!logged.contains(secret), "{logged}");
+    }
+
+    /// A value that parses as JSON but not as a string map decrypts fine, so the
+    /// parse error is the only thing that could quote decrypted content.
+    #[test]
+    fn known_secret_values_does_not_echo_decrypted_content_when_it_cannot_parse() {
+        let enc =
+            encryption_service("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let secret = "super-secret-value";
+        let ciphertext = enc
+            .encrypt_string(&serde_json::json!(secret).to_string())
+            .unwrap();
+        let jobs = [job_with_config(
+            77,
+            serde_json::json!({ "secrets_encrypted": ciphertext }),
+        )];
+
+        let error = known_secret_values(&enc, &jobs).unwrap_err();
+
+        assert!(
+            matches!(error, FailureReportError::SecretsUnavailable { .. }),
+            "{error:?}"
+        );
+        assert!(!format!("{error} {error:?}").contains(secret), "{error:?}");
+    }
+
+    #[test]
+    fn known_secret_values_reads_sealed_and_legacy_plaintext_fields() {
+        let enc =
+            encryption_service("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let mut config = serde_json::Map::new();
+        sensitive_envelope::write_sealed(
+            &mut config,
+            enc.as_ref(),
+            "secrets",
+            &std::collections::HashMap::from([("TOKEN".to_string(), "sealed".to_string())]),
+        )
+        .unwrap();
+        config.insert(
+            "build_args".to_string(),
+            serde_json::json!({ "ARG": "legacy" }),
+        );
+        let jobs = [job_with_config(77, serde_json::Value::Object(config))];
+
+        let mut values = known_secret_values(&enc, &jobs).unwrap();
+        values.sort();
+
+        assert_eq!(values, ["legacy", "sealed"]);
+    }
+
+    #[test]
+    fn secrets_unavailable_maps_to_a_500_problem() {
+        let problem: temps_core::problemdetails::Problem = FailureReportError::SecretsUnavailable {
+            deployment_id: 77,
+            job_id: "build_image".to_string(),
+            field: "secrets".to_string(),
+            reason: "decryption failed".to_string(),
+        }
+        .into();
+        use axum::response::IntoResponse;
+        assert_eq!(
+            problem.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

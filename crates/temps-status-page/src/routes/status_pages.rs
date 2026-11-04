@@ -25,7 +25,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 
 /// Authorize `$permission` on every project in `$project_ids` (the projects a
 /// status page draws from), with ADR-028 semantics on each. A page without
@@ -71,7 +71,7 @@ pub struct StatusPageListQuery {
 }
 
 fn audit_for(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     action: PublicStatusPageAction,
     page: &StatusPageResponse,
@@ -179,7 +179,7 @@ where
                 .filter(|id| !hidden.contains(id))
                 .collect();
             if !candidates.is_empty() {
-                let required = temps_auth::permissions::Permission::StatusPageRead.to_string();
+                let required = temps_authz::permissions::Permission::StatusPageRead.to_string();
                 let permissions = checker
                     .effective_project_permissions_batch(user_id, &candidates)
                     .await
@@ -648,7 +648,7 @@ where
 }
 
 fn domain_audit(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     action: PublicStatusPageAction,
     project_ids: &[i32],
@@ -672,7 +672,7 @@ fn domain_audit(
 
 /// The acting user's email, used as the ACME account contact exactly like
 /// the Domains API does.
-fn acme_email(auth: &temps_auth::AuthContext) -> String {
+fn acme_email(auth: &temps_authz::AuthContext) -> String {
     auth.user
         .as_ref()
         .map(|user| user.email.clone())
@@ -1020,14 +1020,14 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
-    use temps_auth::permissions::{Permission, Role};
-    use temps_auth::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
+    use temps_authz::AuthContext;
     use temps_config::ConfigService;
     use temps_core::{
         AuditLogger, AuditOperation, NoopTelemetryReporter, ProjectAccessChecker, TelemetryReporter,
     };
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{environments, projects, upstream_config::UpstreamList, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
     use tower::ServiceExt;
 
     #[derive(Default)]
@@ -1037,11 +1037,20 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("audit log mutex poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "audit log mutex poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), payload));
             Ok(())
         }

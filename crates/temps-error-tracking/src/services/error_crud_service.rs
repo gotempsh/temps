@@ -844,8 +844,8 @@ mod group_status_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{error_groups, projects};
+    use temps_test_utils::TestDatabase;
 
     /// Test: Manual error resolution workflow
     ///
@@ -856,12 +856,6 @@ mod tests {
     /// 3. Ignore errors with "ignored" status
     /// 4. Proper error handling for non-existent groups
     /// 5. Project isolation - can't update groups from other projects
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
-
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
         use temps_entities::preset::Preset;
         use uuid::Uuid;
@@ -924,9 +918,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping global errors database test: {error}");
                 return;
@@ -1031,7 +1023,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_status_to_resolved() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1058,7 +1050,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_with_assignment() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1091,7 +1083,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_to_ignored() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1118,7 +1110,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_not_found() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db);
 
@@ -1137,7 +1129,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_update_error_group_wrong_project() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1159,7 +1151,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_error_groups_with_pagination() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1193,7 +1185,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_error_groups_with_status_filter() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1233,9 +1225,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping range sort database test: {error}");
                 return;
@@ -1306,7 +1296,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_get_error_group_by_id() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 
@@ -1325,7 +1315,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_has_error_groups() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = ErrorCRUDService::new(db.clone());
 

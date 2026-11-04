@@ -56,7 +56,7 @@ use temps_backup::engines::workload_job::{
     PgJobTarget, RemovalTiming, S3JobTarget,
 };
 use temps_core::{AuditLogger, AuditOperation};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_workload::RuntimeDriver;
 use temps_workload_docker::DockerDriver;
 use temps_workload_plane::{
@@ -77,7 +77,7 @@ struct NoAudit;
 
 #[async_trait]
 impl AuditLogger for NoAudit {
-    async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::anyhow::Result<()> {
+    async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }

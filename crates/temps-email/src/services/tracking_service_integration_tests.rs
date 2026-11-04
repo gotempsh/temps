@@ -9,8 +9,8 @@ mod tests {
     use std::sync::Arc;
 
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{email_links, emails};
+    use temps_test_utils::TestDatabase;
     use uuid::Uuid;
 
     use crate::services::TrackingService;
@@ -52,8 +52,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent tracking service test: {error}");
                     return None;
                 }

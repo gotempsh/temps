@@ -23,11 +23,11 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sha2::Sha256;
 
 use temps_core::EncryptionService;
-use temps_database::test_utils::TestDatabase;
 use temps_revenue::{
     CreateIntegrationInput, IngestOutcome, ProviderRegistry, RevenueAnalyticsService,
     RevenueIngestionService, RevenueIntegrationService,
 };
+use temps_test_utils::TestDatabase;
 
 type HmacSha256 = Hmac<Sha256>;
 

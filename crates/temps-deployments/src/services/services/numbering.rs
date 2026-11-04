@@ -34,7 +34,7 @@ mod tests {
     use super::*;
     use sea_orm::ActiveModelTrait;
     use std::collections::BTreeSet;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Deployments of one project started at the same instant (one per
     /// environment, say) must get distinct slugs: the slug is the container
@@ -46,9 +46,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker unavailable; skipping: {error}");
                 return;
@@ -138,9 +136,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker unavailable; skipping: {error}");
                 return;

@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_ai_agents::sandbox::SandboxProvider;
 use temps_config::ConfigService;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_git::GitProviderManager;
+use temps_sandbox_providers::SandboxProvider;
 use tracing::{debug, info, warn};
 use utoipa::OpenApi;
 
@@ -33,7 +33,7 @@ use crate::services::placement::{NodeProbe, ResolverNodeProbe};
 use crate::services::registry::{SandboxNodeLookup, StandaloneSandboxRegistry};
 use crate::services::sandbox_service::SandboxService;
 use crate::services::snapshot_service::SnapshotService;
-use temps_ai_agents::sandbox::node_routing::DbRemoteNodeResolver;
+use temps_sandbox_providers::node_routing::DbRemoteNodeResolver;
 
 pub struct SandboxPlugin;
 
@@ -204,7 +204,7 @@ impl TempsPlugin for SandboxPlugin {
             // them down. Say so while the operator is looking at the logs, in
             // the background: it shells out to `systemctl`.
             {
-                use temps_ai_agents::sandbox::SandboxBackend;
+                use temps_sandbox_providers::SandboxBackend;
                 let provider = registry.provider();
                 if provider.supports_backend(SandboxBackend::Firecracker)
                     || provider.supports_backend(SandboxBackend::Microsandbox)
@@ -217,8 +217,7 @@ impl TempsPlugin for SandboxPlugin {
             // so agent runs (autofixer, workflow agents) create first-class
             // `sandboxes` rows instead of untracked containers.
             match (
-                context
-                    .get_service::<temps_ai_agents::services::sandbox_registry::SandboxRegistry>(),
+                context.get_service::<temps_sandbox_providers::sandbox_registry::SandboxRegistry>(),
                 sandbox_service.clone(),
             ) {
                 (Some(agent_registry), Some(service)) => {

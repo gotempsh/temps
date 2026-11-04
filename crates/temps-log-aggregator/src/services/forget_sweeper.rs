@@ -267,7 +267,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_failed_forget_stays_queued_and_a_later_pass_resolves_it() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

@@ -170,11 +170,11 @@ mod tests {
     #[tokio::test]
     async fn test_bounded_transaction_gives_up_on_a_held_lock() {
         use sea_orm::ConnectionTrait;
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(test_db) => test_db,
             Err(error) => {
                 let error = format!("test database is unavailable: {error}");
-                if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                if temps_test_utils::is_container_runtime_unavailable(&error) {
                     eprintln!("Skipping Docker-dependent test: {error}");
                     return;
                 }

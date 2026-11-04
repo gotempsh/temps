@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::{
@@ -231,8 +231,8 @@ impl AuditOperation for ActivityAudit {
     fn user_agent(&self) -> &str {
         &self.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 async fn record_audit(
@@ -259,7 +259,7 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_ai::{AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, TokenStream};
-    use temps_auth::context::AuthContext;
+    use temps_authz::context::AuthContext;
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
 
     struct NoAi;
@@ -278,7 +278,7 @@ mod tests {
     struct NoAudit;
     #[async_trait::async_trait]
     impl AuditLogger for NoAudit {
-        async fn create_audit_log(&self, _: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::AuditResult<()> {
             panic!("unauthorized handler reached audit")
         }
     }

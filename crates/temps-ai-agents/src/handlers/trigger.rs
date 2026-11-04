@@ -14,9 +14,10 @@ use axum::{
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
@@ -58,9 +59,8 @@ impl AuditOperation for AgentRunTriggeredAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -266,18 +266,6 @@ pub struct WebhookTriggerRequest {
 pub struct WebhookTriggerResponse {
     pub run_id: i32,
     pub status: String,
-}
-
-/// Constant-time byte comparison to prevent timing attacks on webhook tokens.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Public webhook endpoint. Authenticated via `X-Webhook-Token` header.
@@ -760,7 +748,7 @@ pub async fn smoke_test_agent(
             .flatten()
             .and_then(|s| {
                 s.data.get("agent_sandbox").cloned().and_then(|v| {
-                    serde_json::from_value::<temps_core::AgentSandboxSettings>(v).ok()
+                    serde_json::from_value::<temps_config::AgentSandboxSettings>(v).ok()
                 })
             })
             .unwrap_or_default()
@@ -1157,7 +1145,7 @@ pub async fn save_agent_token(
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, invalidate_legacy_agent_token_caches};
+    use super::invalidate_legacy_agent_token_caches;
     use async_trait::async_trait;
     use futures::stream;
     use sea_orm::{DatabaseBackend, MockDatabase};
@@ -1166,8 +1154,8 @@ mod tests {
         Arc,
     };
     use temps_ai::{AiError, AiRequest, AiResponse, AiService, ChatTurnRequest, TokenStream};
+    use temps_config::AppSettings;
     use temps_config::ServerConfig;
-    use temps_core::AppSettings;
 
     struct InvalidationTrackingAiService {
         invalidated: Arc<AtomicBool>,
@@ -1214,36 +1202,6 @@ mod tests {
             )
             .expect("valid test server config"),
         )
-    }
-
-    #[test]
-    fn accepts_matching_tokens() {
-        assert!(constant_time_eq(b"whsec_abc123", b"whsec_abc123"));
-    }
-
-    #[test]
-    fn rejects_mismatched_tokens_of_equal_length() {
-        // Regression test: an earlier version of this check used
-        // `!fold(..) == 0`, which parses as `(!fold(..)) == 0` due to Rust's
-        // precedence rules (`!` on a `u8` is bitwise NOT, not logical NOT).
-        // That accepted every wrong token whose XOR-accumulation wasn't
-        // exactly 255, i.e. almost all wrong tokens. Every case below must
-        // be rejected.
-        assert!(!constant_time_eq(b"whsec_abc123", b"whsec_abc124"));
-        assert!(!constant_time_eq(b"whsec_abc123", b"whsec_xyz123"));
-        assert!(!constant_time_eq(b"aaaaaaaaaaaa", b"bbbbbbbbbbbb"));
-        assert!(!constant_time_eq(b"\0\0\0\0", b"\x01\x01\x01\x01"));
-    }
-
-    #[test]
-    fn rejects_different_length_tokens() {
-        assert!(!constant_time_eq(b"short", b"much_longer_token"));
-        assert!(!constant_time_eq(b"", b"nonempty"));
-    }
-
-    #[test]
-    fn empty_tokens_are_equal() {
-        assert!(constant_time_eq(b"", b""));
     }
 
     #[tokio::test]

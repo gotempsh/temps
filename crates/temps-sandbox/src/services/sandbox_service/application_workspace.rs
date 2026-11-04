@@ -15,7 +15,7 @@ pub struct ApplicationWorkspaceSandbox {
     /// Authoritative provider handle adopted through SandboxService. Internal
     /// harness callers use this instead of recovering the same live sandbox a
     /// second time and mistaking a cold local cache for an orphan.
-    pub handle: Option<temps_ai_agents::sandbox::SandboxHandle>,
+    pub handle: Option<temps_sandbox_providers::SandboxHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +160,7 @@ pub(super) fn application_workspace_identity_is_attested(
         && attested_application == Some(application_public_id)
         && attested_work_dir == host_work_dir.to_str()
         && row.lifecycle == "workspace"
-        && row.work_dir == temps_ai_agents::sandbox::SANDBOX_WORK_DIR
+        && row.work_dir == temps_sandbox_providers::SANDBOX_WORK_DIR
         && row
             .image
             .as_deref()
@@ -585,7 +585,7 @@ impl SandboxService {
             let compatibility = provider.check_agent_runtime(&handle).await;
             let candidate_identity = if matches!(
                 compatibility,
-                Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible)
+                Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible)
             ) {
                 provider
                     .image_identity(&handle)
@@ -608,7 +608,7 @@ impl SandboxService {
         let (compatibility, candidate_identity) = probe_result?;
         if !matches!(
             compatibility,
-            temps_ai_agents::sandbox::RuntimeCompatibility::Compatible
+            temps_sandbox_providers::RuntimeCompatibility::Compatible
         ) {
             return Err(SandboxError::InvalidState {
                 sandbox_id: sandbox_public_id.to_string(),
@@ -642,7 +642,7 @@ impl SandboxService {
         let actual_compatibility = self.registry.provider().check_agent_runtime(&handle).await;
         if !matches!(
             actual_compatibility,
-            Ok(temps_ai_agents::sandbox::RuntimeCompatibility::Compatible)
+            Ok(temps_sandbox_providers::RuntimeCompatibility::Compatible)
         ) {
             let restore =
                 application_sandbox_create_config(&row, host_work_dir.clone(), &previous_config)?;
@@ -755,7 +755,7 @@ impl SandboxService {
         &self,
         user_id: i32,
         sandbox_public_id: &str,
-    ) -> Result<temps_ai_agents::sandbox::RuntimeCompatibility, SandboxError> {
+    ) -> Result<temps_sandbox_providers::RuntimeCompatibility, SandboxError> {
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         self.registry
             .runtime_compatibility(row.id, sandbox_public_id)
@@ -806,7 +806,7 @@ impl SandboxService {
         sandbox_public_id: &str,
         host_work_dir: PathBuf,
         config: ApplicationWorkspaceConfig,
-        artifact: &temps_ai_agents::sandbox::SnapshotArtifact,
+        artifact: &temps_sandbox_providers::SnapshotArtifact,
     ) -> Result<SandboxSummary, SandboxError> {
         let row = self.find_by_public_id(sandbox_public_id, user_id).await?;
         let key = managed_application_id_from_name(&row.name).unwrap_or(sandbox_public_id);
@@ -916,7 +916,7 @@ impl SandboxService {
         };
         let container_path = format!(
             "{}/projects/{project_slug}",
-            temps_ai_agents::sandbox::user::SANDBOX_WORK_DIR
+            temps_sandbox_providers::user::SANDBOX_WORK_DIR
         );
         self.registry
             .normalize_workspace_path(row.id, &row.public_id, &container_path)

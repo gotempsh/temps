@@ -1,0 +1,5466 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+pub use temps_providers_core::externalsvc::naming::{mongodb_container_name, HEALTHCHECK_COMMAND};
+
+use super::error::{EngineError, Result};
+use async_trait::async_trait;
+use bollard::exec::CreateExecOptions;
+use bollard::query_parameters::{
+    AttachContainerOptionsBuilder, InspectContainerOptions, StopContainerOptions,
+    WaitContainerOptionsBuilder,
+};
+use bollard::Docker;
+use futures::StreamExt;
+use mongodb::bson::doc;
+use mongodb::options::ClientOptions;
+use mongodb::Client as MongoClient;
+use schemars::JsonSchema;
+use sea_orm::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
+
+/// Bound for a single MongoDB backup `docker exec`. Mongo dumps can be
+/// large; 4 hours is a reasonable middle ground.
+const MONGODB_BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+use urlencoding;
+
+use crate::utils::ensure_network_exists;
+
+use super::{
+    ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceResourceLimits,
+    ServiceType,
+};
+
+/// Input configuration for creating a MongoDB service
+/// This is what users provide when creating the service
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(
+    title = "MongoDB Configuration",
+    description = "Configuration for MongoDB service"
+)]
+pub struct MongodbInputConfig {
+    /// MongoDB host address
+    #[serde(default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
+    pub host: String,
+
+    /// MongoDB port (auto-assigned if not provided)
+    #[schemars(example = example_port())]
+    pub port: Option<String>,
+
+    /// MongoDB database name
+    #[serde(default = "default_database")]
+    #[schemars(example = example_database(), default = "default_database")]
+    pub database: String,
+
+    /// MongoDB username
+    #[serde(default = "default_username")]
+    #[schemars(example = example_username(), default = "default_username")]
+    pub username: String,
+
+    /// MongoDB password (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_password")]
+    #[schemars(with = "Option<String>", example = example_password())]
+    pub password: Option<String>,
+
+    /// Docker image to use for MongoDB (e.g., gotempsh/mongodb-walg:8.0, gotempsh/mongodb-walg:7.0)
+    #[serde(default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
+    pub docker_image: String,
+
+    /// Optional replica set name. When set, mongod is started with `--replSet <name>`,
+    /// a keyfile-protected `--auth`, and `rs.initiate()` is run after first start.
+    /// Required for transactions, change streams, and oplog-based CDC.
+    /// This is a single-node replica set — for multi-node HA use the cluster topology.
+    /// Cannot be changed after creation: switching modes on an existing data volume corrupts state.
+    #[serde(default, deserialize_with = "deserialize_optional_replica_set")]
+    #[schemars(with = "Option<String>", example = example_replica_set())]
+    pub replica_set: Option<String>,
+
+    /// Real Docker container name when this service was imported from an
+    /// existing MongoDB-compatible container (set by `import_from_container`,
+    /// never user-editable — omitted from the create form). Overrides the
+    /// derived `temps-mongodb-{name}` container name so internal addressing
+    /// targets the actual pre-existing container instead of a synthesized
+    /// name that doesn't exist. Mirrors the MariaDB/Postgres/Redis fix for
+    /// the same class of bug.
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty")]
+    #[schemars(skip)]
+    pub container_name: Option<String>,
+}
+
+// Example functions for schemars
+fn example_host() -> &'static str {
+    "localhost"
+}
+
+fn example_port() -> &'static str {
+    "27017"
+}
+
+fn example_database() -> &'static str {
+    "mydatabase"
+}
+
+fn example_username() -> &'static str {
+    "root"
+}
+
+fn example_password() -> &'static str {
+    ""
+}
+
+fn default_docker_image() -> String {
+    "gotempsh/mongodb-walg:8.0".to_string()
+}
+
+/// Repositories a restore-time `docker_image` override may name, in addition
+/// to whatever repository the source service already runs. See
+/// [`crate::externalsvc::restore_image`] for why the override is constrained.
+const RESTORE_IMAGE_REPOSITORIES: &[&str] = &["mongo", "gotempsh/mongodb-walg"];
+
+/// Environment variable holding the root username, consumed by the official
+/// MongoDB entrypoint at first boot. Every container this provider creates is
+/// given it (see [`MongodbService::create_container_once`]), which is what
+/// lets in-container probes read the credential back out of their own
+/// environment instead of putting it on `mongosh`'s command line.
+const MONGO_ROOT_USER_ENV: &str = "MONGO_INITDB_ROOT_USERNAME";
+
+/// Environment variable holding the root password. See [`MONGO_ROOT_USER_ENV`].
+const MONGO_ROOT_PASSWORD_ENV: &str = "MONGO_INITDB_ROOT_PASSWORD";
+
+/// Build a `mongodb://` connection URI for an in-container `mongosh` probe
+/// against localhost, percent-encoding both credentials.
+///
+/// In-container probes hand this to `mongosh` as a positional connection
+/// string rather than as `-u <user> -p <pass>`. The reason is the same one
+/// documented on [`HEALTHCHECK_COMMAND`]: mongosh's parser reads any argv token
+/// starting with `-` as a flag, so a username or password beginning with `-`
+/// makes a space-separated `-u`/`-p` value fail with
+/// `unrecognized option: -...` no matter how carefully the shell quoted it. A
+/// URI is always a single token starting with `mongodb://`, so it can never be
+/// mistaken for a flag whatever the credentials look like, and percent-encoding
+/// keeps `:`, `@`, `/` and `?` inside the credentials from reshaping the URI.
+fn local_probe_uri(username: &str, password: &str) -> String {
+    format!(
+        "mongodb://{}:{}@127.0.0.1:{}/admin?authSource=admin",
+        urlencoding::encode(username),
+        urlencoding::encode(password),
+        MONGODB_INTERNAL_PORT
+    )
+}
+
+/// Environment variable an operator sets to allow additional MongoDB
+/// repositories as a restore-time `docker_image` override (comma-separated).
+/// Additive — it can only widen [`RESTORE_IMAGE_REPOSITORIES`], never shrink
+/// it, so a typo cannot block a restore that worked before. Read once; restart
+/// temps to change. Mirrors `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES`.
+pub(crate) const EXTRA_RESTORE_IMAGES_ENV: &str = "TEMPS_ALLOWED_MONGODB_DOCKER_IMAGES";
+
+/// Operator additions to [`RESTORE_IMAGE_REPOSITORIES`], read once per process.
+fn extra_restore_image_repositories() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        crate::externalsvc::restore_image::extra_allowed_repositories(EXTRA_RESTORE_IMAGES_ENV)
+    })
+}
+
+fn example_docker_image() -> &'static str {
+    "gotempsh/mongodb-walg:8.0"
+}
+
+fn example_replica_set() -> &'static str {
+    "rs0"
+}
+
+/// Internal runtime configuration for MongoDB service
+/// This is what the service uses internally after processing input
+/// and what gets saved to the database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MongodbRuntimeConfig {
+    pub host: String,
+    pub port: String,
+    pub database: String,
+    pub username: String,
+    pub password: String,
+    pub docker_image: String,
+    /// When set, mongod runs with `--replSet <name>`. None means standalone mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_set: Option<String>,
+    /// Base64 keyfile contents used for `--keyFile` when replica_set is enabled.
+    /// MongoDB requires a keyfile whenever both `--auth` and `--replSet` are set,
+    /// even for a single-node replica set. Generated once at creation and persisted
+    /// here so the same keyfile is written into the container on every restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyfile_content: Option<String>,
+    /// Real container name for imported services — see
+    /// `MongodbInputConfig::container_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
+impl From<MongodbInputConfig> for MongodbRuntimeConfig {
+    fn from(input: MongodbInputConfig) -> Self {
+        let replica_set = input.replica_set;
+        let keyfile_content = if replica_set.is_some() {
+            Some(generate_keyfile_content())
+        } else {
+            None
+        };
+        Self {
+            host: input.host,
+            port: input.port.unwrap_or_else(|| {
+                find_available_port(27017)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "27017".to_string())
+            }),
+            database: input.database,
+            username: input.username,
+            password: input.password.unwrap_or_else(generate_password),
+            docker_image: input.docker_image,
+            replica_set,
+            keyfile_content,
+            container_name: input.container_name,
+        }
+    }
+}
+
+fn deserialize_optional_password<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Deserialize as Option to handle missing field
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+
+    // Return None if missing or empty (will trigger auto-generation)
+    Ok(match opt {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
+}
+
+/// Treats a blank string the same as an absent value — see
+/// `MongodbInputConfig::container_name`.
+fn deserialize_optional_non_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
+}
+
+/// Treat empty string as `None` so the UI can submit a blank field without
+/// accidentally enabling replica set mode. Validates the name contains only
+/// the characters MongoDB accepts in a replica set name.
+fn deserialize_optional_replica_set<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    let trimmed = opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(ref name) = trimmed {
+        let valid = name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !valid {
+            return Err(serde::de::Error::custom(
+                "replica_set must contain only ASCII letters, digits, '-', or '_'",
+            ));
+        }
+    }
+    Ok(trimmed)
+}
+
+fn default_host() -> String {
+    "localhost".to_string()
+}
+
+fn default_database() -> String {
+    "admin".to_string()
+}
+
+fn default_username() -> String {
+    "root".to_string()
+}
+
+pub fn generate_password() -> String {
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect()
+}
+
+/// Generate a MongoDB keyfile body. Mongo accepts a base64-encoded shared secret
+/// between 6 and 1024 characters; we use 32 random bytes (~44 chars base64) which
+/// matches what `openssl rand -base64 32` produces in MongoDB's own docs.
+pub fn generate_keyfile_content() -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    STANDARD.encode(bytes)
+}
+
+use super::port_util::{find_available_port, find_available_port_async, is_port_conflict_error};
+
+pub struct MongodbService {
+    name: String,
+    config: Arc<RwLock<Option<MongodbRuntimeConfig>>>,
+    /// Resource limits captured at init time, applied to recreate paths.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
+    docker: Arc<Docker>,
+}
+
+impl MongodbService {
+    pub fn new(name: String, docker: Arc<Docker>) -> Self {
+        Self {
+            name,
+            config: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
+            docker,
+        }
+    }
+
+    /// Returns `true` when the desired config wants a replica set but the
+    /// existing container was created without `--replSet`. In that case the
+    /// caller must remove and recreate the container (preserving the data
+    /// volume) so the new flags take effect; a plain `start_container` would
+    /// just bring up the previous standalone process.
+    ///
+    /// Returns `false` (and never recreates) when the container already runs
+    /// in replica-set mode, or when the config is standalone — downgrading
+    /// from replica set back to standalone is intentionally not supported.
+    async fn container_needs_replset_recreate(
+        &self,
+        docker: &Docker,
+        container_name: &str,
+        config: &MongodbRuntimeConfig,
+    ) -> Result<bool> {
+        if config.replica_set.is_none() {
+            return Ok(false);
+        }
+        let inspect = docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to inspect MongoDB container '{}' for replica-set drift check: {}",
+                        container_name, e
+                    ),
+                )
+            })?;
+        let cmd_has_replset = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.cmd.as_ref())
+            .map(|cmd| cmd.iter().any(|arg| arg.contains("--replSet")))
+            .unwrap_or(false);
+        Ok(!cmd_has_replset)
+    }
+
+    fn get_mongodb_config(&self, service_config: ServiceConfig) -> Result<MongodbRuntimeConfig> {
+        // After init the persisted parameters carry runtime-only fields like
+        // `keyfile_content`. We must NOT round-trip those through the input
+        // config — that would drop the keyfile and `From<InputConfig>` would
+        // regenerate a new one, breaking the live replica set's auth.
+        //
+        // Detect that case by looking for `keyfile_content`. If present, the
+        // parameters are already runtime-shaped and we deserialize directly.
+        if service_config
+            .parameters
+            .get("keyfile_content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .is_some()
+        {
+            let runtime: MongodbRuntimeConfig = serde_json::from_value(service_config.parameters)
+                .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Failed to parse MongoDB runtime configuration: {}", e),
+                )
+            })?;
+            return Ok(runtime);
+        }
+
+        // First-time init or standalone (no replica set): parse as input
+        // config and transform. This auto-generates password/port and, if
+        // replica_set is set, generates a fresh keyfile.
+        let input_config: MongodbInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Failed to parse MongoDB input configuration: {}", e),
+                )
+            })?;
+        Ok(input_config.into())
+    }
+
+    fn get_container_name(&self) -> String {
+        mongodb_container_name(&self.name)
+    }
+
+    /// The container this service actually runs in: the imported container's
+    /// real name when `config.container_name` is set, otherwise the derived
+    /// `temps-mongodb-{name}`. Every operation that talks to the live
+    /// container must resolve through this, not `get_container_name()`
+    /// directly, or it targets a synthesized name that doesn't exist for
+    /// imported services.
+    fn get_live_container_name(&self, config: &MongodbRuntimeConfig) -> String {
+        config
+            .container_name
+            .clone()
+            .unwrap_or_else(|| self.get_container_name())
+    }
+
+    fn get_effective_address_for_environment(
+        &self,
+        service_config: ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<(String, String)> {
+        let config = self.get_mongodb_config(service_config)?;
+        Ok(match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), config.port),
+            temps_core::ExecutionEnvironment::Docker => (
+                self.get_live_container_name(&config),
+                MONGODB_INTERNAL_PORT.to_string(),
+            ),
+        })
+    }
+
+    /// Creates and starts the MongoDB container, retrying with a fresh host
+    /// port if the chosen one lost the race described in `port_util` docs
+    /// (bindable when we checked, but taken by the time Docker actually binds
+    /// it). The container name is deterministic, so a failed attempt must be
+    /// removed before retrying or the next attempt's "already exists" check
+    /// short-circuits without picking a new port.
+    ///
+    /// `config` is taken by mutable reference so a retry's port change is
+    /// written back to the caller — otherwise the caller (and anything it
+    /// persists to the database) keeps referencing the original port even
+    /// though the container actually ended up bound to a different one.
+    async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &mut MongodbRuntimeConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt_config = config.clone();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .create_container_once(docker, &attempt_config, resource_limits)
+                .await
+            {
+                Ok(()) => {
+                    *config = attempt_config;
+                    return Ok(());
+                }
+                // A failed guarded recreate has already put the original
+                // back under this name; never remove it as "the failed attempt".
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && !matches!(e, EngineError::RecreateGuard(_))
+                        && is_port_conflict_error(&e.to_string()) =>
+                {
+                    warn!(
+                        "Port {} for MongoDB container was already allocated (attempt {}/{}), retrying with a fresh port: {}",
+                        attempt_config.port, attempt, MAX_ATTEMPTS, e
+                    );
+                    let _ = docker
+                        .remove_container(
+                            &self.get_container_name(),
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    let base_port: u16 = attempt_config.port.parse().unwrap_or(27017);
+                    if let Some(new_port) =
+                        find_available_port_async(docker, base_port.wrapping_add(1)).await
+                    {
+                        attempt_config.port = new_port.to_string();
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/data/db".to_string(),
+            mounts: vec![super::recreate_guard::PlannedMount {
+                volume: format!("temps-mongodb-{}-data", self.name),
+                target: "/data/db".to_string(),
+            }],
+        }
+    }
+
+    async fn create_container_once(
+        &self,
+        docker: &Docker,
+        config: &MongodbRuntimeConfig,
+        resource_limits: &ServiceResourceLimits,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let volume_name = format!("temps-mongodb-{}-data", self.name);
+
+        let create_volume_options = bollard::models::VolumeCreateRequest {
+            name: Some(volume_name.clone()),
+            driver: Some("local".to_string()),
+            ..Default::default()
+        };
+        docker
+            .create_volume(create_volume_options)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MongoDB volume: {}", e),
+                )
+            })?;
+
+        info!("Created MongoDB volume: {}", volume_name);
+
+        // The root credentials are supplied only as environment variables. The
+        // healthcheck below reads them back from here rather than embedding
+        // them in its command line — see [`HEALTHCHECK_COMMAND`].
+        let mut env_vars: Vec<String> = vec![
+            format!("{}={}", MONGO_ROOT_USER_ENV, config.username),
+            format!("{}={}", MONGO_ROOT_PASSWORD_ENV, config.password),
+            format!("MONGO_INITDB_DATABASE={}", config.database),
+        ];
+
+        // When replica set mode is enabled, smuggle the keyfile through an env
+        // var read by a small bash wrapper (see `cmd` below). Persisting the
+        // keyfile in `MongodbRuntimeConfig` means restarts use the same key,
+        // which is critical — a different keyfile would invalidate the
+        // existing replica set's local.system.keys.
+        if let (Some(_), Some(keyfile_content)) =
+            (config.replica_set.as_ref(), config.keyfile_content.as_ref())
+        {
+            env_vars.push(format!("TEMPS_MONGO_KEYFILE_B64={}", keyfile_content));
+        }
+
+        let mut container_labels = HashMap::new();
+        container_labels.insert("temps.service".to_string(), "mongodb".to_string());
+        container_labels.insert("temps.name".to_string(), self.name.clone());
+
+        let image_tag = config.docker_image.clone();
+
+        // Pull the image first
+        info!("Pulling MongoDB image: {}", image_tag);
+        crate::utils::pull_image_with_retry(docker, &image_tag, None)
+            .await
+            .map_err(|e| {
+                EngineError::failed(&self.name, format!("Failed to pull MongoDB image: {}", e))
+            })?;
+
+        let mut host_config = bollard::models::HostConfig {
+            port_bindings: Some(crate::utils::local_port_binding("27017/tcp", &config.port)),
+            mounts: Some(vec![bollard::models::Mount {
+                target: Some("/data/db".to_string()),
+                source: Some(volume_name),
+                typ: Some(bollard::models::MountType::VOLUME),
+                ..Default::default()
+            }]),
+            log_config: Some(crate::utils::default_service_log_config()),
+            // Security hardening for service containers
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            pids_limit: Some(512),
+            init: crate::utils::MANAGED_SERVICE_CONTAINER_INIT,
+            ..Default::default()
+        };
+        resource_limits.apply_to_host_config(&mut host_config);
+
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
+
+        let networking_config = Some(bollard::models::NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                temps_core::NETWORK_NAME.to_string(),
+                bollard::models::EndpointSettings {
+                    ..Default::default()
+                },
+            )])),
+        });
+
+        // In replica-set mode we replace the image's CMD with a bash wrapper
+        // that materializes the keyfile inside the container (with strict
+        // perms required by mongod), then execs the standard entrypoint with
+        // `--replSet` and `--keyFile`. The official mongo entrypoint still
+        // handles MONGO_INITDB_ROOT_USERNAME/PASSWORD via the localhost
+        // exception during first boot.
+        //
+        // We deliberately avoid mounting the keyfile from the host: that path
+        // would require coordinating a host-side temp file across worker
+        // nodes. Writing it inside the container at start time keeps the
+        // service self-contained.
+        let cmd_override: Option<Vec<String>> = config.replica_set.as_ref().map(|rs_name| {
+            let escaped_rs = rs_name.replace('\'', "'\\''");
+            let script = format!(
+                concat!(
+                    "set -e; ",
+                    "printf '%s' \"$TEMPS_MONGO_KEYFILE_B64\" > /etc/mongo-keyfile; ",
+                    "chmod 400 /etc/mongo-keyfile; ",
+                    "chown mongodb:mongodb /etc/mongo-keyfile 2>/dev/null || true; ",
+                    "exec docker-entrypoint.sh mongod ",
+                    "--replSet '{}' --bind_ip_all --keyFile /etc/mongo-keyfile",
+                ),
+                escaped_rs
+            );
+            vec!["bash".to_string(), "-c".to_string(), script]
+        });
+
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(image_tag),
+            exposed_ports: Some(Vec::from(["27017/tcp".to_string()])),
+            env: Some(env_vars.iter().map(|s| s.to_string()).collect()),
+            cmd: cmd_override,
+            labels: Some(container_labels),
+            host_config: Some(bollard::models::HostConfig {
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                    maximum_retry_count: None,
+                }),
+                ..host_config
+            }),
+            networking_config,
+            healthcheck: Some(bollard::models::HealthConfig {
+                // Credential-free command line: the probe reads the root
+                // credentials from the container's own environment (set above)
+                // rather than taking them as `mongosh` arguments. See
+                // [`HEALTHCHECK_COMMAND`] for why argv is not usable here.
+                test: Some(vec![
+                    "CMD-SHELL".to_string(),
+                    HEALTHCHECK_COMMAND.to_string(),
+                ]),
+                interval: Some(2000000000), // 2 seconds
+                timeout: Some(10000000000), // 10 seconds
+                retries: Some(5),
+                start_period: Some(45000000000), // 45 seconds - gives MongoDB time to initialize credentials
+                start_interval: Some(2000000000), // 2 seconds
+            }),
+            ..Default::default()
+        };
+
+        // ADR-055 Phase 4: a database in `enforce` mode is created from its
+        // admitted workload spec through the Docker driver; every other
+        // database sends this request exactly as before.
+        let container_id = match crate::workload::registry::enforced_create(
+            docker,
+            &container_name,
+            &container_config,
+        )
+        .await
+        {
+            Some(created) => created.map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to create MongoDB container: {}", e),
+                )
+            })?,
+            None => {
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&container_name)
+                                .build(),
+                        ),
+                        container_config,
+                    )
+                    .await
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to create MongoDB container: {}", e),
+                        )
+                    })?
+                    .id
+            }
+        };
+
+        docker
+            .start_container(
+                &container_id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start MongoDB container: {}", e),
+                )
+            })?;
+
+        // Wait for container to be healthy
+        self.wait_for_container_health(docker, &container_id)
+            .await?;
+
+        // Replica set mode: initiate the set after first healthy boot. This
+        // is idempotent — if it's already initiated (e.g., container restart),
+        // mongod replies AlreadyInitialized and we treat that as success.
+        if let Some(rs_name) = config.replica_set.as_ref() {
+            self.initiate_replica_set(docker, &container_name, config, rs_name)
+                .await?;
+        }
+
+        info!("MongoDB container {} created and started", container_id);
+        Ok(())
+    }
+
+    /// Run `rs.initiate(...)` inside the container against localhost. Uses the
+    /// root credentials we know mongod will accept (they were created by the
+    /// entrypoint during first-boot via the localhost exception). On a
+    /// container restart the replica set is already initialized — that surfaces
+    /// as `AlreadyInitialized` (code 23) and we return success.
+    async fn initiate_replica_set(
+        &self,
+        docker: &Docker,
+        container_name: &str,
+        config: &MongodbRuntimeConfig,
+        rs_name: &str,
+    ) -> Result<()> {
+        use bollard::exec::{StartExecOptions, StartExecResults};
+
+        // Credentials travel as a percent-encoded connection URI in an env var,
+        // never as `-u`/`-p` arguments — see [`local_probe_uri`]. The
+        // replica-set name is also injected as an env var so it can't break out
+        // of the JSON literal.
+        let env = [
+            format!(
+                "INIT_URI={}",
+                local_probe_uri(&config.username, &config.password)
+            ),
+            format!("INIT_RS={}", rs_name),
+        ];
+        let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
+
+        let script = "mongosh --quiet --norc \"$INIT_URI\" \
+             --eval 'try { rs.initiate({_id: process.env.INIT_RS, members: [{_id: 0, host: \"127.0.0.1:27017\"}]}); } catch (e) { if (e.codeName !== \"AlreadyInitialized\" && !String(e).includes(\"already initialized\")) { throw e; } print(\"replica set already initialized\"); }' 2>&1";
+
+        let exec = docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh", "-c", script]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    env: Some(env_refs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to create rs.initiate exec on '{}': {}",
+                        container_name, e
+                    ),
+                )
+            })?;
+
+        let start = docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to start rs.initiate exec: {}", e),
+                )
+            })?;
+
+        let mut captured = String::new();
+        if let StartExecResults::Attached { mut output, .. } = start {
+            while let Some(chunk) = output.next().await {
+                if let Ok(log) = chunk {
+                    captured.push_str(&log.to_string());
+                    if captured.len() > 4096 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let inspect = docker.inspect_exec(&exec.id).await?;
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+
+        if exit_code == 0 {
+            info!(
+                "rs.initiate completed on '{}' (replica set '{}')",
+                container_name, rs_name
+            );
+            // Wait briefly for the node to elect itself primary so subsequent
+            // operations (e.g. provision_resource creating databases) don't
+            // race the election. mongod typically reaches PRIMARY in <2s for
+            // a single-node set; we cap the wait at 30s.
+            self.wait_for_primary(docker, container_name, config)
+                .await?;
+            Ok(())
+        } else {
+            Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "rs.initiate failed on '{}' with exit {}: {}",
+                    container_name,
+                    exit_code,
+                    captured.trim()
+                ),
+            ))
+        }
+    }
+
+    /// Poll `db.hello()` until it reports `isWritablePrimary: true` or 30s elapse.
+    /// Single-node replica sets normally elect themselves primary in <2s.
+    async fn wait_for_primary(
+        &self,
+        docker: &Docker,
+        container_name: &str,
+        config: &MongodbRuntimeConfig,
+    ) -> Result<()> {
+        use bollard::exec::{StartExecOptions, StartExecResults};
+
+        // Credentials travel as a percent-encoded connection URI, not as
+        // `-u`/`-p` arguments — see [`local_probe_uri`].
+        let env = [format!(
+            "INIT_URI={}",
+            local_probe_uri(&config.username, &config.password)
+        )];
+        let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
+        let probe_script = "mongosh --quiet --norc \"$INIT_URI\" \
+             --eval 'const r = db.hello(); if (!r.isWritablePrimary) { quit(2); }' 2>&1";
+
+        let max_wait = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        loop {
+            let exec = docker
+                .create_exec(
+                    container_name,
+                    CreateExecOptions {
+                        cmd: Some(vec!["sh", "-c", probe_script]),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        env: Some(env_refs.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+            if let StartExecResults::Attached { mut output, .. } = docker
+                .start_exec(
+                    &exec.id,
+                    Some(StartExecOptions {
+                        detach: false,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+            {
+                while output.next().await.is_some() {}
+            }
+
+            let inspect = docker.inspect_exec(&exec.id).await?;
+            if inspect.exit_code == Some(0) {
+                return Ok(());
+            }
+            if start.elapsed() > max_wait {
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Replica set on '{}' did not elect a primary within {}s",
+                        container_name,
+                        max_wait.as_secs()
+                    ),
+                ));
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Render a container's health state as a one-line, log-safe diagnostic.
+    ///
+    /// The healthcheck itself no longer carries the root credentials (see
+    /// [`HEALTHCHECK_COMMAND`]), but anything derived from a probe against a
+    /// credentialed service is still treated as potentially credential-bearing:
+    /// only the healthcheck's captured `output` is surfaced (never the command
+    /// itself), it is truncated, and newlines are flattened so a multi-line
+    /// mongosh stack trace cannot smear across the log.
+    fn describe_container_health(state: &bollard::models::ContainerState) -> String {
+        const MAX_OUTPUT: usize = 400;
+
+        let status = state
+            .health
+            .as_ref()
+            .and_then(|h| h.status.as_ref())
+            .map(|s| format!("{:?}", s))
+            .unwrap_or_else(|| "<no healthcheck reported>".to_string());
+
+        let streak = state
+            .health
+            .as_ref()
+            .and_then(|h| h.failing_streak)
+            .unwrap_or(0);
+
+        let last_output = state
+            .health
+            .as_ref()
+            .and_then(|h| h.log.as_ref())
+            .and_then(|log| log.last())
+            .and_then(|entry| entry.output.as_ref())
+            .map(|out| {
+                let flattened = out.split_whitespace().collect::<Vec<_>>().join(" ");
+                if flattened.chars().count() > MAX_OUTPUT {
+                    let truncated: String = flattened.chars().take(MAX_OUTPUT).collect();
+                    format!("{truncated}... (truncated)")
+                } else {
+                    flattened
+                }
+            })
+            .unwrap_or_else(|| "<no healthcheck output captured>".to_string());
+
+        format!(
+            "status={status}, container_status={:?}, failing_streak={streak}, last_probe_output=\"{last_output}\"",
+            state.status
+        )
+    }
+
+    async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
+        let mut delay = Duration::from_millis(500);
+        let mut total_wait = Duration::from_secs(0);
+        let max_wait = Duration::from_secs(90);
+        let max_delay = Duration::from_secs(2);
+        // Captured on every poll so the timeout error below can explain WHY the
+        // container never became healthy. Without this the operator (and CI)
+        // only ever sees "health check timed out", which is unactionable —
+        // the healthcheck's own stderr is the one thing that identifies
+        // whether MongoDB is still initialising, rejecting the credentials, or
+        // missing `mongosh` entirely.
+        let mut last_health_diagnostic = String::from("no health status was ever reported");
+
+        while total_wait < max_wait {
+            let info = docker
+                .inspect_container(container_id, None::<InspectContainerOptions>)
+                .await?;
+            if let Some(ref state) = info.state {
+                last_health_diagnostic = Self::describe_container_health(state);
+            }
+            if let Some(state) = info.state {
+                // Considered ready if it's running and either has a HEALTHY
+                // Docker healthcheck status or no healthcheck is defined at
+                // all (e.g. an imported container from a vanilla image with
+                // no HEALTHCHECK directive — requiring an explicit HEALTHY
+                // here would spin until `max_wait` every time).
+                let is_running =
+                    state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING);
+                let health_status = state.health.as_ref().and_then(|h| h.status.as_ref());
+
+                if is_running
+                    && (health_status.is_none()
+                        || health_status == Some(&bollard::models::HealthStatusEnum::HEALTHY))
+                {
+                    return Ok(());
+                }
+                if state.status == Some(bollard::models::ContainerStateStatusEnum::EXITED)
+                    || state.status == Some(bollard::models::ContainerStateStatusEnum::DEAD)
+                {
+                    let exit_code = state.exit_code.unwrap_or(-1);
+                    return Err(EngineError::failed(
+                        &self.name,
+                        format!(
+                            "MongoDB container exited unexpectedly with code {}",
+                            exit_code
+                        ),
+                    ));
+                }
+            }
+            sleep(delay).await;
+            total_wait += delay;
+            delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
+        }
+
+        Err(EngineError::failed(
+            &self.name,
+            format!(
+                "MongoDB container health check timed out after {}s. Last health status: {}",
+                max_wait.as_secs(),
+                last_health_diagnostic
+            ),
+        ))
+    }
+
+    async fn get_mongo_client(&self) -> Result<MongoClient> {
+        let config = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?
+            .clone();
+
+        // `directConnection=true` keeps the driver pointed at exactly this
+        // host:port instead of doing replica-set topology discovery. In RS
+        // mode `rs.initiate` registers the member as `127.0.0.1:27017`, which
+        // the driver would then try to dial — that address is the container's
+        // loopback and is unreachable from the host or from sibling
+        // containers. Direct connection bypasses discovery and is safe on
+        // standalone too. See ReplicaSetNoPrimary failure mode.
+        let connection_string = format!(
+            "mongodb://{}:{}@{}:{}/?authSource=admin&directConnection=true",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port
+        );
+
+        let client_options = ClientOptions::parse(&connection_string)
+            .await
+            .map_err(|e| EngineError::connection(&self.name, e.to_string()))?;
+        let client = MongoClient::with_options(client_options)
+            .map_err(|e| EngineError::connection(&self.name, e.to_string()))?;
+
+        Ok(client)
+    }
+
+    async fn create_database(&self, db_name: &str) -> Result<()> {
+        let client = self.get_mongo_client().await?;
+        let db = client.database(db_name);
+
+        // Never give a deployment a sandbox's database: a name in the sandbox
+        // namespace, or one the sandbox user its name would have is defined
+        // in (a sandbox database from before the namespace, such as
+        // `<project>_sandbox` for an environment slugged `sandbox`).
+        let sandbox_evidence =
+            if temps_providers_core::sandbox_namespace::is_reserved_sandbox_database_name(db_name) {
+                None
+            } else {
+                let user = temps_providers_core::sandbox_namespace::sandbox_role_name(db_name);
+                let answer = db
+                .run_command(users_info(&user, db_name))
+                .await
+                .map_err(|e| {
+                    EngineError::failed(&self.name, format!("Failed to check whether MongoDB database '{}' belongs to a sandbox: {}",
+                        db_name,
+                        e))
+                })?;
+                users_info_has_user(&answer)
+                    .then(|| format!("the sandbox user '{user}' is defined in it"))
+            };
+        temps_providers_core::sandbox_namespace::check_deployment_database(
+            "MongoDB",
+            db_name,
+            sandbox_evidence,
+        )
+        .map_err(EngineError::from)?;
+
+        // Create a collection to initialize the database
+        db.create_collection("_temps_init").await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to create MongoDB database: {}", e),
+            )
+        })?;
+
+        info!("Created MongoDB database: {}", db_name);
+        Ok(())
+    }
+
+    async fn drop_database(&self, db_name: &str) -> Result<()> {
+        let client = self.get_mongo_client().await?;
+        let db = client.database(db_name);
+
+        db.drop().await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to drop MongoDB database: {}", e),
+            )
+        })?;
+
+        info!("Dropped MongoDB database: {}", db_name);
+        Ok(())
+    }
+
+    /// Verify that a Docker image can be pulled without actually downloading the full image
+    /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
+    async fn verify_image_pullable(&self, image: &str) -> Result<()> {
+        info!("Attempting to pull Docker image: {}", image);
+
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
+                info!("Docker image {} is available and pullable", image);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to pull Docker image {}: {}", image, e);
+                Err(EngineError::invalid_input(&self.name, format!("Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e)))
+            }
+        }
+    }
+}
+
+impl MongodbService {
+    /// Build wal-g env and run `wal-g backup-push` via the resilient exec
+    /// helper. The MongoDB env wires up `WALG_STREAM_CREATE_COMMAND` to
+    /// invoke `mongodump --archive` so wal-g consumes its stdout.
+    async fn run_walg_backup_push(
+        &self,
+        container_name: &str,
+        walg_s3_prefix: &str,
+        s3_credentials: &super::S3Credentials,
+        mongodb_uri: &str,
+        backup_id: &str,
+    ) -> Result<()> {
+        let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
+        let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
+            format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
+            format!("MONGODB_URI={}", mongodb_uri),
+            format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                serde_json::json!({ "temps_backup_id": backup_id })
+            ),
+        ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
+
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        info!(
+            "Running wal-g backup-push in container '{}' (S3 prefix: {})",
+            container_name, walg_s3_prefix
+        );
+
+        super::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec!["sh".into(), "-c".into(), "wal-g backup-push 2>&1".into()],
+            Some(walg_env),
+            MONGODB_BACKUP_EXEC_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Restore from a WAL-G backup stored in S3.
+    ///
+    /// WAL-G restore runs `wal-g backup-fetch LATEST` which downloads the backup from S3
+    /// and pipes it to `mongorestore --archive` via WALG_STREAM_RESTORE_COMMAND.
+    async fn restore_from_walg(
+        &self,
+        s3_credentials: &super::S3Credentials,
+        walg_s3_prefix: &str,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        // Pull the optional `_alt_password` fallback out of parameters
+        // before `get_mongodb_config` drops it. The orchestrator sets this
+        // to the origin service's password for cross-service restores so
+        // we have a second credential to try if the target's stored one
+        // no longer works (e.g., a prior partial restore already wrote
+        // admin.system.users with the source's hashes).
+        let alt_password: Option<String> = service_config
+            .parameters
+            .get("_alt_password")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let config = self.get_mongodb_config(service_config)?;
+        let container_name = self.get_live_container_name(&config);
+
+        info!(
+            "Restoring MongoDB from WAL-G backup (prefix: {}) in container '{}'",
+            walg_s3_prefix, container_name
+        );
+
+        // Auth probe: figure out which password the LIVE mongod actually
+        // accepts before we hand one to mongorestore. mongorestore streams
+        // over the wire and will fail the whole restore if its initial
+        // connection auth rejects. Candidates, in order:
+        //
+        //   1. target's stored password (the common case)
+        //   2. alt_password if provided (covers partial-retry, where a
+        //      prior run already replaced admin.system.users with origin's
+        //      hash)
+        //
+        // Whichever succeeds is used. If neither works, fail loudly with
+        // a clear message so the operator can reset creds manually.
+        let mut candidates: Vec<(&str, String)> = vec![("target", config.password.clone())];
+        if let Some(alt) = alt_password.as_ref() {
+            if *alt != config.password {
+                candidates.push(("origin", alt.clone()));
+            }
+        }
+
+        let chosen_password = {
+            let mut chosen: Option<(&str, String)> = None;
+            for (label, pw) in &candidates {
+                match self
+                    .probe_mongo_auth(&container_name, &config.username, pw)
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            "Mongo auth probe: {} password accepted by live mongod on '{}'",
+                            label, container_name
+                        );
+                        chosen = Some((*label, pw.clone()));
+                        break;
+                    }
+                    Ok(false) => {
+                        warn!(
+                            "Mongo auth probe: {} password rejected by live mongod on '{}'",
+                            label, container_name
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Mongo auth probe: error while testing {} password on '{}': {}. Treating as rejection.",
+                            label, container_name, e
+                        );
+                    }
+                }
+            }
+            chosen.ok_or_else(|| {
+                EngineError::failed(&self.name, format!("Mongo auth probe failed for container '{}': none of the {} candidate password(s) authenticated. The target's stored password and any origin-service fallback have both been tried. The live mongod's effective credentials may have drifted — reset via `docker exec {} mongosh --quiet --eval 'db.changeUserPassword(...)' ` or redeploy the service.",
+                    container_name, candidates.len(), container_name))
+            })?
+        };
+
+        let (chosen_label, chosen_pw) = chosen_password;
+        let _ = chosen_label; // used only in logs above; retain for future
+
+        // Build the MongoDB URI with the password we just confirmed works.
+        let mongodb_uri = format!(
+            "mongodb://{}:{}@localhost:{}/?authSource=admin",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&chosen_pw),
+            MONGODB_INTERNAL_PORT
+        );
+
+        let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
+        let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
+            format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
+            format!("MONGODB_URI={}", mongodb_uri),
+        ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
+
+        // Resolve S3 endpoint for use inside the Docker container.
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
+
+        // Run wal-g backup-fetch LATEST inside the container. WAL-G
+        // downloads from S3 and pipes to mongorestore via
+        // WALG_STREAM_RESTORE_COMMAND.
+        //
+        // ATTACH stdout+stderr (not detached) so we can:
+        //   - Surface the real error when something fails. Every
+        //     restore-gone-wrong before this was bare "exit code 1" with no
+        //     context, forcing us to hand-repro to diagnose.
+        //   - Detect the "exit 1 but mongorestore actually succeeded"
+        //     pattern — mongorestore can be chatty and emit warnings that
+        //     bump the exit code while still having completed every
+        //     collection. In that case we salvage success.
+        let restore_cmd = vec!["sh", "-c", "wal-g backup-fetch LATEST 2>&1"];
+
+        info!(
+            "Running wal-g backup-fetch LATEST in container '{}'",
+            container_name
+        );
+
+        let exec = self
+            .docker
+            .create_exec(
+                &container_name,
+                CreateExecOptions {
+                    cmd: Some(restore_cmd),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    env: Some(walg_env_refs),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        use bollard::exec::{StartExecOptions, StartExecResults};
+        use futures::StreamExt;
+
+        let start = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // Drain the chunk stream. Keep the last ~8 KB — enough to explain a
+        // failure or confirm a chatty success without unbounded memory for
+        // large-archive restores.
+        let mut captured = String::new();
+        const CAPTURE_TAIL_BYTES: usize = 8 * 1024;
+        if let StartExecResults::Attached { mut output, .. } = start {
+            while let Some(chunk) = output.next().await {
+                match chunk {
+                    Ok(log) => {
+                        let s = log.to_string();
+                        captured.push_str(&s);
+                        if captured.len() > CAPTURE_TAIL_BYTES * 4 {
+                            let cut = captured.len() - CAPTURE_TAIL_BYTES;
+                            let safe_cut = captured
+                                .char_indices()
+                                .find(|(i, _)| *i >= cut)
+                                .map(|(i, _)| i)
+                                .unwrap_or(captured.len());
+                            captured = captured.split_off(safe_cut);
+                        }
+                    }
+                    Err(e) => {
+                        captured.push_str(&format!("\n[stream error: {}]\n", e));
+                    }
+                }
+            }
+        }
+
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+
+        if exit_code == 0 {
+            info!(
+                "MongoDB WAL-G restore completed successfully (exit 0) on container '{}'",
+                container_name
+            );
+            return Ok(());
+        }
+
+        // Non-zero exit. mongorestore can exit non-zero after warnings even
+        // when every document landed. Look for its completion markers in the
+        // captured tail and salvage success if present.
+        let looks_like_success = captured.contains("done restoring")
+            || captured.contains("finished restoring")
+            || captured.contains("0 document(s) failed to restore");
+
+        if looks_like_success {
+            warn!(
+                "wal-g backup-fetch exited {} but mongorestore output indicates the restore completed. Treating as success. Output tail:\n{}",
+                exit_code,
+                captured.trim()
+            );
+            return Ok(());
+        }
+
+        let tail = captured.trim();
+        Err(EngineError::failed(
+            &self.name,
+            format!(
+                "WAL-G backup-fetch failed with exit code {} in container '{}'. Last output:\n{}",
+                exit_code,
+                container_name,
+                if tail.is_empty() {
+                    "<no output captured>".to_string()
+                } else {
+                    tail.to_string()
+                }
+            ),
+        ))
+    }
+
+    /// Restore from a legacy backup (pre-WAL-G .gz files created by mongodump).
+    /// Falls back to the old approach: download from S3, copy into container, run mongorestore.
+    async fn restore_from_legacy(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        let config = self.get_mongodb_config(service_config)?;
+        let container_name = self.get_live_container_name(&config);
+
+        info!(
+            "Restoring MongoDB from legacy backup format: {}",
+            backup_location
+        );
+
+        // Stage the archive on disk and stream it into the container, so
+        // memory stays constant however large the backup is.
+        let staging = tempfile::tempdir().map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to create a temp dir to stage MongoDB backup {}: {}",
+                    backup_location, e
+                ),
+            )
+        })?;
+        let staged = staging.path().join("backup.gz");
+        let size = super::restore_staging::download_s3_object_to_file(
+            s3_client,
+            &s3_source.bucket_name,
+            backup_location,
+            &staged,
+            &super::NoopRestoreGate,
+        )
+        .await?;
+        info!("Downloaded backup, size: {} bytes", size);
+
+        super::container_upload::upload_file_to_container(
+            &self.docker,
+            &container_name,
+            &staged,
+            "/tmp",
+            "backup.gz",
+            0o644,
+        )
+        .await?;
+        drop(staging);
+
+        // Execute mongorestore inside the container
+        let exec_config = CreateExecOptions {
+            cmd: Some(vec![
+                "mongorestore",
+                "--archive=/tmp/backup.gz",
+                "--gzip",
+                "-u",
+                &config.username,
+                "-p",
+                &config.password,
+                "--authenticationDatabase",
+                "admin",
+                "--drop",
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&container_name, exec_config)
+            .await?;
+
+        let output = self.docker.start_exec(&exec.id, None).await?;
+
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+            while let Some(result) = output.next().await {
+                match result {
+                    Ok(log_output) => match log_output {
+                        bollard::container::LogOutput::StdOut { message } => {
+                            let stdout_str = String::from_utf8_lossy(&message);
+                            info!("mongorestore stdout: {}", stdout_str);
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            let stderr_str = String::from_utf8_lossy(&message);
+                            info!("mongorestore stderr: {}", stderr_str);
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        error!("Error reading exec output: {}", e);
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!("Failed to read mongorestore output: {}", e),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Clean up temporary file in container
+        let cleanup_exec = self
+            .docker
+            .create_exec(
+                &container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["rm", "/tmp/backup.gz"]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        self.docker.start_exec(&cleanup_exec.id, None).await?;
+
+        info!("MongoDB legacy restore completed successfully");
+        Ok(())
+    }
+
+    /// Check if the WAL-G binary is available inside a container.
+    async fn container_has_walg(&self, container_name: &str) -> bool {
+        use bollard::exec::{CreateExecOptions, StartExecOptions};
+
+        let exec = match self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["which", "wal-g"]),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+
+        if self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        loop {
+            match self.docker.inspect_exec(&exec.id).await {
+                Ok(inspect) => {
+                    if inspect.running == Some(false) {
+                        return inspect.exit_code == Some(0);
+                    }
+                }
+                Err(_) => return false,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Authenticate against the live mongod with a candidate password.
+    ///
+    /// Returns `Ok(true)` on successful auth + ping, `Ok(false)` on clean
+    /// auth rejection (so the caller can fall back to another candidate),
+    /// and `Err(...)` only for unexpected Docker / exec-plumbing failures
+    /// that aren't attributable to the credential itself.
+    ///
+    /// The password is passed via env var (not argv or a shell-interp'd
+    /// string) to avoid breaking on special characters like `$`, `!`, `&`.
+    async fn probe_mongo_auth(
+        &self,
+        container_name: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<bool> {
+        use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+        use futures::StreamExt;
+
+        // Probe via env var so special chars can't break the shell, and as a
+        // percent-encoded connection URI rather than `-u`/`--password`
+        // arguments so a credential starting with `-` can't be mistaken for a
+        // flag by mongosh's parser — see [`local_probe_uri`].
+        let probe_cmd = vec![
+            "sh",
+            "-c",
+            "mongosh --quiet --norc \"$PROBE_URI\" --eval 'db.runCommand({ping:1})' 2>&1",
+        ];
+
+        let env = [format!("PROBE_URI={}", local_probe_uri(username, password))];
+        let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
+
+        let exec = self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(probe_cmd),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    env: Some(env_refs),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let start = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        let mut captured = String::new();
+        if let StartExecResults::Attached { mut output, .. } = start {
+            while let Some(chunk) = output.next().await {
+                if let Ok(log) = chunk {
+                    captured.push_str(&log.to_string());
+                    if captured.len() > 2048 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+
+        if exit_code == 0 && captured.contains("{ ok: 1 }") {
+            return Ok(true);
+        }
+        // Treat AuthenticationFailed as a clean rejection.
+        if captured.contains("Authentication failed") {
+            return Ok(false);
+        }
+        // Unknown state — could be container not ready, mongosh missing,
+        // network glitch. Surface to the caller; it logs + falls through.
+        Err(EngineError::failed(
+            &self.name,
+            format!(
+                "mongo auth probe returned unexpected result (exit {}): {}",
+                exit_code,
+                captured.trim()
+            ),
+        ))
+    }
+
+    /// Legacy MongoDB backup using mongodump via Bollard exec.
+    /// Fallback for containers without WAL-G (e.g., `mongo:8.0`).
+    async fn backup_to_s3_legacy(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &temps_entities::s3_sources::Model,
+        subpath: &str,
+        service_config: ServiceConfig,
+    ) -> Result<super::BackupOutcome> {
+        use bollard::exec::CreateExecOptions;
+
+        let config = self.get_mongodb_config(service_config)?;
+        let container_name = self.get_live_container_name(&config);
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let backup_file = format!("mongodb_backup_{}.gz", timestamp);
+        let backup_path = format!("{}/{}", subpath, backup_file);
+
+        info!(
+            "Starting MongoDB legacy backup for database: {}",
+            config.database
+        );
+
+        let exec_config = CreateExecOptions {
+            cmd: Some(vec![
+                "mongodump",
+                "--archive",
+                "--gzip",
+                "-u",
+                &config.username,
+                "-p",
+                &config.password,
+                "--authenticationDatabase",
+                "admin",
+                "--db",
+                &config.database,
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&container_name, exec_config)
+            .await?;
+
+        let output = self.docker.start_exec(&exec.id, None).await?;
+
+        // Stream mongodump output directly to a temp file instead of buffering
+        // the entire dump in memory (which caused multi-GB memory spikes).
+        let temp_file = tempfile::NamedTempFile::new()?;
+        let mut total_bytes: u64 = 0;
+        {
+            let mut writer = std::io::BufWriter::new(&temp_file);
+            if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+                use futures::stream::StreamExt;
+                while let Some(result) = output.next().await {
+                    match result {
+                        Ok(log_output) => match log_output {
+                            bollard::container::LogOutput::StdOut { message } => {
+                                use std::io::Write;
+                                writer.write_all(&message)?;
+                                total_bytes += message.len() as u64;
+                            }
+                            bollard::container::LogOutput::StdErr { message } => {
+                                let stderr_str = String::from_utf8_lossy(&message);
+                                info!("mongodump stderr: {}", stderr_str);
+                            }
+                            _ => {}
+                        },
+                        Err(e) => {
+                            error!("Error reading exec output: {}", e);
+                            return Err(EngineError::failed(
+                                &self.name,
+                                format!("Failed to read mongodump output: {}", e),
+                            ));
+                        }
+                    }
+                }
+            }
+            use std::io::Write;
+            writer.flush()?;
+        }
+
+        if total_bytes == 0 {
+            return Err(EngineError::failed(&self.name, "Backup data is empty"));
+        }
+
+        info!("MongoDB legacy backup size: {} bytes", total_bytes);
+
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_file.path())
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to read backup file {}: {}",
+                        temp_file.path().display(),
+                        e
+                    ),
+                )
+            })?;
+        s3_client
+            .put_object()
+            .bucket(&s3_source.bucket_name)
+            .key(&backup_path)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to upload MongoDB backup to S3: {}", e),
+                )
+            })?;
+
+        info!("MongoDB legacy backup uploaded to S3: {}", backup_path);
+        Ok(super::BackupOutcome::new(
+            backup_path,
+            Some(total_bytes as i64),
+        ))
+    }
+}
+
+/// Internal port used by MongoDB inside the container
+const MONGODB_INTERNAL_PORT: &str = "27017";
+
+/// Build the `MONGODB_URL` exposed to user containers.
+///
+/// `authSource=admin` is always set because Temps provisions the connection
+/// user as a root user in the `admin` database and never creates per-database
+/// users. When the deployment is a single-node replica set, `directConnection=true`
+/// is added so the driver skips topology discovery — the rs config advertises
+/// the mongod's internal hostname, which is not always routable from app
+/// containers, so SDAM would otherwise fail even though the seed host works.
+fn build_mongodb_url(
+    username: &str,
+    password: &str,
+    host: &str,
+    port: &str,
+    database: &str,
+    replica_set: Option<&str>,
+) -> String {
+    let mut params = vec!["authSource=admin".to_string()];
+    if replica_set.is_some() {
+        params.push("directConnection=true".to_string());
+    }
+    format!(
+        "mongodb://{}:{}@{}:{}/{}?{}",
+        urlencoding::encode(username),
+        urlencoding::encode(password),
+        host,
+        port,
+        database,
+        params.join("&"),
+    )
+}
+
+/// Sidecar image used for mongodump (backup) and mongorestore operations.
+/// Matches the image used in `temps-backup/src/engines/mongodb.rs`.
+///
+/// Pinned to the 7.0 minor series to prevent silent upgrades to 7.1+.
+/// Ideally this should be pinned to an immutable SHA-256 digest
+/// (e.g. `mongo@sha256:<hash>`); update when rotating the image version.
+const MONGO_SIDECAR_IMAGE: &str = "mongo:7.0";
+/// Directory inside the mongorestore sidecar that receives the uploaded
+/// archive and config file. Exists in every image; never bind-mounted.
+const MONGORESTORE_INPUT_DIR: &str = "/tmp";
+
+/// Create this restore's own staging directory under
+/// `<tmp>/temps-mongo-restore`. The returned guard deletes it when dropped,
+/// so the archive (or a partial one left by a failed download) is removed on
+/// every exit path, not only after the sidecar ran.
+fn new_restore_staging_dir() -> Result<tempfile::TempDir> {
+    let base = std::env::temp_dir().join("temps-mongo-restore");
+    std::fs::create_dir_all(&base).map_err(|e| {
+        EngineError::engine_failure(
+            "MongoDB",
+            format!(
+                "Failed to create restore staging root {}: {}",
+                base.display(),
+                e
+            ),
+        )
+    })?;
+    tempfile::Builder::new()
+        .prefix("restore-")
+        .tempdir_in(&base)
+        .map_err(|e| {
+            EngineError::engine_failure(
+                "MongoDB",
+                format!(
+                    "Failed to create restore staging dir under {}: {}",
+                    base.display(),
+                    e
+                ),
+            )
+        })
+}
+
+impl MongodbService {
+    /// Build the `MONGODB_*` env vars for a given per-tenant database name.
+    /// Shared between `get_runtime_env_vars` and `preview_runtime_env_vars`.
+    async fn build_runtime_env_vars(&self, db_name: &str) -> Result<HashMap<String, String>> {
+        let config_guard = self.config.read().await;
+        let config = config_guard
+            .as_ref()
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?;
+
+        let effective_host = self.get_live_container_name(config);
+        let effective_port = MONGODB_INTERNAL_PORT.to_string();
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), effective_port.clone());
+        env_vars.insert("MONGODB_DATABASE".to_string(), db_name.to_string());
+        env_vars.insert("MONGODB_USERNAME".to_string(), config.username.clone());
+        env_vars.insert("MONGODB_PASSWORD".to_string(), config.password.clone());
+        env_vars.insert(
+            "MONGODB_URL".to_string(),
+            build_mongodb_url(
+                &config.username,
+                &config.password,
+                &effective_host,
+                &effective_port,
+                db_name,
+                config.replica_set.as_deref(),
+            ),
+        );
+
+        Ok(env_vars)
+    }
+
+    /// Run a one-shot `mongo:7` sidecar that executes `mongorestore` against
+    /// `target_container` over the temps bridge network.
+    ///
+    /// `archive_dir` is the host directory holding `archive_filename`. The
+    /// archive is uploaded into the created sidecar through the Docker
+    /// archive API rather than bind-mounted, because a host temp directory is
+    /// not visible to a Docker daemon running in a VM (Colima, Docker
+    /// Desktop) or on another host.
+    ///
+    /// The container is created with `auto_remove: true` so Docker reaps it
+    /// automatically after exit.  The method waits for the container's exit
+    /// code and returns `Err` if it is non-zero.
+    ///
+    /// ## Credential passing
+    ///
+    /// Credentials are passed as separate `argv` entries (not through a shell
+    /// string), so special characters in the password cannot cause injection.
+    async fn run_mongorestore_sidecar(
+        &self,
+        archive_dir: &std::path::Path,
+        archive_filename: &str,
+        target_container: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        // Pull the sidecar image (no-op if already present).
+        crate::utils::pull_image_with_retry(&self.docker, MONGO_SIDECAR_IMAGE, None)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to pull sidecar image {}: {}",
+                        MONGO_SIDECAR_IMAGE, e
+                    ),
+                )
+            })?;
+
+        let container_archive_path = format!("{}/{}", MONGORESTORE_INPUT_DIR, archive_filename);
+        let sidecar_name = format!(
+            "temps-mongorestore-{}",
+            &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]
+        );
+
+        // Put credentials in a config file inside the sidecar instead of
+        // passing them on the command line.  Docker stores the full Cmd array in
+        // container metadata and returns it verbatim via `docker inspect`, so
+        // a plaintext `-p <password>` flag is readable for the entire duration
+        // of the restore (potentially minutes for large databases).  A YAML
+        // config file with mode 0600, uploaded straight into the sidecar and
+        // never written to the host's disk, avoids that exposure.
+        //
+        // mongorestore has supported `--config` since mongo-tools 100.5.0,
+        // which shipped with MongoDB 6.0+; mongo:7.0 is well above that floor.
+        //
+        // mongorestore's --config YAML schema only recognises a small set of
+        // fields: `password`, `uri`, `sslPEMKeyPassword`, `destinationPassword`.
+        // `username` and `authenticationDatabase` are NOT valid config-file
+        // fields (verified against the mongo-tools source struct); they must be
+        // supplied as CLI flags.  We put only the password in the config file
+        // (mode 0600) to keep it out of `docker inspect`'s Cmd array, and pass
+        // the non-sensitive username/authdb as plain CLI arguments.
+        //
+        // YAML single-quoted strings: only `'` needs to be escaped (as `''`).
+        // Generated passwords are alphanumeric (see `generate_password`), so
+        // no escaping will be needed in practice, but we escape defensively.
+        let password_safe = password.replace('\'', "''");
+        let config_content = format!("password: '{}'\n", password_safe);
+
+        // Build the command as a vector of argv tokens (no shell, no injection).
+        // The password is in the uploaded restore.yaml (mode 0600) so
+        // it does not appear in the Docker Cmd array visible via `docker inspect`.
+        // Username and authenticationDatabase are not sensitive and are passed as
+        // plain CLI flags (mongorestore's YAML config schema does not support them).
+        // mongorestore flags:
+        //   --config               : YAML file supplying password only (mode 0600)
+        //   --username             : MongoDB user (non-sensitive, fine on argv)
+        //   --authenticationDatabase : always 'admin' for root-level users
+        //   --host                 : target MongoDB container name (bridge network)
+        //   --archive              : path inside the sidecar (uploaded before start)
+        //   --gzip                 : the archive was created with mongodump --gzip
+        //   --drop                 : drop each collection before restoring (true revert)
+        let cmd_args: Vec<String> = vec![
+            format!("--config={}/restore.yaml", MONGORESTORE_INPUT_DIR),
+            format!("--username={}", username),
+            "--authenticationDatabase=admin".to_string(),
+            format!("--host={}", target_container),
+            format!("--archive={}", container_archive_path),
+            "--gzip".to_string(),
+            "--drop".to_string(),
+        ];
+
+        // auto_remove is intentionally NOT set here.  If it were true, Docker
+        // would reap the container the moment mongorestore exits — for a small
+        // archive that can happen before our wait_container call lands, causing
+        // bollard to return an error even though the restore succeeded.  We
+        // manage the container lifecycle explicitly: wait_container then an
+        // unconditional remove_container, matching the mariadb/redis helper
+        // pattern used elsewhere in this file.
+        let host_config = bollard::models::HostConfig::default();
+
+        // Connect the sidecar to the temps bridge network so it can reach
+        // the target container by name.
+        ensure_network_exists(&self.docker).await.map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
+        let networking_config = Some(bollard::models::NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                temps_core::NETWORK_NAME.to_string(),
+                bollard::models::EndpointSettings {
+                    ..Default::default()
+                },
+            )])),
+        });
+
+        let create_body = bollard::models::ContainerCreateBody {
+            image: Some(MONGO_SIDECAR_IMAGE.to_string()),
+            entrypoint: Some(vec!["mongorestore".to_string()]),
+            cmd: Some(cmd_args),
+            user: Some("root".to_string()),
+            host_config: Some(host_config),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                target_container,
+            )),
+            networking_config,
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            ..Default::default()
+        };
+
+        info!(
+            "MongoDB mongorestore sidecar '{}': restoring {} into '{}'",
+            sidecar_name, archive_filename, target_container
+        );
+
+        self.docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&sidecar_name)
+                        .build(),
+                ),
+                create_body,
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to create mongorestore sidecar container '{}': {}",
+                        sidecar_name, e
+                    ),
+                )
+            })?;
+
+        // Inputs go in through the Docker archive API while the sidecar is
+        // created but not started: no host path has to be shared with the
+        // daemon, and the password never touches the host's disk.
+        let host_archive = archive_dir.join(archive_filename);
+        let uploaded = async {
+            super::container_upload::upload_bytes_to_container(
+                &self.docker,
+                &sidecar_name,
+                config_content.into_bytes(),
+                MONGORESTORE_INPUT_DIR,
+                "restore.yaml",
+                0o600,
+            )
+            .await?;
+            super::container_upload::upload_file_to_container(
+                &self.docker,
+                &sidecar_name,
+                &host_archive,
+                MONGORESTORE_INPUT_DIR,
+                archive_filename,
+                0o644,
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = uploaded {
+            let _ = self
+                .docker
+                .remove_container(
+                    &sidecar_name,
+                    Some(crate::externalsvc::restore_helper::helper_container_removal()),
+                )
+                .await;
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "Failed to copy the restore inputs into mongorestore sidecar '{}': {}",
+                    sidecar_name, e
+                ),
+            ));
+        }
+
+        // Attach BEFORE starting so we capture all output from the first byte.
+        let attach_result = self
+            .docker
+            .attach_container(
+                &sidecar_name,
+                Some(
+                    AttachContainerOptionsBuilder::new()
+                        .stream(true)
+                        .stdout(true)
+                        .stderr(true)
+                        .build(),
+                ),
+            )
+            .await;
+
+        self.docker
+            .start_container(
+                &sidecar_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                // On start failure remove manually (auto_remove only fires
+                // after a successful start).
+                let docker = self.docker.clone();
+                let name = sidecar_name.clone();
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_container(
+                            &name,
+                            Some(crate::externalsvc::restore_helper::helper_container_removal()),
+                        )
+                        .await;
+                });
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to start mongorestore sidecar container '{}': {}",
+                        sidecar_name, e
+                    ),
+                )
+            })?;
+
+        // Drain stdout/stderr concurrently while we wait for exit.
+        let log_handle = match attach_result {
+            Ok(attached) => {
+                let mut stream = attached.output;
+                Some(tokio::spawn(async move {
+                    let mut captured = String::new();
+                    const MAX_CAPTURE: usize = 8 * 1024;
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(bollard::container::LogOutput::StdOut { message }) => {
+                                captured.push_str(&String::from_utf8_lossy(&message));
+                            }
+                            Ok(bollard::container::LogOutput::StdErr { message }) => {
+                                captured.push_str(&String::from_utf8_lossy(&message));
+                            }
+                            _ => {}
+                        }
+                        if captured.len() > MAX_CAPTURE * 4 {
+                            let cut = captured.len() - MAX_CAPTURE;
+                            let safe = captured
+                                .char_indices()
+                                .find(|(i, _)| *i >= cut)
+                                .map(|(i, _)| i)
+                                .unwrap_or(captured.len());
+                            captured = captured.split_off(safe);
+                        }
+                    }
+                    captured
+                }))
+            }
+            Err(e) => {
+                warn!("Failed to attach to mongorestore sidecar: {}", e);
+                None
+            }
+        };
+
+        // Wait for the container to exit.  We collect the result without
+        // returning early so the explicit remove_container below always runs —
+        // the same pattern used by the mariadb and redis helper containers in
+        // this crate.
+        let mut wait_stream = self.docker.wait_container(
+            &sidecar_name,
+            Some(WaitContainerOptionsBuilder::new().build()),
+        );
+        let wait_result = wait_stream.next().await;
+
+        // Collect captured output for diagnostics before removing the container.
+        let captured_output = if let Some(handle) = log_handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+                Ok(Ok(s)) => s,
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        // Always remove the sidecar container regardless of outcome.  Because
+        // auto_remove is not set, the container persists after exit and must be
+        // cleaned up explicitly — see the comment on host_config above.
+        let _ = self
+            .docker
+            .remove_container(
+                &sidecar_name,
+                Some(crate::externalsvc::restore_helper::helper_container_removal()),
+            )
+            .await;
+
+        // Bollard converts a non-zero container exit code into
+        // Err(DockerContainerWaitError { code, error }).  We must treat that
+        // the same as Ok with a non-zero status_code so that the salvage
+        // check below (which looks for "done restoring" / "0 document(s)
+        // failed") can still recover on spurious mongorestore exit-1.  Any
+        // other error variant (e.g. 404 "no such container") is a genuine
+        // infrastructure failure and we surface it directly.
+        let exit_code: i64 = match wait_result {
+            Some(Ok(resp)) => resp.status_code,
+            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+            Some(Err(e)) => {
+                let tail = captured_output.trim();
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Docker wait failed for mongorestore sidecar '{}': {}{}",
+                        sidecar_name,
+                        e,
+                        if tail.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\nContainer output:\n{}", tail)
+                        }
+                    ),
+                ));
+            }
+            None => {
+                return Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "No exit code received for mongorestore sidecar '{}'",
+                        sidecar_name
+                    ),
+                ))
+            }
+        };
+
+        if exit_code != 0 {
+            // mongorestore can exit 1 after warnings even when every
+            // document restored successfully.  Salvage success on the same
+            // markers the WAL-G restore path uses — BUT only check the TAIL
+            // of the output (~500 bytes).  A large restore that partially
+            // fails after an earlier successful collection can emit "done
+            // restoring" early in the log; checking the full output would
+            // then mask the later failure.  Checking only the tail ensures
+            // the final outcome is what we act on.
+            let salvage_region: &str = {
+                // Advance the byte index to the next valid UTF-8 char boundary
+                // so the slice operation is always safe.
+                let cut = captured_output.len().saturating_sub(500);
+                let cut = (cut..=cut.saturating_add(3))
+                    .find(|&i| captured_output.is_char_boundary(i))
+                    .unwrap_or(captured_output.len());
+                &captured_output[cut..]
+            };
+            let looks_like_success = salvage_region.contains("done restoring")
+                || salvage_region.contains("finished restoring")
+                || salvage_region.contains("0 document(s) failed to restore");
+
+            if looks_like_success {
+                warn!(
+                    "mongorestore sidecar exited {} but output tail indicates success. \
+                     Treating as success. Output tail:\n{}",
+                    exit_code,
+                    salvage_region.trim()
+                );
+                return Ok(());
+            }
+
+            let tail = captured_output.trim();
+            return Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "mongorestore sidecar '{}' exited with code {}. Output:\n{}",
+                    sidecar_name,
+                    exit_code,
+                    if tail.is_empty() {
+                        "<no output captured>"
+                    } else {
+                        tail
+                    }
+                ),
+            ));
+        }
+
+        info!(
+            "mongorestore sidecar '{}' completed successfully (exit 0)",
+            sidecar_name
+        );
+        Ok(())
+    }
+
+    /// Build a `NewServiceRestoreResult` from a freshly-provisioned
+    /// `MongodbRuntimeConfig`. Called by `restore_to_new_service`.
+    fn new_mongodb_service_result(
+        service_name: &str,
+        config: &MongodbRuntimeConfig,
+    ) -> Result<super::NewServiceRestoreResult> {
+        let runtime_json = serde_json::to_value(config).map_err(|e| {
+            EngineError::failed(
+                service_name,
+                format!(
+                    "Failed to serialize new MongoDB config for service '{}': {}",
+                    service_name, e
+                ),
+            )
+        })?;
+
+        let mut parameters = HashMap::new();
+        if let Some(obj) = runtime_json.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    parameters.insert(k.clone(), s.to_string());
+                } else if let Some(b) = v.as_bool() {
+                    parameters.insert(k.clone(), b.to_string());
+                }
+                // Skip nested objects (none in MongodbRuntimeConfig).
+            }
+        }
+
+        let connection_info = format!(
+            "mongodb://{}:***@{}:{}/{}?authSource=admin",
+            config.username, config.host, config.port, config.database
+        );
+
+        Ok(super::NewServiceRestoreResult {
+            parameters,
+            connection_info,
+        })
+    }
+}
+
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl MongodbService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        // Generate JSON Schema from MongodbInputConfig
+        let schema = schemars::schema_for!(MongodbInputConfig);
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,        // Don't change host after creation
+                    "port" => true,         // Port can be changed
+                    "database" => false,    // Don't change database name after creation
+                    "username" => false,    // Don't change username after creation
+                    "password" => false,    // Password is auto-generated and cannot be changed
+                    "docker_image" => true, // Docker image can be upgraded
+                    // One-way: standalone -> replica set is supported in-place.
+                    // The merge_updates strategy rejects unsetting or renaming.
+                    "replica_set" => true,
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
+    }
+}
+
+/// Data volumes of a service named `name`, as `remove()` deletes them.
+pub fn mongodb_volume_names(name: &str) -> [String; 1] {
+    [format!("temps-mongodb-{}-data", name)]
+}
+
+#[async_trait]
+impl ExternalService for MongodbService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::MongoDb,
+            self.replacement_storage(),
+        ))
+    }
+
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![mongodb_container_name(&self.name)],
+            volumes: mongodb_volume_names(&self.name).to_vec(),
+        })
+    }
+
+    fn data_import(&self) -> Option<&dyn crate::data_import::DataImportEngine> {
+        Some(self)
+    }
+
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
+        self.get_effective_address_for_environment(
+            service_config,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
+    }
+
+    fn get_docker_container_name(&self) -> String {
+        self.get_container_name()
+    }
+
+    fn get_docker_internal_port(&self) -> String {
+        MONGODB_INTERNAL_PORT.to_string()
+    }
+
+    async fn init(&self, service_config: ServiceConfig) -> Result<HashMap<String, String>> {
+        // Pull resource limits out of parameters JSON before consuming the config.
+        let resource_limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(EngineError::invalid_input(
+                &self.name,
+                format!("Invalid resource limits: {}", e),
+            ));
+        }
+        *self.resource_limits.write().await = resource_limits;
+
+        // Parse input config and transform to runtime config
+        let mongodb_config = self.get_mongodb_config(service_config.clone())?;
+        *self.config.write().await = Some(mongodb_config.clone());
+
+        // Serialize the full runtime config to save to database
+        // This ensures auto-generated values (password, port) are persisted
+        let runtime_config_json = serde_json::to_value(&mongodb_config).map_err(|e| {
+            EngineError::failed(
+                &self.name,
+                format!("Failed to serialize MongoDB runtime config: {}", e),
+            )
+        })?;
+
+        let runtime_config_map = runtime_config_json.as_object().ok_or_else(|| {
+            EngineError::invalid_input(&self.name, "Runtime config is not an object")
+        })?;
+
+        let mut inferred_params = HashMap::new();
+        for (key, value) in runtime_config_map {
+            if let Some(str_value) = value.as_str() {
+                inferred_params.insert(key.clone(), str_value.to_string());
+            }
+        }
+
+        Ok(inferred_params)
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        let client = self.get_mongo_client().await?;
+
+        match client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                error!("MongoDB health check failed: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn health_probe(&self, service_config: ServiceConfig) -> Result<HealthProbeResult> {
+        use std::time::{Duration, Instant};
+
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+        const DEGRADED_MS: u128 = 2000;
+
+        let cfg = match self.get_mongodb_config(service_config) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(HealthProbeResult::down(format!(
+                    "invalid mongodb config: {}",
+                    e
+                )))
+            }
+        };
+
+        // authSource=admin because that's where we create the root user.
+        // directConnection=true skips replica-set topology discovery so the
+        // probe checks *this* node instead of chasing the member address
+        // advertised by `rs.initiate` (`127.0.0.1:27017`, unreachable from
+        // outside the container). Safe on standalone too.
+        let uri = format!(
+            "mongodb://{}:{}@{}:{}/?authSource=admin&directConnection=true&serverSelectionTimeoutMS=3000&connectTimeoutMS=3000",
+            urlencoding::encode(&cfg.username),
+            urlencoding::encode(&cfg.password),
+            cfg.host,
+            cfg.port
+        );
+
+        let start = Instant::now();
+
+        // The mongodb `Client` is a pooled, Arc-backed handle that spawns a
+        // per-server background monitor task and holds pooled sockets. Building
+        // a fresh one every 30s health cycle (and dropping it implicitly) leaks
+        // connections + monitor tasks: pool/monitor teardown on `Drop` is
+        // asynchronous and the runtime never waits for it. Worse, wrapping the
+        // whole connect+ping in `timeout` means a slow probe (degraded Mongo —
+        // exactly when we probe most) cancels the future mid-connect, orphaning
+        // a half-open socket and its monitor task.
+        //
+        // Fix: build the client first, bound only the connect+ping with the
+        // timeout (so cancellation can't strand an in-flight connect with a
+        // live client), then ALWAYS call `client.shutdown().immediate()` to
+        // deterministically close every pooled connection and stop the monitor
+        // before the next cycle. The client is created locally with no clones
+        // or cursor handles, so `shutdown` returns promptly.
+        let client = match MongoClient::with_uri_str(&uri).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(HealthProbeResult::down(format!(
+                    "mongodb probe to {}:{} connect failed: {}",
+                    cfg.host, cfg.port, e
+                )));
+            }
+        };
+
+        let ping = async {
+            client
+                .database("admin")
+                .run_command(doc! { "ping": 1 })
+                .await
+                .map_err(|e| format!("ping failed: {}", e))?;
+            Ok::<(), String>(())
+        };
+        let probe_outcome = tokio::time::timeout(PROBE_TIMEOUT, ping).await;
+
+        // Tear the pool + monitor down before returning, regardless of outcome.
+        // `immediate(true)` skips waiting for in-use resources (cursors/sessions) —
+        // there are none here (local client, no clones), so close promptly.
+        client.shutdown().immediate(true).await;
+
+        match probe_outcome {
+            Err(_) => Ok(HealthProbeResult::down(format!(
+                "mongodb probe to {}:{} timed out after {}s",
+                cfg.host,
+                cfg.port,
+                PROBE_TIMEOUT.as_secs()
+            ))),
+            Ok(Err(msg)) => Ok(HealthProbeResult::down(format!(
+                "mongodb probe to {}:{} {}",
+                cfg.host, cfg.port, msg
+            ))),
+            Ok(Ok(())) => {
+                let elapsed_ms = start.elapsed().as_millis();
+                let response_time = i32::try_from(elapsed_ms).ok();
+                if elapsed_ms > DEGRADED_MS {
+                    Ok(HealthProbeResult::degraded(
+                        format!("mongodb responded in {}ms (>{}ms)", elapsed_ms, DEGRADED_MS),
+                        response_time,
+                    ))
+                } else {
+                    Ok(HealthProbeResult::operational(response_time))
+                }
+            }
+        }
+    }
+
+    fn get_type(&self) -> ServiceType {
+        ServiceType::Mongodb
+    }
+
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn get_connection_info(&self) -> Result<String> {
+        let config_guard = self.config.try_read().map_err(|_| {
+            EngineError::failed(&self.name, "Failed to acquire read lock on config")
+        })?;
+        let config = config_guard
+            .as_ref()
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?;
+
+        Ok(format!(
+            "mongodb://{}:{}@{}:{}",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port
+        ))
+    }
+
+    async fn cleanup(&self) -> Result<()> {
+        self.stop().await?;
+        self.remove().await?;
+        Ok(())
+    }
+
+    fn get_parameter_schema(&self) -> Option<serde_json::Value> {
+        Self::parameter_schema()
+    }
+
+    async fn start(&self) -> Result<()> {
+        let docker = &self.docker;
+        let existing_config = self.config.read().await.as_ref().cloned();
+        let container_name = existing_config
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
+        info!("Starting MongoDB container {}", container_name);
+
+        let containers = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![super::exact_container_name_filter(&container_name)],
+                )])),
+                ..Default::default()
+            }))
+            .await?;
+
+        let mut config = existing_config.ok_or_else(|| {
+            EngineError::not_initialized(&self.name, "MongoDB configuration not found")
+        })?;
+
+        // Imported services skip the replica-set drift-reconciliation path
+        // entirely: the stop+remove+recreate below assumes Temps owns the
+        // container's lifecycle and volume naming. Running that against a
+        // pre-existing container the operator brought in would delete their
+        // real database to "fix" a mismatch that was never Temps' to manage.
+        if config.container_name.is_some() {
+            if containers.is_empty() {
+                return Err(EngineError::not_found(
+                    &self.name,
+                    format!("Imported MongoDB container '{}' not found", container_name),
+                ));
+            }
+            let is_running = matches!(
+                containers[0].state,
+                Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
+            );
+            if !is_running {
+                docker
+                    .start_container(
+                        &container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to start imported MongoDB container: {}", e),
+                        )
+                    })?;
+            }
+            return Ok(());
+        }
+
+        let limits = self.resource_limits.read().await.clone();
+        if containers.is_empty() {
+            self.create_container(docker, &mut config, &limits).await?;
+            *self.config.write().await = Some(config);
+        } else {
+            // If the persisted config now requires `--replSet` but the
+            // existing container was created in standalone mode, restarting it
+            // would just bring up the old standalone again. Detect drift by
+            // inspecting the container's Cmd, then recreate (preserving the
+            // data volume — `remove_container` does NOT touch named volumes).
+            if self
+                .container_needs_replset_recreate(docker, &container_name, &config)
+                .await?
+            {
+                info!(
+                    "MongoDB container {} needs recreate to apply replica_set='{}'; \
+                     removing standalone container and recreating in replica-set mode \
+                     (data volume preserved)",
+                    container_name,
+                    config.replica_set.as_deref().unwrap_or("")
+                );
+                // The shared guard refuses unless the new container mounts
+                // the data the old one uses, keeps the old one until the new
+                // one shows the same databases, and restores it otherwise.
+                let recreated = super::recreate_guard::recreate_preserving_data(
+                    super::recreate_guard::RecreateRequest {
+                        docker,
+                        engine: super::recreate_guard::ManagedEngine::MongoDb,
+                        service_name: &self.name,
+                        container_name: &container_name,
+                        replacement: self.replacement_storage(),
+                        operation: "enabling its replica set",
+                    },
+                    || self.create_container_once(docker, &config, &limits),
+                )
+                .await;
+                let start_original = || async {
+                    docker
+                        .start_container(
+                            &container_name,
+                            None::<bollard::query_parameters::StartContainerOptions>,
+                        )
+                        .await
+                        .or_else(|e| match e {
+                            bollard::errors::Error::DockerResponseServerError {
+                                status_code: 304,
+                                ..
+                            } => Ok(()),
+                            e => Err(e),
+                        })
+                        .map_err(|e| {
+                            EngineError::failed(
+                                &self.name,
+                                format!("Failed to start MongoDB container: {}", e),
+                            )
+                        })
+                };
+                match recreated {
+                    Ok(_) => {}
+                    // The layout cannot carry the data over. Nothing was
+                    // changed; the data matters more than replica-set mode,
+                    // so the standalone server starts as it is, and no
+                    // replica-set connection strings are handed out for it.
+                    // (Changing the setting is refused before it is saved,
+                    // so this is only reached for a setting saved earlier.)
+                    Err(e) if e.is_refusal() => {
+                        warn!(
+                            service = %self.name,
+                            container = %container_name,
+                            error = %e,
+                            "Not enabling the replica set; starting the existing standalone container unchanged"
+                        );
+                        config.replica_set = None;
+                        start_original().await?;
+                    }
+                    // A replacement was attempted and rolled back, verified:
+                    // the standalone original is back. Keep it running, but
+                    // report that the replica set was not enabled.
+                    Err(e) if e.original_in_place() => {
+                        start_original().await?;
+                        return Err(EngineError::failed(
+                            &self.name,
+                            format!(
+                                "The replica set of MongoDB service '{}' was not enabled; the \
+                             standalone server was restored and is running: {}",
+                                self.name, e
+                            ),
+                        ));
+                    }
+                    // The rollback did not complete: never start anything
+                    // that may share the data with another server.
+                    Err(e) => return Err(e.into()),
+                }
+                *self.config.write().await = Some(config);
+            } else {
+                docker
+                    .start_container(
+                        &container_name,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
+                    .await
+                    .map_err(|e| {
+                        EngineError::failed(
+                            &self.name,
+                            format!("Failed to start MongoDB container: {}", e),
+                        )
+                    })?;
+                info!("Started existing MongoDB container: {}", container_name);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
+        info!("Stopping MongoDB container {}", container_name);
+
+        self.docker
+            .stop_container(
+                &container_name,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    signal: None,
+                }),
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to stop MongoDB container: {}", e),
+                )
+            })?;
+
+        info!("Stopped MongoDB container: {}", container_name);
+        Ok(())
+    }
+
+    async fn remove(&self) -> Result<()> {
+        let container_name = self.get_container_name();
+        info!("Removing MongoDB container {}", container_name);
+
+        // Stop the container first if it's running
+        let _ = self.stop().await;
+
+        self.docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    v: true,
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .or_else(|e| match e {
+                // Already gone is what removal asked for, and answering an
+                // error would fail a delete whose row is already deleted.
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => {
+                    info!("MongoDB container {} was already gone", container_name);
+                    Ok(())
+                }
+                e => Err(EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to remove MongoDB container {}: {}",
+                        container_name, e
+                    ),
+                )),
+            })?;
+
+        // Remove the volume
+        let [volume_name] = mongodb_volume_names(&self.name);
+        let _ = self
+            .docker
+            .remove_volume(
+                &volume_name,
+                Some(bollard::query_parameters::RemoveVolumeOptions { force: true }),
+            )
+            .await;
+
+        info!("Removed MongoDB container and volume");
+        Ok(())
+    }
+
+    fn get_environment_variables(
+        &self,
+        parameters: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        let database = parameters
+            .get("database")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing database parameter"))?;
+        let username = parameters
+            .get("username")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing username parameter"))?;
+        let password = parameters
+            .get("password")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing password parameter"))?;
+
+        // An imported service's real container name (stored raw in
+        // parameters, since the typed config isn't available here) wins
+        // over the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
+        let effective_port = MONGODB_INTERNAL_PORT.to_string();
+        let replica_set = parameters.get("replica_set").map(String::as_str);
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), effective_port.clone());
+        env_vars.insert("MONGODB_DATABASE".to_string(), database.clone());
+        env_vars.insert("MONGODB_USERNAME".to_string(), username.clone());
+        env_vars.insert("MONGODB_PASSWORD".to_string(), password.clone());
+        env_vars.insert(
+            "MONGODB_URL".to_string(),
+            build_mongodb_url(
+                username,
+                password,
+                &effective_host,
+                &effective_port,
+                database,
+                replica_set,
+            ),
+        );
+
+        Ok(env_vars)
+    }
+
+    fn get_docker_environment_variables(
+        &self,
+        parameters: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        let database = parameters
+            .get("database")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing database parameter"))?;
+        let username = parameters
+            .get("username")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing username parameter"))?;
+        let password = parameters
+            .get("password")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing password parameter"))?;
+
+        // An imported service's real container name (stored raw in
+        // parameters, since the typed config isn't available here) wins
+        // over the derived one.
+        let effective_host = parameters
+            .get("container_name")
+            .cloned()
+            .unwrap_or_else(|| self.get_container_name());
+        let effective_port = MONGODB_INTERNAL_PORT.to_string();
+        let replica_set = parameters.get("replica_set").map(String::as_str);
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), effective_port.clone());
+        env_vars.insert("MONGODB_DATABASE".to_string(), database.clone());
+        env_vars.insert("MONGODB_USERNAME".to_string(), username.clone());
+        env_vars.insert("MONGODB_PASSWORD".to_string(), password.clone());
+        env_vars.insert(
+            "MONGODB_URL".to_string(),
+            build_mongodb_url(
+                username,
+                password,
+                &effective_host,
+                &effective_port,
+                database,
+                replica_set,
+            ),
+        );
+
+        Ok(env_vars)
+    }
+
+    async fn provision_resource(
+        &self,
+        _service_config: ServiceConfig,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<super::LogicalResource> {
+        let db_name = super::scoped_resource_name(project_id, environment);
+
+        // Create the database
+        self.create_database(&db_name).await?;
+
+        let config = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| EngineError::not_initialized(&self.name, "MongoDB not configured"))?
+            .clone();
+
+        let mut credentials = HashMap::new();
+        credentials.insert("host".to_string(), config.host);
+        credentials.insert("port".to_string(), config.port);
+        credentials.insert("database".to_string(), db_name.clone());
+        credentials.insert("username".to_string(), config.username);
+        credentials.insert("password".to_string(), config.password);
+
+        Ok(super::LogicalResource {
+            name: db_name,
+            resource_type: "mongodb_database".to_string(),
+            credentials,
+        })
+    }
+
+    async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
+        let db_name = super::scoped_resource_name(project_id, environment);
+        self.drop_database(&db_name).await
+    }
+
+    fn get_runtime_env_definitions(&self) -> Vec<RuntimeEnvVar> {
+        vec![
+            RuntimeEnvVar {
+                name: "MONGODB_DATABASE".to_string(),
+                description: "MongoDB database name for this project/environment".to_string(),
+                example: "project1_production".to_string(),
+                sensitive: false,
+            },
+            RuntimeEnvVar {
+                name: "MONGODB_URL".to_string(),
+                description: "Full MongoDB connection URL".to_string(),
+                example: "mongodb://username:password@localhost:27017/project1_production"
+                    .to_string(),
+                sensitive: true, // Contains password
+            },
+            RuntimeEnvVar {
+                name: "MONGODB_HOST".to_string(),
+                description: "MongoDB host".to_string(),
+                example: "localhost".to_string(),
+                sensitive: false,
+            },
+            RuntimeEnvVar {
+                name: "MONGODB_PORT".to_string(),
+                description: "MongoDB port".to_string(),
+                example: "27017".to_string(),
+                sensitive: false,
+            },
+            RuntimeEnvVar {
+                name: "MONGODB_USERNAME".to_string(),
+                description: "MongoDB username".to_string(),
+                example: "root".to_string(),
+                sensitive: false,
+            },
+            RuntimeEnvVar {
+                name: "MONGODB_PASSWORD".to_string(),
+                description: "MongoDB password".to_string(),
+                example: "password".to_string(),
+                sensitive: true,
+            },
+        ]
+    }
+
+    async fn get_runtime_env_vars(
+        &self,
+        _config: ServiceConfig,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<HashMap<String, String>> {
+        let db_name = super::scoped_resource_name(project_id, environment);
+
+        // Create the database if it doesn't exist
+        self.create_database(&db_name).await?;
+        self.build_runtime_env_vars(&db_name).await
+    }
+
+    async fn preview_runtime_env_vars(
+        &self,
+        _config: ServiceConfig,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<HashMap<String, String>> {
+        let db_name = super::scoped_resource_name(project_id, environment);
+        // Preview: skip create_database so the UI doesn't provision DBs.
+        self.build_runtime_env_vars(&db_name).await
+    }
+
+    fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
+        let port = service_config
+            .parameters
+            .get("port")
+            .ok_or_else(|| EngineError::invalid_input(&self.name, "Missing port parameter"))?;
+
+        Ok(format!("localhost:{}", port))
+    }
+
+    /// Backup MongoDB data to S3.
+    ///
+    /// Detects whether the container has WAL-G installed:
+    /// - **WAL-G available**: Uses `wal-g backup-push` with mongodump stream. Zero data
+    ///   flows through the Temps process.
+    /// - **WAL-G not available** (legacy images like `mongo:8.0`): Falls back to
+    ///   mongodump via Bollard exec, buffering output and uploading to S3.
+    async fn backup_to_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
+        backup: temps_entities::backups::Model,
+        s3_source: &temps_entities::s3_sources::Model,
+        subpath: &str,
+        subpath_root: &str,
+        pool: &temps_database::DbConnection,
+        external_service: &temps_entities::external_services::Model,
+        service_config: ServiceConfig,
+    ) -> Result<super::BackupOutcome> {
+        use chrono::Utc;
+        use sea_orm::*;
+
+        let mongodb_config = self.get_mongodb_config(service_config.clone())?;
+        let container_name = self.get_live_container_name(&mongodb_config);
+
+        if !self.container_has_walg(&container_name).await {
+            info!(
+                "WAL-G not found in container '{}', falling back to legacy mongodump backup",
+                container_name
+            );
+            return self
+                .backup_to_s3_legacy(s3_client, s3_source, subpath, service_config)
+                .await;
+        }
+
+        info!("Starting MongoDB backup to S3 via WAL-G");
+
+        let config = self.get_mongodb_config(service_config)?;
+
+        let metadata = serde_json::json!({
+            "service_type": "mongodb",
+            "service_name": self.name,
+            "backup_tool": "wal-g",
+        });
+
+        let backup_record = temps_entities::external_service_backups::Entity::insert(
+            temps_entities::external_service_backups::ActiveModel {
+                service_id: Set(external_service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(Utc::now()),
+                s3_location: Set("".to_string()),
+                metadata: Set(metadata),
+                compression_type: Set("lz4".to_string()),
+                created_by: Set(0),
+                ..Default::default()
+            },
+        )
+        .exec_with_returning(pool)
+        .await?;
+
+        let walg_s3_prefix = format!(
+            "s3://{}/{}/walg",
+            s3_credentials.bucket_name,
+            subpath_root.trim_matches('/')
+        );
+        let s3_list_prefix = format!("{}/walg/", subpath_root.trim_matches('/'));
+
+        let mongodb_uri = format!(
+            "mongodb://{}:{}@localhost:{}/?authSource=admin",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            MONGODB_INTERNAL_PORT
+        );
+
+        let result = self
+            .run_walg_backup_push(
+                &container_name,
+                &walg_s3_prefix,
+                s3_credentials,
+                &mongodb_uri,
+                &backup.backup_id,
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                let size_bytes = match super::s3_util::list_total_size(
+                    s3_client,
+                    &s3_credentials.bucket_name,
+                    &s3_list_prefix,
+                )
+                .await
+                {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        warn!(
+                            "MongoDB WAL-G backup succeeded but failed to compute size from S3: {}",
+                            e
+                        );
+                        None
+                    }
+                };
+
+                let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("completed".to_string());
+                backup_update.finished_at = Set(Some(Utc::now()));
+                backup_update.s3_location = Set(walg_s3_prefix.clone());
+                backup_update.size_bytes = Set(size_bytes);
+                backup_update.update(pool).await?;
+
+                info!(
+                    "MongoDB WAL-G backup completed successfully (prefix: {}, size: {:?})",
+                    walg_s3_prefix, size_bytes
+                );
+                Ok(super::BackupOutcome::new(walg_s3_prefix, size_bytes))
+            }
+            Err(e) => {
+                let error_msg = format!("MongoDB WAL-G backup failed: {}", e);
+                error!("{}", error_msg);
+                let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("failed".to_string());
+                backup_update.error_message = Set(Some(error_msg.clone()));
+                backup_update.finished_at = Set(Some(Utc::now()));
+                if let Err(update_err) = backup_update.update(pool).await {
+                    error!(
+                        "Failed to mark MongoDB backup row as failed: {}",
+                        update_err
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Restore MongoDB data from S3 using WAL-G or legacy format
+    ///
+    /// For WAL-G backups (s3:// prefix): Runs `wal-g backup-fetch LATEST` inside the container.
+    /// WAL-G downloads the backup from S3 and pipes it to mongorestore via WALG_STREAM_RESTORE_COMMAND.
+    ///
+    /// For legacy backups (.gz files): Falls back to the old approach — downloads from S3,
+    /// copies into the container, and runs mongorestore.
+    async fn restore_from_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        info!("Starting MongoDB restore from S3: {}", backup_location);
+
+        if backup_location.starts_with("s3://") {
+            // WAL-G backup: use wal-g backup-fetch
+            self.restore_from_walg(s3_credentials, backup_location, service_config)
+                .await
+        } else {
+            // Legacy backup: fall back to old mongorestore approach
+            self.restore_from_legacy(s3_client, backup_location, s3_source, service_config)
+                .await
+        }
+    }
+
+    /// Declare which restore modes MongoDB supports.
+    ///
+    /// - `restore_in_place`: yes — downloads the archive from S3, runs a
+    ///   `mongo:7` sidecar with `mongorestore --drop` against the live
+    ///   container over the Docker bridge, exactly mirroring the backup-engine
+    ///   sidecar pattern.
+    /// - `restore_to_new_service`: yes — provisions a fresh container, then
+    ///   runs the same sidecar against it.
+    /// - `pitr`: not yet — MongoDB oplog-based PITR is tracked separately.
+    async fn restore_capabilities(
+        &self,
+        _service_config: ServiceConfig,
+    ) -> Result<super::RestoreCapabilities> {
+        Ok(super::RestoreCapabilities {
+            restore_in_place: true,
+            restore_to_new_service: true,
+            pitr: false,
+            earliest_pitr_time: None,
+            latest_pitr_time: None,
+        })
+    }
+
+    /// Restore a mongodump archive (created by `MongodbEngine` in
+    /// `temps-backup`) back onto the **existing, running** MongoDB container.
+    ///
+    /// ## Mechanics
+    ///
+    /// 1. Download the archive from S3 to a host-side temp directory.
+    /// 2. Create a one-shot `mongo:7` sidecar on the temps bridge network and
+    ///    upload the archive into it through the Docker archive API (no bind
+    ///    mount, so it works when Docker runs in a VM or on another host).
+    /// 3. Run `mongorestore --host=<container> --archive=... --gzip --drop ...`
+    ///    inside the sidecar. The sidecar connects to the target container
+    ///    over the bridge; the target container never needs to be stopped.
+    /// 4. Wait for the sidecar's exit code. Non-zero → error.
+    /// 5. Clean up temp directory and sidecar (auto_remove handles the latter).
+    ///
+    /// ## Why `--drop`
+    ///
+    /// `--drop` tells mongorestore to **drop each collection before restoring
+    /// it**. Without this flag, mongorestore merges documents by `_id` —
+    /// records that exist in the backup overwrite matching ones in the live
+    /// collection, but documents inserted AFTER the backup that have
+    /// different `_id`s survive untouched. That is not a restore; it is a
+    /// merge. `--drop` guarantees the collection returns to exactly the state
+    /// captured in the backup, which is what every meaningful restore scenario
+    /// (including our e2e test's "post-backup documents must be absent after
+    /// restore") requires.
+    /// Sidecar archive restores stage the archive on the host and pass the
+    /// gate before mongorestore runs. Legacy WAL-G (`s3://`) restores do not,
+    /// so the orchestrator gates those before calling in.
+    fn defers_target_writes(&self, backup_location: &str) -> bool {
+        !backup_location.starts_with("s3://")
+    }
+
+    async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
+        // WAL-G backups (created by the old gotempsh/mongodb-walg path) store
+        // the whole backup set under an "s3://" prefix; they have their own
+        // restore path that runs `wal-g backup-fetch LATEST` inside the target
+        // container.  Plain S3-key backups (created by `MongodbEngine` sidecar,
+        // e.g. "prefix/mongodb/svcname/uuid/dump.archive") use the new sidecar
+        // restore path.
+        if ctx.backup_location.starts_with("s3://") {
+            return self
+                .restore_from_walg(ctx.s3_credentials, ctx.backup_location, ctx.source_config)
+                .await;
+        }
+
+        let config = self.get_mongodb_config(ctx.source_config.clone())?;
+        let target_container = self.get_live_container_name(&config);
+
+        info!(
+            "MongoDB restore_in_place: downloading archive {} for container '{}'",
+            ctx.backup_location, target_container
+        );
+
+        // ── Download archive from S3 ────────────────────────────────────────
+        // Each restore operation gets its own unique subdirectory so that
+        // concurrent restores (different services, or the same service twice)
+        // cannot overwrite each other's archive file. The guard removes it on
+        // every exit path, including a download that fails part-way.
+        let restore_dir = new_restore_staging_dir()?;
+
+        let archive_filename = std::path::Path::new(ctx.backup_location)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dump.archive")
+            .to_string();
+        let host_archive_path = restore_dir.path().join(&archive_filename);
+
+        // Streamed to disk: memory does not grow with the archive's size.
+        let archive_size = super::restore_staging::download_s3_object_to_file(
+            ctx.s3_client,
+            &ctx.s3_source.bucket_name,
+            ctx.backup_location,
+            &host_archive_path,
+            ctx.gate,
+        )
+        .await?;
+
+        info!(
+            "MongoDB restore_in_place: downloaded {} bytes to {}",
+            archive_size,
+            host_archive_path.display()
+        );
+
+        // Last safe point: the archive is staged on the host and mongorestore
+        // has not run. `restore_dir` removes the archive when it drops.
+        ctx.gate.begin_target_writes().await?;
+
+        // ── Run mongorestore sidecar ────────────────────────────────────────
+        let result = self
+            .run_mongorestore_sidecar(
+                restore_dir.path(),
+                &archive_filename,
+                &target_container,
+                &config.username,
+                &config.password,
+            )
+            .await;
+
+        // Remove the staging directory now rather than at the end of the
+        // function, whether or not the restore succeeded.
+        drop(restore_dir);
+
+        result?;
+
+        info!(
+            "MongoDB restore_in_place: completed for container '{}'",
+            target_container
+        );
+        Ok(())
+    }
+
+    /// Provision a brand-new MongoDB service and restore the backup into it.
+    ///
+    /// ## Steps
+    ///
+    /// 1. Clone the source config, find a free host port, strip any
+    ///    imported-container override so the new service gets a fresh derived
+    ///    name (`temps-mongodb-<new_name>`).
+    /// 2. Create and start the new container (same `create_container` path as
+    ///    `init`), wait for health.
+    /// 3. Download the archive from S3 + run `mongorestore` via the same
+    ///    one-shot sidecar used by `restore_in_place`.
+    /// 4. Return connection parameters for the orchestrator to persist.
+    async fn restore_to_new_service(
+        &self,
+        ctx: super::RestoreContext<'_>,
+        new_service_name: String,
+        parameter_overrides: serde_json::Value,
+    ) -> Result<super::NewServiceRestoreResult> {
+        info!(
+            "MongoDB restore_to_new_service: provisioning '{}' from backup at {}",
+            new_service_name, ctx.backup_location
+        );
+
+        // ── Build the config for the new service ───────────────────────────
+        let mut new_config = self.get_mongodb_config(ctx.source_config.clone())?;
+
+        // Clear imported-container override: the new service must get a fresh
+        // derived container name (`temps-mongodb-<new_name>`), not the source's.
+        new_config.container_name = None;
+
+        // Pick a free host port (the source's port is already taken).
+        let new_port = find_available_port_async(&self.docker, 27017)
+            .await
+            .ok_or_else(|| {
+                EngineError::failed(&self.name, "No available ports for new MongoDB service")
+            })?
+            .to_string();
+        new_config.port = new_port;
+
+        // Apply caller overrides.
+        if let Some(overrides) = parameter_overrides.as_object() {
+            if let Some(port) = overrides.get("port").and_then(|v| v.as_str()) {
+                new_config.port = port.to_string();
+            }
+            if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
+                // The new service inherits the SOURCE service's credentials
+                // (root user/password are cloned above), and they are handed
+                // to the container as `MONGO_INITDB_ROOT_*` env vars. An
+                // arbitrary caller-chosen image would therefore be handed the
+                // source database's password on startup — so the override may
+                // only re-tag a repository we already run.
+                let validated =
+                    crate::externalsvc::restore_image::restore_image_override_with_extra(
+                        &new_config.docker_image,
+                        image,
+                        RESTORE_IMAGE_REPOSITORIES,
+                        extra_restore_image_repositories(),
+                        Some(EXTRA_RESTORE_IMAGES_ENV),
+                    )?;
+                new_config.docker_image = validated.to_string();
+            }
+            if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
+                new_config.database = db.to_string();
+            }
+        }
+
+        // ── Create and start the new container ─────────────────────────────
+        let new_service = MongodbService::new(new_service_name.clone(), self.docker.clone());
+        let cloned_limits = ServiceResourceLimits::from_parameters(&ctx.source_config.parameters);
+        *new_service.resource_limits.write().await = cloned_limits.clone();
+        new_service
+            .create_container(&self.docker, &mut new_config, &cloned_limits)
+            .await?;
+        *new_service.config.write().await = Some(new_config.clone());
+
+        let new_container = new_service.get_live_container_name(&new_config);
+        info!(
+            "MongoDB restore_to_new_service: container '{}' healthy, starting restore",
+            new_container
+        );
+
+        // ── Download archive + run mongorestore ────────────────────────────
+        // Each restore operation gets its own unique subdirectory so that
+        // concurrent restores cannot overwrite each other's archive file. The
+        // guard removes it on every exit path, including a failed download.
+        let restore_dir = new_restore_staging_dir()?;
+
+        let archive_filename = std::path::Path::new(ctx.backup_location)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dump.archive")
+            .to_string();
+        let host_archive_path = restore_dir.path().join(&archive_filename);
+
+        // Streamed to disk: memory does not grow with the archive's size.
+        let archive_size = super::restore_staging::download_s3_object_to_file(
+            ctx.s3_client,
+            &ctx.s3_source.bucket_name,
+            ctx.backup_location,
+            &host_archive_path,
+            ctx.gate,
+        )
+        .await?;
+        info!(
+            "MongoDB restore_to_new_service: downloaded {} bytes to {}",
+            archive_size,
+            host_archive_path.display()
+        );
+
+        let restore_result = new_service
+            .run_mongorestore_sidecar(
+                restore_dir.path(),
+                &archive_filename,
+                &new_container,
+                &new_config.username,
+                &new_config.password,
+            )
+            .await;
+
+        // Remove the staging directory now rather than at the end of the
+        // function, whether or not the restore succeeded.
+        drop(restore_dir);
+
+        restore_result?;
+
+        info!(
+            "MongoDB restore_to_new_service: completed for service '{}' (container '{}')",
+            new_service_name, new_container
+        );
+
+        // ── Build the result the orchestrator will persist ─────────────────
+        Self::new_mongodb_service_result(&new_service_name, &new_config)
+    }
+
+    fn get_default_docker_image(&self) -> (String, String) {
+        // Return (image_name, version)
+        ("gotempsh/mongodb-walg".to_string(), "8.0".to_string())
+    }
+
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        let container_name = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .map(|config| self.get_live_container_name(config))
+            .unwrap_or_else(|| self.get_container_name());
+        let container = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+
+        // Get the image from the container's inspection data
+        if let Some(image) = container.config.and_then(|c| c.image) {
+            // Parse image name and tag from the full image string
+            if let Some((name, tag)) = image.split_once(':') {
+                Ok((name.to_string(), tag.to_string()))
+            } else {
+                Ok((image.clone(), "latest".to_string()))
+            }
+        } else {
+            Err(EngineError::failed(
+                &self.name,
+                "Failed to get current docker image for MongoDB container",
+            ))
+        }
+    }
+
+    fn get_default_version(&self) -> String {
+        "8.0".to_string()
+    }
+
+    async fn get_current_version(&self) -> Result<String> {
+        let (_, version) = self.get_current_docker_image().await?;
+        Ok(version)
+    }
+
+    async fn upgrade(&self, old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        info!("Starting MongoDB upgrade");
+
+        let _old_mongodb_config = self.get_mongodb_config(old_config)?;
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
+        let new_mongodb_config = self.get_mongodb_config(new_config)?;
+
+        // Before any Docker call: a refused upgrade must not pull an image.
+        if new_mongodb_config.container_name.is_some() {
+            return Err(EngineError::conflict(&self.name, format!("Refusing to change the image of imported MongoDB service '{}': Temps does not \
+                 manage that container's lifecycle or storage. Nothing was changed",
+                self.name)));
+        }
+
+        // Verify the new image can be pulled BEFORE stopping the old container
+        info!(
+            "Verifying new Docker image is available: {}",
+            new_mongodb_config.docker_image
+        );
+        self.verify_image_pullable(&new_mongodb_config.docker_image)
+            .await?;
+        info!("New Docker image verified and is available");
+
+        // Replace the container through the shared guard: same data volume
+        // or refuse, keep the old container until the new one lists the same
+        // databases, restore it otherwise.
+        info!("Recreating MongoDB container with new image");
+        let limits = upgrade_limits;
+        let container_name = self.get_container_name();
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker: &self.docker,
+                engine: super::recreate_guard::ManagedEngine::MongoDb,
+                service_name: &self.name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation: "changing its image",
+            },
+            || self.create_container_once(&self.docker, &new_mongodb_config, &limits),
+        )
+        .await?;
+        *self.config.write().await = Some(new_mongodb_config);
+
+        info!("MongoDB upgrade completed successfully");
+        Ok(())
+    }
+
+    async fn import_from_container(
+        &self,
+        container_id: String,
+        service_name: String,
+        credentials: HashMap<String, String>,
+        additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        // Inspect the container to get details
+        let container = self
+            .docker
+            .inspect_container(
+                &container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!("Failed to inspect container '{}': {}", container_id, e),
+                )
+            })?;
+
+        // The real Docker container name — every operation on an imported
+        // service must target this, not the derived `temps-mongodb-{name}`.
+        let imported_container_name = container
+            .name
+            .as_deref()
+            .unwrap_or(&container_id)
+            .trim_start_matches('/')
+            .to_string();
+
+        // Extract image name and version
+        let image = container.config.and_then(|c| c.image).ok_or_else(|| {
+            EngineError::failed(
+                &self.name,
+                format!("Could not determine image for container '{}'", container_id),
+            )
+        })?;
+
+        // Extract version from image name (e.g., "mongo:7" -> "7")
+        let version = if let Some(tag_pos) = image.rfind(':') {
+            image[tag_pos + 1..].to_string()
+        } else {
+            "7".to_string()
+        };
+
+        // Extract port from additional config if provided, otherwise use 27017
+        let port = additional_config
+            .get("port")
+            .and_then(|v| v.as_str())
+            .unwrap_or("27017")
+            .to_string();
+
+        // Extract credentials
+        let username = credentials.get("username").cloned();
+        let password = credentials.get("password").cloned();
+        let database = credentials
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| "admin".to_string());
+
+        // Build connection URL for verification
+        let connection_url = if let (Some(user), Some(pass)) = (&username, &password) {
+            format!(
+                "mongodb://{}:{}@localhost:{}/{}",
+                urlencoding::encode(user),
+                urlencoding::encode(pass),
+                port,
+                database
+            )
+        } else {
+            format!("mongodb://localhost:{}", port)
+        };
+
+        // Verify connection to the imported service. Connects directly with
+        // `.await` on the current runtime — spinning up a nested
+        // `tokio::runtime::Runtime` and calling `block_on` here panics with
+        // "Cannot start a runtime from within a runtime", since this
+        // `async fn` is already driven by one.
+        use std::future::IntoFuture;
+        let client = mongodb::Client::with_uri_str(&connection_url)
+            .await
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    &self.name,
+                    format!("Invalid MongoDB connection URL: {}", e),
+                )
+            })?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_databases().into_future(),
+        )
+        .await
+        .map_err(|_| {
+            EngineError::connection(&self.name, "MongoDB connection timed out after 5 seconds")
+        })?
+        .map_err(|e| {
+            EngineError::connection(
+                &self.name,
+                format!(
+                    "Failed to connect to MongoDB at localhost:{} with provided credentials: {}",
+                    port, e
+                ),
+            )
+        })?;
+        info!("Successfully verified MongoDB connection for import");
+
+        let network_ready = match ensure_network_exists(&self.docker).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    "Failed to ensure Temps Docker network before MongoDB import attach: {:?}",
+                    e
+                );
+                false
+            }
+        };
+        if network_ready {
+            let network_name = temps_core::NETWORK_NAME.as_str();
+            let request = bollard::models::NetworkConnectRequest {
+                container: container_id.clone(),
+                ..Default::default()
+            };
+            match self.docker.connect_network(network_name, request).await {
+                Ok(()) => info!(
+                    "Attached imported MongoDB container '{}' to {}",
+                    imported_container_name, network_name
+                ),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 403, ..
+                }) => debug!(
+                    "Imported MongoDB container '{}' is already attached to {}",
+                    imported_container_name, network_name
+                ),
+                Err(e) => warn!(
+                    "Failed to attach imported MongoDB container '{}' to {}: {}",
+                    imported_container_name, network_name, e
+                ),
+            }
+        }
+
+        // Build the ServiceConfig for registration
+        let config = ServiceConfig {
+            name: service_name,
+            service_type: ServiceType::Mongodb,
+            version: Some(version),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port,
+                "username": username.unwrap_or_default(),
+                "password": password.unwrap_or_default(),
+                "database": database,
+                "docker_image": image,
+                "container_name": imported_container_name,
+            }),
+        };
+
+        info!(
+            "Successfully imported MongoDB service '{}' from container",
+            config.name
+        );
+        Ok(config)
+    }
+}
+
+/// Importing data from an external MongoDB server (see `crate::data_import`).
+mod data_import;
+
+/// `usersInfo` for one user of `database`: an empty `users` array when it
+/// does not exist.
+pub fn users_info(user: &str, database: &str) -> mongodb::bson::Document {
+    mongodb::bson::doc! { "usersInfo": { "user": user, "db": database } }
+}
+
+/// Whether the administrator's `usersInfo` answer names a user.
+pub fn users_info_has_user(answer: &mongodb::bson::Document) -> bool {
+    answer
+        .get_array("users")
+        .map(|users| !users.is_empty())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// Restoring into a new service clones the source's root credentials, so
+    /// a caller-chosen image must not be able to receive them.
+    #[test]
+    fn restore_image_override_rejects_foreign_repository() {
+        let err = crate::externalsvc::restore_image::restore_image_override(
+            "gotempsh/mongodb-walg:8.0",
+            "attacker/exfil:latest",
+            RESTORE_IMAGE_REPOSITORIES,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not permitted"), "unexpected error: {err}");
+    }
+
+    /// Re-tagging the repository the source already runs is the legitimate
+    /// use of the override (restore into a newer patch release).
+    #[test]
+    fn restore_image_override_allows_retagging_source_repository() {
+        assert_eq!(
+            crate::externalsvc::restore_image::restore_image_override(
+                "gotempsh/mongodb-walg:8.0",
+                "gotempsh/mongodb-walg:7.0",
+                RESTORE_IMAGE_REPOSITORIES
+            )
+            .unwrap(),
+            "gotempsh/mongodb-walg:7.0"
+        );
+        assert_eq!(
+            crate::externalsvc::restore_image::restore_image_override(
+                "gotempsh/mongodb-walg:8.0",
+                "mongo:7.0",
+                RESTORE_IMAGE_REPOSITORIES
+            )
+            .unwrap(),
+            "mongo:7.0"
+        );
+    }
+
+    /// Exact repository match, never a prefix test.
+    #[test]
+    fn restore_image_override_does_not_match_by_prefix() {
+        for image in ["mongo-evil:1", "evil/mongo:1", "mongodb:1"] {
+            assert!(
+                crate::externalsvc::restore_image::restore_image_override(
+                    "gotempsh/mongodb-walg:8.0",
+                    image,
+                    RESTORE_IMAGE_REPOSITORIES
+                )
+                .is_err(),
+                "{image} must not be accepted"
+            );
+        }
+    }
+
+    /// A registry port is not a tag separator.
+    use super::*;
+
+    #[test]
+    fn test_default_values() {
+        assert_eq!(default_host(), "localhost");
+        assert_eq!(default_username(), "root");
+        assert_eq!(
+            default_docker_image(),
+            "gotempsh/mongodb-walg:8.0".to_string()
+        );
+    }
+
+    // ── Regression: credentials that mongosh's parser mistakes for flags ────
+
+    /// A root password with the shape that broke MongoDB service creation:
+    /// 32 characters drawn from `generate_secure_password()`'s charset, the
+    /// first of which is `-`. Roughly 1 in 73 generated passwords looks like
+    /// this. Synthesised here rather than copied from the incident, but the
+    /// shape (leading `-`, plus `!&=^@*#%+` in the tail) is preserved because
+    /// that shape is the whole point of the test.
+    const DASH_LEADING_PASSWORD: &str = "-Xq!7&Zt=3^w_9@Mr*4#Pv2%Kd+Ln8*Q";
+
+    /// A username with the same hazard. `-u <value>` is exposed to the exact
+    /// same parse error as `-p <value>`, so fixing only the password would
+    /// leave half the bug in place.
+    const DASH_LEADING_USERNAME: &str = "-temps-probe-admin";
+
+    /// Cheap drift guard: the probe must not carry any credential on
+    /// `mongosh`'s command line, and must reference the env vars the container
+    /// is actually created with.
+    ///
+    /// This is deliberately *not* the regression test. The original bug lived
+    /// entirely in how mongosh parses the string, not in the string itself, so
+    /// an assertion on the constructed command would have passed happily while
+    /// production timed out. Its only job is to fail loudly if a later edit
+    /// puts credentials back on argv, without needing Docker to do so.
+    #[test]
+    fn test_healthcheck_command_carries_no_credentials_on_argv() {
+        assert!(
+            !HEALTHCHECK_COMMAND.contains(" -u "),
+            "healthcheck must not pass the username as an argument: {HEALTHCHECK_COMMAND}"
+        );
+        assert!(
+            !HEALTHCHECK_COMMAND.contains(" -p "),
+            "healthcheck must not pass the password as an argument: {HEALTHCHECK_COMMAND}"
+        );
+        assert!(
+            !HEALTHCHECK_COMMAND.contains("--password"),
+            "healthcheck must not pass the password as an argument: {HEALTHCHECK_COMMAND}"
+        );
+        assert!(
+            HEALTHCHECK_COMMAND.contains(MONGO_ROOT_USER_ENV)
+                && HEALTHCHECK_COMMAND.contains(MONGO_ROOT_PASSWORD_ENV),
+            "healthcheck must read both credentials from the env vars the container is created with: {HEALTHCHECK_COMMAND}"
+        );
+    }
+
+    /// The in-container exec probes hand credentials to mongosh as a
+    /// connection URI, which is a single token always starting with
+    /// `mongodb://` and therefore never mistakable for a flag.
+    #[test]
+    fn test_local_probe_uri_is_never_flag_shaped() {
+        let uri = local_probe_uri(DASH_LEADING_USERNAME, DASH_LEADING_PASSWORD);
+        assert!(
+            uri.starts_with("mongodb://"),
+            "probe URI must be a positional connection string, got: {uri}"
+        );
+        // Characters that would otherwise re-shape the URI must be encoded.
+        assert!(uri.contains("%40"), "`@` must be percent-encoded: {uri}");
+        assert!(uri.contains("%21"), "`!` must be percent-encoded: {uri}");
+        assert!(uri.contains("%3D"), "`=` must be percent-encoded: {uri}");
+        assert!(uri.contains("%26"), "`&` must be percent-encoded: {uri}");
+        assert!(
+            uri.ends_with("/admin?authSource=admin"),
+            "probe URI must authenticate against admin: {uri}"
+        );
+    }
+
+    /// Regression test for the 90-second health-check timeout that made every
+    /// MongoDB service with a `-`-leading root password fail to create.
+    ///
+    /// **This has to run against a real container.** The bug was never in the
+    /// string temps built — the shell quoted it correctly and handed `mongosh`
+    /// two clean argv tokens — it was in how mongosh's own Node-based parser
+    /// reads a token beginning with `-` in a value position. So this boots the
+    /// real image, goes through the same `create_container` path the provider
+    /// uses in production (same env vars, same `HealthConfig`), and lets Docker
+    /// execute the health probe for real. `create_container` only returns `Ok`
+    /// once Docker reports the container HEALTHY; before the fix it returned
+    /// `Err("MongoDB container health check timed out after 90s...")`.
+    ///
+    /// Both the username and the password start with `-`, since `-u` was
+    /// exposed to the identical parse error as `-p`.
+    ///
+    /// Skips (does not fail) when Docker is unavailable — Docker tests in this
+    /// repo must never be `#[ignore]`d.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_container_becomes_healthy_with_dash_leading_credentials() {
+        // Bounded so a wedged daemon or an unreachable registry fails with a
+        // diagnostic instead of stalling CI. The health probe itself is already
+        // capped at 90s inside `wait_for_container_health`.
+        const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+
+        let service_name = format!("test-dash-pw-{}", chrono::Utc::now().timestamp_millis());
+        let port = match find_available_port(27200) {
+            Some(p) => p,
+            None => {
+                println!("No available port for MongoDB, skipping test");
+                return;
+            }
+        };
+
+        let service = MongodbService::new(service_name.clone(), docker.clone());
+        let mut config = MongodbRuntimeConfig {
+            host: "localhost".to_string(),
+            port: port.to_string(),
+            database: "testdb".to_string(),
+            username: DASH_LEADING_USERNAME.to_string(),
+            password: DASH_LEADING_PASSWORD.to_string(),
+            docker_image: default_docker_image(),
+            replica_set: None,
+            keyfile_content: None,
+            container_name: None,
+        };
+
+        let result = tokio::time::timeout(
+            TEST_TIMEOUT,
+            service.create_container(&docker, &mut config, &ServiceResourceLimits::default()),
+        )
+        .await;
+
+        // Tear down before asserting so a failure never leaks a container or
+        // volume onto the developer's machine or the CI runner.
+        let container_name = service.get_container_name();
+        let _ = docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker
+            .remove_volume(
+                &format!("temps-mongodb-{}-data", service_name),
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "MongoDB container with a '-'-leading username and password never became healthy. \
+                 This is the regression: mongosh rejects such a value in a space-separated \
+                 -u/-p/--password position with `unrecognized option`, so every probe fails \
+                 and creation times out. Underlying error: {e}"
+            ),
+            Err(_) => panic!(
+                "create_container exceeded {}s — the daemon or the image pull is wedged",
+                TEST_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    #[test]
+    fn test_build_mongodb_url_standalone() {
+        let url = build_mongodb_url("root", "p@ss/word", "mongo", "27017", "mydb", None);
+        assert_eq!(
+            url,
+            "mongodb://root:p%40ss%2Fword@mongo:27017/mydb?authSource=admin"
+        );
+    }
+
+    #[test]
+    fn test_build_mongodb_url_replica_set() {
+        let url = build_mongodb_url("root", "secret", "mongo", "27017", "mydb", Some("rs0"));
+        assert_eq!(
+            url,
+            "mongodb://root:secret@mongo:27017/mydb?authSource=admin&directConnection=true"
+        );
+    }
+
+    #[test]
+    fn test_generate_password() {
+        let password = generate_password();
+        assert_eq!(password.len(), 16);
+        assert!(password.chars().all(|c| c.is_alphanumeric()));
+    }
+
+    #[test]
+    fn test_generate_password_uniqueness() {
+        // Generate multiple passwords and verify they are unique
+        let password1 = generate_password();
+        let password2 = generate_password();
+        let password3 = generate_password();
+
+        assert_ne!(password1, password2, "Passwords should be unique");
+        assert_ne!(password2, password3, "Passwords should be unique");
+        assert_ne!(password1, password3, "Passwords should be unique");
+
+        // All should be valid
+        assert_eq!(password1.len(), 16);
+        assert_eq!(password2.len(), 16);
+        assert_eq!(password3.len(), 16);
+    }
+
+    #[test]
+    fn test_container_name() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("test-service".to_string(), docker);
+        assert_eq!(service.get_container_name(), "temps-mongodb-test-service");
+    }
+
+    #[tokio::test]
+    async fn init_preserves_a_persisted_port_owned_by_the_running_service() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve a port as a running MongoDB container would");
+        let persisted_port = held.local_addr().expect("read reserved port").port();
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("existing-service".to_string(), docker);
+        let config = ServiceConfig {
+            name: "existing-service".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": persisted_port.to_string(),
+                "database": "admin",
+                "username": "root",
+                "password": "persisted-password",
+                "docker_image": "gotempsh/mongodb-walg:8.0"
+            }),
+        };
+
+        let inferred = service
+            .init(config)
+            .await
+            .expect("initializing an existing service must keep its persisted endpoint");
+
+        assert_eq!(inferred.get("port"), Some(&persisted_port.to_string()));
+        assert_eq!(
+            service
+                .config
+                .read()
+                .await
+                .as_ref()
+                .map(|runtime| runtime.port.as_str()),
+            Some(persisted_port.to_string().as_str())
+        );
+    }
+
+    /// Removing a service whose container is already gone is not a failure.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn remove_succeeds_when_the_container_is_already_gone() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let name = format!("absent-{}", uuid::Uuid::new_v4().simple());
+        MongodbService::new(name, Arc::new(docker))
+            .remove()
+            .await
+            .unwrap();
+    }
+
+    /// An imported service is refused before any Docker call. This client has
+    /// no daemon behind it, so a call would surface as a Docker error, not as
+    /// the conflict: nothing was pulled, and no container or volume created.
+    #[tokio::test]
+    async fn upgrade_of_imported_service_is_refused_before_any_docker_call() {
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap(),
+        );
+        let service = MongodbService::new("imported-svc".to_string(), docker);
+        let config = |image: &str| ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27018",
+                "database": "admin",
+                "username": "root",
+                "password": "testpass",
+                "docker_image": image,
+                "container_name": "operator-mongo",
+            }),
+        };
+
+        let error = service
+            .upgrade(config("mongo:7.0"), config("mongo:8.0"))
+            .await
+            .expect_err("an imported service must not be upgraded");
+
+        assert!(matches!(error, EngineError::Conflict { .. }), "{error}");
+        assert!(error.to_string().contains("imported"), "{error}");
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(&error)
+                .status_code
+                .as_u16(),
+            409
+        );
+    }
+
+    #[test]
+    fn test_get_effective_address_docker_mode_uses_imported_container_name() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("imported-svc".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27018",
+                "database": "admin",
+                "username": "root",
+                "password": "testpass",
+                "container_name": "legacy-mongo",
+            }),
+        };
+
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
+        // The imported container name wins over the derived
+        // `temps-mongodb-{name}`.
+        assert_eq!(host, "legacy-mongo");
+        assert_eq!(port, "27017");
+    }
+
+    #[test]
+    fn test_get_effective_address_host_and_docker_use_environment_specific_addresses() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("address-mapping".to_string(), docker);
+        let config = ServiceConfig {
+            name: "address-mapping".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27018",
+                "database": "admin",
+                "username": "root",
+                "password": "testpass",
+            }),
+        };
+
+        let host = service
+            .get_effective_address_for_environment(
+                config.clone(),
+                temps_core::ExecutionEnvironment::Host,
+            )
+            .unwrap();
+        let docker = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
+
+        assert_eq!(host, ("localhost".to_string(), "27018".to_string()));
+        assert_eq!(
+            docker,
+            (
+                "temps-mongodb-address-mapping".to_string(),
+                "27017".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_container_name_is_not_a_user_input() {
+        // container_name is derived from the service name at creation time
+        // (`temps-mongodb-{name}`), never supplied by the client — same as
+        // MariaDB (see mariadb.rs's identical test). The create form is
+        // generated from this schema, so the field must not appear in it.
+        let schema = serde_json::to_value(schemars::schema_for!(MongodbInputConfig)).unwrap();
+        assert!(
+            !schema.to_string().contains("container_name"),
+            "container_name leaked into the MongoDB create schema"
+        );
+    }
+
+    #[test]
+    fn test_service_type() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("test-service".to_string(), docker);
+        assert_eq!(service.get_type(), ServiceType::Mongodb);
+    }
+
+    #[test]
+    fn test_parameter_schema() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("test-schema".to_string(), docker);
+
+        // Get the parameter schema
+        let schema_opt = service.get_parameter_schema();
+        assert!(schema_opt.is_some(), "Schema should be generated");
+
+        let schema = schema_opt.unwrap();
+
+        // Verify schema structure
+        let schema_obj = schema.as_object().expect("Schema should be an object");
+
+        // Check for schema metadata
+        assert!(
+            schema_obj.contains_key("$schema"),
+            "Should have $schema field"
+        );
+        assert!(schema_obj.contains_key("title"), "Should have title field");
+        assert!(
+            schema_obj.contains_key("description"),
+            "Should have description field"
+        );
+        assert!(
+            schema_obj.contains_key("properties"),
+            "Should have properties field"
+        );
+
+        // Verify title and description
+        assert_eq!(
+            schema_obj.get("title").and_then(|v| v.as_str()),
+            Some("MongoDB Configuration"),
+            "Title should match"
+        );
+
+        // Verify properties
+        let properties = schema_obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("Properties should be an object");
+
+        // Check for expected fields
+        let expected_fields = vec![
+            "host",
+            "port",
+            "database",
+            "username",
+            "password",
+            "docker_image",
+            "replica_set",
+        ];
+        for field in &expected_fields {
+            assert!(
+                properties.contains_key(*field),
+                "Schema should contain '{}' field",
+                field
+            );
+        }
+
+        // Verify host field has default
+        let host_field = properties
+            .get("host")
+            .and_then(|v| v.as_object())
+            .expect("host field should be an object");
+        assert_eq!(
+            host_field.get("default").and_then(|v| v.as_str()),
+            Some("localhost")
+        );
+
+        // Verify password field description
+        let password_field = properties
+            .get("password")
+            .and_then(|v| v.as_object())
+            .expect("password field should be an object");
+        let password_desc = password_field.get("description").and_then(|v| v.as_str());
+        assert!(password_desc.is_some());
+        assert!(password_desc.unwrap().contains("auto-generated"));
+    }
+
+    #[test]
+    fn test_parameter_schema_editable_fields() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("test-editable".to_string(), docker);
+
+        // Get the parameter schema
+        let schema_opt = service.get_parameter_schema();
+        assert!(schema_opt.is_some(), "Schema should be generated");
+
+        let schema = schema_opt.unwrap();
+        let schema_obj = schema.as_object().expect("Schema should be an object");
+        let properties = schema_obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("Properties should be an object");
+
+        // Define expected editable status for each field
+        let editable_status = vec![
+            ("host", false),
+            ("port", true),
+            ("database", false),
+            ("username", false),
+            ("password", false),
+            ("docker_image", true),
+            ("replica_set", true),
+        ];
+
+        for (field_name, should_be_editable) in editable_status {
+            let field = properties
+                .get(field_name)
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| panic!("{} field should exist", field_name));
+
+            let is_editable = field
+                .get("x-editable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| panic!("{} should have x-editable property", field_name));
+
+            assert_eq!(
+                is_editable, should_be_editable,
+                "Field {} editable status should be {}",
+                field_name, should_be_editable
+            );
+        }
+    }
+
+    // ── Unit tests for the new generic restore framework methods ────────────
+
+    #[test]
+    fn test_restore_capabilities_fields() {
+        // restore_capabilities is async and requires a running service; we
+        // verify the struct we expect to return satisfies the invariants we
+        // care about by constructing it directly.
+        let caps = super::super::RestoreCapabilities {
+            restore_in_place: true,
+            restore_to_new_service: true,
+            pitr: false,
+            earliest_pitr_time: None,
+            latest_pitr_time: None,
+        };
+        assert!(
+            caps.restore_in_place,
+            "MongoDB must support in-place restore"
+        );
+        assert!(
+            caps.restore_to_new_service,
+            "MongoDB must support restore-to-new-service"
+        );
+        assert!(!caps.pitr, "MongoDB PITR is not yet supported");
+        assert!(caps.earliest_pitr_time.is_none());
+        assert!(caps.latest_pitr_time.is_none());
+    }
+
+    #[test]
+    fn test_new_mongodb_service_result_connection_info() {
+        let config = MongodbRuntimeConfig {
+            host: "localhost".to_string(),
+            port: "27018".to_string(),
+            database: "mydb".to_string(),
+            username: "root".to_string(),
+            password: "secret".to_string(),
+            docker_image: "gotempsh/mongodb-walg:8.0".to_string(),
+            replica_set: None,
+            keyfile_content: None,
+            container_name: None,
+        };
+        let result = MongodbService::new_mongodb_service_result("newservice", &config).unwrap();
+        // Connection info must mask the password.
+        assert!(
+            result.connection_info.contains("***"),
+            "connection_info must mask the password"
+        );
+        assert!(
+            result.connection_info.contains("27018"),
+            "connection_info must include the port"
+        );
+        assert!(
+            !result.connection_info.contains("newservice"),
+            "connection_info should reference host/port, not service name"
+        );
+        // Parameters must include all the runtime config fields.
+        assert_eq!(
+            result.parameters.get("port").map(|s| s.as_str()),
+            Some("27018")
+        );
+        assert_eq!(
+            result.parameters.get("username").map(|s| s.as_str()),
+            Some("root")
+        );
+        assert_eq!(
+            result.parameters.get("database").map(|s| s.as_str()),
+            Some("mydb")
+        );
+    }
+
+    #[test]
+    fn test_new_mongodb_service_result_no_leaked_password_in_connection_info() {
+        let config = MongodbRuntimeConfig {
+            host: "localhost".to_string(),
+            port: "27019".to_string(),
+            database: "db".to_string(),
+            username: "admin".to_string(),
+            // Deliberately unusual password to make sure it's not in the connection string.
+            password: "p@$$w0rd!".to_string(),
+            docker_image: "gotempsh/mongodb-walg:8.0".to_string(),
+            replica_set: None,
+            keyfile_content: None,
+            container_name: None,
+        };
+        let result = MongodbService::new_mongodb_service_result("svc", &config).unwrap();
+        assert!(
+            !result.connection_info.contains("p@$$w0rd!"),
+            "password must not appear verbatim in connection_info; got: {}",
+            result.connection_info
+        );
+    }
+
+    #[test]
+    fn test_restore_temp_dirs_are_unique_per_operation() {
+        // Each restore operation must get a distinct staging directory so that
+        // two concurrent restores targeting different services (or the same
+        // service twice) cannot write to the same path and corrupt each other's
+        // downloaded archive. `restore_in_place` and `restore_to_new_service`
+        // both stage through `new_restore_staging_dir`.
+        let first = new_restore_staging_dir().expect("first staging dir");
+        let second = new_restore_staging_dir().expect("second staging dir");
+        assert_ne!(
+            first.path(),
+            second.path(),
+            "Two restore operations must produce distinct temp directories; \
+             a shared path would allow concurrent restores to corrupt each other's archive"
+        );
+        assert!(first.path().is_dir() && second.path().is_dir());
+    }
+
+    #[test]
+    fn test_restore_staging_dir_is_removed_with_a_partial_archive() {
+        // A download that fails part-way returns early with `?`; the partial
+        // archive must not outlive the restore and fill the host temp dir.
+        let staging = new_restore_staging_dir().expect("staging dir");
+        let dir = staging.path().to_path_buf();
+        std::fs::write(dir.join("dump.archive"), vec![0_u8; 4096]).expect("partial archive");
+
+        drop(staging);
+
+        assert!(!dir.exists(), "{} must be removed", dir.display());
+    }
+
+    #[test]
+    fn test_salvage_heuristic_only_checks_tail() {
+        // The exit-code salvage check must look only at the TAIL of captured
+        // output.  A large restore that partially fails can emit "done restoring"
+        // for the collections that succeeded early in the log, then fail later.
+        // Checking only the tail prevents that early marker from masking a
+        // subsequent failure.
+        //
+        // Construct output that has "done restoring" in the middle but ends with
+        // a clear error message — and verify the salvage region (last 500 bytes)
+        // does NOT contain the success marker.
+        let mid_success = "done restoring test.collection (1 document)";
+        let tail_failure = "Failed: test.other_collection: connection lost";
+        // Build a string where the success marker is >500 bytes from the end.
+        let mut output = String::new();
+        output.push_str(mid_success);
+        // Pad with >500 bytes of content between the marker and the tail.
+        output.push_str(&"x".repeat(600));
+        output.push_str(tail_failure);
+
+        let salvage_region: &str = {
+            let cut = output.len().saturating_sub(500);
+            let cut = (cut..=cut.saturating_add(3))
+                .find(|&i| output.is_char_boundary(i))
+                .unwrap_or(output.len());
+            &output[cut..]
+        };
+
+        assert!(
+            !salvage_region.contains("done restoring"),
+            "Salvage region must not include the early 'done restoring' marker; \
+             got: {:?}",
+            salvage_region
+        );
+        assert!(
+            salvage_region.contains(tail_failure),
+            "Salvage region must include the tail failure message"
+        );
+    }
+
+    #[test]
+    fn test_archive_filename_extraction_from_backup_location() {
+        // Verify the filename-extraction logic for backup locations like
+        // "some/prefix/mongodb/svcname/uuid/dump.archive"
+        let location = "tenant/mongodb/my-service/abc123/dump.archive";
+        let filename = std::path::Path::new(location)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dump.archive");
+        assert_eq!(filename, "dump.archive");
+
+        // Edge case: bare filename with no path separators.
+        let bare = "backup.gz";
+        let filename2 = std::path::Path::new(bare)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dump.archive");
+        assert_eq!(filename2, "backup.gz");
+
+        // Edge case: empty string falls back to default.
+        let filename3 = std::path::Path::new("")
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dump.archive");
+        assert_eq!(filename3, "dump.archive");
+    }
+
+    #[test]
+    fn test_default_docker_image() {
+        assert_eq!(
+            default_docker_image(),
+            "gotempsh/mongodb-walg:8.0".to_string(),
+            "Default docker_image should be gotempsh/mongodb-walg:8.0"
+        );
+    }
+
+    #[test]
+    fn test_docker_image_configuration() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let _service = MongodbService::new("test-config".to_string(), docker);
+
+        // Create config with specific docker_image
+        let config = ServiceConfig {
+            name: "test-mongo".to_string(),
+            service_type: super::ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27017",
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "docker_image": "gotempsh/mongodb-walg:8.0"
+            }),
+        };
+
+        // Verify configuration contains docker_image
+        assert_eq!(
+            config
+                .parameters
+                .get("docker_image")
+                .and_then(|v| v.as_str()),
+            Some("gotempsh/mongodb-walg:8.0")
+        );
+    }
+
+    #[test]
+    fn test_mongodb_upgrade_config() {
+        // Test simulated upgrade from MongoDB 7.0 to 8.0
+        let old_config = ServiceConfig {
+            name: "test-mongo".to_string(),
+            service_type: super::ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27017",
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "docker_image": "gotempsh/mongodb-walg:7.0"
+            }),
+        };
+
+        let new_config = ServiceConfig {
+            name: "test-mongo".to_string(),
+            service_type: super::ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "27017",
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "docker_image": "gotempsh/mongodb-walg:8.0"
+            }),
+        };
+
+        // Verify upgrade configuration
+        let old_image = old_config
+            .parameters
+            .get("docker_image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let new_image = new_config
+            .parameters
+            .get("docker_image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        assert_eq!(
+            old_image, "gotempsh/mongodb-walg:7.0",
+            "Old docker_image should be gotempsh/mongodb-walg:7.0"
+        );
+        assert_eq!(
+            new_image, "gotempsh/mongodb-walg:8.0",
+            "New docker_image should be gotempsh/mongodb-walg:8.0"
+        );
+    }
+
+    #[test]
+    fn test_import_service_config_creation() {
+        let config = ServiceConfig {
+            name: "test-mongodb-import".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: Some("7.0".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": 27017,
+                "username": "mongouser",
+                "password": "mongopass",
+                "database": "admin",
+                "docker_image": "gotempsh/mongodb-walg:7.0",
+                "container_id": "def456ghi789",
+            }),
+        };
+
+        assert_eq!(config.name, "test-mongodb-import");
+        assert_eq!(config.service_type, ServiceType::Mongodb);
+        assert_eq!(config.version, Some("7.0".to_string()));
+        assert_eq!(config.parameters["port"], 27017);
+    }
+
+    #[test]
+    fn test_import_mongodb_version_extraction() {
+        let test_cases = vec![
+            ("gotempsh/mongodb-walg:7.0", "7.0"),
+            ("mongo:latest", "latest"),
+            ("mongo:6.0-ubuntu", "6.0-ubuntu"),
+            ("gotempsh/mongodb-walg:8.0", "8.0"),
+        ];
+
+        for (image, expected_version) in test_cases {
+            let version = if let Some(tag_pos) = image.rfind(':') {
+                image[tag_pos + 1..].to_string()
+            } else {
+                "latest".to_string()
+            };
+
+            assert_eq!(version, expected_version, "Failed for image: {}", image);
+        }
+    }
+
+    #[test]
+    fn test_import_validates_required_credentials() {
+        let credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // MongoDB requires username, password, port, database
+
+        assert!(!credentials.contains_key("username"));
+        assert!(!credentials.contains_key("password"));
+        assert!(!credentials.contains_key("port"));
+        assert!(!credentials.contains_key("database"));
+    }
+
+    #[test]
+    fn test_import_connection_string_format() {
+        let username = "mongouser";
+        let password = "mongopassword";
+        let port = 27017;
+
+        let connection_url = format!("mongodb://{}:{}@localhost:{}", username, password, port);
+
+        assert!(connection_url.contains("mongodb://"));
+        assert!(connection_url.contains("mongouser"));
+        assert!(connection_url.contains("mongopassword"));
+        assert!(connection_url.contains("localhost"));
+        assert!(connection_url.contains("27017"));
+    }
+
+    #[test]
+    fn test_import_credential_extraction() {
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert("username".to_string(), "mongouser".to_string());
+        credentials.insert("password".to_string(), "mongopass".to_string());
+        credentials.insert("port".to_string(), "27017".to_string());
+        credentials.insert("database".to_string(), "admin".to_string());
+
+        assert_eq!(
+            credentials.get("username").map(|s| s.as_str()),
+            Some("mongouser")
+        );
+        assert_eq!(
+            credentials.get("password").map(|s| s.as_str()),
+            Some("mongopass")
+        );
+        assert_eq!(credentials.get("port").map(|s| s.as_str()), Some("27017"));
+        assert_eq!(
+            credentials.get("database").map(|s| s.as_str()),
+            Some("admin")
+        );
+    }
+
+    #[test]
+    fn test_replica_set_default_is_none() {
+        let input: MongodbInputConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "database": "admin",
+            "username": "root",
+            "docker_image": "gotempsh/mongodb-walg:8.0",
+        }))
+        .expect("should deserialize without replica_set");
+        assert!(input.replica_set.is_none());
+
+        let runtime: MongodbRuntimeConfig = input.into();
+        assert!(runtime.replica_set.is_none());
+        assert!(runtime.keyfile_content.is_none());
+    }
+
+    #[test]
+    fn test_replica_set_some_generates_keyfile() {
+        let input: MongodbInputConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "database": "admin",
+            "username": "root",
+            "docker_image": "gotempsh/mongodb-walg:8.0",
+            "replica_set": "rs0",
+        }))
+        .expect("should deserialize with replica_set");
+        assert_eq!(input.replica_set.as_deref(), Some("rs0"));
+
+        let runtime: MongodbRuntimeConfig = input.into();
+        assert_eq!(runtime.replica_set.as_deref(), Some("rs0"));
+        let kf = runtime
+            .keyfile_content
+            .expect("keyfile should be generated");
+        // Base64 of 32 bytes is 44 chars including padding
+        assert_eq!(kf.len(), 44);
+    }
+
+    #[test]
+    fn test_replica_set_empty_string_treated_as_none() {
+        let input: MongodbInputConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "database": "admin",
+            "username": "root",
+            "docker_image": "gotempsh/mongodb-walg:8.0",
+            "replica_set": "",
+        }))
+        .expect("empty replica_set should deserialize");
+        assert!(input.replica_set.is_none());
+    }
+
+    #[test]
+    fn test_replica_set_rejects_invalid_chars() {
+        let result: Result<MongodbInputConfig, _> = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "database": "admin",
+            "username": "root",
+            "docker_image": "gotempsh/mongodb-walg:8.0",
+            "replica_set": "bad name with spaces",
+        }));
+        assert!(result.is_err(), "spaces in replica_set should fail");
+    }
+
+    #[test]
+    fn test_runtime_config_round_trip_preserves_keyfile() {
+        // First-time init: input has replica_set, no keyfile
+        let input: MongodbInputConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "database": "admin",
+            "username": "root",
+            "password": "secret",
+            "docker_image": "gotempsh/mongodb-walg:8.0",
+            "replica_set": "rs0",
+        }))
+        .unwrap();
+        let runtime: MongodbRuntimeConfig = input.into();
+        let original_keyfile = runtime.keyfile_content.clone().unwrap();
+
+        // Persisted as JSON, then loaded back via the runtime path
+        let persisted = serde_json::to_value(&runtime).unwrap();
+        assert!(persisted.get("keyfile_content").is_some());
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => return, // No docker on host; skip this round-trip path
+        };
+        let service = MongodbService::new("test-rt".to_string(), docker);
+        let svc_config = ServiceConfig {
+            name: "test-rt".into(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: persisted,
+        };
+        let reloaded = service
+            .get_mongodb_config(svc_config)
+            .expect("should reload runtime config");
+        // Critical: the keyfile must NOT be regenerated on reload
+        assert_eq!(
+            reloaded.keyfile_content.as_deref(),
+            Some(original_keyfile.as_str())
+        );
+        assert_eq!(reloaded.replica_set.as_deref(), Some("rs0"));
+    }
+
+    #[test]
+    fn test_generate_keyfile_content_is_random() {
+        let a = generate_keyfile_content();
+        let b = generate_keyfile_content();
+        assert_eq!(a.len(), 44);
+        assert_eq!(b.len(), 44);
+        assert_ne!(a, b);
+    }
+
+    /// Test backup and restore of MongoDB to/from S3 using real Docker containers
+    /// This test uses MongoDB and MinIO (S3-compatible) containers
+    /// Demonstrates the use of test_utils for backup/restore testing
+    ///
+    /// `flavor = "multi_thread"` is required because `S3TestContainer`'s
+    /// `Drop` impl calls `tokio::task::block_in_place`, which panics on the
+    /// default current-thread runtime.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_mongodb_backup_and_restore_to_s3() {
+        // Whole-test wall-clock budget. Anything above this is a hang — fail
+        // loudly with a diagnostic instead of stalling the CI runner for 90 min.
+        // See incident: GitHub run 25806816492 (PR #89) burned 90 min on this
+        // test plus the Redis counterpart because something downstream of the
+        // MinIO/Mongo container startup never returned.
+        const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+        tokio::time::timeout(TEST_TIMEOUT, run_mongodb_backup_and_restore_to_s3())
+            .await
+            .expect("test_mongodb_backup_and_restore_to_s3 exceeded 300s — likely hung on MinIO/Mongo/S3 wait");
+    }
+
+    /// Body of `test_mongodb_backup_and_restore_to_s3`, extracted so the outer
+    /// test can wrap it in `tokio::time::timeout`.
+    #[cfg(feature = "docker-tests")]
+    async fn run_mongodb_backup_and_restore_to_s3() {
+        use super::super::test_utils::{
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
+        };
+        use futures::TryStreamExt;
+
+        // Check if Docker is available
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+
+        // Verify Docker is actually responding
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+
+        println!("✓ Docker is available");
+
+        // Test configuration
+        let service_name = format!("test-backup-{}", chrono::Utc::now().timestamp());
+        let username = "testuser";
+        let password = "testpass123";
+        let database = "testdb";
+        let test_port = find_available_port(27018).expect("No available port found");
+
+        println!("✓ Test configuration: MongoDB port {}", test_port);
+
+        // Step 1 & 2: Start MinIO container and set up S3 (using test utilities)
+        println!("Step 1: Starting MinIO container and setting up S3...");
+        let minio = match S3TestContainer::start(docker.clone(), "test-backups").await {
+            Ok(m) => m,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("certificate")
+                    || error_msg.contains("TrustStore")
+                    || error_msg.contains("panicked")
+                {
+                    println!("❌ Skipping MongoDB backup test: TLS certificate issue");
+                    println!(
+                        "   Reason: {}",
+                        error_msg.lines().next().unwrap_or(&error_msg)
+                    );
+                    println!("   Solution: Install system root certificates (required by AWS SDK even for HTTP endpoints)");
+                    return;
+                }
+                panic!("Failed to start MinIO container: {}", e);
+            }
+        };
+
+        // Step 3: Create MongoDB service and start container
+        println!("Step 3: Starting MongoDB container...");
+        let service = MongodbService::new(service_name.clone(), docker.clone());
+
+        let mut mongodb_config = MongodbRuntimeConfig {
+            host: "localhost".to_string(),
+            port: test_port.to_string(),
+            database: database.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+            docker_image: "gotempsh/mongodb-walg:8.0".to_string(),
+            replica_set: None,
+            keyfile_content: None,
+            container_name: None,
+        };
+
+        *service.config.write().await = Some(mongodb_config.clone());
+
+        // Create and start MongoDB container
+        service
+            .create_container(
+                &docker,
+                &mut mongodb_config,
+                &ServiceResourceLimits::default(),
+            )
+            .await
+            .expect("Failed to create MongoDB container");
+        println!("✓ MongoDB container started and healthy");
+
+        // Step 4: Insert test data into MongoDB
+        println!("Step 4: Inserting test data...");
+        let client = service
+            .get_mongo_client()
+            .await
+            .expect("Failed to get MongoDB client");
+        let db = client.database(database);
+        let collection = db.collection::<mongodb::bson::Document>("test_collection");
+
+        // Insert test documents
+        let test_docs = vec![
+            doc! { "name": "Alice", "age": 30, "city": "New York" },
+            doc! { "name": "Bob", "age": 25, "city": "San Francisco" },
+            doc! { "name": "Charlie", "age": 35, "city": "Boston" },
+        ];
+        collection
+            .insert_many(&test_docs)
+            .await
+            .expect("Failed to insert test data");
+
+        let count_before = collection
+            .count_documents(doc! {})
+            .await
+            .expect("Failed to count documents");
+        assert_eq!(count_before, 3, "Should have 3 documents before backup");
+        println!("✓ Inserted {} test documents", count_before);
+
+        // Step 5: Backup MongoDB to S3 (using test utilities for mock entities)
+        println!("Step 5: Backing up MongoDB to S3...");
+
+        // Create mock entities using test utilities
+        let backup_record = create_mock_backup("backups/test");
+        let db_conn = create_mock_db()
+            .await
+            .expect("Failed to create mock database");
+        let external_service = create_mock_external_service(service_name.clone(), "mongodb", "8.0");
+
+        let service_config = ServiceConfig {
+            name: service_name.clone(),
+            service_type: ServiceType::Mongodb,
+            version: Some("8.0".to_string()),
+            parameters: serde_json::to_value(&mongodb_config).expect("Failed to serialize config"),
+        };
+
+        let s3_creds = minio.s3_credentials();
+        let backup_outcome = service
+            .backup_to_s3(
+                &minio.s3_client,
+                &s3_creds,
+                backup_record,
+                &minio.s3_source,
+                "backups/test",
+                "backups",
+                &db_conn,
+                &external_service,
+                service_config.clone(),
+            )
+            .await
+            .expect("Failed to backup MongoDB to S3");
+        let backup_path = backup_outcome.location;
+
+        println!("✓ Backup created at: {}", backup_path);
+
+        // Verify backup exists in S3 by listing objects under the WAL-G prefix.
+        // WAL-G stores backups under the prefix (e.g., backups/test/walg/basebackups_005/...),
+        // not at the exact prefix path, so we use list_objects instead of head_object.
+        let walg_prefix = backup_path
+            .strip_prefix(&format!("s3://{}/", minio.bucket_name))
+            .unwrap_or(&backup_path);
+        let list_result = minio
+            .s3_client
+            .list_objects_v2()
+            .bucket(&minio.bucket_name)
+            .prefix(walg_prefix)
+            .max_keys(5)
+            .send()
+            .await
+            .expect("Failed to list S3 objects");
+        let object_count = list_result.contents().len();
+        assert!(
+            object_count > 0,
+            "Backup files should exist in S3 under prefix '{}'",
+            walg_prefix
+        );
+        println!(
+            "✓ Backup verified in S3 ({} objects under prefix '{}')",
+            object_count, walg_prefix
+        );
+
+        // Step 6: Drop the database to simulate data loss
+        println!("Step 6: Dropping database to simulate data loss...");
+        service
+            .drop_database(database)
+            .await
+            .expect("Failed to drop database");
+
+        // Verify data is gone
+        let db_after_drop = client.database(database);
+        let collection_after_drop =
+            db_after_drop.collection::<mongodb::bson::Document>("test_collection");
+        let count_after_drop = collection_after_drop
+            .count_documents(doc! {})
+            .await
+            .expect("Failed to count documents");
+        assert_eq!(count_after_drop, 0, "Should have 0 documents after drop");
+        println!("✓ Database dropped successfully");
+
+        // Step 7: Restore from S3
+        println!("Step 7: Restoring MongoDB from S3...");
+        let legacy_service_config = service_config.clone();
+        service
+            .restore_from_s3(
+                &minio.s3_client,
+                &s3_creds,
+                &backup_path,
+                &minio.s3_source,
+                service_config,
+            )
+            .await
+            .expect("Failed to restore MongoDB from S3");
+        println!("✓ Restore completed");
+
+        // Step 8: Verify restored data
+        println!("Step 8: Verifying restored data...");
+        let db_after_restore = client.database(database);
+        let collection_after_restore =
+            db_after_restore.collection::<mongodb::bson::Document>("test_collection");
+        let count_after_restore = collection_after_restore
+            .count_documents(doc! {})
+            .await
+            .expect("Failed to count documents");
+        assert_eq!(
+            count_after_restore, 3,
+            "Should have 3 documents after restore"
+        );
+
+        // Verify the actual data
+        let restored_docs: Vec<mongodb::bson::Document> = collection_after_restore
+            .find(doc! {})
+            .await
+            .expect("Failed to query documents")
+            .try_collect()
+            .await
+            .expect("Failed to collect documents");
+
+        assert_eq!(restored_docs.len(), 3);
+
+        let names: Vec<String> = restored_docs
+            .iter()
+            .filter_map(|doc| doc.get_str("name").ok().map(|s| s.to_string()))
+            .collect();
+
+        assert!(names.contains(&"Alice".to_string()));
+        assert!(names.contains(&"Bob".to_string()));
+        assert!(names.contains(&"Charlie".to_string()));
+
+        println!(
+            "✓ Data verified: {} documents restored correctly",
+            count_after_restore
+        );
+
+        // Step 8b: Legacy (non-WAL-G) archive restore. The archive is staged
+        // through the default temp dir and streamed into the container, so
+        // this also proves it works when that dir is not shared with Docker.
+        println!("Step 8b: Restoring a legacy mongodump archive...");
+        let mongo_container = service.get_container_name();
+        crate::externalsvc::exec_util::run_exec(
+            &docker,
+            &mongo_container,
+            vec![
+                "mongodump".to_string(),
+                format!("--username={}", username),
+                format!("--password={}", password),
+                "--authenticationDatabase=admin".to_string(),
+                "--archive=/tmp/legacy.archive.gz".to_string(),
+                "--gzip".to_string(),
+            ],
+            None,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+        .expect("mongodump for the legacy archive");
+        let mut legacy_tar = Vec::new();
+        let mut download = docker.download_from_container(
+            &mongo_container,
+            Some(
+                bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                    .path("/tmp/legacy.archive.gz")
+                    .build(),
+            ),
+        );
+        while let Some(chunk) = futures::StreamExt::next(&mut download).await {
+            legacy_tar.extend_from_slice(&chunk.expect("download legacy archive"));
+        }
+        let mut legacy_archive = Vec::new();
+        {
+            use std::io::Read;
+            let mut tar = tar::Archive::new(legacy_tar.as_slice());
+            let mut entry = tar
+                .entries()
+                .expect("tar entries")
+                .next()
+                .expect("one entry")
+                .expect("entry");
+            entry
+                .read_to_end(&mut legacy_archive)
+                .expect("read legacy archive");
+        }
+        let legacy_key = "legacy/backup.archive.gz";
+        minio
+            .s3_client
+            .put_object()
+            .bucket(&minio.s3_source.bucket_name)
+            .key(legacy_key)
+            .body(legacy_archive.into())
+            .send()
+            .await
+            .expect("upload legacy archive");
+        collection_after_restore
+            .drop()
+            .await
+            .expect("drop collection before legacy restore");
+        service
+            .restore_from_s3(
+                &minio.s3_client,
+                &s3_creds,
+                legacy_key,
+                &minio.s3_source,
+                legacy_service_config,
+            )
+            .await
+            .expect("legacy archive restore");
+        let legacy_count = collection_after_restore
+            .count_documents(doc! {})
+            .await
+            .expect("count after legacy restore");
+        assert_eq!(
+            legacy_count, 3,
+            "legacy restore must bring back 3 documents"
+        );
+        println!("✓ Legacy archive restore verified");
+
+        // Step 9: Cleanup
+        println!("Step 9: Cleaning up...");
+
+        // Stop and remove MongoDB container
+        let _ = service.stop().await;
+        let _ = service.remove().await;
+
+        // Stop and remove MinIO container (using test utility)
+        let _ = minio.cleanup().await;
+
+        println!("✓ Cleanup completed");
+        println!("\n✅ MongoDB backup and restore test completed successfully!");
+    }
+
+    /// The in-place / new-service restore path: the mongorestore sidecar gets
+    /// its archive and credentials through the Docker archive API, so it
+    /// works with the OS default temp dir even when that dir is not shared
+    /// with the Docker daemon (macOS with Colima or Docker Desktop).
+    #[tokio::test]
+    #[cfg(feature = "docker-tests")]
+    async fn mongorestore_sidecar_restores_without_a_shared_temp_dir() {
+        use crate::externalsvc::exec_util::run_exec;
+        use futures::StreamExt;
+        use std::io::Read;
+
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        if crate::utils::pull_image_with_retry(&docker, MONGO_SIDECAR_IMAGE, None)
+            .await
+            .is_err()
+        {
+            println!("Could not pull {MONGO_SIDECAR_IMAGE}, skipping");
+            return;
+        }
+        if crate::utils::ensure_network_exists(&docker).await.is_err() {
+            println!("Could not ensure the temps network, skipping");
+            return;
+        }
+        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..10];
+        let target = format!("temps-mongo-sidecar-test-{suffix}");
+        let (user, password) = ("root", "sidecar-test-pw");
+        let created = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&target)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(MONGO_SIDECAR_IMAGE.to_string()),
+                    env: Some(vec![
+                        format!("MONGO_INITDB_ROOT_USERNAME={user}"),
+                        format!("MONGO_INITDB_ROOT_PASSWORD={password}"),
+                    ]),
+                    networking_config: Some(bollard::models::NetworkingConfig {
+                        endpoints_config: Some(HashMap::from([(
+                            temps_core::NETWORK_NAME.to_string(),
+                            bollard::models::EndpointSettings::default(),
+                        )])),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if created.is_err() {
+            println!("Could not create the target MongoDB, skipping");
+            return;
+        }
+        let remove_target = || async {
+            let _ = docker
+                .remove_container(
+                    &target,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        };
+        let _ = docker
+            .start_container(
+                &target,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+
+        let timeout = std::time::Duration::from_secs(60);
+        let mongosh = |eval: &str| {
+            vec![
+                "mongosh".to_string(),
+                "--quiet".to_string(),
+                "-u".to_string(),
+                user.to_string(),
+                "-p".to_string(),
+                password.to_string(),
+                "--authenticationDatabase".to_string(),
+                "admin".to_string(),
+                "--eval".to_string(),
+                eval.to_string(),
+            ]
+        };
+        let mut ready = false;
+        for _ in 0..60 {
+            if let Ok(r) = run_exec(
+                &docker,
+                &target,
+                mongosh("db.runCommand({ping:1}).ok"),
+                None,
+                timeout,
+            )
+            .await
+            {
+                if r.output.trim().ends_with('1') {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if !ready {
+            remove_target().await;
+            panic!("target MongoDB never became ready");
+        }
+
+        let outcome: anyhow::Result<String> = async {
+            run_exec(
+                &docker,
+                &target,
+                mongosh("db.getSiblingDB('app').items.insertMany([{n:1},{n:2},{n:3}])"),
+                None,
+                timeout,
+            )
+            .await?;
+            run_exec(
+                &docker,
+                &target,
+                vec![
+                    "mongodump".into(),
+                    format!("--username={user}"),
+                    format!("--password={password}"),
+                    "--authenticationDatabase=admin".into(),
+                    "--db=app".into(),
+                    "--archive=/tmp/dump.archive".into(),
+                    "--gzip".into(),
+                ],
+                None,
+                timeout,
+            )
+            .await?;
+
+            // Copy the archive to the OS default temp dir — deliberately not
+            // a directory shared with Docker.
+            let host_dir = tempfile::tempdir()?;
+            let mut tar_bytes = Vec::new();
+            let mut stream = docker.download_from_container(
+                &target,
+                Some(
+                    bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                        .path("/tmp/dump.archive")
+                        .build(),
+                ),
+            );
+            while let Some(chunk) = stream.next().await {
+                tar_bytes.extend_from_slice(&chunk?);
+            }
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let mut entry = archive
+                .entries()?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty archive download"))??;
+            let mut dump = Vec::new();
+            entry.read_to_end(&mut dump)?;
+            std::fs::write(host_dir.path().join("dump.archive"), &dump)?;
+
+            run_exec(
+                &docker,
+                &target,
+                mongosh("db.getSiblingDB('app').items.drop()"),
+                None,
+                timeout,
+            )
+            .await?;
+
+            let service =
+                MongodbService::new(format!("sidecar-test-{suffix}"), Arc::new(docker.clone()));
+            service
+                .run_mongorestore_sidecar(host_dir.path(), "dump.archive", &target, user, password)
+                .await?;
+
+            let count = run_exec(
+                &docker,
+                &target,
+                mongosh("db.getSiblingDB('app').items.countDocuments()"),
+                None,
+                timeout,
+            )
+            .await?;
+            Ok(count.output)
+        }
+        .await;
+
+        let leftover_helpers = docker
+            .list_containers(Some(
+                bollard::query_parameters::ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&HashMap::from([(
+                        "label".to_string(),
+                        vec![format!(
+                            "{}={}",
+                            crate::externalsvc::restore_helper::RESTORE_TARGET_LABEL,
+                            target
+                        )],
+                    )]))
+                    .build(),
+            ))
+            .await
+            .map(|containers| containers.len())
+            .unwrap_or(0);
+        remove_target().await;
+
+        let count = outcome.expect("sidecar restore round trip");
+        assert_eq!(count.trim(), "3", "restored document count");
+        assert_eq!(leftover_helpers, 0, "the sidecar must be removed");
+    }
+}

@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, conflict, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
@@ -645,10 +645,10 @@ mod tests {
     use sea_orm::{
         ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DatabaseBackend, Statement,
     };
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployment_tokens::DeploymentTokenPermission, email_domains, users};
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]
@@ -687,7 +687,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for MockAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -696,8 +699,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for FailingAuditLogger {
-        async fn create_audit_log(&self, _operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            anyhow::bail!("intentional audit storage failure")
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "intentional audit storage failure",
+            ));
         }
     }
 
@@ -749,8 +758,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email handler test: {error}");
                     return None;
                 }
@@ -1026,6 +1034,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["title"], "Audit Log Unavailable");
+        assert_eq!(
+            body["detail"],
+            "The email was not sent because its audit record could not be stored"
+        );
+        assert!(!body
+            .to_string()
+            .contains("intentional audit storage failure"));
         let persisted = db
             .db
             .query_one(Statement::from_string(
@@ -1038,6 +1056,37 @@ mod tests {
             .try_get::<i64>("", "count")
             .unwrap();
         assert_eq!(persisted, 0, "unaudited sends must not reach persistence");
+    }
+
+    #[tokio::test]
+    async fn audit_failure_prevents_resend_with_a_stable_problem() {
+        let Some((_db, state)) = setup_test_env_with_audit(Arc::new(FailingAuditLogger)).await
+        else {
+            return;
+        };
+
+        let response = build_session_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/emails/{}/resend", Uuid::new_v4()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["title"], "Audit Log Unavailable");
+        assert_eq!(
+            body["detail"],
+            "The email was not resent because its audit record could not be stored"
+        );
+        assert!(!body
+            .to_string()
+            .contains("intentional audit storage failure"));
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use axum::{
 use bytes::Bytes;
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
@@ -42,7 +42,7 @@ use crate::services::{ListOptions, PutOptions};
 /// 1. Deployment tokens: Use project_id from token (request value ignored for security)
 /// 2. API keys/sessions: Use project_id from request (required)
 async fn extract_project_id(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     request_project_id: Option<i32>,
     project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<i32, Problem> {
@@ -72,11 +72,11 @@ async fn extract_project_id(
 /// path-based `blob_head`/`blob_download` handlers, which resolve `project_id`
 /// from the URL path rather than the body.
 async fn authorize_project_access(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     project_id: i32,
     project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<(), Problem> {
-    temps_auth::project_access_guard!(auth, project_id, project_access_checker);
+    temps_authz::project_access_guard!(auth, project_id, project_access_checker);
     Ok(())
 }
 
@@ -1164,7 +1164,7 @@ mod idor_tests {
     use super::{authorize_project_access, extract_project_id};
     use async_trait::async_trait;
     use std::sync::Arc;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_core::ProjectAccessChecker;
 
     struct MockChecker {

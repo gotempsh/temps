@@ -16,9 +16,9 @@ pub(super) use github::repository_target_changed;
 /// Resolve the git webhook delivery base from the settings row:
 /// `public_ingress_url` when set, `external_url` otherwise, and the local
 /// development address when neither is configured.
-fn git_webhook_base_url(settings: Option<&temps_core::AppSettings>) -> String {
+fn git_webhook_base_url(settings: Option<&temps_config::AppSettings>) -> String {
     settings
-        .and_then(temps_core::AppSettings::configured_public_ingress_url)
+        .and_then(temps_config::AppSettings::configured_public_ingress_url)
         .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
@@ -98,7 +98,7 @@ mod tests {
     // ADR-051 D2: provider webhooks are delivered to the public ingress URL.
     #[test]
     fn git_webhooks_are_delivered_to_the_public_ingress_url_when_set() {
-        let settings = temps_core::AppSettings {
+        let settings = temps_config::AppSettings {
             external_url: Some("https://console.example.com".to_string()),
             public_ingress_url: Some("https://hooks.example.com/".to_string()),
             ..Default::default()
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn git_webhooks_fall_back_to_the_external_url_then_the_local_default() {
-        let settings = temps_core::AppSettings {
+        let settings = temps_config::AppSettings {
             external_url: Some("https://console.example.com".to_string()),
             ..Default::default()
         };
@@ -120,7 +120,7 @@ mod tests {
             "https://console.example.com"
         );
         assert_eq!(
-            git_webhook_base_url(Some(&temps_core::AppSettings::default())),
+            git_webhook_base_url(Some(&temps_config::AppSettings::default())),
             "http://localhost:8080"
         );
         // An unreadable settings row behaves like an unconfigured one.

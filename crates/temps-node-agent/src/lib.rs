@@ -31,7 +31,7 @@ pub mod node_runtime;
 mod output_buffer;
 pub mod overlay_addresses;
 mod overlay_driver;
-mod plugin_build_handler;
+pub mod plugin_build_handler;
 pub mod private_check;
 pub mod public_ingress;
 pub mod public_ingress_manager;
@@ -47,6 +47,8 @@ pub mod shield;
 pub mod tailnet_identity;
 pub mod tailscale_api;
 pub mod tailscale_serve;
+#[cfg(test)]
+mod test_engines;
 pub mod worker_metrics;
 
 use serde::{Deserialize, Serialize};

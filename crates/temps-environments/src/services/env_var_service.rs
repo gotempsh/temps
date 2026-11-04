@@ -58,15 +58,32 @@ pub enum EnvVarError {
     /// optional — omitting it keeps the existing ciphertext — but explicitly
     /// passing an empty string is a logic error in the caller, and a
     /// destructive one: the write cannot be read back or undone.
+    ///
+    /// `omit_keeps_stored` says whether the caller's write path keeps the
+    /// stored value when the value is omitted (this crate's service does);
+    /// only then does the message tell the user to omit it. temps-projects'
+    /// legacy service has no such path and leaves it `false`.
     #[error(
-        "Secret env var '{key}' requires a non-empty value. Omit the value entirely to keep the one already stored."
+        "Secret env var '{key}' requires a non-empty value{}",
+        secret_value_required_hint(*.omit_keeps_stored)
     )]
-    SecretValueRequired { key: String },
+    SecretValueRequired {
+        key: String,
+        omit_keeps_stored: bool,
+    },
 
     #[error(
         "Secret environment variable '{key}' (id={var_id}) is write-only and cannot be revealed"
     )]
     SecretValueCannotBeRevealed { var_id: i32, key: String },
+
+    /// Raised by temps-projects' legacy env var service, which has no
+    /// authorization or audit context: a secret's plaintext is available only
+    /// through this crate's permission-checked, audited reveal flow.
+    #[error(
+        "Secret env var '{key}' (id={var_id}) must be read through the audited reveal endpoint"
+    )]
+    SecretValueRequiresAuditedReveal { var_id: i32, key: String },
 
     #[error(
         "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
@@ -80,6 +97,14 @@ pub enum EnvVarError {
 
     #[error("Other error: {0}")]
     Other(String),
+}
+
+fn secret_value_required_hint(omit_keeps_stored: bool) -> &'static str {
+    if omit_keeps_stored {
+        ". Omit the value entirely to keep the one already stored."
+    } else {
+        ""
+    }
 }
 
 impl From<sea_orm::DbErr> for EnvVarError {
@@ -438,7 +463,10 @@ impl EnvVarService {
         is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
         if is_secret && value.is_empty() {
-            return Err(EnvVarError::SecretValueRequired { key });
+            return Err(EnvVarError::SecretValueRequired {
+                key,
+                omit_keeps_stored: true,
+            });
         }
 
         let encrypted_value = self.encrypt_value(&key, &value)?;
@@ -628,7 +656,10 @@ impl EnvVarService {
                     // credential is unusable and the classification cannot
                     // be demoted. Mirrors the create-time guard.
                     if final_is_secret && value_is_explicitly_empty {
-                        return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                        return Err(EnvVarError::SecretValueRequired {
+                            key: key.clone(),
+                            omit_keeps_stored: true,
+                        });
                     }
 
                     // A promotion is the transition non-secret -> secret. It is
@@ -1066,6 +1097,39 @@ mod tests {
             is_secret,
             secret_suggestion_dismissed_at: None,
         }
+    }
+
+    #[test]
+    fn secret_value_required_message_tells_the_user_to_omit_only_when_that_keeps_the_value() {
+        let keeps = EnvVarError::SecretValueRequired {
+            key: "API_KEY".to_string(),
+            omit_keeps_stored: true,
+        };
+        assert_eq!(
+            keeps.to_string(),
+            "Secret env var 'API_KEY' requires a non-empty value. Omit the value entirely to keep the one already stored."
+        );
+
+        let legacy = EnvVarError::SecretValueRequired {
+            key: "API_KEY".to_string(),
+            omit_keeps_stored: false,
+        };
+        assert_eq!(
+            legacy.to_string(),
+            "Secret env var 'API_KEY' requires a non-empty value"
+        );
+    }
+
+    #[test]
+    fn audited_reveal_message_names_the_variable() {
+        let error = EnvVarError::SecretValueRequiresAuditedReveal {
+            var_id: 7,
+            key: "API_KEY".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Secret env var 'API_KEY' (id=7) must be read through the audited reveal endpoint"
+        );
     }
 
     #[test]
@@ -2144,7 +2208,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+            EnvVarError::SecretValueRequired { ref key, .. } if key == "API_KEY"
         ));
     }
 
@@ -2180,7 +2244,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EnvVarError::SecretValueRequired { ref key } if key == "TOKEN"
+            EnvVarError::SecretValueRequired { ref key, .. } if key == "TOKEN"
         ));
     }
 
@@ -2266,8 +2330,8 @@ mod tests {
 mod integration_tests {
     use super::*;
     use chrono::Utc;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -2611,8 +2675,8 @@ mod integration_tests {
     mod secret_suggestion_lifecycle {
         use super::*;
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         async fn test_database() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {

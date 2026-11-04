@@ -64,25 +64,22 @@ pub fn build_router(
     config: &AgentConfig,
     network: SharedNetwork,
     platform: SharedPlatform,
+    engines: AgentEngines,
 ) -> Router {
     // ADR-048: the worker hosts sandboxes with the same Docker provider the
     // control plane uses for local ones.
     let sandbox_host = docker.clone().map(|docker| {
         let docker = Arc::new(docker);
-        let provider = Arc::new(
-            temps_ai_agents::sandbox::docker::DockerSandboxProvider::new(
-                docker.clone(),
-                temps_ai_agents::sandbox::docker::DockerSandboxConfig {
-                    control_plane_url: config.control_plane_url.clone(),
-                    // Bound exec output while Docker streams it, not after: the
-                    // exec response is cut to this size anyway.
-                    exec_output_limit: Some(
-                        temps_ai_agents::sandbox::remote::WORKER_EXEC_OUTPUT_LIMIT,
-                    ),
-                    ..Default::default()
-                },
-            ),
-        );
+        let provider = Arc::new(temps_sandbox_providers::docker::DockerSandboxProvider::new(
+            docker.clone(),
+            temps_sandbox_providers::docker::DockerSandboxConfig {
+                control_plane_url: config.control_plane_url.clone(),
+                // Bound exec output while Docker streams it, not after: the
+                // exec response is cut to this size anyway.
+                exec_output_limit: Some(temps_sandbox_providers::remote::WORKER_EXEC_OUTPUT_LIMIT),
+                ..Default::default()
+            },
+        ));
         spawn_sandbox_quarantine(provider.clone(), config.node_name.clone());
         SandboxHost {
             provider,
@@ -101,6 +98,8 @@ pub fn build_router(
     ));
     let state = Arc::new(AgentState {
         container_deployer,
+        service_runtime: engines.service_runtime,
+        plugin_builder: engines.plugin_builder,
         image_builder,
         docker,
         overlay_bridge_address: network.overlay_bridge_address,
@@ -413,7 +412,7 @@ pub(crate) fn sandbox_router(
 /// is logged, not fatal — the node still refuses to recover a stale sandbox
 /// when it is next accessed.
 fn spawn_sandbox_quarantine(
-    provider: Arc<temps_ai_agents::sandbox::docker::DockerSandboxProvider>,
+    provider: Arc<temps_sandbox_providers::docker::DockerSandboxProvider>,
     node_name: String,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -1135,19 +1134,31 @@ fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentErro
     Ok(())
 }
 
-/// Options of [`start_agent_server_with`] that older callers do not set.
-#[derive(Debug, Clone)]
+/// Options of [`start_agent_server_with`].
+#[derive(Clone)]
 pub struct AgentServerOptions {
     /// Run the node runtime and advertise the `state_stream` capability
     /// (ADR-055 §7). Off, the agent is driven through `/agent/*` only, as
     /// before; `temps agent --disable-state-stream` is the rollback.
     pub state_stream: bool,
+    pub engines: AgentEngines,
 }
 
-impl Default for AgentServerOptions {
-    fn default() -> Self {
-        Self { state_stream: true }
+impl AgentServerOptions {
+    pub fn new(engines: AgentEngines) -> Self {
+        Self {
+            state_stream: true,
+            engines,
+        }
     }
+}
+
+/// The heavy code a worker calls but does not build: the database engines and
+/// the plugin compiler. The binary that starts the agent passes them in.
+#[derive(Clone)]
+pub struct AgentEngines {
+    pub service_runtime: Arc<dyn temps_service_protocol::NodeServiceRuntime>,
+    pub plugin_builder: Arc<dyn crate::plugin_build_handler::PluginContainerBuilder>,
 }
 
 /// Start the agent server. This blocks until the server shuts down.
@@ -1158,6 +1169,7 @@ pub async fn start_agent_server(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
+    engines: AgentEngines,
 ) -> Result<(), crate::AgentError> {
     start_agent_server_with(
         container_deployer,
@@ -1166,7 +1178,7 @@ pub async fn start_agent_server(
         config,
         network,
         docker_socket_grant,
-        AgentServerOptions::default(),
+        AgentServerOptions::new(engines),
     )
     .await
 }
@@ -1214,6 +1226,7 @@ pub async fn start_agent_server_with(
         &config,
         network.clone(),
         platform.clone(),
+        options.engines.clone(),
     );
 
     // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
@@ -1785,6 +1798,10 @@ pub(crate) mod tests {
                 dns_policy: temps_node_dns::open_dns_policy_slot(),
             },
             Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
         )
     }
 
@@ -1958,6 +1975,10 @@ pub(crate) mod tests {
                 dns_policy: temps_node_dns::open_dns_policy_slot(),
             },
             Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let agent_url = format!("http://{}", listener.local_addr().unwrap());
@@ -2055,6 +2076,10 @@ pub(crate) mod tests {
                 dns_policy: temps_node_dns::open_dns_policy_slot(),
             },
             Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
         );
         for route in ["/agent/containers/deploy", "/agent/v2/containers/deploy"] {
             for (token, status) in [(None, 401), (Some("wrong"), 401), (Some("secret"), 422)] {

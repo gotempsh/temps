@@ -516,8 +516,8 @@ describe('pairing expiry', () => {
 describe('SSH enrollment steps', () => {
   test('match the steps the server reports, in order', () => {
     // The `progress.step(...)` calls in
-    // crates/temps-deployments/src/services/node_ssh.rs (`enroll`) and
-    // the heartbeat wait in crates/temps-deployments/src/services/node_ssh_enrollment.rs.
+    // crates/temps-nodes/src/services/node_ssh.rs (`enroll`) and
+    // the heartbeat wait in crates/temps-nodes/src/services/node_ssh_enrollment.rs.
     // Update both sides together: an unknown step shows no progress.
     expect(SSH_ENROLLMENT_STEPS).toEqual([
       'connecting',

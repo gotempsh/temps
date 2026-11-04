@@ -238,7 +238,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                                 .await
                                 .ok()
                                 .flatten()
-                                .map(|r| temps_core::AppSettings::from_json(r.data))
+                                .map(|r| temps_config::AppSettings::from_json(r.data))
                                 .and_then(|s| s.external_url);
                             if let Some(base_url) = base_url {
                                 let url = format!(

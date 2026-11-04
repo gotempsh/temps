@@ -5,7 +5,7 @@
 //!
 //! `start_console_api` returns `anyhow::Result` because it glues together
 //! dozens of plugin and service errors. The checks an operator can actually
-//! fix on a first run (Docker, GeoLite2, logs directory, log storage, the
+//! fix on a first run (Docker, logs directory, log storage, the
 //! initial admin, the listener address) raise a typed error from this module
 //! instead of a formatted string, so [`summarize`] can recover *which* check
 //! failed from the `anyhow` chain and pair it with concrete remediation. The
@@ -30,16 +30,6 @@ pub enum ConsoleStartupError {
         /// Endpoint description, e.g. `unix:///var/run/docker.sock (from DOCKER_HOST)`.
         endpoint: String,
         reason: String,
-    },
-
-    #[error("{message}")]
-    GeoDatabase {
-        /// Where the database was looked for, in order.
-        checked: Vec<PathBuf>,
-        /// Why the automatic download failed.
-        reason: String,
-        /// Full operator guidance, logged as-is.
-        message: String,
     },
 
     #[error("{}", logs_directory_message(.path, .data_dir, .reason))]
@@ -163,23 +153,6 @@ fn summarize_typed(error: &ConsoleStartupError) -> ConsoleStartupFailure {
                 "Check with `temps doctor`, then restart `temps serve`.".to_string(),
             ],
         ),
-        ConsoleStartupError::GeoDatabase { checked, reason, .. } => {
-            let locations = checked
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            ConsoleStartupFailure::new(
-                ConsoleStartupCheck::GeoDatabase,
-                "GeoLite2-City.mmdb is missing and could not be downloaded",
-                format!("Checked: {locations}. Download error: {reason}"),
-                vec![
-                    "Check that this server can reach the internet over HTTPS; the database is downloaded automatically on startup.".to_string(),
-                    "Or download GeoLite2-City from MaxMind (free account) and copy GeoLite2-City.mmdb into the data directory.".to_string(),
-                    "Restart `temps serve`.".to_string(),
-                ],
-            )
-        }
         ConsoleStartupError::LogsDirectory {
             path,
             data_dir,

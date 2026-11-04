@@ -8,6 +8,7 @@ use sea_orm::{
 use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::problemdetails::Problem;
 use temps_core::secret_string::SecretString;
 use temps_core::{
@@ -778,7 +779,7 @@ impl EnvironmentService {
         replicas: Option<i32>,
     ) -> Result<environments::Model, EnvironmentError> {
         if let Some(replicas) = replicas {
-            temps_entities::deployment_config::validate_replicas(replicas).map_err(|e| {
+            temps_config::deployment_config::validate_replicas(replicas).map_err(|e| {
                 EnvironmentError::InvalidInput(format!(
                     "Invalid replicas for new environment '{name}' in project {project_id}: {e}"
                 ))
@@ -1052,7 +1053,7 @@ impl EnvironmentService {
         project_id_param: i32,
         env_id: i32,
         settings: crate::handlers::UpdateEnvironmentSettingsRequest,
-        ceiling_enforcement: temps_core::CeilingEnforcement,
+        ceiling_enforcement: temps_config::CeilingEnforcement,
     ) -> Result<environments::Model, EnvironmentError> {
         // Everything that does not need the environment row happens before
         // the transaction below, so it never holds the placement lock (and
@@ -1061,7 +1062,7 @@ impl EnvironmentService {
         // concurrent saves queued on the lock would otherwise hold every
         // connection it could use. Hashing is CPU-bound and gains nothing
         // from the lock either.
-        let tenant_ceilings = if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+        let tenant_ceilings = if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|e| {
                 EnvironmentError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for environment {env_id}: {e}"
@@ -2425,7 +2426,7 @@ mod tests {
                 },
                 // These fixtures assert merge/persistence behaviour, not policy;
                 // bypassing the ceiling check keeps their mock query sequence intact.
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await;
 
@@ -2543,7 +2544,7 @@ mod tests {
                 },
                 // These fixtures assert merge/persistence behaviour, not policy;
                 // bypassing the ceiling check keeps their mock query sequence intact.
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await;
         assert!(
@@ -2652,7 +2653,7 @@ mod tests {
                         health: change,
                         ..empty_settings_request()
                     },
-                    temps_core::CeilingEnforcement::Bypass,
+                    temps_config::CeilingEnforcement::Bypass,
                 )
                 .await
                 .unwrap();
@@ -2709,7 +2710,7 @@ mod tests {
                     shield_exempt_paths: Some(vec![" /api/* ".into()]),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await
             .unwrap();
@@ -2762,7 +2763,7 @@ mod tests {
                     attack_mode: Some(Some(false)),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await
             .unwrap();
@@ -2788,7 +2789,7 @@ mod tests {
                     shield_exempt_paths: Some(vec!["/ok/*".into(), "api/*".into()]),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await
             .unwrap_err();
@@ -2808,9 +2809,9 @@ mod tests {
 
     fn service_with_ceilings(
         db: Arc<sea_orm::DatabaseConnection>,
-        ceilings: temps_core::TenantResourceCeilings,
+        ceilings: temps_config::TenantResourceCeilings,
     ) -> EnvironmentService {
-        let app_settings = temps_core::AppSettings {
+        let app_settings = temps_config::AppSettings {
             tenant_resource_ceilings: ceilings,
             ..Default::default()
         };
@@ -2942,7 +2943,7 @@ mod tests {
         );
         let svc = service_with_ceilings(
             db,
-            temps_core::TenantResourceCeilings {
+            temps_config::TenantResourceCeilings {
                 max_memory_limit_mb: 2048,
                 ..Default::default()
             },
@@ -2958,7 +2959,7 @@ mod tests {
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Enforce,
+                temps_config::CeilingEnforcement::Enforce,
             )
             .await
             .expect_err("unlimited memory must be refused under a ceiling");
@@ -2993,7 +2994,7 @@ mod tests {
         );
         let svc = service_with_ceilings(
             db,
-            temps_core::TenantResourceCeilings {
+            temps_config::TenantResourceCeilings {
                 max_memory_limit_mb: 2048,
                 ..Default::default()
             },
@@ -3009,7 +3010,7 @@ mod tests {
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
             )
             .await;
 
@@ -3582,8 +3583,8 @@ mod tests {
     #[tokio::test]
     async fn a_save_racing_a_node_removal_waits_and_then_rejects_the_removed_node() {
         use sea_orm::TransactionTrait;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -3664,7 +3665,7 @@ mod tests {
                     project_id,
                     environment_id,
                     settings_with_target_nodes(vec![0, node_id]),
-                    temps_core::CeilingEnforcement::Bypass,
+                    temps_config::CeilingEnforcement::Bypass,
                 )
                 .await
         });
@@ -3712,8 +3713,8 @@ mod tests {
     /// read before the transaction starts.
     #[tokio::test]
     async fn a_ceiling_checked_save_needs_only_one_pooled_connection() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
@@ -3787,7 +3788,7 @@ mod tests {
                 project.id,
                 environment.id,
                 request,
-                temps_core::CeilingEnforcement::Enforce,
+                temps_config::CeilingEnforcement::Enforce,
             ),
         )
         .await

@@ -428,7 +428,7 @@ mod tests {
 mod integration_tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     async fn test_database() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

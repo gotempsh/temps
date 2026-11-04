@@ -3,12 +3,12 @@
 
 import { defineConfig } from '@hey-api/openapi-ts'
 
-// Generates the typed client into src/. Input is the checked-in openapi.json
-// (kept in sync with the server's spec — regenerate after API changes via
-// `bun run generate`). Mirrors the CLI's generator config so the output shape
-// is identical, but this package is the single shared source of truth.
+// Generates the typed client into src/. Input is the canonical spec committed
+// at apps/temps-cli/openapi.json, the only copy in the repository (regenerate
+// after API changes via `bun run generate`). Mirrors the CLI's generator config
+// so the output shape is identical.
 export default defineConfig({
-  input: 'openapi.json',
+  input: '../../apps/temps-cli/openapi.json',
   output: {
     path: 'src',
     format: 'prettier',

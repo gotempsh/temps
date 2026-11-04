@@ -64,8 +64,9 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
     EntityTrait, IntoActiveModel, QueryFilter, Statement,
 };
+use temps_config::AppSettings;
 use temps_core::route_table::RouteTableRefresher;
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::PublicHostnameStrategy;
 use temps_entities::traefik_discovered_routes as discovered;
 use temps_entities::traefik_route_certificates as route_certs;
 // No direct dependency on temps-monitoring here: that crate depends on

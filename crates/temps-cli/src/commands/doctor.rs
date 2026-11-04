@@ -747,7 +747,7 @@ impl DoctorCommand {
         // read-only schema guard: unlike Sea-ORM's migrator it never creates
         // the ledger table, and it understands a database migrated by a newer
         // release (e.g. after a binary-only rollback).
-        let schema_status = temps_database::check_schema_compatibility(&db)
+        let schema_status = temps_schema::check_schema_compatibility(&db)
             .await
             .map_err(|error| error.to_string());
         report.add("Migrations", migration_check_result(schema_status.as_ref()));
@@ -803,7 +803,7 @@ impl DoctorCommand {
                 use sea_orm::TryGetable;
                 match serde_json::Value::try_get_by(&row, "data") {
                     Ok(data) => {
-                        let settings = temps_core::AppSettings::from_json(data);
+                        let settings = temps_config::AppSettings::from_json(data);
 
                         // External URL
                         if let Some(ref url) = settings.external_url {
@@ -967,7 +967,7 @@ impl DoctorCommand {
         }
 
         match (geo.last_check_status.as_deref(), geo.last_check_at) {
-            (Some(temps_core::GEO_CHECK_STATUS_ERROR), checked_at) => {
+            (Some(temps_config::GEO_CHECK_STATUS_ERROR), checked_at) => {
                 let when = checked_at
                     .map(iso8601)
                     .unwrap_or_else(|| "an unknown time".to_string());
@@ -982,7 +982,7 @@ impl DoctorCommand {
                     )),
                 );
             }
-            (Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY), checked_at) => {
+            (Some(temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY), checked_at) => {
                 let when = checked_at
                     .map(iso8601)
                     .unwrap_or_else(|| "an unknown time".to_string());
@@ -1311,7 +1311,7 @@ pub(super) fn other_data_dirs_with(data_dir: &Path, home: &Path, marker: &Path) 
 /// a failure.
 async fn read_geo_settings(
     db: &sea_orm::DatabaseConnection,
-) -> anyhow::Result<temps_core::GeoSettings> {
+) -> anyhow::Result<temps_config::GeoSettings> {
     use sea_orm::TryGetable;
 
     let Some(row) = db
@@ -1322,12 +1322,12 @@ async fn read_geo_settings(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to query the settings row: {}", e))?
     else {
-        return Ok(temps_core::GeoSettings::default());
+        return Ok(temps_config::GeoSettings::default());
     };
 
     let data = serde_json::Value::try_get_by(&row, "data")
         .map_err(|e| anyhow::anyhow!("Failed to read the settings 'data' column: {:?}", e))?;
-    Ok(temps_core::AppSettings::from_json(data).geo)
+    Ok(temps_config::AppSettings::from_json(data).geo)
 }
 
 fn iso8601(value: chrono::DateTime<chrono::Utc>) -> String {
@@ -1471,8 +1471,8 @@ fn mask_database_url(url: &str) -> String {
 /// the channel so it installs what was suggested (plain `temps upgrade`
 /// tracks stable).
 /// Doctor's "Migrations" line for a classified schema.
-fn migration_check_result(status: Result<&temps_database::SchemaStatus, &String>) -> CheckResult {
-    use temps_database::SchemaStatus;
+fn migration_check_result(status: Result<&temps_schema::SchemaStatus, &String>) -> CheckResult {
+    use temps_schema::SchemaStatus;
     let pending_hint = |count: usize| {
         format!("{count} PENDING — run `temps migrate` before restarting the server")
     };
@@ -1580,7 +1580,7 @@ mod tests {
 
     #[test]
     fn migration_check_reports_every_schema_state() {
-        use temps_database::SchemaStatus;
+        use temps_schema::SchemaStatus;
         let names = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
 
         assert!(matches!(

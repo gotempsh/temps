@@ -473,8 +473,8 @@ impl IngressService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     #[tokio::test]
     async fn a_missing_environment_is_reported_with_its_ids() {

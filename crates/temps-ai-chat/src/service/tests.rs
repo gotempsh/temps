@@ -1086,13 +1086,13 @@ async fn active_assistant_checkpoint_is_written_to_the_message_row() {
 /// round (a list of [`ChatStreamDelta`]s to stream, or an error to fail the
 /// call with) so a test can drive the agentic loop round-by-round, while
 /// counting how many model calls were made.
-struct ScriptedAi {
+pub(super) struct ScriptedAi {
     /// Front-to-back queue of rounds for successive `chat_stream_turn` calls.
     rounds: Mutex<std::collections::VecDeque<Result<Vec<ChatStreamDelta>, AiError>>>,
     /// Counts `chat_stream_turn` invocations (kept named `chat_calls` for the
     /// round-cap assertions).
-    chat_calls: Arc<std::sync::atomic::AtomicUsize>,
-    requests: Arc<Mutex<Vec<ChatTurnRequest>>>,
+    pub(super) chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) requests: Arc<Mutex<Vec<ChatTurnRequest>>>,
     available: bool,
     /// Advance the paused test clock by this much on every model call, so a
     /// deadline can be exercised without a test that actually waits.
@@ -1100,7 +1100,7 @@ struct ScriptedAi {
 }
 
 impl ScriptedAi {
-    fn new(rounds: Vec<Result<Vec<ChatStreamDelta>, AiError>>) -> Self {
+    pub(super) fn new(rounds: Vec<Result<Vec<ChatStreamDelta>, AiError>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into_iter().collect()),
             chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1111,7 +1111,7 @@ impl ScriptedAi {
     }
 
     /// Advance the paused clock by `d` on each model call.
-    fn advancing(mut self, d: std::time::Duration) -> Self {
+    pub(super) fn advancing(mut self, d: std::time::Duration) -> Self {
         self.advance_per_round = Some(d);
         self
     }
@@ -1340,8 +1340,8 @@ impl AiService for HostHarnessOnlyAi {
 }
 
 /// A stub provider exposing a single `echo` tool, counting executions.
-struct StubProvider {
-    tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+pub(super) struct StubProvider {
+    pub(super) tool_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct AuthRecordingProvider {
@@ -1570,7 +1570,7 @@ async fn runtime_update_fails_closed_on_database_error() {
         .is_ok());
 }
 
-fn test_conversation() -> ai_conversations::Model {
+pub(super) fn test_conversation() -> ai_conversations::Model {
     let now = Utc::now();
     ai_conversations::Model {
         id: 1,
@@ -1600,7 +1600,7 @@ fn test_conversation() -> ai_conversations::Model {
     }
 }
 
-fn test_auth() -> AuthContext {
+pub(super) fn test_auth() -> AuthContext {
     let now = Utc::now();
     let user = temps_entities::users::Model {
         id: 1,
@@ -2187,7 +2187,7 @@ async fn tool_authorization_caps_an_admin_key_whose_owner_was_demoted() {
     assert!(!refreshed.has_permission(&Permission::UsersWrite));
 }
 
-fn test_request_metadata() -> RequestMetadata {
+pub(super) fn test_request_metadata() -> RequestMetadata {
     RequestMetadata {
         ip_address: "127.0.0.1".to_string(),
         user_agent: "temps-ai-chat-test".to_string(),
@@ -2341,7 +2341,7 @@ fn service_with_db(ai: Arc<dyn AiService>, db: DatabaseConnection) -> Conversati
     }
 }
 
-fn echo_tools() -> Vec<ChatTool> {
+pub(super) fn echo_tools() -> Vec<ChatTool> {
     let tools = vec![ChatTool {
         name: "echo".to_string(),
         description: "Echoes its input.".to_string(),
@@ -2365,7 +2365,7 @@ fn service_with(ai: Arc<dyn AiService>) -> (ConversationService, Vec<ChatTool>) 
 /// request-only test session would now (correctly) fail closed.
 /// The `admin` role row `current_user_role` looks up when a refresh
 /// re-checks the key owner's role.
-fn owner_admin_role() -> temps_entities::roles::Model {
+pub(super) fn owner_admin_role() -> temps_entities::roles::Model {
     let now = Utc::now();
     temps_entities::roles::Model {
         id: 1,
@@ -2377,7 +2377,7 @@ fn owner_admin_role() -> temps_entities::roles::Model {
 
 /// The test user's grant of [`owner_admin_role`]: the key owner is still
 /// an admin, so the key keeps its full grant.
-fn owner_admin_grant() -> temps_entities::user_roles::Model {
+pub(super) fn owner_admin_grant() -> temps_entities::user_roles::Model {
     let now = Utc::now();
     temps_entities::user_roles::Model {
         id: 1,
@@ -3697,7 +3697,7 @@ fn db_service(db: DatabaseConnection) -> ConversationService {
     db_service_from_arc(Arc::new(db))
 }
 
-fn db_service_from_arc(db: Arc<DatabaseConnection>) -> ConversationService {
+pub(super) fn db_service_from_arc(db: Arc<DatabaseConnection>) -> ConversationService {
     ConversationService {
         db,
         ai: Arc::new(ScriptedAi::new(vec![])),
@@ -4709,11 +4709,11 @@ async fn every_conversation_lookup_is_scoped_to_the_current_creator() {
         .is_empty());
     assert!(matches!(
         svc.get_by_public_id(7, 11, "owned-session").await,
-        Err(ChatError::NotFound(_))
+        Err(ChatError::NotFound { .. })
     ));
     assert!(matches!(
         svc.get_by_id(7, 11, 99).await,
-        Err(ChatError::NotFound(_))
+        Err(ChatError::NotFound { .. })
     ));
 
     drop(svc);
@@ -4745,7 +4745,9 @@ async fn another_project_member_cannot_load_or_resume_an_owned_cli_session() {
         .get_by_public_id(7, 22, "user-11-claude-session")
         .await
         .expect_err("another member must receive the same not-found as an unknown id");
-    assert!(matches!(error, ChatError::NotFound(id) if id == "user-11-claude-session"));
+    assert!(
+        matches!(error, ChatError::NotFound { conversation_id: id } if id == "user-11-claude-session")
+    );
 
     drop(svc);
     let db = Arc::try_unwrap(db).expect("release mock database");
@@ -4771,7 +4773,7 @@ async fn test_get_by_id_retains_project_scope() {
         .get_by_id(8, 5, 1)
         .await
         .expect_err("cross-project child lookup must not resolve");
-    assert!(matches!(err, ChatError::NotFound(_)));
+    assert!(matches!(err, ChatError::NotFound { .. }));
 }
 
 // list_conversations: returns the project's active conversations.
@@ -5072,12 +5074,6 @@ async fn conversation_search_matches_title_or_project_before_pagination() {
     assert!(values.contains(r"%barber\\_50\\%%"), "{values}");
 }
 
-#[test]
-fn escape_like_matches_metacharacters_literally() {
-    assert_eq!(escape_like(r"50%_off\"), r"50\%\_off\\");
-    assert_eq!(escape_like("plain"), "plain");
-}
-
 // Legacy project toggle values no longer affect chat visibility. Access is
 // determined by the current user's project membership and permissions.
 #[tokio::test]
@@ -5157,7 +5153,9 @@ async fn test_get_by_public_id_not_found_is_scoped_error() {
         .await
         .expect_err("should not find a conversation in the wrong project");
     match err {
-        ChatError::NotFound(id) => assert_eq!(id, "pubA"),
+        ChatError::NotFound {
+            conversation_id: id,
+        } => assert_eq!(id, "pubA"),
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
@@ -6296,7 +6294,7 @@ impl AiService for InterruptedStreamAi {
     }
 }
 
-async fn collect_all(
+pub(super) async fn collect_all(
     stream: Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>>,
 ) -> Vec<Result<ChatStreamEvent, ChatError>> {
     let mut stream = stream;

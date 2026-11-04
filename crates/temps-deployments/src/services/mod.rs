@@ -6,20 +6,20 @@ pub mod services;
 pub use services::*;
 
 pub mod compose_check_service;
-pub mod compose_placement;
+pub use temps_nodes::services::compose_placement;
 pub mod container_operations;
 pub use container_operations::*;
 
 pub mod types;
 pub use types::*;
 
-pub mod cluster_network;
-pub mod node_pairing;
-pub mod node_pairing_admin;
-pub mod node_ssh;
-pub mod node_ssh_enrollment;
-pub mod wireguard_mesh;
-pub mod worker_metrics_collector;
+pub use temps_nodes::services::cluster_network;
+pub use temps_nodes::services::node_pairing;
+pub use temps_nodes::services::node_pairing_admin;
+pub use temps_nodes::services::node_ssh;
+pub use temps_nodes::services::node_ssh_enrollment;
+pub use temps_nodes::services::wireguard_mesh;
+pub use temps_nodes::services::worker_metrics_collector;
 
 pub mod job_processor;
 pub use job_processor::*;
@@ -61,28 +61,29 @@ pub use external_deployment::*;
 pub mod screenshot_operation;
 pub use screenshot_operation::*;
 
-pub mod docker_cleanup_service;
 pub use docker_cleanup_service::*;
+pub use temps_docker_housekeeping::services::docker_cleanup_service;
 
-pub mod docker_disk_usage;
 pub use docker_disk_usage::*;
+pub use temps_docker_housekeeping::services::docker_disk_usage;
 
-pub mod deployment_token_service;
 pub use deployment_token_service::*;
+pub use temps_ci_tokens::services::deployment_token_service;
 
 pub mod remote_deployment_service;
 pub use remote_deployment_service::*;
 
-pub mod node_service;
 pub use node_service::*;
+pub use temps_nodes::services::edge_routes;
+pub use temps_nodes::services::node_service;
 
-pub mod node_plugin_builder;
-pub mod node_public_ingress;
-pub mod node_scheduler;
 pub use node_scheduler::*;
+pub use temps_nodes::services::node_plugin_builder;
+pub use temps_nodes::services::node_public_ingress;
+pub use temps_nodes::services::node_scheduler;
 
-pub mod remote_log_source;
 pub use remote_log_source::*;
+pub use temps_nodes::services::remote_log_source;
 
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;
@@ -99,30 +100,30 @@ pub use failure_classifier::{
 pub mod failure_report_service;
 pub use failure_report_service::*;
 
-pub mod traefik_discovery_service;
+pub use temps_traefik_discovery::services::traefik_discovery_service;
 pub use traefik_discovery_service::*;
 
-pub mod cert_validator;
 pub use cert_validator::*;
+pub use temps_traefik_discovery::services::cert_validator;
 
 pub mod source_drop_service;
 pub use source_drop_service::*;
 
 pub(crate) mod deployment_commit;
 
-pub mod ci_dispatch;
+pub use temps_ci_tokens::services::ci_dispatch;
 
 pub mod runtime_health;
 
 pub mod workload_placement;
 pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
 pub mod workload_volumes;
-pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
-pub mod node_state;
-pub mod resolver_coverage;
 pub use resolver_coverage::{
     DeploymentWithoutResolver, ResolverCoverageError, ResolverCoverageHost, ResolverCoverageService,
 };
+pub use temps_nodes::services::node_state;
+pub use temps_nodes::services::resolver_coverage;
+pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
 pub mod plane_deployer;
 pub use node_state::{
     AgentApiDriver, NodeStateError, NodeStateService, NodeStateStatus, NodeWorkloadPlacement,

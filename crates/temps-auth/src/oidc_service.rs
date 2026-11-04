@@ -2742,9 +2742,8 @@ mod tests {
     // testcontainers); skips gracefully rather than failing the run when
     // Docker is unavailable, per CLAUDE.md.
 
-    async fn test_oidc_service() -> Option<(temps_database::test_utils::TestDatabase, OidcService)>
-    {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_oidc_service() -> Option<(temps_test_utils::TestDatabase, OidcService)> {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Docker not available, skipping test: {e}");
@@ -3680,12 +3679,10 @@ mod tests {
     }
     #[tokio::test]
     async fn managed_cloud_requires_verified_email_for_new_and_returning_subjects() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return;
@@ -3780,12 +3777,10 @@ mod tests {
     }
     #[tokio::test]
     async fn login_state_is_single_use_expires_at_its_deadline_and_redacts_state() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return;

@@ -17,13 +17,11 @@ readme = "README.md"
 [dependencies]
 temps-analytics-backend = { path = "../temps-analytics-backend" }
 clickhouse = { workspace = true }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-migrations = { path = "../temps-migrations" }
 schemars = { workspace = true }
 reqwest = { workspace = true }
 scraper = { workspace = true }
@@ -48,6 +46,8 @@ moka = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+temps-migrations = { path = "../temps-migrations" }
+temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

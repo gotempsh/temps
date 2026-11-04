@@ -468,14 +468,6 @@ impl ExternalServiceManager {
                 })?;
             Ok((result.exit_code, result.stdout, result.stderr))
         } else {
-            // Local path — augment exec_in_local_container with env
-            // support. Until we extend that helper, fall back to a
-            // bollard call here.
-            use bollard::exec::{CreateExecOptions, StartExecOptions};
-            use futures::StreamExt;
-
-            let docker = self.require_docker()?;
-            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let env_strings: Vec<String> =
                 env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             let env_refs: Option<Vec<&str>> = if env_strings.is_empty() {
@@ -483,72 +475,8 @@ impl ExternalServiceManager {
             } else {
                 Some(env_strings.iter().map(|s| s.as_str()).collect())
             };
-
-            let exec = docker
-                .create_exec(
-                    &member.container_name,
-                    CreateExecOptions {
-                        cmd: Some(cmd_refs),
-                        env: env_refs,
-                        user,
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
+            self.exec_in_local_container_with_env(&member.container_name, &cmd, user, env_refs)
                 .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!(
-                        "Failed to create exec in '{}': {}",
-                        member.container_name, e
-                    ),
-                })?;
-
-            let output = docker
-                .start_exec(
-                    &exec.id,
-                    Some(StartExecOptions {
-                        detach: false,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!("Failed to start exec in '{}': {}", member.container_name, e),
-                })?;
-
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-                while let Some(chunk) = output.next().await {
-                    match chunk {
-                        Ok(bollard::container::LogOutput::StdOut { message }) => {
-                            stdout.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(bollard::container::LogOutput::StdErr { message }) => {
-                            stderr.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(other) => stdout.push_str(&other.to_string()),
-                        Err(e) => {
-                            return Err(ExternalServiceError::DockerError {
-                                id: 0,
-                                reason: format!("Exec stream error: {}", e),
-                            });
-                        }
-                    }
-                }
-            }
-
-            let inspect = docker.inspect_exec(&exec.id).await.map_err(|e| {
-                ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!("Failed to inspect exec result: {}", e),
-                }
-            })?;
-            let exit_code = inspect.exit_code.unwrap_or(-1);
-            Ok((exit_code, stdout, stderr))
         }
     }
 
@@ -1024,6 +952,156 @@ echo "[restore] Pre-seed complete"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `exec_in_local_container` and the local path of `exec_in_member_with_env`
+    /// are one function: env reaches the command, the streams stay apart and
+    /// the output is not capped.
+    #[tokio::test]
+    async fn local_cluster_exec_keeps_streams_apart_and_passes_env() {
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        };
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new("busybox:1.36"))
+            .await
+            .expect("pull the test image");
+        let name = format!("temps-cluster-exec-test-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                bollard::models::ContainerCreateBody {
+                    image: Some("busybox:1.36".to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the test container");
+        if let Err(error) = docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+        {
+            // The panic ends the test before its own cleanup can run.
+            let _ = docker
+                .remove_container(
+                    &name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            panic!("start the test container {name}: {error}");
+        }
+
+        let db =
+            std::sync::Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = std::sync::Arc::new(
+            temps_core::EncryptionService::new(&"0".repeat(64)).expect("encryption key"),
+        );
+        let dns = std::sync::Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let manager = crate::services::ExternalServiceManager::new(
+            db,
+            enc,
+            std::sync::Arc::new(docker.clone()),
+            dns,
+        );
+
+        let sh = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let plain = manager
+            .exec_in_local_container(
+                &name,
+                &sh(
+                    "i=0; while [ $i -lt 10000 ]; do echo 0123456789; i=$((i+1)); done; \
+                     echo err >&2; exit 8",
+                ),
+                None,
+            )
+            .await;
+        let with_env = manager
+            .exec_in_local_container_with_env(
+                &name,
+                &sh("echo \"$CLUSTER_VALUE\"; id -u"),
+                Some("nobody"),
+                Some(vec!["CLUSTER_VALUE=from-env"]),
+            )
+            .await;
+        let member = ServiceMemberInfo {
+            id: 1,
+            role: "data".to_string(),
+            node_id: None,
+            container_name: name.clone(),
+            hostname: None,
+            port: None,
+            status: "running".to_string(),
+            ordinal: 0,
+            compute_ip: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            live_state: None,
+        };
+        let through_member = manager
+            .exec_in_member_with_env(
+                &member,
+                sh("echo \"$MEMBER_VALUE\""),
+                None,
+                std::collections::HashMap::from([(
+                    "MEMBER_VALUE".to_string(),
+                    "member-env".to_string(),
+                )]),
+            )
+            .await;
+        let missing = manager
+            .exec_in_local_container(
+                "temps-cluster-exec-test-no-such-container",
+                &sh("true"),
+                None,
+            )
+            .await;
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let (exit_code, stdout, stderr) = plain.expect("exec");
+        assert_eq!(exit_code, 8);
+        assert_eq!(stdout.len(), 10_000 * 11);
+        assert_eq!(stderr, "err\n");
+
+        let (exit_code, stdout, _) = with_env.expect("exec");
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, "from-env\n65534\n");
+
+        let (exit_code, stdout, _) = through_member.expect("exec");
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, "member-env\n");
+
+        match missing {
+            Err(ExternalServiceError::DockerError { reason, .. }) => assert!(
+                reason.starts_with(
+                    "Failed to create exec in 'temps-cluster-exec-test-no-such-container': "
+                ),
+                "{reason}"
+            ),
+            other => panic!("expected a DockerError, got {other:?}"),
+        }
+    }
 
     fn test_s3_credentials() -> crate::S3Credentials {
         crate::S3Credentials {

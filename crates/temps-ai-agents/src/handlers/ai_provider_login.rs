@@ -27,9 +27,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::audit::AuditContext;
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 
 use crate::ai_cli::catalog::find_provider;
@@ -82,68 +82,9 @@ pub struct AiProviderLoginResponse {
     pub session: LoginSessionView,
 }
 
-impl From<LoginError> for Problem {
-    fn from(error: LoginError) -> Self {
-        match error {
-            LoginError::NotSupported { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Sign-in Not Supported")
-                .with_detail(error.to_string()),
-            LoginError::UnknownProvider { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Unknown AI Provider")
-                .with_detail(error.to_string()),
-            LoginError::NotInstalled { .. } => {
-                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
-                    .with_title("AI CLI Not Installed")
-                    .with_detail(error.to_string())
-            }
-            LoginError::AlreadyInProgress { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sign-in Already In Progress")
-                .with_detail(error.to_string()),
-            LoginError::ConcurrencyLimit { .. } => {
-                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
-                    .with_title("Too Many Sign-ins")
-                    .with_detail(error.to_string())
-            }
-            LoginError::NoSession { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("No Sign-in In Progress")
-                .with_detail(error.to_string()),
-            LoginError::NotWaitingForCode { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sign-in Not Waiting For A Code")
-                .with_detail(error.to_string()),
-            LoginError::InvalidCode { .. } | LoginError::InvalidUrl { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Invalid Sign-in Input")
-                    .with_detail(error.to_string())
-            }
-            LoginError::StateDirectoryInaccessible { .. } => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Sign-in Directory Unavailable")
-                    .with_detail(error.to_string())
-            }
-            LoginError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-                .with_title("Sign-in Timed Out")
-                .with_detail(error.to_string()),
-            LoginError::Cancelled { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sign-in Cancelled")
-                .with_detail(error.to_string()),
-            LoginError::Spawn { .. }
-            | LoginError::NoChallenge { .. }
-            | LoginError::DisallowedHost { .. }
-            | LoginError::CliRejected { .. }
-            | LoginError::NotCompleted { .. }
-            | LoginError::NotAuthenticated { .. }
-            | LoginError::CredentialFileMissing { .. }
-            | LoginError::CredentialImport { .. }
-            | LoginError::Io { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Sign-in Failed")
-                .with_detail(error.to_string()),
-        }
-    }
-}
-
 /// Authorize a sign-in operation for `provider_id`: settings write access and
 /// the catalog's host access requirement for running that CLI on this host.
-fn authorize(auth: &temps_auth::AuthContext, provider_id: &str) -> Result<(), Problem> {
+fn authorize(auth: &temps_authz::AuthContext, provider_id: &str) -> Result<(), Problem> {
     permission_guard!(auth, SettingsWrite);
     let provider = find_provider(provider_id).ok_or_else(|| {
         Problem::from(LoginError::UnknownProvider {
@@ -408,7 +349,7 @@ impl LoginCredentialSink for SettingsLoginSink {
 mod tests {
     use super::*;
 
-    fn auth_with(permissions: Vec<temps_auth::Permission>) -> temps_auth::AuthContext {
+    fn auth_with(permissions: Vec<temps_authz::Permission>) -> temps_authz::AuthContext {
         let now = chrono::Utc::now();
         let user = temps_entities::users::Model {
             id: 7,
@@ -430,7 +371,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        temps_auth::AuthContext::new_api_key(
+        temps_authz::AuthContext::new_api_key(
             user,
             None,
             Some(permissions),
@@ -441,7 +382,7 @@ mod tests {
 
     #[test]
     fn sign_in_requires_settings_write_and_the_provider_host_permission() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         // Claude Code: AiGatewayWrite is its host access requirement.
         assert!(authorize(
@@ -474,7 +415,7 @@ mod tests {
 
     #[test]
     fn codex_sign_in_requires_system_admin() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         assert!(authorize(
             &auth_with(vec![Permission::SettingsWrite, Permission::SystemAdmin]),
@@ -494,7 +435,7 @@ mod tests {
 
     #[test]
     fn unknown_providers_are_not_found_after_the_permission_check() {
-        use temps_auth::Permission;
+        use temps_authz::Permission;
 
         let error = authorize(
             &auth_with(vec![Permission::SettingsWrite, Permission::SystemAdmin]),

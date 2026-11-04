@@ -1246,8 +1246,8 @@ mod tests {
             "leap-second wait must stay within one minute, got {wait:?}"
         );
     }
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
 
     // Mock queue for tests
     struct MockQueue;
@@ -2492,7 +2492,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

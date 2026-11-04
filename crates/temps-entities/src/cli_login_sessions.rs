@@ -11,7 +11,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "cli_login_sessions")]
 pub struct Model {
     #[sea_orm(primary_key)]
@@ -44,6 +44,33 @@ pub struct Model {
     pub denied_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+}
+
+/// Hand-written so a stray `{:?}` cannot print the polling code or the minted
+/// API key: either one is enough to take over the login.
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Model")
+            .field("id", &self.id)
+            .field("device_code", &"***")
+            .field("user_code", &self.user_code)
+            .field("status", &self.status)
+            .field("user_id", &self.user_id)
+            .field("api_key_id", &self.api_key_id)
+            .field(
+                "api_key_plaintext",
+                &self.api_key_plaintext.as_ref().map(|_| "***"),
+            )
+            .field("client_name", &self.client_name)
+            .field("requested_ip", &self.requested_ip)
+            .field("expires_at", &self.expires_at)
+            .field("last_polled_at", &self.last_polled_at)
+            .field("approved_at", &self.approved_at)
+            .field("denied_at", &self.denied_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -94,5 +121,43 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_device_code_and_api_key_are_masked_in_debug_and_absent_from_json() {
+        let now = chrono::Utc::now();
+        let session = Model {
+            id: 3,
+            device_code: "stored-device-code".to_string(),
+            user_code: "ABCD-EFGH".to_string(),
+            status: "approved".to_string(),
+            user_id: Some(1),
+            api_key_id: Some(2),
+            api_key_plaintext: Some("stored-api-key".to_string()),
+            client_name: Some("laptop".to_string()),
+            requested_ip: None,
+            expires_at: now,
+            last_polled_at: None,
+            approved_at: Some(now),
+            denied_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let debug = format!("{session:?}");
+        assert!(!debug.contains("stored-device-code"), "{debug}");
+        assert!(!debug.contains("stored-api-key"), "{debug}");
+        // Still useful for debugging: whether a key is waiting, and the rest.
+        assert!(debug.contains("api_key_plaintext: Some("), "{debug}");
+        assert!(debug.contains("ABCD-EFGH"), "{debug}");
+
+        let json = serde_json::to_string(&session).expect("serializes");
+        assert!(!json.contains("stored-device-code"), "{json}");
+        assert!(!json.contains("stored-api-key"), "{json}");
     }
 }

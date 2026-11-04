@@ -10,6 +10,7 @@
 //! code relocated behind the trait.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -598,12 +599,6 @@ fn bind_filter_value(
     }
 }
 
-fn escape_like(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn append_pg_filter(
     filter: &TrafficFilter,
     conditions: &mut Vec<String>,
@@ -1039,7 +1034,7 @@ mod tests {
     /// whole-batch retry cannot insert them a second time.
     #[tokio::test]
     async fn a_multi_statement_batch_lands_whole_or_not_at_all() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1111,7 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn timescale_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

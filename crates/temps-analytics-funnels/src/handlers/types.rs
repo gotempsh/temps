@@ -24,6 +24,12 @@ pub struct FunnelResponse {
     pub updated_at: String,
 }
 
+/// Acknowledges a funnel update or delete.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FunnelMessageResponse {
+    pub message: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateFunnelResponse {
     pub funnel_id: i32,

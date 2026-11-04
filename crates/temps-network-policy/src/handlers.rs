@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata, UtcDateTime};
 use temps_entities::network_policy_rules;
@@ -423,9 +423,9 @@ impl AuditOperation for NetworkPolicyAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
+    fn serialize(&self) -> temps_core::AuditResult<String> {
         serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("failed to serialize {} audit event: {e}", self.operation))
+            .map_err(|source| temps_core::AuditError::serialize(self.operation, source))
     }
 }
 
@@ -763,7 +763,7 @@ async fn set_node_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_auth::permissions::Role;
+    use temps_authz::permissions::Role;
     use temps_entities::users;
 
     fn auth(role: Role) -> AuthContext {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 
 use axum::{
     extract::{rejection::QueryRejection, Extension, Path, Query, State},
@@ -139,10 +140,6 @@ fn clear_login_binding_cookie(state: &str, secure: bool) -> Result<HeaderValue, 
 fn insert_no_store_no_referrer(headers: &mut HeaderMap) {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// True when the request carries the cookie that was set when the login
@@ -1586,14 +1583,6 @@ mod login_binding_tests {
         assert!(plain.starts_with("oidc_login_"), "{plain}");
         assert_ne!(plain, login_binding_cookie_name("state-one", true));
     }
-
-    #[test]
-    fn constant_time_eq_matches_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(constant_time_eq(b"", b""));
-    }
 }
 
 /// The binding wired into the real handlers: the start redirect, and the
@@ -1612,8 +1601,8 @@ mod login_binding_http_tests {
         AuthUrl, EmptyAdditionalProviderMetadata, IssuerUrl, JsonWebKeySetUrl, ResponseTypes,
     };
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{oidc_login_states, oidc_providers};
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     struct Fixture {
@@ -1626,9 +1615,7 @@ mod login_binding_http_tests {
         match TestDatabase::with_migrations().await {
             Ok(db) => Some(db),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 None

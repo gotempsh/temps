@@ -92,10 +92,6 @@ jobs:
       #     (direct `image` dep, and via qrcode for MFA QR codes). This is
       #     the only path in the default build -- temps-auth is depended on
       #     by nearly every service crate.
-      #   * tokenizers (and macro_rules_attribute <- tokenizers) <-
-      #     temps-embeddings, only behind its optional `huggingface`/`all`
-      #     feature, which no workspace crate enables (in Cargo.lock but not
-      #     compiled by default).
       # - RUSTSEC-2026-0173 (proc-macro-error2): proc-macro only. Paths:
       #   * sea-orm -> sea-orm-macros -> sea-bae -> proc-macro-error2
       #     (default build); sea-orm 1.1.20 is the pinned major, 2.0 is a
@@ -117,7 +113,7 @@ jobs:
       #   `Opt::default()`, so the parser is linked but never fed input.
       # - RUSTSEC-2025-0141 (bincode 2.0.1): no workspace crate uses bincode.
       #   Its only dependents are microsandbox-filesystem, msb_krun_devices
-      #   and msb_krun_vmm, all under temps-ai-agents' exact-pinned microsandbox
+      #   and msb_krun_vmm, all under temps-sandbox-providers' exact-pinned microsandbox
       #   SDK (ADR-050), which is not linked on musl (the container image) or
       #   Intel macOS. They encode/decode VM and filesystem state blobs the
       #   microsandbox runtime writes itself. The latest releases checked on
@@ -152,11 +148,11 @@ jobs:
       #     `mysql` feature): caching_sha2/sha256_password auth on non-TLS
       #     connections RSA-OAEP *encrypts* the password to the server's
       #     public key -- encryption, never decryption.
-      #   * dev-dependency only: temps-deployments (cert_validator.rs test
+      #   * dev-dependency only: temps-traefik-discovery (cert_validator.rs test
       #     module generates throwaway RSA keys) and the
       #     examples/google-indexing-plugin test module (keygen); that
       #     example also signs RS256 JWTs via jsonwebtoken 11.
-      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-deployments for SSH node
+      #   rsa 0.10.0-rc.18: russh/ssh-key <- temps-nodes for SSH node
       #   enrollment, where RSA is only used for host-key/user-key signatures
       #   and verification -- no RSA decryption path exists in SSH2.
       #   Marvin Attack is a chosen-ciphertext *decryption* oracle attack;

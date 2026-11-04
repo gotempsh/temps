@@ -223,13 +223,13 @@ pub struct PublicComposePreviewResponse {
 /// Convert PublicRepoError to Problem
 fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
     match err {
-        PublicRepoError::NotFound(msg) => problem_new(StatusCode::NOT_FOUND)
+        PublicRepoError::NotFound { context: msg } => problem_new(StatusCode::NOT_FOUND)
             .with_title("Repository Not Found")
             .with_detail(format!(
                 "Repository {}/{} not found or is not public: {}",
                 owner, repo, msg
             )),
-        PublicRepoError::RepositoryNotPublic(_) => problem_new(StatusCode::NOT_FOUND)
+        PublicRepoError::RepositoryNotPublic { .. } => problem_new(StatusCode::NOT_FOUND)
             .with_title("Repository Not Found")
             .with_detail(format!(
                 "Repository {}/{} was not found or is not public.",
@@ -251,14 +251,14 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
             ))
             .with_value("operation", operation)
             .with_value("required_permission", required_permission),
-        PublicRepoError::BranchNotFound(branch) => problem_new(StatusCode::NOT_FOUND)
+        PublicRepoError::BranchNotFound { branch } => problem_new(StatusCode::NOT_FOUND)
             .with_title("Branch Not Found")
             .with_detail(format!("Branch '{}' not found in repository", branch)),
-        PublicRepoError::ProviderNotSupported(provider) => problem_new(StatusCode::BAD_REQUEST)
+        PublicRepoError::ProviderNotSupported { subject } => problem_new(StatusCode::BAD_REQUEST)
             .with_title("Provider Not Supported")
             .with_detail(format!(
                 "Provider '{}' is not supported. Supported providers: github, gitlab",
-                provider
+                subject
             )),
         PublicRepoError::ApiError(msg) => problem_new(StatusCode::BAD_GATEWAY)
             .with_title("API Error")
@@ -283,9 +283,9 @@ fn require_public_repository(
     repo: &str,
 ) -> Result<crate::services::public_repo::PublicRepoInfo, PublicRepoError> {
     if info.is_private {
-        Err(PublicRepoError::NotFound(format!(
-            "Repository {owner}/{repo} is private"
-        )))
+        Err(PublicRepoError::NotFound {
+            context: format!("Repository {owner}/{repo} is private"),
+        })
     } else {
         Ok(info)
     }
@@ -1664,14 +1664,18 @@ mod tests {
 
     #[test]
     fn test_error_mapping_not_found() {
-        let err = PublicRepoError::NotFound("not found".to_string());
+        let err = PublicRepoError::NotFound {
+            context: "not found".to_string(),
+        };
         let problem = map_error(err, "owner", "repo");
         assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn test_private_repository_is_hidden_as_not_found() {
-        let err = PublicRepoError::RepositoryNotPublic("owner/private".to_string());
+        let err = PublicRepoError::RepositoryNotPublic {
+            repository: "owner/private".to_string(),
+        };
         let problem = map_error(err, "owner", "private");
         assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
         assert!(!problem
@@ -1708,8 +1712,48 @@ mod tests {
     }
 
     #[test]
+    fn repository_errors_keep_their_status_and_detail() {
+        for (error, status, detail) in [
+            (
+                PublicRepoError::NotFound {
+                    context: "no such path".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+                "Repository owner/repo not found or is not public: no such path",
+            ),
+            (
+                PublicRepoError::RepositoryNotPublic {
+                    repository: "owner/repo".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+                "Repository owner/repo was not found or is not public.",
+            ),
+            (
+                PublicRepoError::BranchNotFound {
+                    branch: "feature".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+                "Branch 'feature' not found in repository",
+            ),
+            (
+                PublicRepoError::ProviderNotSupported {
+                    subject: "bitbucket".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+                "Provider 'bitbucket' is not supported. Supported providers: github, gitlab",
+            ),
+        ] {
+            let problem = map_error(error, "owner", "repo");
+            assert_eq!(problem.status_code, status, "{detail}");
+            assert_eq!(problem.body["detail"].as_str(), Some(detail));
+        }
+    }
+
+    #[test]
     fn test_error_mapping_provider_not_supported() {
-        let err = PublicRepoError::ProviderNotSupported("bitbucket".to_string());
+        let err = PublicRepoError::ProviderNotSupported {
+            subject: "bitbucket".to_string(),
+        };
         let problem = map_error(err, "owner", "repo");
         assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
     }
@@ -1730,7 +1774,7 @@ mod tests {
 
         assert!(matches!(
             require_public_repository(info, "example", "repository"),
-            Err(PublicRepoError::NotFound(message)) if message.contains("is private")
+            Err(PublicRepoError::NotFound { context: message }) if message.contains("is private")
         ));
     }
 
@@ -1838,7 +1882,7 @@ mod tests {
             .await;
 
         match result {
-            Err(PublicRepoError::NotFound(_)) => {
+            Err(PublicRepoError::NotFound { .. }) => {
                 // Expected
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -1906,7 +1950,7 @@ mod tests {
             .await;
 
         match result {
-            Err(PublicRepoError::NotFound(_)) => {
+            Err(PublicRepoError::NotFound { .. }) => {
                 // Expected
             }
             Err(PublicRepoError::RateLimitExceeded) => {

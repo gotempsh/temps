@@ -20,8 +20,8 @@ other plugins, and returns its router and OpenAPI document.
   router, one OpenAPI doc, no background work).
 - Example with declared requirements: `crates/temps-error-tracking/src/plugin.rs`.
 - Example with deferred initialisation: `crates/temps-blob/src/plugin.rs`.
-- Where plugins are registered: `start_console_api` in
-  `crates/temps-cli/src/commands/serve/console.rs`.
+- Where plugins are registered: `register_builtin_plugins` in
+  `crates/temps-cli/src/commands/serve/console/startup/plugins.rs`.
 
 ## 1. The crate
 
@@ -128,20 +128,24 @@ Handlers themselves follow the `temps-add-handler` skill.
 
 ## 3. Wire it into the server
 
-In `start_console_api` (`crates/temps-cli/src/commands/serve/console.rs`):
+In `register_builtin_plugins`
+(`crates/temps-cli/src/commands/serve/console/startup/plugins.rs`), add one row to
+the table at the point the plugin's dependencies are met:
 
 ```rust
-// 5.3. FlagsPlugin - provides feature flags (depends on database only)
-debug!("Registering FlagsPlugin");
-let flags_plugin = Box::new(FlagsPlugin::new());
-plugin_manager.register_plugin(flags_plugin);
+// Feature flags (depends on database only).
+|| Box::new(FlagsPlugin::new()),
 ```
 
-- Insert it after every plugin whose services it requires in phase 1, with a
-  numbered comment that names those dependencies.
+- That function is the startup order, read top to bottom. Insert the row after
+  every plugin whose services it requires in phase 1, with a comment that names
+  those dependencies.
+- A plugin that takes startup inputs or depends on the serve profile is an
+  explicit statement between the tables, not a row.
+- Add its `name()` at the same position in `FULL_ORDER` in that file's tests.
 - Add the crate to `crates/temps-cli/Cargo.toml`
-  (`temps-flags = { path = "../temps-flags" }`) and the `use` at the top of
-  `console.rs`.
+  (`temps-flags = { path = "../temps-flags" }`) and the `use` to
+  `crates/temps-cli/src/commands/serve/console.rs`.
 - This is the console process. The proxy, agent and stateless processes wire
   their services separately; if the feature must run there too, wire it there
   explicitly.

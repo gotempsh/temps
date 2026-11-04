@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{DateTime, RequestMetadata};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -958,9 +958,9 @@ mod tests {
     use axum::http::HeaderMap;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
     use std::sync::Mutex;
-    use temps_auth::{AuthContext, Role};
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_authz::{AuthContext, Role};
     use temps_entities::{error_groups, projects, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     /// Audit logger that records every operation it receives so tests can
     /// assert exactly which audit events a handler emitted.
@@ -974,11 +974,17 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "recording audit logger lock poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), operation.user_id(), payload));
             Ok(())
         }

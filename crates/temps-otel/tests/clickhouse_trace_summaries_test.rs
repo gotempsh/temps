@@ -101,11 +101,13 @@ struct Harness {
 }
 
 fn client(url: &str) -> ::clickhouse::Client {
-    ::clickhouse::Client::default()
-        .with_url(url)
-        .with_database(DB)
-        .with_user("default")
-        .with_password("test")
+    temps_clickhouse::build_client(
+        url,
+        DB,
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    )
 }
 
 fn storage_for(url: &str) -> ClickHouseOtelStorage {

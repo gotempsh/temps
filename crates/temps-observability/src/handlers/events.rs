@@ -22,7 +22,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 

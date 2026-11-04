@@ -429,19 +429,19 @@ mod tests {
     fn connect_playbook_names_variables_the_providers_set() {
         let providers: &[(&str, &str)] = &[
             (
-                include_str!("../../temps-providers/src/externalsvc/postgres/lifecycle.rs"),
+                include_str!("../../temps-providers-postgres/src/postgres/lifecycle.rs"),
                 "POSTGRES_URL POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/redis.rs"),
+                include_str!("../../temps-providers-redis/src/redis.rs"),
                 "REDIS_URL REDIS_HOST REDIS_PORT REDIS_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/mongodb.rs"),
+                include_str!("../../temps-providers-mongodb/src/mongodb.rs"),
                 "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/s3.rs"),
+                include_str!("../../temps-providers-s3/src/s3.rs"),
                 "S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_REGION",
             ),
         ];

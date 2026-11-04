@@ -24,7 +24,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_authz::{permission_check, Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::secret_string::SecretString;
 use temps_core::{AuditContext, AuditOperation, ForceRouteReloadJob, Job, RequestMetadata};
@@ -67,9 +67,8 @@ impl AuditOperation for DnsGovernanceAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -1587,7 +1586,7 @@ fn hostname_mode_failure_audit_details(
 
 async fn log_dns_governance_audit(
     state: &Arc<DnsAppState>,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     provider_id: i32,
     domain: &str,

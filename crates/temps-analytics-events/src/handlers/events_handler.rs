@@ -35,7 +35,7 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, AnalyticsIngestKeyService,
     AnalyticsIngestRateLimiter, IngestBranch, IngestJson, KeyedIngestCors,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
@@ -1511,8 +1511,8 @@ mod tests {
     use axum::http::Request;
     use axum::middleware;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]
@@ -1567,7 +1567,7 @@ mod tests {
         );
     }
 
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -1588,7 +1588,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     async fn setup_test_app(
@@ -1735,7 +1735,7 @@ mod tests {
     fn setup_deployment_token_app(state: Arc<AppState>, token_project_id: i32) -> axum::Router {
         let auth_middleware = middleware::from_fn(
             move |mut req: Request<Body>, next: axum::middleware::Next| async move {
-                let auth_context = temps_auth::AuthContext::new_deployment_token(
+                let auth_context = temps_authz::AuthContext::new_deployment_token(
                     token_project_id,
                     None,
                     None,

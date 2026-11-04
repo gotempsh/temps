@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use hyper_util::rt::TokioIo;
-use temps_core::external_plugin::{PluginEvent, PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
+use temps_plugin_protocol::{PluginEvent, PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixListener;
 use tower::{Service, ServiceExt};

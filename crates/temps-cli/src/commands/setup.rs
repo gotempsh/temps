@@ -21,7 +21,8 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
-use temps_core::{url_validation::validate_ipv4, AppSettings, EncryptionService};
+use temps_config::AppSettings;
+use temps_core::{url_validation::validate_ipv4, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
@@ -1088,7 +1089,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     println!(
         "   {} {}",
         "📍".bright_yellow(),
-        "GeoLite2-City.mmdb is required to run the application".bright_white()
+        "GeoLite2-City.mmdb is needed for geolocation".bright_white()
     );
     println!(
         "{}",
@@ -1129,7 +1130,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     );
     println!();
     println!(
-        "   {} Setup can continue, but {} will fail without this file.",
+        "   {} Setup can continue; {} runs without geolocation until this file is provided.",
         "ℹ️ ".bright_blue(),
         "temps serve".bright_cyan()
     );
@@ -1772,7 +1773,7 @@ impl SetupCommand {
         print_section("Database Setup");
         print_substep("Checking database connectivity...");
 
-        let db = match rt.block_on(temps_database::establish_connection(&self.database_url)) {
+        let db = match rt.block_on(temps_schema::establish_connection(&self.database_url)) {
             Ok(db) => {
                 print_substep(&format!("{} Database reachable", "✓".bright_green()));
                 print_substep("Running migrations...");

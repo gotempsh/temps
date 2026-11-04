@@ -1537,7 +1537,7 @@ mod tests {
     async fn a_failed_redis_import_releases_only_the_database_it_created() {
         use crate::data_import::test_support::TestDocker;
         use futures::FutureExt;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let Some(mut docker) = TestDocker::connect().await else {
             println!("Docker not available, skipping");
@@ -1755,7 +1755,7 @@ mod tests {
     /// or join is caught here rather than in production.
     #[tokio::test]
     async fn a_name_a_linked_environment_resolves_to_is_found() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

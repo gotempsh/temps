@@ -30,9 +30,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use temps_core::{LogWriter, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::{docker::DockerRuntime, ImageBuilder};
 use temps_deployments::jobs::BuildImageJobBuilder;
+use temps_deployments::workflow::LogWriter;
+use temps_deployments::workflow::WorkflowContext;
+use temps_deployments::workflow::WorkflowError;
+use temps_deployments::workflow::WorkflowTask;
 
 struct NoopLogWriter;
 

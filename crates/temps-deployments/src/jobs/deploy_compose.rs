@@ -7,6 +7,11 @@
 //! Outputs container IDs, names, ports, and service names for
 //! MarkDeploymentCompleteJob to register in deployment_containers.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set,
@@ -16,9 +21,6 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use temps_core::{
-    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
-};
 use temps_database::DbConnection;
 use temps_deployer::compose::{
     ComposeCheckInput, ComposeDeployRequest, ComposeError, ComposeExecutor, ComposeOutputSink,

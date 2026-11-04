@@ -12,17 +12,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bollard::container::LogOutput;
-use bollard::exec::StartExecResults;
-use futures::StreamExt;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use super::ring_buffer::RingBuffer;
+use super::postgres_walg::{exec_stdout_probe, run_walg_exec};
 use super::v2_common;
 use super::walg_size::load_backup_size_bytes;
-use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "postgres_cluster";
 
@@ -334,87 +331,6 @@ fn load_postgres_params(config_json: &str) -> PgParams {
     }
 }
 
-struct ExecResult {
-    exit_code: i64,
-    stdout: String,
-    stderr: String,
-}
-
-async fn run_walg_exec(
-    docker: &bollard::Docker,
-    container_name: &str,
-    cmd: &str,
-    env: &[String],
-    cancel: &tokio_util::sync::CancellationToken,
-) -> Result<ExecResult, BackupError> {
-    let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
-    let exec = docker
-        .create_exec(
-            container_name,
-            bollard::exec::CreateExecOptions {
-                cmd: Some(vec!["sh", "-c", cmd]),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                env: Some(env_refs),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("create exec on {}: {}", container_name, e),
-        })?;
-    let stream_result = docker
-        .start_exec(
-            &exec.id,
-            Some(bollard::exec::StartExecOptions {
-                detach: false,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("start exec on {}: {}", container_name, e),
-        })?;
-
-    let mut stdout = RingBuffer::with_capacity(64 * 1024);
-    let mut stderr = RingBuffer::with_capacity(64 * 1024);
-
-    if let StartExecResults::Attached { mut output, .. } = stream_result {
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err(BackupError::Cancelled);
-                }
-                item = output.next() => {
-                    match item {
-                        Some(Ok(LogOutput::StdOut { message })) => stdout.append(&message),
-                        Some(Ok(LogOutput::StdErr { message })) => stderr.append(&message),
-                        Some(Ok(_)) => {}
-                        Some(Err(e)) => {
-                            error!(container = container_name, "exec stream error: {}", e);
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    }
-
-    let inspect = docker
-        .inspect_exec(&exec.id)
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("inspect exec: {}", e),
-        })?;
-    let exit_code = inspect.exit_code.unwrap_or(-1);
-    Ok(ExecResult {
-        exit_code,
-        stdout: stdout.into_string_lossy(),
-        stderr: stderr.into_string_lossy(),
-    })
-}
-
 /// Build the (cmd, env) pair for the `pg_current_wal_lsn()` probe.
 ///
 /// Critically: **credentials never appear in `cmd`**. They go through env
@@ -443,39 +359,8 @@ async fn query_current_wal_lsn(
     pg: &PgParams,
     pg_port: i32,
 ) -> Result<String, BackupError> {
-    let (cmd_owned, env_owned) = build_lsn_exec_args(pg, pg_port);
-    let cmd_refs: Vec<&str> = cmd_owned.iter().map(|s| s.as_str()).collect();
-    let env_refs: Vec<&str> = env_owned.iter().map(|s| s.as_str()).collect();
-    let exec = docker
-        .create_exec(
-            container_name,
-            bollard::exec::CreateExecOptions {
-                cmd: Some(cmd_refs),
-                env: Some(env_refs),
-                attach_stdout: Some(true),
-                attach_stderr: Some(false),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("create exec for LSN: {}", e),
-        })?;
-    let output = docker
-        .start_exec(&exec.id, None)
-        .await
-        .map_err(|e| BackupError::Failed {
-            reason: format!("start exec for LSN: {}", e),
-        })?;
-    let mut result = String::new();
-    if let StartExecResults::Attached { mut output, .. } = output {
-        while let Some(Ok(msg)) = output.next().await {
-            if let LogOutput::StdOut { message } = msg {
-                result.push_str(&String::from_utf8_lossy(&message));
-            }
-        }
-    }
-    Ok(result.trim().to_string())
+    let (cmd, env) = build_lsn_exec_args(pg, pg_port);
+    exec_stdout_probe(docker, container_name, &cmd, &env).await
 }
 
 #[cfg(test)]

@@ -12236,6 +12236,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-agent-core"
+version = "0.1.0-beta.59"
+dependencies = [
+ "http 1.5.0",
+ "sea-orm 1.1.20",
+ "serde_json",
+ "temps-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "temps-agent-runtime"
 version = "0.1.0"
 source = "git+https://github.com/gotempsh/agent-runtime-sdk.git?rev=ac661d29974eb020f3bd7bd1a286445d5cb820cd#ac661d29974eb020f3bd7bd1a286445d5cb820cd"
@@ -12286,12 +12297,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "subtle",
  "tempfile",
+ "temps-agent-core",
  "temps-agent-runtime",
  "temps-ai",
- "temps-ai-agents",
+ "temps-ai-cli",
+ "temps-core",
  "temps-sandbox",
+ "temps-sandbox-providers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -12308,49 +12321,43 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
- "base64 0.23.1",
  "bollard",
- "bytes",
  "chrono",
  "cron",
  "flate2",
  "futures",
  "hex",
  "http 1.5.0",
- "http-body-util",
  "libc",
- "microsandbox",
  "pulldown-cmark",
  "rand 0.10.3",
  "regex",
- "reqwest 0.12.28",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "sha2 0.11.1",
  "tar",
  "tempfile",
+ "temps-agent-core",
  "temps-agents-mcp-proxy",
  "temps-ai",
- "temps-auth",
+ "temps-ai-cli",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-deployments",
- "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
  "temps-error-tracking",
  "temps-git",
+ "temps-memory",
  "temps-notifications",
- "temps-vm-agent",
+ "temps-sandbox-providers",
+ "temps-test-utils",
  "temps-workload",
- "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
- "tokio-tungstenite 0.30.0",
  "tracing",
  "utoipa",
- "walkdir",
  "yaml_serde",
 ]
 
@@ -12364,7 +12371,7 @@ dependencies = [
  "http 1.5.0",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-core",
  "temps-entities",
  "thiserror 2.0.21",
@@ -12379,7 +12386,6 @@ dependencies = [
 name = "temps-ai-chat"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-stream",
  "async-trait",
  "axum",
@@ -12402,20 +12408,22 @@ dependencies = [
  "tempfile",
  "temps-ai",
  "temps-ai-agent-cli",
- "temps-ai-agents",
  "temps-ai-api-tools",
+ "temps-ai-cli",
  "temps-auth",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-deployment-logs",
  "temps-entities",
  "temps-environments",
  "temps-error-tracking",
  "temps-git",
+ "temps-presets",
  "temps-projects",
  "temps-providers",
  "temps-sandbox",
+ "temps-sandbox-providers",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -12431,10 +12439,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-ai-cli"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "chrono",
+ "http 1.5.0",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-agent-core",
+ "temps-ai",
+ "temps-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-ai-gateway"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-stream",
  "async-trait",
  "axum",
@@ -12454,14 +12483,15 @@ dependencies = [
  "tempfile",
  "temps-ai",
  "temps-ai-agent-cli",
- "temps-ai-agents",
- "temps-auth",
+ "temps-ai-cli",
+ "temps-authz",
  "temps-cloud-client",
  "temps-cloud-protocol",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-sandbox-providers",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -12470,6 +12500,27 @@ dependencies = [
  "utoipa",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "temps-alarms"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "maplit",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-metrics",
+ "temps-test-utils",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -12494,12 +12545,12 @@ dependencies = [
  "sha2 0.11.1",
  "temps-ai",
  "temps-analytics-backend",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-migrations",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -12523,7 +12574,7 @@ dependencies = [
  "serde",
  "temps-clickhouse",
  "temps-core",
- "temps-database",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -12547,14 +12598,14 @@ dependencies = [
  "serde_json",
  "temps-analytics",
  "temps-analytics-backend",
- "temps-auth",
+ "temps-authz",
  "temps-clickhouse",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-geo",
  "temps-routes",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -12575,10 +12626,10 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "tokio",
  "tracing",
  "utoipa",
@@ -12598,12 +12649,12 @@ dependencies = [
  "serde_json",
  "temps-analytics",
  "temps-analytics-events",
- "temps-auth",
+ "temps-authz",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-geo",
  "temps-routes",
+ "temps-test-utils",
  "tokio",
  "tower",
  "tracing",
@@ -12626,11 +12677,11 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-analytics",
- "temps-auth",
+ "temps-authz",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-routes",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -12649,7 +12700,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -12664,7 +12715,6 @@ dependencies = [
 name = "temps-auth"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "argon2",
  "async-trait",
  "axum",
@@ -12683,9 +12733,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "temps-authz",
+ "temps-config",
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "totp-rs",
@@ -12694,6 +12747,22 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "temps-authz"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "serde",
+ "temps-core",
+ "temps-entities",
+ "tokio",
+ "tracing",
+ "utoipa",
  "walkdir",
 ]
 
@@ -12725,16 +12794,17 @@ dependencies = [
  "sqlx 0.8.6",
  "tar",
  "tempfile",
+ "temps-alarms",
  "temps-auth",
- "temps-backup-core",
  "temps-config",
  "temps-core",
  "temps-database",
  "temps-deployment-logs",
+ "temps-docker-util",
  "temps-entities",
  "temps-migrations",
- "temps-monitoring",
  "temps-providers",
+ "temps-test-utils",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-env",
@@ -12756,28 +12826,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "temps-backup-core"
-version = "0.1.0-beta.59"
-dependencies = [
- "async-trait",
- "chrono",
- "sea-orm 1.1.20",
- "serde_json",
- "temps-core",
- "temps-database",
- "temps-entities",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "temps-blob"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "axum",
@@ -12790,7 +12841,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-entities",
@@ -12812,6 +12863,42 @@ dependencies = [
  "js-sys",
  "sha2 0.11.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "temps-ci-tokens"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "jsonwebtoken 11.1.0",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "rsa 0.9.10",
+ "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-deployer",
+ "temps-deployment-logs",
+ "temps-entities",
+ "temps-migrations",
+ "temps-test-utils",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -12877,12 +12964,14 @@ dependencies = [
  "temps-cloud",
  "temps-cloud-client",
  "temps-config",
+ "temps-config-handlers",
  "temps-core",
  "temps-database",
  "temps-deployer",
  "temps-deployment-logs",
  "temps-deployments",
  "temps-dns",
+ "temps-docker-util",
  "temps-domains",
  "temps-edge",
  "temps-email",
@@ -12910,6 +12999,7 @@ dependencies = [
  "temps-observability",
  "temps-otel",
  "temps-plugin-sdk",
+ "temps-presets",
  "temps-product-telemetry",
  "temps-project-groups",
  "temps-projects",
@@ -12919,10 +13009,12 @@ dependencies = [
  "temps-revenue",
  "temps-routes",
  "temps-sandbox",
+ "temps-sandbox-providers",
+ "temps-schema",
  "temps-screenshots",
- "temps-static-files",
  "temps-status-page",
  "temps-teams",
+ "temps-test-utils",
  "temps-vulnerability-scanner",
  "temps-webhooks",
  "temps-wireguard",
@@ -12969,7 +13061,6 @@ dependencies = [
 name = "temps-cloud"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "aws-sdk-s3",
  "axum",
@@ -12985,8 +13076,8 @@ dependencies = [
  "temps-cloud-protocol",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -13017,8 +13108,8 @@ dependencies = [
  "tempfile",
  "temps-cloud-protocol",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -13046,32 +13137,57 @@ name = "temps-config"
 version = "0.1.0-beta.59"
 dependencies = [
  "anyhow",
- "axum",
  "chrono",
  "dirs",
  "hex",
  "rand 0.10.3",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-pemfile",
  "sea-orm 1.1.20",
  "serde",
  "serde_derive",
  "serde_json",
- "serde_path_to_error",
  "sha2 0.11.1",
  "sqlx 0.8.6",
  "sysinfo",
  "tempfile",
- "temps-auth",
- "temps-clickhouse",
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
  "utoipa",
  "uuid",
+ "x509-parser",
  "yaml_serde",
+]
+
+[[package]]
+name = "temps-config-handlers"
+version = "0.1.0-beta.59"
+dependencies = [
+ "axum",
+ "chrono",
+ "hex",
+ "rand 0.10.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "temps-auth",
+ "temps-clickhouse",
+ "temps-config",
+ "temps-core",
+ "temps-entities",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "utoipa",
 ]
 
 [[package]]
@@ -13089,11 +13205,9 @@ dependencies = [
  "chrono",
  "cookie",
  "ed25519-dalek 3.0.0",
- "futures",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "include_dir",
  "ipnet",
  "jsonwebtoken 11.1.0",
  "once_cell",
@@ -13101,12 +13215,11 @@ dependencies = [
  "rcgen",
  "rsa 0.9.10",
  "rustls",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "subtle",
  "tempfile",
- "temps-memory",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -13145,19 +13258,15 @@ name = "temps-database"
 version = "0.1.0-beta.59"
 dependencies = [
  "anyhow",
- "futures",
  "log",
  "sea-orm 1.1.20",
- "sea-orm-migration 1.1.20",
  "sqlx 0.8.6",
  "temps-core",
- "temps-migrations",
+ "temps-test-utils",
  "testcontainers",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -13191,8 +13300,8 @@ dependencies = [
  "tempfile",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
  "temps-file-store",
  "temps-network",
@@ -13200,6 +13309,7 @@ dependencies = [
  "temps-presets",
  "temps-routes",
  "temps-runtime-health",
+ "temps-test-utils",
  "temps-workload",
  "temps-workload-docker",
  "testcontainers",
@@ -13246,7 +13356,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
@@ -13257,40 +13366,32 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
- "hyper",
- "hyper-util",
- "ipnet",
- "jsonwebtoken 11.1.0",
  "libc",
  "mockall",
  "octocrab",
- "p256 0.14.0",
  "rand 0.10.3",
- "rcgen",
  "regex",
  "reqwest 0.12.28",
- "rsa 0.9.10",
- "russh",
  "rustls",
  "rustls-pemfile",
- "rustls-pki-types",
  "sea-orm 1.1.20",
  "sea-orm-migration 1.1.20",
  "serde",
  "serde_json",
  "serial_test",
  "sha2 0.11.1",
- "sysinfo",
  "tar",
  "tempfile",
  "temps-auth",
  "temps-blob",
+ "temps-ci-tokens",
  "temps-config",
  "temps-core",
  "temps-database",
  "temps-deployer",
  "temps-deployment-logs",
- "temps-dns",
+ "temps-docker-housekeeping",
+ "temps-docker-util",
  "temps-entities",
  "temps-error-tracking",
  "temps-file-store",
@@ -13299,35 +13400,34 @@ dependencies = [
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
- "temps-network",
+ "temps-nodes",
  "temps-otel",
+ "temps-plugin-protocol",
  "temps-presets",
  "temps-providers",
  "temps-queue",
  "temps-runtime-health",
  "temps-screenshots",
+ "temps-test-utils",
+ "temps-traefik-discovery",
  "temps-vulnerability-scanner",
- "temps-wireguard",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-env",
  "temps-workload-plane",
  "temps-workload-volumes",
- "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
  "tokio-tungstenite 0.30.0",
- "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "urlencoding",
  "utoipa",
  "uuid",
- "x509-parser",
  "yaml_serde",
- "zeroize",
  "zip",
 ]
 
@@ -13335,7 +13435,6 @@ dependencies = [
 name = "temps-dns"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -13355,13 +13454,14 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "sha2 0.11.1",
- "temps-auth",
+ "temps-authz",
+ "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-migrations",
  "temps-node-dns",
  "temps-projects",
+ "temps-test-utils",
  "temps-workload",
  "temps-workload-netpol",
  "testcontainers",
@@ -13383,6 +13483,53 @@ dependencies = [
  "bollard",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "temps-docker-housekeeping"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "tar",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-file-store",
+ "temps-test-utils",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
+name = "temps-docker-util"
+version = "0.1.0-beta.59"
+dependencies = [
+ "bollard",
+ "bytes",
+ "futures",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -13424,6 +13571,7 @@ dependencies = [
  "temps-geo",
  "temps-monitoring",
  "temps-notifications",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "time",
@@ -13510,12 +13658,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-dns",
  "temps-entities",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13543,12 +13691,12 @@ dependencies = [
  "sha1 0.10.6",
  "sha2 0.10.9",
  "sha2 0.11.1",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-email",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
@@ -13558,13 +13706,6 @@ dependencies = [
  "utoipa",
  "uuid",
  "x509-parser",
-]
-
-[[package]]
-name = "temps-embeddings"
-version = "0.1.0-beta.59"
-dependencies = [
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -13586,7 +13727,6 @@ dependencies = [
 name = "temps-environments"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "argon2",
  "axum",
  "chrono",
@@ -13601,6 +13741,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-shield",
+ "temps-test-utils",
  "temps-workload-ingress",
  "thiserror 2.0.21",
  "tokio",
@@ -13614,7 +13755,6 @@ dependencies = [
 name = "temps-error-tracking"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "axum",
@@ -13638,11 +13778,9 @@ dependencies = [
  "sha2 0.11.1",
  "sourcemap",
  "temps-analytics-session-replay",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
- "temps-embeddings",
  "temps-entities",
  "temps-geo",
  "temps-migrations",
@@ -13650,6 +13788,7 @@ dependencies = [
  "temps-notifications",
  "temps-otel",
  "temps-routes",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tower-http 0.7.1",
@@ -13687,7 +13826,6 @@ dependencies = [
 name = "temps-external-plugins"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -13710,11 +13848,13 @@ dependencies = [
  "tempfile",
  "temps-ai",
  "temps-auth",
+ "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-migrations",
+ "temps-plugin-protocol",
  "temps-presets",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -13748,7 +13888,6 @@ dependencies = [
 name = "temps-flags"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -13757,7 +13896,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "temps-auth",
+ "temps-authz",
  "temps-core",
  "temps-entities",
  "thiserror 2.0.21",
@@ -13785,7 +13924,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-entities",
@@ -13800,7 +13939,6 @@ dependencies = [
 name = "temps-git"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -13829,13 +13967,14 @@ dependencies = [
  "subtle",
  "tar",
  "tempfile",
+ "temps-alarms",
  "temps-auth",
  "temps-config",
  "temps-core",
  "temps-database",
  "temps-entities",
- "temps-monitoring",
  "temps-presets",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -13889,7 +14028,6 @@ dependencies = [
 name = "temps-import"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "axum",
  "bollard",
  "chrono",
@@ -13899,10 +14037,11 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-deployments",
+ "temps-docker-util",
  "temps-entities",
  "temps-git",
  "temps-import-caprover",
@@ -13980,6 +14119,7 @@ dependencies = [
  "temps-import-types",
  "temps-presets",
  "temps-projects",
+ "temps-test-utils",
  "tokio",
  "tracing",
 ]
@@ -14119,7 +14259,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-entities",
@@ -14134,7 +14274,6 @@ dependencies = [
 name = "temps-ingress"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -14149,12 +14288,12 @@ dependencies = [
  "temps-auth",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-dns",
  "temps-domains",
  "temps-entities",
  "temps-projects",
  "temps-routes",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -14167,7 +14306,6 @@ dependencies = [
 name = "temps-kv"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -14177,7 +14315,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-entities",
@@ -14236,13 +14374,13 @@ dependencies = [
  "serial_test",
  "sha2 0.11.1",
  "tempfile",
- "temps-auth",
+ "temps-authz",
  "temps-clickhouse",
  "temps-cloud-client",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14263,15 +14401,15 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-deployments",
  "temps-edge-rules",
  "temps-entities",
  "temps-projects",
  "temps-proxy",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -14312,8 +14450,8 @@ dependencies = [
  "temps-clickhouse",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14332,6 +14470,7 @@ dependencies = [
  "sea-orm-migration 1.1.20",
  "sqlx 0.8.6",
  "temps-entities",
+ "temps-test-utils",
  "testcontainers",
  "tokio",
  "tracing",
@@ -14355,15 +14494,16 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-alarms",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-credential-checks",
- "temps-database",
  "temps-deployer",
  "temps-entities",
  "temps-metrics",
  "temps-migrations",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -14436,7 +14576,6 @@ dependencies = [
 name = "temps-network-policy"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "axum",
@@ -14445,11 +14584,11 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-routes",
+ "temps-test-utils",
  "temps-workload",
  "temps-workload-netpol",
  "thiserror 2.0.21",
@@ -14492,18 +14631,20 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
- "temps-ai-agents",
- "temps-auth",
+ "temps-agent-core",
+ "temps-authz",
  "temps-core",
  "temps-deployer",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
- "temps-external-plugins",
  "temps-metrics",
  "temps-network",
  "temps-node-dns",
  "temps-providers",
  "temps-runtime-health",
+ "temps-sandbox-providers",
+ "temps-service-protocol",
  "temps-shield",
  "temps-vulnerability-scanner",
  "temps-wireguard",
@@ -14546,10 +14687,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-nodes"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "futures-util",
+ "hex",
+ "ipnet",
+ "mockall",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "russh",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sysinfo",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-database",
+ "temps-deployer",
+ "temps-dns",
+ "temps-entities",
+ "temps-log-aggregator",
+ "temps-metrics",
+ "temps-migrations",
+ "temps-monitoring",
+ "temps-network",
+ "temps-test-utils",
+ "temps-wireguard",
+ "temps-workload",
+ "temps-workload-plane",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "utoipa",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "temps-notifications"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -14559,13 +14750,13 @@ dependencies = [
  "sea-orm-migration 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-cloud",
  "temps-cloud-protocol",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-migrations",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14588,13 +14779,14 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
+ "temps-clickhouse",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-geo",
  "temps-otel",
  "temps-proxy",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14607,7 +14799,6 @@ dependencies = [
 name = "temps-otel"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "aws-config",
@@ -14631,16 +14822,17 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "temps-ai",
- "temps-auth",
+ "temps-alarms",
+ "temps-authz",
  "temps-clickhouse",
  "temps-cloud-client",
  "temps-cloud-protocol",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-metrics",
- "temps-monitoring",
+ "temps-schema",
+ "temps-test-utils",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14649,6 +14841,18 @@ dependencies = [
  "utoipa",
  "uuid",
  "zstd 0.14.3",
+]
+
+[[package]]
+name = "temps-plugin-protocol"
+version = "0.1.0-beta.59"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "utoipa",
 ]
 
 [[package]]
@@ -14663,7 +14867,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
- "temps-core",
+ "temps-plugin-protocol",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -14682,8 +14886,11 @@ dependencies = [
  "autopack-core",
  "autopack-dockerfile",
  "autopack-providers",
+ "include_dir",
+ "once_cell",
  "picomatch-rs",
  "regex",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -14713,7 +14920,6 @@ dependencies = [
 name = "temps-product-telemetry"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
@@ -14721,7 +14927,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
  "temps-entities",
@@ -14737,7 +14943,6 @@ dependencies = [
 name = "temps-project-groups"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "bollard",
@@ -14746,14 +14951,16 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-environments",
  "temps-git",
+ "temps-presets",
  "temps-projects",
  "temps-providers",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -14765,7 +14972,6 @@ dependencies = [
 name = "temps-projects"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "axum",
  "base64 0.23.1",
  "bollard",
@@ -14789,6 +14995,7 @@ dependencies = [
  "temps-presets",
  "temps-providers",
  "temps-shield",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -14806,23 +15013,78 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "axum",
- "base64 0.23.1",
  "bollard",
  "bytes",
  "chrono",
- "flate2",
  "futures",
  "hex",
  "hmac 0.13.0",
  "http 1.5.0",
  "hyper",
  "mongodb",
- "percent-encoding",
  "rand 0.10.3",
  "redis",
  "regex",
  "reqwest 0.12.28",
- "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx 0.8.6",
+ "tempfile",
+ "temps-alarms",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-deployment-logs",
+ "temps-dns",
+ "temps-docker-capture",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-metrics",
+ "temps-migrations",
+ "temps-network",
+ "temps-node-dns",
+ "temps-providers-core",
+ "temps-providers-mariadb",
+ "temps-providers-mongodb",
+ "temps-providers-postgres",
+ "temps-providers-redis",
+ "temps-providers-s3",
+ "temps-service-protocol",
+ "temps-test-utils",
+ "temps-workload-docker",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "urlencoding",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-core"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "axum",
+ "bollard",
+ "bytes",
+ "chrono",
+ "downcast-rs",
+ "flate2",
+ "futures",
+ "hex",
+ "hmac 0.13.0",
+ "mongodb",
+ "percent-encoding",
+ "rand 0.10.3",
+ "redis",
+ "regex",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
@@ -14830,35 +15092,194 @@ dependencies = [
  "sqlx 0.8.6",
  "tar",
  "tempfile",
- "temps-auth",
- "temps-config",
  "temps-core",
  "temps-database",
- "temps-deployment-logs",
- "temps-dns",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-entities",
- "temps-metrics",
- "temps-migrations",
- "temps-monitoring",
- "temps-network",
- "temps-node-dns",
- "temps-query",
- "temps-query-mongodb",
- "temps-query-postgres",
- "temps-query-redis",
- "temps-query-s3",
+ "temps-service-protocol",
+ "temps-test-utils",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-plane",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-mariadb"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "bollard",
+ "bytes",
+ "chrono",
+ "flate2",
+ "futures",
+ "rand 0.10.3",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sqlx 0.8.6",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-providers-core",
+ "temps-providers-postgres",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-mongodb"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "base64 0.23.1",
+ "bollard",
+ "bson 3.1.0",
+ "chrono",
+ "futures",
+ "mongodb",
+ "rand 0.10.3",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-providers-core",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-postgres"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "axum",
+ "bollard",
+ "chrono",
+ "flate2",
+ "futures",
+ "futures-util",
+ "rand 0.10.3",
+ "rustls",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sqlx 0.8.6",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-deployment-logs",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-providers-core",
+ "temps-test-utils",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
  "tokio-postgres",
+ "tokio-postgres-rustls",
  "tokio-util",
  "tracing",
  "urlencoding",
  "utoipa",
+ "uuid",
+ "webpki-roots 1.0.11",
+]
+
+[[package]]
+name = "temps-providers-redis"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-sdk-s3",
+ "axum",
+ "bollard",
+ "chrono",
+ "flate2",
+ "futures",
+ "http 1.5.0",
+ "rand 0.10.3",
+ "redis",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-providers-core",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "temps-providers-s3"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "schemars 1.2.3",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "temps-core",
+ "temps-database",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-providers-core",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -14905,9 +15326,10 @@ dependencies = [
  "sqlx 0.8.6",
  "temp-dir",
  "temps-analytics",
- "temps-auth",
+ "temps-authz",
  "temps-clickhouse",
  "temps-config",
+ "temps-config-handlers",
  "temps-core",
  "temps-database",
  "temps-edge-rules",
@@ -14918,6 +15340,7 @@ dependencies = [
  "temps-presets",
  "temps-routes",
  "temps-shield",
+ "temps-test-utils",
  "temps-workload-activator",
  "temps-workload-ingress",
  "testcontainers",
@@ -14951,90 +15374,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "temps-query"
-version = "0.1.0-beta.59"
-dependencies = [
- "async-trait",
- "bytes",
- "downcast-rs",
- "futures",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-mongodb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bson 3.1.0",
- "mongodb",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-postgres"
-version = "0.1.0-beta.59"
-dependencies = [
- "async-trait",
- "futures-util",
- "rustls",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
- "tracing",
- "webpki-roots 1.0.11",
-]
-
-[[package]]
-name = "temps-query-redis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "redis",
- "serde_json",
- "temps-query",
- "testcontainers",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "temps-query-s3"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "bytes",
- "futures",
- "serde_json",
- "temps-query",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "temps-queue"
 version = "0.1.0-beta.59"
 dependencies = [
  "sea-orm 1.1.20",
  "serde_json",
  "temps-core",
- "temps-database",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15046,7 +15392,6 @@ dependencies = [
 name = "temps-revenue"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "axum",
  "base64 0.23.1",
  "bytes",
@@ -15061,10 +15406,10 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "subtle",
- "temps-auth",
+ "temps-authz",
  "temps-core",
- "temps-database",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15091,11 +15436,12 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqlx 0.8.6",
- "subtle",
+ "temps-config",
  "temps-core",
  "temps-database",
  "temps-entities",
  "temps-shield",
+ "temps-test-utils",
  "temps-workload-ingress",
  "thiserror 2.0.21",
  "tokio",
@@ -15126,7 +15472,6 @@ dependencies = [
 name = "temps-sandbox"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "argon2",
  "async-stream",
  "async-trait",
@@ -15147,13 +15492,14 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
- "temps-ai-agents",
+ "temps-agent-core",
  "temps-auth",
  "temps-config",
  "temps-core",
  "temps-entities",
  "temps-git",
  "temps-pty-agent",
+ "temps-sandbox-providers",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -15162,6 +15508,67 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+]
+
+[[package]]
+name = "temps-sandbox-providers"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "http 1.5.0",
+ "http-body-util",
+ "libc",
+ "microsandbox",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "temps-agent-core",
+ "temps-config",
+ "temps-core",
+ "temps-docker-capture",
+ "temps-docker-util",
+ "temps-entities",
+ "temps-test-utils",
+ "temps-vm-agent",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "utoipa",
+ "walkdir",
+]
+
+[[package]]
+name = "temps-schema"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
+ "sqlx 0.8.6",
+ "temps-core",
+ "temps-database",
+ "temps-migrations",
+ "temps-test-utils",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -15184,15 +15591,27 @@ dependencies = [
  "tempfile",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-file-store",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
  "utoipa",
  "zip",
+]
+
+[[package]]
+name = "temps-service-protocol"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "utoipa",
 ]
 
 [[package]]
@@ -15226,29 +15645,13 @@ name = "temps-signatures"
 version = "0.1.0-beta.59"
 
 [[package]]
-name = "temps-static-files"
-version = "0.1.0-beta.59"
-dependencies = [
- "axum",
- "temps-auth",
- "temps-config",
- "temps-core",
- "temps-file-store",
- "tokio",
- "tracing",
- "utoipa",
-]
-
-[[package]]
 name = "temps-status-page"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "arc-swap",
  "async-trait",
  "axum",
  "chrono",
- "futures",
  "hex",
  "http 1.5.0",
  "rand 0.10.3",
@@ -15259,13 +15662,13 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
- "temps-auth",
+ "temps-authz",
  "temps-config",
  "temps-core",
- "temps-database",
  "temps-domains",
  "temps-entities",
  "temps-routes",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -15279,14 +15682,12 @@ dependencies = [
 name = "temps-teams"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "chrono",
  "moka",
  "sea-orm 1.1.20",
  "serde",
- "serde_json",
  "temps-auth",
  "temps-core",
  "temps-entities",
@@ -15294,6 +15695,51 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "temps-test-utils"
+version = "0.1.0-beta.59"
+dependencies = [
+ "anyhow",
+ "bollard",
+ "futures",
+ "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
+ "temps-migrations",
+ "testcontainers",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "temps-traefik-discovery"
+version = "0.1.0-beta.59"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "p256 0.14.0",
+ "rcgen",
+ "rsa 0.9.10",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-deployer",
+ "temps-entities",
+ "temps-test-utils",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "x509-parser",
 ]
 
 [[package]]
@@ -15311,7 +15757,6 @@ dependencies = [
 name = "temps-vulnerability-scanner"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "bollard",
@@ -15322,11 +15767,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "temps-auth",
+ "temps-authz",
  "temps-core",
  "temps-database",
  "temps-deployer",
+ "temps-docker-util",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15338,7 +15785,6 @@ dependencies = [
 name = "temps-webhooks"
 version = "0.1.0-beta.59"
 dependencies = [
- "anyhow",
  "axum",
  "chrono",
  "hex",
@@ -15348,7 +15794,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "temps-auth",
+ "temps-authz",
  "temps-core",
  "temps-entities",
  "temps-queue",
@@ -15417,6 +15863,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-docker-capture",
+ "temps-docker-util",
  "temps-workload",
  "temps-workload-volumes",
  "tokio",
@@ -15461,6 +15908,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "temps-docker-util",
  "temps-netpol-ebpf-common",
  "temps-workload",
  "thiserror 2.0.21",
@@ -15498,9 +15946,9 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-core",
- "temps-database",
  "temps-entities",
  "temps-migrations",
+ "temps-test-utils",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-env",

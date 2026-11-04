@@ -73,7 +73,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 # `test-util` backs `#[tokio::test(start_paused = true)]`, used by
 # `console_proxy`'s idle-timer tests to advance virtual time instantly
 # instead of sleeping for real minutes.

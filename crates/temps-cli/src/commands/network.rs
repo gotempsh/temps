@@ -273,7 +273,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         .ok_or_else(|| {
             anyhow::anyhow!("TEMPS_DATABASE_URL must be set in the protected process environment")
         })?;
-    let db = temps_database::establish_connection(&database_url)
+    let db = temps_schema::establish_connection(&database_url)
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
 
@@ -310,7 +310,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         .one(db.as_ref())
         .await
         .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
-        .map(|model| temps_core::AppSettings::from_json(model.data))
+        .map(|model| temps_config::AppSettings::from_json(model.data))
         .unwrap_or_default();
     // What `temps serve --wg-endpoint` recorded, so this command publishes
     // the same WireGuard endpoint the running server does.

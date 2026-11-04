@@ -45,6 +45,8 @@ async fn golden_worker_postgres_service() {
     );
     let state = Arc::new(AgentState {
         container_deployer: remote.clone(),
+        service_runtime: Arc::new(temps_providers::node_runtime::ProvidersNodeRuntime),
+        plugin_builder: Arc::new(NoPluginBuilds),
         image_builder: remote,
         docker: Some(fake.docker()),
         overlay_bridge_address: Default::default(),
@@ -88,4 +90,19 @@ async fn golden_worker_postgres_service() {
             .join("tests/fixtures/golden/worker-postgres-service.json"),
         &Value::Array(creates.iter().map(golden_value).collect()),
     );
+}
+
+/// These tests never compile a plugin.
+struct NoPluginBuilds;
+
+#[async_trait::async_trait]
+impl temps_node_agent::plugin_build_handler::PluginContainerBuilder for NoPluginBuilds {
+    async fn build_from_archive(
+        &self,
+        _archive: &std::path::Path,
+        _target: &str,
+        _output: &std::path::Path,
+    ) -> Result<(), temps_node_agent::plugin_build_handler::PluginBuildError> {
+        Err(temps_node_agent::plugin_build_handler::PluginBuildError::RuntimeMissing)
+    }
 }

@@ -4248,7 +4248,7 @@
           },
           "environment_hostname_template": {
             "default": null,
-            "description": "Label of a new environment's generated hostname under `preview_domain`,\nfrom `{project}` and `{env}` (ADR 058 D9). `None` means\n[`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to\nenvironments created after it is set; existing ones keep their names.",
+            "description": "Label of a new environment's generated hostname under `preview_domain`,\nfrom `{project}` and `{env}` (ADR 058 D9). `None` means\n[`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to\nenvironments created after it is set; existing ones keep their names.",
             "type": [
               "string",
               "null"
@@ -7146,7 +7146,7 @@
             ]
           },
           "max_runtime_secs": {
-            "description": "Per-schedule wall-clock timeout override for backup jobs (seconds).\n`null` means the engine-family default is used. See\n`temps_backup_core::timeouts::default_max_runtime_secs`.",
+            "description": "Per-schedule wall-clock timeout override for backup jobs (seconds).\n`null` means the default of four hours (14400 seconds) is used.",
             "format": "int64",
             "type": [
               "integer",
@@ -7886,7 +7886,7 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Values for the Dockerfile's `ARG` instructions, applied exactly as\n`docker build --build-arg` would be (protocol v2). The control plane\ndecides which values may leave it -- never one marked secret or a\nplatform credential -- and sends only names the Dockerfile declares.\nThey travel inside this spec over the node's authenticated build\nchannel and are held in memory on both sides; neither side writes\nthem to disk or to a log.",
+            "description": "Values for the Dockerfile's `ARG` instructions, applied exactly as\n`docker build --build-arg` would be (protocol v2). The control plane\ndecides which values may leave it -- never one marked secret or a\nplatform credential -- and sends only names the Dockerfile declares.\nA spec holding them is encrypted to the node's key\n([`SEALED_BUILD_SPEC_FIELD`]). They are held in memory on both sides;\nneither side writes them to disk or to a log.",
             "propertyNames": {
               "type": "string"
             },
@@ -31301,6 +31301,18 @@
           "host",
           "path",
           "status"
+        ],
+        "type": "object"
+      },
+      "FunnelMessageResponse": {
+        "description": "Acknowledges a funnel update or delete.",
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
         ],
         "type": "object"
       },
@@ -100472,7 +100484,7 @@
     },
     "/deployments/{id}/metrics/enable": {
       "patch": {
-        "description": "When `enabled=true`, seeds the default container alert rules for the\ndeployment via [`temps_monitoring::seed_default_container_rules`] (idempotent).",
+        "description": "When `enabled=true`, seeds the default container alert rules for the\ndeployment via [`temps_alarms::seed_default_container_rules`] (idempotent).",
         "operationId": "DeploymentMetricsToggle",
         "parameters": [
           {
@@ -106033,6 +106045,9 @@
             },
             "description": "Service environment variables in plaintext"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
+          },
           "403": {
             "description": "Caller cannot access a project linked to this service"
           },
@@ -106300,7 +106315,10 @@
             "description": "Insufficient permissions or deployment-token caller"
           },
           "404": {
-            "description": "Service not found"
+            "description": "Service or requested node not found"
+          },
+          "409": {
+            "description": "The member cannot be placed as requested, or this process has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -106355,6 +106373,9 @@
           },
           "404": {
             "description": "Service or member not found"
+          },
+          "409": {
+            "description": "The member is still being provisioned"
           },
           "500": {
             "description": "Internal server error"
@@ -106461,6 +106482,9 @@
           },
           "404": {
             "description": "Service or member not found"
+          },
+          "409": {
+            "description": "This process has no local Docker daemon to run the promotion on"
           },
           "500": {
             "description": "pg_autoctl perform promotion failed"
@@ -106878,7 +106902,7 @@
     },
     "/external-services/{id}/metrics/enable": {
       "patch": {
-        "description": "When `enabled=true`, seeds the default alert rules for the service's engine\nvia [`temps_monitoring::seed_default_rules`] (idempotent).",
+        "description": "When `enabled=true`, seeds the default alert rules for the service's engine\nvia [`temps_alarms::seed_default_rules`] (idempotent).",
         "operationId": "ExternalServiceMetricsToggle",
         "parameters": [
           {
@@ -107179,6 +107203,9 @@
             },
             "description": "Preview of environment variables with sensitive values masked as ***"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -107220,6 +107247,9 @@
               }
             },
             "description": "List of environment variable names that would be provided"
+          },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
           },
           "404": {
             "description": "Service not found"
@@ -107468,6 +107498,9 @@
             },
             "description": "List of environment variables"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
+          },
           "404": {
             "description": "Service or project not found"
           },
@@ -107525,6 +107558,9 @@
               }
             },
             "description": "Environment variable value"
+          },
+          "400": {
+            "description": "The service's stored configuration cannot be used to build its variables"
           },
           "403": {
             "description": "Plaintext secret access is not permitted"
@@ -107588,6 +107624,9 @@
               }
             },
             "description": "Connection credentials issued"
+          },
+          "400": {
+            "description": "The service type or its stored configuration cannot issue connection credentials"
           },
           "403": {
             "description": "Plaintext secret access is not permitted"
@@ -108112,6 +108151,9 @@
             },
             "description": "Service started successfully"
           },
+          "400": {
+            "description": "The service's stored configuration cannot be used to start it"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -108192,6 +108234,9 @@
               }
             },
             "description": "Service stopped successfully"
+          },
+          "400": {
+            "description": "The service's stored configuration cannot be used to stop it"
           },
           "404": {
             "description": "Service not found"
@@ -110370,6 +110415,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No GeoIP database is loaded yet"
           }
         },
         "security": [
@@ -149414,6 +149469,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunnelMessageResponse"
+                }
+              }
+            },
             "description": "Funnel deleted successfully"
           },
           "401": {
@@ -149473,6 +149535,13 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunnelMessageResponse"
+                }
+              }
+            },
             "description": "Funnel updated successfully"
           },
           "400": {

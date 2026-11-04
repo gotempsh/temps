@@ -18,6 +18,7 @@ use temps_import_types::plan::{
     DeploymentConfiguration, EnvironmentConfiguration, PlanComplexity, PlanMetadata,
     ProjectConfiguration, ProjectType, Protocol,
 };
+use temps_import_types::sanitize_slug;
 use temps_import_types::{
     CredentialValidation, DataImplication, DataImplicationSeverity, DeploymentStrategy, DomainPlan,
     DomainSnapshot, EnvironmentVariable, ImportContext, ImportCredentials, ImportError,
@@ -59,13 +60,6 @@ impl PortainerImporter {
 // ---------------------------------------------------------------------------
 // Mapping helpers
 // ---------------------------------------------------------------------------
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
-}
 
 /// Parse `endpoint/kind/name` back into its parts
 fn parse_workload_id(id: &str) -> Option<(i64, String, String)> {

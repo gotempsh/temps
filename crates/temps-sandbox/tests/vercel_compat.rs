@@ -106,6 +106,12 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/placement",
         "/v1/sandboxes/placement/nodes/{node}",
         "/v1/sandboxes/placement/nodes/{node}/evict",
+        // Changing a sandbox's egress policy after it was created (temps
+        // extension, ADR-055).
+        "/v1/sandboxes/{id}/egress-policy",
+        // Directory listing and preview access checks (temps extensions).
+        "/v1/sandboxes/{id}/fs/list",
+        "/v1/sandboxes/{id}/preview-access",
     ]
 }
 
@@ -131,16 +137,19 @@ fn openapi_covers_every_sdk_path() {
 fn openapi_does_not_advertise_unknown_paths() {
     let api = SandboxApiDoc::openapi();
     let expected: std::collections::HashSet<_> = expected_sdk_paths().into_iter().collect();
-    let got = &api.paths.paths;
+    let mut unknown: Vec<_> = api
+        .paths
+        .paths
+        .keys()
+        .filter(|path| !expected.contains(path.as_str()))
+        .collect();
+    unknown.sort();
 
-    for path in got.keys() {
-        assert!(
-            expected.contains(path.as_str()),
-            "OpenAPI doc exposes path '{}' not in the Vercel SDK surface — \
-             add it to `expected_sdk_paths` with a comment, or remove it from `SandboxApiDoc::paths`.",
-            path
-        );
-    }
+    assert!(
+        unknown.is_empty(),
+        "OpenAPI doc exposes paths not in the Vercel SDK surface: {unknown:?} — \
+         add them to `expected_sdk_paths` with a comment, or remove them from `SandboxApiDoc::paths`.",
+    );
 }
 
 // ── DTO shape: request bodies the SDK sends ─────────────────────────────────

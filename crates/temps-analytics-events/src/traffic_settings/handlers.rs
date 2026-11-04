@@ -19,7 +19,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
 use temps_geo::GeoIpService;
@@ -157,12 +157,14 @@ impl AuditOperation for ProjectAnalyticsSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize PROJECT_ANALYTICS_SETTINGS_UPDATED audit for project {}: {}",
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "PROJECT_ANALYTICS_SETTINGS_UPDATED for project {}",
+                    self.project_id
+                ),
+                source,
             )
         })
     }
@@ -326,8 +328,8 @@ pub(in crate::traffic_settings) mod tests {
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::Role;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::Role;
     use temps_entities::{project_analytics_settings, users};
 
     #[derive(Default)]
@@ -337,7 +339,10 @@ pub(in crate::traffic_settings) mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let mut operations = match self.operations.lock() {
                 Ok(operations) => operations,
                 Err(poisoned) => poisoned.into_inner(),

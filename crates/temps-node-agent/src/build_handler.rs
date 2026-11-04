@@ -33,7 +33,7 @@ use crate::sealed_requests::SealedRequestState;
 
 use crate::auth::RequireAgentAuth;
 use crate::handlers::{AgentResourceLimits, AgentState};
-use temps_auth::permission_guard;
+use temps_authz::permission_guard;
 use temps_core::problemdetails::{self, Problem};
 
 #[derive(Debug, thiserror::Error)]
@@ -1054,6 +1054,8 @@ mod tests {
             .unwrap(),
         );
         let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
             container_deployer: remote.clone(),
             image_builder: remote,
             docker: None,
@@ -1237,6 +1239,8 @@ mod tests {
             .unwrap(),
         );
         let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
             container_deployer: remote_for_containers,
             image_builder: builder.clone(),
             docker: None,
@@ -1378,6 +1382,8 @@ mod tests {
                 overlay_peers: Default::default(),
                 platform: Default::default(),
                 host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
             }));
         let mut body = format!(
             "--test\r\nContent-Disposition: form-data; name=\"{SEALED_BUILD_SPEC_FIELD}\"\r\n\r\n"
@@ -1485,6 +1491,8 @@ mod tests {
             .unwrap(),
         );
         let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
             container_deployer: container,
             image_builder: builder.clone(),
             docker: None,
@@ -1703,6 +1711,8 @@ mod tests {
             .unwrap(),
         );
         let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
             container_deployer: remote,
             image_builder: Arc::new(PathExportBuilder),
             docker: None,
@@ -1841,6 +1851,8 @@ mod tests {
             .unwrap(),
         );
         let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
             container_deployer: remote,
             image_builder: Arc::new(InspectOnlyBuilder),
             docker,
@@ -2039,6 +2051,8 @@ mod tests {
         ));
         let platform = builder.ensure_platform_discovered().await.unwrap();
         let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
             container_deployer: Arc::new(
                 temps_deployer::remote::RemoteNodeDeployer::new(
                     "http://127.0.0.1:9".into(),

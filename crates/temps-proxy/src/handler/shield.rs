@@ -18,9 +18,10 @@ use axum::{
     Extension, Json,
 };
 use serde::Serialize;
-use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_config::ShieldSettings;
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
-use temps_core::{AuditLogger, AuditOperation, RequestMetadata, ShieldSettings};
+use temps_core::{AuditLogger, AuditOperation, RequestMetadata};
 use tracing::error;
 
 use crate::service::shield_console_service::{
@@ -156,10 +157,9 @@ impl<T: Serialize + Send + Sync> AuditOperation for Named<T> {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(&self.body).map_err(|e| {
-            anyhow::anyhow!("Failed to serialize audit operation {}: {}", self.name, e)
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(&self.body)
+            .map_err(|source| temps_core::AuditError::serialize(self.name, source))
     }
 }
 
@@ -1111,7 +1111,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use tower::ServiceExt;
 
     #[derive(Default)]
@@ -1130,7 +1130,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             let payload = operation.serialize()?;
             if let Ok(mut entries) = self.entries.lock() {
                 entries.push((operation.operation_type(), payload));
@@ -1450,7 +1453,7 @@ mod tests {
     /// that leaves no audit record.
     #[tokio::test]
     async fn an_admin_decides_a_proposal_and_each_decision_is_audited() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
@@ -1528,7 +1531,7 @@ mod tests {
     /// audit log; the platform settings save is audited with both values.
     #[tokio::test]
     async fn a_new_token_is_shown_once_and_kept_out_of_the_audit_log() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {

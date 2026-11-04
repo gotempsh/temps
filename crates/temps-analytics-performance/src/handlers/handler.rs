@@ -23,7 +23,7 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, IngestBranch, IngestJson,
     KeyedIngestCors,
 };
-use temps_auth::{project_access_guard, AuthContext, Permission, RequireAuth};
+use temps_authz::{project_access_guard, AuthContext, Permission, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
 use tracing::{error, info};
@@ -987,7 +987,7 @@ pub async fn update_speed_metrics(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use temps_auth::Role;
+    use temps_authz::Role;
     use temps_core::ProjectAccessChecker;
     use temps_entities::deployments::Model as DeploymentModel;
 
@@ -1235,7 +1235,7 @@ mod tests {
     }
 
     /// A mock [`ProjectAccessChecker`] that returns a fixed outcome, mirroring
-    /// `temps_auth::permission_guard::tests::MockChecker`.
+    /// `temps_authz::permission_guard::tests::MockChecker`.
     struct MockChecker {
         allow: bool,
     }
@@ -1346,7 +1346,7 @@ mod tests {
     use axum::middleware;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use temps_analytics::ingest_keys::{AnalyticsIngestKeyService, AnalyticsIngestRateLimiter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     /// A syntactically valid key that is guaranteed not to exist.

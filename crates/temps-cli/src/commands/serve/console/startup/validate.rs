@@ -86,8 +86,7 @@ pub(super) async fn validate_deps(
     // var, so a startup download uses whatever the admin configured through
     // the UI -- the same value the scheduled refresh job reads each tick.
     let maxmind_license_key = configured_maxmind_license_key(db, encryption_service).await;
-    validate_geolite2_database(&geo_db_path, maxmind_license_key.as_deref()).await?;
-    debug!("✓ GeoLite2 database file found");
+    ensure_geolite2_database(&geo_db_path, maxmind_license_key.as_deref()).await;
     ensure_geolite2_asn_database(
         &config.data_dir.join(temps_geo::ASN_DB_FILENAME),
         maxmind_license_key.as_deref(),

@@ -12,10 +12,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-dns = { path = "../temps-dns" }
 temps-entities = { path = "../temps-entities" }
 
@@ -70,6 +69,7 @@ tokio-socks = { workspace = true }
 md5 = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }

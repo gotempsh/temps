@@ -15,7 +15,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use tracing::error;
@@ -190,14 +190,14 @@ impl AuditOperation for TrafficFilterAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize {} audit for traffic filter {} in project {}: {}",
-                self.operation,
-                self.filter_id,
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "{} for traffic filter {} in project {}",
+                    self.operation, self.filter_id, self.project_id
+                ),
+                source,
             )
         })
     }
@@ -507,7 +507,7 @@ mod tests {
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
     use std::collections::BTreeMap;
-    use temps_auth::permissions::Role;
+    use temps_authz::permissions::Role;
     use temps_entities::analytics_traffic_filters;
 
     #[test]

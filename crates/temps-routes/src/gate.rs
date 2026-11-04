@@ -19,13 +19,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use temps_core::crypto::sha256_hex;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set,
     Statement,
 };
-use sha2::{Digest, Sha256};
 use temps_core::gate::{
     self, GateAllowList, GateClaims, GateError, GateKind, GateLogoutRequest, GateRedeemRequest,
     GateRedeemResponse, SigningKey,
@@ -186,10 +186,6 @@ pub fn parse_allow(value: Option<&serde_json::Value>) -> GateAllowList {
                 users: vec![0],
             }),
     }
-}
-
-fn sha256_hex(value: &str) -> String {
-    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 /// The console's authorize request, after authentication.
@@ -514,7 +510,7 @@ impl GateService {
         let now = Utc::now();
         if code.expires_at <= now
             || code.address_id != request.address_id
-            || !gate::constant_time_eq(
+            || !temps_core::crypto::constant_time_eq(
                 gate::code_challenge(&request.code_verifier).as_bytes(),
                 code.code_challenge.as_bytes(),
             )

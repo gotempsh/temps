@@ -88,8 +88,17 @@ impl CookieCrypto {
             secret_key.as_bytes().to_vec()
         } else if secret_key.len() == 64 {
             // Hex-encoded 64-character key
-            hex::decode(secret_key)
-                .map_err(|e| CryptoError::InvalidKey(format!("Invalid hex key: {}", e)))?
+            hex::decode(secret_key).map_err(|error| {
+                // `FromHexError`'s own message prints the rejected key character.
+                CryptoError::InvalidKey(match error {
+                    hex::FromHexError::InvalidHexCharacter { index, .. } => {
+                        format!("Invalid hex key: invalid character at position {index}")
+                    }
+                    hex::FromHexError::OddLength | hex::FromHexError::InvalidStringLength => {
+                        "Key must be exactly 32 bytes or 64 hex characters".to_string()
+                    }
+                })
+            })?
         } else {
             return Err(CryptoError::InvalidKey(
                 "Key must be exactly 32 bytes or 64 hex characters".to_string(),
@@ -187,6 +196,17 @@ impl CookieCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_hex_key_error_does_not_name_the_rejected_character() {
+        let key = format!("abcZ{}", "a".repeat(60));
+        let error = CookieCrypto::new(&key).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid key: Invalid hex key: invalid character at position 3"
+        );
+    }
 
     fn get_test_crypto() -> CookieCrypto {
         let test_key = "test_key_32_bytes_long_for_tests"; // 32 bytes

@@ -13,12 +13,14 @@
 pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
+mod clickhouse_compression;
 pub mod client_ip;
 /// The seam the purchase-triggered Cloud telemetry activation crosses
 /// (ADR-042 P3).
 pub mod cloud_telemetry_activation;
 pub mod config;
 pub mod console_startup;
+pub mod crypto;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;
@@ -26,7 +28,7 @@ pub mod environment_address;
 pub mod error;
 pub mod error_builder;
 pub mod error_metrics;
-pub mod external_plugin;
+pub mod escape;
 pub mod feature_maturity;
 pub mod gate;
 pub mod gate_access;
@@ -48,7 +50,6 @@ pub mod project_deletion;
 pub mod project_ip_gate;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
-pub mod public_ingress;
 pub mod public_status_page;
 pub mod registry_prefix;
 #[cfg(test)]
@@ -60,8 +61,6 @@ pub mod release_images {
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
 pub mod docker_handle;
-/// Idempotent, race-safe creation of a named Docker bridge network.
-pub mod docker_network;
 /// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
 pub mod docker_socket_grant;
 pub mod retention;
@@ -103,7 +102,6 @@ pub use serve_profile::{
     policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
-mod app_settings;
 mod constants;
 mod cookie_crypto;
 #[allow(deprecated)] // generic-array 0.14.x deprecation in aes-gcm 0.10
@@ -115,15 +113,12 @@ mod request_metadata;
 pub mod route_table;
 pub mod sealed_request;
 pub mod stages;
-pub mod templates;
 pub mod types;
 pub mod url_validation;
 pub mod utils;
-pub mod workflow;
-pub mod workflow_executor;
-pub mod workflow_memory;
 // Re-export commonly used types
 pub use audit::*;
+pub use clickhouse_compression::{ClickHouseCompression, ParseClickHouseCompressionError};
 pub use client_ip::resolve_client_ip;
 pub use cloud_telemetry_activation::{
     CloudTelemetryActivationTrigger, StartedTelemetryActivation, TelemetryActivationOutcome,
@@ -167,8 +162,9 @@ pub use request_policy_gate::{
     RequestPolicyGateSlot,
 };
 pub use retention::{
-    FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
-    SettingsRetentionResolver,
+    FixedRetentionResolver, ObservabilityRetentionSettings, RetentionResolver,
+    RetentionResolverSlot, RetentionTable, SettingsRetentionResolver, MAX_ANALYTICS_RETENTION_DAYS,
+    MIN_ANALYTICS_RETENTION_DAYS,
 };
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
@@ -195,43 +191,10 @@ pub use utils::*;
 
 // Re-export external dependencies
 pub use anyhow;
-pub use app_settings::{
-    normalize_loopback_ja4_header, AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings,
-    AiWorkspaceFileLimitsSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
-    BuildLimitsSettings, CeilingEnforcement, ClickHouseCompression, ClickHouseSettings,
-    CloudSettings, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
-    ControlPlaneResourceSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
-    ImageRetentionSettings, KvSettings, LetsEncryptSettings, LoopbackJa4HeaderError,
-    McpServerSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, OnDemandTlsSettings,
-    ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
-    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    ShieldSettings, TenantResourceCeilings, DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
-    DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
-    DEFAULT_GEO_REFRESH_INTERVAL_HOURS, DEFAULT_GEO_STALE_LOOKUP_DAYS,
-    DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
-    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
-    GEO_SOURCE_MAXMIND_OFFICIAL, IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS,
-    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MAX_GEO_REFRESH_INTERVAL_HOURS,
-    MAX_GEO_STALE_LOOKUP_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
-    MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
-    MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
-};
-// Settings that replace deprecated environment variables (P0.7), and the
-// one-release shim that migrates those variables into them.
-pub use app_settings::{
-    decide_env_setting_migration, decide_secret_env_migration, record_env_setting_persisted,
-    BackupExecutorSettings, EnvMigrationLedger, EnvSecret, EnvSettingMigratedAudit,
-    EnvSettingMigration, OtelIngestSettings, OtelIngestSettingsError, OtelS3ArchiveSettings,
-    OtelS3Credentials, DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT, DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
-    DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS, DEFAULT_OTEL_S3_ARCHIVE_PREFIX, ENV_MIGRATION_LEDGER_KEY,
-    MAX_BACKUP_EXECUTOR_MAX_CONCURRENT,
-};
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
-pub use encryption::{EncryptionService, PasswordEncryptionError};
+pub use encryption::{EncryptionError, EncryptionService, PasswordEncryptionError};
 pub use preview_grant::{
     encode_preview_session_grant, sanitize_preview_next, sanitize_preview_next_ref,
     validate_preview_session_grant_envelope, verify_preview_session_grant, PreviewGrantError,
@@ -246,18 +209,11 @@ pub use request_metadata::{
 pub use serde;
 pub use serde_json;
 pub use stages::*;
-pub use templates::*;
 pub use thiserror;
 pub use tokio;
 pub use tracing;
 pub use types::*;
 pub use uuid;
-pub use workflow::*;
-pub use workflow_executor::*;
-pub use workflow_memory::{
-    memory_install_command, WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider,
-    MEMORY_SCRIPT, MEMORY_SCRIPT_DIR, MEMORY_SCRIPT_PATH,
-};
 
 // Re-export standard datetime type for use across all crates
 pub use types::UtcDateTime;

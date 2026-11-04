@@ -164,6 +164,9 @@ jobs:
           python3 scripts/test_source_attribution.py
           python3 scripts/test_release_attribution.py
 
+      - name: Test CI test coverage tooling
+        run: python3 scripts/test_ci_test_coverage.py
+
       - name: Verify every Rust install uses the pinned toolchain
         run: |
           python3 .github/scripts/test-check-toolchain-pin.py
@@ -704,6 +707,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Here rather than in Release Workflow Contracts because this job is a
+      # required check, so a test binary no group runs cannot merge. Reads the
+      # manifests and workflows only and compiles nothing.
+      - name: Every test binary is run by a CI group or allow-listed
+        run: python3 scripts/ci_test_coverage.py
+
   web-typecheck:
     name: Web TypeScript Check
     needs: changes
@@ -987,17 +996,17 @@ jobs:
 
       - name: Archive docker-tests test binaries
         # Used by docker-providers/docker-backups/postgres-upgrades and
-        # mariadb-pitr-e2e. `docker-tests = []` on both crates (no optional
-        # deps), so this only recompiles temps-providers/temps-backup
-        # themselves on top of the previous step's already-built dependency
+        # mariadb-pitr-e2e. `docker-tests` adds no optional deps on any of
+        # these crates, so this only recompiles temps-providers, its engine
+        # crates and temps-backup themselves on top of the previous step's already-built dependency
         # graph, not the whole workspace again. Still ~5 minutes, so it is
         # skipped when the change cannot reach either crate.
         if: needs.changes.outputs.docker_tests != 'false'
         run: |
-          cargo test --no-run --package temps-providers --package temps-backup --all-targets \
+          cargo test --no-run --package 'temps-providers*' --package temps-backup --all-targets \
             --features temps-providers/docker-tests,temps-backup/docker-tests \
             --message-format=json-render-diagnostics > cargo-messages-docker-tests.json
-          cargo nextest archive --package temps-providers --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
+          cargo nextest archive --package 'temps-providers*' --package temps-backup --all-targets --features temps-providers/docker-tests,temps-backup/docker-tests --archive-file test-binaries-docker-tests.tar.zst
         env:
           CARGO_INCREMENTAL: 0
 
@@ -1082,15 +1091,34 @@ jobs:
             # --all-targets pulled them in by accident once (see PR
             # discussion), so every group that used to pass --lib keeps that
             # exact scope here via kind(=lib) instead.
+            #
+            # The temps-external-plugins filter keeps the actor token tests,
+            # which moved there from temps-core. No group runs the rest of
+            # that crate.
             filter: >-
-              (package(temps-providers) or package(temps-presets) or
+              ((package(temps-providers*) and not test(/^query::/)) or package(temps-presets) or
               package(temps-auth) or package(temps-core) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
               package(temps-geo) or package(temps-environments) or
               package(temps-audit) or package(temps-analytics-performance) or
-              package(temps-shield))
+              package(temps-shield) or package(temps-ai) or
+              package(temps-agent-core) or package(temps-ai-cli) or
+              package(temps-service-protocol) or
+              package(temps-agents-mcp-proxy) or package(temps-ai-api-tools) or
+              package(temps-ai-gateway) or package(temps-alarms) or
+              package(temps-analytics-backend) or package(temps-authz) or
+              package(temps-clickhouse) or package(temps-cloud) or
+              package(temps-cloud-client) or package(temps-config-handlers) or
+              package(temps-credential-checks) or package(temps-edge) or
+              package(temps-edge-rules) or package(temps-email-tracking) or
+              package(temps-file-store) or package(temps-flags) or
+              package(temps-log-aggregator) or package(temps-mcp-server) or
+              package(temps-memory) or package(temps-observability) or
+              package(temps-product-telemetry) or package(temps-project-groups) or
+              package(temps-revenue) or package(temps-signatures) or
+              package(temps-teams) or package(temps-plugin-protocol))
               and kind(=lib)
           - group: unit-b
             # `not (temps-git and *_real_api)`: those tests call the live
@@ -1100,44 +1128,77 @@ jobs:
             # answers with a body the parser can't decode, which surfaces as
             # `ApiError("Failed to parse tree: error decoding response body")`
             # and panics -- turning third-party availability into a red build
-            # on PRs that never touched temps-git. Same reasoning already
-            # applied to temps-auth::oidc_discovery_live and
-            # temps-git::gitea_e2e in unit-integration below. They still run
-            # (and still assert strictly) with `cargo test -p temps-git`.
+            # on PRs that never touched temps-git. Same reasoning as
+            # temps-auth::oidc_discovery_live, which no group runs. They still
+            # run (and still assert strictly) with `cargo test -p temps-git`.
+            #
+            # `not (temps-vm-agent and a_cursor_...)`: fails on Linux because of a
+            # real bug, not the test. A log cursor names a file by inode alone,
+            # rotation frees an inode and ext4 reuses it at once, so a cursor for a
+            # rotated-out file matches the wrong file and the gap is not reported.
+            # The fix changes the agent's cursor format. Remove this line with it.
             filter: >-
               (package(temps-proxy) or package(temps-error-tracking) or
               package(temps-git) or package(temps-screenshots) or
               package(temps-routes) or package(temps-entities) or
               package(temps-cli) or package(temps-status-page) or
               package(temps-import) or package(temps-queue) or
-              package(temps-query) or package(temps-analytics-session-replay) or
+              package(temps-analytics-session-replay) or
               package(temps-dns) or package(temps-email) or
               package(temps-analytics) or package(temps-analytics-events) or
-              package(temps-otel)) and kind(=lib)
+              package(temps-otel) or package(temps-ai-agent-cli) or
+              package(temps-ai-chat) or package(temps-cloud-protocol) or
+              package(temps-docker-capture) or package(temps-external-plugins) or
+              package(temps-git-credential) or package(temps-import-caprover) or
+              package(temps-import-coolify) or package(temps-import-dokploy) or
+              package(temps-import-kamal) or package(temps-import-kubernetes) or
+              package(temps-import-portainer) or package(temps-import-types) or
+              package(temps-ingress) or package(temps-netpol-ebpf-common) or
+              package(temps-netpol-probe) or package(temps-network-policy) or
+              package(temps-node-dns) or package(temps-plugin-sdk) or
+              package(temps-pty-agent) or package(temps-sandbox) or
+              package(temps-vm-agent) or package(temps-wireguard) or
+              package(temps-workload) or package(temps-workload-activator) or
+              package(temps-workload-docker) or package(temps-workload-env) or
+              package(temps-workload-ingress) or package(temps-workload-netpol) or
+              package(temps-workload-node) or package(temps-workload-plane) or
+              package(temps-workload-volumes)) and kind(=lib)
               and not (package(temps-git) and test(/_real_api$/))
+              and not (package(temps-vm-agent) and test(a_cursor_whose_file_was_rotated_out))
           - group: unit-integration
-            # The kind(=test) counterpart to the two groups above: crates
-            # whose tests/*.rs files need neither Docker nor a database, and
-            # which therefore no CI job has ever run (the groups above are
-            # all kind(=lib)).
+            # The kind(=test) counterpart to the two groups above, plus the
+            # test modules inside binaries and examples: everything that is
+            # not a library test and does not need a Docker build or a
+            # container per test.
             #
-            # This list is deliberately short. Every candidate was run
-            # locally first, and two were dropped because they FAIL today —
-            # they are not in scope here and each needs its own fix:
-            #   temps-node-dns      both end_to_end tests time out
-            #                       ("first sync converged: Elapsed(())")
-            #   temps-ai-agents     sandbox_credential_smoke_test builds a
-            #                       Docker image; `cargo build --release
-            #                       --bin temps-pty-agent` exits 101
-            # Also excluded, needing infrastructure CI does not have:
-            # temps-network (it_kernel/it_allocator — covered by
-            # network-kernel-tests.yml), temps-ai-agents::firecracker_e2e (KVM),
-            # temps-auth::oidc_discovery_live and temps-git::gitea_e2e (live
-            # network / a Gitea server).
+            # scripts/ci_test_coverage.py fails CI when a test binary is in no
+            # group here and not in scripts/ci-test-coverage-allowlist.toml,
+            # which also says why each excluded binary cannot run here (live
+            # services, KVM, privileged firewall changes).
             filter: >-
-              (package(temps-ai-gateway) or package(temps-git-credential) or
-              package(temps-memory) or package(temps-pty-agent))
+              ((package(temps-ai-gateway) or package(temps-auth) or
+              package(temps-authz) or package(temps-cli) or
+              package(temps-cloud-client) or package(temps-core) or
+              package(temps-dns) or package(temps-edge-rules) or
+              package(temps-external-plugins) or package(temps-git-credential) or
+              package(temps-memory) or package(temps-monitoring) or
+              package(temps-node-dns) or package(temps-pty-agent) or
+              package(temps-revenue) or package(temps-sandbox) or
+              package(temps-screenshots) or package(temps-shield) or
+              package(temps-workload-ingress) or
+              (package(temps-metrics) and binary(postgres_checkpoint_stats_integration)) or
+              (package(temps-observability) and binary(merge_integration)) or
+              (package(temps-presets) and (binary(preset_scenarios) or binary(starters))) or
+              (package(temps-proxy) and binary(ingress_no_alloc)))
               and kind(=test)
+              and not binary(oidc_discovery_live)
+              and not binary(cloud_query_proxy_live_test)
+              and not binary(dns_registry_test))
+              or (kind(=bin) and (package(temps-example-plugin) or
+              package(temps-git-credential) or package(temps-google-indexing-plugin) or
+              package(temps-indexnow-plugin) or package(temps-lighthouse-plugin) or
+              package(temps-preview-gateway) or package(temps-vm-agent)))
+              or (kind(=example) and package(temps-plugin-sdk))
 
     steps:
       - name: Skip when no Rust input changed
@@ -1166,7 +1227,7 @@ jobs:
             done
           ) > "$RUNNER_TEMP/disk-samples.log" 2>&1 &
 
-      # TestDatabase::new() (crates/temps-database/src/test_utils.rs) falls
+      # TestDatabase::new() (crates/temps-test-utils/src/lib.rs) falls
       # back to lazily booting its own TimescaleDB container via a
       # process-local `OnceCell` when TEMPS_TEST_DATABASE_URL isn't set --
       # reused across tests only within the SAME process. Nextest runs every
@@ -1311,7 +1372,7 @@ jobs:
       matrix:
         include:
           - group: docker-providers
-            # temps-providers with Docker tests enabled.
+            # temps-providers and its engine crates with Docker tests enabled.
             # NOTE: orchestrator_* tests run in a dedicated `postgres-upgrades`
             # group, and *_backup_and_restore_to_s3 tests in a dedicated
             # `docker-backups` group (both serial, long-running, container-heavy).
@@ -1323,12 +1384,11 @@ jobs:
             # most tests here start a service container, and host-port picks
             # (externalsvc/port_util.rs) can still collide across processes,
             # which postgres/redis/mongodb/s3 retry and MariaDB does not.
-            # kind(=lib): matches the old --lib flag -- excludes
-            # tests/*.rs integration test files (e.g. temps-providers'
-            # mariadb_binlog_health_integration.rs), which no CI job has ever
-            # run and aren't necessarily green yet.
+            # kind(=lib): matches the old --lib flag. The crate's tests/*.rs
+            # files need no docker-tests feature; they run in
+            # docker-deployments and migrations below.
             archive: docker-tests
-            filter: package(temps-providers) and kind(=lib) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
+            filter: package(temps-providers*) and kind(=lib) and not test(/^query::/) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
             test_threads: "2"
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
@@ -1338,7 +1398,13 @@ jobs:
             # Docker and races for host ports (`port is already allocated`),
             # causing 300s hangs. --test-threads=1 guarantees serial execution.
             archive: docker-tests
-            filter: package(temps-providers) and kind(=lib) and test(backup_and_restore_to_s3)
+            #
+            # temps-backup's docker-tests-gated tests that mariadb-pitr-e2e
+            # does not run are here for the same reason.
+            filter: >-
+              (package(temps-providers*) and kind(=lib) and test(backup_and_restore_to_s3)) or
+              (package(temps-backup) and (binary(workload_job_proof) or
+               (kind(=lib) and test(resolve_backup_location_from_s3_finds_mariadb))))
             extra_args: --no-capture
             test_threads: "1"
           - group: postgres-upgrades
@@ -1347,7 +1413,7 @@ jobs:
             # so they're 2–6 min apiece and must not contend for Docker.
             # --test-threads=1 guarantees serial execution.
             archive: docker-tests
-            filter: package(temps-providers) and kind(=lib) and test(orchestrator_)
+            filter: package(temps-providers*) and kind(=lib) and test(orchestrator_)
             extra_args: --no-capture
             test_threads: "1"
           - group: docker-deployments
@@ -1372,25 +1438,41 @@ jobs:
             # temps-metrics is here for the same reason: no group ran it, so
             # its TestDatabase-backed store tests and the ClickHouse
             # testcontainers tests (which check rows read via
-            # system.query_log) never executed. kind(=lib) keeps its
-            # tests/*.rs binary out until that is shown to be green.
+            # system.query_log) never executed.
+            #
+            # temps-ai-agents, temps-sandbox-providers and the other binaries named below start real
+            # sandboxes, containers or per-test databases.
             archive: default
             filter: >-
-              package(temps-deployments) or package(temps-backup) or
+              package(temps-deployments) or package(temps-nodes) or package(temps-docker-housekeeping) or package(temps-ci-tokens) or package(temps-traefik-discovery) or package(temps-backup) or
               package(temps-vulnerability-scanner) or package(temps-import-docker) or
-              package(temps-database) or
-              package(temps-blob) or package(temps-query-s3) or
-              package(temps-query-redis) or package(temps-query-mongodb) or
-              package(temps-query-postgres) or package(temps-embeddings) or
+              package(temps-database) or package(temps-schema) or
+              package(temps-test-utils) or package(temps-docker-util) or
+              package(temps-blob) or (package(temps-providers*) and test(/^query::/)) or
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
               package(temps-node-agent) or
               (package(temps-metrics) and kind(=lib)) or
+              package(temps-runtime-health) or
+              (package(temps-ai-agents) and kind(=lib)) or
+              (package(temps-sandbox-providers) and
+               (kind(=lib) or binary(golden_container_create) or
+                binary(netpol_sdk_compat) or binary(sandbox_driver_eval))) or
+              (package(temps-git) and binary(gitea_e2e)) or
+              (package(temps-network) and binary(it_allocator)) or
+              (package(temps-presets) and binary(registry_prefix_docker_build)) or
+              (package(temps-providers) and kind(=test) and
+               not binary(role_reconciler_integration)) or
+              (package(temps-workload-plane) and binary(crash_recovery)) or
               (package(temps-otel) and kind(=test) and
                (binary(timescaledb_storage_test) or binary(e2e_http_test) or
                 binary(dynamic_alert_integration_test) or
-                binary(decode_to_store_test)))
+                binary(decode_to_store_test) or
+                binary(cloud_primary_write_mode_test) or
+                binary(cloud_primary_outbox_load_test) or
+                binary(cloud_bulk_activation_test) or
+                binary(global_traces_postgres_test)))
             test_threads: num-cpus
           - group: migrations
             # temps-migrations' up()/down() tests guard on
@@ -1398,25 +1480,34 @@ jobs:
             # migration cycle would destroy a shared database). Inside the
             # shared-DB groups above that guard always fired, so this suite
             # had never actually run in CI. This entry runs it for real:
-            # the env var is left unset (see the run step's conditional) and
-            # each test provisions its own disposable TimescaleDB via
+            # the env var is emptied, which these guards treat as unset (see the
+            # run step's conditional), and each test provisions its own disposable TimescaleDB via
             # testcontainers -- isolated, so two can run at once.
+            #
+            # dns_registry_test and role_reconciler_integration skip-as-pass
+            # against a shared database for the same reason, so they are here.
             archive: default
-            filter: package(temps-migrations)
+            filter: >-
+              package(temps-migrations) or
+              (package(temps-dns) and binary(dns_registry_test)) or
+              (package(temps-providers) and binary(role_reconciler_integration))
             test_threads: "2"
           # temps-otel's ClickHouse integration binaries. Each test provisions
           # its own ClickHouse via testcontainers and uses a MockDatabase for
           # the inner store, so the shared server is irrelevant and the
           # container cost (~60s/test, 23 tests) is unavoidable. Isolated
           # containers mean no shared state, so two at a time is safe. Its
-          # TestDatabase-backed siblings run in docker-deployments above.
+          # TestDatabase-backed siblings run in docker-deployments above. The
+          # other crates' ClickHouse integration binaries work the same way.
           - group: otel-clickhouse
             archive: default
             filter: >-
-              package(temps-otel) and kind(=test) and
-              (binary(clickhouse_storage_test) or
-               binary(clickhouse_query_spans_test) or
-               binary(clickhouse_trace_summaries_test))
+              (package(temps-otel) and kind(=test) and
+               (binary(clickhouse_storage_test) or
+                binary(clickhouse_query_spans_test) or
+                binary(clickhouse_trace_summaries_test))) or
+              (package(temps-log-aggregator) and binary(clickhouse_line_index)) or
+              (package(temps-observability) and binary(clickhouse_observe_test))
             test_threads: "2"
 
     steps:

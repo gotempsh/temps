@@ -24,6 +24,7 @@ use temps_core::{
     },
     problemdetails::Problem,
 };
+use temps_providers_core::service_errors::worker_node_required;
 use tracing::{error, info, warn};
 use utoipa::OpenApi;
 
@@ -53,79 +54,6 @@ use crate::services::{DatabaseProvisioningConfig, EnvironmentVariableOptions};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 
-/// The shared, uniform mapping for the two `ExternalServiceError` variants
-/// that both mean "this process cannot run containers here".
-///
-/// Both produce the same 409 `WORKER_NODE_REQUIRED` Problem (built in
-/// `temps_core`), so the status code, error code, title, remedy sentence and
-/// `setup_path` are byte-identical on every endpoint in every crate. Before
-/// this existed the same condition surfaced as a 500 on one route, a 409 on
-/// another and a 503 on a third, which is unreadable for a self-hosted
-/// operator who has nobody to ask.
-///
-/// Returns `None` for every other variant, so callers keep their own, more
-/// specific classification.
-pub(crate) fn worker_node_required(
-    error: &crate::services::ExternalServiceError,
-) -> Option<Problem> {
-    use crate::services::ExternalServiceError as E;
-    match error {
-        // Capability: this process has no daemon at all.
-        E::DockerUnavailable(inner) => Some(Problem::from(inner)),
-        // Policy: a daemon may exist, but the serve profile forbids local
-        // workloads. Same remedy, so the same response.
-        E::LocalWorkloadsDisabled { .. } => {
-            Some(temps_core::worker_node_required_problem(error.to_string()))
-        }
-        E::ServiceNameConflict { .. }
-        | E::ServiceNameRestoreConflict { .. }
-        | E::ServiceContainerRestoreConflict { .. }
-        | E::AmbiguousServiceName { .. }
-        | E::ServiceResourceConflict { .. }
-        | E::ServiceContainerConflict { .. }
-        | E::ServiceNotFound { .. }
-        | E::ServiceNotFoundByName { .. }
-        | E::ServiceNotFoundBySlug { .. }
-        | E::InitializationFailed { .. }
-        | E::UpgradeRejected { .. }
-        | E::EncryptionFailed { .. }
-        | E::DecryptionFailed { .. }
-        | E::InvalidServiceType { .. }
-        | E::ServiceNotLinkedToProject { .. }
-        | E::SandboxAccessUnsupported { .. }
-        | E::SandboxNamespaceConflict { .. }
-        | E::NoSandboxAccessEngine { .. }
-        | E::ServiceClaimDenied { .. }
-        | E::InvalidDatabaseProvisioning { .. }
-        | E::ProjectNotFound { .. }
-        | E::EnvironmentNotFound { .. }
-        | E::DatabaseError { .. }
-        | E::ArchiveSourceDesynced { .. }
-        | E::ParameterValidationFailed { .. }
-        | E::DataSafetyRefusal { .. }
-        | E::StartFailed { .. }
-        | E::UpgradeInProgress { .. }
-        | E::StopFailed { .. }
-        | E::DeletionFailed { .. }
-        | E::ServiceHasLinkedProjects { .. }
-        | E::EnvironmentVariableNotFound { .. }
-        | E::ParameterNotFound { .. }
-        | E::ParameterNotSensitive { .. }
-        | E::EncryptedVariableAccessDenied { .. }
-        | E::DockerError { .. }
-        | E::DuplicateServiceType { .. }
-        | E::InternalError { .. }
-        | E::ControlPlaneAddressRequired { .. }
-        | E::ControlPlaneMemberUnreachable { .. }
-        | E::ClusterPortsUnavailable { .. }
-        | E::ClusterMemberLimitExceeded { .. }
-        | E::ClusterMemberProvisioning { .. }
-        | E::ClusterNotSettled { .. }
-        | E::ClusterBusy { .. }
-        | E::LockTimeout { .. } => None,
-    }
-}
-
 /// Classify an `ExternalServiceError` that a handler would otherwise report as
 /// a generic 500.
 ///
@@ -139,12 +67,54 @@ pub(crate) fn external_service_problem(
     error: &crate::services::ExternalServiceError,
     detail: String,
 ) -> Problem {
-    worker_node_required(error)
+    engine_problem(error)
+        .or_else(|| worker_node_required(error))
         .or_else(|| missing_resource_problem(error))
         .or_else(|| data_safety_problem(error))
         .or_else(|| service_name_problem(error))
         .or_else(|| cluster_placement_problem(error))
         .unwrap_or_else(|| internal_server_error().detail(detail).build())
+}
+
+/// The cluster routes: a request the cluster's state or topology forbids is a
+/// 400, and everything else takes the shared classification, including 404 for
+/// a missing service, member or node. Decided by variant, because the messages
+/// quote container output and a message is free to change.
+fn cluster_operation_problem(
+    error: &crate::services::ExternalServiceError,
+    operation: &str,
+) -> Problem {
+    if matches!(
+        error,
+        crate::services::ExternalServiceError::ParameterValidationFailed { .. }
+    ) {
+        return bad_request().detail(error.to_string()).build();
+    }
+    external_service_problem(error, format!("Failed to {operation}: {error}"))
+}
+
+fn service_health_problem(error: crate::services::ExternalServiceError) -> Problem {
+    match error {
+        crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+            not_found().detail("Service not found").build()
+        }
+        other => internal_server_error()
+            .detail(format!("Health check failed: {}", other))
+            .build(),
+    }
+}
+
+/// An engine error the caller can act on: its own status, with the service ID
+/// when the manager had one.
+fn engine_problem(error: &crate::services::ExternalServiceError) -> Option<Problem> {
+    let crate::services::ExternalServiceError::Engine { service_id, source } = error else {
+        return None;
+    };
+    let problem = Problem::from(source.as_ref());
+    Some(match service_id {
+        Some(service_id) => problem.with_value("service_id", *service_id),
+        None => problem,
+    })
 }
 
 /// Something the request named doesn't exist: a 404, so a client can tell that
@@ -159,6 +129,8 @@ fn missing_resource_problem(error: &crate::services::ExternalServiceError) -> Op
             | E::ServiceNotFound { .. }
             | E::ServiceNotFoundByName { .. }
             | E::ServiceNotFoundBySlug { .. }
+            | E::ClusterMemberNotFound { .. }
+            | E::NodeNotFound { .. }
     )
     .then(|| not_found().detail(error.to_string()).build())
 }
@@ -197,6 +169,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }
@@ -233,7 +207,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ClusterMemberProvisioning { .. }
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
-        | E::LockTimeout { .. } => None,
+        | E::LockTimeout { .. }
+        | E::Engine { .. } => None,
     }
 }
 
@@ -256,6 +231,8 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }
@@ -292,6 +269,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::ClusterNotSettled { .. }
         | E::ClusterBusy { .. }
         | E::LockTimeout { .. }
+        | E::Engine { .. }
         | E::NoSandboxAccessEngine { .. }
         | E::SandboxAccessUnsupported { .. }
         | E::SandboxNamespaceConflict { .. } => None,
@@ -337,6 +315,8 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }
@@ -367,7 +347,8 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
         | E::DockerUnavailable(_)
-        | E::LocalWorkloadsDisabled { .. } => return None,
+        | E::LocalWorkloadsDisabled { .. }
+        | E::Engine { .. } => return None,
     };
     Some(conflict().title(title).detail(error.to_string()).build())
 }
@@ -529,10 +510,8 @@ async fn import_external_service(
         .await
         .map_err(|e| {
             error!("Failed to import service: {}", e);
-            if let Some(error) = e.downcast_ref::<crate::services::ExternalServiceError>() {
-                if let Some(problem) = service_name_problem(error) {
-                    return problem;
-                }
+            if let Some(problem) = engine_problem(&e).or_else(|| service_name_problem(&e)) {
+                return problem;
             }
             bad_request()
                 .detail(format!("Failed to import service: {}", e))
@@ -1026,8 +1005,7 @@ async fn create_service(
             //   service that is effectively still first-booting.
             let engine = service.service_type.to_string();
             if let Err(e) =
-                temps_monitoring::seed_default_rules(app_state.db.as_ref(), service.id, &engine)
-                    .await
+                temps_alarms::seed_default_rules(app_state.db.as_ref(), service.id, &engine).await
             {
                 error!(
                     service_id = service.id,
@@ -1443,7 +1421,7 @@ async fn authorize_service_link_source(
 }
 
 fn require_reveal_audit(
-    result: std::result::Result<(), temps_core::anyhow::Error>,
+    result: temps_core::AuditResult<()>,
     detail: &'static str,
 ) -> Result<(), Problem> {
     result.map_err(|_| internal_server_error().detail(detail).build())
@@ -1457,6 +1435,7 @@ fn require_reveal_audit(
 fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
     match e {
+        E::Engine { .. } => engine_problem(e),
         E::UpgradeRejected { .. } => Some(bad_request().detail(e.to_string()).build()),
         E::ServiceNotFound { .. } => Some(not_found().detail(e.to_string()).build()),
         E::UpgradeInProgress { .. } => Some(conflict().detail(e.to_string()).build()),
@@ -1527,14 +1506,10 @@ async fn upgrade_service(
             if let Some(problem) = upgrade_error_problem(&e) {
                 return Err(problem);
             }
-            if e.to_string().contains("Upgrade not implemented") {
-                Err(bad_request().detail(e.to_string()).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to upgrade service: {}", e),
-                ))
-            }
+            Err(external_service_problem(
+                &e,
+                format!("Failed to upgrade service: {}", e),
+            ))
         }
     }
 }
@@ -1697,21 +1672,13 @@ async fn delete_service(
 
                     Ok(StatusCode::NO_CONTENT)
                 }
-                Err(e) => {
-                    // Check for specific error types
-                    let error_str = e.to_string();
-                    if error_str.contains("Service not found") {
-                        Err(not_found().detail("Service not found").build())
-                    } else if error_str.contains("still linked to") {
-                        // Return 400 Bad Request with detailed message about linked projects
-                        Err(bad_request().detail(error_str).build())
-                    } else {
-                        Err(external_service_problem(
-                            &e,
-                            format!("Failed to delete service: {}", e),
-                        ))
-                    }
+                Err(e @ crate::services::ExternalServiceError::ServiceHasLinkedProjects { .. }) => {
+                    Err(bad_request().detail(e.to_string()).build())
                 }
+                Err(e) => Err(external_service_problem(
+                    &e,
+                    format!("Failed to delete service: {}", e),
+                )),
             }
         }
         Err(e) => Err(external_service_problem(
@@ -1749,12 +1716,7 @@ async fn check_health(
         .await
     {
         Ok(health) => Ok((StatusCode::OK, Json(health))),
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" => Err(not_found().detail("Service not found").build()),
-            _ => Err(internal_server_error()
-                .detail(format!("Health check failed: {}", e))
-                .build()),
-        },
+        Err(e) => Err(service_health_problem(e)),
     }
 }
 
@@ -2272,6 +2234,7 @@ async fn list_service_health_statuses(
     tag = "External Services",
     responses(
         (status = 200, description = "Service started successfully", body = ExternalServiceInfo),
+        (status = 400, description = "The service's stored configuration cannot be used to start it"),
         (status = 404, description = "Service not found"),
         (status = 409, description = "A Postgres major upgrade is in progress, duplicate service names prevent safe resource control, another cluster action is in progress, the cluster or one of its members is still being provisioned, or the cluster's provisioning failed"),
         (status = 500, description = "Internal server error")
@@ -2405,19 +2368,7 @@ async fn retry_cluster(
         }
         Err(e) => {
             error!("Failed to retry cluster service {}: {}", id, e);
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found()
-                    .detail(format!("Service {} not found", id))
-                    .build())
-            } else if msg.contains("only valid for") || msg.contains("must be in") {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to retry cluster: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "retry cluster"))
         }
     }
 }
@@ -2439,7 +2390,8 @@ async fn retry_cluster(
         (status = 202, description = "Cluster member provisioning started", body = ServiceMemberInfo),
         (status = 400, description = "Validation failed (wrong topology, status, or role)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
-        (status = 404, description = "Service not found"),
+        (status = 404, description = "Service or requested node not found"),
+        (status = 409, description = "The member cannot be placed as requested, or this process has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     params(("id" = i32, Path, description = "External service ID")),
@@ -2495,24 +2447,7 @@ async fn add_cluster_member(
         }
         Err(e) => {
             error!("Failed to add cluster member to service {}: {}", id, e);
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found()
-                    .detail(format!("Service {} not found", id))
-                    .build())
-            } else if msg.contains("only valid for")
-                || msg.contains("must be in")
-                || msg.contains("only 'replica'")
-                || msg.contains("only supported for Postgres")
-                || msg.contains("Only 'replica'")
-            {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to add cluster member: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "add cluster member"))
         }
     }
 }
@@ -2556,17 +2491,7 @@ async fn get_cluster_member(
             let wire: ServiceMemberInfo = member.into();
             Ok((StatusCode::OK, Json(wire)))
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to load cluster member: {}", e),
-                ))
-            }
-        }
+        Err(e) => Err(cluster_operation_problem(&e, "load cluster member")),
     }
 }
 
@@ -2585,6 +2510,7 @@ async fn get_cluster_member(
         (status = 400, description = "Validation failed (monitor, primary, or quorum violation)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
+        (status = 409, description = "The member is still being provisioned"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2638,32 +2564,7 @@ async fn remove_cluster_member(
                 "Failed to remove cluster member {} from service {}: {}",
                 member_id, id, e
             );
-            // Classified before the message matching below, whose "Cannot
-            // remove" would turn this conflict into a 400.
-            if matches!(
-                e,
-                crate::services::ExternalServiceError::ClusterMemberProvisioning { .. }
-            ) {
-                return Err(external_service_problem(
-                    &e,
-                    format!("Failed to remove cluster member: {}", e),
-                ));
-            }
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found().detail(msg).build())
-            } else if msg.contains("only valid for")
-                || msg.contains("does not belong")
-                || msg.contains("Cannot remove")
-                || msg.contains("Refusing to remove")
-            {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to remove cluster member: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "remove cluster member"))
         }
     }
 }
@@ -2681,6 +2582,7 @@ async fn remove_cluster_member(
         (status = 400, description = "Validation failed (monitor, already primary, not running, etc.)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
+        (status = 409, description = "This process has no local Docker daemon to run the promotion on"),
         (status = 500, description = "pg_autoctl perform promotion failed")
     ),
     params(
@@ -2744,23 +2646,7 @@ async fn promote_cluster_member(
                 "Failed to promote cluster member {} on service {}: {}",
                 member_id, id, e
             );
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found().detail(msg).build())
-            } else if msg.contains("only valid for")
-                || msg.contains("only supported for")
-                || msg.contains("does not belong")
-                || msg.contains("Cannot promote")
-                || msg.contains("already the primary")
-                || msg.contains("not running")
-            {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to promote cluster member: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "promote cluster member"))
         }
     }
 }
@@ -2772,6 +2658,7 @@ async fn promote_cluster_member(
     tag = "External Services",
     responses(
         (status = 200, description = "Service stopped successfully", body = ExternalServiceInfo),
+        (status = 400, description = "The service's stored configuration cannot be used to stop it"),
         (status = 404, description = "Service not found"),
         (status = 409, description = "Duplicate service names prevent safe resource control, another cluster action is in progress, or the cluster or one of its members is still being provisioned"),
         (status = 500, description = "Internal server error")
@@ -3172,6 +3059,7 @@ async fn list_project_services(
     tag = "External Services",
     responses(
         (status = 200, description = "Environment variable value", body = EnvironmentVariableInfo),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Service, project, or variable not found"),
         (status = 500, description = "Internal server error")
@@ -3266,6 +3154,7 @@ async fn get_service_environment_variable(
     tag = "External Services",
     responses(
         (status = 200, description = "Connection credentials issued", body = RuntimeCredentialsResponse),
+        (status = 400, description = "The service type or its stored configuration cannot issue connection credentials"),
         (status = 403, description = "Plaintext secret access is not permitted"),
         (status = 404, description = "Service, project, or environment not found"),
         (status = 409, description = "Service is not linked to the project"),
@@ -3363,6 +3252,7 @@ fn runtime_credentials_problem(e: crate::services::ExternalServiceError) -> Prob
     tag = "External Services",
     responses(
         (status = 200, description = "List of environment variables", body = Vec<EnvironmentVariableInfo>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service or project not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3505,6 +3395,7 @@ async fn get_service_by_slug(
     tag = "External Services",
     responses(
         (status = 200, description = "List of environment variable names that would be provided", body = Vec<String>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3554,6 +3445,7 @@ async fn get_service_preview_environment_variable_names(
     tag = "External Services",
     responses(
         (status = 200, description = "Preview of environment variables with sensitive values masked as ***", body = HashMap<String, String>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -3603,6 +3495,7 @@ async fn get_service_preview_environment_variables_masked(
     tag = "External Services",
     responses(
         (status = 200, description = "Service environment variables in plaintext", body = HashMap<String, String>),
+        (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 403, description = "Caller cannot access a project linked to this service"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
@@ -4165,6 +4058,43 @@ mod tests {
     use std::sync::Mutex;
     use temps_entities::{external_services, project_services};
 
+    /// These handlers reach an engine call whose bad-input or unsupported
+    /// error `external_service_problem` answers with a 400.
+    #[test]
+    fn handlers_that_can_answer_an_engine_400_declare_it() {
+        let spec = serde_json::to_value(<ExternalServiceApiDoc as OpenApi>::openapi())
+            .expect("the API document serializes");
+        for (method, path) in [
+            ("post", "/external-services/{id}/start"),
+            ("post", "/external-services/{id}/stop"),
+            (
+                "get",
+                "/external-services/{id}/projects/{project_id}/environment/{var_name}",
+            ),
+            (
+                "get",
+                "/external-services/{id}/projects/{project_id}/environment",
+            ),
+            ("get", "/external-services/{id}/preview-environment-names"),
+            ("get", "/external-services/{id}/preview-environment-masked"),
+            ("get", "/external-services/{id}/environment"),
+            (
+                "post",
+                "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
+            ),
+        ] {
+            let responses = &spec["paths"][path][method]["responses"];
+            assert!(
+                responses.is_object(),
+                "{method} {path} is not in the API document"
+            );
+            assert!(
+                responses.get("400").is_some(),
+                "{method} {path} does not declare a 400"
+            );
+        }
+    }
+
     #[test]
     fn a_missing_project_or_service_is_a_404_whatever_the_caller_was_doing() {
         use crate::services::ExternalServiceError as E;
@@ -4195,7 +4125,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("recording audit mutex should not be poisoned")
@@ -4964,6 +4894,74 @@ mod tests {
         );
     }
 
+    fn engine_error(
+        source: crate::externalsvc::EngineError,
+    ) -> crate::services::ExternalServiceError {
+        crate::services::ExternalServiceError::Engine {
+            service_id: Some(7),
+            source: Box::new(source),
+        }
+    }
+
+    /// An engine's verdict reaches the client with its own status and the
+    /// service ID, not as the handler's generic 500.
+    #[test]
+    fn engine_errors_keep_their_status_through_the_shared_mapping() {
+        use crate::externalsvc::EngineError;
+        for (source, expected) in [
+            (
+                EngineError::invalid_input("orders", "Missing port parameter"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                EngineError::not_found("orders", "Imported container 'pg' not found"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                EngineError::conflict("orders", "already exists"),
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let problem =
+                external_service_problem(&engine_error(source), "generic detail".to_string());
+            assert_eq!(problem.status_code, expected);
+            assert_eq!(
+                problem.body.get("service_id").and_then(|v| v.as_i64()),
+                Some(7)
+            );
+            assert_ne!(
+                problem.body.get("detail").and_then(|v| v.as_str()),
+                Some("generic detail")
+            );
+        }
+    }
+
+    /// `upgrade_service` used to find this case by matching on the message.
+    #[test]
+    fn an_upgrade_the_engine_does_not_implement_is_a_400() {
+        let error = engine_error(crate::externalsvc::EngineError::unsupported(
+            "orders",
+            crate::ServiceType::Redis,
+            "Upgrade",
+        ));
+        let problem = upgrade_error_problem(&error).expect("mapped");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_health_check_on_a_missing_service_is_a_404() {
+        let problem =
+            service_health_problem(crate::services::ExternalServiceError::ServiceNotFound {
+                id: 7,
+            });
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        let problem =
+            service_health_problem(crate::services::ExternalServiceError::InternalError {
+                reason: "boom".to_string(),
+            });
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     /// Everything else keeps the caller's context and its 500.
     #[test]
     fn unrelated_errors_keep_their_context_and_status() {
@@ -4982,10 +4980,17 @@ mod tests {
     fn credential_reveal_fails_closed_when_audit_write_fails() {
         assert!(require_reveal_audit(Ok(()), "audit failed").is_ok());
         let problem = require_reveal_audit(
-            Err(temps_core::anyhow::anyhow!("database unavailable")),
+            Err(temps_core::AuditError::write(
+                "SERVICE_PARAMETER_REVEALED",
+                "database unavailable",
+            )),
             "audit failed",
         )
         .expect_err("reveal must fail when its audit cannot be written");
+        assert_eq!(problem.body["detail"], "audit failed");
+        assert!(!serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("database unavailable"));
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -5331,6 +5336,261 @@ mod tests {
             updated_at: now,
         };
         (service, link)
+    }
+
+    /// A 404 in RFC 7807 shape, naming what was looked for.
+    fn assert_not_found_problem(problem: Problem, expected_detail: &str) {
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::NOT_FOUND,
+            "{problem:?}"
+        );
+        assert_eq!(
+            problem.body.get("detail").and_then(|v| v.as_str()),
+            Some(expected_detail)
+        );
+        assert!(problem.body.contains_key("title"), "{problem:?}");
+        let response = problem.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+    }
+
+    /// Query results in order: the ownership guard's two lookups for an
+    /// existing cluster service, then `rest`, which the route under test reads.
+    fn cluster_route_state<const N: usize>(rest: [Vec<sea_orm::MockRow>; N]) -> Arc<AppState> {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "cluster-route-not-found-test",
+        ));
+        let (mut service, link) = preview_service(&encryption_service);
+        service.topology = "cluster".to_string();
+        let mut mock = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![link]]);
+        for rows in rest {
+            mock = mock.append_query_results([rows]);
+        }
+        preview_state(
+            Arc::new(mock.into_connection()),
+            encryption_service,
+            vec![99],
+        )
+    }
+
+    fn cluster_service_row() -> sea_orm::MockRow {
+        let encryption_service = temps_core::EncryptionService::new_from_password("row");
+        let (mut service, _) = preview_service(&encryption_service);
+        service.topology = "cluster".to_string();
+        sea_orm::IntoMockRow::into_mock_row(service)
+    }
+
+    fn admin() -> RequireAuth {
+        RequireAuth(test_auth_context_with_role(temps_auth::Role::Admin))
+    }
+
+    #[tokio::test]
+    async fn retry_cluster_on_a_missing_service_is_a_404_problem() {
+        let result = retry_cluster(
+            State(cluster_route_state([Vec::new()])),
+            Path(17),
+            admin(),
+            Extension(test_request_metadata()),
+            Json(RetryClusterRequest {
+                members: Vec::new(),
+            }),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing service cannot be retried");
+        };
+        assert_not_found_problem(problem, "Service 17 not found");
+    }
+
+    #[tokio::test]
+    async fn add_cluster_member_on_a_missing_service_is_a_404_problem() {
+        let result = add_cluster_member(
+            State(cluster_route_state([Vec::new()])),
+            Path(17),
+            admin(),
+            Extension(test_request_metadata()),
+            Json(AddClusterMemberRequest {
+                role: "replica".to_string(),
+                node_id: None,
+            }),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing service cannot gain a member");
+        };
+        assert_not_found_problem(problem, "Service 17 not found");
+    }
+
+    #[tokio::test]
+    async fn get_cluster_member_with_a_missing_member_is_a_404_problem() {
+        let result = get_cluster_member(
+            State(cluster_route_state([Vec::new()])),
+            Path((17, 404)),
+            admin(),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing member cannot be read");
+        };
+        assert_not_found_problem(problem, "Cluster member 404 not found in service 17");
+    }
+
+    #[tokio::test]
+    async fn remove_cluster_member_with_a_missing_member_is_a_404_problem() {
+        let result = remove_cluster_member(
+            State(cluster_route_state([
+                vec![cluster_service_row()],
+                Vec::new(),
+            ])),
+            Path((17, 404)),
+            admin(),
+            Extension(test_request_metadata()),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing member cannot be removed");
+        };
+        assert_not_found_problem(problem, "Cluster member 404 not found in service 17");
+    }
+
+    #[tokio::test]
+    async fn promote_cluster_member_with_a_missing_member_is_a_404_problem() {
+        let result = promote_cluster_member(
+            State(cluster_route_state([
+                vec![cluster_service_row()],
+                Vec::new(),
+            ])),
+            Path((17, 404)),
+            admin(),
+            Extension(test_request_metadata()),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing member cannot be promoted");
+        };
+        assert_not_found_problem(problem, "Cluster member 404 not found in service 17");
+    }
+
+    #[tokio::test]
+    async fn toggle_service_metrics_on_a_missing_service_is_a_404_problem() {
+        let result = super::super::metrics_handlers::toggle_service_metrics(
+            admin(),
+            State(cluster_route_state([Vec::new()])),
+            Path(17),
+            Json(super::super::metrics_handlers::ToggleServiceMetricsRequest { enabled: true }),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing service cannot have its metrics enabled");
+        };
+        assert_not_found_problem(problem, "Service 17 not found");
+    }
+
+    /// Query results in order: the ownership guard, `get_service_details`, then
+    /// `delete_service` up to the check that finds the link.
+    #[tokio::test]
+    async fn delete_service_with_linked_projects_is_a_400_problem() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "delete-linked-service-test",
+        ));
+        let (service, link) = preview_service(&encryption_service);
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service.clone()]])
+            .append_query_results([vec![link.clone()]])
+            .append_query_results([vec![service.clone()]])
+            .append_query_results([vec![service.clone()]])
+            .append_query_results([vec![service]])
+            .append_query_results([Vec::<external_services::Model>::new()])
+            .append_query_results([vec![link]])
+            .into_connection();
+        let state = preview_state(Arc::new(db), encryption_service, vec![99]);
+
+        let result = delete_service(
+            State(state),
+            Path(17),
+            admin(),
+            Extension(test_request_metadata()),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a service with linked projects cannot be deleted");
+        };
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{problem:?}"
+        );
+        let detail = problem.body.get("detail").and_then(|v| v.as_str());
+        assert!(
+            detail.is_some_and(|detail| detail.contains("17")),
+            "{problem:?}"
+        );
+    }
+
+    /// The bug class: the words in a message used to pick the status.
+    #[test]
+    fn cluster_routes_classify_by_variant_not_by_message() {
+        use crate::services::ExternalServiceError as E;
+
+        for (error, want) in [
+            // A refusal that happens to say "not found" is still a refusal.
+            (
+                E::ParameterValidationFailed {
+                    service_id: 1,
+                    reason: "replica not found in the monitor".to_string(),
+                },
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            // A failure on our side that says "not found" is still a failure.
+            (
+                E::InternalError {
+                    reason: "Monitor's node 3 not found".to_string(),
+                },
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                E::ClusterMemberNotFound {
+                    service_id: 1,
+                    member_id: 2,
+                },
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                E::NodeNotFound {
+                    service_id: 1,
+                    node_id: 2,
+                },
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                E::ServiceNotFound { id: 1 },
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            // Its message says "Cannot remove", which used to be a 400.
+            (
+                E::ClusterMemberProvisioning {
+                    service_id: 1,
+                    action: "remove a member from",
+                    container_name: "postgres-ha-1".to_string(),
+                    status: "creating".to_string(),
+                },
+                axum::http::StatusCode::CONFLICT,
+            ),
+        ] {
+            assert_eq!(
+                cluster_operation_problem(&error, "do a thing").status_code,
+                want,
+                "{error}"
+            );
+        }
     }
 
     fn preview_state(

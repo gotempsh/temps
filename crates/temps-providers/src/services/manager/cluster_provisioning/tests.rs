@@ -313,7 +313,7 @@ async fn test_precreated_cluster_topology_is_one_transaction() {
 #[tokio::test]
 async fn concurrent_cluster_creations_reserve_distinct_port_blocks() {
     use sea_orm::IntoActiveModel;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,

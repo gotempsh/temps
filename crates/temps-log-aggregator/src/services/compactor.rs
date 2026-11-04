@@ -768,7 +768,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn compaction_indexes_replacement_before_forgetting_sources() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

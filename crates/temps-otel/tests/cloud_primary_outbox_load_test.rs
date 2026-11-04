@@ -144,7 +144,7 @@ async fn serve(stub: Stub) -> Option<String> {
 // ── Harness ────────────────────────────────────────────────────────────────
 
 struct Harness {
-    _db: temps_database::test_utils::TestDatabase,
+    _db: temps_test_utils::TestDatabase,
     db: Arc<sea_orm::DatabaseConnection>,
     link: Arc<CloudLink>,
     stub: Stub,
@@ -155,7 +155,7 @@ impl Harness {
     /// `None` means the environment cannot run this test (no Docker, or no TCP
     /// bind), and the caller returns rather than failing.
     async fn start() -> Option<Self> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("skipping outbox load test: no test database ({error})");
@@ -260,6 +260,28 @@ impl Harness {
         .collect()
     }
 
+    /// The database's own clock.
+    ///
+    /// Gap windows are stamped with the database's `NOW()`, and the database
+    /// can run on a different clock from this process, so bounds to compare
+    /// them against have to come from here. `clock_timestamp()` rather than
+    /// `NOW()` so it reads the time of this call, not of a transaction's start.
+    async fn database_clock(&self) -> chrono::DateTime<chrono::Utc> {
+        #[derive(FromQueryResult)]
+        struct Clock {
+            now: chrono::DateTime<chrono::Utc>,
+        }
+        Clock::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT clock_timestamp() AS now".to_string(),
+        ))
+        .one(self.db.as_ref())
+        .await
+        .expect("the database clock must be readable")
+        .expect("SELECT clock_timestamp() must return a row")
+        .now
+    }
+
     /// Truncate the queue between phases of one test without rebuilding the
     /// whole container.
     async fn reset_queue(&self) {
@@ -313,7 +335,7 @@ async fn sustains_the_target_rate_with_cloud_reachable_and_drains_to_empty() {
         return;
     };
     // 512 MiB, the shipped default — the cap must not be what makes this pass.
-    let outbox = harness.outbox(temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
+    let outbox = harness.outbox(temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
 
     let total_spans = TARGET_SPANS_PER_SECOND * SUSTAIN_SECONDS;
     let batches_per_second = TARGET_SPANS_PER_SECOND / PRODUCER_BATCH;
@@ -476,7 +498,7 @@ async fn at_the_cap_drops_are_accounted_exactly_and_a_gap_window_is_recorded() {
     let cap_bytes = 64 * 1024;
     let outbox = harness.outbox(cap_bytes);
 
-    let before = chrono::Utc::now();
+    let before = harness.database_clock().await;
     let mut accepted = 0usize;
     let mut refused = 0usize;
     for i in 0..40 {
@@ -487,7 +509,7 @@ async fn at_the_cap_drops_are_accounted_exactly_and_a_gap_window_is_recorded() {
         accepted += outcome.accepted;
         refused += outcome.refused;
     }
-    let after = chrono::Utc::now();
+    let after = harness.database_clock().await;
 
     assert!(accepted > 0, "the queue must accept up to its cap");
     assert!(refused > 0, "the cap must actually bind in this test");
@@ -620,7 +642,7 @@ async fn the_producer_handoff_never_drops_a_whole_batch() {
     let Some(harness) = Harness::start().await else {
         return;
     };
-    let outbox = harness.outbox(temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
+    let outbox = harness.outbox(temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
 
     const PRODUCERS: usize = 16;
     const BATCHES_EACH: usize = 20;
@@ -674,7 +696,7 @@ async fn a_deep_queue_costs_disk_and_not_memory() {
         return;
     };
     harness.stub.down.store(true, Ordering::SeqCst);
-    let outbox = harness.outbox(temps_core::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
+    let outbox = harness.outbox(temps_config::DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES);
 
     // Build a queue several times deeper than one wire batch.
     let deep = OUTBOX_BATCH_SIZE as usize * 8;

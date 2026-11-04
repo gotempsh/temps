@@ -30,9 +30,9 @@ use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 
-use temps_auth::{AuthContext, RequireAuth, Role};
+use temps_alarms::{AlarmService, AlarmStatus};
+use temps_authz::{AuthContext, RequireAuth, Role};
 use temps_core::RequestMetadata;
-use temps_monitoring::{AlarmService, AlarmStatus};
 use temps_otel::detectors::{Comparator, DetectionConfig, StaticParams};
 use temps_otel::handlers::metric_alert_handler::{delete_alert, MetricAlertScopeParams};
 use temps_otel::ingest::auth::OtelAuthService;
@@ -114,7 +114,7 @@ impl temps_core::AuditLogger for NoOpAuditLogger {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }
@@ -123,7 +123,7 @@ impl temps_core::AuditLogger for NoOpAuditLogger {
 /// cleanup on drop), the evaluator under test, the alert service for rule CRUD,
 /// the storage for seeding metrics, and the project the rows are scoped to.
 struct EvaluatorTestCtx {
-    _db: temps_database::test_utils::TestDatabase,
+    _db: temps_test_utils::TestDatabase,
     db: Arc<sea_orm::DatabaseConnection>,
     evaluator: Arc<MetricAlertEvaluator>,
     alert_service: Arc<MetricAlertService>,
@@ -142,7 +142,7 @@ struct EvaluatorTestCtx {
 /// service, so the DB cooldown key can't tell series apart — the evaluator's
 /// per-series state machine guarantees exactly-once firing instead.
 async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!(

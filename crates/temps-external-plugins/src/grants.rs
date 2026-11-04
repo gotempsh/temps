@@ -6,7 +6,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::external_plugin::channel::{PluginActorInfo, PluginHostPermission};
+use temps_plugin_protocol::channel::{PluginActorInfo, PluginHostPermission};
 use thiserror::Error;
 
 pub const MAX_PROMPT_BYTES: u32 = 65_536;

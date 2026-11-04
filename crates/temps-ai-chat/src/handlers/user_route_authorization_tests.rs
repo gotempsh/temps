@@ -57,7 +57,7 @@ impl AuditLogger for CountingAudit {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -901,7 +901,7 @@ async fn platform_admins_reject_what_they_could_approve() {
 // container runtime is available.
 
 use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
 async fn database(test: &str) -> Option<TestDatabase> {
     match TestDatabase::with_migrations().await {

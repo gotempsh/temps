@@ -1,0 +1,4475 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! RustFS Service implementation
+//!
+//! RustFS is a high-performance, distributed object storage system built in Rust.
+//! It provides S3-compatible API and is 2.3x faster than MinIO for small object payloads.
+//!
+//! See: https://github.com/rustfs/rustfs
+
+use super::error::{EngineError, Result};
+use async_trait::async_trait;
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::Client;
+use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
+use bollard::Docker;
+use futures::TryStreamExt;
+use rand::RngExt;
+use schemars::JsonSchema;
+use sea_orm::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::{self};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use temps_core::EncryptionService;
+use tokio::sync::RwLock;
+use tokio::time::sleep;
+use tracing::{debug, error, info, warn};
+
+use crate::readiness::{ReadinessObservation, ReadinessPolicy, ReadinessTarget};
+use crate::utils::ensure_network_exists;
+
+use super::managed_s3::{
+    derive_grant, scope_slug, CredentialFormat, ManagedS3AccessKeyRequest, ManagedS3Backend,
+    ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Endpoint, ManagedS3Error,
+    ManagedS3Grant, ManagedS3MirrorReport, MigrationSource, S3BucketPlan, S3Location,
+};
+use super::s3_mirror::RcSession;
+use super::{
+    ExternalService, HealthProbeResult, SensitiveValues, ServiceConfig, ServiceResourceLimits,
+    ServiceType,
+};
+
+pub use temps_providers_core::externalsvc::managed_s3::DEFAULT_RUSTFS_IMAGE;
+const DEFAULT_RUSTFS_VERSION: &str = "1.0.0";
+/// Default RustFS API port
+pub const DEFAULT_RUSTFS_API_PORT: u16 = 9000;
+/// Default RustFS console port
+pub const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 9001;
+/// Default RustFS username
+pub const DEFAULT_RUSTFS_USER: &str = "rustfsadmin";
+/// Default RustFS password
+pub const DEFAULT_RUSTFS_PASSWORD: &str = "rustfsadmin";
+
+/// Input configuration for creating a RustFS service
+/// This is what users provide when creating the service
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(
+    title = "RustFS Configuration",
+    description = "Configuration for RustFS S3-compatible storage service"
+)]
+pub struct RustfsInputConfig {
+    /// RustFS API port (auto-assigned if not provided)
+    #[schemars(example = example_port())]
+    pub port: Option<String>,
+
+    /// RustFS console port (auto-assigned if not provided)
+    #[schemars(example = example_console_port())]
+    pub console_port: Option<String>,
+
+    /// Access key (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_key")]
+    #[schemars(with = "Option<String>", example = example_access_key())]
+    pub access_key: Option<String>,
+
+    /// Secret key (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_key")]
+    #[schemars(with = "Option<String>", example = example_secret_key())]
+    pub secret_key: Option<String>,
+
+    /// Host address
+    #[serde(default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
+    pub host: String,
+
+    /// S3 region
+    #[serde(default = "default_region")]
+    #[schemars(example = example_region(), default = "default_region")]
+    pub region: String,
+
+    /// Docker image to use for RustFS
+    #[serde(default = "default_image")]
+    #[schemars(example = example_image(), default = "default_image")]
+    pub docker_image: String,
+
+    /// Metrics ingest key (`si_` prefix). Populated automatically when metrics
+    /// are enabled — never set by the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub metrics_ingest_key: Option<String>,
+
+    /// Base internal URL containers push OTLP metrics to (no trailing slash,
+    /// no path). Populated automatically alongside `metrics_ingest_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub metrics_ingest_url: Option<String>,
+
+    /// Managed S3 storage engine: `rustfs` (default). Services created before
+    /// the field existed have none and are RustFS.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub backend: Option<String>,
+
+    /// Logical bucket names every linked environment receives.
+    #[serde(default)]
+    #[schemars(with = "Option<Vec<String>>")]
+    pub buckets: Option<serde_json::Value>,
+}
+
+/// Internal runtime configuration for RustFS service
+/// This is what the service uses internally after processing input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RustfsConfig {
+    pub port: String,
+    pub console_port: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub host: String,
+    pub region: String,
+    pub docker_image: String,
+    /// Plaintext `si_` metrics ingest key, present when metrics are enabled.
+    /// Stored in the encrypted service config blob — never in plaintext elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_ingest_key: Option<String>,
+    /// Base internal URL containers push OTLP metrics to (no trailing slash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_ingest_url: Option<String>,
+}
+
+fn rustfs_container_env(config: &RustfsConfig) -> Vec<String> {
+    let mut env_vars = vec![
+        format!("RUSTFS_ACCESS_KEY={}", config.access_key),
+        format!("RUSTFS_SECRET_KEY={}", config.secret_key),
+    ];
+    if let Some(key) = &config.metrics_ingest_key {
+        let base_url = config
+            .metrics_ingest_url
+            .as_deref()
+            .unwrap_or("http://host.docker.internal:8080")
+            .trim_end_matches('/');
+        // RustFS forces its stdout exporter on whenever the *root*
+        // `RUSTFS_OBS_ENDPOINT` is empty -- regardless of
+        // `RUSTFS_OBS_USE_STDOUT` and even when a per-signal endpoint is set.
+        // That exporter prints a multi-line dump of every metric on every
+        // meter interval (>1M lines/hour per idle instance), all of which goes
+        // through log ingestion. Setting the root endpoint lets
+        // `RUSTFS_OBS_USE_STDOUT=false` take effect. The explicit metric
+        // endpoint still wins for metrics, and traces/logs export stay off,
+        // so nothing is ever sent to the root's derived `/v1/traces` or
+        // `/v1/logs` paths. Application logs are unaffected: they are routed
+        // by `RUSTFS_OBS_LOG_STDOUT_ENABLED`, not by this exporter switch.
+        env_vars.push(format!("RUSTFS_OBS_ENDPOINT={}/api/otel", base_url));
+        env_vars.push("RUSTFS_OBS_USE_STDOUT=false".to_string());
+        env_vars.push(format!(
+            "RUSTFS_OBS_METRIC_ENDPOINT={}/api/otel/v1/metrics",
+            base_url
+        ));
+        env_vars.push(format!(
+            "RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20{}",
+            key
+        ));
+        env_vars.push("RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string());
+        env_vars.push("RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string());
+        env_vars.push("RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string());
+    }
+    env_vars
+}
+
+/// Why an existing RustFS container no longer matches what
+/// `create_container` would build, or `None` when it does. Both checks are
+/// fixed at container creation, so a restart can never apply them:
+///
+/// - `HostConfig.Init` missing (orphaned processes pile up as zombies);
+/// - an environment entry Temps sets is absent or has a different value --
+///   e.g. a container from before the stdout metrics exporter was turned off.
+///
+/// Only variable *names* appear in the reason: values include credentials.
+fn rustfs_drift_reason(
+    host_config: Option<&bollard::models::HostConfig>,
+    actual_env: &[String],
+    desired_env: &[String],
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if host_config.is_some_and(crate::utils::host_config_missing_init) {
+        reasons.push("no init process".to_string());
+    }
+    let missing = crate::utils::missing_env_entries(desired_env, actual_env);
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing
+            .iter()
+            .map(|entry| entry.split_once('=').map_or(*entry, |(name, _)| name))
+            .collect();
+        reasons.push(format!("environment differs for {}", names.join(", ")));
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+/// Inspect `container_name` and report [`rustfs_drift_reason`]. Returns
+/// `None` when the container cannot be inspected: an unknown state must not
+/// trigger a recreate.
+async fn rustfs_container_drift(
+    docker: &Docker,
+    container_name: &str,
+    config: &RustfsConfig,
+) -> Option<String> {
+    let info = match docker
+        .inspect_container(
+            container_name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(info) => info,
+        Err(error) => {
+            tracing::warn!(
+                "Could not inspect RustFS container {} for config drift, keeping it as is: {}",
+                container_name,
+                error
+            );
+            return None;
+        }
+    };
+    let actual_env = info
+        .config
+        .as_ref()
+        .and_then(|c| c.env.clone())
+        .unwrap_or_default();
+    rustfs_drift_reason(
+        info.host_config.as_ref(),
+        &actual_env,
+        &rustfs_container_env(config),
+    )
+}
+
+impl RustfsConfig {
+    /// Create a RustfsConfig from input, using async Docker-aware port finding
+    /// Even if ports are provided, validates they are available and finds new ones if not
+    async fn from_input_async(input: RustfsInputConfig, docker: &Docker) -> Self {
+        // For API port: use provided if available, otherwise find a new one
+        let port = match &input.port {
+            Some(p) => {
+                let port_num: u16 = p.parse().unwrap_or(DEFAULT_RUSTFS_API_PORT);
+                // Check if the provided port is actually available
+                if is_port_available_async(docker, port_num).await {
+                    p.clone()
+                } else {
+                    // Port is in use, find a new one
+                    tracing::warn!(
+                        "Provided port {} is not available, finding a new one",
+                        port_num
+                    );
+                    find_available_port_async(docker, DEFAULT_RUSTFS_API_PORT)
+                        .await
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| DEFAULT_RUSTFS_API_PORT.to_string())
+                }
+            }
+            None => find_available_port_async(docker, DEFAULT_RUSTFS_API_PORT)
+                .await
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| DEFAULT_RUSTFS_API_PORT.to_string()),
+        };
+
+        // For console port, start searching after the API port to avoid conflicts
+        let api_port: u16 = port.parse().unwrap_or(DEFAULT_RUSTFS_API_PORT);
+        let console_start = std::cmp::max(api_port + 1, DEFAULT_RUSTFS_CONSOLE_PORT);
+
+        let console_port = match &input.console_port {
+            Some(p) => {
+                let port_num: u16 = p.parse().unwrap_or(DEFAULT_RUSTFS_CONSOLE_PORT);
+                // Check if the provided port is actually available
+                if is_port_available_async(docker, port_num).await {
+                    p.clone()
+                } else {
+                    // Port is in use, find a new one
+                    tracing::warn!(
+                        "Provided console port {} is not available, finding a new one",
+                        port_num
+                    );
+                    find_available_port_async(docker, console_start)
+                        .await
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| DEFAULT_RUSTFS_CONSOLE_PORT.to_string())
+                }
+            }
+            None => find_available_port_async(docker, console_start)
+                .await
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| DEFAULT_RUSTFS_CONSOLE_PORT.to_string()),
+        };
+
+        Self {
+            port,
+            console_port,
+            access_key: input.access_key.unwrap_or_else(default_access_key),
+            secret_key: input.secret_key.unwrap_or_else(default_secret_key),
+            host: input.host,
+            region: input.region,
+            docker_image: input.docker_image,
+            metrics_ingest_key: input.metrics_ingest_key,
+            metrics_ingest_url: input.metrics_ingest_url,
+        }
+    }
+}
+
+impl From<RustfsInputConfig> for RustfsConfig {
+    fn from(input: RustfsInputConfig) -> Self {
+        Self {
+            port: input.port.unwrap_or_else(|| {
+                find_available_port(DEFAULT_RUSTFS_API_PORT)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| DEFAULT_RUSTFS_API_PORT.to_string())
+            }),
+            console_port: input.console_port.unwrap_or_else(|| {
+                find_available_port(DEFAULT_RUSTFS_CONSOLE_PORT)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| DEFAULT_RUSTFS_CONSOLE_PORT.to_string())
+            }),
+            access_key: input.access_key.unwrap_or_else(default_access_key),
+            secret_key: input.secret_key.unwrap_or_else(default_secret_key),
+            host: input.host,
+            region: input.region,
+            docker_image: input.docker_image,
+            metrics_ingest_key: input.metrics_ingest_key,
+            metrics_ingest_url: input.metrics_ingest_url,
+        }
+    }
+}
+
+fn deserialize_optional_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
+}
+
+fn default_region() -> String {
+    "us-east-1".to_string()
+}
+
+fn default_host() -> String {
+    "localhost".to_string()
+}
+
+fn default_access_key() -> String {
+    // AWS Access Key format: AKIA + 16 uppercase alphanumeric characters = 20 chars total
+    let mut rng = rand::rng();
+    let random_part: String = (0..16)
+        .map(|_| {
+            let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            charset[rng.random_range(0..charset.len())] as char
+        })
+        .collect();
+    format!("AKIA{}", random_part)
+}
+
+fn default_secret_key() -> String {
+    // AWS Secret Key format: 40 characters of base64-like characters (alphanumeric + / +)
+    let mut rng = rand::rng();
+    (0..40)
+        .map(|_| {
+            let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+";
+            charset[rng.random_range(0..charset.len())] as char
+        })
+        .collect()
+}
+
+/// Build the `rc mirror` command used by RustFS restores.
+///
+/// In-place restores must exactly reproduce every bucket present in the
+/// backup: objects created later inside those buckets are removed and any
+/// mirror error fails the restore. Destination-only buckets are intentionally
+/// retained to avoid deleting an entire bucket outside the selected backup's
+/// scope. A newly provisioned target is empty, so it does not need `--remove`.
+///
+/// When the backup source is a temporary credential (`source_has_token`) the
+/// mirror is staged so only the source-side `rc` call sends the session token
+/// (see `rc_client::mirror_command`).
+fn restore_mirror_command(
+    source: &str,
+    destination: &str,
+    remove_extraneous: bool,
+    source_has_token: bool,
+) -> Vec<String> {
+    super::rc_client::mirror_command(
+        source,
+        destination,
+        remove_extraneous,
+        super::rc_client::TokenSide::when(source_has_token, super::rc_client::TokenSide::Source),
+    )
+}
+
+fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+/// Best-effort cleanup for a restore target that has no database owner yet.
+/// `remove_container` must only be true after this invocation successfully
+/// created that exact container; this prevents a name collision from deleting
+/// another service's data.
+async fn cleanup_unowned_rustfs_resources(
+    docker: &Docker,
+    container_name: &str,
+    volume_names: &[&str],
+    remove_container: bool,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if remove_container {
+        if let Err(error) = docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                errors.push(format!("container '{}': {}", container_name, error));
+            }
+        }
+    }
+    for volume_name in volume_names {
+        if let Err(error) = docker
+            .remove_volume(
+                volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                errors.push(format!("volume '{}': {}", volume_name, error));
+            }
+        }
+    }
+    errors
+}
+
+// Schema example functions
+fn example_port() -> &'static str {
+    "9000"
+}
+
+fn example_console_port() -> &'static str {
+    "9001"
+}
+
+fn example_access_key() -> &'static str {
+    "rustfsadmin"
+}
+
+fn example_secret_key() -> &'static str {
+    "rustfsadmin"
+}
+
+fn example_host() -> &'static str {
+    "localhost"
+}
+
+fn example_region() -> &'static str {
+    "us-east-1"
+}
+
+fn default_image() -> String {
+    DEFAULT_RUSTFS_IMAGE.to_string()
+}
+
+fn example_image() -> &'static str {
+    "rustfs/rustfs:latest"
+}
+
+use super::port_util::{find_available_port, find_available_port_async, is_port_available_async};
+
+pub struct RustfsService {
+    name: std::sync::RwLock<String>,
+    config: Arc<RwLock<Option<RustfsConfig>>>,
+    client: Arc<RwLock<Option<Client>>>,
+    /// Resource limits captured at init time, applied to recreate paths.
+    resource_limits: Arc<RwLock<ServiceResourceLimits>>,
+    docker: Arc<Docker>,
+    /// Reserved for encrypting/decrypting credentials when storing to database
+    encryption_service: Arc<EncryptionService>,
+}
+
+/// Host ports to adopt from an already-running container, if any.
+///
+/// Split out of [`RustfsService::running_container_ports`] so the decision can
+/// be tested without a Docker daemon. Returns `Some((api, console))` only when
+/// the container is running the exact image we're about to ask for — anything
+/// else means `create_container` recreates it and the caller's freshly probed
+/// ports are the right ones.
+fn adopted_ports_from_inspect(
+    info: &bollard::models::ContainerInspectResponse,
+    docker_image: &str,
+) -> Option<(String, String)> {
+    let running = info
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .is_some_and(|status| status == bollard::models::ContainerStateStatusEnum::RUNNING);
+    if !running {
+        return None;
+    }
+
+    // Same image check as `create_container` — a mismatch means the container
+    // is about to be replaced, ports and all.
+    let image_matches = info
+        .config
+        .as_ref()
+        .and_then(|config| config.image.as_deref())
+        .is_some_and(|image| image == docker_image);
+    if !image_matches {
+        return None;
+    }
+
+    let ports = info.network_settings.as_ref()?.ports.as_ref()?;
+    let host_port = |internal: &str| -> Option<String> {
+        ports
+            .get(internal)?
+            .as_ref()?
+            .first()?
+            .host_port
+            .clone()
+            .filter(|port| !port.is_empty())
+    };
+
+    Some((host_port("9000/tcp")?, host_port("9001/tcp")?))
+}
+
+impl RustfsService {
+    pub fn new(
+        name: String,
+        docker: Arc<Docker>,
+        encryption_service: Arc<EncryptionService>,
+    ) -> Self {
+        Self {
+            name: std::sync::RwLock::new(name),
+            config: Arc::new(RwLock::new(None)),
+            client: Arc::new(RwLock::new(None)),
+            resource_limits: Arc::new(RwLock::new(ServiceResourceLimits::default())),
+            docker,
+            encryption_service,
+        }
+    }
+
+    /// The instance name this engine currently works under: the service name
+    /// its container (`{prefix}-{name}`) and volumes are derived from.
+    pub fn instance_name(&self) -> String {
+        self.name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Point this engine at a different instance name.
+    ///
+    /// Only meaningful before the service is created: the managed KV and Blob
+    /// plugins build their engine once at startup, and the operator may pick
+    /// another container name (while the service does not exist) before
+    /// enabling it. Renaming an engine whose container exists would make it
+    /// lose track of that container.
+    pub fn set_instance_name(&self, name: String) {
+        *self
+            .name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+    }
+
+    /// Restart-loop note for this service's container, if it has restarted.
+    /// Bounded by [`RESTART_NOTE_TIMEOUT`]: the note is best-effort context,
+    /// and a failed health check must not wait on a slow Docker daemon.
+    async fn restart_loop_note(&self) -> Option<String> {
+        let name = self.get_container_name();
+        let restart_count = container_restart_count(&self.docker, &name).await?;
+        restart_loop_note(&name, restart_count)
+    }
+
+    /// The Docker container this instance owns.
+    ///
+    /// Public so callers that need to reason about the container — the blob
+    /// plugin checking for a duplicate left by the pre-#495 naming split, for
+    /// one — can ask instead of re-deriving `rustfs-{name}` themselves.
+    pub fn get_container_name(&self) -> String {
+        rustfs_container_name(&self.instance_name())
+    }
+
+    /// Host ports this service's container already publishes, when it is
+    /// running the image we're about to ask for.
+    ///
+    /// `RustfsConfig::from_input_async` probes each configured port and
+    /// relocates off anything already bound. On the second and every later
+    /// `init()` — re-enabling a running service, or the blob plugin loading
+    /// its config on boot — the process holding those ports *is this
+    /// service's own container*, so the probe hands back a free port nothing
+    /// is listening on. `create_container` then sees a healthy container on
+    /// the right image and returns early without applying the new ports, and
+    /// the S3 client below gets built against a dead endpoint: every blob
+    /// request fails with a dispatch error while the container sits there
+    /// healthy.
+    ///
+    /// Returns `None` when the container is absent, stopped, or on a
+    /// different image — all cases where `create_container` recreates it and
+    /// the freshly probed ports are the correct ones to use.
+    async fn running_container_ports(&self, docker_image: &str) -> Option<(String, String)> {
+        let info = self
+            .docker
+            .inspect_container(&self.get_container_name(), None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        adopted_ports_from_inspect(&info, docker_image)
+    }
+
+    /// Pull the RustFS client (`rc`) image used for backup/restore operations
+    async fn pull_rc_image(&self, docker: &Docker) -> Result<()> {
+        info!("Pulling RustFS client image {}", super::rc_client::RC_IMAGE);
+
+        crate::utils::pull_image_with_retry(docker, super::rc_client::RC_IMAGE, None)
+            .await
+            .map_err(|e| EngineError::failed(self.instance_name(), e))?;
+        Ok(())
+    }
+
+    /// Parse ServiceConfig parameters into RustfsConfig
+    fn get_rustfs_config(&self, service_config: ServiceConfig) -> Result<RustfsConfig> {
+        let input_config: RustfsInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!("Failed to parse RustFS configuration: {}", e),
+                )
+            })?;
+
+        Ok(RustfsConfig::from(input_config))
+    }
+
+    /// Execute a command in a container and return (success, stdout, stderr)
+    async fn exec_in_container(
+        &self,
+        docker: &Docker,
+        container_id: &str,
+        cmd: Vec<&str>,
+    ) -> Result<(bool, String, String)> {
+        let output = temps_docker_util::exec_capture(
+            docker,
+            container_id,
+            bollard::exec::CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+            temps_docker_util::ExecCaptureOptions::separate(
+                temps_docker_util::OutputLimit::Unbounded,
+                temps_docker_util::OutputLimit::Unbounded,
+            )
+            .stream_errors(temps_docker_util::StreamErrorPolicy::Stop),
+        )
+        .await
+        .map_err(|error| match error.into_docker_source() {
+            Ok(source) => EngineError::from(source),
+            Err(other) => EngineError::from(other),
+        })?;
+
+        Ok((
+            output.exit_code.unwrap_or(-1) == 0,
+            output.stdout,
+            output.stderr,
+        ))
+    }
+
+    async fn create_container(
+        &self,
+        docker: &Docker,
+        config: &RustfsConfig,
+        resource_limits: &ServiceResourceLimits,
+        require_new: bool,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+
+        // Check if container already exists
+        let containers = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![super::exact_container_name_filter(&container_name)],
+                )])),
+                ..Default::default()
+            }))
+            .await?;
+
+        if !containers.is_empty() {
+            if require_new {
+                return Err(EngineError::conflict(self.instance_name(), format!("Cannot create restored RustFS service '{}': Docker container '{}' already exists",
+                    self.instance_name(),
+                    container_name)));
+            }
+            let container = containers.first().ok_or_else(|| {
+                EngineError::failed(self.instance_name(), format!("Docker reported a RustFS container collision for '{}' without container details",
+                    container_name))
+            })?;
+            // The reference the container was created from; the list API
+            // reports an image ID once the tag has moved to a newer digest.
+            let existing_image = super::recreate_guard::created_image(docker, &container_name)
+                .await
+                .or_else(|| container.image.clone())
+                .unwrap_or_default();
+            let is_running =
+                container.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING);
+
+            // Check if container is running with same image and the creation-time
+            // settings Temps now requires - if so, we're good
+            if existing_image == config.docker_image && is_running {
+                let drift = rustfs_container_drift(docker, &container_name, config).await;
+                if drift.is_none() {
+                    info!(
+                        "Container {} already exists and is running with same image",
+                        container_name
+                    );
+                    return Ok(());
+                }
+                info!(
+                    "Container {} has config drift ({}); recreating it to apply the current settings. \
+                     Data and logs volumes are kept",
+                    container_name,
+                    drift.as_deref().unwrap_or_default()
+                );
+            } else {
+                // Container exists but is not running or has a different image
+                info!(
+                    "Container {} exists (running: {}, image: {}) but needs to be recreated (requested image: {})",
+                    container_name, is_running, existing_image, config.docker_image
+                );
+            }
+
+            // A stopped or drifted container is replaced so it picks up the
+            // current specification (credentials, ingest keys, init, env), as
+            // before; now through the guard, so the replacement must mount the
+            // same data.
+            let same_image = existing_image == config.docker_image;
+            let operation = if same_image {
+                "applying its current configuration"
+            } else {
+                "changing its image"
+            };
+            match self
+                .recreate_container_guarded(docker, config, resource_limits, operation)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if same_image
+                        && matches!(&e, EngineError::RecreateGuard(g) if g.is_refusal()) =>
+                {
+                    // Refreshing the specification is optional; the data is
+                    // not. Keep a running container (one with config drift)
+                    // as it is, and start a stopped one unchanged.
+                    if is_running {
+                        warn!(
+                            service = %self.instance_name(),
+                            container = %container_name,
+                            error = %e,
+                            "Not recreating the RustFS container to apply its config drift; keeping it running unchanged"
+                        );
+                        return Ok(());
+                    }
+                    warn!(
+                        service = %self.instance_name(),
+                        container = %container_name,
+                        error = %e,
+                        "Not recreating the RustFS container; starting it unchanged"
+                    );
+                    docker
+                        .start_container(
+                            &container_name,
+                            None::<bollard::query_parameters::StartContainerOptions>,
+                        )
+                        .await
+                        .map_err(|e| {
+                            EngineError::failed(
+                                self.instance_name(),
+                                format!(
+                                    "Failed to start existing RustFS container '{}': {}",
+                                    container_name, e
+                                ),
+                            )
+                        })?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        info!("Pulling RustFS image {}", config.docker_image);
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| EngineError::failed(self.instance_name(), e))?;
+        self.create_fresh_container(docker, config, resource_limits, require_new)
+            .await
+    }
+
+    /// The storage a container created by this service mounts, for
+    /// [`recreate_guard`](super::recreate_guard).
+    fn replacement_storage(&self) -> super::recreate_guard::ReplacementStorage {
+        super::recreate_guard::ReplacementStorage {
+            data_dir: "/data".to_string(),
+            mounts: vec![
+                super::recreate_guard::PlannedMount {
+                    volume: format!("rustfs_{}_data", self.instance_name()),
+                    target: "/data".to_string(),
+                },
+                super::recreate_guard::PlannedMount {
+                    volume: format!("rustfs_{}_logs", self.instance_name()),
+                    target: "/logs".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// Replace this service's existing container with one built from
+    /// `config` through the shared guard (same data volume or refuse; old
+    /// container kept until the new one lists the same buckets).
+    async fn recreate_container_guarded(
+        &self,
+        docker: &Docker,
+        config: &RustfsConfig,
+        resource_limits: &ServiceResourceLimits,
+        operation: &str,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        // Pull while the original still serves.
+        info!("Pulling RustFS image {}", config.docker_image);
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| EngineError::failed(self.instance_name(), e))?;
+        let service_name = self.instance_name();
+        super::recreate_guard::recreate_preserving_data(
+            super::recreate_guard::RecreateRequest {
+                docker,
+                engine: super::recreate_guard::ManagedEngine::Rustfs,
+                service_name: &service_name,
+                container_name: &container_name,
+                replacement: self.replacement_storage(),
+                operation,
+            },
+            || self.create_fresh_container(docker, config, resource_limits, false),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Create and start a new container. The caller has made sure no
+    /// container with this name exists.
+    async fn create_fresh_container(
+        &self,
+        docker: &Docker,
+        config: &RustfsConfig,
+        resource_limits: &ServiceResourceLimits,
+        require_new: bool,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+        let data_volume_name = format!("rustfs_{}_data", self.instance_name());
+        let logs_volume_name = format!("rustfs_{}_logs", self.instance_name());
+
+        if require_new {
+            for volume_name in [&data_volume_name, &logs_volume_name] {
+                match docker.inspect_volume(volume_name).await {
+                    Ok(_) => {
+                        return Err(EngineError::conflict(self.instance_name(), format!("Cannot create restored RustFS service '{}': derived Docker volume '{}' already exists",
+                            self.instance_name(),
+                            volume_name)));
+                    }
+                    Err(error) if docker_error_is_not_found(&error) => {}
+                    Err(error) => {
+                        return Err(EngineError::failed(self.instance_name(), format!("Cannot verify Docker volume '{}' is available for restored RustFS service '{}': {}",
+                            volume_name,
+                            self.instance_name(),
+                            error)));
+                    }
+                }
+            }
+        }
+
+        ensure_network_exists(docker).await.map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to ensure network exists: {:?}", e),
+            )
+        })?;
+
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(data_volume_name.clone()),
+                ..Default::default()
+            })
+            .await?;
+
+        if let Err(error) = docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(logs_volume_name.clone()),
+                ..Default::default()
+            })
+            .await
+        {
+            let cleanup_errors = if require_new {
+                cleanup_unowned_rustfs_resources(
+                    docker,
+                    &container_name,
+                    &[&data_volume_name],
+                    false,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            return Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to create RustFS logs volume '{}': {}{}",
+                    logs_volume_name,
+                    error,
+                    if cleanup_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                    }
+                ),
+            ));
+        }
+
+        let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
+        let instance_name = self.instance_name();
+        let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
+
+        let container_labels = HashMap::from([
+            (service_label_key.as_str(), "rustfs"),
+            (name_label_key.as_str(), instance_name.as_str()),
+        ]);
+
+        // RustFS uses RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY and, on the pinned
+        // image, pushes application telemetry through the OTLP env.
+        let env_vars = rustfs_container_env(config);
+
+        let networking_config = Some(bollard::models::NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                temps_core::NETWORK_NAME.to_string(),
+                bollard::models::EndpointSettings {
+                    ..Default::default()
+                },
+            )])),
+        });
+
+        let mut port_bindings = crate::utils::local_port_binding("9000/tcp", &config.port);
+        port_bindings.extend(crate::utils::local_port_binding(
+            "9001/tcp",
+            &config.console_port,
+        ));
+
+        let mut host_config = bollard::models::HostConfig {
+            port_bindings: Some(port_bindings),
+            // Add volume mounts for data and logs
+            mounts: Some(vec![
+                bollard::models::Mount {
+                    target: Some("/data".to_string()),
+                    source: Some(data_volume_name.clone()),
+                    typ: Some(bollard::models::MountType::VOLUME),
+                    ..Default::default()
+                },
+                bollard::models::Mount {
+                    target: Some("/logs".to_string()),
+                    source: Some(logs_volume_name.clone()),
+                    typ: Some(bollard::models::MountType::VOLUME),
+                    ..Default::default()
+                },
+            ]),
+            log_config: Some(crate::utils::default_service_log_config()),
+            // Security hardening for service containers
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            pids_limit: Some(512),
+            init: crate::utils::MANAGED_SERVICE_CONTAINER_INIT,
+            ..Default::default()
+        };
+        resource_limits.apply_to_host_config(&mut host_config);
+
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(config.docker_image.to_string()),
+            networking_config,
+            exposed_ports: Some(Vec::from(["9000/tcp".to_string(), "9001/tcp".to_string()])),
+            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+            labels: Some(
+                container_labels
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            host_config: Some(bollard::models::HostConfig {
+                restart_policy: Some(bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                    maximum_retry_count: None,
+                }),
+                ..host_config
+            }),
+            // RustFS healthcheck - check if the health endpoint is responding
+            healthcheck: Some(bollard::models::HealthConfig {
+                test: Some(vec![
+                    "CMD-SHELL".to_string(),
+                    "curl -sf http://localhost:9000/health > /dev/null || exit 1".to_string(),
+                ]),
+                interval: Some(2000000000), // 2 seconds
+                timeout: Some(5000000000),  // 5 seconds
+                retries: Some(3),
+                start_period: Some(10000000000),  // 10 seconds
+                start_interval: Some(2000000000), // 2 seconds
+            }),
+            ..Default::default()
+        };
+
+        let container = match docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                container_config,
+            )
+            .await
+        {
+            Ok(container) => container,
+            Err(error) => {
+                let cleanup_errors = if require_new {
+                    cleanup_unowned_rustfs_resources(
+                        docker,
+                        &container_name,
+                        &[&data_volume_name, &logs_volume_name],
+                        false,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                };
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to create RustFS container '{}': {}{}",
+                        container_name,
+                        error,
+                        if cleanup_errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                        }
+                    ),
+                ));
+            }
+        };
+
+        if let Err(error) = docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+        {
+            let cleanup_errors = if require_new {
+                cleanup_unowned_rustfs_resources(
+                    docker,
+                    &container_name,
+                    &[&data_volume_name, &logs_volume_name],
+                    true,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            return Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "Failed to start RustFS container '{}': {}{}",
+                    container_name,
+                    error,
+                    if cleanup_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                    }
+                ),
+            ));
+        }
+
+        // Spawn health check as background task (non-blocking)
+        let container_id = container.id.clone();
+        let container_name_clone = container_name.clone();
+        let docker_clone = docker.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_millis(100);
+            let mut total_wait = Duration::from_secs(0);
+            let max_wait = Duration::from_secs(60);
+
+            while total_wait < max_wait {
+                if let Ok(info) = docker_clone
+                    .inspect_container(&container_id, None::<InspectContainerOptions>)
+                    .await
+                {
+                    if let Some(state) = info.state {
+                        if state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING)
+                            && state.health.as_ref().and_then(|h| h.status.as_ref())
+                                == Some(&bollard::models::HealthStatusEnum::HEALTHY)
+                        {
+                            info!("RustFS container {} is healthy", container_name_clone);
+                            return;
+                        }
+                    }
+                }
+                sleep(delay).await;
+                total_wait += delay;
+                delay = delay.mul_f32(1.5);
+            }
+            error!(
+                "RustFS container {} health check timed out after 60s",
+                container_name_clone
+            );
+        });
+
+        info!(
+            "RustFS container {} created and started (health check running in background)",
+            container.id
+        );
+        Ok(())
+    }
+
+    async fn create_s3_client(&self, config: &RustfsConfig) -> Result<Client> {
+        let endpoint = format!("http://{}:{}", config.host, config.port);
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            &config.access_key,
+            &config.secret_key,
+            None,
+            None,
+            "rustfs",
+        );
+
+        let sdk_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(Region::new(config.region.clone()))
+            .endpoint_url(&endpoint)
+            .force_path_style(true)
+            .credentials_provider(credentials)
+            .build();
+
+        Ok(Client::from_conf(sdk_config))
+    }
+
+    /// Create a fresh S3 client connection
+    /// Connection will be automatically closed when Client is dropped
+    pub async fn get_connection(&self) -> Result<Client> {
+        let config_guard = self.config.read().await;
+        if let Some(config) = config_guard.as_ref() {
+            self.create_s3_client(config).await
+        } else {
+            Err(EngineError::not_initialized(
+                self.instance_name(),
+                "RustFS service not initialized",
+            ))
+        }
+    }
+
+    fn managed_error(&self, operation: &str, reason: impl std::fmt::Display) -> ManagedS3Error {
+        ManagedS3Error::Admin {
+            backend: "rustfs",
+            service: self.instance_name(),
+            operation: operation.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn stored_config(&self, config: &ServiceConfig) -> Result<RustfsConfig, ManagedS3Error> {
+        let input: RustfsInputConfig =
+            serde_json::from_value(config.parameters.clone()).map_err(|e| {
+                ManagedS3Error::InvalidConfig {
+                    backend: "rustfs",
+                    service: self.instance_name(),
+                    reason: format!("stored configuration did not parse: {e}"),
+                }
+            })?;
+        let missing = |field: &str| ManagedS3Error::InvalidConfig {
+            backend: "rustfs",
+            service: self.instance_name(),
+            reason: format!("stored configuration is missing required field '{field}'"),
+        };
+        // Never generate here: a service that exists already has its ports and
+        // credentials, and a generated one could not match the container.
+        if input.port.is_none() {
+            return Err(missing("port"));
+        }
+        if input.access_key.is_none() {
+            return Err(missing("access_key"));
+        }
+        if input.secret_key.is_none() {
+            return Err(missing("secret_key"));
+        }
+        Ok(RustfsConfig::from(input))
+    }
+}
+
+/// `rc admin` access policy that reaches exactly `buckets`: list/locate each
+/// bucket and read, write and delete its objects. Nothing else, so an
+/// environment key can neither see nor touch another environment's data.
+pub(crate) fn bucket_scoped_policy(buckets: &[S3BucketPlan]) -> String {
+    let bucket_arns: Vec<String> = buckets
+        .iter()
+        .map(|plan| format!("\"arn:aws:s3:::{}\"", plan.physical))
+        .collect();
+    let object_arns: Vec<String> = buckets
+        .iter()
+        .map(|plan| format!("\"arn:aws:s3:::{}/*\"", plan.physical))
+        .collect();
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[\
+         {{\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\",\"s3:GetBucketLocation\",\"s3:ListBucketMultipartUploads\"],\"Resource\":[{}]}},\
+         {{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:AbortMultipartUpload\",\"s3:ListMultipartUploadParts\"],\"Resource\":[{}]}}]}}",
+        bucket_arns.join(","),
+        object_arns.join(",")
+    )
+}
+
+/// Name of the per-environment IAM policy. One stable name per environment,
+/// so re-applying a changed bucket list replaces the policy in place.
+pub(crate) fn env_policy_name(scope: &str) -> String {
+    format!(
+        "te-{}",
+        super::managed_s3::physical_bucket_name(scope, None)
+    )
+}
+
+/// Shape of RustFS credentials: 20-character upper-case access key, 40
+/// character secret (the maximums RustFS accepts).
+pub(crate) const RUSTFS_CREDENTIAL_FORMAT: CredentialFormat = CredentialFormat {
+    access_prefix: "TMPS",
+    access_hex_len: 16,
+    secret_hex_len: 40,
+    upper_case_access: true,
+};
+
+#[async_trait]
+impl ManagedS3Backend for RustfsService {
+    fn kind(&self) -> ManagedS3BackendKind {
+        ManagedS3BackendKind::Rustfs
+    }
+
+    fn service_name(&self) -> String {
+        self.instance_name()
+    }
+
+    fn container_name(&self) -> String {
+        self.get_container_name()
+    }
+
+    async fn backup(
+        &self,
+        config: &ServiceConfig,
+        destination: &S3Location,
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
+        let (access_key, secret_key) = self.admin_credentials(config)?;
+        super::s3_mirror::backup_buckets(
+            self.docker.clone(),
+            &self.service_name(),
+            &self.endpoint(config)?,
+            &access_key,
+            &secret_key,
+            destination,
+        )
+        .await
+    }
+
+    async fn restore(
+        &self,
+        config: &ServiceConfig,
+        source: &S3Location,
+        exact: bool,
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
+        super::s3_mirror::restore_buckets(self.docker.clone(), self, config, source, exact).await
+    }
+
+    async fn migrate_from(
+        &self,
+        config: &ServiceConfig,
+        source: &MigrationSource,
+    ) -> Result<ManagedS3MirrorReport, ManagedS3Error> {
+        super::s3_mirror::migrate_buckets(self.docker.clone(), self, config, source).await
+    }
+
+    fn endpoint(&self, config: &ServiceConfig) -> Result<ManagedS3Endpoint, ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let host_port = stored
+            .port
+            .parse::<u16>()
+            .map_err(|_| ManagedS3Error::InvalidConfig {
+                backend: "rustfs",
+                service: self.instance_name(),
+                reason: format!("'port' value '{}' is not a valid TCP port", stored.port),
+            })?;
+        Ok(ManagedS3Endpoint {
+            internal_host: self.get_container_name(),
+            internal_port: DEFAULT_RUSTFS_API_PORT,
+            host: stored.host,
+            host_port,
+            region: stored.region,
+        })
+    }
+
+    fn admin_credentials(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<(String, String), ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        Ok((stored.access_key, stored.secret_key))
+    }
+
+    async fn provision_service(
+        &self,
+        config: ServiceConfig,
+    ) -> Result<HashMap<String, String>, ManagedS3Error> {
+        ExternalService::init(self, config)
+            .await
+            .map_err(|e| self.managed_error("initializing the service", format!("{e:#}")))
+    }
+
+    async fn create_bucket(
+        &self,
+        config: &ServiceConfig,
+        bucket: &str,
+    ) -> Result<(), ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let client = self
+            .create_s3_client(&stored)
+            .await
+            .map_err(|e| self.managed_error("building the S3 client", e))?;
+        if client.head_bucket().bucket(bucket).send().await.is_ok() {
+            return Ok(());
+        }
+        match client.create_bucket().bucket(bucket).send().await {
+            Ok(_) => {
+                info!(service = %self.instance_name(), bucket, "Created RustFS bucket");
+                Ok(())
+            }
+            // Created concurrently between the check and the create.
+            Err(e)
+                if e.as_service_error().is_some_and(|se| {
+                    se.is_bucket_already_owned_by_you() || se.is_bucket_already_exists()
+                }) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(self.managed_error(
+                &format!("creating bucket '{bucket}'"),
+                aws_sdk_s3::error::DisplayErrorContext(&e),
+            )),
+        }
+    }
+
+    async fn create_access_key(
+        &self,
+        config: &ServiceConfig,
+        request: &ManagedS3AccessKeyRequest,
+    ) -> Result<ManagedS3Grant, ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let scope = request.scope();
+        let grant = derive_grant(
+            ManagedS3BackendKind::Rustfs,
+            &stored.secret_key,
+            &scope,
+            &request.buckets,
+            RUSTFS_CREDENTIAL_FORMAT,
+        );
+        for plan in &grant.buckets {
+            self.create_bucket(config, &plan.physical).await?;
+        }
+
+        let policy = bucket_scoped_policy(&grant.buckets);
+        // Bucket names are validated to `[a-z0-9-]`, so the document holds no
+        // quote that could end the shell string below.
+        if policy.contains('\'') {
+            return Err(self.managed_error(
+                "building the access policy",
+                "the generated policy contains a quote character",
+            ));
+        }
+        let policy_name = env_policy_name(&scope);
+        let write_policy = format!("printf '%s' '{policy}' > /tmp/temps-policy.json");
+
+        let endpoint = self.endpoint(config)?;
+        let env = vec![super::rc_client::rc_host_env(
+            "svc",
+            &endpoint.internal_url(),
+            &stored.access_key,
+            &stored.secret_key,
+        )];
+        let sensitive = SensitiveValues::new()
+            .credential(&stored.access_key, &stored.secret_key, None)
+            .credential(&grant.access_key_id, &grant.secret_access_key, None);
+        let session = RcSession::start(self.docker.clone(), &self.instance_name(), env).await?;
+        let applied = async {
+            session
+                .run(
+                    "writing the access policy",
+                    &["sh", "-c", &write_policy],
+                    &sensitive,
+                )
+                .await?;
+            // `user add` is an upsert, `policy create` replaces a policy of the
+            // same name and `attach` is idempotent, so a redeploy re-applies
+            // the same state and a changed bucket list takes effect.
+            session
+                .run(
+                    "creating the environment user",
+                    &[
+                        "rc",
+                        "admin",
+                        "user",
+                        "add",
+                        "svc",
+                        &grant.access_key_id,
+                        &grant.secret_access_key,
+                    ],
+                    &sensitive,
+                )
+                .await?;
+            session
+                .run(
+                    "creating the environment policy",
+                    &[
+                        "rc",
+                        "admin",
+                        "policy",
+                        "create",
+                        "svc",
+                        &policy_name,
+                        "/tmp/temps-policy.json",
+                    ],
+                    &sensitive,
+                )
+                .await?;
+            session
+                .run(
+                    "attaching the environment policy",
+                    &[
+                        "rc",
+                        "admin",
+                        "policy",
+                        "attach",
+                        "svc",
+                        &policy_name,
+                        "--user",
+                        &grant.access_key_id,
+                    ],
+                    &sensitive,
+                )
+                .await?;
+            Ok::<_, ManagedS3Error>(())
+        }
+        .await;
+        session.finish().await;
+        applied?;
+        info!(
+            service = %self.instance_name(),
+            scope = %scope,
+            buckets = grant.buckets.len(),
+            "Provisioned RustFS environment key"
+        );
+        Ok(grant)
+    }
+
+    async fn revoke_access_key(
+        &self,
+        config: &ServiceConfig,
+        project_scope: &str,
+        environment_scope: &str,
+    ) -> Result<(), ManagedS3Error> {
+        let stored = self.stored_config(config)?;
+        let scope = scope_slug(project_scope, environment_scope);
+        let (access_key_id, _) = super::managed_s3::derive_env_credentials(
+            ManagedS3BackendKind::Rustfs,
+            &stored.secret_key,
+            &scope,
+            RUSTFS_CREDENTIAL_FORMAT,
+        );
+        let policy_name = env_policy_name(&scope);
+        let endpoint = self.endpoint(config)?;
+        let env = vec![super::rc_client::rc_host_env(
+            "svc",
+            &endpoint.internal_url(),
+            &stored.access_key,
+            &stored.secret_key,
+        )];
+        let sensitive =
+            SensitiveValues::new().credential(&stored.access_key, &stored.secret_key, None);
+        // Already-gone entities are the goal, not an error.
+        const GONE: &[&str] = &["does not exist", "not found", "no such"];
+        let session = RcSession::start(self.docker.clone(), &self.instance_name(), env).await?;
+        let removed = async {
+            session
+                .run_tolerant(
+                    "detaching the environment policy",
+                    &[
+                        "rc",
+                        "admin",
+                        "policy",
+                        "detach",
+                        "svc",
+                        &policy_name,
+                        "--user",
+                        &access_key_id,
+                    ],
+                    &sensitive,
+                    GONE,
+                )
+                .await?;
+            session
+                .run_tolerant(
+                    "removing the environment user",
+                    &["rc", "admin", "user", "rm", "svc", &access_key_id],
+                    &sensitive,
+                    GONE,
+                )
+                .await?;
+            session
+                .run_tolerant(
+                    "removing the environment policy",
+                    &["rc", "admin", "policy", "rm", "svc", &policy_name],
+                    &sensitive,
+                    GONE,
+                )
+                .await
+        }
+        .await;
+        session.finish().await;
+        removed?;
+        info!(service = %self.instance_name(), scope = %scope, "Revoked RustFS environment key");
+        Ok(())
+    }
+
+    async fn health_check(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<HealthProbeResult, ManagedS3Error> {
+        ExternalService::health_probe(self, config.clone())
+            .await
+            .map_err(|e| self.managed_error("health probe", format!("{e:#}")))
+    }
+}
+
+/// Docker-free, static metadata about this engine.
+///
+/// The parameter schema is generated from the input-config type and
+/// depends on nothing at runtime, so it must be reachable without
+/// constructing a service instance — a control plane with no local
+/// Docker daemon still has to serve it to the console.
+impl RustfsService {
+    /// JSON Schema describing this engine's creation parameters.
+    pub fn parameter_schema() -> Option<serde_json::Value> {
+        let schema = schemars::schema_for!(RustfsInputConfig);
+        serde_json::to_value(schema).ok()
+    }
+}
+
+/// Container name of a service named `name`. The single derivation shared by
+/// the engine and anything that must find its container without an instance.
+/// Authenticated `ListBuckets` against a RustFS endpoint. An unauthenticated
+/// `/health` 200 does not prove the storage layer can serve S3 requests, so
+/// readiness and health are both judged by this call.
+async fn list_buckets_probe(
+    endpoint: &str,
+    cfg: &RustfsConfig,
+) -> std::result::Result<(), RustfsProbeError> {
+    let creds = aws_sdk_s3::config::Credentials::new(
+        cfg.access_key.clone(),
+        cfg.secret_key.clone(),
+        None,
+        None,
+        "rustfs-health-probe",
+    );
+    let s3_config = aws_sdk_s3::Config::builder()
+        .region(Region::new(cfg.region.clone()))
+        .endpoint_url(endpoint.to_string())
+        .credentials_provider(creds)
+        .force_path_style(true)
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .build();
+    Client::from_conf(s3_config)
+        .list_buckets()
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            RustfsProbeError::from_response(
+                "ListBuckets",
+                e.raw_response().map(|r| r.status().as_u16()),
+                aws_sdk_s3::error::DisplayErrorContext(&e).to_string(),
+            )
+        })
+}
+
+/// Why an authenticated S3 probe against RustFS failed. Each message says
+/// what the failure means; the SDK's own `Display` is just "service error",
+/// which tells an operator nothing. `detail` is the SDK's full error chain.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RustfsProbeError {
+    #[error(
+        "{operation} failed with HTTP 503: RustFS is answering but its storage layer is \
+         not ready (still initializing, or initialization failed): {detail}"
+    )]
+    StorageNotReady {
+        operation: &'static str,
+        detail: String,
+    },
+
+    #[error(
+        "{operation} failed with HTTP {status}: RustFS rejected the service's access key: {detail}"
+    )]
+    CredentialsRejected {
+        operation: &'static str,
+        status: u16,
+        detail: String,
+    },
+
+    #[error("{operation} failed with HTTP {status}: {detail}")]
+    HttpStatus {
+        operation: &'static str,
+        status: u16,
+        detail: String,
+    },
+
+    /// No HTTP response at all: connection refused, reset, DNS, timeout.
+    #[error("{operation} got no response from RustFS: {detail}")]
+    Unreachable {
+        operation: &'static str,
+        detail: String,
+    },
+}
+
+impl RustfsProbeError {
+    fn from_response(operation: &'static str, status: Option<u16>, detail: String) -> Self {
+        match status {
+            Some(503) => Self::StorageNotReady { operation, detail },
+            Some(status @ (401 | 403)) => Self::CredentialsRejected {
+                operation,
+                status,
+                detail,
+            },
+            Some(status) => Self::HttpStatus {
+                operation,
+                status,
+                detail,
+            },
+            None => Self::Unreachable { operation, detail },
+        }
+    }
+}
+
+/// Upper bound on the Docker inspect behind a failed probe's restart note,
+/// so a slow or hung daemon cannot hold up the health check.
+const RESTART_NOTE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Note appended to a failed probe when the container keeps restarting, which
+/// points at an initialization failure only its logs can explain.
+fn restart_loop_note(container_name: &str, restart_count: i64) -> Option<String> {
+    (restart_count > 0).then(|| {
+        format!(
+            ". Container '{container_name}' has restarted {restart_count} time(s); its logs \
+             (docker logs {container_name}) show why RustFS could not start its storage"
+        )
+    })
+}
+
+/// Docker's restart count for `container_name`, bounded by
+/// [`RESTART_NOTE_TIMEOUT`]. `None` when Docker is slow or the container is
+/// missing: restart evidence is best-effort and never blocks a probe.
+pub(crate) async fn container_restart_count(docker: &Docker, container_name: &str) -> Option<i64> {
+    let inspect = docker.inspect_container(container_name, None::<InspectContainerOptions>);
+    match tokio::time::timeout(RESTART_NOTE_TIMEOUT, inspect).await {
+        Ok(Ok(info)) => Some(info.restart_count.unwrap_or(0)),
+        Ok(Err(e)) => {
+            debug!(
+                "Could not inspect RustFS container {}: {}",
+                container_name, e
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                "Could not inspect RustFS container {}: Docker inspect took longer than {}s",
+                container_name,
+                RESTART_NOTE_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
+}
+
+/// How long a new or restarted RustFS service may take to serve its first
+/// authenticated request. A healthy first boot takes seconds; this leaves
+/// room for a slow disk without leaving a broken service "starting" for long.
+const RUSTFS_READINESS_DEADLINE: Duration = Duration::from_secs(180);
+const RUSTFS_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// RustFS restarts only when its process exits; three exits before the
+/// first usable answer is a loop, not a slow start.
+const RUSTFS_READINESS_MAX_RESTARTS: i64 = 3;
+/// Bound on one readiness probe, matching `health_probe`.
+const RUSTFS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Container log lines read when looking for initialization errors.
+const RUSTFS_LOG_TAIL_LINES: usize = 200;
+/// Most log lines carried in a failure report, and the longest line kept.
+const RUSTFS_LOG_EXCERPT_LINES: usize = 12;
+const RUSTFS_LOG_LINE_MAX_CHARS: usize = 400;
+
+/// Log fragments that mean RustFS gave up initializing its store. Seen in a
+/// fresh-volume first boot that never became usable:
+///
+/// ```text
+/// pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available
+/// Server runtime failed ... store init failed: init retry budget exhausted
+/// ```
+const RUSTFS_FATAL_INIT_SIGNATURES: &[&str] = &[
+    "store init failed",
+    "init retry budget exhausted",
+    "pool metadata recovery required",
+];
+
+/// Further fragments worth showing next to a failure, without being fatal
+/// on their own (RustFS may log them while it is still retrying).
+const RUSTFS_INIT_CONTEXT_SIGNATURES: &[&str] = &[
+    "recovery_required",
+    "metadata_absence",
+    "server runtime failed",
+    "panicked",
+];
+
+/// Readiness gate for one RustFS service: authenticated `ListBuckets` with
+/// the service's own credentials, plus restart and log evidence from its
+/// container. An unauthenticated `/health` 200 is deliberately not enough.
+pub(crate) struct RustfsReadinessTarget {
+    endpoint: String,
+    config: RustfsConfig,
+    /// Docker client and container name; `None` skips container evidence.
+    container: Option<(Arc<Docker>, String)>,
+    policy: ReadinessPolicy,
+}
+
+impl RustfsReadinessTarget {
+    pub(crate) fn new(
+        config: RustfsConfig,
+        container: Option<(Arc<Docker>, String)>,
+        policy: ReadinessPolicy,
+    ) -> Self {
+        Self {
+            endpoint: format!("http://{}:{}", config.host, config.port),
+            config,
+            container,
+            policy,
+        }
+    }
+
+    pub(crate) fn default_policy() -> ReadinessPolicy {
+        ReadinessPolicy {
+            deadline: RUSTFS_READINESS_DEADLINE,
+            poll_interval: RUSTFS_READINESS_POLL_INTERVAL,
+            max_restarts: RUSTFS_READINESS_MAX_RESTARTS,
+        }
+    }
+
+    async fn probe(&self) -> Option<String> {
+        let probe = list_buckets_probe(&self.endpoint, &self.config);
+        match tokio::time::timeout(RUSTFS_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("rustfs probe to {} {}", self.endpoint, error)),
+            Err(_) => Some(format!(
+                "rustfs probe to {} timed out after {}s",
+                self.endpoint,
+                RUSTFS_PROBE_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// The container's recent log lines, secrets redacted. Empty when there
+    /// is no container to read or Docker does not answer in time.
+    async fn recent_log_lines(&self) -> Vec<String> {
+        let Some((docker, name)) = &self.container else {
+            return Vec::new();
+        };
+        let logs = docker
+            .logs(
+                name,
+                Some(
+                    bollard::query_parameters::LogsOptionsBuilder::new()
+                        .stdout(true)
+                        .stderr(true)
+                        .tail(&RUSTFS_LOG_TAIL_LINES.to_string())
+                        .build(),
+                ),
+            )
+            .try_collect::<Vec<_>>();
+        let chunks = match tokio::time::timeout(RESTART_NOTE_TIMEOUT, logs).await {
+            Ok(Ok(chunks)) => chunks,
+            Ok(Err(e)) => {
+                debug!("Could not read logs of RustFS container {}: {}", name, e);
+                return Vec::new();
+            }
+            Err(_) => {
+                warn!(
+                    "Could not read logs of RustFS container {}: Docker took longer than {}s",
+                    name,
+                    RESTART_NOTE_TIMEOUT.as_secs()
+                );
+                return Vec::new();
+            }
+        };
+        let text: String = chunks.into_iter().map(|c| c.to_string()).collect();
+        let secrets = [
+            self.config.access_key.as_str(),
+            self.config.secret_key.as_str(),
+        ];
+        text.lines()
+            .map(|line| clean_log_line(line, &secrets))
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ReadinessTarget for RustfsReadinessTarget {
+    fn policy(&self) -> ReadinessPolicy {
+        self.policy
+    }
+
+    async fn observe(&self) -> ReadinessObservation {
+        let Some(reason) = self.probe().await else {
+            return ReadinessObservation::default();
+        };
+        let restart_count = match &self.container {
+            Some((docker, name)) => container_restart_count(docker, name).await,
+            None => None,
+        };
+        // Logs are only worth reading once the process has exited at least
+        // once: RustFS logs its fatal store-init error right before exiting.
+        let fatal_log_lines = if restart_count.unwrap_or(0) > 0 {
+            matching_lines(&self.recent_log_lines().await, RUSTFS_FATAL_INIT_SIGNATURES)
+        } else {
+            Vec::new()
+        };
+        ReadinessObservation {
+            not_ready_reason: Some(reason),
+            restart_count,
+            fatal_log_lines,
+        }
+    }
+
+    async fn log_excerpt(&self) -> Vec<String> {
+        log_excerpt(&self.recent_log_lines().await)
+    }
+}
+
+/// Lines containing any of `signatures` (case-insensitive), most recent
+/// [`RUSTFS_LOG_EXCERPT_LINES`] of them.
+fn matching_lines(lines: &[String], signatures: &[&str]) -> Vec<String> {
+    let matched: Vec<String> = lines
+        .iter()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            signatures.iter().any(|signature| lower.contains(signature))
+        })
+        .cloned()
+        .collect();
+    let skip = matched.len().saturating_sub(RUSTFS_LOG_EXCERPT_LINES);
+    matched.into_iter().skip(skip).collect()
+}
+
+/// Lines worth showing with a failure: the initialization errors when the
+/// log has any, otherwise its last few lines.
+fn log_excerpt(lines: &[String]) -> Vec<String> {
+    let signatures: Vec<&str> = RUSTFS_FATAL_INIT_SIGNATURES
+        .iter()
+        .chain(RUSTFS_INIT_CONTEXT_SIGNATURES)
+        .copied()
+        .collect();
+    let relevant = matching_lines(lines, &signatures);
+    if !relevant.is_empty() {
+        return relevant;
+    }
+    let skip = lines.len().saturating_sub(RUSTFS_LOG_EXCERPT_LINES);
+    lines.iter().skip(skip).cloned().collect()
+}
+
+/// One log line made safe to show: ANSI colour codes stripped, the
+/// service's credentials masked, and long lines truncated.
+fn clean_log_line(line: &str, secrets: &[&str]) -> String {
+    let mut cleaned = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            // CSI sequence: ESC [ params... final byte in '@'..='~'
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        cleaned.push(c);
+    }
+    for secret in secrets.iter().filter(|s| s.len() >= 4) {
+        cleaned = cleaned.replace(secret, "***");
+    }
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() > RUSTFS_LOG_LINE_MAX_CHARS {
+        let truncated: String = cleaned.chars().take(RUSTFS_LOG_LINE_MAX_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        cleaned.to_string()
+    }
+}
+
+pub fn rustfs_container_name(name: &str) -> String {
+    format!("rustfs-{}", name)
+}
+
+/// Data and log volumes of a RustFS service named `name`.
+pub fn rustfs_volume_names(name: &str) -> [String; 2] {
+    [
+        format!("rustfs_{}_data", name),
+        format!("rustfs_{}_logs", name),
+    ]
+}
+
+#[async_trait]
+impl ExternalService for RustfsService {
+    fn recreate_plan(
+        &self,
+        _service_config: &ServiceConfig,
+    ) -> Option<(
+        super::recreate_guard::ManagedEngine,
+        super::recreate_guard::ReplacementStorage,
+    )> {
+        Some((
+            super::recreate_guard::ManagedEngine::Rustfs,
+            self.replacement_storage(),
+        ))
+    }
+
+    fn docker_resource_names(&self) -> Option<super::DockerResourceNames> {
+        Some(super::DockerResourceNames {
+            containers: vec![rustfs_container_name(&self.instance_name())],
+            volumes: rustfs_volume_names(&self.instance_name()).to_vec(),
+        })
+    }
+
+    /// Hold the service `starting` until authenticated `ListBuckets` works.
+    fn readiness_target(&self, service_config: &ServiceConfig) -> Option<Box<dyn ReadinessTarget>> {
+        let config = match self.get_rustfs_config(service_config.clone()) {
+            Ok(config) => config,
+            Err(e) => {
+                warn!(
+                    "RustFS service {} has no readiness gate: its configuration did not parse: {}",
+                    self.instance_name(),
+                    e
+                );
+                return None;
+            }
+        };
+        Some(Box::new(RustfsReadinessTarget::new(
+            config,
+            Some((self.docker.clone(), self.get_container_name())),
+            RustfsReadinessTarget::default_policy(),
+        )))
+    }
+
+    /// Restart the RustFS container so that the `metrics_ingest_key` stored in
+    /// `service_config` takes effect as OTLP env vars.
+    async fn apply_ingest_key(&self, service_config: ServiceConfig) -> Result<()> {
+        let input_config: RustfsInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!("Failed to parse RustFS configuration: {}", e),
+                )
+            })?;
+        let config = RustfsConfig::from(input_config);
+        let resource_limits = self.resource_limits.read().await.clone();
+
+        self.recreate_container_guarded(
+            &self.docker,
+            &config,
+            &resource_limits,
+            "applying its metrics ingest key",
+        )
+        .await
+    }
+
+    /// Upgrade the RustFS container to a new Docker image.
+    ///
+    /// RustFS stores data on a Docker volume mounted at `/data`, so an upgrade
+    /// is simply: stop + remove the old container, then create a new one with
+    /// the new image. The volume (and therefore all data) is preserved. The
+    /// metrics ingest key carried in the new config is re-applied so OTLP push
+    /// keeps working after the upgrade.
+    async fn upgrade(&self, _old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        // The service's own limits: a provider built for this call has
+        // none loaded, and the new container must keep them.
+        let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
+        let new_cfg = self.get_rustfs_config(new_config)?;
+        info!(
+            "Starting RustFS upgrade to image {} for service {}",
+            new_cfg.docker_image,
+            self.instance_name()
+        );
+
+        let resource_limits = upgrade_limits;
+        self.recreate_container_guarded(
+            &self.docker,
+            &new_cfg,
+            &resource_limits,
+            "changing its image",
+        )
+        .await?;
+
+        info!(
+            "RustFS upgrade completed successfully for service {}",
+            self.instance_name()
+        );
+        Ok(())
+    }
+
+    async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
+        info!("Initializing RustFS service: {}", config.name);
+
+        // Pull resource limits before consuming the parameters JSON.
+        let resource_limits = ServiceResourceLimits::from_parameters(&config.parameters);
+        if let Err(e) = resource_limits.validate() {
+            return Err(EngineError::invalid_input(
+                self.instance_name(),
+                format!("Invalid resource limits: {}", e),
+            ));
+        }
+        *self.resource_limits.write().await = resource_limits.clone();
+
+        // Parse input configuration
+        let input_config: RustfsInputConfig = serde_json::from_value(config.parameters.clone())
+            .map_err(|e| {
+                EngineError::invalid_input(
+                    self.instance_name(),
+                    format!(
+                        "Failed to parse RustFS configuration for service {}: {}",
+                        config.name, e
+                    ),
+                )
+            })?;
+
+        // Convert to runtime config using async Docker-aware port finding
+        let mut runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
+
+        // If our container is already up on this image, it owns its ports and
+        // `create_container` below will leave it alone — so the freshly probed
+        // ports above are fiction. Adopt what the container actually
+        // publishes. See `running_container_ports`.
+        if let Some((api_port, console_port)) = self
+            .running_container_ports(&runtime_config.docker_image)
+            .await
+        {
+            if api_port != runtime_config.port || console_port != runtime_config.console_port {
+                info!(
+                    "Adopting ports {}/{} already published by running container {} \
+                     (probe suggested {}/{})",
+                    api_port,
+                    console_port,
+                    self.get_container_name(),
+                    runtime_config.port,
+                    runtime_config.console_port
+                );
+            }
+            runtime_config.port = api_port;
+            runtime_config.console_port = console_port;
+        }
+
+        // Create container
+        self.create_container(&self.docker, &runtime_config, &resource_limits, false)
+            .await?;
+
+        // Create S3 client
+        let client = self.create_s3_client(&runtime_config).await?;
+
+        // Store configuration and client
+        {
+            let mut config_guard = self.config.write().await;
+            *config_guard = Some(runtime_config.clone());
+        }
+        {
+            let mut client_guard = self.client.write().await;
+            *client_guard = Some(client);
+        }
+
+        // Return inferred parameters for storage
+        let mut inferred = HashMap::new();
+        inferred.insert("port".to_string(), runtime_config.port);
+        inferred.insert("console_port".to_string(), runtime_config.console_port);
+        inferred.insert("access_key".to_string(), runtime_config.access_key);
+        inferred.insert("secret_key".to_string(), runtime_config.secret_key);
+        inferred.insert("host".to_string(), runtime_config.host);
+        inferred.insert("region".to_string(), runtime_config.region);
+        inferred.insert("docker_image".to_string(), runtime_config.docker_image);
+
+        Ok(inferred)
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        let client_guard = self.client.read().await;
+        if let Some(client) = client_guard.as_ref() {
+            // Try to list buckets as a health check
+            match client.list_buckets().send().await {
+                Ok(_) => Ok(true),
+                Err(e) => {
+                    error!("RustFS health check failed: {}", e);
+                    Ok(false)
+                }
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn health_probe(&self, service_config: ServiceConfig) -> Result<HealthProbeResult> {
+        use std::time::Instant;
+
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+        const DEGRADED_MS: u128 = 2000;
+
+        let cfg = match self.get_rustfs_config(service_config) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(HealthProbeResult::down(format!(
+                    "invalid rustfs config: {}",
+                    e
+                )))
+            }
+        };
+
+        let endpoint = format!("http://{}:{}", cfg.host, cfg.port);
+        let start = Instant::now();
+
+        let probe = list_buckets_probe(&endpoint, &cfg);
+
+        match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+            Err(_) => Ok(HealthProbeResult::down(format!(
+                "rustfs probe to {} timed out after {}s",
+                endpoint,
+                PROBE_TIMEOUT.as_secs()
+            ))),
+            Ok(Err(error)) => {
+                let restart_note = self.restart_loop_note().await.unwrap_or_default();
+                Ok(HealthProbeResult::down(format!(
+                    "rustfs probe to {} {}{}",
+                    endpoint, error, restart_note
+                )))
+            }
+            Ok(Ok(())) => {
+                let elapsed_ms = start.elapsed().as_millis();
+                let response_time = i32::try_from(elapsed_ms).ok();
+                if elapsed_ms > DEGRADED_MS {
+                    Ok(HealthProbeResult::degraded(
+                        format!("rustfs responded in {}ms (>{}ms)", elapsed_ms, DEGRADED_MS),
+                        response_time,
+                    ))
+                } else {
+                    Ok(HealthProbeResult::operational(response_time))
+                }
+            }
+        }
+    }
+
+    fn get_type(&self) -> ServiceType {
+        ServiceType::Blob
+    }
+
+    fn get_name(&self) -> String {
+        self.instance_name()
+    }
+
+    fn get_connection_info(&self) -> Result<String> {
+        let config = self
+            .config
+            .try_read()
+            .map_err(|_| EngineError::failed(self.instance_name(), "Config locked"))?;
+        if let Some(cfg) = config.as_ref() {
+            Ok(format!("http://{}:{}", cfg.host, cfg.port))
+        } else {
+            Err(EngineError::not_initialized(
+                self.instance_name(),
+                "Service not initialized",
+            ))
+        }
+    }
+
+    async fn cleanup(&self) -> Result<()> {
+        self.stop().await?;
+        self.remove().await
+    }
+
+    fn get_parameter_schema(&self) -> Option<serde_json::Value> {
+        Self::parameter_schema()
+    }
+
+    async fn start(&self) -> Result<()> {
+        let container_name = self.get_container_name();
+        self.docker
+            .start_container(
+                &container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to start RustFS container: {}", e),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        let container_name = self.get_container_name();
+        self.docker
+            .stop_container(&container_name, None::<StopContainerOptions>)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to stop RustFS container: {}", e),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn remove(&self) -> Result<()> {
+        let container_name = self.get_container_name();
+
+        // Stop the container first
+        let _ = self.stop().await;
+
+        // Remove the container
+        self.docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to remove RustFS container: {}", e),
+                )
+            })?;
+
+        // Remove volumes
+        let [data_volume_name, logs_volume_name] = rustfs_volume_names(&self.instance_name());
+
+        let _ = self
+            .docker
+            .remove_volume(
+                &data_volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+        let _ = self
+            .docker
+            .remove_volume(
+                &logs_volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+
+        Ok(())
+    }
+
+    fn get_environment_variables(
+        &self,
+        parameters: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        let mut env = HashMap::new();
+
+        let host = parameters
+            .get("host")
+            .cloned()
+            .unwrap_or_else(|| "localhost".to_string());
+        let port = parameters
+            .get("port")
+            .cloned()
+            .unwrap_or_else(|| "9000".to_string());
+        let access_key = parameters
+            .get("access_key")
+            .cloned()
+            .unwrap_or_else(|| "".to_string());
+        let secret_key = parameters
+            .get("secret_key")
+            .cloned()
+            .unwrap_or_else(|| "".to_string());
+        let region = parameters
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_string());
+
+        env.insert(
+            "BLOB_ENDPOINT".to_string(),
+            format!("http://{}:{}", host, port),
+        );
+        env.insert("BLOB_ACCESS_KEY".to_string(), access_key.clone());
+        env.insert("BLOB_SECRET_KEY".to_string(), secret_key.clone());
+        env.insert("BLOB_REGION".to_string(), region);
+
+        // Also provide S3-compatible variable names
+        env.insert(
+            "S3_ENDPOINT".to_string(),
+            format!("http://{}:{}", host, port),
+        );
+        env.insert("AWS_ACCESS_KEY_ID".to_string(), access_key);
+        env.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key);
+
+        Ok(env)
+    }
+
+    fn get_docker_environment_variables(
+        &self,
+        parameters: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>> {
+        // For Docker containers, use the container name as host
+        let container_name = self.get_container_name();
+        let port = parameters
+            .get("port")
+            .cloned()
+            .unwrap_or_else(|| "9000".to_string());
+        let access_key = parameters
+            .get("access_key")
+            .cloned()
+            .unwrap_or_else(|| "".to_string());
+        let secret_key = parameters
+            .get("secret_key")
+            .cloned()
+            .unwrap_or_else(|| "".to_string());
+        let region = parameters
+            .get("region")
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_string());
+
+        let mut env = HashMap::new();
+        env.insert(
+            "BLOB_ENDPOINT".to_string(),
+            format!("http://{}:{}", container_name, port),
+        );
+        env.insert("BLOB_ACCESS_KEY".to_string(), access_key.clone());
+        env.insert("BLOB_SECRET_KEY".to_string(), secret_key.clone());
+        env.insert("BLOB_REGION".to_string(), region);
+
+        // Also provide S3-compatible variable names
+        env.insert(
+            "S3_ENDPOINT".to_string(),
+            format!("http://{}:{}", container_name, port),
+        );
+        env.insert("AWS_ACCESS_KEY_ID".to_string(), access_key);
+        env.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key);
+
+        Ok(env)
+    }
+
+    fn get_runtime_env_definitions(&self) -> Vec<super::RuntimeEnvVar> {
+        vec![
+            super::RuntimeEnvVar {
+                name: "S3_BUCKET".to_string(),
+                description: "S3 bucket name for this project/environment".to_string(),
+                example: "project-123-production".to_string(),
+                sensitive: false,
+            },
+            super::RuntimeEnvVar {
+                name: "S3_ENDPOINT".to_string(),
+                description: "S3-compatible endpoint URL (internal container name)".to_string(),
+                example: "http://rustfs-my-service:9000".to_string(),
+                sensitive: false,
+            },
+        ]
+    }
+
+    async fn get_runtime_env_vars(
+        &self,
+        config: ServiceConfig,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<HashMap<String, String>> {
+        let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)?;
+        let request = ManagedS3AccessKeyRequest {
+            project_scope: project_id.to_string(),
+            environment_scope: environment.to_string(),
+            buckets: selection.buckets,
+        };
+        let grant = self.create_access_key(&config, &request).await?;
+        Ok(self.render_runtime_env(&config, &grant)?)
+    }
+
+    async fn preview_runtime_env_vars(
+        &self,
+        config: ServiceConfig,
+        project_id: &str,
+        environment: &str,
+    ) -> Result<HashMap<String, String>> {
+        let selection = ManagedS3BackendSelection::from_parameters(&config.parameters)?;
+        let stored = self.get_rustfs_config(config.clone())?;
+        // Preview: no bucket, user or policy is created. The grant is a pure
+        // function of the stored secret, so the UI shows what a deployment
+        // will actually receive.
+        let grant = derive_grant(
+            ManagedS3BackendKind::Rustfs,
+            &stored.secret_key,
+            &scope_slug(project_id, environment),
+            &selection.buckets,
+            RUSTFS_CREDENTIAL_FORMAT,
+        );
+        Ok(self.render_runtime_env(&config, &grant)?)
+    }
+
+    fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
+        let port: String = serde_json::from_value(
+            service_config
+                .parameters
+                .get("port")
+                .cloned()
+                .unwrap_or(serde_json::Value::String("9000".to_string())),
+        )
+        .unwrap_or_else(|_| "9000".to_string());
+
+        Ok(format!("localhost:{}", port))
+    }
+
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
+        let port: String = serde_json::from_value(
+            service_config
+                .parameters
+                .get("port")
+                .cloned()
+                .unwrap_or(serde_json::Value::String("9000".to_string())),
+        )
+        .unwrap_or_else(|_| "9000".to_string());
+
+        // In Docker mode, use container name
+        let container_name = self.get_container_name();
+        Ok((container_name, port))
+    }
+
+    fn get_docker_container_name(&self) -> String {
+        self.get_container_name()
+    }
+
+    fn get_docker_internal_port(&self) -> String {
+        DEFAULT_RUSTFS_API_PORT.to_string()
+    }
+
+    fn get_default_docker_image(&self) -> (String, String) {
+        (
+            "rustfs/rustfs".to_string(),
+            DEFAULT_RUSTFS_VERSION.to_string(),
+        )
+    }
+
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        let container_name = self.get_container_name();
+        let info = self
+            .docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await?;
+
+        if let Some(config) = info.config {
+            if let Some(image) = config.image {
+                if let Some((name, tag)) = image.split_once(':') {
+                    return Ok((name.to_string(), tag.to_string()));
+                }
+                return Ok((image, "latest".to_string()));
+            }
+        }
+
+        Err(EngineError::failed(
+            self.instance_name(),
+            "Could not determine current docker image",
+        ))
+    }
+
+    fn get_default_version(&self) -> String {
+        DEFAULT_RUSTFS_VERSION.to_string()
+    }
+
+    async fn get_current_version(&self) -> Result<String> {
+        let (_, tag) = self.get_current_docker_image().await?;
+        Ok(tag)
+    }
+
+    /// Backup RustFS data to another S3 location using `rc mirror`
+    async fn backup_to_s3(
+        &self,
+        _s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
+        backup: temps_entities::backups::Model,
+        s3_source: &temps_entities::s3_sources::Model,
+        _subpath: &str,
+        subpath_root: &str,
+        pool: &temps_database::DbConnection,
+        external_service: &temps_entities::external_services::Model,
+        service_config: ServiceConfig,
+    ) -> Result<super::BackupOutcome> {
+        use chrono::Utc;
+        use sea_orm::*;
+
+        info!(
+            "Starting RustFS backup using the RustFS client (rc) for backup {}",
+            backup.id
+        );
+
+        let backup_prefix = subpath_root;
+        let container_name = format!("rc-backup-{}", backup.id);
+
+        // Create a backup record
+        let backup_record = temps_entities::external_service_backups::Entity::insert(
+            temps_entities::external_service_backups::ActiveModel {
+                service_id: Set(external_service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(Utc::now()),
+                s3_location: Set(backup_prefix.to_string()),
+                metadata: Set(serde_json::json!({
+                    "service_type": "rustfs",
+                    "service_name": self.instance_name(),
+                    "timestamp": Utc::now().to_rfc3339(),
+                })),
+                compression_type: Set("none".to_string()),
+                created_by: Set(0),
+                ..Default::default()
+            },
+        )
+        .exec_with_returning(pool)
+        .await?;
+
+        // Pull the RustFS client image
+        self.pull_rc_image(&self.docker).await?;
+
+        let rustfs_config = self.get_rustfs_config(service_config)?;
+
+        // Decrypt destination S3 credentials
+        let decrypted_access_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.access_key_id)
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to decrypt access key: {}", e),
+                )
+            })?;
+        let decrypted_secret_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to decrypt secret key: {}", e),
+                )
+            })?;
+        // `None` for every operator-configured long-lived credential, which
+        // leaves the values below byte-for-byte what they were.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| {
+            EngineError::failed(
+                self.instance_name(),
+                format!("Failed to decrypt session token: {}", e),
+            )
+        })?;
+
+        let default_dest_endpoint = format!("http://{}:9000", s3_source.bucket_name);
+        let dest_endpoint_str = s3_source
+            .endpoint
+            .as_deref()
+            .unwrap_or(&default_dest_endpoint);
+        let has_token = decrypted_session_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+
+        // Both aliases are defined through `RC_HOST_*` (no `rc alias set`, so
+        // no keys in argv). A temporary destination credential's session
+        // token travels separately as `TEMPS_REMOTE_SESSION_TOKEN` and is only
+        // sent, via `-H`, by the destination-side step of each mirror.
+        let mut env_vars = vec![
+            super::rc_client::rc_host_env(
+                "original",
+                &format!("http://{}:{}", rustfs_config.host, rustfs_config.port),
+                &rustfs_config.access_key,
+                &rustfs_config.secret_key,
+            ),
+            super::rc_client::rc_host_env(
+                "backup-dest",
+                dest_endpoint_str,
+                &decrypted_access_key,
+                &decrypted_secret_key,
+            ),
+        ];
+        env_vars.extend(super::rc_client::remote_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
+
+        // Long-running rc helper container (a `sh` entrypoint + tty keeps it
+        // alive) with host networking; the commands below run via exec.
+        let rc_config = bollard::models::ContainerCreateBody {
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
+            entrypoint: Some(vec!["sh".to_string()]),
+            tty: Some(true),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some("host".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let container = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                rc_config,
+            )
+            .await?;
+
+        self.docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await?;
+
+        let dest_name = format!(
+            "backup-dest/{}/{}",
+            s3_source.bucket_name,
+            subpath_root.trim_matches('/')
+        );
+
+        let mut success = true;
+        let mut error_logs = Vec::new();
+        // Client stderr lands in `external_service_backups.error_message`, and
+        // `mc` used to echo the credential-bearing host URL into it. The
+        // destination credential may be a temporary one, so its session token
+        // has to be on this list alongside the keys.
+        let sensitive_values = SensitiveValues::new()
+            .credential(&rustfs_config.access_key, &rustfs_config.secret_key, None)
+            .credential(
+                &decrypted_access_key,
+                &decrypted_secret_key,
+                decrypted_session_token.as_deref(),
+            );
+
+        // `rc mirror` cannot take the alias root as its source the way
+        // `mc mirror original/ ...` did, so mirror bucket by bucket into
+        // `<dest_name>/<bucket>/` — the same layout the restore paths list.
+        if success {
+            if let Err(e) = super::rc_client::mirror_all_buckets(
+                &self.docker,
+                &container.id,
+                "original",
+                &dest_name,
+                has_token,
+                &sensitive_values,
+            )
+            .await
+            {
+                error_logs.push(e.to_string());
+                success = false;
+            }
+        }
+
+        // Clean up the rc container
+        self.docker
+            .remove_container(
+                &container.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        if success {
+            // Compute size by listing the destination prefix.
+            let dest_s3_client = s3_credentials.build_s3_client().await;
+            let size_bytes = match super::s3_util::list_total_size(
+                &dest_s3_client,
+                &s3_credentials.bucket_name,
+                &format!("{}/", subpath_root.trim_matches('/')),
+            )
+            .await
+            {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    warn!("RustFS mirror succeeded but failed to compute size: {}", e);
+                    None
+                }
+            };
+
+            let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                backup_record.clone().into();
+            backup_update.state = Set("completed".to_string());
+            backup_update.finished_at = Set(Some(Utc::now()));
+            backup_update.size_bytes = Set(size_bytes);
+            temps_entities::external_service_backups::Entity::update(backup_update)
+                .exec(pool)
+                .await?;
+
+            info!(
+                "RustFS backup completed successfully ({:?} bytes)",
+                size_bytes
+            );
+            Ok(super::BackupOutcome::new(
+                backup_prefix.to_string(),
+                size_bytes,
+            ))
+        } else {
+            let error_message = error_logs.join("\n");
+
+            let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                backup_record.clone().into();
+            backup_update.state = Set("failed".to_string());
+            backup_update.error_message = Set(Some(error_message.clone()));
+            backup_update.finished_at = Set(Some(Utc::now()));
+            temps_entities::external_service_backups::Entity::update(backup_update)
+                .exec(pool)
+                .await?;
+
+            Err(EngineError::failed(
+                self.instance_name(),
+                format!("RustFS backup failed: {}", error_message),
+            ))
+        }
+    }
+
+    /// Restore RustFS data from an S3 backup using `rc mirror`
+    async fn restore_from_s3(
+        &self,
+        _s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &super::S3Credentials,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        info!(
+            "Starting RustFS restore from backup location: {}",
+            backup_location
+        );
+
+        // Ensure RustFS container is running before attempting restore
+        self.start().await?;
+
+        let docker = &self.docker;
+        let container_name = format!("rc-restore-{}", uuid::Uuid::new_v4());
+        let rustfs_config = self.get_rustfs_config(service_config)?;
+
+        // Pull the RustFS client image
+        self.pull_rc_image(docker).await?;
+
+        // s3_source credentials are expected to be plain-text (already decrypted by caller)
+        let source_access_key = &s3_source.access_key_id;
+        let source_secret_key = &s3_source.secret_key;
+        // Plaintext on the same contract; `None` for a long-lived credential.
+        let source_session_token = s3_source.session_token.as_deref();
+        let source_endpoint = s3_source
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://s3.amazonaws.com");
+        let has_token = source_session_token.is_some_and(|token| !token.is_empty());
+
+        // Environment for rc: `backup-source` is the backup S3, `dest` the
+        // RustFS service. No `rc alias set` (keys would sit in argv, and its
+        // probe cannot send a session token). A temporary source credential's
+        // token travels as `TEMPS_REMOTE_SESSION_TOKEN` and is only sent, via
+        // `-H`, by the source-side `rc` calls.
+        let mut env_vars = vec![
+            super::rc_client::rc_host_env(
+                "backup-source",
+                source_endpoint,
+                source_access_key,
+                source_secret_key,
+            ),
+            super::rc_client::rc_host_env(
+                "dest",
+                &format!("http://localhost:{}", rustfs_config.port),
+                &rustfs_config.access_key,
+                &rustfs_config.secret_key,
+            ),
+        ];
+        env_vars.extend(super::rc_client::remote_session_token_env(
+            source_session_token,
+        ));
+
+        // Long-running rc helper container (a `sh` entrypoint + tty keeps it
+        // alive) with host networking; the commands below run via exec.
+        let rc_config = bollard::models::ContainerCreateBody {
+            image: Some(super::rc_client::RC_IMAGE.to_string()),
+            env: Some(env_vars),
+            entrypoint: Some(vec!["sh".to_string()]),
+            tty: Some(true),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            host_config: Some(bollard::models::HostConfig {
+                network_mode: Some("host".to_string()),
+                ..Default::default()
+            }),
+            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+                &self.get_container_name(),
+            )),
+            ..Default::default()
+        };
+
+        let container = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                rc_config,
+            )
+            .await?;
+
+        docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await?;
+
+        // The backup source may be a temporary credential, so its session token
+        // is as sensitive as its secret key; redact it from any client output.
+        let sensitive_values = SensitiveValues::new()
+            .credential(source_access_key, source_secret_key, source_session_token)
+            .credential(&rustfs_config.access_key, &rustfs_config.secret_key, None);
+
+        // List buckets in the backup location. The trailing `/` lists the
+        // folder's contents rather than every key sharing the prefix.
+        let source_backup_location = format!(
+            "backup-source/{}/{}/",
+            s3_source.bucket_name,
+            backup_location.trim_matches('/')
+        );
+        let buckets = match super::rc_client::list_dir_names(
+            docker,
+            &container.id,
+            &source_backup_location,
+            has_token,
+            &sensitive_values,
+        )
+        .await
+        {
+            Ok(buckets) => buckets,
+            Err(e) => {
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                // The typed error already names the listed location.
+                return Err(e.into());
+            }
+        };
+
+        info!("Found buckets to restore: {:?}", buckets);
+
+        // For each bucket, create it and mirror its contents
+        for bucket_name in &buckets {
+            let dest_location = format!("dest/{}", bucket_name);
+
+            // Create the bucket; `--ignore-existing` exits 0 when it is there,
+            // so a failure here is real (auth, network).
+            let create_bucket_cmd = vec!["rc", "mb", "--ignore-existing", &dest_location];
+            let (ok, _stdout_mb, stderr_mb) = self
+                .exec_in_container(docker, &container.id, create_bucket_cmd)
+                .await?;
+
+            if !ok {
+                let safe_stderr = sensitive_values.redact(&stderr_mb);
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RustFS in-place restore could not create bucket '{}': {}",
+                        bucket_name,
+                        safe_stderr.trim()
+                    ),
+                ));
+            }
+
+            // An in-place restore must reproduce the selected backup exactly.
+            // Do not use --skip-errors: a partial mirror cannot be reported as
+            // a completed restore.
+            let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
+            let dest_bucket_loc = format!("dest/{}/", bucket_name);
+            let mirror_cmd =
+                restore_mirror_command(&source_bucket_loc, &dest_bucket_loc, true, has_token);
+            let mirror_cmd: Vec<&str> = mirror_cmd.iter().map(String::as_str).collect();
+
+            info!(
+                "Executing mirror command for bucket {}: {:?}",
+                bucket_name, mirror_cmd
+            );
+
+            let (ok, _stdout, stderr) = self
+                .exec_in_container(docker, &container.id, mirror_cmd)
+                .await?;
+
+            if !ok {
+                let safe_stderr = sensitive_values.redact(&stderr);
+                error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "RustFS in-place restore failed while mirroring bucket '{}': {}",
+                        bucket_name,
+                        safe_stderr.trim()
+                    ),
+                ));
+            }
+        }
+
+        // Clean up the rc container
+        docker
+            .remove_container(
+                &container.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        info!("RustFS restore completed successfully");
+        Ok(())
+    }
+
+    async fn restore_capabilities(
+        &self,
+        _service_config: ServiceConfig,
+    ) -> Result<super::RestoreCapabilities> {
+        Ok(super::RestoreCapabilities {
+            restore_in_place: true,
+            restore_to_new_service: true,
+            // PITR for object stores would require versioned buckets + per-version
+            // pointers; not yet wired up.
+            pitr: false,
+            earliest_pitr_time: None,
+            latest_pitr_time: None,
+        })
+    }
+
+    /// Provision a fresh RustFS service and mirror a backup into it.
+    ///
+    /// Strategy: clone the source service's config (image, region), generate new
+    /// credentials and unused host ports, spin up a new container+volumes, then
+    /// run `rc mirror` from the backup location into every bucket discovered
+    /// under the backup prefix. The new service gets its OWN access keys.
+    async fn restore_to_new_service(
+        &self,
+        ctx: super::RestoreContext<'_>,
+        new_service_name: String,
+        parameter_overrides: serde_json::Value,
+    ) -> Result<super::NewServiceRestoreResult> {
+        info!(
+            "Provisioning new RustFS service '{}' from backup at {}",
+            new_service_name, ctx.backup_location
+        );
+
+        // Start from the source service's parameters (image/region), then rewrite
+        // port + credentials so we don't collide with the source.
+        let mut new_config = self.get_rustfs_config(ctx.source_config.clone())?;
+
+        let new_api_port = find_available_port(DEFAULT_RUSTFS_API_PORT)
+            .ok_or_else(|| {
+                EngineError::failed(
+                    self.instance_name(),
+                    "No available API ports for new RustFS service",
+                )
+            })?
+            .to_string();
+        let api_port_num: u16 = new_api_port.parse().unwrap_or(DEFAULT_RUSTFS_API_PORT);
+        let console_start = std::cmp::max(api_port_num + 1, DEFAULT_RUSTFS_CONSOLE_PORT);
+        let new_console_port = find_available_port(console_start)
+            .ok_or_else(|| {
+                EngineError::failed(
+                    self.instance_name(),
+                    "No available console ports for new RustFS service",
+                )
+            })?
+            .to_string();
+
+        new_config.port = new_api_port;
+        new_config.console_port = new_console_port;
+        new_config.access_key = default_access_key();
+        new_config.secret_key = default_secret_key();
+
+        if let Some(overrides) = parameter_overrides.as_object() {
+            if let Some(port) = overrides.get("port").and_then(|v| v.as_str()) {
+                new_config.port = port.to_string();
+            }
+            if let Some(port) = overrides.get("console_port").and_then(|v| v.as_str()) {
+                new_config.console_port = port.to_string();
+            }
+            if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
+                new_config.docker_image = image.to_string();
+            }
+            if let Some(ak) = overrides.get("access_key").and_then(|v| v.as_str()) {
+                new_config.access_key = ak.to_string();
+            }
+            if let Some(sk) = overrides.get("secret_key").and_then(|v| v.as_str()) {
+                new_config.secret_key = sk.to_string();
+            }
+        }
+
+        let new_service = RustfsService::new(
+            new_service_name.clone(),
+            self.docker.clone(),
+            self.encryption_service.clone(),
+        );
+        // Inherit limits from the source service so the restored copy
+        // runs with the same caps. Unlimited when the source had none.
+        let cloned_limits = ServiceResourceLimits::from_parameters(&ctx.source_config.parameters);
+        *new_service.config.write().await = Some(new_config.clone());
+        *new_service.resource_limits.write().await = cloned_limits.clone();
+
+        if temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::Name.eq(&new_service_name))
+            .one(ctx.pool)
+            .await?
+            .is_some()
+        {
+            return Err(EngineError::conflict(self.instance_name(), format!("Cannot restore to new RustFS service '{}': a service with that name already exists",
+                new_service_name)));
+        }
+
+        new_service
+            .create_container(&self.docker, &new_config, &cloned_limits, true)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    self.instance_name(),
+                    format!("Failed to create new RustFS container: {}", e),
+                )
+            })?;
+
+        let mut rc_container_id: Option<String> = None;
+        let restore_result: Result<()> = async {
+            // Orchestrator already decrypted into the plaintext s3_source copy.
+            // Re-decrypting would fail because these are no longer ciphertext.
+            let source_access_key = ctx.s3_source.access_key_id.clone();
+            let source_secret_key = ctx.s3_source.secret_key.clone();
+            // Plaintext on the same contract; `None` for a long-lived one.
+            let source_session_token = ctx.s3_source.session_token.clone();
+            let source_endpoint = ctx
+                .s3_source
+                .endpoint
+                .as_deref()
+                .unwrap_or("https://s3.amazonaws.com");
+            let has_token = source_session_token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty());
+            // A session token is exactly as sensitive as the secret key, so rc
+            // output has to have it redacted too.
+            let sensitive_values = SensitiveValues::new()
+                .credential(
+                    &source_access_key,
+                    &source_secret_key,
+                    source_session_token.as_deref(),
+                )
+                .credential(&new_config.access_key, &new_config.secret_key, None);
+
+            self.pull_rc_image(&self.docker).await?;
+
+            let rc_container_name = format!("rc-restore-new-{}", uuid::Uuid::new_v4());
+            // Aliases via `RC_HOST_*` only (no `rc alias set`); a temporary
+            // source credential's token goes in `TEMPS_REMOTE_SESSION_TOKEN`
+            // and is only sent, via `-H`, by the source-side `rc` calls.
+            let mut env_vars = vec![
+                super::rc_client::rc_host_env(
+                    "backup-source",
+                    source_endpoint,
+                    &source_access_key,
+                    &source_secret_key,
+                ),
+                super::rc_client::rc_host_env(
+                    "dest",
+                    &format!("http://localhost:{}", new_config.port),
+                    &new_config.access_key,
+                    &new_config.secret_key,
+                ),
+            ];
+            env_vars.extend(super::rc_client::remote_session_token_env(
+                source_session_token.as_deref(),
+            ));
+
+            let rc_config = bollard::models::ContainerCreateBody {
+                image: Some(super::rc_client::RC_IMAGE.to_string()),
+                env: Some(env_vars),
+                entrypoint: Some(vec!["sh".to_string()]),
+                tty: Some(true),
+                attach_stdin: Some(true),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some("host".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let container = self
+                .docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(&rc_container_name)
+                            .build(),
+                    ),
+                    rc_config,
+                )
+                .await?;
+            rc_container_id = Some(container.id.clone());
+
+            self.docker
+                .start_container(
+                    &container.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await?;
+
+            // List buckets at the backup prefix.
+            let source_backup_location = format!(
+                "backup-source/{}/{}/",
+                ctx.s3_source.bucket_name,
+                ctx.backup_location.trim_matches('/')
+            );
+            let buckets = super::rc_client::list_dir_names(
+                &self.docker,
+                &container.id,
+                &source_backup_location,
+                has_token,
+                &sensitive_values,
+            )
+            .await?;
+
+            info!(
+                "Restoring {} bucket(s) into new RustFS service '{}'",
+                buckets.len(),
+                new_service_name
+            );
+
+            for bucket_name in &buckets {
+                let dest_location = format!("dest/{}/", bucket_name);
+
+                // `--ignore-existing` exits 0 when the bucket is already there,
+                // so any failure here is real (auth, network) and would only
+                // resurface as a less clear "bucket not found" from the mirror.
+                let mb_target = format!("dest/{}", bucket_name);
+                let mb_cmd = vec!["rc", "mb", "--ignore-existing", &mb_target];
+                let (ok, _stdout_mb, stderr_mb) = self
+                    .exec_in_container(&self.docker, &container.id, mb_cmd)
+                    .await?;
+                if !ok {
+                    Err(EngineError::failed(self.instance_name(), format!("RustFS restore to new service '{}' could not create bucket '{}': {}",
+                        new_service_name,
+                        bucket_name,
+                        sensitive_values.redact(&stderr_mb).trim())))?;
+                }
+
+                let source_bucket_loc = format!("{}{}/", source_backup_location, bucket_name);
+                let mirror_cmd =
+                    restore_mirror_command(&source_bucket_loc, &dest_location, false, has_token);
+                let mirror_cmd: Vec<&str> = mirror_cmd.iter().map(String::as_str).collect();
+
+                info!("Mirroring bucket {} -> new RustFS service", bucket_name);
+                let (ok, _stdout, stderr) = self
+                    .exec_in_container(&self.docker, &container.id, mirror_cmd)
+                    .await?;
+                if !ok {
+                    let safe_stderr = sensitive_values.redact(&stderr);
+                    error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
+                    Err(EngineError::failed(self.instance_name(), format!("RustFS restore to new service '{}' failed while mirroring bucket '{}': {}",
+                        new_service_name,
+                        bucket_name,
+                        safe_stderr.trim())))?;
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        // Always remove the credential-bearing helper. On failure, also remove
+        // the not-yet-owned target container and volumes: the orchestrator only
+        // creates its service row after this method succeeds.
+        let helper_cleanup_error = if let Some(container_id) = rc_container_id {
+            match self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => None,
+                Err(error) if docker_error_is_not_found(&error) => None,
+                Err(error) => Some(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "failed to remove credential-bearing rc helper container '{}': {}",
+                        container_id, error
+                    ),
+                )),
+            }
+        } else {
+            None
+        };
+        let restore_result = match (restore_result, helper_cleanup_error) {
+            (Ok(()), None) => Ok(()),
+            (Err(error), None) => Err(error),
+            (Ok(()), Some(cleanup_error)) => Err(cleanup_error),
+            (Err(error), Some(cleanup_error)) => Err(EngineError::failed(
+                self.instance_name(),
+                format!(
+                    "{}. Credential-helper cleanup also failed: {}",
+                    error, cleanup_error
+                ),
+            )),
+        };
+        if let Err(error) = restore_result {
+            let data_volume_name = format!("rustfs_{}_data", new_service_name);
+            let logs_volume_name = format!("rustfs_{}_logs", new_service_name);
+            let cleanup_errors = cleanup_unowned_rustfs_resources(
+                &self.docker,
+                &new_service.get_container_name(),
+                &[&data_volume_name, &logs_volume_name],
+                true,
+            )
+            .await;
+            if !cleanup_errors.is_empty() {
+                return Err(EngineError::failed(self.instance_name(), format!("RustFS restore to new service '{}' failed: {}. Cleanup of the unowned target also failed: {}",
+                    new_service_name,
+                    error,
+                    cleanup_errors.join("; "))));
+            }
+            return Err(error);
+        }
+
+        let runtime_json = match serde_json::to_value(&new_config) {
+            Ok(runtime_json) => runtime_json,
+            Err(error) => {
+                let data_volume_name = format!("rustfs_{}_data", new_service_name);
+                let logs_volume_name = format!("rustfs_{}_logs", new_service_name);
+                let cleanup_errors = cleanup_unowned_rustfs_resources(
+                    &self.docker,
+                    &new_service.get_container_name(),
+                    &[&data_volume_name, &logs_volume_name],
+                    true,
+                )
+                .await;
+                return Err(EngineError::failed(
+                    self.instance_name(),
+                    format!(
+                        "Failed to serialize restored RustFS service '{}' configuration: {}{}",
+                        new_service_name,
+                        error,
+                        if cleanup_errors.is_empty() {
+                            String::new()
+                        } else {
+                            format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                        }
+                    ),
+                ));
+            }
+        };
+        let mut parameters = HashMap::new();
+        if let Some(obj) = runtime_json.as_object() {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    parameters.insert(k.clone(), s.to_string());
+                } else if let Some(n) = v.as_u64() {
+                    parameters.insert(k.clone(), n.to_string());
+                }
+            }
+        }
+
+        let connection_info = format!(
+            "s3://{}:***@{}:{}",
+            new_config.access_key, new_config.host, new_config.port
+        );
+
+        Ok(super::NewServiceRestoreResult {
+            parameters,
+            connection_info,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
+
+    /// One-shot HTTP server answering every request with `status`.
+    async fn fake_s3_endpoint(status_line: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = "<Error><Code>ServiceUnavailable</Code><Message>store init in progress</Message></Error>";
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn probe_config() -> RustfsConfig {
+        RustfsConfig {
+            port: "9000".to_string(),
+            console_port: "9001".to_string(),
+            access_key: "probe-access".to_string(),
+            secret_key: "probe-secret".to_string(),
+            host: "127.0.0.1".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_buckets_probe_explains_a_503_instead_of_service_error() {
+        let endpoint = fake_s3_endpoint("503 Service Unavailable").await;
+        let error = list_buckets_probe(&endpoint, &probe_config())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RustfsProbeError::StorageNotReady {
+                    operation: "ListBuckets",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("HTTP 503") && message.contains("storage layer is not ready"),
+            "diagnostic should state the status and what it means: {message}"
+        );
+        assert!(
+            message.contains("ServiceUnavailable"),
+            "diagnostic should carry the S3 error code: {message}"
+        );
+        assert!(!message.contains("probe-secret"));
+    }
+
+    #[tokio::test]
+    async fn list_buckets_probe_flags_rejected_credentials() {
+        let endpoint = fake_s3_endpoint("403 Forbidden").await;
+        let error = list_buckets_probe(&endpoint, &probe_config())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RustfsProbeError::CredentialsRejected { status: 403, .. }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("access key"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn list_buckets_probe_reports_an_unreachable_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = list_buckets_probe(&endpoint, &probe_config())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RustfsProbeError::Unreachable { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// HTTP server answering every request with 503 (store still
+    /// initializing) until `ready` is set, then with an empty, valid
+    /// ListBuckets result.
+    async fn switchable_s3_endpoint(ready: Arc<std::sync::atomic::AtomicBool>) -> String {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let (status_line, body) = if ready.load(Ordering::SeqCst) {
+                    (
+                        "200 OK",
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListAllMyBucketsResult \
+                         xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>o</ID>\
+                         <DisplayName>o</DisplayName></Owner><Buckets></Buckets>\
+                         </ListAllMyBucketsResult>",
+                    )
+                } else {
+                    (
+                        "503 Service Unavailable",
+                        "<Error><Code>ServiceUnavailable</Code><Message>store init in progress</Message></Error>",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A readiness target for a fake endpoint, with no container behind it.
+    fn readiness_target_for(endpoint: &str, deadline: Duration) -> RustfsReadinessTarget {
+        let port = endpoint.rsplit(':').next().unwrap().to_string();
+        RustfsReadinessTarget::new(
+            RustfsConfig {
+                port,
+                ..probe_config()
+            },
+            None,
+            ReadinessPolicy {
+                deadline,
+                poll_interval: Duration::from_millis(20),
+                max_restarts: 3,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn readiness_stays_starting_on_503_and_runs_once_list_buckets_works() {
+        use crate::readiness::{
+            drive_readiness, test_support::RecordingSink, ReadinessOutcome, ServiceReadiness,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let endpoint = switchable_s3_endpoint(ready.clone()).await;
+        let target = readiness_target_for(&endpoint, Duration::from_secs(30));
+        let sink = Arc::new(RecordingSink::default());
+        let prior = ServiceReadiness::starting(chrono::Utc::now(), &target.policy());
+
+        let watch = {
+            let sink = sink.clone();
+            tokio::spawn(
+                async move { drive_readiness(&target, sink.as_ref(), prior, || false).await },
+            )
+        };
+
+        // Starting, with the typed 503 reason, while the store initializes.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let reported = sink.starting.lock().unwrap().first().cloned();
+            if let Some(readiness) = reported {
+                let reason = readiness.reason.unwrap_or_default();
+                assert!(
+                    reason.contains("HTTP 503") && reason.contains("storage layer is not ready"),
+                    "{reason}"
+                );
+                assert!(!reason.contains("probe-secret"), "{reason}");
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no starting report");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!*sink.ready.lock().unwrap(), "503 must not count as ready");
+
+        // Storage comes up: authenticated ListBuckets succeeds.
+        ready.store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), watch)
+            .await
+            .expect("watch did not finish after ListBuckets succeeded")
+            .unwrap();
+
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+        assert!(*sink.ready.lock().unwrap());
+        assert!(sink.failed.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_with_the_probe_reason_when_503_outlasts_the_deadline() {
+        use crate::readiness::{
+            drive_readiness, test_support::RecordingSink, InitializationFailureKind,
+            ReadinessNextAction, ReadinessOutcome, ReadinessPhase, ServiceReadiness,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        let endpoint = switchable_s3_endpoint(Arc::new(AtomicBool::new(false))).await;
+        let target = readiness_target_for(&endpoint, Duration::from_millis(500));
+        let sink = RecordingSink::default();
+        let prior = ServiceReadiness::starting(chrono::Utc::now(), &target.policy());
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            drive_readiness(&target, &sink, prior, || false),
+        )
+        .await
+        .expect("readiness gate did not give up at its deadline");
+
+        let ReadinessOutcome::Failed(readiness) = outcome else {
+            panic!("expected a failed initialization, got {outcome:?}");
+        };
+        assert_eq!(readiness.phase, ReadinessPhase::Failed);
+        let failure = readiness.failure.clone().unwrap();
+        assert_eq!(failure.kind, InitializationFailureKind::Timeout);
+        assert!(
+            failure.reason.contains("HTTP 503") && failure.reason.contains("storage layer"),
+            "{}",
+            failure.reason
+        );
+        assert_eq!(failure.next_actions[0], ReadinessNextAction::ViewLogs);
+        assert_eq!(sink.failed.lock().unwrap().as_ref(), Some(&readiness));
+        assert!(!*sink.ready.lock().unwrap());
+    }
+
+    #[test]
+    fn log_lines_are_cleaned_of_colour_codes_and_credentials() {
+        let line = "\u{1b}[31mERROR\u{1b}[0m auth failed for key probe-access with probe-secret  ";
+        assert_eq!(
+            clean_log_line(line, &["probe-access", "probe-secret"]),
+            "ERROR auth failed for key *** with ***"
+        );
+        let long = "x".repeat(RUSTFS_LOG_LINE_MAX_CHARS + 50);
+        let cleaned = clean_log_line(&long, &[]);
+        assert_eq!(cleaned.chars().count(), RUSTFS_LOG_LINE_MAX_CHARS + 1);
+        assert!(cleaned.ends_with('…'));
+    }
+
+    #[test]
+    fn store_init_failure_lines_are_fatal_and_lead_the_excerpt() {
+        let lines: Vec<String> = [
+            "INFO starting rustfs",
+            "WARN Pool metadata writes blocked, reason: recovery_required, phase: metadata_absence",
+            "ERROR pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
+            "ERROR Server runtime failed: store init failed: init retry budget exhausted",
+            "INFO shutting down",
+        ]
+        .iter()
+        .map(|l| String::from(*l))
+        .collect();
+
+        let fatal = matching_lines(&lines, RUSTFS_FATAL_INIT_SIGNATURES);
+        assert_eq!(fatal, lines[2..4].to_vec());
+
+        // The excerpt also carries the non-fatal context line, oldest first.
+        assert_eq!(log_excerpt(&lines), lines[1..4].to_vec());
+    }
+
+    #[test]
+    fn a_healthy_log_is_not_fatal_and_the_excerpt_is_its_tail() {
+        let lines: Vec<String> = (0..30).map(|i| format!("INFO line {i}")).collect();
+        assert!(matching_lines(&lines, RUSTFS_FATAL_INIT_SIGNATURES).is_empty());
+        let excerpt = log_excerpt(&lines);
+        assert_eq!(excerpt.len(), RUSTFS_LOG_EXCERPT_LINES);
+        assert_eq!(excerpt.last().map(String::as_str), Some("INFO line 29"));
+    }
+
+    #[tokio::test]
+    async fn restart_note_is_bounded_when_docker_does_not_answer() {
+        // A socket that accepts connections and never replies stands in for
+        // a hung Docker daemon.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let docker =
+            Docker::connect_with_unix(socket.to_str().unwrap(), 120, bollard::API_DEFAULT_VERSION)
+                .unwrap();
+        let service = RustfsService::new(
+            "hung-docker".to_string(),
+            Arc::new(docker),
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(service.restart_loop_note().await, None);
+        assert!(
+            started.elapsed() < RESTART_NOTE_TIMEOUT + Duration::from_secs(1),
+            "restart note waited {:?} on an unresponsive daemon",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn restart_loop_note_only_for_restarted_containers() {
+        assert_eq!(restart_loop_note("rustfs-a", 0), None);
+        let note = restart_loop_note("rustfs-a", 20).unwrap();
+        assert!(note.contains("restarted 20 time(s)") && note.contains("docker logs rustfs-a"));
+    }
+
+    #[test]
+    fn external_client_output_redacts_keys_and_credential_urls() {
+        let output =
+            "request to http://access-key:secret-key@backup.internal failed for access-key";
+
+        let redacted = SensitiveValues::new()
+            .credential("access-key", "secret-key", None)
+            .redact(output);
+
+        assert_eq!(
+            redacted,
+            "request to http://***:***@backup.internal failed for ***"
+        );
+        assert!(!redacted.contains("access-key"));
+        assert!(!redacted.contains("secret-key"));
+    }
+
+    /// The gap this file had at two of its three mc call sites: a temporary
+    /// destination credential's session token was left out of the redaction
+    /// list, so mc's echoed `MC_HOST_*` URL carried it into
+    /// `external_service_backups.error_message` and the API response.
+    #[test]
+    fn external_client_output_redacts_a_temporary_credentials_session_token() {
+        let sensitive = SensitiveValues::new()
+            .credential("live-key", "live-secret", None)
+            .credential("bkp-key", "bkp-secret", Some("sts-session-token"));
+
+        let redacted = sensitive.redact(
+            "mc: <ERROR> Unable to initialize \
+             http://bkp-key:bkp-secret:sts-session-token@backup.internal",
+        );
+
+        assert_eq!(
+            redacted,
+            "mc: <ERROR> Unable to initialize http://***:***:***@backup.internal"
+        );
+        assert!(!redacted.contains("sts-session-token"));
+    }
+
+    #[test]
+    fn in_place_restore_mirror_is_exact_and_does_not_hide_errors() {
+        assert_eq!(
+            restore_mirror_command("backup/bucket", "live/bucket", true, false),
+            vec![
+                "rc",
+                "mirror",
+                "--overwrite",
+                "--remove",
+                "backup/bucket",
+                "live/bucket",
+            ]
+        );
+    }
+
+    #[test]
+    fn new_service_restore_does_not_remove_concurrent_writes() {
+        assert_eq!(
+            restore_mirror_command("backup/bucket", "new/bucket", false, false),
+            vec!["rc", "mirror", "--overwrite", "backup/bucket", "new/bucket"]
+        );
+    }
+
+    /// A temporary backup credential stages the restore so only the
+    /// backup-side step sends the token; `--remove` stays on the live side.
+    #[test]
+    fn restore_from_a_temporary_credential_is_staged() {
+        let command = restore_mirror_command("backup/bucket/", "live/bucket/", true, true);
+        assert_eq!(command[0..2], ["sh", "-c"]);
+        assert_eq!(
+            command[3..],
+            ["sh", "backup/bucket/", "live/bucket/", "remove", "source"]
+        );
+    }
+
+    fn inspect_response(
+        status: bollard::models::ContainerStateStatusEnum,
+        image: &str,
+        ports: Vec<(&str, Option<&str>)>,
+    ) -> bollard::models::ContainerInspectResponse {
+        let port_map = ports
+            .into_iter()
+            .map(|(internal, host_port)| {
+                let bindings = host_port.map(|port| {
+                    vec![bollard::models::PortBinding {
+                        host_ip: Some("127.0.0.1".to_string()),
+                        host_port: Some(port.to_string()),
+                    }]
+                });
+                (internal.to_string(), bindings)
+            })
+            .collect();
+
+        bollard::models::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                status: Some(status),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                image: Some(image.to_string()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(port_map),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn running_on(ports: Vec<(&str, Option<&str>)>) -> bollard::models::ContainerInspectResponse {
+        inspect_response(
+            bollard::models::ContainerStateStatusEnum::RUNNING,
+            TEST_IMAGE,
+            ports,
+        )
+    }
+
+    /// The regression behind the "dispatch failure" on every blob request.
+    ///
+    /// On any `init()` after the first, `from_input_async` probes the
+    /// persisted port, finds it bound — by this service's *own* container —
+    /// and relocates. `create_container` then sees a healthy container on the
+    /// right image and returns without applying the move, so the S3 client
+    /// ends up pointed at a port nothing serves. Adopting the ports the
+    /// container actually publishes is what keeps the two in agreement.
+    #[test]
+    fn adopts_ports_published_by_the_running_container() {
+        let info = running_on(vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))]);
+
+        assert_eq!(
+            adopted_ports_from_inspect(&info, TEST_IMAGE),
+            Some(("9000".to_string(), "9002".to_string())),
+            "must return the container's real published ports, not a re-probed guess"
+        );
+    }
+
+    /// A stopped container is about to be removed and recreated by
+    /// `create_container`, so its old bindings must not be adopted.
+    #[test]
+    fn ignores_a_stopped_container() {
+        let info = inspect_response(
+            bollard::models::ContainerStateStatusEnum::EXITED,
+            TEST_IMAGE,
+            vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))],
+        );
+
+        assert_eq!(adopted_ports_from_inspect(&info, TEST_IMAGE), None);
+    }
+
+    /// An image change also forces a recreate, which re-binds the ports —
+    /// adopting the outgoing container's would pin the new one to stale values.
+    #[test]
+    fn ignores_a_container_running_a_different_image() {
+        let info = running_on(vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))]);
+
+        assert_eq!(
+            adopted_ports_from_inspect(&info, "rustfs/rustfs:1.0.0-alpha.99"),
+            None
+        );
+    }
+
+    /// Partially-published containers must not yield a half-adopted config:
+    /// a missing console binding with an adopted API port would silently keep
+    /// the probed console port, which is exactly the mismatch being fixed.
+    #[test]
+    fn ignores_a_container_missing_a_published_port() {
+        for ports in [
+            vec![("9000/tcp", Some("9000")), ("9001/tcp", None)],
+            vec![("9000/tcp", None), ("9001/tcp", Some("9002"))],
+            vec![("9000/tcp", Some("9000"))],
+        ] {
+            assert_eq!(
+                adopted_ports_from_inspect(&running_on(ports), TEST_IMAGE),
+                None,
+                "an incomplete port map must fall back to the probed config wholesale"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rustfs_config_defaults() {
+        let input = RustfsInputConfig {
+            backend: None,
+            buckets: None,
+            port: None,
+            console_port: None,
+            access_key: None,
+            secret_key: None,
+            host: default_host(),
+            region: default_region(),
+            docker_image: default_image(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        };
+
+        let config = RustfsConfig::from(input);
+
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.region, "us-east-1");
+        assert_eq!(config.docker_image, DEFAULT_RUSTFS_IMAGE);
+        assert!(!config.access_key.is_empty());
+        assert!(!config.secret_key.is_empty());
+    }
+
+    #[test]
+    fn rustfs_lifecycle_defaults_match_the_provisioning_image() {
+        let (repository, version) = DEFAULT_RUSTFS_IMAGE
+            .rsplit_once(':')
+            .expect("the tested RustFS image must include an explicit version");
+
+        assert_eq!(repository, "rustfs/rustfs");
+        assert_eq!(version, DEFAULT_RUSTFS_VERSION);
+    }
+
+    #[test]
+    fn test_rustfs_config_custom() {
+        let input = RustfsInputConfig {
+            backend: None,
+            buckets: None,
+            port: Some("9100".to_string()),
+            console_port: Some("9101".to_string()),
+            access_key: Some("myaccesskey".to_string()),
+            secret_key: Some("mysecretkey".to_string()),
+            host: "custom-host".to_string(),
+            region: "eu-west-1".to_string(),
+            docker_image: "rustfs/rustfs:1.0.0".to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        };
+
+        let config = RustfsConfig::from(input);
+
+        assert_eq!(config.port, "9100");
+        assert_eq!(config.console_port, "9101");
+        assert_eq!(config.access_key, "myaccesskey");
+        assert_eq!(config.secret_key, "mysecretkey");
+        assert_eq!(config.host, "custom-host");
+        assert_eq!(config.region, "eu-west-1");
+        assert_eq!(config.docker_image, "rustfs/rustfs:1.0.0");
+    }
+
+    #[test]
+    fn otel_capable_image_receives_exact_metrics_export_environment() {
+        let config = RustfsConfig {
+            port: "9000".to_string(),
+            console_port: "9001".to_string(),
+            access_key: "TEST_ACCESS".to_string(),
+            secret_key: "TEST_SECRET".to_string(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: Some("si_TEST_ONLY".to_string()),
+            metrics_ingest_url: Some("http://temps.internal:8080/".to_string()),
+        };
+
+        let env = rustfs_container_env(&config);
+        assert!(env.contains(
+            &"RUSTFS_OBS_METRIC_ENDPOINT=http://temps.internal:8080/api/otel/v1/metrics"
+                .to_string()
+        ));
+        assert!(env.contains(
+            &"RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20si_TEST_ONLY".to_string()
+        ));
+        assert!(env.contains(&"RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string()));
+        // The stdout metrics exporter is only switchable once the root
+        // endpoint is set; without both, every metric is dumped to stdout.
+        assert!(
+            env.contains(&"RUSTFS_OBS_ENDPOINT=http://temps.internal:8080/api/otel".to_string())
+        );
+        assert!(env.contains(&"RUSTFS_OBS_USE_STDOUT=false".to_string()));
+        assert!(env.contains(&"RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string()));
+        assert!(env.contains(&"RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string()));
+    }
+
+    #[test]
+    fn container_without_metrics_key_sets_no_obs_environment() {
+        let config = RustfsConfig {
+            port: "9000".to_string(),
+            console_port: "9001".to_string(),
+            access_key: "TEST_ACCESS".to_string(),
+            secret_key: "TEST_SECRET".to_string(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        };
+        let env = rustfs_container_env(&config);
+        assert!(
+            env.iter().all(|entry| !entry.starts_with("RUSTFS_OBS_")),
+            "unexpected OBS env without a metrics key: {env:?}"
+        );
+    }
+
+    fn init_host_config(init: Option<bool>) -> bollard::models::HostConfig {
+        bollard::models::HostConfig {
+            init,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drift_reason_none_when_init_and_env_match() {
+        let desired = vec!["A=1".to_string(), "B=2".to_string()];
+        // Image-provided extras such as PATH never count as drift.
+        let actual = vec![
+            "PATH=/usr/bin".to_string(),
+            "B=2".to_string(),
+            "A=1".to_string(),
+        ];
+        assert_eq!(
+            rustfs_drift_reason(Some(&init_host_config(Some(true))), &actual, &desired),
+            None
+        );
+    }
+
+    #[test]
+    fn drift_reason_reports_missing_init() {
+        let env = vec!["A=1".to_string()];
+        let reason = rustfs_drift_reason(Some(&init_host_config(None)), &env, &env)
+            .expect("a container without init must be recreated");
+        assert!(reason.contains("no init process"), "{reason}");
+    }
+
+    #[test]
+    fn drift_reason_names_changed_variables_without_their_values() {
+        let desired = vec![
+            "RUSTFS_SECRET_KEY=TEST_SECRET".to_string(),
+            "RUSTFS_OBS_USE_STDOUT=false".to_string(),
+        ];
+        // A container from before the stdout fix: no USE_STDOUT entry.
+        let actual = vec!["RUSTFS_SECRET_KEY=TEST_SECRET".to_string()];
+        let reason = rustfs_drift_reason(Some(&init_host_config(Some(true))), &actual, &desired)
+            .expect("missing env must be reported");
+        assert!(reason.contains("RUSTFS_OBS_USE_STDOUT"), "{reason}");
+        assert!(
+            !reason.contains("false"),
+            "values must not be logged: {reason}"
+        );
+
+        // A changed credential is reported by name only.
+        let actual = vec![
+            "RUSTFS_SECRET_KEY=OLD_SECRET".to_string(),
+            "RUSTFS_OBS_USE_STDOUT=false".to_string(),
+        ];
+        let reason = rustfs_drift_reason(Some(&init_host_config(Some(true))), &actual, &desired)
+            .expect("changed env must be reported");
+        assert!(reason.contains("RUSTFS_SECRET_KEY"), "{reason}");
+        assert!(
+            !reason.contains("SECRET,") && !reason.contains("TEST_SECRET"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn drift_reason_none_without_host_config() {
+        // Uninspectable host config is not evidence of drift.
+        assert_eq!(rustfs_drift_reason(None, &[], &[]), None);
+    }
+
+    #[test]
+    fn test_access_key_format() {
+        let key = default_access_key();
+        assert!(key.starts_with("AKIA"));
+        assert_eq!(key.len(), 20);
+    }
+
+    #[test]
+    fn test_secret_key_format() {
+        let key = default_secret_key();
+        assert_eq!(key.len(), 40);
+    }
+
+    /// End-to-end backup and in-place restore of a RustFS service through the
+    /// `rc` helper container: backup mirrors every bucket (rc cannot mirror an
+    /// alias root), restore lists rc's full-key JSON output, recreates each
+    /// bucket and mirrors it back with `--remove`.
+    ///
+    /// Bucket names `app` and `app-logs` share a prefix on purpose: a listing
+    /// or mirror without the trailing `/` would mix their objects.
+    /// Drop guard that force-removes a test RustFS service's container and
+    /// volumes, so a failing Docker test never leaks resources. Drop is sync,
+    /// so the async cleanup runs on its own thread and runtime.
+    #[cfg(feature = "docker-tests")]
+    struct RustfsDockerCleanup {
+        docker: Arc<Docker>,
+        service_name: String,
+    }
+
+    #[cfg(feature = "docker-tests")]
+    impl Drop for RustfsDockerCleanup {
+        fn drop(&mut self) {
+            let docker = self.docker.clone();
+            let name = self.service_name.clone();
+            let cleanup = std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    let _ = docker
+                        .remove_container(
+                            &rustfs_container_name(&name),
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                    for volume in rustfs_volume_names(&name) {
+                        let _ = docker
+                            .remove_volume(
+                                &volume,
+                                Some(bollard::query_parameters::RemoveVolumeOptions {
+                                    force: true,
+                                }),
+                            )
+                            .await;
+                    }
+                });
+            });
+            let _ = cleanup.join();
+        }
+    }
+
+    /// Qualification gate for [`DEFAULT_RUSTFS_IMAGE`]: a service created the
+    /// way the console creates one, on fresh volumes, must serve authenticated
+    /// ListBuckets and CreateBucket (not just `/health`), must not be in a
+    /// restart loop, and must keep serving after a container restart.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_default_image_fresh_volumes_serve_authenticated_s3() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service_name = format!("test-rustfs-qual-{}", chrono::Utc::now().timestamp_millis());
+        // Removes the container and both volumes on every exit path,
+        // including a panic in `init` or an assertion.
+        let _cleanup = RustfsDockerCleanup {
+            docker: docker.clone(),
+            service_name: service_name.clone(),
+        };
+        let service = RustfsService::new(service_name.clone(), docker.clone(), encryption_service);
+        let inferred = service
+            .init(ServiceConfig {
+                name: service_name.clone(),
+                service_type: ServiceType::Rustfs,
+                version: None,
+                parameters: serde_json::json!({
+                    "host": "localhost",
+                    "region": "us-east-1",
+                    "docker_image": DEFAULT_RUSTFS_IMAGE,
+                }),
+            })
+            .await
+            .expect("RustFS service should start");
+        let cfg: RustfsConfig = RustfsConfig {
+            port: inferred["port"].clone(),
+            console_port: inferred["console_port"].clone(),
+            access_key: inferred["access_key"].clone(),
+            secret_key: inferred["secret_key"].clone(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        };
+        let endpoint = format!("http://localhost:{}", cfg.port);
+        let container = service.get_container_name();
+
+        async fn wait_for_s3(
+            endpoint: &str,
+            cfg: &RustfsConfig,
+        ) -> std::result::Result<(), String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                match list_buckets_probe(endpoint, cfg).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if std::time::Instant::now() > deadline => return Err(e.to_string()),
+                    Err(_) => sleep(Duration::from_secs(2)).await,
+                }
+            }
+        }
+
+        let result = async {
+            wait_for_s3(&endpoint, &cfg).await?;
+            let client = Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .endpoint_url(&endpoint)
+                    .region(Region::new("us-east-1"))
+                    .behavior_version_latest()
+                    .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                        cfg.access_key.clone(),
+                        cfg.secret_key.clone(),
+                        None,
+                        None,
+                        "rustfs-qualification",
+                    ))
+                    .force_path_style(true)
+                    .build(),
+            );
+            client
+                .create_bucket()
+                .bucket("qualification")
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "CreateBucket failed: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    )
+                })?;
+            let restarts = docker
+                .inspect_container(&container, None::<InspectContainerOptions>)
+                .await
+                .map_err(|e| e.to_string())?
+                .restart_count
+                .unwrap_or(0);
+            if restarts != 0 {
+                return Err(format!(
+                    "container restarted {restarts} time(s) during first boot"
+                ));
+            }
+
+            docker
+                .restart_container(
+                    &container,
+                    None::<bollard::query_parameters::RestartContainerOptions>,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            wait_for_s3(&endpoint, &cfg)
+                .await
+                .map_err(|e| format!("after restart: {e}"))?;
+            let names: Vec<String> = client
+                .list_buckets()
+                .send()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "ListBuckets after restart failed: {}",
+                        aws_sdk_s3::error::DisplayErrorContext(&e)
+                    )
+                })?
+                .buckets()
+                .iter()
+                .filter_map(|b| b.name().map(str::to_string))
+                .collect();
+            if !names.iter().any(|n| n == "qualification") {
+                return Err(format!("bucket lost across restart: {names:?}"));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            panic!("{DEFAULT_RUSTFS_IMAGE} failed fresh-volume S3 qualification: {e}");
+        }
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_rustfs_backup_and_restore_in_place() {
+        use super::super::test_utils::{
+            create_mock_backup, create_mock_db, create_mock_external_service, S3TestContainer,
+        };
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+
+        let backup_s3 = match S3TestContainer::start(docker.clone(), "rustfs-backup-dest").await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("certificate") || msg.contains("TrustStore") {
+                    println!("Skipping RustFS backup test: TLS certificate issue: {msg}");
+                    return;
+                }
+                panic!("Failed to start backup S3 container: {e}");
+            }
+        };
+
+        let run_id = chrono::Utc::now().timestamp_millis();
+        let service_name = format!("test-rustfs-bkp-{run_id}");
+        let service = RustfsService::new(
+            service_name.clone(),
+            docker.clone(),
+            encryption_service.clone(),
+        );
+        let inferred = service
+            .init(ServiceConfig {
+                name: service_name.clone(),
+                service_type: ServiceType::Rustfs,
+                version: None,
+                parameters: serde_json::json!({
+                    "host": "localhost",
+                    "region": "us-east-1",
+                    "docker_image": DEFAULT_RUSTFS_IMAGE,
+                }),
+            })
+            .await
+            .expect("RustFS service should start");
+        let service_config = ServiceConfig {
+            name: service_name.clone(),
+            service_type: ServiceType::Rustfs,
+            version: None,
+            parameters: serde_json::to_value(&inferred).unwrap(),
+        };
+
+        let client = Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .endpoint_url(format!("http://localhost:{}", inferred["port"]))
+                .region(Region::new("us-east-1"))
+                .behavior_version_latest()
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    inferred["access_key"].clone(),
+                    inferred["secret_key"].clone(),
+                    None,
+                    None,
+                    "rustfs-test",
+                ))
+                .force_path_style(true)
+                .build(),
+        );
+        let objects = [
+            ("app", "a.txt", "app object"),
+            ("app", "nested/b.txt", "app nested object"),
+            ("app-logs", "log.txt", "log object"),
+            ("uploads", "u.bin", "upload object"),
+        ];
+        for bucket in ["app", "app-logs", "uploads"] {
+            client.create_bucket().bucket(bucket).send().await.unwrap();
+        }
+        for (bucket, key, body) in objects {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(
+                    body.as_bytes().to_vec(),
+                ))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let mock_db = create_mock_db().await.expect("mock db");
+        let backup_s3_source = temps_entities::s3_sources::Model {
+            access_key_id: encryption_service
+                .encrypt_string(&backup_s3.access_key)
+                .unwrap(),
+            secret_key: encryption_service
+                .encrypt_string(&backup_s3.secret_key)
+                .unwrap(),
+            ..backup_s3.s3_source.clone()
+        };
+        let subpath_root = format!("external_services/rustfs/{service_name}");
+        let backup = create_mock_backup(&subpath_root);
+        let external_service =
+            create_mock_external_service(service_name.clone(), "rustfs", "latest");
+
+        let outcome = service
+            .backup_to_s3(
+                &backup_s3.s3_client,
+                &backup_s3.s3_credentials(),
+                backup.clone(),
+                &backup_s3_source,
+                &subpath_root,
+                &subpath_root,
+                &mock_db,
+                &external_service,
+                service_config.clone(),
+            )
+            .await
+            .expect("RustFS backup should complete");
+        assert!(outcome.size_bytes.unwrap_or_default() > 0);
+
+        // One folder per source bucket under the backup prefix.
+        let listed = backup_s3
+            .s3_client
+            .list_objects_v2()
+            .bucket(&backup_s3.bucket_name)
+            .prefix(format!("{subpath_root}/"))
+            .send()
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = listed
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                format!("{subpath_root}/app-logs/log.txt"),
+                format!("{subpath_root}/app/a.txt"),
+                format!("{subpath_root}/app/nested/b.txt"),
+                format!("{subpath_root}/uploads/u.bin"),
+            ]
+        );
+
+        // Diverge from the backup: lose an object, gain a stray one.
+        client
+            .delete_object()
+            .bucket("app")
+            .key("a.txt")
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket("app")
+            .key("written-after-backup.txt")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"stray"))
+            .send()
+            .await
+            .unwrap();
+
+        // `restore_from_s3` takes plaintext credentials.
+        let plaintext_source = temps_entities::s3_sources::Model {
+            access_key_id: backup_s3.access_key.clone(),
+            secret_key: backup_s3.secret_key.clone(),
+            ..backup_s3.s3_source.clone()
+        };
+        let restore = service
+            .restore_from_s3(
+                &backup_s3.s3_client,
+                &backup_s3.s3_credentials(),
+                &outcome.location,
+                &plaintext_source,
+                service_config.clone(),
+            )
+            .await;
+
+        let mut restored = Vec::new();
+        for bucket in ["app", "app-logs", "uploads"] {
+            let listed = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap();
+            for object in listed.contents() {
+                restored.push(format!("{bucket}/{}", object.key().unwrap_or_default()));
+            }
+        }
+        restored.sort();
+
+        let _ = service.remove().await;
+        let _ = backup_s3.cleanup().await;
+
+        restore.expect("RustFS in-place restore should complete");
+        assert_eq!(
+            restored,
+            vec![
+                "app-logs/log.txt".to_string(),
+                "app/a.txt".to_string(),
+                "app/nested/b.txt".to_string(),
+                "uploads/u.bin".to_string(),
+            ],
+            "in-place restore must bring back the lost object and remove the stray one"
+        );
+    }
+}

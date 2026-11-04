@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -734,7 +735,7 @@ impl WorkloadPlacementService {
 
     async fn control_plane_settings(
         &self,
-    ) -> Result<temps_core::ControlPlaneResourceSettings, WorkloadPlacementError> {
+    ) -> Result<temps_config::ControlPlaneResourceSettings, WorkloadPlacementError> {
         self.config_service
             .get_settings()
             .await
@@ -746,7 +747,7 @@ impl WorkloadPlacementService {
     }
 
     fn control_plane_reserved(
-        settings: &temps_core::ControlPlaneResourceSettings,
+        settings: &temps_config::ControlPlaneResourceSettings,
     ) -> SystemReserved {
         // The §5 default for a control plane assumes its database is local
         // (the larger reserve): the conservative reading, since Temps cannot
@@ -1643,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_enforced_control_plane_with_room_schedules_a_deployment() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Postgres unavailable, skipping the enforced node 0 test: {e}");
@@ -1731,7 +1732,7 @@ mod tests {
         use temps_entities::deployment_config::DeploymentConfigSnapshot;
         use temps_entities::upstream_config::UpstreamList;
         use temps_entities::{deployment_containers, deployments};
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Postgres unavailable, skipping the committed load test: {e}");
@@ -2348,7 +2349,7 @@ mod tests {
     /// each case built to show one must be attributed to exactly it.
     #[tokio::test]
     async fn shadow_scheduler_agrees_with_node_scheduler_except_for_documented_differences() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Postgres unavailable, skipping the shadow scheduler proof: {e}");
@@ -2454,7 +2455,7 @@ mod tests {
     #[tokio::test]
     async fn environment_isolation_round_trips_and_explains_the_micro_vm_refusal() {
         use temps_entities::upstream_config::UpstreamList;
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Postgres unavailable, skipping the isolation round trip: {e}");

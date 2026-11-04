@@ -27,9 +27,8 @@ use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     require_sensitive_action,
 };
-use temps_core::{
-    AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction,
-};
+use temps_config::AppSettings;
+use temps_core::{AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
@@ -3001,7 +3000,7 @@ pub async fn purge_environment_asset_cache(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     mod lifecycle_conflict_tests {
         use crate::services::services::DeploymentError;
@@ -3041,7 +3040,7 @@ mod tests {
         use super::super::*;
         use axum::body::{to_bytes, Body};
         use axum::http::Request;
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         use tower::ServiceExt;
 
         #[tokio::test]
@@ -3173,9 +3172,9 @@ mod tests {
     use std::sync::Arc;
     use temps_config::ConfigService;
     use temps_core::ProjectAccessChecker;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployment_logs::{DockerLogService, LogService};
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -3564,7 +3563,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3575,9 +3574,12 @@ mod tests {
     impl temps_core::AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("audit database unavailable"))
+            operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit database unavailable",
+            ))
         }
     }
 
@@ -3643,6 +3645,14 @@ mod tests {
             .await
             .expect_err("credential reveal must fail if audit persistence fails");
 
+        assert_eq!(
+            problem.body["title"],
+            "Container environment variable could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -4993,7 +5003,7 @@ mod tests {
     // =============================================================================
 
     /// Helper to create test app state for HTTP tests
-    async fn create_test_app_state_for_http(
+    pub(crate) async fn create_test_app_state_for_http(
         db: Arc<sea_orm::DatabaseConnection>,
         temp_dir: std::path::PathBuf,
     ) -> Arc<AppState> {
@@ -5167,16 +5177,6 @@ mod tests {
             ),
             db.clone(),
         ));
-        let enrollment_token_service =
-            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
-        let node_pairing_admin = Arc::new(
-            crate::services::node_pairing_admin::NodePairingAdminService::new(
-                db.clone(),
-                config_service.clone(),
-                encryption_service.clone(),
-                enrollment_token_service.clone(),
-            ),
-        );
 
         let external_deployment_manager =
             Arc::new(crate::services::ExternalDeploymentManager::new());
@@ -5202,12 +5202,6 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
-            node_public_ingress_service: Arc::new(
-                crate::services::node_public_ingress::NodePublicIngressService::new(
-                    db.clone(),
-                    Arc::new(crate::services::NodeService::new(db.clone())),
-                ),
-            ),
             node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
                 crate::services::NodeService::new(db.clone()),
             ))),
@@ -5217,23 +5211,12 @@ mod tests {
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ))),
-            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
-            resolver_coverage: Arc::new(crate::services::ResolverCoverageService::new(
-                db.clone(),
-                Arc::new(temps_core::DockerHandle::disabled(
-                    "test",
-                    "no daemon in tests",
-                )),
-                None,
-            )),
             deployment_gate: None,
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
-            enrollment_token_service,
-            node_pairing_admin,
             sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }

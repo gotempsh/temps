@@ -97,11 +97,13 @@ async fn start_ch_container() -> Option<(ClickHouseOtelConfig, Box<dyn std::any:
     let config = ClickHouseOtelConfig::new(&url, "temps_otel_test", "default", "test");
 
     // A bare client for the migration runner + readiness probe.
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("temps_otel_test")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "temps_otel_test",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     // Wait until the HTTP listener actually accepts queries.
     let mut last_err = String::new();

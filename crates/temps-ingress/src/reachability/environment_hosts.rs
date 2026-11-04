@@ -493,7 +493,7 @@ struct Snapshot {
     /// Which environment holds each of this connector's generated names:
     /// the oldest row wins when two hold one name.
     holder: HashMap<String, i32>,
-    settings: temps_core::AppSettings,
+    settings: temps_config::AppSettings,
 }
 
 impl Snapshot {

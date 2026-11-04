@@ -3,9 +3,11 @@
 
 //! Test utilities for workflow tests
 
+use crate::workflow::LogWriter;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
 use async_trait::async_trait;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowContext, WorkflowError};
 
 /// Mock LogWriter for testing that doesn't actually write anything
 pub struct MockLogWriter {

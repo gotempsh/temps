@@ -5,6 +5,7 @@
 //! start/stop/restart, environment variables and metrics.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 /// Boxed log stream so local-Docker and remote-agent paths share one return type.
 pub type ContainerLogStream =
@@ -38,7 +39,7 @@ pub struct EnvironmentContainer {
 #[derive(Debug, Clone)]
 pub struct ContainerPresentationContext {
     pub node_names: HashMap<i32, String>,
-    pub app_settings: temps_core::AppSettings,
+    pub app_settings: temps_config::AppSettings,
     pub environment_subdomain: String,
     pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
     pub resource_limits: ResolvedContainerResourceLimits,

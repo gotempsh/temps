@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
 
 use futures::StreamExt;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -313,10 +314,6 @@ fn explain_channel_failure(port: u16, reason: String) -> String {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 /// Read until the end of the request head; returns the index just past it.
 async fn read_request_head<R: AsyncRead + Unpin>(
     stream: &mut R,
@@ -352,10 +349,10 @@ async fn read_request_head<R: AsyncRead + Unpin>(
 /// reached the client (typically: nothing listens on the port).
 async fn splice<C: AsyncRead + AsyncWrite + Unpin>(
     client: &mut C,
-    attachment: temps_ai_agents::sandbox::PtyAttachment,
+    attachment: temps_sandbox_providers::PtyAttachment,
     forwarded: Vec<u8>,
 ) -> Result<(), String> {
-    let temps_ai_agents::sandbox::PtyAttachment {
+    let temps_sandbox_providers::PtyAttachment {
         mut output,
         mut input,
     } = attachment;
@@ -494,14 +491,14 @@ mod tests {
     }
 
     fn attachment(
-        output: Vec<Result<bytes::Bytes, temps_ai_agents::error::AgentError>>,
+        output: Vec<Result<bytes::Bytes, temps_agent_core::error::AgentError>>,
     ) -> (
-        temps_ai_agents::sandbox::PtyAttachment,
+        temps_sandbox_providers::PtyAttachment,
         tokio::io::DuplexStream,
     ) {
         let (input, sandbox_side) = tokio::io::duplex(1024);
         (
-            temps_ai_agents::sandbox::PtyAttachment {
+            temps_sandbox_providers::PtyAttachment {
                 output: Box::pin(futures::stream::iter(output)),
                 input: Box::pin(input),
             },
@@ -530,7 +527,7 @@ mod tests {
     #[tokio::test]
     async fn a_channel_failing_before_any_byte_is_an_error_the_caller_can_answer() {
         let (attachment, _sandbox_side) = attachment(vec![Err(
-            temps_ai_agents::error::AgentError::SandboxExecFailed {
+            temps_agent_core::error::AgentError::SandboxExecFailed {
                 run_id: 0,
                 sandbox_id: "x".to_string(),
                 reason: "port relay error: Connection refused".to_string(),

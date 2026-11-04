@@ -74,8 +74,8 @@ impl AuditOperation for DnsAutomationAudit {
     fn user_agent(&self) -> &str {
         "temps-certificate-renewal-scheduler"
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -1831,9 +1831,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping manual certificate policy test: {error}");
                 return;
@@ -2084,7 +2082,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .unwrap()
@@ -2200,9 +2198,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping LETSENCRYPT_MODE migration test: {error}");
                 return;
@@ -2265,15 +2261,13 @@ mod tests {
     #[serial_test::serial(dns_renewal_db)]
     async fn test_dns01_renewal_policy_failures_precede_provider_credential_decryption() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_entities::{dns_managed_domains, dns_providers, settings};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping DNS policy ordering test: {error}");
                 return;
@@ -2426,7 +2420,7 @@ mod tests {
     #[serial_test::serial(dns_renewal_db)]
     async fn test_check_and_renew_certificates_dns01_denied_gate_falls_back_to_manual_action() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_dns::providers::{CloudflareCredentials, DnsProviderType, ProviderCredentials};
         use temps_dns::services::{
             AddManagedDomainRequest, CreateProviderRequest, DnsProviderService,
@@ -2436,9 +2430,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping DNS renewal regression test: {error}");
                 return;
@@ -2593,7 +2585,7 @@ mod tests {
     #[serial_test::serial(dns_renewal_db)]
     async fn test_try_dns01_renewal_with_provider_publishes_and_finalizes_certificate() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_core::AppSettings;
+        use temps_config::AppSettings;
         use temps_dns::providers::{DnsProviderType, PebbleCredentials, ProviderCredentials};
         use temps_dns::services::{
             AddManagedDomainRequest, CreateProviderRequest, DnsProviderService,
@@ -2605,9 +2597,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping DNS renewal regression test: {error}");
                 return;
@@ -2776,7 +2766,7 @@ mod tests {
     use crate::tls::providers::CertificateProvider;
     use crate::tls::repository::test_utils::MockCertificateRepository;
     use crate::tls::repository::DefaultCertificateRepository;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_builder_pattern() {
@@ -3668,8 +3658,8 @@ mod tests {
 
         let config_service = Arc::new(temps_config::ConfigService::new(test_server_config(), db));
         config_service
-            .update_settings(temps_core::AppSettings {
-                letsencrypt: temps_core::LetsEncryptSettings {
+            .update_settings(temps_config::AppSettings {
+                letsencrypt: temps_config::LetsEncryptSettings {
                     email: Some("ops@example.com".to_string()),
                     environment: "production".to_string(),
                 },

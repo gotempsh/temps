@@ -8,6 +8,7 @@ use sea_orm::{
     EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use std::sync::Arc;
+use temps_core::escape::escape_html;
 use temps_core::EncryptionService;
 use temps_entities::{email_domains, email_providers};
 use tracing::{debug, error, info};
@@ -773,25 +774,6 @@ fn pretty_provider_type(raw: &str) -> String {
     }
 }
 
-/// HTML-escape the small set of characters that matter inside an email body.
-/// Values shown in the test email come from the database (provider name,
-/// region) and are user-controlled, so we escape them to keep the message
-/// HTML-safe.
-fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 /// Render the HTML body of the "test email provider" message. Visually
 /// matches the notification template (header bar, success badge, title,
 /// details table, footer) so it looks like a real Temps email rather than
@@ -923,7 +905,7 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     // Helper to create a test encryption service
     fn create_test_encryption_service() -> Arc<EncryptionService> {
@@ -937,8 +919,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email provider test: {error}");
                     return None;
                 }

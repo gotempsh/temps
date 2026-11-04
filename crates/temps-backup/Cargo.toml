@@ -12,8 +12,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-backup-core = { path = "../temps-backup-core" }
-temps-monitoring = { path = "../temps-monitoring" }
+temps-docker-util = { path = "../temps-docker-util" }
+temps-alarms = { path = "../temps-alarms" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
@@ -75,7 +75,10 @@ urlencoding = { workspace = true }
 docker-tests = []
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
+# `test-util` backs `#[tokio::test(start_paused = true)]` in the executor tests.
+tokio = { workspace = true, features = ["test-util"] }
 sea-orm-migration = { workspace = true }
 testcontainers = { workspace = true }
 sqlx = { workspace = true }

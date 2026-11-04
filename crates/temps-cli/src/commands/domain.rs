@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use temps_core::EncryptionService;
-use temps_database::establish_connection;
 use temps_entities::domains;
+use temps_schema::establish_connection;
 use x509_parser::prelude::*;
 
 use super::api_url::management_api_url;

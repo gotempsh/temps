@@ -95,15 +95,15 @@ impl OverlayDriver {
         if attach.network.primary.as_deref() != Some(network) {
             return Ok(());
         }
-        let outcome = temps_core::docker_network::ensure_bridge_network(&self.docker, network)
+        let outcome = temps_docker_util::ensure_bridge_network(&self.docker, network)
             .await
             .map_err(|e| DriverError::Attach {
                 driver: self.inner.capabilities().name.clone(),
                 instance: spec.name.clone(),
                 network: network.to_string(),
-                reason: format!("creating the app network failed: {e}"),
+                reason: format!("creating the app network failed: {}", e.cause_text()),
             })?;
-        if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+        if outcome != temps_docker_util::NetworkEnsured::Existing {
             tracing::info!(network, instance = %spec.name, ?outcome, "app network created for the node runtime");
         }
         // Re-applied on every create so the block survives a host firewall

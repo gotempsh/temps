@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -22,7 +21,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditOperation, RequestMetadata};
 use tracing::{error, info};
@@ -123,7 +122,7 @@ fn validate_session_action_origin(
     auth: &AuthContext,
     metadata: &RequestMetadata,
 ) -> Result<(), (StatusCode, Json<OpenAiErrorResponse>)> {
-    if !matches!(&auth.source, temps_auth::AuthSource::Session { .. })
+    if !matches!(&auth.source, temps_authz::AuthSource::Session { .. })
         || session_action_origin_is_allowed(&metadata.headers, &metadata.base_url)
     {
         return Ok(());
@@ -302,9 +301,8 @@ impl AuditOperation for AiGatewayObjectAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

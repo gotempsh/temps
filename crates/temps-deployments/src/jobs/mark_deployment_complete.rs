@@ -8,6 +8,10 @@
 //! Optional jobs (screenshots, crons) depend on this job, ensuring the deployment
 //! is live before they run.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
@@ -16,10 +20,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::{
-    Job, JobQueue, JobReceiver, JobResult, UtcDateTime, WorkflowContext, WorkflowError,
-    WorkflowTask,
-};
+use temps_core::{Job, JobQueue, JobReceiver, UtcDateTime};
 use temps_database::DbConnection;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{
@@ -3205,7 +3206,6 @@ mod teardown_tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use temps_core::QueueError;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployer::{
         ContainerDeployer, ContainerInfo, ContainerStats, DeployRequest, DeployResult,
         DeployerError,
@@ -3213,6 +3213,7 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
+    use temps_test_utils::TestDatabase;
 
     struct RouteEvents(std::collections::VecDeque<Job>);
 
@@ -3808,7 +3809,7 @@ mod teardown_tests {
             )
             .await;
 
-        assert_eq!(result.status, temps_core::JobStatus::Success);
+        assert_eq!(result.status, crate::workflow::JobStatus::Success);
         assert_eq!(
             result
                 .context

@@ -258,7 +258,7 @@ impl SandboxService {
     /// microsandbox, the host probe that names what is missing.
     pub(super) fn control_plane_backends(&self) -> Vec<placement::NodeBackend> {
         let provider = self.registry.provider_arc();
-        temps_ai_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
+        temps_sandbox_providers::SELECTABLE_SANDBOX_BACKENDS
             .into_iter()
             .map(|backend| {
                 let available = provider.supports_backend(backend);

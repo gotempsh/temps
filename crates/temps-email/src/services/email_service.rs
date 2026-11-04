@@ -1795,7 +1795,7 @@ mod tests {
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use crate::services::TrackingService;
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     fn test_provider_send_request() -> ProviderSendRequest {
         ProviderSendRequest {
@@ -1928,8 +1928,7 @@ mod tests {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
-                if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string())
-                {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
                     eprintln!("Skipping Docker-dependent email test: {error}");
                     return None;
                 }

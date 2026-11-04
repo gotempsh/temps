@@ -7,8 +7,8 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 use std::sync::Arc;
 use temps_config::{ConfigService, ServerConfig};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError};
-use temps_database::test_utils::TestDatabase;
 use temps_entities::{deployments, environments, projects, status_monitors};
+use temps_test_utils::TestDatabase;
 
 fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService> {
     let config = ServerConfig::new(

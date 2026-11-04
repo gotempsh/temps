@@ -5,6 +5,7 @@
 
 use super::reuse::{clean_up_failed_completion, deployment_asset_origin};
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 impl DeploymentService {
     /// Promote a deployment to a different environment.
@@ -479,7 +480,7 @@ impl DeploymentService {
 
             // Create workflow context for the promoted deployment
             let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
-            let mut promote_context = temps_core::WorkflowContext::new(
+            let mut promote_context = crate::workflow::WorkflowContext::new(
                 format!("promote-{}", promoted_id),
                 promoted_id,
                 project_id,

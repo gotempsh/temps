@@ -3,8 +3,8 @@
 
 //! Backup engine implementations for `temps-backup` (ADR-014 Phase 1–4).
 //!
-//! Each module implements the [`temps_backup_core::BackupEngine`] trait for a
-//! specific backup target. The runner in `temps-backup-core` dispatches to these
+//! Each module implements the [`crate::execution::BackupEngine`] trait for a
+//! specific backup target. The executor in [`crate::execution`] dispatches to these
 //! engines by matching `backup_jobs.engine` against `BackupEngine::engine()`.
 //!
 //! ## Phase 1 engines

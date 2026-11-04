@@ -59,7 +59,7 @@ async fn disable_admin_mfa_requirement<C: sea_orm::ConnectionTrait>(
     else {
         return Ok(false);
     };
-    if !temps_core::AppSettings::from_json(settings.data.clone()).require_mfa_for_admins {
+    if !temps_config::AppSettings::from_json(settings.data.clone()).require_mfa_for_admins {
         return Ok(false);
     }
 
@@ -326,7 +326,7 @@ impl ResetPasswordCommand {
         debug!("Initializing database connection...");
         // Create tokio runtime for database connection
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let db = rt.block_on(temps_schema::establish_connection(&self.database_url))?;
 
         // Reset the admin password
         rt.block_on(reset_admin_password(
@@ -345,13 +345,11 @@ mod tests {
     use chrono::Utc;
     use sea_orm::DatabaseConnection;
 
-    async fn test_db() -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_db() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => Some(db),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 None

@@ -2074,7 +2074,7 @@ export type AppSettings = {
     /**
      * Label of a new environment's generated hostname under `preview_domain`,
      * from `{project}` and `{env}` (ADR 058 D9). `None` means
-     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * [`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
@@ -3390,8 +3390,7 @@ export type BackupScheduleResponse = {
     last_run?: number | null;
     /**
      * Per-schedule wall-clock timeout override for backup jobs (seconds).
-     * `null` means the engine-family default is used. See
-     * `temps_backup_core::timeouts::default_max_runtime_secs`.
+     * `null` means the default of four hours (14400 seconds) is used.
      */
     max_runtime_secs?: number | null;
     name: string;
@@ -3780,9 +3779,9 @@ export type BuildSpec = {
      * `docker build --build-arg` would be (protocol v2). The control plane
      * decides which values may leave it -- never one marked secret or a
      * platform credential -- and sends only names the Dockerfile declares.
-     * They travel inside this spec over the node's authenticated build
-     * channel and are held in memory on both sides; neither side writes
-     * them to disk or to a log.
+     * A spec holding them is encrypted to the node's key
+     * ([`SEALED_BUILD_SPEC_FIELD`]). They are held in memory on both sides;
+     * neither side writes them to disk or to a log.
      */
     build_args?: {
         [key: string]: string;
@@ -14753,6 +14752,13 @@ export type FullRequest = {
     trace_id?: string | null;
     ts: string;
     user_agent?: string | null;
+};
+
+/**
+ * Acknowledges a funnel update or delete.
+ */
+export type FunnelMessageResponse = {
+    message: string;
 };
 
 export type FunnelMetricsResponse = {
@@ -37744,7 +37750,7 @@ export type AppSettingsWritable = {
     /**
      * Label of a new environment's generated hostname under `preview_domain`,
      * from `{project}` and `{env}` (ADR 058 D9). `None` means
-     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * [`temps_core::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
@@ -52888,6 +52894,10 @@ export type RevealServiceEnvironmentVariablesData = {
 
 export type RevealServiceEnvironmentVariablesErrors = {
     /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
+    /**
      * Caller cannot access a project linked to this service
      */
     403: unknown;
@@ -53091,9 +53101,13 @@ export type AddClusterMemberErrors = {
      */
     403: unknown;
     /**
-     * Service not found
+     * Service or requested node not found
      */
     404: unknown;
+    /**
+     * The member cannot be placed as requested, or this process has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -53138,6 +53152,10 @@ export type RemoveClusterMemberErrors = {
      * Service or member not found
      */
     404: unknown;
+    /**
+     * The member is still being provisioned
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -53218,6 +53236,10 @@ export type PromoteClusterMemberErrors = {
      * Service or member not found
      */
     404: unknown;
+    /**
+     * This process has no local Docker daemon to run the promotion on
+     */
+    409: unknown;
     /**
      * pg_autoctl perform promotion failed
      */
@@ -53712,6 +53734,10 @@ export type GetServicePreviewEnvironmentVariablesMaskedData = {
 
 export type GetServicePreviewEnvironmentVariablesMaskedErrors = {
     /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -53745,6 +53771,10 @@ export type GetServicePreviewEnvironmentVariableNamesData = {
 };
 
 export type GetServicePreviewEnvironmentVariableNamesErrors = {
+    /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
     /**
      * Service not found
      */
@@ -53925,6 +53955,10 @@ export type GetServiceEnvironmentVariablesData = {
 
 export type GetServiceEnvironmentVariablesErrors = {
     /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
+    /**
      * Service or project not found
      */
     404: unknown;
@@ -53964,6 +53998,10 @@ export type GetServiceEnvironmentVariableData = {
 };
 
 export type GetServiceEnvironmentVariableErrors = {
+    /**
+     * The service's stored configuration cannot be used to build its variables
+     */
+    400: unknown;
     /**
      * Plaintext secret access is not permitted
      */
@@ -54008,6 +54046,10 @@ export type IssueRuntimeCredentialsData = {
 };
 
 export type IssueRuntimeCredentialsErrors = {
+    /**
+     * The service type or its stored configuration cannot issue connection credentials
+     */
+    400: unknown;
     /**
      * Plaintext secret access is not permitted
      */
@@ -54318,6 +54360,10 @@ export type StartServiceData = {
 
 export type StartServiceErrors = {
     /**
+     * The service's stored configuration cannot be used to start it
+     */
+    400: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -54385,6 +54431,10 @@ export type StopServiceData = {
 };
 
 export type StopServiceErrors = {
+    /**
+     * The service's stored configuration cannot be used to stop it
+     */
+    400: unknown;
     /**
      * Service not found
      */
@@ -55774,6 +55824,10 @@ export type GetIpGeolocationErrors = {
      * Internal server error
      */
     500: ProblemDetails;
+    /**
+     * No GeoIP database is loaded yet
+     */
+    503: ProblemDetails;
 };
 
 export type GetIpGeolocationError = GetIpGeolocationErrors[keyof GetIpGeolocationErrors];
@@ -79274,8 +79328,10 @@ export type DeleteFunnelResponses = {
     /**
      * Funnel deleted successfully
      */
-    200: unknown;
+    200: FunnelMessageResponse;
 };
+
+export type DeleteFunnelResponse = DeleteFunnelResponses[keyof DeleteFunnelResponses];
 
 export type UpdateFunnelData = {
     body: CreateFunnelRequest;
@@ -79316,8 +79372,10 @@ export type UpdateFunnelResponses = {
     /**
      * Funnel updated successfully
      */
-    200: unknown;
+    200: FunnelMessageResponse;
 };
+
+export type UpdateFunnelResponse = UpdateFunnelResponses[keyof UpdateFunnelResponses];
 
 export type GetFunnelMetricsData = {
     body?: never;

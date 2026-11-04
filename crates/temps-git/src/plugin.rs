@@ -227,7 +227,7 @@ impl TempsPlugin for GitPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(alarm_service) =
-                context.get_service::<temps_monitoring::alarm_service::AlarmService>()
+                context.get_service::<temps_alarms::alarm_service::AlarmService>()
             {
                 let connection_health_service =
                     context.require_service::<ConnectionHealthService>();

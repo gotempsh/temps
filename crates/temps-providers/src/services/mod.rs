@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::externalsvc::error::{EngineError, Result};
 use crate::externalsvc::{
     garage::GarageService, managed_instance_name, mariadb::MariaDbService, mongodb::MongodbService,
     postgres::PostgresService, redis::RedisService, rustfs::RustfsService, s3::S3Service,
     ExternalService, ManagedS3BackendKind, ManagedS3BackendSelection, ServiceType,
 };
-use anyhow::Result;
 use bollard::Docker;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::collections::HashMap;
@@ -18,7 +18,6 @@ use temps_core::EncryptionService;
 
 mod cluster_state;
 mod cluster_topology;
-mod errors;
 mod manager;
 mod schema;
 #[cfg(test)]
@@ -28,8 +27,8 @@ mod types;
 
 pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
-pub use errors::*;
 pub use schema::*;
+pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
 pub use types::*;
 

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::ConnectionTrait;
 use temps_core::{AuditLogger, AuditOperation};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_workload::{
     Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError, EnvSpec,
     InstanceHandle, InstanceSpec, InstanceState, InstanceStats, InstanceStatus, Isolation,
@@ -188,7 +188,7 @@ impl AuditLogger for RecordingAudit {
     async fn create_audit_log(
         &self,
         operation: &dyn AuditOperation,
-    ) -> temps_core::anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         let line = format!("{} {}", operation.operation_type(), operation.serialize()?);
         self.operations.lock().expect("lock").push(line);
         Ok(())

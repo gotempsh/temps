@@ -36,8 +36,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::execution::engine_v2::BackupError;
 use bollard::Docker;
-use temps_backup_core::engine_v2::BackupError;
 use temps_providers::externalsvc::container_download::read_file_tail;
 pub use temps_providers::externalsvc::container_download::{
     copy_file_out_of_container, CopyOutFailure,

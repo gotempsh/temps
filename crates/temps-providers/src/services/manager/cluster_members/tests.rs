@@ -620,7 +620,10 @@ async fn test_remove_cluster_member_not_found() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ExternalServiceError::InitializationFailed { .. }
+        ExternalServiceError::ClusterMemberNotFound {
+            member_id: 99999,
+            ..
+        }
     ));
 }
 
@@ -911,7 +914,10 @@ async fn test_promote_cluster_member_not_found() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ExternalServiceError::InitializationFailed { .. }
+        ExternalServiceError::ClusterMemberNotFound {
+            member_id: 99999,
+            ..
+        }
     ));
 }
 

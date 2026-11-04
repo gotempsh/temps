@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
 use tracing::error;
@@ -391,7 +391,7 @@ async fn revoke_dsn(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> AuditContext {
+fn audit_context(auth: &temps_authz::AuthContext, metadata: &RequestMetadata) -> AuditContext {
     AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -426,8 +426,8 @@ mod tests {
 
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::Role;
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::Role;
     use temps_entities::users;
 
     // Regression tests for the unauthenticated-access finding: every DSN
@@ -443,7 +443,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -520,11 +520,17 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("recording audit logger lock poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "recording audit logger lock poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), operation.user_id(), payload));
             Ok(())
         }
@@ -548,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn dsn_lifecycle_emits_audit_events_without_the_key() {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

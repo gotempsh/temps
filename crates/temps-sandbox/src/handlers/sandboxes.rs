@@ -31,7 +31,7 @@ use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Duration;
-use temps_ai_agents::sandbox::ExecStream;
+use temps_sandbox_providers::ExecStream;
 use tokio_stream::wrappers::BroadcastStream;
 use utoipa::ToSchema;
 
@@ -222,12 +222,12 @@ impl From<SandboxError> for Problem {
             // ADR 063. No `setup_path`: a worker does not make the control
             // plane able to run this; the message says what does.
             SandboxError::NoLocalHost { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_type(temps_ai_agents::error::NO_LOCAL_SANDBOX_HOST_TYPE)
-                .with_title(temps_ai_agents::error::NO_LOCAL_SANDBOX_HOST_TITLE)
+                .with_type(temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_TYPE)
+                .with_title(temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_TITLE)
                 .with_detail(error.to_string())
                 .with_value(
                     "error_code",
-                    temps_ai_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE,
+                    temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE,
                 ),
             // ADR 063: the same problem every "needs a worker" path returns,
             // so the console offers the same Add worker node action.
@@ -680,7 +680,7 @@ pub struct CreateSandboxBody {
     /// A restricted policy needs the docker backend; elsewhere the create
     /// fails with 422. Change it later with `PUT /v1/sandboxes/{id}/egress-policy`.
     #[serde(default)]
-    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
 
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
@@ -872,7 +872,7 @@ pub struct SandboxInner {
     /// sandboxes.
     pub node_name: String,
     /// Which outside destinations the sandbox may reach (temps-native).
-    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -1560,7 +1560,7 @@ pub async fn resize_sandbox(
 struct SandboxEgressPolicyUpdatedAudit {
     context: temps_core::AuditContext,
     sandbox_id: String,
-    egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
 }
 
 impl temps_core::AuditOperation for SandboxEgressPolicyUpdatedAudit {
@@ -1576,12 +1576,14 @@ impl temps_core::AuditOperation for SandboxEgressPolicyUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize SandboxEgressPolicyUpdatedAudit for sandbox {}: {}",
-                self.sandbox_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "SandboxEgressPolicyUpdatedAudit for sandbox {}",
+                    self.sandbox_id
+                ),
+                source,
             )
         })
     }
@@ -1606,7 +1608,7 @@ impl temps_core::AuditOperation for SandboxEgressPolicyUpdatedAudit {
     put,
     path = "/v1/sandboxes/{id}/egress-policy",
     params(("id" = String, Path, description = "Sandbox id (`sbx_...`)")),
-    request_body = temps_ai_agents::sandbox::SandboxEgressPolicy,
+    request_body = temps_sandbox_providers::SandboxEgressPolicy,
     responses(
         (status = 200, description = "Policy applied and stored", body = SandboxResponse),
         (status = 400, description = "Invalid policy (the detail names the rule and value)", body = temps_core::problemdetails::ProblemDetails),
@@ -1624,7 +1626,7 @@ pub async fn set_egress_policy(
     State(state): State<Arc<SandboxAppState>>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
     Path(id): Path<String>,
-    Json(policy): Json<temps_ai_agents::sandbox::SandboxEgressPolicy>,
+    Json(policy): Json<temps_sandbox_providers::SandboxEgressPolicy>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
     let user_id = auth.user_id();
@@ -3409,9 +3411,9 @@ mod tests {
     fn the_egress_policy_body_rejects_unknown_fields() {
         let typo = r#"{"mode":"restricted","rulez":[{"host":"api.example.com"}]}"#;
         assert!(
-            serde_json::from_str::<temps_ai_agents::sandbox::SandboxEgressPolicy>(typo).is_err()
+            serde_json::from_str::<temps_sandbox_providers::SandboxEgressPolicy>(typo).is_err()
         );
-        let body: temps_ai_agents::sandbox::SandboxEgressPolicy = serde_json::from_str(
+        let body: temps_sandbox_providers::SandboxEgressPolicy = serde_json::from_str(
             r#"{"mode":"restricted","rules":[{"host":"api.example.com","ports":[443]},{"cidr":"1.1.1.0/24"}]}"#,
         )
         .expect("documented shape");

@@ -26,6 +26,8 @@ use mongodb::Client;
 use temps_entities::external_services;
 use tracing::info;
 
+pub use crate::externalsvc::mongodb::{users_info, users_info_has_user};
+
 use crate::externalsvc::mongodb::mongodb_container_name;
 use crate::sandbox_access::sandbox_role_name;
 use crate::sandbox_engines::{
@@ -96,20 +98,6 @@ pub fn classify_database(database_exists: bool, user_exists: bool, user: &str) -
             evidence: format!("it holds data and no sandbox user '{user}' is defined in it"),
         },
     }
-}
-
-/// `usersInfo` for one user of `database`: an empty `users` array when it
-/// does not exist.
-pub fn users_info(user: &str, database: &str) -> Document {
-    doc! { "usersInfo": { "user": user, "db": database } }
-}
-
-/// Whether the administrator's `usersInfo` answer names a user.
-pub fn users_info_has_user(answer: &Document) -> bool {
-    answer
-        .get_array("users")
-        .map(|users| !users.is_empty())
-        .unwrap_or(false)
 }
 
 impl MongoDbSandboxPlan {

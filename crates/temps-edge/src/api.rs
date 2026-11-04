@@ -18,6 +18,7 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 
 use crate::analytics::AnalyticsStore;
 use crate::cache::EdgeCache;
@@ -47,17 +48,6 @@ impl TokenAuth {
         let provided_hash = hex::encode(digest);
         constant_time_eq(self.token_hash.as_bytes(), provided_hash.as_bytes())
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Bearer token auth middleware.

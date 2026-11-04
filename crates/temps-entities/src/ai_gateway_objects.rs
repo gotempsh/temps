@@ -27,6 +27,7 @@ pub struct Model {
     /// Administrator-configured key the object was created with
     pub provider_key_id: Option<i32>,
     /// Encrypted BYOK batch credential, cleared once accounting commits.
+    #[serde(skip_serializing)]
     pub byok_key_encrypted: Option<String>,
     pub byok_base_url: Option<String>,
     /// SHA-256 of credential and canonical endpoint; never exposes the key.
@@ -50,3 +51,34 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializing_a_gateway_object_leaves_out_its_byok_key() {
+        let object = Model {
+            id: 1,
+            kind: "batch".to_string(),
+            upstream_id: "upstream-1".to_string(),
+            provider: "openai".to_string(),
+            provider_key_id: None,
+            byok_key_encrypted: Some("stored-key-ciphertext".to_string()),
+            byok_base_url: None,
+            credential_scope: "byok".to_string(),
+            next_poll_at: None,
+            owner_user_id: None,
+            owner_project_id: None,
+            model: None,
+            endpoint: None,
+            usage_recorded_at: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let json = serde_json::to_string(&object).expect("serializes");
+
+        assert!(!json.contains("stored-key-ciphertext"), "{json}");
+        assert!(json.contains("upstream-1"), "{json}");
+    }
+}

@@ -29,12 +29,12 @@ use bollard::Docker;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
-use temps_database::test_utils::TestDatabase;
 use temps_deployer::traefik_discovery::{
     ConflictReason, TraefikDiscoveryConfig, TraefikDiscoveryService,
 };
 use temps_entities::traefik_discovered_routes as discovered;
 use temps_routes::route_table::{BackendType, CachedPeerTable};
+use temps_test_utils::TestDatabase;
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,

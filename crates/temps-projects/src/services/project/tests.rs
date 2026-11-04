@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use temps_core::async_trait::async_trait;
 use temps_core::{JobQueue, QueueError};
-use temps_database::test_utils::TestDatabase;
 use temps_entities::preset::Preset;
+use temps_test_utils::TestDatabase;
 // Mock JobQueue for testing
 struct MockJobQueue {
     jobs: Arc<Mutex<Vec<Job>>>,
@@ -1407,7 +1407,7 @@ async fn test_update_project_emits_event() {
 /// older consoles read, and a legacy attack-mode write maps onto a mode.
 #[tokio::test]
 async fn shield_mode_and_legacy_attack_mode_are_written_together() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -1490,7 +1490,7 @@ async fn shield_mode_and_legacy_attack_mode_are_written_together() {
 async fn test_update_project_settings_renames_without_touching_slug() {
     // create_test_services needs a Docker daemon; skip rather than fail
     // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -1553,7 +1553,7 @@ async fn test_update_project_settings_renames_without_touching_slug() {
 async fn test_update_project_settings_renames_alongside_git_settings() {
     // create_test_services needs a Docker daemon; skip rather than fail
     // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -1616,7 +1616,7 @@ async fn test_update_project_settings_renames_alongside_git_settings() {
 async fn test_update_project_settings_rename_not_applied_when_preset_is_invalid() {
     // create_test_services needs a Docker daemon; skip rather than fail
     // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -1672,7 +1672,7 @@ async fn test_update_project_settings_rename_not_applied_when_preset_is_invalid(
 async fn test_update_project_settings_reports_no_rename_for_a_no_op() {
     // create_test_services needs a Docker daemon; skip rather than fail
     // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -1721,7 +1721,7 @@ async fn test_update_project_settings_reports_no_rename_for_a_no_op() {
 async fn test_update_project_settings_rename_does_not_persist_when_slug_conflicts() {
     // create_test_services needs a Docker daemon; skip rather than fail
     // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -1790,7 +1790,7 @@ async fn test_update_project_settings_rename_does_not_persist_when_slug_conflict
 async fn test_update_project_settings_rejects_blank_and_overlong_names() {
     // create_test_services needs a Docker daemon; skip rather than fail
     // where one isn't available (CLAUDE.md: no #[ignore] on Docker tests).
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -2045,16 +2045,9 @@ async fn test_partial_update_does_not_clobber_concurrent_columns() {
     );
 }
 
-async fn docker_available() -> bool {
-    match bollard::Docker::connect_with_local_defaults() {
-        Ok(d) => d.ping().await.is_ok(),
-        Err(_) => false,
-    }
-}
-
 #[tokio::test]
 async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -2068,9 +2061,9 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
         command: Some(vec!["start".to_string()]),
         health_check_path: Some("/realms/master".to_string()),
     };
-    let applied = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-        temps_core::templates::bundled_template_by_slug("keycloak")
+    let applied = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("bundled Keycloak release"),
     );
     let project = projects::ActiveModel {
@@ -2118,7 +2111,7 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
                 memory_limit: None,
                 exposed_port: None,
             },
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await
@@ -2156,7 +2149,7 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
                 memory_limit: None,
                 exposed_port: Some(9090),
             },
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await;
@@ -2181,7 +2174,7 @@ async fn service_template_runtime_update_is_atomic_and_can_clear_resources() {
 
 #[tokio::test]
 async fn service_template_upgrade_persists_release_and_preserves_runtime_overrides() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -2189,14 +2182,14 @@ async fn service_template_upgrade_persists_release_and_preserves_runtime_overrid
     let db = test_db.db.clone();
     let mock_queue = Arc::new(MockJobQueue::new());
     let project_service = create_test_services(db.clone(), mock_queue).await;
-    let mut applied = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-        temps_core::templates::bundled_template_by_slug("browserless")
+    let mut applied = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("bundled Browserless release"),
     );
     applied.template.services[0]
         .env_vars
-        .push(temps_core::templates::EnvVarTemplate {
+        .push(temps_presets::templates::EnvVarTemplate {
             name: "OPTIONAL_SETTING".to_string(),
             example: None,
             default: None,
@@ -2375,7 +2368,7 @@ async fn service_template_upgrade_persists_release_and_preserves_runtime_overrid
             created.id,
             target.clone(),
             Vec::new(),
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await;
@@ -2390,7 +2383,7 @@ async fn service_template_upgrade_persists_release_and_preserves_runtime_overrid
                 value: "configured-after-upgrade".to_string(),
                 is_secret: false,
             }],
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await
@@ -2488,13 +2481,13 @@ impl temps_core::AuditLogger for DiscardingAudit {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }
 
-fn stack_app_template() -> temps_core::templates::ProjectTemplate {
-    temps_core::templates::TemplatesConfig::from_yaml(STACK_APP_TEMPLATE)
+fn stack_app_template() -> temps_presets::templates::ProjectTemplate {
+    temps_presets::templates::TemplatesConfig::from_yaml(STACK_APP_TEMPLATE)
         .expect("the test template parses")
         .templates
         .into_iter()
@@ -2503,7 +2496,7 @@ fn stack_app_template() -> temps_core::templates::ProjectTemplate {
 }
 
 fn stack_app_service_request(
-    template: &temps_core::templates::ProjectTemplate,
+    template: &temps_presets::templates::ProjectTemplate,
     service_name: &str,
     instantiation_id: i32,
 ) -> crate::template_creation::TemplateServiceRequest {
@@ -2511,8 +2504,8 @@ fn stack_app_service_request(
         .service(service_name)
         .cloned()
         .expect("the template declares the service");
-    let release = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+    let release = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
         template.clone(),
     )
     .for_service(service_name);
@@ -2560,7 +2553,7 @@ fn stack_app_service_request(
 /// creator the instantiation engine uses.
 #[tokio::test]
 async fn app_template_services_satisfy_the_service_identity_constraint() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -2639,7 +2632,7 @@ async fn app_template_services_satisfy_the_service_identity_constraint() {
             Some(temps_entities::projects::instantiation_token(41, service_name).as_str()),
             "'{service_name}' is sealed with the final token"
         );
-        let snapshot = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+        let snapshot = serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
             row.service_template
                 .clone()
                 .unwrap_or_else(|| panic!("'{service_name}' keeps its release")),
@@ -2665,7 +2658,7 @@ async fn app_template_services_satisfy_the_service_identity_constraint() {
 
     // What the deployment environment reads back: the source-built
     // backend still carries its managed-database bindings.
-    let api_release = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+    let api_release = serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
         api_row.service_template.clone().expect("api release"),
     )
     .unwrap();
@@ -2700,7 +2693,7 @@ async fn app_template_services_satisfy_the_service_identity_constraint() {
 /// service project, so a release with none must never reach the table.
 #[tokio::test]
 async fn a_release_without_template_provenance_is_refused_before_it_is_stored() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -2708,8 +2701,8 @@ async fn a_release_without_template_provenance_is_refused_before_it_is_stored() 
     let db = test_db.db.clone();
     let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
     let template = stack_app_template();
-    let release = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+    let release = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
         template,
     )
     .for_service("api");
@@ -2742,7 +2735,7 @@ async fn a_release_without_template_provenance_is_refused_before_it_is_stored() 
 /// whole snapshot was persisted.
 #[tokio::test]
 async fn service_template_upgrade_rejects_a_multi_service_target() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -2750,9 +2743,9 @@ async fn service_template_upgrade_rejects_a_multi_service_target() {
     let db = test_db.db.clone();
     let mock_queue = Arc::new(MockJobQueue::new());
     let project_service = create_test_services(db.clone(), mock_queue).await;
-    let applied = temps_core::templates::ServiceTemplateInstance::new(
-        temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-        temps_core::templates::bundled_template_by_slug("browserless")
+    let applied = temps_presets::templates::ServiceTemplateInstance::new(
+        temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        temps_presets::templates::bundled_template_by_slug("browserless")
             .expect("bundled Browserless release"),
     );
     let mut request = create_request("Single service upgrade");
@@ -2806,7 +2799,7 @@ async fn service_template_upgrade_rejects_a_multi_service_target() {
             created.id,
             target,
             Vec::new(),
-            temps_core::CeilingEnforcement::Bypass,
+            temps_config::CeilingEnforcement::Bypass,
             DeployCaller::Platform,
         )
         .await;
@@ -3173,7 +3166,7 @@ impl SlugClaimSession {
 /// the display name, which is how the claim would be made in practice.
 #[tokio::test]
 async fn create_project_refuses_a_non_admin_claim_on_a_granted_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3214,7 +3207,7 @@ async fn create_project_refuses_a_non_admin_claim_on_a_granted_slug() {
 
 #[tokio::test]
 async fn create_project_allows_an_instance_admin_to_claim_a_granted_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3236,7 +3229,7 @@ async fn create_project_allows_an_instance_admin_to_claim_a_granted_slug() {
 
 #[tokio::test]
 async fn update_project_settings_refuses_a_non_admin_rename_onto_a_granted_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3315,7 +3308,7 @@ async fn update_project_settings_refuses_a_non_admin_rename_onto_a_granted_slug(
 /// refuse and no HTTP deploy request is ever made.
 #[tokio::test]
 async fn update_project_settings_refuses_a_non_admin_repo_change_on_a_granted_project() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3407,7 +3400,7 @@ async fn update_project_settings_refuses_a_non_admin_repo_change_on_a_granted_pr
 /// guard's predicate previously missed.
 #[tokio::test]
 async fn update_project_settings_refuses_a_non_admin_connection_change_on_a_granted_project() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3527,7 +3520,7 @@ async fn update_project_settings_refuses_a_non_admin_connection_change_on_a_gran
 #[tokio::test]
 async fn update_project_settings_refuses_a_non_admin_enabling_preview_environments_on_a_granted_project(
 ) {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3593,7 +3586,7 @@ async fn update_project_settings_refuses_a_non_admin_enabling_preview_environmen
 /// bypassed the guard entirely.
 #[tokio::test]
 async fn update_project_refuses_a_non_admin_on_a_granted_project() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3667,7 +3660,7 @@ async fn update_project_refuses_a_non_admin_on_a_granted_project() {
 /// (`Role::User`) with no ADR-045 check until this test.
 #[tokio::test]
 async fn update_automatic_deploy_refuses_a_non_admin_on_a_granted_project() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3725,7 +3718,7 @@ async fn update_automatic_deploy_refuses_a_non_admin_on_a_granted_project() {
 /// would let any project writer reach host root in two requests.
 #[tokio::test]
 async fn update_project_settings_refuses_a_non_admin_rename_away_from_a_granted_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3805,7 +3798,7 @@ async fn update_project_settings_refuses_a_non_admin_rename_away_from_a_granted_
 /// including one that re-sends its current (granted) slug unchanged.
 #[tokio::test]
 async fn update_project_settings_leaves_an_already_granted_project_alone() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -3866,7 +3859,7 @@ async fn update_project_settings_leaves_an_already_granted_project_alone() {
 /// mock would assert the shape of a query nobody ran.
 #[tokio::test]
 async fn docker_socket_capability_matches_advertised_slugs_in_the_database() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4000,7 +3993,7 @@ fn assert_step_up_challenge(error: &ProjectError, expected_action: &str) {
 /// challenged for the claim, and nothing is written until they do.
 #[tokio::test]
 async fn claiming_a_granted_slug_challenges_an_mfa_enrolled_admin() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4052,7 +4045,7 @@ async fn claiming_a_granted_slug_challenges_an_mfa_enrolled_admin() {
 /// operator reading the audit trail can tell a grant from a revocation.
 #[tokio::test]
 async fn releasing_a_granted_slug_challenges_with_its_own_action_name() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4121,7 +4114,7 @@ async fn releasing_a_granted_slug_challenges_with_its_own_action_name() {
 /// unenrolled principals. See ADR 045.
 #[tokio::test]
 async fn an_admin_without_mfa_is_allowed_through_without_a_challenge() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4148,7 +4141,7 @@ async fn an_admin_without_mfa_is_allowed_through_without_a_challenge() {
 /// after satisfying it.
 #[tokio::test]
 async fn a_non_admin_is_refused_before_step_up_is_considered() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4189,7 +4182,7 @@ async fn a_non_admin_is_refused_before_step_up_is_considered() {
 /// every project in the console.
 #[tokio::test]
 async fn an_unreserved_slug_never_challenges_anyone() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4232,7 +4225,7 @@ async fn an_unreserved_slug_never_challenges_anyone() {
 /// with no MFA prompt, identically to `create_project_as`.
 #[tokio::test]
 async fn preflight_guard_reserved_slug_refuses_a_non_admin() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4268,7 +4261,7 @@ async fn preflight_guard_reserved_slug_refuses_a_non_admin() {
 /// re-verification before the caller does anything irreversible.
 #[tokio::test]
 async fn preflight_guard_reserved_slug_challenges_stale_mfa() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4295,7 +4288,7 @@ async fn preflight_guard_reserved_slug_challenges_stale_mfa() {
 /// to run before the authoritative creation-time guard is reached.
 #[tokio::test]
 async fn preflight_guard_reserved_slug_allows_a_verified_admin() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4320,7 +4313,7 @@ async fn preflight_guard_reserved_slug_allows_a_verified_admin() {
 /// template fork onto a non-granted name sees no MFA friction.
 #[tokio::test]
 async fn preflight_guard_reserved_slug_ignores_an_unreserved_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -4424,7 +4417,7 @@ async fn health_probe_updates_require_admin_on_socket_granted_projects() {
             .update_project_deployment_config(
                 10,
                 request,
-                temps_core::CeilingEnforcement::Bypass,
+                temps_config::CeilingEnforcement::Bypass,
                 caller,
             )
             .await;
@@ -4640,7 +4633,7 @@ async fn hosting_mutations_authorize_the_locked_project_slug() {
 
 #[tokio::test]
 async fn external_hosting_activation_rolls_back_domains_and_source_on_failure() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         return;
     }
     let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -4712,7 +4705,7 @@ async fn external_hosting_activation_rolls_back_domains_and_source_on_failure() 
 
 #[tokio::test]
 async fn external_project_creates_telemetry_environment_and_can_enable_hosting() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         return;
     }
     let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -5101,7 +5094,7 @@ async fn insert_search_test_project(
 
 #[tokio::test]
 async fn project_search_is_case_insensitive_bounded_and_honors_hidden_projects() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5170,7 +5163,7 @@ async fn project_search_is_case_insensitive_bounded_and_honors_hidden_projects()
 
 #[tokio::test]
 async fn create_project_rejects_a_name_another_active_project_uses() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5214,7 +5207,7 @@ async fn create_project_rejects_a_name_another_active_project_uses() {
 
 #[tokio::test]
 async fn create_project_reuses_the_name_of_a_deleted_project() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5248,7 +5241,7 @@ async fn create_project_reuses_the_name_of_a_deleted_project() {
 
 #[tokio::test]
 async fn legacy_duplicate_names_allow_unrelated_updates_and_unchanged_settings() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         return;
     }
     let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -5306,7 +5299,7 @@ async fn legacy_duplicate_names_allow_unrelated_updates_and_unchanged_settings()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_project_renames_keep_names_unique() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         return;
     }
     let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -5343,7 +5336,7 @@ async fn concurrent_project_renames_keep_names_unique() {
 
 #[tokio::test]
 async fn rename_onto_another_projects_name_is_rejected_but_recasing_is_not() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5399,7 +5392,7 @@ async fn rename_onto_another_projects_name_is_rejected_but_recasing_is_not() {
 
 #[tokio::test]
 async fn test_create_project_succeeds_and_creates_default_environment() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5451,7 +5444,7 @@ async fn test_create_project_succeeds_and_creates_default_environment() {
 async fn test_create_project_applies_resource_profile_to_default_environment() {
     use temps_entities::environments;
 
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5486,7 +5479,7 @@ async fn test_create_project_applies_resource_profile_to_default_environment() {
 
 #[tokio::test]
 async fn test_create_project_persists_curated_template_provenance() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5515,7 +5508,7 @@ async fn test_create_project_persists_curated_template_provenance() {
 
 #[tokio::test]
 async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5524,7 +5517,7 @@ async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
     let mock_queue = Arc::new(MockJobQueue::new());
     let project_service = create_test_services(db, mock_queue).await;
     let mut request = create_request("Custom Template");
-    request.template_slug = Some("x".repeat(temps_core::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
+    request.template_slug = Some("x".repeat(temps_presets::templates::MAX_TEMPLATE_SLUG_CHARS + 1));
 
     let error = match project_service.create_project(request).await {
         Ok(_) => panic!("oversized template slug must be rejected before insertion"),
@@ -5538,7 +5531,7 @@ async fn test_create_project_rejects_template_slug_longer_than_schema_limit() {
 
 #[tokio::test]
 async fn test_create_project_nixpacks_node_stores_provider_and_returns_runtime_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5580,7 +5573,7 @@ async fn test_create_project_nixpacks_node_stores_provider_and_returns_runtime_s
 
 #[tokio::test]
 async fn test_create_project_rejects_unknown_nixpacks_provider_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5603,7 +5596,7 @@ async fn test_create_project_rejects_unknown_nixpacks_provider_slug() {
 
 #[tokio::test]
 async fn test_update_project_leaving_nixpacks_clears_stale_preset_config() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5648,7 +5641,7 @@ async fn test_update_project_leaving_nixpacks_clears_stale_preset_config() {
 
 #[tokio::test]
 async fn test_partial_preset_config_patch_preserves_nixpacks_providers() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5698,7 +5691,7 @@ async fn test_partial_preset_config_patch_preserves_nixpacks_providers() {
 
 #[tokio::test]
 async fn test_partial_preset_config_patch_preserves_docker_compose_fields() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5869,7 +5862,7 @@ async fn test_partial_preset_config_patch_preserves_docker_compose_fields() {
 
 #[tokio::test]
 async fn test_relaxed_capability_services_allows_non_database_service_via_settings_update() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5924,7 +5917,7 @@ async fn test_relaxed_capability_services_allows_non_database_service_via_settin
 
 #[tokio::test]
 async fn test_relaxed_capability_services_rejects_phantom_service_via_settings_update() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -5978,7 +5971,7 @@ async fn test_relaxed_capability_services_rejects_phantom_service_via_settings_u
 
 #[tokio::test]
 async fn test_explicit_empty_providers_resets_nixpacks_to_auto() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6023,7 +6016,7 @@ async fn test_explicit_empty_providers_resets_nixpacks_to_auto() {
 
 #[tokio::test]
 async fn test_update_project_base_nixpacks_resets_provider_and_preserves_toml() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6069,7 +6062,7 @@ async fn test_update_project_base_nixpacks_resets_provider_and_preserves_toml() 
 
 #[tokio::test]
 async fn test_nixpacks_config_rejects_unknown_provider() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6116,7 +6109,7 @@ async fn test_nixpacks_config_rejects_unknown_provider() {
 
 #[tokio::test]
 async fn test_nixpacks_invalid_inline_toml_is_rejected_during_create() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6146,7 +6139,7 @@ async fn test_nixpacks_invalid_inline_toml_is_rejected_during_create() {
 
 #[tokio::test]
 async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_settings_update() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6195,7 +6188,7 @@ async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_settin
 
 #[tokio::test]
 async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_git_update() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6251,7 +6244,7 @@ async fn test_nixpacks_invalid_inline_toml_is_rejected_during_config_only_git_up
 
 #[tokio::test]
 async fn test_config_only_settings_update_preserves_custom_dockerfile_variant() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6315,7 +6308,7 @@ async fn test_config_only_settings_update_preserves_custom_dockerfile_variant() 
 
 #[tokio::test]
 async fn test_config_only_git_update_preserves_custom_dockerfile_variant() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6386,7 +6379,7 @@ async fn test_config_only_git_update_preserves_custom_dockerfile_variant() {
 
 #[tokio::test]
 async fn test_nixpacks_supports_multiple_ordered_providers() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6426,7 +6419,7 @@ async fn test_nixpacks_supports_multiple_ordered_providers() {
 
 #[tokio::test]
 async fn test_git_settings_persist_multiple_ordered_nixpacks_providers() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6479,7 +6472,7 @@ async fn test_git_settings_persist_multiple_ordered_nixpacks_providers() {
 
 #[tokio::test]
 async fn test_preset_and_config_update_use_effective_new_preset() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6529,7 +6522,7 @@ async fn test_preset_and_config_update_use_effective_new_preset() {
 
 #[tokio::test]
 async fn test_reusing_a_deleted_projects_name_gets_suffixed_slug() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6581,7 +6574,7 @@ async fn test_reusing_a_deleted_projects_name_gets_suffixed_slug() {
 
 #[tokio::test]
 async fn test_create_project_slug_conflict_returns_typed_error() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6644,7 +6637,7 @@ async fn test_create_project_slug_conflict_returns_typed_error() {
 
 #[tokio::test]
 async fn test_create_project_rolls_back_on_invalid_storage_service() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6711,7 +6704,7 @@ async fn test_is_unique_violation_detects_record_not_inserted() {
 
 #[tokio::test]
 async fn test_update_git_settings_allows_connection_created_by_different_user() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -6881,7 +6874,7 @@ fn a_source_is_rechecked_only_when_its_location_changes() {
 /// instead; a path that exists saves; an unreachable provider saves too.
 #[tokio::test]
 async fn root_directory_changes_are_checked_against_the_repository() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7099,7 +7092,7 @@ async fn test_update_project_settings_normalizes_blank_directory() {
 /// rather than a settings row an admin edited once.
 #[tokio::test]
 async fn test_update_project_settings_rejects_out_of_range_image_retention_hours() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7158,7 +7151,7 @@ async fn test_update_project_settings_rejects_out_of_range_image_retention_hours
 
 #[tokio::test]
 async fn test_update_project_settings_log_ingest_override_set_lift_reset_and_reject() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7379,7 +7372,7 @@ async fn test_update_git_settings_persists_pull_only_root_directory() {
 
 #[tokio::test]
 async fn changing_compose_public_ports_requests_a_route_reload() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7510,7 +7503,7 @@ fn row_lockable_while_blocked(
 
 #[tokio::test]
 async fn deletion_refuses_projects_and_environments_with_delivery_bindings() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7663,7 +7656,7 @@ async fn deletion_refuses_projects_and_environments_with_delivery_bindings() {
 
 #[tokio::test]
 async fn cloudflare_capability_reports_setup_and_future_default() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7680,7 +7673,7 @@ async fn cloudflare_capability_reports_setup_and_future_default() {
     assert!(!missing.default_enabled);
     assert_eq!(missing.setup_path.as_deref(), Some("/dns-providers"));
 
-    let app_settings = temps_core::AppSettings {
+    let app_settings = temps_config::AppSettings {
         cloudflare_new_projects: true,
         ..Default::default()
     };
@@ -7733,7 +7726,7 @@ async fn cloudflare_capability_reports_setup_and_future_default() {
         .col_expr(
             settings::Column::Data,
             sea_orm::sea_query::Expr::value(
-                temps_core::AppSettings {
+                temps_config::AppSettings {
                     bunny_new_projects: true,
                     ..Default::default()
                 }
@@ -7775,7 +7768,7 @@ async fn cloudflare_capability_reports_setup_and_future_default() {
 /// mention delivery. An explicit request for the same provider still fails.
 #[tokio::test]
 async fn create_project_degrades_an_unusable_inherited_delivery_default() {
-    if !docker_available().await {
+    if !temps_test_utils::docker_available().await {
         println!("Docker not available, skipping");
         return;
     }
@@ -7787,7 +7780,7 @@ async fn create_project_degrades_an_unusable_inherited_delivery_default() {
     let set_defaults = |cloudflare: bool, bunny: bool| {
         let db = db.clone();
         async move {
-            let data = temps_core::AppSettings {
+            let data = temps_config::AppSettings {
                 cloudflare_new_projects: cloudflare,
                 bunny_new_projects: bunny,
                 ..Default::default()

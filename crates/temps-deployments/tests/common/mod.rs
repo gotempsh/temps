@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use bollard::Docker;
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowCancellationProvider, WorkflowError};
+use temps_deployments::workflow::LogWriter;
+use temps_deployments::workflow::WorkflowCancellationProvider;
+use temps_deployments::workflow::WorkflowError;
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use tokio::sync::Mutex;
 

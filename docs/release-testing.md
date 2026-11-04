@@ -729,7 +729,7 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
   has SQL binding and real-DB hostile-value tests;
   `crates/temps-providers/src/handlers/metrics_handlers.rs` covers concurrent
   creation, built-in capacity and rollback;
-  `crates/temps-monitoring/src/evaluator.rs` tests the built-in rule catalog.
+  `crates/temps-alarms/src/default_rules.rs` tests the built-in rule catalog.
 
 ### 10.9 Dependency exception review and HA boundary (#1210)
 

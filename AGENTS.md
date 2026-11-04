@@ -204,9 +204,9 @@ status and body, and the Problem Details shape of errors. Real patterns:
 - service tests on Sea-ORM `MockDatabase`: `crates/temps-flags/src/services/flag_service.rs`;
 - handler guard tests: `mod tests` in `crates/temps-flags/src/handlers/handler.rs`;
   401s and audit assertions through the router with `oneshot`:
-  `crates/temps-deployments/src/handlers/wireguard_mesh.rs`;
+  `crates/temps-nodes/src/handlers/wireguard_mesh.rs`;
 - trait-based mocks or `mockall` for external services; `TestDatabase`
-  (`crates/temps-database/src/test_utils.rs`) for real-database tests, one
+  (`crates/temps-test-utils/src/lib.rs`) for real-database tests, one
   isolated schema per test, cleaned up on drop;
 - Docker tests check `docker.ping()` and return early with a message when Docker
   is unavailable.
@@ -326,6 +326,11 @@ FORCE_WEB_BUILD=1 cargo build                # debug build with the web UI
   fixing violations, lower it with `python3 scripts/rule_drift.py
   --update-baseline` and commit the baseline; `--list <metric>` shows where the
   rest are.
+- **Test coverage**: `scripts/ci_test_coverage.py` fails the required
+  **Formatting** job when a test binary is selected by no group in
+  `rust-tests.yml` and not listed, with its reason, in
+  `scripts/ci-test-coverage-allowlist.toml`. A new test binary or crate goes in a
+  group. `--measure` reports per test from a `cargo nextest list` file.
 - **Generated docs** are checked in CI: `python3 scripts/crate_map.py --check`
   (crate map and Cargo descriptions) and `python3 scripts/adr_index.py --check`
   (unique ADR numbers and the index).

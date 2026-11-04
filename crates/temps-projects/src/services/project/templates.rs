@@ -4,6 +4,8 @@
 //! Service-template provenance, runtime updates and upgrades.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 // API Response types
 #[derive(Debug, Serialize)]
@@ -41,8 +43,8 @@ fn apply_new_template_default_when_unmodified<T: Clone + PartialEq>(
 }
 
 fn template_resource_value(
-    template: &temps_core::templates::TemplateServiceSpec,
-    select: impl FnOnce(&temps_core::templates::TemplateResources) -> Option<i32>,
+    template: &temps_presets::templates::TemplateServiceSpec,
+    select: impl FnOnce(&temps_presets::templates::TemplateResources) -> Option<i32>,
 ) -> Option<i32> {
     template.resources.as_ref().and_then(select)
 }
@@ -52,7 +54,7 @@ fn missing_required_service_types(required: &[String], linked: &HashSet<String>)
         .iter()
         .filter(|service| {
             !linked.iter().any(|linked_service| {
-                temps_core::templates::managed_service_types_compatible(service, linked_service)
+                temps_presets::templates::managed_service_types_compatible(service, linked_service)
             })
         })
         .cloned()
@@ -65,12 +67,12 @@ fn missing_required_service_types(required: &[String], linked: &HashSet<String>)
 /// used by an older release. That keeps a rollback's database credentials
 /// compatible without guessing from the live catalog.
 fn validate_service_binding_compatibility(
-    applied: &temps_core::templates::TemplateServiceSpec,
-    target: &temps_core::templates::TemplateServiceSpec,
+    applied: &temps_presets::templates::TemplateServiceSpec,
+    target: &temps_presets::templates::TemplateServiceSpec,
 ) -> Result<(), ProjectError> {
     for required_service in &applied.databases {
         if !target.databases.iter().any(|target_service| {
-            temps_core::templates::managed_service_types_compatible(
+            temps_presets::templates::managed_service_types_compatible(
                 required_service,
                 target_service,
             )
@@ -85,7 +87,7 @@ fn validate_service_binding_compatibility(
             .database_bindings
             .iter()
             .find(|(target_service_type, _)| {
-                temps_core::templates::managed_service_types_compatible(
+                temps_presets::templates::managed_service_types_compatible(
                     service_type,
                     target_service_type,
                 )
@@ -139,7 +141,7 @@ fn production_configured_variable_keys(
 
 pub(super) fn applied_service_template_from_model(
     project: &projects::Model,
-) -> Result<temps_core::templates::ServiceTemplateInstance, ProjectError> {
+) -> Result<temps_presets::templates::ServiceTemplateInstance, ProjectError> {
     if project.project_type != ProjectType::Service {
         return Err(ProjectError::InvalidInput(format!(
             "Project {} is not a service project",
@@ -148,7 +150,7 @@ pub(super) fn applied_service_template_from_model(
     }
 
     if let Some(snapshot) = &project.service_template {
-        let instance = serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+        let instance = serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
             snapshot.clone(),
         )
         .map_err(|error| {
@@ -175,9 +177,9 @@ pub(super) fn applied_service_template_from_model(
 impl ProjectService {
     pub(super) fn check_service_release(
         request: &CreateProjectRequest,
-        service_template: &temps_core::templates::ServiceTemplateInstance,
+        service_template: &temps_presets::templates::ServiceTemplateInstance,
     ) -> Result<(), ProjectError> {
-        if service_template.template.kind != temps_core::templates::TemplateKind::App {
+        if service_template.template.kind != temps_presets::templates::TemplateKind::App {
             return Err(ProjectError::InvalidInput(format!(
                 "Template '{}' is not a service template",
                 service_template.slug
@@ -202,7 +204,7 @@ impl ProjectService {
     pub async fn get_applied_service_template(
         &self,
         project_id: i32,
-    ) -> Result<temps_core::templates::ServiceTemplateInstance, ProjectError> {
+    ) -> Result<temps_presets::templates::ServiceTemplateInstance, ProjectError> {
         let project = projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
@@ -247,7 +249,7 @@ impl ProjectService {
         &self,
         project_id: i32,
         runtime: UpdateServiceTemplateRuntimeRequest,
-        ceiling_enforcement: temps_core::CeilingEnforcement,
+        ceiling_enforcement: temps_config::CeilingEnforcement,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
@@ -308,7 +310,7 @@ impl ProjectService {
             ProjectError::InvalidInput(format!("Invalid deployment config: {error}"))
         })?;
 
-        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|error| {
                 ProjectError::Other(format!(
                     "Failed to read instance settings to check resource ceilings for project {project_id}: {error}"
@@ -343,9 +345,9 @@ impl ProjectService {
     pub async fn upgrade_service_template(
         &self,
         project_id: i32,
-        target: temps_core::templates::ServiceTemplateInstance,
+        target: temps_presets::templates::ServiceTemplateInstance,
         new_environment_variables: Vec<CreateProjectEnvVar>,
-        ceiling_enforcement: temps_core::CeilingEnforcement,
+        ceiling_enforcement: temps_config::CeilingEnforcement,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
         let txn = self.db.begin().await?;
@@ -375,7 +377,7 @@ impl ProjectService {
                 "Only service projects can apply service-template upgrades".to_string(),
             ));
         }
-        if target.template.kind != temps_core::templates::TemplateKind::App {
+        if target.template.kind != temps_presets::templates::TemplateKind::App {
             return Err(ProjectError::InvalidInput(format!(
                 "Template '{}' is not a service release",
                 target.slug
@@ -467,7 +469,7 @@ impl ProjectService {
                 .iter()
                 .filter_map(|(_, service)| service.as_ref())
                 .filter(|service| {
-                    temps_core::templates::managed_service_types_compatible(
+                    temps_presets::templates::managed_service_types_compatible(
                         required,
                         &service.service_type,
                     )
@@ -562,7 +564,7 @@ impl ProjectService {
             ProjectError::InvalidInput(format!("Invalid target deployment config: {error}"))
         })?;
 
-        if ceiling_enforcement == temps_core::CeilingEnforcement::Enforce {
+        if ceiling_enforcement == temps_config::CeilingEnforcement::Enforce {
             let app_settings = self.config_service.get_settings().await.map_err(|error| {
                 ProjectError::Other(format!(
                     "Failed to read instance settings before upgrading project {project_id}: {error}"
@@ -887,7 +889,7 @@ mod tests {
 
     #[test]
     fn service_upgrade_may_add_but_not_remap_managed_service_bindings() {
-        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+        let mut applied = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("bundled Keycloak release")
             .primary()
             .clone();
@@ -918,7 +920,7 @@ mod tests {
 
     #[test]
     fn service_upgrade_cannot_remove_required_service_without_custom_bindings() {
-        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+        let mut applied = temps_presets::templates::bundled_template_by_slug("keycloak")
             .expect("bundled Keycloak release")
             .primary()
             .clone();

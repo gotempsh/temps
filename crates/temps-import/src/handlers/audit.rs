@@ -8,7 +8,6 @@
 //! credentials — exactly the kind of write operation CLAUDE.md requires an
 //! audit trail for, and the only one worth recording here.
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -40,8 +39,7 @@ impl AuditOperation for ImportExecutedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
