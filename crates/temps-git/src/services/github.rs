@@ -2,14 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use hex;
-use hmac::{Hmac, KeyInit, Mac};
 use octocrab::models::{AppId, InstallationId, InstallationRepositories, InstallationToken};
 use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_database::DbConnection;
@@ -18,6 +15,8 @@ use temps_entities::{git_provider_connections, git_providers, projects};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use url::Url;
+
+use crate::services::github_provider::github_webhook_signature_matches;
 
 /// Create a GitHub App JWT signed with RS256.
 ///
@@ -89,6 +88,40 @@ pub enum GithubAppServiceError {
     Validation(String),
     #[error("Other")]
     Other(String),
+}
+
+/// Check the JSON GitHub returns when a manifest `code` is converted into a
+/// GitHub App: the app needs an id, OAuth credentials, a webhook secret and a
+/// private key before Temps can use it. A reply without them (an error body,
+/// a partial answer) must not be stored as a provider.
+///
+/// Only field names are reported, never their values.
+pub(crate) fn validate_manifest_reply(
+    app_data: &serde_json::Value,
+) -> Result<(), GithubAppServiceError> {
+    let mut missing: Vec<&str> = Vec::new();
+
+    match app_data["id"].as_i64() {
+        Some(id) if id > 0 && i32::try_from(id).is_ok() => {}
+        _ => missing.push("id"),
+    }
+    for field in ["client_id", "client_secret", "webhook_secret", "pem"] {
+        if app_data[field]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            missing.push(field);
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(GithubAppServiceError::Validation(format!(
+            "GitHub's reply is missing a usable value for: {}",
+            missing.join(", ")
+        )))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1179,6 +1212,8 @@ impl GithubAppService {
         app_data: serde_json::Value,
         _source_id_p: Option<String>,
     ) -> Result<GitHubAppData, GithubAppServiceError> {
+        validate_manifest_reply(&app_data)?;
+
         // Extract data from the app_data JSON
         let name_val = app_data["name"].as_str().unwrap_or("").to_string();
         let app_id_val = app_data["id"].as_i64().unwrap_or(0) as i32;
@@ -1481,29 +1516,15 @@ impl GithubAppService {
             return Err(GithubAppServiceError::InvalidWebhookSignature);
         }
 
-        // Try each GitHub App's webhook secret
+        // Try each GitHub App's webhook secret. `webhook_secret` is already
+        // decrypted in GitHubAppData. The comparison is constant-time and an
+        // app with no secret never matches (see the helper).
         for github_app in github_apps {
-            // webhook_secret is already decrypted in GitHubAppData
-            let webhook_secret = github_app.webhook_secret;
-
-            let mut mac = match Hmac::<Sha256>::new_from_slice(webhook_secret.as_bytes()) {
-                Ok(mac) => mac,
-                Err(_) => continue, // Skip this app if HMAC creation fails
-            };
-
-            mac.update(body);
-            let result = mac.finalize();
-            let code_bytes = result.into_bytes();
-            let expected_signature = format!("sha256={}", hex::encode(code_bytes));
-
-            // Constant-time comparison to avoid a timing side-channel that could
-            // leak the expected signature byte-by-byte (security review finding #14).
-            use subtle::ConstantTimeEq;
-            if original_signature
-                .as_bytes()
-                .ct_eq(expected_signature.as_bytes())
-                .into()
-            {
+            if let Ok(true) = github_webhook_signature_matches(
+                body,
+                original_signature,
+                &github_app.webhook_secret,
+            ) {
                 debug!("Valid signature for GitHub App: {}", github_app.name);
                 return Ok(());
             }
@@ -1965,4 +1986,88 @@ pub struct GithubAccountDetails {
     pub account_name: String,
     pub account_id: i64,
     pub is_org: bool,
+}
+
+#[cfg(test)]
+mod manifest_reply_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn complete_reply() -> serde_json::Value {
+        json!({
+            "id": 123456,
+            "name": "temps-example",
+            "client_id": "Iv1.example",
+            "client_secret": "client-secret",
+            "webhook_secret": "webhook-secret",
+            "pem": "test-private-key-value"
+        })
+    }
+
+    fn rejected_fields(reply: &serde_json::Value) -> String {
+        match validate_manifest_reply(reply) {
+            Err(GithubAppServiceError::Validation(message)) => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_reply_is_accepted() {
+        assert!(validate_manifest_reply(&complete_reply()).is_ok());
+    }
+
+    #[test]
+    fn github_error_body_is_rejected() {
+        let message = rejected_fields(&json!({
+            "message": "Not Found",
+            "documentation_url": "https://docs.github.com/rest"
+        }));
+        for field in ["id", "client_id", "client_secret", "webhook_secret", "pem"] {
+            assert!(message.contains(field), "{field} missing from: {message}");
+        }
+    }
+
+    #[test]
+    fn each_required_field_is_checked() {
+        for field in ["id", "client_id", "client_secret", "webhook_secret", "pem"] {
+            let mut reply = complete_reply();
+            reply.as_object_mut().unwrap().remove(field);
+            assert!(
+                rejected_fields(&reply).contains(field),
+                "removing {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_blank_values_are_rejected() {
+        for (field, value) in [
+            ("client_id", json!("")),
+            ("client_secret", json!("   ")),
+            ("webhook_secret", json!("")),
+            ("pem", json!("\n")),
+            ("id", json!(0)),
+            ("id", json!(-4)),
+            ("id", json!(i64::from(i32::MAX) + 1)),
+            ("id", json!("123")),
+            ("webhook_secret", json!(null)),
+        ] {
+            let mut reply = complete_reply();
+            reply[field] = value.clone();
+            assert!(
+                rejected_fields(&reply).contains(field),
+                "{field}={value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_names_fields_but_never_their_values() {
+        let mut reply = complete_reply();
+        reply["webhook_secret"] = json!("");
+        let message = rejected_fields(&reply);
+        assert!(message.contains("webhook_secret"));
+        assert!(!message.contains("client-secret"));
+        assert!(!message.contains("test-private-key-value"));
+    }
 }

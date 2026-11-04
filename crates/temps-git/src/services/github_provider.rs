@@ -3669,6 +3669,10 @@ fn validate_github_webhook_id(
 /// timing side-channel that could leak the expected signature byte-by-byte
 /// (security review finding #14). Factored out as a free function so the
 /// verification logic can be unit-tested with a known vector.
+///
+/// An empty secret never matches. HMAC accepts an empty key, so a signature
+/// computed under one is valid HMAC, but it proves nothing: anyone can
+/// compute it. A secret that is not set therefore verifies nothing.
 pub(crate) fn github_webhook_signature_matches(
     payload: &[u8],
     signature: &str,
@@ -3677,6 +3681,10 @@ pub(crate) fn github_webhook_signature_matches(
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use subtle::ConstantTimeEq;
+
+    if secret.is_empty() {
+        return Ok(false);
+    }
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|e| format!("Invalid secret key: {}", e))?;
@@ -3753,6 +3761,20 @@ mod signature_tests {
     fn wrong_length_signature_is_rejected() {
         // ct_eq handles unequal lengths without panicking and returns false.
         assert!(!github_webhook_signature_matches(PAYLOAD, "sha256=deadbeef", SECRET).unwrap());
+    }
+
+    #[test]
+    fn empty_secret_never_matches_even_a_signature_made_with_an_empty_key() {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"").unwrap();
+        mac.update(PAYLOAD);
+        let signed_with_empty_key = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        assert!(!github_webhook_signature_matches(PAYLOAD, &signed_with_empty_key, "").unwrap());
+        // A real secret is unaffected by the guard.
+        assert!(github_webhook_signature_matches(PAYLOAD, VALID, SECRET).unwrap());
     }
 }
 

@@ -77,40 +77,13 @@ async fn handle_manifest_conversion_with_source(
     code: String,
     source: Option<String>,
 ) -> Result<(HeaderMap, Redirect), Problem> {
+    // The code is a one-time credential: it is not logged.
     info!(
-        "Processing GitHub App manifest conversion with code: {} and source: {:?}",
-        code, source
+        "Processing GitHub App manifest conversion (source: {:?})",
+        source
     );
 
-    let client = reqwest::Client::new();
-    let api_url = "https://api.github.com";
-    let conversions_url = format!("{}/app-manifests/{}/conversions", api_url, code);
-
-    let response = match client
-        .post(&conversions_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Temps")
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!("Failed to convert manifest: {}", e);
-            return Err(problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Manifest Conversion Failed")
-                .with_detail(format!("Failed to convert manifest: {}", e)));
-        }
-    };
-
-    let github_app_data = match response.json::<serde_json::Value>().await {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Failed to parse GitHub App response: {}", e);
-            return Err(problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Response Parse Failed")
-                .with_detail(format!("Failed to parse GitHub App response: {}", e)));
-        }
-    };
+    let github_app_data = fetch_manifest_app(GITHUB_API_URL, &code).await?;
 
     // Create the GitHub App with source tracking (this creates both github_apps entry and git_provider)
     match state
@@ -157,6 +130,18 @@ async fn handle_manifest_conversion_with_source(
 
             Ok((response_headers, Redirect::to(&redirect_url)))
         }
+        Err(GithubAppServiceError::Validation(message)) => {
+            warn!("GitHub returned an unusable app: {}", message);
+            Err(problem_new(StatusCode::BAD_GATEWAY)
+                .with_title("Incomplete GitHub App")
+                .with_detail(message))
+        }
+        Err(GithubAppServiceError::Conflict(message)) => {
+            warn!("GitHub App already registered: {}", message);
+            Err(problem_new(StatusCode::CONFLICT)
+                .with_title("GitHub App Already Registered")
+                .with_detail(message))
+        }
         Err(e) => {
             error!("Failed to create GitHub app: {:?}", e);
             Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -164,6 +149,54 @@ async fn handle_manifest_conversion_with_source(
                 .with_detail(format!("Failed to create GitHub app: {}", e)))
         }
     }
+}
+
+const GITHUB_API_URL: &str = "https://api.github.com";
+
+/// Exchange a manifest `code` for the GitHub App it created.
+///
+/// Returns the JSON body only when GitHub answers with a success status. The
+/// code is percent-encoded into the request path, and reqwest errors are
+/// logged and returned without their URL, which would contain the code.
+async fn fetch_manifest_app(api_url: &str, code: &str) -> Result<serde_json::Value, Problem> {
+    let conversions_url = format!(
+        "{}/app-manifests/{}/conversions",
+        api_url,
+        urlencoding::encode(code)
+    );
+
+    let response = reqwest::Client::new()
+        .post(&conversions_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Temps")
+        .send()
+        .await
+        .map_err(|e| {
+            let e = e.without_url();
+            error!("Failed to convert manifest: {}", e);
+            problem_new(StatusCode::BAD_GATEWAY)
+                .with_title("Manifest Conversion Failed")
+                .with_detail(format!("Failed to convert manifest: {}", e))
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        warn!("GitHub rejected the manifest conversion: HTTP {}", status);
+        return Err(problem_new(StatusCode::BAD_GATEWAY)
+            .with_title("Manifest Conversion Failed")
+            .with_detail(format!(
+                "GitHub answered the manifest conversion with HTTP {}",
+                status.as_u16()
+            )));
+    }
+
+    response.json::<serde_json::Value>().await.map_err(|e| {
+        let e = e.without_url();
+        error!("Failed to parse GitHub App response: {}", e);
+        problem_new(StatusCode::BAD_GATEWAY)
+            .with_title("Response Parse Failed")
+            .with_detail(format!("Failed to parse GitHub App response: {}", e))
+    })
 }
 
 #[derive(ToSchema, Serialize, Deserialize)]
@@ -1115,5 +1148,89 @@ mod tests {
             (None, Some("v1.2.0".to_string()))
         );
         assert_eq!(push_target("", None), (None, None));
+    }
+
+    fn detail_of(problem: &Problem) -> String {
+        problem
+            .body
+            .get("detail")
+            .and_then(|detail| detail.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn manifest_conversion_returns_the_app_github_created() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/app-manifests/abc123/conversions")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":42,"client_id":"client"}"#)
+            .create_async()
+            .await;
+
+        let app = fetch_manifest_app(&server.url(), "abc123")
+            .await
+            .expect("a 201 reply is a created app");
+
+        mock.assert_async().await;
+        assert_eq!(app["id"], 42);
+    }
+
+    #[tokio::test]
+    async fn manifest_conversion_rejects_a_status_that_is_not_success() {
+        for status in [404, 422, 500] {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("POST", "/app-manifests/not-a-code/conversions")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"message":"Not Found"}"#)
+                .create_async()
+                .await;
+
+            let problem = fetch_manifest_app(&server.url(), "not-a-code")
+                .await
+                .expect_err("an error status must not yield an app");
+
+            mock.assert_async().await;
+            assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+            assert!(
+                detail_of(&problem).contains(&status.to_string()),
+                "detail should name GitHub's status {status}: {}",
+                detail_of(&problem)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_code_is_percent_encoded_into_the_request_path() {
+        let mut server = mockito::Server::new_async().await;
+        // Without encoding, `/`, `?` and `#` would change which URL is requested.
+        let mock = server
+            .mock("POST", "/app-manifests/a%2Fb%3Fc%23d/conversions")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":1}"#)
+            .create_async()
+            .await;
+
+        fetch_manifest_app(&server.url(), "a/b?c#d")
+            .await
+            .expect("the encoded path should reach the mock");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn manifest_conversion_errors_do_not_contain_the_code() {
+        // Nothing listens on port 1, so the request fails before any reply.
+        let problem = fetch_manifest_app("http://127.0.0.1:1", "one-time-code-value")
+            .await
+            .expect_err("the connection is refused");
+
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        assert!(!detail_of(&problem).contains("one-time-code-value"));
     }
 }
