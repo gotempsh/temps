@@ -4,12 +4,39 @@
 //! Deployment lifecycle: teardown, pause and resume.
 
 use super::*;
+use crate::jobs::mark_deployment_complete::{
+    environment_lifecycle_lock, MAX_CONCURRENT_REPLICA_STOPS,
+};
+use futures::StreamExt;
 
 /// Deployment states a pause applies to: the deployment is live and serving.
 const PAUSABLE_DEPLOYMENT_STATES: &[&str] = &["deployed", "completed"];
 
 /// Deployment states a resume applies to: only one paused by `pause_deployment`.
 const RESUMABLE_DEPLOYMENT_STATES: &[&str] = &["paused"];
+
+/// How long a pause or resume waits for one replica's runtime to answer. Docker
+/// itself gives a container 10s to stop; this bounds an unreachable worker,
+/// whose HTTP client would otherwise hold the request for minutes.
+const REPLICA_LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What an operator can do about a pause that did not complete, given the state
+/// it left the deployment in (`None` when that could not be read).
+fn next_step_after_incomplete_pause(state: Option<&str>) -> &'static str {
+    match state {
+        Some(state) if PAUSABLE_DEPLOYMENT_STATES.contains(&state) => "pause it again to retry",
+        // A pause refuses this state, so a retry has to go through a resume,
+        // which is safe: starting a replica that is still running does nothing.
+        Some("paused") => "resume it, then pause it again to retry",
+        Some(_) => "something else changed it during the pause, so it cannot be paused now",
+        None => "check its state before retrying",
+    }
+}
+
+/// Where a container runs, as error messages name it.
+fn container_location(node_id: Option<i32>) -> String {
+    node_id.map_or_else(|| "this host".to_string(), |id| format!("node {id}"))
+}
 
 /// Refuse a pause/resume whose current state is not one it applies to.
 /// Without this, resume restarted the containers of a stopped, failed or
@@ -110,11 +137,174 @@ impl DeploymentService {
             .map_err(|e| DeploymentError::ContainerOperation {
                 container_id: container.container_id.clone(),
                 operation: "stop",
-                location: container
-                    .node_id
-                    .map_or_else(|| "this host".to_string(), |id| format!("node {id}")),
+                location: container_location(container.node_id),
                 reason: e.to_string(),
             })
+    }
+
+    /// The deployer of the node running `container`, with a failure to reach
+    /// it reported against that container and node.
+    async fn replica_deployer(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+        operation: &'static str,
+    ) -> Result<Arc<dyn temps_deployer::ContainerDeployer>, DeploymentError> {
+        self.deployer_for_node(container.node_id)
+            .await
+            .map_err(|error| DeploymentError::ContainerOperation {
+                container_id: container.container_id.clone(),
+                operation,
+                location: container_location(container.node_id),
+                reason: match error {
+                    // Its Display drops the message, which names the node.
+                    DeploymentError::NotFound(message) => message,
+                    other => other.to_string(),
+                },
+            })
+    }
+
+    /// A deployment by id, provided it belongs to `project_id`.
+    async fn deployment_of_project(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+    ) -> Result<deployments::Model, DeploymentError> {
+        deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))
+    }
+
+    /// Which of `containers` are microVM replicas, by container id with their
+    /// workload. Read from the database, so a plane that is not running in
+    /// this process cannot make one look like a container.
+    async fn micro_vm_replicas_of(
+        &self,
+        containers: &[temps_entities::deployment_containers::Model],
+    ) -> Result<std::collections::HashMap<String, i64>, DeploymentError> {
+        let container_ids: Vec<String> = containers
+            .iter()
+            .map(|container| container.container_id.clone())
+            .collect();
+        crate::services::plane_deployer::micro_vm_replica_workloads(
+            self.db.as_ref(),
+            &container_ids,
+        )
+        .await
+    }
+
+    /// Put a deployment whose pause did not complete back in `previous_state`,
+    /// and report the state it is in now, `None` if that could not be read.
+    /// Guarded so a concurrent transition out of "paused" is not overwritten.
+    async fn restore_after_incomplete_pause(
+        &self,
+        deployment_id: i32,
+        previous_state: &str,
+    ) -> Option<String> {
+        let restored = deployments::Entity::update_many()
+            .col_expr(
+                deployments::Column::State,
+                sea_orm::sea_query::Expr::value(previous_state),
+            )
+            .col_expr(
+                deployments::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .filter(deployments::Column::State.eq("paused"))
+            .exec(self.db.as_ref())
+            .await;
+        match restored {
+            Ok(result) if result.rows_affected > 0 => return Some(previous_state.to_string()),
+            // Something moved it out of "paused" first, such as a teardown.
+            Ok(_) => {}
+            Err(error) => error!(
+                deployment_id,
+                previous_state, "Failed to restore deployment after an incomplete pause: {}", error
+            ),
+        }
+        match deployments::Entity::find_by_id(deployment_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(deployment) => deployment.map(|deployment| deployment.state),
+            Err(error) => {
+                error!(
+                    deployment_id,
+                    "Failed to read deployment state after an incomplete pause: {}", error
+                );
+                None
+            }
+        }
+    }
+
+    /// Stop one replica of a deployment being paused, on the node that runs
+    /// it, keeping it resumable. `Ok` means it is not running: stopped now,
+    /// already stopped, or gone from its node. A plane-started container is
+    /// stopped the same way: the plane reports it stopped and leaves it for
+    /// its owner to start again.
+    async fn stop_replica_for_pause(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+    ) -> Result<(), DeploymentError> {
+        let failure = |reason: String| DeploymentError::ContainerOperation {
+            container_id: container.container_id.clone(),
+            operation: "stop",
+            location: container_location(container.node_id),
+            reason,
+        };
+        let deployer = self.replica_deployer(container, "stop").await?;
+        match tokio::time::timeout(
+            REPLICA_LIFECYCLE_TIMEOUT,
+            deployer.stop_container(&container.container_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(temps_deployer::DeployerError::ContainerNotFound(reason))) => {
+                warn!(
+                    deployment_id = container.deployment_id,
+                    container_id = container.container_id,
+                    node_id = container.node_id,
+                    "Container to pause no longer exists on its node: {}",
+                    reason
+                );
+                Ok(())
+            }
+            Ok(Err(error)) => Err(failure(error.to_string())),
+            Err(_) => Err(failure(format!(
+                "no answer after {}s; it may still be running",
+                REPLICA_LIFECYCLE_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Start one replica of a deployment being resumed, on the node that runs
+    /// it.
+    async fn start_replica_for_resume(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+    ) -> Result<(), DeploymentError> {
+        let failure = |reason: String| DeploymentError::ContainerOperation {
+            container_id: container.container_id.clone(),
+            operation: "start",
+            location: container_location(container.node_id),
+            reason,
+        };
+        let deployer = self.replica_deployer(container, "start").await?;
+        match tokio::time::timeout(
+            REPLICA_LIFECYCLE_TIMEOUT,
+            deployer.start_container(&container.container_id),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| failure(error.to_string())),
+            Err(_) => Err(failure(format!(
+                "no answer after {}s",
+                REPLICA_LIFECYCLE_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     /// Tears down an environment and all its active deployments
@@ -212,15 +402,45 @@ impl DeploymentService {
         use sea_orm::{ActiveModelTrait, Set};
         use temps_entities::{deployment_containers, deployments, status_incidents};
 
-        // First verify the deployment exists and belongs to the project
-        let deployment = deployments::Entity::find_by_id(deployment_id)
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
+        // First verify the deployment exists and belongs to the project, then
+        // read its state again once nothing else can be stopping or starting
+        // this environment's replicas: see `environment_lifecycle_lock`.
+        let environment_id = self
+            .deployment_of_project(project_id, deployment_id)
             .await?
-            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+            .environment_id;
+        let lifecycle_lock = environment_lifecycle_lock(environment_id);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let deployment = self
+            .deployment_of_project(project_id, deployment_id)
+            .await?;
         check_lifecycle_transition(&deployment, "pause", PAUSABLE_DEPLOYMENT_STATES, "deployed")?;
 
-        let environment_id = deployment.environment_id;
+        let previous_state = deployment.state.clone();
+
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        // The plane can only retire a microVM for good, which would leave a
+        // resume nothing to bring back, and no container runtime can see one
+        // to stop it. Refuse before the deployment reads as paused. A replica
+        // that cannot be classified fails the pause too: the alternative is
+        // asking Docker, whose 404 would read as "already stopped".
+        let micro_vms = self.micro_vm_replicas_of(&containers).await?;
+        if let Some((container, workload_id)) = containers.iter().find_map(|container| {
+            micro_vms
+                .get(&container.container_id)
+                .map(|workload_id| (container, *workload_id))
+        }) {
+            return Err(DeploymentError::MicroVmReplicaCannotBePaused {
+                deployment_id,
+                container_id: container.container_id.clone(),
+                workload_id,
+            });
+        }
 
         // Persist "paused" BEFORE touching any container. Monitoring (the
         // container-health poller and the uptime health checker) treats
@@ -287,37 +507,43 @@ impl DeploymentService {
 
         txn.commit().await?;
 
-        // Stop and remove all containers for this deployment
-        let containers = deployment_containers::Entity::find()
-            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await?;
-
-        // Stop (but do not remove) each container. Keeping the Docker
-        // container object around — rather than force-removing it, as this
-        // used to do — is what makes `resume_deployment` able to bring the
-        // exact same containers back with a plain `docker start` instead of
-        // trying to "unpause" containers that no longer exist (see the fix
+        // Stop (but do not remove) each container, on the node that runs it:
+        // this host's Docker cannot see a worker's container. Keeping the
+        // Docker container object around — rather than force-removing it, as
+        // this used to do — is what makes `resume_deployment` able to bring
+        // the exact same containers back with a plain `docker start` instead
+        // of trying to "unpause" containers that no longer exist (see the fix
         // note on `resume_deployment` below). The route table additionally
         // stops sending live traffic to any container whose `status` isn't
         // "running" (see `route_table::load_routes`), so a stopped-but-not-
         // removed container is just as inert from the outside as a removed
         // one, without sacrificing resumability.
-        // Best-effort like the `stop_container` call above: the deployment
-        // row is already committed as "paused", so aborting this loop on a
-        // single container's DB write failure would strand the *remaining*
-        // containers untouched (still "running" in the DB, never even
-        // asked to stop) and skip the route-table reload below, while the
-        // deployment stays paused indefinitely. Warn and keep going so one
-        // failure can't silently drop the rest of the pause.
-        for container in containers {
+        //
+        // Concurrently, so one unreachable worker costs the request one timeout
+        // rather than one per replica, and boundedly, so a large deployment
+        // does not open a connection per replica at once. A failed stop does
+        // not abort the others: the operator wants as little as possible left
+        // running.
+        let total = containers.len();
+        let stops = containers.into_iter().map(|container| async move {
+            let result = self.stop_replica_for_pause(&container).await;
+            (container, result)
+        });
+        let stops: Vec<_> = futures::stream::iter(stops)
+            .buffer_unordered(MAX_CONCURRENT_REPLICA_STOPS)
+            .collect()
+            .await;
+        let mut failures: Vec<String> = Vec::new();
+        for (container, result) in stops {
             let container_id = container.container_id.clone();
-            if let Err(e) = self.deployer.stop_container(&container_id).await {
+            // Still running as far as anyone knows: the row keeps saying so.
+            if let Err(error) = result {
                 warn!(
-                    "Failed to stop container {} during deployment pause: {}",
-                    container_id, e
+                    deployment_id,
+                    container_id, "Failed to stop container during deployment pause: {}", error
                 );
+                failures.push(error.to_string());
+                continue;
             }
 
             // Retry the DB write: a container whose status never makes it to
@@ -351,6 +577,21 @@ impl DeploymentService {
             }
         }
 
+        // Something is still running, so the deployment is not paused. Put it
+        // back in the state it came from, which keeps what is left routed and
+        // monitored and lets the pause be asked for again: a stop of a stopped
+        // container succeeds, and "paused" would refuse the retry. Replicas
+        // that did stop stay stopped, and their "stopped" status tells both
+        // health monitors they were stopped on purpose.
+        let incomplete_state = if failures.is_empty() {
+            None
+        } else {
+            Some(
+                self.restore_after_incomplete_pause(deployment_id, &previous_state)
+                    .await,
+            )
+        };
+
         // Force an in-process route-table reload (same mechanism
         // `mark_deployment_complete.rs` uses after a normal deploy — see its
         // comment for why this is needed in addition to PG NOTIFY). Nothing
@@ -381,6 +622,17 @@ impl DeploymentService {
             );
         }
 
+        if let Some(state) = incomplete_state {
+            return Err(DeploymentError::DeploymentPauseIncomplete {
+                deployment_id,
+                stopped: total - failures.len(),
+                total,
+                failures: failures.join("; "),
+                next_step: next_step_after_incomplete_pause(state.as_deref()),
+                state: state.unwrap_or_else(|| "unknown".to_string()),
+            });
+        }
+
         info!(
             "Successfully paused deployment {}: stopped all containers",
             deployment_id
@@ -395,13 +647,18 @@ impl DeploymentService {
     ) -> Result<(), DeploymentError> {
         use temps_entities::deployment_containers;
 
-        // First verify the deployment exists and belongs to the project
-        let deployment = deployments::Entity::find()
-            .filter(deployments::Column::Id.eq(deployment_id))
-            .filter(deployments::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
+        // First verify the deployment exists and belongs to the project, then
+        // read its state again once nothing else can be stopping or starting
+        // this environment's replicas: see `environment_lifecycle_lock`.
+        let environment_id = self
+            .deployment_of_project(project_id, deployment_id)
             .await?
-            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+            .environment_id;
+        let lifecycle_lock = environment_lifecycle_lock(environment_id);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let deployment = self
+            .deployment_of_project(project_id, deployment_id)
+            .await?;
         check_lifecycle_transition(&deployment, "resume", RESUMABLE_DEPLOYMENT_STATES, "paused")?;
 
         // Resume all containers for this deployment
@@ -418,22 +675,19 @@ impl DeploymentService {
         // this codebase's real pause path ever calls; using it here against
         // a merely-stopped container always failed ("container is not
         // paused"), so resume could never actually succeed after a real
-        // pause.
+        // pause. A microVM is left alone: pause never stopped it and no runtime
+        // here could start it, as the plane keeps it running.
+        let micro_vms = self.micro_vm_replicas_of(&containers).await?;
         for container in containers {
-            self.deployer
-                .start_container(&container.container_id)
-                .await
-                .map_err(|e| {
-                    DeploymentError::Other(format!("Failed to resume container: {}", e))
-                })?;
+            if !micro_vms.contains_key(&container.container_id) {
+                self.start_replica_for_resume(&container).await?;
+            }
 
             // Update container status
             let mut active_container: deployment_containers::ActiveModel = container.into();
             active_container.status = Set(Some("running".to_string()));
             active_container.update(self.db.as_ref()).await?;
         }
-
-        let environment_id = deployment.environment_id;
 
         // Update deployment state to "deployed"
         let mut active_deployment: deployments::ActiveModel = deployment.into();
@@ -530,6 +784,26 @@ mod lifecycle_transition_tests {
                 }) => assert_eq!(rejected, state),
                 other => panic!("resuming a '{state}' deployment must be refused, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn an_incomplete_pause_only_advises_a_retry_a_pause_would_accept() {
+        for state in PAUSABLE_DEPLOYMENT_STATES {
+            assert_eq!(
+                next_step_after_incomplete_pause(Some(state)),
+                "pause it again to retry"
+            );
+        }
+        assert_eq!(
+            next_step_after_incomplete_pause(Some("paused")),
+            "resume it, then pause it again to retry"
+        );
+        for step in [
+            next_step_after_incomplete_pause(Some("stopped")),
+            next_step_after_incomplete_pause(None),
+        ] {
+            assert!(!step.contains("pause it again"), "{step}");
         }
     }
 

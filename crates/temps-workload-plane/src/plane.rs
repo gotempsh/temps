@@ -922,6 +922,14 @@ impl WorkloadPlane {
         Ok(row.map(|row| (row.workload_id, row.driver)))
     }
 
+    /// See [`isolation_of_instances`].
+    pub async fn isolation_of_instances(
+        &self,
+        instance_ids: &[String],
+    ) -> Result<HashMap<String, (i64, Isolation)>, PlaneError> {
+        isolation_of_instances(self.db.as_ref(), instance_ids).await
+    }
+
     pub fn with_finalizer(mut self, finalizer: Arc<dyn Finalizer>) -> Self {
         self.finalizers
             .insert(finalizer.name().to_string(), finalizer);
@@ -1499,6 +1507,52 @@ pub(crate) fn encode_status(
         field: "status",
         reason: e.to_string(),
     })
+}
+
+/// The workload and isolation behind each of several runtime ids, in one
+/// query. An id no instance ever had is absent from the map; an id reused by
+/// several instances answers for the latest one, as
+/// [`WorkloadPlane::workload_for_instance`] does.
+///
+/// Takes the database rather than a plane because what a replica is does not
+/// depend on a plane running in this process: one that failed to start must
+/// not make a microVM look like a container.
+pub async fn isolation_of_instances(
+    db: &DatabaseConnection,
+    instance_ids: &[String],
+) -> Result<HashMap<String, (i64, Isolation)>, PlaneError> {
+    if instance_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, i64, serde_json::Value)> = workload_instances::Entity::find()
+        .inner_join(workloads::Entity)
+        .filter(
+            Expr::expr(Expr::cust("\"workload_instances\".\"handle\"->>'id'"))
+                .is_in(instance_ids.iter().map(String::as_str)),
+        )
+        .order_by_asc(workload_instances::Column::Id)
+        .select_only()
+        .expr(Expr::cust("\"workload_instances\".\"handle\"->>'id'"))
+        .column(workloads::Column::Id)
+        .column(workloads::Column::Spec)
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(PlaneError::db(
+            "finding the workloads of runtime ids",
+            format!("{} instance(s)", instance_ids.len()),
+        ))?;
+    rows.into_iter()
+        .map(|(instance_id, workload_id, spec)| {
+            let spec: WorkloadSpec =
+                serde_json::from_value(spec).map_err(|e| PlaneError::Corrupt {
+                    workload_id,
+                    field: "spec",
+                    reason: e.to_string(),
+                })?;
+            Ok((instance_id, (workload_id, spec.isolation)))
+        })
+        .collect()
 }
 
 pub(crate) fn view_from(

@@ -37,6 +37,41 @@ pub enum DeploymentError {
         expected: &'static str,
     },
 
+    /// A pause could not stop every replica, so it put the deployment back in
+    /// the state it was paused from, unless something else had already moved
+    /// it. Replicas that did stop stay stopped: the operator asked for them
+    /// not to run. `state` is what the deployment is now, or "unknown" when
+    /// that could not be read, and `next_step` follows from it: a retry is only
+    /// advice while a pause would accept it.
+    #[error(
+        "Pause of deployment {deployment_id} did not complete: stopped {stopped} of {total} \
+         replica(s) and could not stop the rest, which are still running ({failures}). The \
+         deployment's state is '{state}': {next_step}"
+    )]
+    DeploymentPauseIncomplete {
+        deployment_id: i32,
+        stopped: usize,
+        total: usize,
+        failures: String,
+        state: String,
+        next_step: &'static str,
+    },
+
+    /// A pause was asked of a deployment with a microVM replica, which the
+    /// workload plane can only retire for good: there would be nothing for a
+    /// resume to bring back. Refused before anything changes. Mapped to 409,
+    /// like the other pauses the deployment's current shape does not allow.
+    #[error(
+        "Cannot pause deployment {deployment_id}: container {container_id} runs in a Firecracker \
+         microVM (workload {workload_id}), which cannot be stopped and started again. Redeploy \
+         the environment to replace it, or delete the deployment to remove it"
+    )]
+    MicroVmReplicaCannotBePaused {
+        deployment_id: i32,
+        container_id: String,
+        workload_id: i64,
+    },
+
     #[error("Pipeline error: {0}")]
     PipelineError(String),
 

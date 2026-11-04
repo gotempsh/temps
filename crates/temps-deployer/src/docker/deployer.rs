@@ -28,6 +28,20 @@ use temps_workload_docker::secrets::{
 };
 use tracing::{debug, info, warn};
 
+/// A failed stop as a deployer error. Only Docker's 404 means the container is
+/// gone, and so not running; any other failure may have left it running.
+fn stop_error(container_id: &str, error: bollard::errors::Error) -> DeployerError {
+    match error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message,
+        } => DeployerError::ContainerNotFound(format!(
+            "Container {container_id} not found: {message}"
+        )),
+        other => DeployerError::Other(format!("Failed to stop container {container_id}: {other}")),
+    }
+}
+
 /// A failed inspect as a deployer error. Only Docker's 404 means the
 /// container is gone: callers record a container as removed on
 /// [`DeployerError::ContainerNotFound`], so a daemon error, timeout or
@@ -930,9 +944,7 @@ impl ContainerDeployer for DockerRuntime {
                 }),
             )
             .await
-            .map_err(|e| {
-                DeployerError::Other(format!("Failed to stop container {}: {}", container_id, e))
-            })?;
+            .map_err(|error| stop_error(container_id, error))?;
         Ok(())
     }
 

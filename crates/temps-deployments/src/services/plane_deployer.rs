@@ -446,25 +446,47 @@ pub async fn micro_vm_replica_workload(
     plane: &WorkloadPlane,
     container_id: &str,
 ) -> Result<Option<i64>, DeploymentError> {
-    let plane_error =
-        |operation: &'static str, reason: String| DeploymentError::ContainerOperation {
-            container_id: container_id.to_string(),
-            operation,
-            location: "workload plane".to_string(),
-            reason,
-        };
-    let Some((workload_id, _driver)) = plane
-        .workload_for_instance(container_id)
+    let container_ids = [container_id.to_string()];
+    let replicas = plane
+        .isolation_of_instances(&container_ids)
         .await
-        .map_err(|e| plane_error("look up the workload", e.to_string()))?
-    else {
-        return Ok(None);
-    };
-    match plane.get(workload_id).await {
-        Ok(view) => Ok(served_by_plane_only(view.spec.isolation).then_some(workload_id)),
-        // Gone with its instances: nothing the plane could serve.
-        Err(temps_workload_plane::PlaneError::NotFound { .. }) => Ok(None),
-        Err(e) => Err(plane_error("read the workload", e.to_string())),
+        .map_err(|e| classification_failure(&container_ids, e))?;
+    Ok(micro_vms_among(replicas).remove(container_id))
+}
+
+/// [`micro_vm_replica_workload`] for all of a lifecycle operation's containers
+/// in one query, keyed by container id, whether or not a plane runs in this
+/// process. Anything that is not a microVM replica is absent. A failure to
+/// classify any of them fails the whole call: callers must not ask Docker
+/// about a replica that may be a microVM, whose 404 would read as "already
+/// stopped".
+pub async fn micro_vm_replica_workloads(
+    db: &sea_orm::DatabaseConnection,
+    container_ids: &[String],
+) -> Result<HashMap<String, i64>, DeploymentError> {
+    let replicas = temps_workload_plane::isolation_of_instances(db, container_ids)
+        .await
+        .map_err(|e| classification_failure(container_ids, e))?;
+    Ok(micro_vms_among(replicas))
+}
+
+fn micro_vms_among(replicas: HashMap<String, (i64, Isolation)>) -> HashMap<String, i64> {
+    replicas
+        .into_iter()
+        .filter(|(_, (_, isolation))| served_by_plane_only(*isolation))
+        .map(|(container_id, (workload_id, _))| (container_id, workload_id))
+        .collect()
+}
+
+fn classification_failure(
+    container_ids: &[String],
+    error: temps_workload_plane::PlaneError,
+) -> DeploymentError {
+    DeploymentError::ContainerOperation {
+        container_id: container_ids.join(", "),
+        operation: "look up the workload",
+        location: "workload plane".to_string(),
+        reason: error.to_string(),
     }
 }
 
@@ -2208,6 +2230,51 @@ mod tests {
         }
     }
 
+    /// A replica that cannot be classified must not pass for "not a microVM":
+    /// the caller would ask Docker, whose 404 reads as "already stopped".
+    #[tokio::test]
+    async fn classifying_replicas_fails_when_a_workload_spec_is_corrupt() {
+        use sea_orm::ConnectionTrait;
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-classify-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::new())),
+        );
+        let workload_id = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+        db.execute_unprepared(&format!(
+            "UPDATE workloads SET spec = '{{\"not\": \"a spec\"}}' WHERE id = {workload_id}"
+        ))
+        .await
+        .expect("corrupt the spec");
+
+        let error = micro_vm_replica_workloads(db.as_ref(), &["vm-42-1".to_string()])
+            .await
+            .expect_err("a corrupt spec cannot be classified");
+        let message = error.to_string();
+        assert!(
+            message.contains("vm-42-1") && message.contains(&workload_id.to_string()),
+            "the error names the container and the workload: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn the_containers_view_reads_a_micro_vm_replica_from_the_plane() {
         let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
@@ -2289,6 +2356,19 @@ mod tests {
             "{}",
             stats.cpu_percent
         );
+
+        // Several at once, in one query, name only the microVM.
+        let all = micro_vm_replica_workloads(
+            db.as_ref(),
+            &["c-docker", "vm-42-2", "legacy-1"].map(String::from),
+        )
+        .await
+        .expect("classify the replicas");
+        assert_eq!(all, HashMap::from([("vm-42-2".to_string(), micro_vm)]));
+        assert!(micro_vm_replica_workloads(db.as_ref(), &[])
+            .await
+            .expect("nothing to classify")
+            .is_empty());
 
         // Docker serves its own containers and ids the plane never started:
         // the plane answers "not mine" so the caller asks Docker.

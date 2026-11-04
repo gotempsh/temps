@@ -49,6 +49,35 @@ fn block_io_saturates_instead_of_wrapping() {
 }
 
 #[test]
+fn only_a_docker_404_makes_a_failed_stop_read_as_not_found() {
+    let missing = stop_error(
+        "abc123",
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container: abc123".to_string(),
+        },
+    );
+    assert!(
+        matches!(&missing, DeployerError::ContainerNotFound(message) if message.contains("abc123")),
+        "{missing:?}"
+    );
+
+    for error in [
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "context deadline exceeded".to_string(),
+        },
+        bollard::errors::Error::RequestTimeoutError,
+    ] {
+        let failed = stop_error("abc123", error);
+        assert!(
+            matches!(&failed, DeployerError::Other(message) if message.contains("abc123")),
+            "{failed:?}"
+        );
+    }
+}
+
+#[test]
 fn only_a_docker_404_reports_a_container_as_not_found() {
     let missing = inspect_error(
         "abc123",

@@ -1012,6 +1012,29 @@ impl RemoteNodeDeployer {
         body: &B,
         carries_values: bool,
     ) -> Result<T, DeployerError> {
+        self.agent_post_inner(path, body, carries_values, None)
+            .await
+    }
+
+    /// POST to a container-scoped agent resource, preserving a missing runtime
+    /// container as the typed not-found outcome.
+    async fn agent_post_container<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+        container_id: &str,
+    ) -> Result<T, DeployerError> {
+        self.agent_post_inner(path, body, false, Some(container_id))
+            .await
+    }
+
+    async fn agent_post_inner<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+        carries_values: bool,
+        missing_container_id: Option<&str>,
+    ) -> Result<T, DeployerError> {
         let url = format!("{}{}", self.agent_url, path);
         let request = self
             .with_body(
@@ -1051,6 +1074,18 @@ impl RemoteNodeDeployer {
                 self.node_name, url, e
             ))
         })?;
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            if let Some(container_id) = missing_container_id {
+                return Err(DeployerError::ContainerNotFound(format!(
+                    "container {} was not found on node {} at {}: {}",
+                    container_id,
+                    self.node_name,
+                    url,
+                    body.error.unwrap_or_else(|| "not found".to_string())
+                )));
+            }
+        }
 
         if !body.success {
             return Err(DeployerError::DeploymentFailed(format!(
@@ -1368,9 +1403,10 @@ impl ContainerDeployer for RemoteNodeDeployer {
 
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
         let _: String = self
-            .agent_post(
+            .agent_post_container(
                 &format!("/agent/containers/{}/stop", container_id),
                 &serde_json::json!({}),
+                container_id,
             )
             .await?;
         Ok(())
@@ -3424,6 +3460,74 @@ mod tests {
         .expect("create remote deployer");
         let result = deployer.remove_container("already-gone").await;
         assert!(matches!(result, Err(DeployerError::ContainerNotFound(_))));
+        server.await.expect("mock agent task");
+    }
+
+    /// Answer one request on a local port with `status_line` and a failed
+    /// agent envelope, and return the agent's address.
+    async fn one_shot_agent_failure(
+        status_line: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"scripted failure"}"#;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn stop_container_maps_agent_not_found_to_typed_error() {
+        let (address, server) = one_shot_agent_failure("404 Not Found").await;
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer");
+        let result = deployer.stop_container("already-gone").await;
+        match result {
+            Err(DeployerError::ContainerNotFound(message)) => {
+                assert!(message.contains("already-gone"), "{message}");
+                assert!(message.contains("worker-test"), "{message}");
+            }
+            other => panic!("expected ContainerNotFound, got {other:?}"),
+        }
+        server.await.expect("mock agent task");
+    }
+
+    /// Anything but a 404 may mean the container is still running, and must
+    /// not read as "it is gone".
+    #[tokio::test]
+    async fn stop_container_keeps_agent_failure_distinct_from_not_found() {
+        let (address, server) = one_shot_agent_failure("500 Internal Server Error").await;
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer");
+        let result = deployer.stop_container("still-running").await;
+        assert!(
+            matches!(result, Err(DeployerError::DeploymentFailed(_))),
+            "{result:?}"
+        );
         server.await.expect("mock agent task");
     }
 
