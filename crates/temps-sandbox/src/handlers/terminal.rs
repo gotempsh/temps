@@ -895,6 +895,7 @@ fn attach_failure_problem(
         unexpected @ (AgentError::ConfigNotFound { .. }
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
+        | AgentError::RunCancelled { .. }
         | AgentError::ProjectNotFound { .. }
         | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }

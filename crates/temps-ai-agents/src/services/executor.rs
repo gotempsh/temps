@@ -2109,6 +2109,34 @@ impl AgentExecutor {
         })
     }
 
+    /// Cancel a run and stop its work: mark it cancelled, revoke its run-scoped
+    /// token and destroy its sandbox, which ends whatever the agent is running
+    /// there. The task executing the run (if any) stops when its next sandbox
+    /// call fails or its next status write returns
+    /// [`AgentError::RunCancelled`], and it cannot overwrite `cancelled`.
+    ///
+    /// A step already running outside the sandbox on this server, such as a
+    /// clone or a push to the git provider, is not interrupted: it finishes,
+    /// and the run stops at the status write after it.
+    pub async fn cancel_run(&self, run_id: i32) -> Result<agent_runs::Model, AgentError> {
+        let run = self.run_service.cancel_run(run_id).await?;
+
+        if let Err(error) = self
+            .run_service
+            .append_log(run_id, "info", "Run cancelled by user", None)
+            .await
+        {
+            tracing::warn!("Failed to log the cancel of run {}: {}", run_id, error);
+        }
+        if let Some(token_id) = self.run_token_ids.write().await.remove(&run_id) {
+            self.revoke_run_token(run_id, token_id).await;
+        }
+        // Logs its own failure: the run stays cancelled either way.
+        let _ = self.sandbox_registry.release(run_id).await;
+
+        Ok(run)
+    }
+
     /// Execute a single autopilot run. Handles the full lifecycle from cloning to PR creation.
     pub async fn execute_run(&self, run_id: i32) {
         tracing::info!("Starting autopilot run {}", run_id);
@@ -2120,8 +2148,7 @@ impl AgentExecutor {
                 tracing::info!("Autopilot run {} completed successfully", run_id);
             }
             Err(e) => {
-                tracing::error!("Autopilot run {} failed: {}", run_id, e);
-                let _ = self
+                let recorded = self
                     .run_service
                     .update_status(
                         run_id,
@@ -2133,13 +2160,24 @@ impl AgentExecutor {
                         },
                     )
                     .await;
-                let _ = self
-                    .run_service
-                    .append_log(run_id, "error", &format!("Run failed: {}", e), None)
-                    .await;
+                if recorded.is_ok_and(|run| run.status == "cancelled") {
+                    // What ended it is the cancel (often its sandbox being
+                    // stopped), not a failure to tell anyone about.
+                    tracing::info!(
+                        "Autopilot run {} stopped after being cancelled: {}",
+                        run_id,
+                        e
+                    );
+                } else {
+                    tracing::error!("Autopilot run {} failed: {}", run_id, e);
+                    let _ = self
+                        .run_service
+                        .append_log(run_id, "error", &format!("Run failed: {}", e), None)
+                        .await;
 
-                // Send failure notification (best-effort — load context from DB)
-                self.send_failure_notification(run_id, &e).await;
+                    // Send failure notification (best-effort — load context from DB)
+                    self.send_failure_notification(run_id, &e).await;
+                }
             }
         }
 
@@ -5889,6 +5927,156 @@ mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
+    }
+
+    /// Records which runs had their sandbox released.
+    #[derive(Default)]
+    struct RecordingRunSandboxes {
+        released: Mutex<Vec<i32>>,
+    }
+
+    #[async_trait]
+    impl crate::sandbox::managed::RunSandboxService for RecordingRunSandboxes {
+        async fn create_for_run(
+            &self,
+            config: crate::sandbox::SandboxCreateConfig,
+        ) -> Result<crate::sandbox::SandboxHandle, AgentError> {
+            Err(AgentError::SandboxNotFound {
+                run_id: config.run_id,
+                sandbox: "this test creates no sandboxes".to_string(),
+            })
+        }
+
+        async fn release_for_run(
+            &self,
+            run_id: i32,
+            _handle: Option<&crate::sandbox::SandboxHandle>,
+        ) -> Result<(), AgentError> {
+            self.released.lock().unwrap().push(run_id);
+            Ok(())
+        }
+    }
+
+    fn make_executor_for_cancel_tests(
+        db: sea_orm::DatabaseConnection,
+    ) -> (AgentExecutor, Arc<RecordingRunSandboxes>) {
+        let db = Arc::new(db);
+        let enc = make_encryption_service();
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder: Arc::new(GitRecorder::default()),
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let sandboxes = Arc::new(RecordingRunSandboxes::default());
+        let registry = make_sandbox_registry();
+        registry.set_managed(sandboxes.clone());
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            Arc::new(AgentRunService::new(db.clone())),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            registry,
+            make_secret_service(db.clone()),
+            make_definition_service(db),
+        );
+        (executor, sandboxes)
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_stops_its_sandbox_and_forgets_its_token() {
+        let run_id = 77;
+        let cancelled = agent_runs::Model {
+            status: "cancelled".to_string(),
+            ..make_run(run_id, 1)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run(run_id, 1)]]) // get_run
+            .append_query_results(vec![vec![cancelled]]) // guarded write
+            .append_query_results(vec![vec![make_log(run_id)]]) // append_log
+            .into_connection();
+        let (executor, sandboxes) = make_executor_for_cancel_tests(db);
+        executor.run_token_ids.write().await.insert(run_id, 999);
+
+        let run = executor.cancel_run(run_id).await.expect("cancel");
+
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(*sandboxes.released.lock().unwrap(), vec![run_id]);
+        assert!(executor.run_token_ids.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_already_finished_keeps_its_sandbox_state_on_cancel() {
+        let run_id = 78;
+        let finished = agent_runs::Model {
+            status: "completed".to_string(),
+            ..make_run(run_id, 1)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![finished]])
+            .into_connection();
+        let (executor, sandboxes) = make_executor_for_cancel_tests(db);
+
+        let error = executor.cancel_run(run_id).await.expect_err("finished");
+
+        assert!(matches!(error, AgentError::Validation { .. }), "{error}");
+        assert!(sandboxes.released.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_stopped_by_its_cancel_reports_no_failure() {
+        let run_id = 79;
+        let cancelled = agent_runs::Model {
+            status: "cancelled".to_string(),
+            ..make_run(run_id, 1)
+        };
+        // Every query after the failure write would need a result here: the
+        // failure log and notification are not written for a cancelled run.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![cancelled.clone()]]) // execute_run_inner: get_run
+                .append_query_results(vec![Vec::<project_agents::Model>::new()]) // no such agent
+                .append_query_results(vec![vec![cancelled.clone()]]) // update_status: get_run
+                .append_query_results(vec![vec![cancelled]]) // update_status: UPDATE
+                .into_connection(),
+        );
+        let enc = make_encryption_service();
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder: Arc::new(GitRecorder::default()),
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            Arc::new(AgentRunService::new(db.clone())),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            make_sandbox_registry(),
+            make_secret_service(db.clone()),
+            make_definition_service(db.clone()),
+        );
+
+        executor.execute_run(run_id).await;
+        drop(executor);
+
+        let log = Arc::into_inner(db)
+            .expect("only reference")
+            .into_transaction_log();
+        assert!(
+            !log.iter()
+                .flat_map(|transaction| transaction.statements())
+                .any(|statement| statement.sql.contains("agent_run_logs")),
+            "a cancelled run must not log a failure: {log:?}"
+        );
     }
 
     #[test]

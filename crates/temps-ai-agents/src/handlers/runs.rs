@@ -615,7 +615,7 @@ pub async fn cancel_run(
         .map_err(Problem::from)?;
 
     let run = app_state
-        .run_service
+        .executor
         .cancel_run(run_id)
         .await
         .map_err(Problem::from)?;

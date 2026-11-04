@@ -293,6 +293,7 @@ fn provider_err(e: AgentError) -> ApiError {
         AgentError::ConfigNotFound { .. }
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
+        | AgentError::RunCancelled { .. }
         | AgentError::ProjectNotFound { .. }
         | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }

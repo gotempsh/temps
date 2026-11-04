@@ -92,6 +92,11 @@ pub enum AgentError {
     #[error("Sandbox not found: {sandbox}")]
     SandboxNotFound { run_id: i32, sandbox: String },
 
+    /// A step of a run tried to move it on after it was cancelled. Returned
+    /// by the run's status write, so the run stops at its next step.
+    #[error("Agent run {run_id} was cancelled, so it stops here")]
+    RunCancelled { run_id: i32 },
+
     /// The sandbox's provider state is known (its VM or container exists on
     /// disk or in the runtime) but the VM is not running: the VMM process
     /// exited, was killed with the Temps service, or the host rebooted. Kept
@@ -587,6 +592,9 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Creation Failed")
                     .with_detail(error.to_string())
             }
+            AgentError::RunCancelled { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Agent Run Cancelled")
+                .with_detail(error.to_string()),
             AgentError::SandboxNotFound { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Not Found")
