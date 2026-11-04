@@ -5595,6 +5595,129 @@ async fn test_failure_report_preview_stops_at_failed_job_and_redacts_secrets(
     Ok(())
 }
 
+/// A key rotated since the deployment ran leaves its envelope undecryptable.
+/// The log, which still holds the secret value, must stay out of the preview
+/// and of anything sent, not go out with only the pattern-based redaction.
+#[tokio::test]
+#[serial_test::serial(temps_telemetry_env)]
+async fn test_failure_report_withholds_the_log_when_secrets_cannot_be_decrypted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+        && !tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    {
+        eprintln!("Docker unavailable; skipping undecryptable failure-report test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+    let secret = "super-secret-value";
+    let rotated_away =
+        EncryptionService::new("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")?;
+    let mut job_config = serde_json::Map::new();
+    crate::services::sensitive_envelope::write_sealed(
+        &mut job_config,
+        &rotated_away,
+        "secrets",
+        &std::collections::HashMap::from([("DB_PASSWORD".to_string(), secret.to_string())]),
+    )?;
+
+    let log_dir = tempfile::tempdir()?;
+    let log_id = format!("{}-build_image", uuid::Uuid::new_v4().simple());
+    tokio::fs::write(
+        log_dir.path().join(format!("{log_id}.log")),
+        format!("connecting with password {secret}\n"),
+    )
+    .await?;
+    let job = temps_entities::deployment_jobs::ActiveModel {
+        deployment_id: Set(deployment.id),
+        job_id: Set("build_image".to_string()),
+        job_type: Set("build_imageJob".to_string()),
+        name: Set("Build Image".to_string()),
+        log_id: Set(log_id),
+        status: Set(temps_entities::types::JobStatus::Failure),
+        error_message: Set(Some(format!("login failed for {secret}"))),
+        job_config: Set(Some(serde_json::Value::Object(job_config))),
+        execution_order: Set(Some(0)),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+
+    // Reporting on, and pointed at a closed port: if the refusal below ever
+    // regresses, the test fails on the send error instead of reaching a server.
+    std::env::remove_var("TEMPS_TELEMETRY");
+    std::env::set_var(
+        "TEMPS_FAILURE_REPORT_ENDPOINT",
+        "http://127.0.0.1:9/v1/deploy-failure-reports",
+    );
+    let failure_service = crate::services::FailureReportService::new(
+        Arc::new(create_deployment_service_for_test(db.clone())),
+        Arc::new(temps_deployment_logs::LogService::new(
+            log_dir.path().to_path_buf(),
+        )),
+        create_test_encryption_service(),
+    );
+    std::env::remove_var("TEMPS_FAILURE_REPORT_ENDPOINT");
+    let failure_service = failure_service?;
+
+    let preview = failure_service
+        .build_preview(deployment.project_id, deployment.id, &job.job_id)
+        .await?;
+
+    assert!(
+        !preview.redacted_log.contains(secret),
+        "the log must not be shown without exact-match redaction: {}",
+        preview.redacted_log
+    );
+    assert!(
+        preview.redacted_log.contains("Log withheld")
+            && preview
+                .redacted_log
+                .contains(&format!("deployment {}", deployment.id)),
+        "the preview must say why the log is missing: {}",
+        preview.redacted_log
+    );
+    assert_eq!(preview.error_message, None);
+    assert!(
+        !preview.github_issue_title.contains(secret),
+        "{}",
+        preview.github_issue_title
+    );
+    assert!(
+        !preview.github_issue_body.contains(secret),
+        "{}",
+        preview.github_issue_body
+    );
+
+    let refused = failure_service
+        .send_report(
+            deployment.project_id,
+            deployment.id,
+            &job.job_id,
+            &format!("connecting with password {secret}\n"),
+        )
+        .await
+        .expect_err("a report that cannot be checked for secrets must not be sent");
+    assert!(
+        matches!(
+            &refused,
+            crate::services::FailureReportError::SecretsUnavailable { deployment_id, .. }
+                if *deployment_id == deployment.id
+        ),
+        "{refused:?}"
+    );
+    assert!(!refused.to_string().contains(secret), "{refused}");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_get_public_repo_reference_none_for_private_none_for_public(
 ) -> Result<(), Box<dyn std::error::Error>> {
