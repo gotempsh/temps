@@ -921,7 +921,7 @@ fn expect_owned_container_info(
     });
 }
 
-fn create_cleanup_service_for_test(
+pub(crate) fn create_cleanup_service_for_test(
     db: Arc<temps_database::DbConnection>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
 ) -> DeploymentService {
@@ -2751,6 +2751,41 @@ async fn pause_refuses_a_micro_vm_replica_before_changing_anything(
         .await?
         .ok_or("container row")?;
     assert_eq!(row.status.as_deref(), Some("running"));
+    Ok(())
+}
+
+/// What a replica is does not depend on a plane running in this process: one
+/// that failed to start must not let a pause ask Docker about a microVM, whose
+/// 404 would read as stopped and leave the VM running under a "paused" row.
+#[tokio::test]
+async fn pause_refuses_a_micro_vm_replica_without_a_workload_plane(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping microVM pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    plane_with_micro_vm_replica(&db, &deployment, &container).await?;
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    let error = service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await
+        .expect_err("a microVM replica cannot be paused");
+    assert!(
+        matches!(error, DeploymentError::MicroVmReplicaCannotBePaused { .. }),
+        "{error:?}"
+    );
+    let after = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(after.state, "deployed");
     Ok(())
 }
 

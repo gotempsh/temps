@@ -37,20 +37,24 @@ pub enum DeploymentError {
         expected: &'static str,
     },
 
-    /// A pause could not stop every replica, so the deployment was put back
-    /// in the state it was paused from and the pause can be retried. Replicas
-    /// that did stop stay stopped: the operator asked for them not to run.
+    /// A pause could not stop every replica, so it put the deployment back in
+    /// the state it was paused from, unless something else had already moved
+    /// it. Replicas that did stop stay stopped: the operator asked for them
+    /// not to run. `state` is what the deployment is now, or "unknown" when
+    /// that could not be read, and `next_step` follows from it: a retry is only
+    /// advice while a pause would accept it.
     #[error(
         "Pause of deployment {deployment_id} did not complete: stopped {stopped} of {total} \
          replica(s) and could not stop the rest, which are still running ({failures}). The \
-         deployment stays '{restored_state}'; pause it again to retry"
+         deployment's state is '{state}': {next_step}"
     )]
     DeploymentPauseIncomplete {
         deployment_id: i32,
         stopped: usize,
         total: usize,
         failures: String,
-        restored_state: String,
+        state: String,
+        next_step: &'static str,
     },
 
     /// A pause was asked of a deployment with a microVM replica, which the

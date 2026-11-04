@@ -1345,7 +1345,7 @@ mod tests {
     {
         let database = temps_test_utils::TestDatabase::new().await?;
         let db = database.connection_arc();
-        db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY,preset TEXT NOT NULL,is_deleted BOOLEAN NOT NULL DEFAULT FALSE); CREATE TABLE environments(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL,current_deployment_id INTEGER,sleeping BOOLEAN NOT NULL DEFAULT FALSE,deleted_at TIMESTAMPTZ); CREATE TABLE deployments(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL,environment_id INTEGER NOT NULL,state TEXT NOT NULL); CREATE TABLE nodes(id INTEGER PRIMARY KEY); CREATE TABLE alarms(id INTEGER PRIMARY KEY,alarm_type TEXT,status TEXT,metadata JSONB,project_id INTEGER); CREATE TABLE deployment_containers(id INTEGER PRIMARY KEY,deployment_id INTEGER NOT NULL,container_id TEXT NOT NULL,container_port INTEGER,node_id INTEGER,deleted_at TIMESTAMPTZ); INSERT INTO projects(id,preset) VALUES(1,'dockerfile'); INSERT INTO environments(id,project_id,current_deployment_id) VALUES(2,1,3); INSERT INTO deployments VALUES(3,1,2,'completed'); INSERT INTO nodes VALUES(5),(6);").await?;
+        db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY,preset TEXT NOT NULL,is_deleted BOOLEAN NOT NULL DEFAULT FALSE); CREATE TABLE environments(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL,current_deployment_id INTEGER,sleeping BOOLEAN NOT NULL DEFAULT FALSE,deleted_at TIMESTAMPTZ); CREATE TABLE deployments(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL,environment_id INTEGER NOT NULL,state TEXT NOT NULL); CREATE TABLE nodes(id INTEGER PRIMARY KEY); CREATE TABLE alarms(id INTEGER PRIMARY KEY,alarm_type TEXT,status TEXT,metadata JSONB,project_id INTEGER); CREATE TABLE deployment_containers(id INTEGER PRIMARY KEY,deployment_id INTEGER NOT NULL,container_id TEXT NOT NULL,container_port INTEGER,node_id INTEGER,deleted_at TIMESTAMPTZ,status TEXT); INSERT INTO projects(id,preset) VALUES(1,'dockerfile'); INSERT INTO environments(id,project_id,current_deployment_id) VALUES(2,1,3); INSERT INTO deployments VALUES(3,1,2,'completed'); INSERT INTO nodes VALUES(5),(6);").await?;
         db.execute(sql("INSERT INTO deployment_containers(id,deployment_id,container_id,container_port) VALUES(4,3,$1,NULL)",vec!["a".repeat(64).into()])).await?;
         temps_migrations::RuntimeHealthMigration
             .up(&SchemaManager::new(db.as_ref()))
@@ -2006,6 +2006,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replica_stopped_on_purpose_raises_no_alarm_until_it_runs_again(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_database, service) = setup().await?;
+        save(&service).await;
+        let row = placement(&service).await;
+        let session = Uuid::new_v4();
+        let term = grant(&service, &row, session).await;
+        service.db.execute_unprepared("UPDATE runtime_health_assignments SET activated_at=clock_timestamp()-interval '5 minutes'").await?;
+        let failing = |sequence| {
+            let mut failure = sample(&row, sequence);
+            failure.observation.state = HealthState::Unhealthy;
+            failure.observation.reason = temps_runtime_health::HealthReason::NotRunning;
+            failure
+        };
+
+        service
+            .db
+            .execute_unprepared("UPDATE deployment_containers SET status='stopped'")
+            .await?;
+        for sequence in 1..=3 {
+            service
+                .accept(&row, session, failing(sequence), term)
+                .await?;
+        }
+        service.stage_alarms(vec![row.id], term).await?;
+        assert_eq!(
+            count(&service, "runtime_health_alarm_outbox").await,
+            0,
+            "a stopped replica failing its probe is what stopped means"
+        );
+        // Started again, it is monitored again.
+        service
+            .db
+            .execute_unprepared("UPDATE deployment_containers SET status='running'")
+            .await?;
+        service.accept(&row, session, failing(4), term).await?;
+        service.stage_alarms(vec![row.id], term).await?;
+        assert_eq!(count(&service, "runtime_health_alarm_outbox").await, 1);
+        let fired=service.db.query_one(sql("SELECT event_type FROM runtime_health_alarm_outbox ORDER BY created_at DESC LIMIT 1",vec![])).await?.unwrap();
+        assert_eq!(fired.try_get::<String>("", "event_type")?, "fire_probe");
+        // Stopping a replica that was alarmed resolves the alarm.
+        service
+            .db
+            .execute_unprepared("UPDATE deployment_containers SET status='stopped'")
+            .await?;
+        service.stage_alarms(vec![row.id], term).await?;
+        assert_eq!(count(&service, "runtime_health_alarm_outbox").await, 2);
+        let resolved=service.db.query_one(sql("SELECT event_type FROM runtime_health_alarm_outbox ORDER BY created_at DESC LIMIT 1",vec![])).await?.unwrap();
+        assert_eq!(
+            resolved.try_get::<String>("", "event_type")?,
+            "resolve_probe"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn alarm_thresholds_deduplicate_and_distinguish_monitoring_loss_from_failure(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (_database, service) = setup().await?;
@@ -2093,7 +2149,7 @@ impl RuntimeHealthService {
         }
         let ids = serde_json::to_value(ids)
             .map_err(|_| RuntimeHealthError::Configuration { deployment_id: 0 })?;
-        let rows=AlarmCandidate::find_by_statement(sql("SELECT a.id,r.configuration,a.state,COALESCE(a.valid_until>clock_timestamp() AND a.lease_until>clock_timestamp(),FALSE) AS fresh,((a.state='unknown' AND a.reason IN ('runtime_unavailable','unauthorized','endpoint_unavailable','identity_mismatch','cancelled','authorization_failed') AND a.unknown_since<clock_timestamp()-interval '120 seconds') OR COALESCE(LEAST(a.valid_until,a.lease_until),a.activated_at,a.created_at)<clock_timestamp()-interval '120 seconds') AS lost,(a.retired_at IS NOT NULL OR e.current_deployment_id IS DISTINCT FROM r.deployment_id OR d.state NOT IN ('completed','deployed') OR c.deleted_at IS NOT NULL OR p.is_deleted OR NOT COALESCE(h.enabled,TRUE) OR COALESCE(h.paused,FALSE) OR e.sleeping OR r.configuration->>'unavailable_reason' IS NOT NULL) AS inactive,a.failure_streak,a.recovery_streak,a.alarm_state,a.monitoring_lost FROM runtime_health_assignments a JOIN runtime_health_revisions r ON r.id=a.revision_id JOIN deployment_containers c ON c.id=a.container_record_id JOIN environments e ON e.id=r.environment_id JOIN deployments d ON d.id=r.deployment_id JOIN projects p ON p.id=r.project_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE a.id IN (SELECT value::uuid FROM jsonb_array_elements_text($1)) ORDER BY a.id FOR UPDATE OF a",vec![ids.into()])).all(&transaction).await.map_err(|e| db_error("load runtime alarm transitions",e))?;
+        let rows=AlarmCandidate::find_by_statement(sql("SELECT a.id,r.configuration,a.state,COALESCE(a.valid_until>clock_timestamp() AND a.lease_until>clock_timestamp(),FALSE) AS fresh,((a.state='unknown' AND a.reason IN ('runtime_unavailable','unauthorized','endpoint_unavailable','identity_mismatch','cancelled','authorization_failed') AND a.unknown_since<clock_timestamp()-interval '120 seconds') OR COALESCE(LEAST(a.valid_until,a.lease_until),a.activated_at,a.created_at)<clock_timestamp()-interval '120 seconds') AS lost,(a.retired_at IS NOT NULL OR e.current_deployment_id IS DISTINCT FROM r.deployment_id OR d.state NOT IN ('completed','deployed') OR c.deleted_at IS NOT NULL OR c.status IS NOT DISTINCT FROM 'stopped' OR p.is_deleted OR NOT COALESCE(h.enabled,TRUE) OR COALESCE(h.paused,FALSE) OR e.sleeping OR r.configuration->>'unavailable_reason' IS NOT NULL) AS inactive,a.failure_streak,a.recovery_streak,a.alarm_state,a.monitoring_lost FROM runtime_health_assignments a JOIN runtime_health_revisions r ON r.id=a.revision_id JOIN deployment_containers c ON c.id=a.container_record_id JOIN environments e ON e.id=r.environment_id JOIN deployments d ON d.id=r.deployment_id JOIN projects p ON p.id=r.project_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE a.id IN (SELECT value::uuid FROM jsonb_array_elements_text($1)) ORDER BY a.id FOR UPDATE OF a",vec![ids.into()])).all(&transaction).await.map_err(|e| db_error("load runtime alarm transitions",e))?;
         for row in rows {
             let config: EffectiveProbeRevision = serde_json::from_value(row.configuration)
                 .map_err(|_| RuntimeHealthError::Configuration { deployment_id: 0 })?;
@@ -2155,7 +2211,7 @@ impl RuntimeHealthService {
         let Some(alarms) = self.alarms.get() else {
             return Ok(());
         };
-        let events=AlarmDelivery::find_by_statement(sql("SELECT o.id,o.assignment_id,o.event_type,r.project_id,r.environment_id,r.deployment_id,a.container_record_id,COALESCE(a.retired_at IS NULL AND e.current_deployment_id=r.deployment_id AND d.state IN ('completed','deployed') AND c.deleted_at IS NULL AND NOT e.sleeping AND COALESCE(h.enabled,TRUE) AND NOT COALESCE(h.paused,FALSE),FALSE) AS current,a.alarm_state,a.monitoring_lost FROM runtime_health_alarm_outbox o LEFT JOIN runtime_health_assignments a ON a.id=o.assignment_id LEFT JOIN runtime_health_revisions r ON r.id=a.revision_id LEFT JOIN deployments d ON d.id=r.deployment_id LEFT JOIN environments e ON e.id=r.environment_id LEFT JOIN deployment_containers c ON c.id=a.container_record_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE o.delivered_at IS NULL AND o.ready_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM runtime_health_coordinator WHERE owner=$1 AND term=$2 AND expires_at>clock_timestamp()) ORDER BY o.ready_at,o.id LIMIT 100",vec![self.coordinator.into(),term.into()])).all(self.db.as_ref()).await.map_err(|e| db_error("load runtime alarm outbox",e))?;
+        let events=AlarmDelivery::find_by_statement(sql("SELECT o.id,o.assignment_id,o.event_type,r.project_id,r.environment_id,r.deployment_id,a.container_record_id,COALESCE(a.retired_at IS NULL AND e.current_deployment_id=r.deployment_id AND d.state IN ('completed','deployed') AND c.deleted_at IS NULL AND c.status IS DISTINCT FROM 'stopped' AND NOT e.sleeping AND COALESCE(h.enabled,TRUE) AND NOT COALESCE(h.paused,FALSE),FALSE) AS current,a.alarm_state,a.monitoring_lost FROM runtime_health_alarm_outbox o LEFT JOIN runtime_health_assignments a ON a.id=o.assignment_id LEFT JOIN runtime_health_revisions r ON r.id=a.revision_id LEFT JOIN deployments d ON d.id=r.deployment_id LEFT JOIN environments e ON e.id=r.environment_id LEFT JOIN deployment_containers c ON c.id=a.container_record_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE o.delivered_at IS NULL AND o.ready_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM runtime_health_coordinator WHERE owner=$1 AND term=$2 AND expires_at>clock_timestamp()) ORDER BY o.ready_at,o.id LIMIT 100",vec![self.coordinator.into(),term.into()])).all(self.db.as_ref()).await.map_err(|e| db_error("load runtime alarm outbox",e))?;
         for event in events {
             let probe = event.event_type.ends_with("probe");
             let alarm_type = if probe {
