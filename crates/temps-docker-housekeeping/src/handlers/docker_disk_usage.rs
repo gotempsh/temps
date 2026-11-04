@@ -71,28 +71,52 @@ async fn node_docker_disk_usage(
     Ok(Json(usage))
 }
 
+/// The daemon failures carry the daemon's address, its error text and whatever
+/// body it answered with. All of that goes to the log for the operator; the
+/// response only says what kind of failure it was.
 impl From<DockerDiskUsageError> for Problem {
     fn from(error: DockerDiskUsageError) -> Self {
-        match error {
+        match &error {
             DockerDiskUsageError::UnsupportedNode { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Docker Disk Usage Not Available For Node")
                     .with_detail(error.to_string())
             }
             DockerDiskUsageError::Unavailable { .. } => {
+                tracing::error!(error = %error, "Docker disk usage request failed");
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("Docker Daemon Unreachable")
-                    .with_detail(error.to_string())
+                    .with_detail(
+                        "Could not reach the Docker daemon on this server. \
+                         The server log has the details.",
+                    )
             }
-            DockerDiskUsageError::Timeout { .. } => {
+            DockerDiskUsageError::Timeout { timeout_secs, .. } => {
+                tracing::error!(error = %error, "Docker disk usage request failed");
                 problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                     .with_title("Docker Daemon Timed Out")
-                    .with_detail(error.to_string())
+                    .with_detail(format!(
+                        "The Docker daemon on this server did not answer within \
+                         {timeout_secs} seconds. The server log has the details."
+                    ))
             }
-            DockerDiskUsageError::UnexpectedStatus { .. } | DockerDiskUsageError::Parse { .. } => {
+            DockerDiskUsageError::UnexpectedStatus { status, .. } => {
+                tracing::error!(error = %error, "Docker disk usage request failed");
                 problemdetails::new(StatusCode::BAD_GATEWAY)
                     .with_title("Unexpected Docker Daemon Response")
-                    .with_detail(error.to_string())
+                    .with_detail(format!(
+                        "The Docker daemon on this server answered with HTTP {status}. \
+                         The server log has the details."
+                    ))
+            }
+            DockerDiskUsageError::Parse { .. } => {
+                tracing::error!(error = %error, "Docker disk usage request failed");
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Unexpected Docker Daemon Response")
+                    .with_detail(
+                        "The Docker daemon on this server answered with a response that \
+                         could not be read. The server log has the details.",
+                    )
             }
         }
     }
@@ -218,5 +242,90 @@ mod tests {
         ] {
             assert_eq!(Problem::from(error).status_code, status);
         }
+    }
+
+    /// The daemon's address, its error text and its response body stay on the
+    /// server, whichever way the daemon failed.
+    #[test]
+    fn daemon_failures_keep_the_daemon_details_out_of_the_response() {
+        let host = || "unix:///var/run/private/docker.sock".to_string();
+        for error in [
+            DockerDiskUsageError::Unavailable {
+                host: host(),
+                reason: "connect refused at 10.0.0.9".to_string(),
+            },
+            DockerDiskUsageError::Timeout {
+                host: host(),
+                timeout_secs: 30,
+            },
+            DockerDiskUsageError::UnexpectedStatus {
+                host: host(),
+                status: 500,
+                body: "layer path /var/lib/private/overlay2".to_string(),
+            },
+            DockerDiskUsageError::Parse {
+                host: host(),
+                reason: "expected value at 10.0.0.9".to_string(),
+            },
+        ] {
+            let problem = Problem::from(error);
+            let detail = problem.body.get("detail").and_then(|v| v.as_str());
+            let detail = detail.unwrap_or_else(|| panic!("no detail in {:?}", problem.body));
+            for leaked in ["unix:", "docker.sock", "10.0.0.9", "overlay2"] {
+                assert!(!detail.contains(leaked), "{leaked} in {detail}");
+            }
+        }
+    }
+
+    /// The route, not just the mapping, against a daemon that answers 500.
+    #[tokio::test]
+    async fn a_daemon_error_answer_is_a_502_without_the_daemon_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub daemon");
+        let address = listener.local_addr().expect("stub daemon address");
+        let daemon = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let body = "daemon internals";
+            let answer = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(answer.as_bytes())
+                .await
+                .expect("write answer");
+        });
+
+        let service = DockerDiskUsageService::new(crate::services::DockerHost::Http(format!(
+            "http://{address}"
+        )));
+        let mut request = Request::builder()
+            .uri("/nodes/0/docker-disk-usage")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(api_key(temps_auth::Permission::SettingsRead));
+        let response = configure_routes()
+            .with_state(Arc::new(service))
+            .oneshot(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("HTTP 500"), "{body}");
+        assert!(!body.contains(&address.to_string()), "{body}");
+        assert!(!body.contains("daemon internals"), "{body}");
+        daemon.await.expect("stub daemon");
     }
 }
