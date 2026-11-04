@@ -7,6 +7,7 @@ pub mod deployment_config;
 pub mod disk_status;
 pub mod enrollment_tokens;
 mod installation_secrets;
+pub mod loopback_reservation;
 pub mod node_client;
 pub mod otel_export;
 pub mod public_ingress;

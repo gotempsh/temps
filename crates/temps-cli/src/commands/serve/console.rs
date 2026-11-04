@@ -2093,17 +2093,25 @@ pub struct ConsoleApiParams {
     pub startup_state: Arc<temps_core::console_startup::ConsoleStartupState>,
 }
 
+/// The backlog `TcpListener::bind` uses, so a reserved port behaves the same.
+const RESERVED_LISTENER_BACKLOG: u32 = 1024;
+
 /// Bind a console listener, naming the address in the error so the startup
-/// status page can tell the operator which address is taken.
+/// status page can tell the operator which address is taken. A port the server
+/// picked for itself is already held, and starts listening here.
 async fn bind_console_listener(
     address: &str,
 ) -> Result<TcpListener, super::startup_failure::ConsoleStartupError> {
-    TcpListener::bind(address).await.map_err(|source| {
-        super::startup_failure::ConsoleStartupError::ListenerBind {
+    let bound = match temps_config::loopback_reservation::take_reserved_socket(address) {
+        Some(socket) => socket.listen(RESERVED_LISTENER_BACKLOG),
+        None => TcpListener::bind(address).await,
+    };
+    bound.map_err(
+        |source| super::startup_failure::ConsoleStartupError::ListenerBind {
             address: address.to_string(),
             source,
-        }
-    })
+        },
+    )
 }
 
 /// Storage backend selection error for the log aggregator. Owned by
@@ -3992,6 +4000,51 @@ mod spa_fallback_tests {
                 .get(header::CONTENT_TYPE)
                 .map(|v| v.as_bytes()),
             Some(b"application/json".as_slice())
+        );
+    }
+}
+
+#[cfg(test)]
+mod bind_console_listener_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serves_a_reserved_port_on_the_reserved_address() {
+        let address = temps_config::loopback_reservation::reserve_loopback_address().unwrap();
+
+        let listener = bind_console_listener(&address).await.unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().to_string(), address);
+        tokio::net::TcpStream::connect(&address).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binds_a_named_address_that_was_not_reserved() {
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = free.local_addr().unwrap().to_string();
+        drop(free);
+
+        let listener = bind_console_listener(&address).await.unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().to_string(), address);
+    }
+
+    #[tokio::test]
+    async fn names_the_address_when_a_named_one_is_taken() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = taken.local_addr().unwrap().to_string();
+
+        let error = bind_console_listener(&address).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                crate::commands::serve::startup_failure::ConsoleStartupError::ListenerBind {
+                    address: named,
+                    ..
+                } if named == &address
+            ),
+            "unexpected error: {error}"
         );
     }
 }
