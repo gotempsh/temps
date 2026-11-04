@@ -371,4 +371,269 @@ async fn integration_fan_out_skips_control_plane_when_flag_off() {
     // Silence unused warning on the QueryFilter / ColumnTrait imports.
     let _ = temps_entities::backup_schedule_services::Column::ScheduleId.eq(0);
 }
+
+/// A schedule whose fan-out is control-plane only, so no service rows or
+/// Docker probes are involved in the run.
+async fn insert_control_plane_schedule(
+    db: &DatabaseConnection,
+) -> temps_entities::backup_schedules::Model {
+    use sea_orm::ActiveValue::Set;
+
+    let now = chrono::Utc::now();
+    // Scheduled rows are owned by the system user, which the server seeds at
+    // boot and a freshly migrated database does not have.
+    temps_entities::users::ActiveModel {
+        id: Set(0),
+        name: Set("System".to_string()),
+        email: Set("system@example.invalid".to_string()),
+        password_hash: Set(None),
+        email_verified: Set(true),
+        email_verification_token: Set(None),
+        email_verification_expires: Set(None),
+        password_reset_token: Set(None),
+        password_reset_expires: Set(None),
+        must_change_password: Set(false),
+        deleted_at: Set(None),
+        mfa_secret: Set(None),
+        mfa_enabled: Set(false),
+        mfa_recovery_codes: Set(None),
+        oidc_subject: Set(None),
+        oidc_provider_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .expect("insert system user");
+
+    let source = temps_entities::s3_sources::ActiveModel {
+        id: sea_orm::NotSet,
+        name: Set(format!("run-race-source-{}", Uuid::new_v4())),
+        bucket_name: Set("run-race".to_string()),
+        bucket_path: Set("/".to_string()),
+        access_key_id: Set(String::new()),
+        secret_key: Set(String::new()),
+        session_token: Set(None),
+        credentials_expire_at: Set(None),
+        region: Set("test-region-1".to_string()),
+        endpoint: Set(None),
+        force_path_style: Set(Some(true)),
+        is_default: Set(false),
+        managed_by_cloud: Set(false),
+        lifecycle_reconcile_failed_at: Set(None),
+        lifecycle_reconcile_generation: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        backing_service_id: Set(None),
+    }
+    .insert(db)
+    .await
+    .expect("insert S3 source");
+
+    temps_entities::backup_schedules::ActiveModel {
+        id: sea_orm::NotSet,
+        name: Set(format!("run-race-schedule-{}", Uuid::new_v4())),
+        backup_type: Set("full".to_string()),
+        retention_period: Set(7),
+        s3_source_id: Set(source.id),
+        schedule_expression: Set("0 0 2 * * *".to_string()),
+        enabled: Set(true),
+        last_run: Set(None),
+        next_run: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+        description: Set(None),
+        tags: Set("[]".to_string()),
+        max_runtime_secs: Set(None),
+        target_all_services: Set(false),
+        include_control_plane: Set(true),
+        generated_kind: Set(None),
+    }
+    .insert(db)
+    .await
+    .expect("insert schedule")
+}
+
+/// Triggers that all pass the early in-flight check must still start one run.
+#[tokio::test]
+async fn concurrent_triggers_start_exactly_one_run() {
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+    use temps_test_utils::TestDatabase;
+
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(d) => d,
+        Err(e) => {
+            println!("TestDatabase unavailable, skipping: {e}");
+            return;
+        }
+    };
+    let db = test_db.db.clone();
+    let schedule = insert_control_plane_schedule(db.as_ref()).await;
+    let service = make_scope_test_service(db.clone());
+
+    let outcomes = futures::future::join_all(
+        (0..8).map(|_| service.enqueue_scheduled_run(&schedule, TriggerSource::Manual, None)),
+    )
+    .await;
+
+    let mut started = Vec::new();
+    let mut declined = Vec::new();
+    for outcome in outcomes {
+        match outcome.expect("a trigger either starts a run or declines") {
+            ScheduleRunOutcome::Started { run_id, .. } => started.push(run_id),
+            ScheduleRunOutcome::AlreadyInFlight { existing_run_id } => {
+                declined.push(existing_run_id)
+            }
+        }
+    }
+    assert_eq!(started.len(), 1, "started: {started:?}");
+    assert_eq!(declined, vec![started[0]; 7]);
+
+    let runs = temps_entities::schedule_runs::Entity::find()
+        .filter(temps_entities::schedule_runs::Column::ScheduleId.eq(schedule.id))
+        .count(db.as_ref())
+        .await
+        .expect("count runs");
+    assert_eq!(runs, 1);
+    let backups = temps_entities::backups::Entity::find()
+        .filter(temps_entities::backups::Column::ScheduleId.eq(Some(schedule.id)))
+        .count(db.as_ref())
+        .await
+        .expect("count backups");
+    assert_eq!(backups, 1);
+
+    // A declined trigger releases the lock: a later one is declined again
+    // rather than blocking, and it does not record anything.
+    let again = service
+        .enqueue_scheduled_run(&schedule, TriggerSource::Manual, None)
+        .await
+        .expect("later trigger");
+    assert!(matches!(
+        again,
+        ScheduleRunOutcome::AlreadyInFlight { existing_run_id } if existing_run_id == started[0]
+    ));
+}
+
+/// An S3 source that names its backing service, so resolving it takes one
+/// query and no decryption.
+fn source_with_backing_service(id: i32) -> temps_entities::s3_sources::Model {
+    let now = chrono::Utc::now();
+    temps_entities::s3_sources::Model {
+        id,
+        name: format!("source-{id}"),
+        bucket_name: "bucket".to_string(),
+        bucket_path: "/".to_string(),
+        access_key_id: String::new(),
+        secret_key: String::new(),
+        session_token: None,
+        credentials_expire_at: None,
+        region: "test-region-1".to_string(),
+        endpoint: None,
+        force_path_style: Some(true),
+        is_default: false,
+        managed_by_cloud: false,
+        lifecycle_reconcile_failed_at: None,
+        lifecycle_reconcile_generation: 0,
+        created_at: now,
+        updated_at: now,
+        backing_service_id: Some(99),
+    }
+}
+
+/// The query results of a trigger up to the point it opens its transaction:
+/// the early check finds nothing, then the source and the services in scope.
+fn mock_up_to_the_transaction() -> MockDatabase {
+    MockDatabase::new(DatabaseBackend::Postgres)
+        .append_exec_results([sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }])
+        .append_query_results([Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new()])
+        .append_query_results([vec![source_with_backing_service(1)]])
+        .append_query_results([Vec::<temps_entities::external_services::Model>::new()])
+}
+
+/// The lock and the check that decides both come before the run is recorded,
+/// inside the same transaction.
+#[tokio::test]
+async fn the_schedule_row_is_locked_and_rechecked_before_the_run_is_inserted() {
+    // Engine resolution builds a Docker client before the transaction opens.
+    if skip_if_no_docker() {
+        return;
+    }
+    let schedule = make_test_schedule(1, 1);
+    let in_flight = std::collections::BTreeMap::from([("id", sea_orm::Value::BigInt(Some(5)))]);
+    let db = Arc::new(
+        mock_up_to_the_transaction()
+            // The locked schedule row.
+            .append_query_results([vec![schedule.clone()]])
+            // Check under the lock: another trigger got there first.
+            .append_query_results([vec![in_flight]])
+            .into_connection(),
+    );
+    let service = make_scope_test_service(db.clone());
+
+    let outcome = service
+        .enqueue_scheduled_run(&schedule, TriggerSource::Cron, None)
+        .await
+        .expect("the trigger declines");
+
+    assert!(matches!(
+        outcome,
+        ScheduleRunOutcome::AlreadyInFlight { existing_run_id: 5 }
+    ));
+    drop(service);
+    let log = Arc::try_unwrap(db)
+        .expect("service should release the mock database")
+        .into_transaction_log();
+    let transaction = log
+        .iter()
+        .find(|txn| {
+            txn.statements()
+                .iter()
+                .any(|statement| statement.sql == "BEGIN")
+        })
+        .expect("the check runs in a transaction");
+    let statements: Vec<&str> = transaction
+        .statements()
+        .iter()
+        .map(|statement| statement.sql.as_str())
+        .collect();
+    assert!(statements[1].contains("FOR UPDATE"), "{statements:?}");
+    assert!(statements[2].contains("schedule_runs"), "{statements:?}");
+    assert_eq!(statements.last(), Some(&"ROLLBACK"), "{statements:?}");
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("INSERT INTO schedule_runs")),
+        "{statements:?}",
+    );
+}
+
+/// A schedule deleted between the caller's read and the lock is reported with
+/// its ID instead of failing later on a foreign key.
+#[tokio::test]
+async fn a_schedule_deleted_before_the_lock_is_not_found() {
+    if skip_if_no_docker() {
+        return;
+    }
+    let schedule = make_test_schedule(77, 1);
+    let db = Arc::new(
+        mock_up_to_the_transaction()
+            .append_query_results([Vec::<temps_entities::backup_schedules::Model>::new()])
+            .into_connection(),
+    );
+    let service = make_scope_test_service(db);
+
+    let error = service
+        .enqueue_scheduled_run(&schedule, TriggerSource::Cron, None)
+        .await
+        .expect_err("the schedule is gone");
+
+    match error {
+        BackupError::NotFound { detail, .. } => assert!(detail.contains("77"), "{detail}"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
 // ── retention deadline (`backups.expires_at`) ───────────────────────────
