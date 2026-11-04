@@ -922,7 +922,7 @@ impl ContainerHealthMonitor {
                 let intentional = exit_is_intentional(container, info);
                 self.persist_exit_info(container, info, intentional).await;
 
-                // A user-initiated stop (`stop_container`/`stop_all_containers`)
+                // A user-initiated stop (`stop_container`)
                 // and a failed deployment retained for log inspection are both
                 // stopped on purpose — an exit there is expected, not a crash.
                 if intentional {
