@@ -671,6 +671,8 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         ExternalServiceError::ServiceNotFound { .. }
         | ExternalServiceError::ServiceNotFoundByName { .. }
         | ExternalServiceError::ServiceNotFoundBySlug { .. }
+        | ExternalServiceError::ClusterMemberNotFound { .. }
+        | ExternalServiceError::NodeNotFound { .. }
         | ExternalServiceError::InitializationFailed { .. }
         | ExternalServiceError::UpgradeRejected { .. }
         | ExternalServiceError::EncryptionFailed { .. }

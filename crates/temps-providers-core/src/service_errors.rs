@@ -77,6 +77,12 @@ pub enum ExternalServiceError {
     #[error("Service with slug '{slug}' not found")]
     ServiceNotFoundBySlug { slug: String },
 
+    #[error("Cluster member {member_id} not found in service {service_id}")]
+    ClusterMemberNotFound { service_id: i32, member_id: i32 },
+
+    #[error("Node {node_id} not found: cannot place a member of service {service_id} on it")]
+    NodeNotFound { service_id: i32, node_id: i32 },
+
     #[error("Failed to initialize service {id}: {reason}")]
     InitializationFailed { id: i32, reason: String },
 
@@ -473,6 +479,8 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }

@@ -1047,7 +1047,7 @@ async fn delete_service_alert_rule(
     ),
     security(("bearer_auth" = []))
 )]
-async fn toggle_service_metrics(
+pub(super) async fn toggle_service_metrics(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
@@ -1066,15 +1066,13 @@ async fn toggle_service_metrics(
             .external_service_manager
             .get_service(id)
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("not found") {
-                    not_found().detail("Service not found").build()
-                } else {
-                    internal_server_error()
-                        .detail(format!("Failed to load service: {}", e))
-                        .build()
+            .map_err(|error| match error {
+                crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+                    not_found().detail(error.to_string()).build()
                 }
+                error => internal_server_error()
+                    .detail(format!("Failed to load service: {}", error))
+                    .build(),
             })?;
 
         if let Err(e) =

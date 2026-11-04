@@ -76,6 +76,23 @@ pub(crate) fn external_service_problem(
         .unwrap_or_else(|| internal_server_error().detail(detail).build())
 }
 
+/// The cluster routes: a request the cluster's state or topology forbids is a
+/// 400, and everything else takes the shared classification, including 404 for
+/// a missing service, member or node. Decided by variant, because the messages
+/// quote container output and a message is free to change.
+fn cluster_operation_problem(
+    error: &crate::services::ExternalServiceError,
+    operation: &str,
+) -> Problem {
+    if matches!(
+        error,
+        crate::services::ExternalServiceError::ParameterValidationFailed { .. }
+    ) {
+        return bad_request().detail(error.to_string()).build();
+    }
+    external_service_problem(error, format!("Failed to {operation}: {error}"))
+}
+
 fn service_health_problem(error: crate::services::ExternalServiceError) -> Problem {
     match error {
         crate::services::ExternalServiceError::ServiceNotFound { .. } => {
@@ -112,6 +129,8 @@ fn missing_resource_problem(error: &crate::services::ExternalServiceError) -> Op
             | E::ServiceNotFound { .. }
             | E::ServiceNotFoundByName { .. }
             | E::ServiceNotFoundBySlug { .. }
+            | E::ClusterMemberNotFound { .. }
+            | E::NodeNotFound { .. }
     )
     .then(|| not_found().detail(error.to_string()).build())
 }
@@ -150,6 +169,8 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }
@@ -210,6 +231,8 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }
@@ -292,6 +315,8 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::ServiceNotFound { .. }
         | E::ServiceNotFoundByName { .. }
         | E::ServiceNotFoundBySlug { .. }
+        | E::ClusterMemberNotFound { .. }
+        | E::NodeNotFound { .. }
         | E::InitializationFailed { .. }
         | E::UpgradeRejected { .. }
         | E::EncryptionFailed { .. }
@@ -1647,21 +1672,13 @@ async fn delete_service(
 
                     Ok(StatusCode::NO_CONTENT)
                 }
-                Err(e) => {
-                    // Check for specific error types
-                    let error_str = e.to_string();
-                    if error_str.contains("Service not found") {
-                        Err(not_found().detail("Service not found").build())
-                    } else if error_str.contains("still linked to") {
-                        // Return 400 Bad Request with detailed message about linked projects
-                        Err(bad_request().detail(error_str).build())
-                    } else {
-                        Err(external_service_problem(
-                            &e,
-                            format!("Failed to delete service: {}", e),
-                        ))
-                    }
+                Err(e @ crate::services::ExternalServiceError::ServiceHasLinkedProjects { .. }) => {
+                    Err(bad_request().detail(e.to_string()).build())
                 }
+                Err(e) => Err(external_service_problem(
+                    &e,
+                    format!("Failed to delete service: {}", e),
+                )),
             }
         }
         Err(e) => Err(external_service_problem(
@@ -2351,19 +2368,7 @@ async fn retry_cluster(
         }
         Err(e) => {
             error!("Failed to retry cluster service {}: {}", id, e);
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found()
-                    .detail(format!("Service {} not found", id))
-                    .build())
-            } else if msg.contains("only valid for") || msg.contains("must be in") {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to retry cluster: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "retry cluster"))
         }
     }
 }
@@ -2385,7 +2390,8 @@ async fn retry_cluster(
         (status = 202, description = "Cluster member provisioning started", body = ServiceMemberInfo),
         (status = 400, description = "Validation failed (wrong topology, status, or role)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
-        (status = 404, description = "Service not found"),
+        (status = 404, description = "Service or requested node not found"),
+        (status = 409, description = "The member cannot be placed as requested, or this process has no local Docker daemon"),
         (status = 500, description = "Internal server error")
     ),
     params(("id" = i32, Path, description = "External service ID")),
@@ -2441,24 +2447,7 @@ async fn add_cluster_member(
         }
         Err(e) => {
             error!("Failed to add cluster member to service {}: {}", id, e);
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found()
-                    .detail(format!("Service {} not found", id))
-                    .build())
-            } else if msg.contains("only valid for")
-                || msg.contains("must be in")
-                || msg.contains("only 'replica'")
-                || msg.contains("only supported for Postgres")
-                || msg.contains("Only 'replica'")
-            {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to add cluster member: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "add cluster member"))
         }
     }
 }
@@ -2502,17 +2491,7 @@ async fn get_cluster_member(
             let wire: ServiceMemberInfo = member.into();
             Ok((StatusCode::OK, Json(wire)))
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to load cluster member: {}", e),
-                ))
-            }
-        }
+        Err(e) => Err(cluster_operation_problem(&e, "load cluster member")),
     }
 }
 
@@ -2531,6 +2510,7 @@ async fn get_cluster_member(
         (status = 400, description = "Validation failed (monitor, primary, or quorum violation)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
+        (status = 409, description = "The member is still being provisioned"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2584,32 +2564,7 @@ async fn remove_cluster_member(
                 "Failed to remove cluster member {} from service {}: {}",
                 member_id, id, e
             );
-            // Classified before the message matching below, whose "Cannot
-            // remove" would turn this conflict into a 400.
-            if matches!(
-                e,
-                crate::services::ExternalServiceError::ClusterMemberProvisioning { .. }
-            ) {
-                return Err(external_service_problem(
-                    &e,
-                    format!("Failed to remove cluster member: {}", e),
-                ));
-            }
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found().detail(msg).build())
-            } else if msg.contains("only valid for")
-                || msg.contains("does not belong")
-                || msg.contains("Cannot remove")
-                || msg.contains("Refusing to remove")
-            {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to remove cluster member: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "remove cluster member"))
         }
     }
 }
@@ -2627,6 +2582,7 @@ async fn remove_cluster_member(
         (status = 400, description = "Validation failed (monitor, already primary, not running, etc.)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
+        (status = 409, description = "This process has no local Docker daemon to run the promotion on"),
         (status = 500, description = "pg_autoctl perform promotion failed")
     ),
     params(
@@ -2690,23 +2646,7 @@ async fn promote_cluster_member(
                 "Failed to promote cluster member {} on service {}: {}",
                 member_id, id, e
             );
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Err(not_found().detail(msg).build())
-            } else if msg.contains("only valid for")
-                || msg.contains("only supported for")
-                || msg.contains("does not belong")
-                || msg.contains("Cannot promote")
-                || msg.contains("already the primary")
-                || msg.contains("not running")
-            {
-                Err(bad_request().detail(msg).build())
-            } else {
-                Err(external_service_problem(
-                    &e,
-                    format!("Failed to promote cluster member: {}", e),
-                ))
-            }
+            Err(cluster_operation_problem(&e, "promote cluster member"))
         }
     }
 }
@@ -5396,6 +5336,261 @@ mod tests {
             updated_at: now,
         };
         (service, link)
+    }
+
+    /// A 404 in RFC 7807 shape, naming what was looked for.
+    fn assert_not_found_problem(problem: Problem, expected_detail: &str) {
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::NOT_FOUND,
+            "{problem:?}"
+        );
+        assert_eq!(
+            problem.body.get("detail").and_then(|v| v.as_str()),
+            Some(expected_detail)
+        );
+        assert!(problem.body.contains_key("title"), "{problem:?}");
+        let response = problem.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+    }
+
+    /// Query results in order: the ownership guard's two lookups for an
+    /// existing cluster service, then `rest`, which the route under test reads.
+    fn cluster_route_state<const N: usize>(rest: [Vec<sea_orm::MockRow>; N]) -> Arc<AppState> {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "cluster-route-not-found-test",
+        ));
+        let (mut service, link) = preview_service(&encryption_service);
+        service.topology = "cluster".to_string();
+        let mut mock = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service]])
+            .append_query_results([vec![link]]);
+        for rows in rest {
+            mock = mock.append_query_results([rows]);
+        }
+        preview_state(
+            Arc::new(mock.into_connection()),
+            encryption_service,
+            vec![99],
+        )
+    }
+
+    fn cluster_service_row() -> sea_orm::MockRow {
+        let encryption_service = temps_core::EncryptionService::new_from_password("row");
+        let (mut service, _) = preview_service(&encryption_service);
+        service.topology = "cluster".to_string();
+        sea_orm::IntoMockRow::into_mock_row(service)
+    }
+
+    fn admin() -> RequireAuth {
+        RequireAuth(test_auth_context_with_role(temps_auth::Role::Admin))
+    }
+
+    #[tokio::test]
+    async fn retry_cluster_on_a_missing_service_is_a_404_problem() {
+        let result = retry_cluster(
+            State(cluster_route_state([Vec::new()])),
+            Path(17),
+            admin(),
+            Extension(test_request_metadata()),
+            Json(RetryClusterRequest {
+                members: Vec::new(),
+            }),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing service cannot be retried");
+        };
+        assert_not_found_problem(problem, "Service 17 not found");
+    }
+
+    #[tokio::test]
+    async fn add_cluster_member_on_a_missing_service_is_a_404_problem() {
+        let result = add_cluster_member(
+            State(cluster_route_state([Vec::new()])),
+            Path(17),
+            admin(),
+            Extension(test_request_metadata()),
+            Json(AddClusterMemberRequest {
+                role: "replica".to_string(),
+                node_id: None,
+            }),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing service cannot gain a member");
+        };
+        assert_not_found_problem(problem, "Service 17 not found");
+    }
+
+    #[tokio::test]
+    async fn get_cluster_member_with_a_missing_member_is_a_404_problem() {
+        let result = get_cluster_member(
+            State(cluster_route_state([Vec::new()])),
+            Path((17, 404)),
+            admin(),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing member cannot be read");
+        };
+        assert_not_found_problem(problem, "Cluster member 404 not found in service 17");
+    }
+
+    #[tokio::test]
+    async fn remove_cluster_member_with_a_missing_member_is_a_404_problem() {
+        let result = remove_cluster_member(
+            State(cluster_route_state([
+                vec![cluster_service_row()],
+                Vec::new(),
+            ])),
+            Path((17, 404)),
+            admin(),
+            Extension(test_request_metadata()),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing member cannot be removed");
+        };
+        assert_not_found_problem(problem, "Cluster member 404 not found in service 17");
+    }
+
+    #[tokio::test]
+    async fn promote_cluster_member_with_a_missing_member_is_a_404_problem() {
+        let result = promote_cluster_member(
+            State(cluster_route_state([
+                vec![cluster_service_row()],
+                Vec::new(),
+            ])),
+            Path((17, 404)),
+            admin(),
+            Extension(test_request_metadata()),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing member cannot be promoted");
+        };
+        assert_not_found_problem(problem, "Cluster member 404 not found in service 17");
+    }
+
+    #[tokio::test]
+    async fn toggle_service_metrics_on_a_missing_service_is_a_404_problem() {
+        let result = super::super::metrics_handlers::toggle_service_metrics(
+            admin(),
+            State(cluster_route_state([Vec::new()])),
+            Path(17),
+            Json(super::super::metrics_handlers::ToggleServiceMetricsRequest { enabled: true }),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a missing service cannot have its metrics enabled");
+        };
+        assert_not_found_problem(problem, "Service 17 not found");
+    }
+
+    /// Query results in order: the ownership guard, `get_service_details`, then
+    /// `delete_service` up to the check that finds the link.
+    #[tokio::test]
+    async fn delete_service_with_linked_projects_is_a_400_problem() {
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "delete-linked-service-test",
+        ));
+        let (service, link) = preview_service(&encryption_service);
+        let db = MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service.clone()]])
+            .append_query_results([vec![link.clone()]])
+            .append_query_results([vec![service.clone()]])
+            .append_query_results([vec![service.clone()]])
+            .append_query_results([vec![service]])
+            .append_query_results([Vec::<external_services::Model>::new()])
+            .append_query_results([vec![link]])
+            .into_connection();
+        let state = preview_state(Arc::new(db), encryption_service, vec![99]);
+
+        let result = delete_service(
+            State(state),
+            Path(17),
+            admin(),
+            Extension(test_request_metadata()),
+        )
+        .await;
+        let Err(problem) = result else {
+            panic!("a service with linked projects cannot be deleted");
+        };
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{problem:?}"
+        );
+        let detail = problem.body.get("detail").and_then(|v| v.as_str());
+        assert!(
+            detail.is_some_and(|detail| detail.contains("17")),
+            "{problem:?}"
+        );
+    }
+
+    /// The bug class: the words in a message used to pick the status.
+    #[test]
+    fn cluster_routes_classify_by_variant_not_by_message() {
+        use crate::services::ExternalServiceError as E;
+
+        for (error, want) in [
+            // A refusal that happens to say "not found" is still a refusal.
+            (
+                E::ParameterValidationFailed {
+                    service_id: 1,
+                    reason: "replica not found in the monitor".to_string(),
+                },
+                axum::http::StatusCode::BAD_REQUEST,
+            ),
+            // A failure on our side that says "not found" is still a failure.
+            (
+                E::InternalError {
+                    reason: "Monitor's node 3 not found".to_string(),
+                },
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                E::ClusterMemberNotFound {
+                    service_id: 1,
+                    member_id: 2,
+                },
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                E::NodeNotFound {
+                    service_id: 1,
+                    node_id: 2,
+                },
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            (
+                E::ServiceNotFound { id: 1 },
+                axum::http::StatusCode::NOT_FOUND,
+            ),
+            // Its message says "Cannot remove", which used to be a 400.
+            (
+                E::ClusterMemberProvisioning {
+                    service_id: 1,
+                    action: "remove a member from",
+                    container_name: "postgres-ha-1".to_string(),
+                    status: "creating".to_string(),
+                },
+                axum::http::StatusCode::CONFLICT,
+            ),
+        ] {
+            assert_eq!(
+                cluster_operation_problem(&error, "do a thing").status_code,
+                want,
+                "{error}"
+            );
+        }
     }
 
     fn preview_state(
