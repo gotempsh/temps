@@ -78,6 +78,14 @@ docker-heavy = { max-threads = 2 }
 filter = 'package(temps-vulnerability-scanner) and binary(integration_test)'
 test-group = 'shared-host-serial'
 
+# The Docker sandbox tests share one image, ghcr.io/gotempsh/temps-sandbox-node,
+# and test_pull_fallback_on_missing_hub_image deletes it, so a container created
+# meanwhile fails with `unable to find image`. Their docker_image_lock is per
+# process, so it only protects them under `cargo test`.
+[[profile.default.overrides]]
+filter = 'package(temps-ai-agents) and test(/^sandbox::docker::tests::/)'
+test-group = 'shared-host-serial'
+
 # Docker builds and multi-container deployments.
 [[profile.default.overrides]]
 filter = '''

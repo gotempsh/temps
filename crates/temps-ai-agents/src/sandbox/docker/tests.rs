@@ -2039,7 +2039,7 @@ async fn test_kill_processes_term_and_kill() {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
+                "pgrep -fx 'sleep 9999' | wc -l".to_string(),
             ],
             HashMap::new(),
             None,
@@ -2049,11 +2049,11 @@ async fn test_kill_processes_term_and_kill() {
     let count: i32 = result.stdout.trim().parse().unwrap_or(0);
     assert!(count > 0, "sleep should be running before kill");
 
-    // Kill with SIGTERM via our typed enum.
-    // Use the exact binary name "sleep" rather than a full-command
-    // pattern to avoid matching pgrep itself.
+    // Kill with SIGTERM via our typed enum. The pattern names only the sleep
+    // this test started: the sandbox keeps itself alive with `sleep infinity`,
+    // which must outlive this, so counting every `sleep` never reaches zero.
     provider
-        .kill_processes(&handle, "sleep", crate::sandbox::KillSignal::Term)
+        .kill_processes(&handle, "sleep 9999", crate::sandbox::KillSignal::Term)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2065,7 +2065,7 @@ async fn test_kill_processes_term_and_kill() {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
+                "pgrep -fx 'sleep 9999' | wc -l".to_string(),
             ],
             HashMap::new(),
             None,
@@ -2094,7 +2094,7 @@ async fn test_kill_processes_term_and_kill() {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
+                "pgrep -fx 'sleep 9999' | wc -l".to_string(),
             ],
             HashMap::new(),
             None,
@@ -2106,7 +2106,7 @@ async fn test_kill_processes_term_and_kill() {
 
     // SIGKILL — cannot be trapped
     provider
-        .kill_processes(&handle, "sleep", crate::sandbox::KillSignal::Kill)
+        .kill_processes(&handle, "sleep 9999", crate::sandbox::KillSignal::Kill)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2117,7 +2117,7 @@ async fn test_kill_processes_term_and_kill() {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                "pgrep -x sleep | wc -l".to_string(),
+                "pgrep -fx 'sleep 9999' | wc -l".to_string(),
             ],
             HashMap::new(),
             None,
