@@ -190,8 +190,7 @@ pub struct UpgradeCommand {
     pub ee_api: Option<String>,
 
     /// Data dir whose `data/license.jwt` receives the license on `--tier ee`.
-    /// Defaults to `$TEMPS_DATA_DIR`, then the directory of a running `temps
-    /// serve`, then the install layout under `~/.temps`.
+    /// Defaults to `$TEMPS_DATA_DIR` or `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 }
@@ -213,12 +212,18 @@ pub struct GitHubAsset {
 }
 
 impl UpgradeCommand {
-    /// The data directory of the server this upgrade is for. A running `temps
-    /// serve` is the authority on its own; the shell running this upgrade
-    /// inherits none of its environment.
-    fn resolve_data_dir(&self) -> super::data_dir_discovery::ResolvedDataDir {
+    /// Where a running `temps serve` says its data is. A shell inherits none of
+    /// the server's environment, so this finds a server's directory that it
+    /// could not otherwise know. It is read from another process's arguments, so
+    /// it decides what this upgrade tells the operator, never where it writes.
+    fn discover_data_dir(&self) -> super::data_dir_discovery::ResolvedDataDir {
         let home = dirs::home_dir();
-        super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref())
+        let discovered =
+            super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref());
+        for warning in data_dir_warnings(&discovered) {
+            println!("  Note: {warning}");
+        }
+        discovered
     }
 
     pub fn execute(self) -> anyhow::Result<()> {
@@ -450,7 +455,7 @@ impl UpgradeCommand {
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
-        print_microsandbox_refresh_reminder(&self.resolve_data_dir().dir);
+        print_microsandbox_refresh_reminder(&binary_path, &self.discover_data_dir().dir);
 
         println!();
         println!(
@@ -628,12 +633,16 @@ impl UpgradeCommand {
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
 
-        let resolved = self.resolve_data_dir();
-        print_microsandbox_refresh_reminder(&resolved.dir);
+        let discovered = self.discover_data_dir();
+        print_microsandbox_refresh_reminder(&binary_path, &discovered.dir);
 
         // Install the license into the data dir so the binary finds it.
-        let installed_license = install_license_for_server(&resolved, &license_jwt)?;
+        let data_dir = resolve_data_dir(&self.data_dir)?;
+        let installed_license = install_license(&data_dir, &license_jwt)?;
         println!("  License installed at {}", installed_license.display());
+        if let Some(note) = license_location_note(&data_dir, &discovered) {
+            println!("  Note: {note}");
+        }
 
         // Best-effort: point the systemd unit at the license so restarts
         // keep working without re-passing --license-path.
@@ -2083,8 +2092,9 @@ fn install_agent_reporting(agent: &ShippedAgent, staged: Option<StagedVmAgent>) 
     }
 }
 
-fn print_microsandbox_refresh_reminder(data_dir: &Path) {
-    if let Some(reminder) = super::microsandbox::runtime_refresh_reminder(data_dir) {
+fn print_microsandbox_refresh_reminder(upgraded_binary: &Path, data_dir: &Path) {
+    if let Some(reminder) = super::microsandbox::runtime_refresh_reminder(upgraded_binary, data_dir)
+    {
         println!("  Note: {reminder}");
     }
 }
@@ -2472,16 +2482,48 @@ async fn download_ee_asset_to_file(
 }
 
 /// Resolve the data dir: explicit flag/env > `~/.temps`.
-/// Install the license where the server this upgrade is for will read it,
-/// saying so first if that directory looks wrong.
-fn install_license_for_server(
-    resolved: &super::data_dir_discovery::ResolvedDataDir,
-    license_jwt: &str,
-) -> anyhow::Result<PathBuf> {
-    for warning in &resolved.warnings {
-        println!("  Note: {warning}");
+/// Data dir that receives the license: the one the operator named, or the
+/// default. Never one discovered from a running process: any local user can start
+/// a process claiming any directory, and a privileged upgrade would then write the
+/// license into a directory, and possibly a file, that user owns.
+fn resolve_data_dir(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.clone());
     }
-    install_license(&resolved.dir, license_jwt)
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory for data dir"))?;
+    Ok(home.join(".temps"))
+}
+
+/// The warnings worth showing during an upgrade: only when a running server
+/// contradicts the chosen directory. On its own, "this directory holds no Temps
+/// data" is normal on a host that only runs the CLI.
+fn data_dir_warnings(discovered: &super::data_dir_discovery::ResolvedDataDir) -> &[String] {
+    if discovered.server_disagrees {
+        &discovered.warnings
+    } else {
+        &[]
+    }
+}
+
+/// What to tell the operator when a running server reports a different data
+/// directory from the one that received the license, or `None` when they agree.
+fn license_location_note(
+    license_dir: &Path,
+    discovered: &super::data_dir_discovery::ResolvedDataDir,
+) -> Option<String> {
+    let super::data_dir_discovery::DataDirSource::RunningServer { pid } = discovered.source else {
+        return None;
+    };
+    (!super::data_dir_discovery::same_path(license_dir, &discovered.dir)).then(|| {
+        format!(
+            "The running `temps serve` (pid {pid}) reports {} as its data directory, but the \
+             license went to {}. If that server is yours, re-run with `--data-dir {}`.",
+            discovered.dir.display(),
+            license_dir.display(),
+            discovered.dir.display()
+        )
+    })
 }
 
 /// Install the license JWT at `<data_dir>/data/license.jwt` (mode 0600).
@@ -2557,21 +2599,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_license_goes_to_the_directory_the_running_server_uses() {
+    fn a_running_server_elsewhere_gets_a_note_and_not_the_license() {
         let home = tempfile::tempdir().unwrap();
         let server_dir = tempfile::tempdir().unwrap();
-
-        let resolved = super::super::data_dir_discovery::resolve_with(
+        let license_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
             None,
             Some(home.path()),
             Some((42, server_dir.path().to_path_buf())),
         );
-        let installed = install_license_for_server(&resolved, "license").unwrap();
 
-        assert_eq!(
-            installed,
-            server_dir.path().join("data").join("license.jwt")
+        let note = license_location_note(license_dir.path(), &discovered)
+            .expect("the server reports another directory");
+
+        assert!(
+            note.contains(&server_dir.path().display().to_string()),
+            "{note}"
         );
+        assert!(note.contains("--data-dir"), "{note}");
+    }
+
+    #[test]
+    fn no_note_when_the_license_is_where_the_server_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let server_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            None,
+            Some(home.path()),
+            Some((42, server_dir.path().to_path_buf())),
+        );
+
+        assert_eq!(license_location_note(server_dir.path(), &discovered), None);
+    }
+
+    #[test]
+    fn a_chosen_directory_a_running_server_does_not_use_is_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let chosen = tempfile::tempdir().unwrap();
+        let server_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            Some(chosen.path()),
+            Some(home.path()),
+            Some((42, server_dir.path().to_path_buf())),
+        );
+
+        let warnings = data_dir_warnings(&discovered).join("\n");
+
+        assert!(
+            warnings.contains(&server_dir.path().display().to_string()),
+            "{warnings}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_server_is_not_warned_about_an_empty_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let discovered =
+            super::super::data_dir_discovery::resolve_with(None, Some(home.path()), None);
+
+        assert!(!discovered.warnings.is_empty(), "the resolver does warn");
+        assert!(data_dir_warnings(&discovered).is_empty());
+    }
+
+    #[test]
+    fn no_note_without_a_running_server() {
+        let home = tempfile::tempdir().unwrap();
+        let license_dir = tempfile::tempdir().unwrap();
+        let discovered =
+            super::super::data_dir_discovery::resolve_with(None, Some(home.path()), None);
+
+        assert_eq!(license_location_note(license_dir.path(), &discovered), None);
     }
 
     #[test]

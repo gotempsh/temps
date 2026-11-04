@@ -42,6 +42,8 @@ pub(crate) struct ResolvedDataDir {
     pub source: DataDirSource,
     /// Problems the operator should see before anything is installed.
     pub warnings: Vec<String>,
+    /// A running `temps serve` uses a different directory from the one chosen.
+    pub server_disagrees: bool,
 }
 
 /// A directory holds Temps state once the server has generated its keys.
@@ -65,11 +67,13 @@ pub(super) fn resolve_with(
     server: Option<(u32, PathBuf)>,
 ) -> ResolvedDataDir {
     let mut warnings = Vec::new();
+    let mut server_disagrees = false;
 
     let (dir, source) = match (explicit, server.as_ref()) {
         (Some(dir), server) => {
             if let Some((pid, server_dir)) = server {
                 if !same_path(dir, server_dir) {
+                    server_disagrees = true;
                     warnings.push(format!(
                         "the running `temps serve` (pid {pid}) uses {}, not {}; it will not \
                          see anything installed there. Use `--data-dir {}` to set up the \
@@ -110,10 +114,11 @@ pub(super) fn resolve_with(
         dir,
         source,
         warnings,
+        server_disagrees,
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canonical(a) == canonical(b)
 }

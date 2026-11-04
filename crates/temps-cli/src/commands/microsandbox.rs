@@ -26,7 +26,8 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 use temps_sandbox_providers::microsandbox::{
-    microsandbox_capability, setup_command_for, MicrosandboxSandboxConfig, MICROSANDBOX_VERSION,
+    microsandbox_capability, setup_command_with_binary, MicrosandboxSandboxConfig,
+    MICROSANDBOX_VERSION,
 };
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use temps_sandbox_providers::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
@@ -99,14 +100,17 @@ impl MicrosandboxCommand {
 /// the upgrade is the previous release, so it cannot know which runtime the new
 /// one pins, and replacing a runtime that sandboxes may be using is the
 /// operator's call.
-pub(crate) fn runtime_refresh_reminder(data_dir: &std::path::Path) -> Option<String> {
+pub(crate) fn runtime_refresh_reminder(
+    upgraded_binary: &std::path::Path,
+    data_dir: &std::path::Path,
+) -> Option<String> {
     let config = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
     config.home().join("bin").join("msb").exists().then(|| {
         format!(
             "A microsandbox runtime is installed, and each temps release needs one exact \
              version of it. If this release moved to a new version, the microsandbox backend \
              stays unavailable until you run `{}` and restart temps.",
-            setup_command_for(data_dir)
+            setup_command_with_binary(upgraded_binary, data_dir)
         )
     })
 }
@@ -439,14 +443,16 @@ mod tests {
     }
 
     #[test]
-    fn an_installed_runtime_gets_a_refresh_reminder_naming_its_data_dir() {
+    fn an_installed_runtime_gets_a_refresh_reminder_naming_binary_and_data_dir() {
         let dir = tempfile::tempdir().unwrap();
         install_msb(dir.path());
 
-        let reminder = runtime_refresh_reminder(dir.path()).expect("a runtime is installed");
+        let reminder =
+            runtime_refresh_reminder(std::path::Path::new("/opt/temps/temps"), dir.path())
+                .expect("a runtime is installed");
 
         assert!(
-            reminder.contains(&setup_command_for(dir.path())),
+            reminder.contains("/opt/temps/temps microsandbox setup"),
             "{reminder}"
         );
         assert!(
@@ -460,7 +466,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("microsandbox")).unwrap();
 
-        assert_eq!(runtime_refresh_reminder(dir.path()), None);
+        assert_eq!(
+            runtime_refresh_reminder(std::path::Path::new("/opt/temps/temps"), dir.path()),
+            None
+        );
     }
 
     #[test]
