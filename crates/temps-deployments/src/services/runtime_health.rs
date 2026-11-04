@@ -723,7 +723,8 @@ WITH accepted AS (
   state=sample.state,reason=sample.reason,last_sequence=sample.sequence,
   observed_at=statement_timestamp(),
   valid_until=sample.deadline,
-  failure_streak=CASE WHEN sample.state='unhealthy' THEN
+  failure_streak=CASE WHEN c.status IS NOT DISTINCT FROM 'stopped' THEN 0
+   WHEN sample.state='unhealthy' THEN
    CASE WHEN a.valid_until>clock_timestamp() THEN LEAST(a.failure_streak+1,1000) ELSE 1 END ELSE 0 END,
   recovery_streak=CASE WHEN sample.state='healthy' THEN
    CASE WHEN a.valid_until>clock_timestamp() THEN LEAST(a.recovery_streak+1,1000) ELSE 1 END ELSE 0 END,
@@ -2036,12 +2037,25 @@ mod tests {
             0,
             "a stopped replica failing its probe is what stopped means"
         );
-        // Started again, it is monitored again.
+        // Started again, it is monitored again, and the failures it had while
+        // stopped do not count: an app still starting gets the whole threshold.
         service
             .db
             .execute_unprepared("UPDATE deployment_containers SET status='running'")
             .await?;
-        service.accept(&row, session, failing(4), term).await?;
+        for sequence in 4..=5 {
+            service
+                .accept(&row, session, failing(sequence), term)
+                .await?;
+            service.stage_alarms(vec![row.id], term).await?;
+            assert_eq!(
+                count(&service, "runtime_health_alarm_outbox").await,
+                0,
+                "failure {} since it started again is under the threshold",
+                sequence - 3
+            );
+        }
+        service.accept(&row, session, failing(6), term).await?;
         service.stage_alarms(vec![row.id], term).await?;
         assert_eq!(count(&service, "runtime_health_alarm_outbox").await, 1);
         let fired=service.db.query_one(sql("SELECT event_type FROM runtime_health_alarm_outbox ORDER BY created_at DESC LIMIT 1",vec![])).await?.unwrap();
