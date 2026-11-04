@@ -1888,8 +1888,7 @@ async fn ensure_geolite2_databases(data_dir: &Path, license_key: Option<String>)
         warn!(
             wait_seconds = temps_geo::refresh::STARTUP_DOWNLOAD_WAIT.as_secs(),
             "GeoLite2 downloads are still running; starting without waiting for them. \
-             Geolocation loads when the city database arrives. Datacenter traffic detection \
-             needs a restart after the ASN database arrives"
+             Geolocation and datacenter traffic detection turn on when their databases arrive"
         );
     }
 }

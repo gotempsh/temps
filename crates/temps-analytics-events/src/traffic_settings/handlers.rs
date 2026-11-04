@@ -80,7 +80,7 @@ impl DatacenterDetectionStatus {
             reason: Some(
                 "No ASN database is loaded, so visitors cannot be classified as datacenter \
                  traffic. Temps ships GeoLite2-ASN.mmdb next to GeoLite2-City.mmdb; place it \
-                 in the working or data directory and restart Temps."
+                 in the data directory and it loads without a restart."
                     .to_string(),
             ),
             setup_path: Some(GEO_SETTINGS_PATH.to_string()),

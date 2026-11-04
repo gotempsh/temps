@@ -643,7 +643,7 @@ impl GeoIpService {
         })?;
         Ok(Self::MaxMind(Arc::new(MaxMindGeoIpService {
             reader: ArcSwapOption::from_pointee(reader),
-            asn_reader: None,
+            asn_reader: ArcSwapOption::empty(),
         })))
     }
 
@@ -713,6 +713,34 @@ impl GeoIpService {
         }
     }
 
+    /// Reload the ASN database from `path`, but only when the file holds a
+    /// different build than the one loaded. Returns the new `build_epoch` when a
+    /// swap happened. See [`Self::refresh_from_path_if_changed`].
+    pub fn refresh_asn_from_path_if_changed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<u64>, GeoIpError> {
+        match self {
+            Self::MaxMind(service) => {
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                let build_epoch = reader.metadata().build_epoch;
+                if service.asn_build_epoch() == Some(build_epoch) {
+                    return Ok(None);
+                }
+                service.refresh_asn(reader);
+                Ok(Some(build_epoch))
+            }
+            Self::Mock(_) => Err(GeoIpError::ReloadFailed {
+                path: path.display().to_string(),
+                reason: "mock geo service is enabled (TEMPS_GEO_MOCK); no database is loaded"
+                    .to_string(),
+            }),
+        }
+    }
+
     /// `build_epoch` of the currently loaded city database, i.e. when MaxMind
     /// built the data being served right now. `None` in mock mode and while no
     /// city database is loaded.
@@ -749,7 +777,9 @@ pub struct MaxMindGeoIpService {
     /// while the file is missing: a server without it still runs, and the
     /// refresh job or the file watcher fills this in when the file arrives.
     reader: ArcSwapOption<maxminddb::Reader<MmdbSource>>,
-    asn_reader: Option<maxminddb::Reader<MmdbSource>>,
+    /// Swapped by the file watcher, so a database that arrives after startup
+    /// turns hosting classification on without a restart.
+    asn_reader: ArcSwapOption<maxminddb::Reader<MmdbSource>>,
 }
 
 impl MaxMindGeoIpService {
@@ -792,7 +822,8 @@ impl MaxMindGeoIpService {
             }
             Err(e) => {
                 warn!(
-                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
+                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection \
+                     stays off until the file is provided. No restart is needed",
                     asn_db_path.display(),
                     e
                 );
@@ -802,7 +833,7 @@ impl MaxMindGeoIpService {
 
         Ok(Self {
             reader: ArcSwapOption::new(reader.map(Arc::new)),
-            asn_reader,
+            asn_reader: ArcSwapOption::new(asn_reader.map(Arc::new)),
         })
     }
 
@@ -816,7 +847,7 @@ impl MaxMindGeoIpService {
         let asn = open_mmdb(&cli_dir.join("GeoLite2-ASN.mmdb")).ok()?;
         Some(Self {
             reader: ArcSwapOption::from_pointee(city),
-            asn_reader: Some(asn),
+            asn_reader: ArcSwapOption::from_pointee(asn),
         })
     }
 
@@ -874,6 +905,18 @@ impl MaxMindGeoIpService {
         );
     }
 
+    /// Publish `new_reader` as the ASN database for all subsequent lookups.
+    pub fn refresh_asn(&self, new_reader: maxminddb::Reader<MmdbSource>) {
+        let previous_epoch = self.asn_build_epoch();
+        let new_epoch = new_reader.metadata().build_epoch;
+        self.asn_reader.store(Some(Arc::new(new_reader)));
+        info!(
+            previous_build_epoch = previous_epoch,
+            new_build_epoch = new_epoch,
+            "swapped in GeoLite2 ASN database"
+        );
+    }
+
     /// `build_epoch` from the loaded database's metadata: the Unix timestamp
     /// MaxMind stamped the build with, which is the real age of the data (a
     /// freshly downloaded file can still hold a months-old build). `None` while
@@ -888,12 +931,13 @@ impl MaxMindGeoIpService {
     /// Whether an ASN database is loaded, i.e. whether hosting-provider
     /// classification is active at all.
     pub fn has_asn_database(&self) -> bool {
-        self.asn_reader.is_some()
+        self.asn_reader.load().is_some()
     }
 
     /// `build_epoch` of the loaded ASN database, `None` when none is loaded.
     pub fn asn_build_epoch(&self) -> Option<u64> {
         self.asn_reader
+            .load()
             .as_ref()
             .map(|reader| reader.metadata().build_epoch)
     }
@@ -903,7 +947,8 @@ impl MaxMindGeoIpService {
     /// failing the whole geolocation — the City lookup already succeeded and
     /// callers shouldn't lose city/country data over an optional signal.
     fn lookup_asn(&self, ip: IpAddr) -> AsnLookup {
-        let Some(asn_reader) = &self.asn_reader else {
+        let asn_reader = self.asn_reader.load();
+        let Some(asn_reader) = asn_reader.as_ref() else {
             return AsnLookup::default();
         };
 
@@ -1200,7 +1245,7 @@ mod tests {
             reader: ArcSwapOption::from_pointee(
                 open_mmdb(&path).expect("open GeoLite2 city database"),
             ),
-            asn_reader: None,
+            asn_reader: ArcSwapOption::empty(),
         };
 
         let private: IpAddr = "172.17.0.2".parse().unwrap();
@@ -1413,7 +1458,9 @@ mod tests {
             reader: ArcSwapOption::from_pointee(
                 open_mmdb(&city_path).expect("open bundled city db"),
             ),
-            asn_reader: Some(open_mmdb(&asn_path).expect("open bundled ASN db")),
+            asn_reader: ArcSwapOption::from_pointee(
+                open_mmdb(&asn_path).expect("open bundled ASN db"),
+            ),
         };
         assert!(service.has_asn_database());
 

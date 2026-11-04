@@ -1086,8 +1086,9 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
-/// Watch the city database file and hot-reload `service` whenever the file on
-/// disk turns out to hold a different build than the one loaded.
+/// Watch the database files and hot-reload `service` whenever a file on disk
+/// turns out to hold a different build than the one loaded, including a file that
+/// was missing at startup: a slow download finishes after startup stops waiting.
 ///
 /// This is what makes a **split-role** deployment (ADR-017) correct. `temps
 /// proxy` and `temps serve --role=console` are separate OS processes, each with
@@ -1119,24 +1120,25 @@ pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
         return false;
     }
 
-    let path = city_db_path();
-    match spawn_db_file_watcher_every(&service, path.clone(), DB_FILE_WATCH_INTERVAL) {
+    let databases = vec![
+        (GeoDatabaseKind::City, city_db_path()),
+        (GeoDatabaseKind::Asn, asn_db_path()),
+    ];
+    match spawn_db_file_watcher_every(&service, databases, DB_FILE_WATCH_INTERVAL) {
         Ok(_handle) => {
             info!(
-                path = %path.display(),
                 poll_interval_secs = DB_FILE_WATCH_INTERVAL.as_secs(),
-                "watching the GeoLite2 city database file so a refresh performed by another \
-                 process is picked up without a restart"
+                "watching the GeoLite2 database files so a database that arrives late, or a \
+                 refresh performed by another process, is picked up without a restart"
             );
             true
         }
         Err(error) => {
             FILE_WATCHER_SPAWNED.store(false, Ordering::SeqCst);
             warn!(
-                path = %path.display(),
                 error = %error,
                 "could not start the GeoLite2 database file watcher; this process will keep \
-                 serving the database it loaded at startup until it is restarted"
+                 serving the databases it loaded at startup until it is restarted"
             );
             false
         }
@@ -1157,81 +1159,121 @@ pub fn spawn_db_file_watcher(service: std::sync::Arc<GeoIpService>) -> bool {
 /// stops the first time the `GeoIpService` it would refresh no longer exists.
 fn spawn_db_file_watcher_every(
     service: &std::sync::Arc<GeoIpService>,
-    path: PathBuf,
+    databases: Vec<(GeoDatabaseKind, PathBuf)>,
     interval: Duration,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let service = std::sync::Arc::downgrade(service);
     std::thread::Builder::new()
         .name("geo-db-watch".to_string())
-        .spawn(move || watch_db_file(service, path, interval))
+        .spawn(move || watch_db_files(service, databases, interval))
 }
 
-fn watch_db_file(service: std::sync::Weak<GeoIpService>, path: PathBuf, interval: Duration) {
-    // What the loaded reader corresponds to. Seeded from the current file so a
-    // process that just opened it does not immediately re-open it. With nothing
-    // loaded there is nothing to correspond to, so a file that appeared after the
-    // service looked for it still gets loaded.
-    let mut loaded_from = service
-        .upgrade()
-        .and_then(|service| service.build_epoch())
-        .and_then(|_| file_fingerprint(&path));
-    // The fingerprint a failure was already reported for, so a permanently
-    // broken file warns once instead of every poll.
-    let mut reported_failure: Option<FileFingerprint> = None;
+/// One database the watcher follows, and what it has already done about it.
+struct WatchedDatabase {
+    kind: GeoDatabaseKind,
+    path: PathBuf,
+    /// What the loaded reader corresponds to. Seeded from the current file so a
+    /// process that just opened it does not immediately re-open it. With nothing
+    /// loaded there is nothing to correspond to, so a file that appeared after the
+    /// service looked for it still gets loaded.
+    loaded_from: Option<FileFingerprint>,
+    /// The fingerprint a failure was already reported for, so a permanently
+    /// broken file warns once instead of every poll.
+    reported_failure: Option<FileFingerprint>,
+}
+
+impl WatchedDatabase {
+    fn new(kind: GeoDatabaseKind, path: PathBuf, service: Option<&GeoIpService>) -> Self {
+        let loaded = service.and_then(|service| match kind {
+            GeoDatabaseKind::City => service.build_epoch(),
+            GeoDatabaseKind::Asn => service.asn_build_epoch(),
+        });
+        let loaded_from = loaded.and_then(|_| file_fingerprint(&path));
+        Self {
+            kind,
+            path,
+            loaded_from,
+            reported_failure: None,
+        }
+    }
+
+    fn poll(&mut self, service: &GeoIpService) {
+        let database = self.kind.filename();
+        let path = self.path.display().to_string();
+
+        let Some(current) = file_fingerprint(&self.path) else {
+            // Missing or unreadable right now (a refresh is mid-rename, or the
+            // file was removed). The loaded database keeps serving lookups and
+            // the next poll looks again.
+            return;
+        };
+
+        if Some(&current) == self.loaded_from.as_ref() {
+            return;
+        }
+
+        let reloaded = match self.kind {
+            GeoDatabaseKind::City => service.refresh_from_path_if_changed(&self.path),
+            GeoDatabaseKind::Asn => service.refresh_asn_from_path_if_changed(&self.path),
+        };
+        match reloaded {
+            Ok(Some(build_epoch)) => {
+                info!(
+                    database,
+                    path, build_epoch, "reloaded a GeoLite2 database after it changed on disk"
+                );
+                self.loaded_from = Some(current);
+                self.reported_failure = None;
+            }
+            Ok(None) => {
+                debug!(
+                    database,
+                    path, "a GeoLite2 database file changed but holds the build already loaded"
+                );
+                self.loaded_from = Some(current);
+                self.reported_failure = None;
+            }
+            Err(error) => {
+                // `loaded_from` is deliberately left alone so the next poll
+                // retries: a reload that fails must not be remembered as done.
+                if self.reported_failure.as_ref() != Some(&current) {
+                    warn!(
+                        database,
+                        path,
+                        error = %error,
+                        "a GeoLite2 database changed on disk but could not be loaded; keeping \
+                         what is currently in memory and retrying on the next poll"
+                    );
+                    self.reported_failure = Some(current);
+                }
+            }
+        }
+    }
+}
+
+fn watch_db_files(
+    service: std::sync::Weak<GeoIpService>,
+    databases: Vec<(GeoDatabaseKind, PathBuf)>,
+    interval: Duration,
+) {
+    let mut databases: Vec<WatchedDatabase> = {
+        let service = service.upgrade();
+        databases
+            .into_iter()
+            .map(|(kind, path)| WatchedDatabase::new(kind, path, service.as_deref()))
+            .collect()
+    };
 
     loop {
         std::thread::sleep(interval);
 
         let Some(service) = service.upgrade() else {
-            debug!(
-                path = %path.display(),
-                "the geo service was dropped; stopping the database file watcher"
-            );
+            debug!("the geo service was dropped; stopping the database file watcher");
             return;
         };
 
-        let Some(current) = file_fingerprint(&path) else {
-            // Missing or unreadable right now (a refresh is mid-rename, or the
-            // file was removed). The loaded database keeps serving lookups and
-            // the next poll looks again.
-            continue;
-        };
-
-        if Some(&current) == loaded_from.as_ref() {
-            continue;
-        }
-
-        match service.refresh_from_path_if_changed(&path) {
-            Ok(Some(build_epoch)) => {
-                info!(
-                    path = %path.display(),
-                    build_epoch,
-                    "reloaded the GeoLite2 city database after it changed on disk"
-                );
-                loaded_from = Some(current);
-                reported_failure = None;
-            }
-            Ok(None) => {
-                debug!(
-                    path = %path.display(),
-                    "the GeoLite2 city database file changed but holds the build already loaded"
-                );
-                loaded_from = Some(current);
-                reported_failure = None;
-            }
-            Err(error) => {
-                // `loaded_from` is deliberately left alone so the next poll
-                // retries: a reload that fails must not be remembered as done.
-                if reported_failure.as_ref() != Some(&current) {
-                    warn!(
-                        path = %path.display(),
-                        error = %error,
-                        "the GeoLite2 city database changed on disk but could not be loaded; \
-                         keeping the database currently in memory and retrying on the next poll"
-                    );
-                    reported_failure = Some(current);
-                }
-            }
+        for database in &mut databases {
+            database.poll(&service);
         }
     }
 }
@@ -1708,6 +1750,14 @@ mod tests {
             .clone()
     }
 
+    fn bundled_asn_db() -> Option<std::sync::Arc<Vec<u8>>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("temps-cli")
+            .join(ASN_DB_FILENAME);
+        std::fs::read(path).ok().map(std::sync::Arc::new)
+    }
+
     fn build_epoch_of(bytes: &[u8]) -> u64 {
         maxminddb::Reader::from_source(bytes)
             .expect("the fixture must be a readable database")
@@ -1785,8 +1835,12 @@ mod tests {
         assert_eq!(proxy.build_epoch(), Some(initial_epoch));
 
         // Short poll so the test does not wait a real minute.
-        let _watcher = spawn_db_file_watcher_every(&proxy, path.clone(), Duration::from_millis(25))
-            .expect("start the watcher");
+        let _watcher = spawn_db_file_watcher_every(
+            &proxy,
+            vec![(GeoDatabaseKind::City, path.clone())],
+            Duration::from_millis(25),
+        )
+        .expect("start the watcher");
 
         // The console process refreshes: the file is replaced and *its* reader
         // is swapped. Nothing tells the proxy's reader anything.
@@ -1837,9 +1891,12 @@ mod tests {
         )));
         assert_eq!(service.build_epoch(), None);
 
-        let _watcher =
-            spawn_db_file_watcher_every(&service, path.clone(), Duration::from_millis(25))
-                .expect("start the watcher");
+        let _watcher = spawn_db_file_watcher_every(
+            &service,
+            vec![(GeoDatabaseKind::City, path.clone())],
+            Duration::from_millis(25),
+        )
+        .expect("start the watcher");
 
         write_mmdb_atomically(&path, shared(base.to_vec()))
             .await
@@ -1856,6 +1913,76 @@ mod tests {
             picked_up.is_ok(),
             "the database file appeared but the degraded server never loaded it"
         );
+
+        drop(service);
+    }
+
+    /// Startup stops waiting for a slow download, so the ASN database can arrive
+    /// long after the service looked for it. Hosting classification must turn on
+    /// when it does, or datacenter traffic counts as human until a restart.
+    #[tokio::test]
+    async fn the_file_watcher_loads_an_asn_database_that_arrives_after_startup() {
+        let (Some(city), Some(asn)) = (bundled_city_db(), bundled_asn_db()) else {
+            println!("the bundled databases are not in this checkout; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let city_path = dir.path().join(CITY_DB_FILENAME);
+        let asn_path = dir.path().join(ASN_DB_FILENAME);
+        write_mmdb_atomically(&city_path, city)
+            .await
+            .expect("provide the city database");
+        let maxmind = std::sync::Arc::new(
+            crate::geoip_service::MaxMindGeoIpService::load(&city_path, &asn_path)
+                .expect("a missing ASN file must not fail startup"),
+        );
+        let service = std::sync::Arc::new(GeoIpService::MaxMind(maxmind.clone()));
+        let cloud_ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!service.has_asn_database());
+        assert_eq!(
+            maxmind
+                .geolocate(cloud_ip)
+                .await
+                .unwrap()
+                .is_hosting_provider,
+            None
+        );
+
+        let _watcher = spawn_db_file_watcher_every(
+            &service,
+            vec![
+                (GeoDatabaseKind::City, city_path),
+                (GeoDatabaseKind::Asn, asn_path.clone()),
+            ],
+            Duration::from_millis(25),
+        )
+        .expect("start the watcher");
+
+        // A file that cannot be read yet is retried, not given up on.
+        std::fs::write(&asn_path, b"not a database").expect("write a broken file");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!service.has_asn_database());
+
+        let expected = Some(build_epoch_of(&asn));
+        write_mmdb_atomically(&asn_path, asn)
+            .await
+            .expect("provide the ASN database");
+        let picked_up = tokio::time::timeout(Duration::from_secs(20), async {
+            while service.asn_build_epoch() != expected {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            picked_up.is_ok(),
+            "the ASN database arrived but the running server never loaded it"
+        );
+        assert!(maxmind
+            .geolocate(cloud_ip)
+            .await
+            .unwrap()
+            .is_hosting_provider
+            .is_some());
 
         drop(service);
     }
