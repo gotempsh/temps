@@ -14728,6 +14728,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "urlencoding",
  "utoipa",
  "uuid",

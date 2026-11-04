@@ -3480,20 +3480,54 @@ async fn admin_list_node_containers(
 /// Routes through the shared `cluster_ca::build_node_deployer` factory so an
 /// `https://` node gets mutual TLS (ADR-020 WS-2.1) rather than a plain-HTTP
 /// client the agent would reject under `require_mtls`. Returns `None` if the
-/// node has no encrypted token or decryption/build fails (best-effort).
+/// node has no encrypted token or decryption/build fails (best-effort). A
+/// node with no token simply has no remote deployer; every failure is logged
+/// with the node's id, because the caller cannot tell it from that case.
 pub async fn create_remote_deployer(
     node: &temps_entities::nodes::Model,
     config_service: &ConfigService,
     encryption_service: &temps_core::EncryptionService,
 ) -> Option<Arc<dyn ContainerDeployer>> {
     let encrypted_token = node.token_encrypted.as_ref()?;
-    let decrypted_bytes = encryption_service.decrypt(encrypted_token).ok()?;
-    let token = String::from_utf8(decrypted_bytes).ok()?;
-    let deployer =
-        crate::cluster_ca::build_node_deployer(node, token, config_service, encryption_service)
-            .await
-            .ok()?;
-    Some(Arc::new(deployer))
+    let decrypted_bytes = match encryption_service.decrypt(encrypted_token) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            error!(
+                node_id = node.id,
+                node_name = %node.name,
+                %error,
+                "cannot create the remote deployer: decrypting the node's token failed"
+            );
+            return None;
+        }
+    };
+    let token = match String::from_utf8(decrypted_bytes) {
+        Ok(token) => token,
+        // The error's Display says where the UTF-8 broke, never the bytes.
+        Err(error) => {
+            error!(
+                node_id = node.id,
+                node_name = %node.name,
+                error = %error.utf8_error(),
+                "cannot create the remote deployer: the node's decrypted token is not UTF-8"
+            );
+            return None;
+        }
+    };
+    match crate::cluster_ca::build_node_deployer(node, token, config_service, encryption_service)
+        .await
+    {
+        Ok(deployer) => Some(Arc::new(deployer)),
+        Err(error) => {
+            error!(
+                node_id = node.id,
+                node_name = %node.name,
+                %error,
+                "cannot create the remote deployer: building its client failed"
+            );
+            None
+        }
+    }
 }
 
 /// 409 for removing an unreachable node that deployments still serve from:
@@ -5155,6 +5189,99 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    /// What this thread logged while the guard from [`CapturedLogs::install`] lives.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(self.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A worker whose token cannot be used loses its deployer: the operator has
+    /// to be able to find out which node and why, without the token in the log.
+    #[tokio::test]
+    async fn a_node_token_that_cannot_be_used_is_logged_with_the_node_and_without_the_token() {
+        let encryption =
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap();
+        let config = config_service_with(temps_config::AppSettings::default());
+        let undecryptable = "stored-token-ciphertext";
+        let not_text = encryption.encrypt(&[0xff, 0xfe, 0xfd]).unwrap();
+
+        for (token, failure) in [
+            (
+                undecryptable.to_string(),
+                "decrypting the node's token failed",
+            ),
+            (not_text.clone(), "the node's decrypted token is not UTF-8"),
+        ] {
+            let mut node = sample_node();
+            node.id = 42;
+            node.token_encrypted = Some(token);
+
+            let logs = CapturedLogs::default();
+            let deployer = {
+                let _guard = logs.install();
+                create_remote_deployer(&node, &config, &encryption).await
+            };
+
+            assert!(deployer.is_none());
+            let text = logs.text();
+            assert!(text.contains("ERROR"), "{text}");
+            assert!(text.contains("node_id=42"), "{text}");
+            assert!(text.contains("worker-1"), "{text}");
+            assert!(text.contains(failure), "{text}");
+            assert!(!text.contains(undecryptable), "{text}");
+            assert!(!text.contains(&not_text), "{text}");
+        }
+    }
+
+    /// A node with no stored token is a normal state, not a failure.
+    #[tokio::test]
+    async fn a_node_without_a_token_has_no_deployer_and_logs_nothing() {
+        let encryption =
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap();
+        let config = config_service_with(temps_config::AppSettings::default());
+
+        let logs = CapturedLogs::default();
+        let deployer = {
+            let _guard = logs.install();
+            create_remote_deployer(&sample_node(), &config, &encryption).await
+        };
+
+        assert!(deployer.is_none());
+        assert_eq!(logs.text(), "");
     }
 
     fn make_app(db: sea_orm::DatabaseConnection) -> axum::Router {
