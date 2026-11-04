@@ -670,6 +670,7 @@ pub async fn deploy_container(
     responses(
         (status = 200, description = "Container stopped", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container does not exist on this node"),
         (status = 500, description = "Stop failed")
     ),
     security(("bearer_auth" = []))
@@ -687,7 +688,7 @@ pub async fn stop_container(
         Err(e) => {
             tracing::error!(container_id = %container_id, "Stop failed: {}", e);
             error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                container_error_status(&e),
                 format!("Stop failed for container {}: {}", container_id, e),
             )
             .into_response()
@@ -796,6 +797,74 @@ mod container_error_tests {
             "container no longer exists".to_string(),
         );
         assert_eq!(container_error_status(&error), StatusCode::NOT_FOUND);
+    }
+
+    /// The control plane treats a 404 as "this container is gone, so it is not
+    /// running". Any other failure must stay a 500, so that a stop that did
+    /// not happen can never read that way.
+    async fn stop_answer(agent_status_line: &'static str) -> StatusCode {
+        use axum::extract::{Path, State};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The deployer behind this agent, answering like a Docker runtime that
+        // does not have the container (or is failing).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock runtime");
+        let address = listener.local_addr().expect("mock runtime address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"scripted failure"}"#;
+            let response = format!(
+                "HTTP/1.1 {agent_status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                format!("http://{address}"),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .expect("create deployer"),
+        );
+        let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
+            container_deployer: runtime.clone(),
+            image_builder: runtime,
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+
+        let response = stop_container(State(state), Path("some-container".to_string()))
+            .await
+            .into_response();
+        server.await.expect("mock runtime task");
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn stopping_a_missing_container_answers_not_found() {
+        assert_eq!(stop_answer("404 Not Found").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_answers_internal_server_error() {
+        assert_eq!(
+            stop_answer("500 Internal Server Error").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

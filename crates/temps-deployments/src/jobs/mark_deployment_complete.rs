@@ -34,6 +34,8 @@ use tracing::{debug, info, warn};
 /// lagging worker ever waits this long.
 const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
 
+mod paused_sweep;
+
 /// Deployment states the previous-deployment teardown sweep picks up.
 const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "completed"];
 
@@ -2543,6 +2545,21 @@ WHERE project.id = $2
         }
     }
 
+    /// Deployments created before `current_created_at`; ID is the deterministic
+    /// tie-breaker for equal timestamps.
+    fn created_before_this_deployment(
+        &self,
+        current_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Condition {
+        Condition::any()
+            .add(deployments::Column::CreatedAt.lt(current_created_at))
+            .add(
+                Condition::all()
+                    .add(deployments::Column::CreatedAt.eq(current_created_at))
+                    .add(deployments::Column::Id.lt(self.deployment_id)),
+            )
+    }
+
     /// Teardown all running/pending deployments for the same environment.
     /// This ensures only one active deployment per environment.
     ///
@@ -2558,6 +2575,9 @@ WHERE project.id = $2
         environment_id: i32,
         current_created_at: chrono::DateTime<chrono::Utc>,
     ) {
+        self.stop_paused_deployments(environment_id, current_created_at)
+            .await;
+
         self.log("Checking for previous deployments to teardown...".to_string())
             .await
             .ok();
@@ -2581,15 +2601,7 @@ WHERE project.id = $2
         // deterministic tie-breaker for equal timestamps.
         let previous_deployments = match deployments::Entity::find()
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(
-                Condition::any()
-                    .add(deployments::Column::CreatedAt.lt(current_created_at))
-                    .add(
-                        Condition::all()
-                            .add(deployments::Column::CreatedAt.eq(current_created_at))
-                            .add(deployments::Column::Id.lt(self.deployment_id)),
-                    ),
-            )
+            .filter(self.created_before_this_deployment(current_created_at))
             .filter(deployments::Column::State.is_in(TEARDOWN_SWEPT_STATES))
             .order_by_desc(deployments::Column::CreatedAt)
             .limit(MAX_TEARDOWN_DEPLOYMENTS_PER_PASS)
@@ -3444,6 +3456,8 @@ mod teardown_tests {
         fail_remove: std::sync::atomic::AtomicBool,
         /// When set, `remove_container` reports the container as already gone.
         container_missing: std::sync::atomic::AtomicBool,
+        /// When set, `stop_container` fails like an unreachable daemon.
+        fail_stop: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingDeployer {
@@ -3453,6 +3467,7 @@ mod teardown_tests {
                 removed: Arc::new(StdMutex::new(Vec::new())),
                 fail_remove: std::sync::atomic::AtomicBool::new(false),
                 container_missing: std::sync::atomic::AtomicBool::new(false),
+                fail_stop: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -3484,6 +3499,11 @@ mod teardown_tests {
             Ok(())
         }
         async fn stop_container(&self, id: &str) -> Result<(), DeployerError> {
+            if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DeployerError::Other(format!(
+                    "stop of container {id} failed"
+                )));
+            }
             self.stopped.lock().unwrap().push(id.to_string());
             Ok(())
         }
@@ -4432,6 +4452,211 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(prev_after.state, "stopped");
+    }
+
+    /// A deploy must leave nothing of an older paused deployment running, even
+    /// a container whose row claims it stopped (a pause used to record that
+    /// without having reached the container). It stays resumable: stopped,
+    /// never removed, and the deployment stays paused. A paused deployment
+    /// newer than the one finishing is not this deploy's to touch.
+    #[tokio::test]
+    async fn test_sweep_stops_but_keeps_containers_of_older_paused_deployments() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let still_running = insert_container(&db, paused.id, "paused-running").await;
+        let claims_stopped = insert_container(&db, paused.id, "paused-claims-stopped").await;
+        let mut active: deployment_containers::ActiveModel = claims_stopped.clone().into();
+        active.status = Set(Some("stopped".to_string()));
+        active.update(db.as_ref()).await.unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+        let newer = insert_deployment(&db, project.id, env.id, "newer-deploy", "paused").await;
+        insert_container(&db, newer.id, "newer-paused").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let mut stopped = deployer.stopped.lock().unwrap().clone();
+        stopped.sort();
+        assert_eq!(stopped, ["paused-claims-stopped", "paused-running"]);
+        assert!(
+            deployer.removed.lock().unwrap().is_empty(),
+            "a paused deployment must stay resumable"
+        );
+        let paused_after = deployments::Entity::find_by_id(paused.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused_after.state, "paused");
+        let row = deployment_containers::Entity::find_by_id(still_running.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+        assert!(row.finished_at.is_some());
+        assert!(row.deleted_at.is_none());
+    }
+
+    /// A microVM paused before pause refused them has no stopped state: the
+    /// only way to leave it not running next to the new deployment is to
+    /// retire it through the plane, and Docker is never asked about it.
+    #[tokio::test]
+    async fn test_sweep_retires_a_micro_vm_replica_of_a_paused_deployment() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-vm").await;
+        let plane =
+            crate::services::services::tests::plane_with_micro_vm_replica(&db, &paused, &container)
+                .await
+                .unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone()).with_workload_plane(plane);
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        let workload = crate::services::plane_deployer::deployment_replica_workload(
+            db.as_ref(),
+            paused.id,
+            "paused-vm",
+        )
+        .await
+        .unwrap()
+        .expect("the replica's workload");
+        assert!(workload.retired, "the plane retired the microVM");
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_some());
+    }
+
+    /// A stop that fails leaves the row saying what is true, so the next
+    /// deploy tries again.
+    #[tokio::test]
+    async fn test_sweep_keeps_paused_container_running_when_its_stop_fails() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-running").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
+        assert!(row.finished_at.is_none());
+
+        deployer
+            .fail_stop
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+        assert_eq!(
+            deployer.stopped.lock().unwrap().as_slice(),
+            ["paused-running"]
+        );
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+    }
+
+    /// A worker's container is never looked for on this host: if the worker
+    /// cannot be reached, nothing is stopped and nothing is recorded.
+    #[tokio::test]
+    async fn test_sweep_never_stops_a_worker_container_on_the_local_runtime() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-on-worker").await;
+        // No agent token, so this worker can never be dialled.
+        let node = nodes::ActiveModel {
+            name: Set("worker-unreachable".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:1".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            build_limits: Set(None),
+            public_ingress_enabled: Set(false),
+            public_ingress_unsupported_reasons: Set(serde_json::json!([])),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let mut active: deployment_containers::ActiveModel = container.clone().into();
+        active.node_id = Set(Some(node.id));
+        active.update(db.as_ref()).await.unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
     }
 
     /// A container that is already gone from Docker (pruned, removed by hand)

@@ -500,6 +500,16 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Deployment State Conflict")
                     .with_detail(err.to_string())
             }
+            DeploymentError::MicroVmReplicaCannotBePaused { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Deployment Cannot Be Paused")
+                    .with_detail(err.to_string())
+            }
+            DeploymentError::DeploymentPauseIncomplete { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Deployment Pause Incomplete")
+                    .with_detail(err.to_string())
+            }
             DeploymentError::PipelineError(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Pipeline Error")
