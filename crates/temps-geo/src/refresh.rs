@@ -125,7 +125,7 @@ impl GeoDatabaseKind {
     /// database, so a file holding the wrong database (a City file saved as
     /// `GeoLite2-ASN.mmdb`) is rejected instead of silently answering every
     /// lookup with nothing.
-    fn accepts_database_type(self, database_type: &str) -> bool {
+    pub(crate) fn accepts_database_type(self, database_type: &str) -> bool {
         match self {
             // GeoLite2-City, GeoIP2-City, DBIP-City-Lite, GeoIP2-Enterprise
             Self::City => database_type.contains("City") || database_type.contains("Enterprise"),
@@ -1985,6 +1985,77 @@ mod tests {
             .is_some());
 
         drop(service);
+    }
+
+    /// Downloads check a file's kind, but an operator can copy any file into
+    /// place. A City file saved under the ASN name decodes to empty records, which
+    /// classify every cloud address as "not hosting", and those verdicts get stored.
+    #[tokio::test]
+    async fn a_database_of_the_wrong_kind_never_replaces_the_loaded_one() {
+        let (Some(city), Some(asn)) = (bundled_city_db(), bundled_asn_db()) else {
+            println!("the bundled databases are not in this checkout; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let city_path = dir.path().join(CITY_DB_FILENAME);
+        let asn_path = dir.path().join(ASN_DB_FILENAME);
+        std::fs::write(&city_path, city.as_slice()).expect("seed the city database");
+        std::fs::write(&asn_path, asn.as_slice()).expect("seed the ASN database");
+        let service = GeoIpService::MaxMind(std::sync::Arc::new(
+            crate::geoip_service::MaxMindGeoIpService::load(&city_path, &asn_path)
+                .expect("load both databases"),
+        ));
+        let city_epoch = Some(build_epoch_of(&city));
+        let asn_epoch = Some(build_epoch_of(&asn));
+        assert_ne!(city_epoch, asn_epoch, "the swap guard must not hide this");
+
+        // Each file holds a readable database of the other kind.
+        let wrong_asn = service
+            .refresh_asn_from_path_if_changed(&city_path)
+            .expect_err("a City file is not an ASN database");
+        assert!(
+            wrong_asn.to_string().contains("GeoLite2-City"),
+            "{wrong_asn}"
+        );
+        let wrong_city = service
+            .refresh_from_path_if_changed(&asn_path)
+            .expect_err("an ASN file is not a City database");
+        assert!(
+            wrong_city.to_string().contains("GeoLite2-ASN"),
+            "{wrong_city}"
+        );
+
+        assert_eq!(service.asn_build_epoch(), asn_epoch);
+        assert_eq!(service.build_epoch(), city_epoch);
+
+        // A real replacement of the right kind still lands.
+        let newer = with_build_epoch(&asn, build_epoch_of(&asn) + 86_400);
+        std::fs::write(&asn_path, &newer).expect("replace the ASN database");
+        assert_eq!(
+            service
+                .refresh_asn_from_path_if_changed(&asn_path)
+                .expect("a newer ASN database"),
+            Some(build_epoch_of(&newer))
+        );
+    }
+
+    /// The same file at startup must not turn detection "on" with nothing behind it.
+    #[test]
+    fn startup_treats_a_wrong_kind_of_asn_file_as_missing() {
+        let Some(city) = bundled_city_db() else {
+            println!("{} is not in this checkout; skipping", CITY_DB_FILENAME);
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let city_path = dir.path().join(CITY_DB_FILENAME);
+        let asn_path = dir.path().join(ASN_DB_FILENAME);
+        std::fs::write(&city_path, city.as_slice()).expect("seed the city database");
+        std::fs::write(&asn_path, city.as_slice()).expect("save it under the ASN name");
+
+        let service = crate::geoip_service::MaxMindGeoIpService::load(&city_path, &asn_path)
+            .expect("an optional database must not fail startup");
+
+        assert!(!service.has_asn_database());
     }
 
     /// The poll exists to notice an out-of-process write quickly; it must stay

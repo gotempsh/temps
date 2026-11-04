@@ -588,6 +588,26 @@ fn open_mmdb(
     }
 }
 
+/// [`open_mmdb`], refusing a readable database of the wrong kind. Opening a file
+/// only proves it is an `.mmdb`: a City file saved under the ASN name would load,
+/// decode to empty records and classify every address as "not hosting".
+fn open_mmdb_of_kind(
+    kind: crate::refresh::GeoDatabaseKind,
+    path: &std::path::Path,
+) -> Result<maxminddb::Reader<MmdbSource>, String> {
+    let reader = open_mmdb(path).map_err(|e| e.to_string())?;
+    let database_type = &reader.metadata().database_type;
+    if !kind.accepts_database_type(database_type) {
+        return Err(format!(
+            "expected a {} database ({}) but the file is '{}'",
+            kind.label(),
+            kind.filename(),
+            database_type
+        ));
+    }
+    Ok(reader)
+}
+
 /// Whether `TEMPS_GEO_MOCK=true` asks for the in-memory mock geolocation
 /// service instead of the MaxMind database.
 ///
@@ -694,10 +714,11 @@ impl GeoIpService {
     ) -> Result<Option<u64>, GeoIpError> {
         match self {
             Self::MaxMind(service) => {
-                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
+                let reader = open_mmdb_of_kind(crate::refresh::GeoDatabaseKind::City, path)
+                    .map_err(|reason| GeoIpError::ReloadFailed {
+                        path: path.display().to_string(),
+                        reason,
+                    })?;
                 let build_epoch = reader.metadata().build_epoch;
                 if service.build_epoch() == Some(build_epoch) {
                     return Ok(None);
@@ -722,10 +743,11 @@ impl GeoIpService {
     ) -> Result<Option<u64>, GeoIpError> {
         match self {
             Self::MaxMind(service) => {
-                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
+                let reader = open_mmdb_of_kind(crate::refresh::GeoDatabaseKind::Asn, path)
+                    .map_err(|reason| GeoIpError::ReloadFailed {
+                        path: path.display().to_string(),
+                        reason,
+                    })?;
                 let build_epoch = reader.metadata().build_epoch;
                 if service.asn_build_epoch() == Some(build_epoch) {
                     return Ok(None);
@@ -815,14 +837,15 @@ impl MaxMindGeoIpService {
         // (asn_org/is_hosting_provider stay None) rather than failing startup when
         // the operator hasn't provisioned it, same as the City database's own
         // optional-file convention in Dockerfile/docker-compose.
-        let asn_reader = match open_mmdb(asn_db_path) {
+        let asn_reader = match open_mmdb_of_kind(crate::refresh::GeoDatabaseKind::Asn, asn_db_path)
+        {
             Ok(reader) => {
                 info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
                 Some(reader)
             }
             Err(e) => {
                 warn!(
-                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection \
+                    "No usable MaxMind ASN database at '{}' ({}); hosting-provider detection \
                      stays off until the file is provided. No restart is needed",
                     asn_db_path.display(),
                     e
