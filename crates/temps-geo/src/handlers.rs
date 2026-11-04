@@ -63,6 +63,11 @@ impl From<GeoIpError> for Problem {
             GeoIpError::NonGlobalAddress(_) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("IP Not Found")
                 .with_detail(error.to_string()),
+            GeoIpError::DatabaseNotLoaded { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Geolocation Database Not Loaded")
+                    .with_detail(error.to_string())
+            }
             GeoIpError::Settings(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Settings Unavailable")
                 .with_detail(error.to_string()),
@@ -476,6 +481,17 @@ mod tests {
         assert_eq!(response.age_days, Some(0));
         assert!(response.is_stale);
         assert_eq!(response.last_error.as_deref(), Some("HTTP 401"));
+    }
+
+    #[test]
+    fn a_lookup_without_a_database_is_a_503_saying_what_to_do() {
+        let problem = Problem::from(GeoIpError::DatabaseNotLoaded {
+            ip: "8.8.8.8".parse().unwrap(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str());
+        assert!(detail.is_some_and(|detail| detail.contains("MaxMind license key")));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 use maxminddb::geoip2;
 use maxminddb::Mmap;
 use rand::prelude::IndexedRandom;
@@ -247,6 +247,15 @@ pub enum GeoIpError {
     DatabaseError(#[from] maxminddb::MaxMindDbError),
     #[error("IP address not found in database")]
     NotFound(String),
+    /// No city database is loaded: the file was missing at startup and nothing
+    /// has provided it since. Geolocation is degraded rather than broken, and
+    /// the file watcher loads the database as soon as the file appears.
+    #[error(
+        "No GeoLite2 city database is loaded, so {ip} cannot be geolocated. Add a MaxMind \
+         license key in the geolocation settings, or copy GeoLite2-City.mmdb into the data \
+         directory"
+    )]
+    DatabaseNotLoaded { ip: IpAddr },
     /// A private, loopback, link-local, CGNAT, documentation or other
     /// special-use address. No GeoIP database can place it, so it is
     /// answered without a lookup. Expected for traffic from a container
@@ -611,39 +620,8 @@ impl GeoIpService {
 
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
-            debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = open_mmdb(&db_path).map_err(|e| {
-                GeoIpError::Other(format!(
-                    "Failed to open MaxMind database at '{}': {}",
-                    db_path.display(),
-                    e
-                ))
-            })?;
-
-            // ASN database is optional: hosting-provider detection degrades gracefully
-            // (asn_org/is_hosting_provider stay None) rather than failing startup when
-            // the operator hasn't provisioned it, same as the City database's own
-            // optional-file convention in Dockerfile/docker-compose.
             let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-            let asn_reader = match open_mmdb(&asn_db_path) {
-                Ok(reader) => {
-                    info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
-                    Some(reader)
-                }
-                Err(e) => {
-                    warn!(
-                        "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
-                        asn_db_path.display(),
-                        e
-                    );
-                    None
-                }
-            };
-
-            Ok(MaxMindGeoIpService {
-                reader: ArcSwap::from_pointee(reader),
-                asn_reader,
-            })
+            MaxMindGeoIpService::load(&db_path, &asn_db_path)
         })?;
 
         Ok(Self::MaxMind(service))
@@ -664,7 +642,7 @@ impl GeoIpService {
             reason: e.to_string(),
         })?;
         Ok(Self::MaxMind(Arc::new(MaxMindGeoIpService {
-            reader: ArcSwap::from_pointee(reader),
+            reader: ArcSwapOption::from_pointee(reader),
             asn_reader: None,
         })))
     }
@@ -721,7 +699,7 @@ impl GeoIpService {
                     reason: e.to_string(),
                 })?;
                 let build_epoch = reader.metadata().build_epoch;
-                if build_epoch == service.build_epoch() {
+                if service.build_epoch() == Some(build_epoch) {
                     return Ok(None);
                 }
                 service.refresh(reader);
@@ -736,10 +714,11 @@ impl GeoIpService {
     }
 
     /// `build_epoch` of the currently loaded city database, i.e. when MaxMind
-    /// built the data being served right now. `None` in mock mode.
+    /// built the data being served right now. `None` in mock mode and while no
+    /// city database is loaded.
     pub fn build_epoch(&self) -> Option<u64> {
         match self {
-            Self::MaxMind(service) => Some(service.build_epoch()),
+            Self::MaxMind(service) => service.build_epoch(),
             Self::Mock(_) => None,
         }
     }
@@ -766,12 +745,67 @@ impl GeoIpService {
 pub struct MaxMindGeoIpService {
     /// Swapped wholesale by the scheduled refresh job. `ArcSwap` keeps lookups
     /// lock-free on the proxy hot path while letting a background task publish
-    /// a newly downloaded database to every in-flight caller at once.
-    reader: ArcSwap<maxminddb::Reader<MmdbSource>>,
+    /// a newly downloaded database to every in-flight caller at once. Empty
+    /// while the file is missing: a server without it still runs, and the
+    /// refresh job or the file watcher fills this in when the file arrives.
+    reader: ArcSwapOption<maxminddb::Reader<MmdbSource>>,
     asn_reader: Option<maxminddb::Reader<MmdbSource>>,
 }
 
 impl MaxMindGeoIpService {
+    /// Open the databases at these paths. A missing city file is a degraded
+    /// server, not a failed one: lookups answer
+    /// [`GeoIpError::DatabaseNotLoaded`] until the file shows up. A file that is
+    /// there but cannot be read is still an error, since it means something is
+    /// wrong rather than not set up yet.
+    pub(crate) fn load(
+        db_path: &std::path::Path,
+        asn_db_path: &std::path::Path,
+    ) -> Result<Self, GeoIpError> {
+        debug!("Loading MaxMind database from: {:?}", db_path);
+        let reader = if db_path.exists() {
+            Some(open_mmdb(db_path).map_err(|e| {
+                GeoIpError::Other(format!(
+                    "Failed to open MaxMind database at '{}': {}",
+                    db_path.display(),
+                    e
+                ))
+            })?)
+        } else {
+            warn!(
+                path = %db_path.display(),
+                "GeoLite2 city database not found; starting without geolocation. Locations stay \
+                 empty until the file is provided: add a MaxMind license key in the geolocation \
+                 settings, or copy GeoLite2-City.mmdb to this path. No restart is needed"
+            );
+            None
+        };
+
+        // ASN database is optional: hosting-provider detection degrades gracefully
+        // (asn_org/is_hosting_provider stay None) rather than failing startup when
+        // the operator hasn't provisioned it, same as the City database's own
+        // optional-file convention in Dockerfile/docker-compose.
+        let asn_reader = match open_mmdb(asn_db_path) {
+            Ok(reader) => {
+                info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
+                Some(reader)
+            }
+            Err(e) => {
+                warn!(
+                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
+                    asn_db_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
+        Ok(Self {
+            reader: ArcSwapOption::new(reader.map(Arc::new)),
+            asn_reader,
+        })
+    }
+
     /// The databases bundled with `temps-cli`, for tests in this crate that
     /// need real ASN data. `None` when they are not present (e.g. a source
     /// tarball without them), so callers can skip.
@@ -781,7 +815,7 @@ impl MaxMindGeoIpService {
         let city = open_mmdb(&cli_dir.join("GeoLite2-City.mmdb")).ok()?;
         let asn = open_mmdb(&cli_dir.join("GeoLite2-ASN.mmdb")).ok()?;
         Some(Self {
-            reader: ArcSwap::from_pointee(city),
+            reader: ArcSwapOption::from_pointee(city),
             asn_reader: Some(asn),
         })
     }
@@ -795,6 +829,9 @@ impl MaxMindGeoIpService {
         // One snapshot per lookup: a concurrent refresh publishes a new reader
         // without disturbing this one, which stays alive until the guard drops.
         let reader = self.reader.load();
+        let Some(reader) = reader.as_ref() else {
+            return Err(GeoIpError::DatabaseNotLoaded { ip });
+        };
         let lookup_result = reader.lookup(ip)?;
 
         let city_data = lookup_result
@@ -829,7 +866,7 @@ impl MaxMindGeoIpService {
     pub fn refresh(&self, new_reader: maxminddb::Reader<MmdbSource>) {
         let previous_epoch = self.build_epoch();
         let new_epoch = new_reader.metadata().build_epoch;
-        self.reader.store(Arc::new(new_reader));
+        self.reader.store(Some(Arc::new(new_reader)));
         info!(
             previous_build_epoch = previous_epoch,
             new_build_epoch = new_epoch,
@@ -839,9 +876,13 @@ impl MaxMindGeoIpService {
 
     /// `build_epoch` from the loaded database's metadata: the Unix timestamp
     /// MaxMind stamped the build with, which is the real age of the data (a
-    /// freshly downloaded file can still hold a months-old build).
-    pub fn build_epoch(&self) -> u64 {
-        self.reader.load().metadata().build_epoch
+    /// freshly downloaded file can still hold a months-old build). `None` while
+    /// no city database is loaded.
+    pub fn build_epoch(&self) -> Option<u64> {
+        self.reader
+            .load()
+            .as_ref()
+            .map(|reader| reader.metadata().build_epoch)
     }
 
     /// Whether an ASN database is loaded, i.e. whether hosting-provider
@@ -1055,6 +1096,87 @@ mod tests {
         }
     }
 
+    /// `temps serve` used to exit about 30 seconds in on a host with no city
+    /// database and no way to download one. It starts instead, and lookups say
+    /// why they have no answer.
+    #[tokio::test]
+    async fn a_missing_city_database_degrades_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = MaxMindGeoIpService::load(
+            &dir.path().join("GeoLite2-City.mmdb"),
+            &dir.path().join("GeoLite2-ASN.mmdb"),
+        )
+        .expect("a missing file must not fail startup");
+        let service = GeoIpService::MaxMind(Arc::new(service));
+
+        assert_eq!(service.build_epoch(), None);
+        assert!(!service.has_asn_database());
+
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        let error = service.geolocate(ip).await.unwrap_err();
+        assert!(matches!(error, GeoIpError::DatabaseNotLoaded { .. }));
+        // Not a miss: an expected miss is a verdict about the address, and
+        // `IpAddressService` stores it as "not a hosting network". No database
+        // says nothing about the address, so it goes through the failure path,
+        // which keeps the stored row and logs through a latch, not per visitor.
+        assert!(!error.is_expected_miss());
+        assert!(error.to_string().contains("8.8.8.8"));
+
+        // A private address is still answered without a lookup.
+        let private: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(matches!(
+            service.geolocate(private).await,
+            Err(GeoIpError::NonGlobalAddress(_))
+        ));
+    }
+
+    /// A file that is there but unreadable is something wrong, not something
+    /// not set up yet, and is still reported at startup.
+    #[test]
+    fn a_corrupt_city_database_still_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let city = dir.path().join("GeoLite2-City.mmdb");
+        std::fs::write(&city, b"not a database").unwrap();
+
+        let error = MaxMindGeoIpService::load(&city, &dir.path().join("GeoLite2-ASN.mmdb"))
+            .err()
+            .expect("a corrupt file must fail");
+
+        assert!(error.to_string().contains("GeoLite2-City.mmdb"), "{error}");
+    }
+
+    /// The database a degraded server was missing starts answering lookups as
+    /// soon as it arrives, without a restart.
+    #[tokio::test]
+    async fn a_city_database_that_arrives_later_starts_serving_lookups() {
+        let bundled =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temps-cli/GeoLite2-City.mmdb");
+        if !bundled.exists() {
+            eprintln!("Skipping: {} not present", bundled.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let service = GeoIpService::MaxMind(Arc::new(
+            MaxMindGeoIpService::load(
+                &dir.path().join("GeoLite2-City.mmdb"),
+                &dir.path().join("GeoLite2-ASN.mmdb"),
+            )
+            .unwrap(),
+        ));
+
+        let epoch = service
+            .refresh_from_path_if_changed(&bundled)
+            .unwrap()
+            .expect("the first database is a change");
+
+        assert_eq!(service.build_epoch(), Some(epoch));
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!matches!(
+            service.geolocate(ip).await,
+            Err(GeoIpError::DatabaseNotLoaded { .. })
+        ));
+    }
+
     #[test]
     fn test_expected_misses_are_distinguished_from_failures() {
         let private: IpAddr = "10.0.0.5".parse().unwrap();
@@ -1075,7 +1197,9 @@ mod tests {
             return;
         }
         let service = MaxMindGeoIpService {
-            reader: ArcSwap::from_pointee(open_mmdb(&path).expect("open GeoLite2 city database")),
+            reader: ArcSwapOption::from_pointee(
+                open_mmdb(&path).expect("open GeoLite2 city database"),
+            ),
             asn_reader: None,
         };
 
@@ -1286,7 +1410,9 @@ mod tests {
             return;
         }
         let service = MaxMindGeoIpService {
-            reader: ArcSwap::from_pointee(open_mmdb(&city_path).expect("open bundled city db")),
+            reader: ArcSwapOption::from_pointee(
+                open_mmdb(&city_path).expect("open bundled city db"),
+            ),
             asn_reader: Some(open_mmdb(&asn_path).expect("open bundled ASN db")),
         };
         assert!(service.has_asn_database());

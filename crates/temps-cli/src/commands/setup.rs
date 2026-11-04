@@ -1089,7 +1089,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     println!(
         "   {} {}",
         "📍".bright_yellow(),
-        "GeoLite2-City.mmdb is required to run the application".bright_white()
+        "GeoLite2-City.mmdb is needed for geolocation".bright_white()
     );
     println!(
         "{}",
@@ -1130,7 +1130,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     );
     println!();
     println!(
-        "   {} Setup can continue, but {} will fail without this file.",
+        "   {} Setup can continue; {} runs without geolocation until this file is provided.",
         "ℹ️ ".bright_blue(),
         "temps serve".bright_cyan()
     );

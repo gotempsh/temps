@@ -1927,12 +1927,9 @@ async fn ensure_geolite2_asn_database(default_db_path: &Path, license_key: Optio
 
 /// Validate GeoLite2-City database exists in multiple locations.
 /// Checks current directory and data directory; if neither has the file,
-/// downloads it to `default_db_path`. Errors only after the download attempt
-/// fails.
-async fn validate_geolite2_database(
-    default_db_path: &Path,
-    license_key: Option<&str>,
-) -> anyhow::Result<()> {
+/// downloads it to `default_db_path`. A failed download is a warning: the
+/// server runs without geolocation until the file is provided.
+async fn ensure_geolite2_database(default_db_path: &Path, license_key: Option<&str>) {
     // Check multiple locations in order of preference
     let search_paths = vec![
         // 1. Current working directory (most convenient for local development)
@@ -1945,7 +1942,7 @@ async fn validate_geolite2_database(
     for path in &search_paths {
         if path.exists() {
             debug!("✓ GeoLite2 database found at: {}", path.display());
-            return Ok(());
+            return;
         }
     }
 
@@ -1957,44 +1954,16 @@ async fn validate_geolite2_database(
         search_paths[1].display()
     );
     match download_geolite2_database_on_startup(default_db_path, license_key).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(anyhow::Error::new(
-            super::startup_failure::ConsoleStartupError::GeoDatabase {
-                checked: search_paths.clone(),
-                reason: e.to_string(),
-                message: format!(
-                    "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
-            The MaxMind GeoLite2 database is required for geolocation features.\n\n\
-            📍 Checked locations (in order):\n\
-            1. {}\n\
-            2. {}\n\n\
-            ⬇️  Download attempt error: {}\n\n\
-            📥 Manual setup (takes 2 minutes):\n\
-            1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
-            2. Create free MaxMind account (if needed)\n\
-            3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
-            4. Extract the archive:\n\
-               tar xzf GeoLite2-City_*.tar.gz\n\n\
-            5. Copy the database file to any location above:\n\
-               # Option A: Current directory (recommended for local development)\n\
-               cp GeoLite2-City_*/GeoLite2-City.mmdb .\n\n\
-               # Option B: Data directory\n\
-               cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
-            6. Start the server again\n\n\
-            🔑 Automatic downloads and refreshes:\n\
-            Add a MaxMind license key (free MaxMind account) under\n\
-            Settings → Metrics Monitoring → Geolocation database, and Temps\n\
-            downloads GeoLite2-City itself and re-checks it on the refresh\n\
-            interval configured there (default every 24 hours).\n\n\
-            🐳 For Docker users:\n\
-            See Dockerfile in the repository for embedding the database",
-                    search_paths[0].display(),
-                    search_paths[1].display(),
-                    e,
-                    search_paths[1].display()
-                ),
-            },
-        )),
+        Ok(()) => {}
+        Err(e) => warn!(
+            first_location = %search_paths[0].display(),
+            second_location = %search_paths[1].display(),
+            error = %temps_geo::redact_license_key(e.to_string(), license_key),
+            "GeoLite2-City.mmdb not found and could not be downloaded; starting without \
+             geolocation. Add a MaxMind license key under Settings > Metrics Monitoring > \
+             Geolocation database, or copy GeoLite2-City.mmdb into the data directory. \
+             No restart is needed"
+        ),
     }
 }
 
