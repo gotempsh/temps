@@ -3848,6 +3848,34 @@ services:
         );
     }
 
+    /// Stopping also clears the restart policy. A stack where that failed could
+    /// come back when Docker restarts, so it must not be kept.
+    #[tokio::test]
+    async fn a_failed_stack_that_could_not_be_stopped_is_removed() {
+        let agent = fake_compose_agent_with_deploy(
+            ComposeHostEvent::Prepared,
+            Some(STOP),
+            Some(failed_deploy_with_a_container()),
+        )
+        .await;
+        let job = job_on_worker(
+            db_that_can_record_a_retained_stack(),
+            &agent,
+            sealed_to_a_key(),
+        );
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        assert!(routes.iter().any(|route| route == STOP), "{routes:?}");
+        assert!(!job.retained_failed_stack.load(Ordering::Acquire));
+        assert_eq!(
+            routes.last().map(String::as_str),
+            Some(TEARDOWN),
+            "{routes:?}"
+        );
+    }
+
     /// The old stack is gone by now, and what started in its place failed.
     #[tokio::test]
     async fn a_deployment_that_fails_after_replacing_the_stack_is_cleaned_up() {
