@@ -395,34 +395,20 @@ impl DeployImageJob {
         })
     }
 
-    /// Publish the container port. For local deployments, allocate a port on
-    /// this host. For remote deployments, set host_port=0 so Docker on the
-    /// agent picks an available port, bound to the node's private address.
+    /// Publish the container port on a host port Docker picks while creating
+    /// the container, bound to the node's private address on a remote node.
+    /// The create result reports the port it chose. Choosing one here instead
+    /// would leave it free for anything to take until Docker bound it.
     async fn replica_port_mappings(
         &self,
         context: &WorkflowContext,
         assignment: &NodeAssignment,
         container_port: Option<u16>,
     ) -> Result<Vec<PortMapping>, WorkflowError> {
-        let host_port = if assignment.is_local() && container_port.is_some() {
-            Self::find_available_port()?
-        } else {
-            0
-        };
         self.log(
             context,
             format!(
-                "🔌 {} host port: {} → container port: {}",
-                if assignment.is_local() {
-                    "Allocated"
-                } else {
-                    "Requesting dynamic"
-                },
-                if host_port == 0 {
-                    "auto".to_string()
-                } else {
-                    host_port.to_string()
-                },
+                "🔌 Requesting dynamic host port → container port: {}",
                 container_port
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "none (background worker)".to_string())
@@ -436,7 +422,7 @@ impl DeployImageJob {
             .transpose()?;
         Ok(container_port
             .map(|container_port| PortMapping {
-                host_port,
+                host_port: 0,
                 container_port,
                 protocol: Protocol::Tcp,
                 host_ip,
@@ -1554,6 +1540,30 @@ mod tests {
         assert_eq!(env["TEMPS_NODE_NAME"], "control-plane");
         assert_eq!(env["TEMPS_NODE_ID"], "0");
         assert_eq!(env["TEMPS_REPLICA"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_local_replica_lets_docker_pick_its_host_port() {
+        let deployer = Arc::new(ScriptedDeployer {
+            reported_host_port: Some(49000),
+            ..ScriptedDeployer::default()
+        });
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        let (_, host_port, _) = deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+            .await
+            .expect("a replica with no health path is ready once running");
+
+        let requests = deployer.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].port_mappings[0].host_port, 0,
+            "a port chosen before the create call can be taken before Docker binds it"
+        );
+        assert_eq!(
+            host_port, 49000,
+            "the port Docker chose is the one reported"
+        );
     }
 
     // Create phase.
