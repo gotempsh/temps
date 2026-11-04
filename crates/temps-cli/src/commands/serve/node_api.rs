@@ -421,7 +421,13 @@ fn is_node_route(path: &str) -> bool {
                 | "network-policy"
                 | "dns/changes"
                 | "dns/ack"
-        ) || route.strip_prefix("s3-credentials/").is_some_and(is_id))
+                | "state"
+                | "state/ack"
+        ) || route.strip_prefix("s3-credentials/").is_some_and(is_id)
+            || route
+                .strip_prefix("instances/")
+                .and_then(|rest| rest.strip_suffix("/env"))
+                .is_some_and(is_id))
 }
 
 /// A database id as it appears in a path: ASCII digits that fit an `i32`
@@ -785,6 +791,11 @@ mod tests {
             "/api/internal/nodes/7/network-policy",
             "/api/internal/nodes/7/dns/changes",
             "/api/internal/nodes/7/dns/ack",
+            // The node runtime's state sync (`HttpControlPlaneLink`), whose
+            // base URL is this listener on a node registered over the mesh.
+            "/api/internal/nodes/7/state",
+            "/api/internal/nodes/7/state/ack",
+            "/api/internal/nodes/7/instances/12/env",
         ] {
             assert!(is_node_route(allowed), "{allowed}");
         }
@@ -797,6 +808,19 @@ mod tests {
             "/api/internal/nodes/7/network-policy/x",
             "/api/internal/nodes/7/dns",
             "/api/internal/nodes/7/dns/changes/x",
+            "/api/internal/nodes/abc/state",
+            "/api/internal/nodes/7/state/",
+            "/api/internal/nodes/7/state/x",
+            "/api/internal/nodes/7/state/ack/x",
+            "/api/internal/nodes/7/instances",
+            "/api/internal/nodes/7/instances/12",
+            "/api/internal/nodes/7/instances/env",
+            "/api/internal/nodes/7/instances//env",
+            "/api/internal/nodes/7/instances/abc/env",
+            "/api/internal/nodes/7/instances/-1/env",
+            "/api/internal/nodes/7/instances/%31/env",
+            "/api/internal/nodes/7/instances/../8/env",
+            "/api/internal/nodes/7/instances/12/env/x",
             "/api/nodes/pairings",
             "/api/settings",
             "/",
