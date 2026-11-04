@@ -808,9 +808,12 @@ impl ComposeExecutor {
 
     // --- Internal methods ---
 
-    /// Clear the restart policy of the project's service containers. One-off
-    /// `docker compose run` containers are not part of the stack and are not
-    /// stopped with it.
+    /// Clear the restart policy of the project's stopped service containers.
+    /// Compose stops only the services in the file it was given, so a container
+    /// from an older deployment that is not in that file keeps running and keeps
+    /// its automatic recovery. One-off `docker compose run` containers are not part
+    /// of the stack and are not stopped with it. A container that never started has
+    /// no need for this: Docker does not start it when the daemon restarts.
     async fn disable_automatic_restart(project_name: &str) -> Result<(), ComposeError> {
         let mut list = isolated_docker_command();
         list.args([
@@ -821,6 +824,8 @@ impl ComposeExecutor {
             &format!("label={COMPOSE_PROJECT_LABEL}={project_name}"),
             "--filter",
             "label=com.docker.compose.oneoff=False",
+            "--filter",
+            "status=exited",
         ]);
         let listed = Self::bounded_command_output(
             list,
