@@ -294,7 +294,9 @@ pub fn dockerfile_build_arg_names(contents: &str) -> Option<BTreeSet<String>> {
 /// `RUN <<EOF` must not look like a new stage and hide a final-stage `ARG`),
 /// and every doubt widens the result or returns `None`:
 ///
-/// - `FROM $BASE` may name any earlier stage, so all of them count.
+/// - `FROM $BASE` may name any earlier stage, as may a base name with quotes or
+///   escapes in it (`FROM "build"`), which Docker removes first. All of them
+///   count.
 /// - `ARG $NAME` and an unterminated heredoc return `None`, as does a
 ///   Dockerfile with no `FROM`.
 ///
@@ -349,7 +351,7 @@ pub fn dockerfile_final_image_arg_names(contents: &str) -> Option<BTreeSet<Strin
         }
         let stage = &stages[index];
         names.extend(stage.args.iter().cloned());
-        if stage.base.contains('$') {
+        if stage.base.contains(['$', '"', '\'', instructions.escape]) {
             pending.extend(0..index);
         } else if let Some(parent) = stages[..index]
             .iter()
@@ -595,34 +597,53 @@ fn heredoc_terminator(word: &str) -> Option<(&str, bool)> {
 }
 
 /// `line` without its line continuation, or `None` when it does not end with
-/// one. Docker's rule: the escape character, preceded by any character other
-/// than the escape character, with only blanks after it. An escaped escape
-/// (`\\`) at the end of a line therefore does not continue it.
+/// one. Docker's rule: the escape character with only blanks after it, either
+/// alone on the line or preceded by any character other than the escape
+/// character. An escaped escape (`\\`) at the end of a line therefore does not
+/// continue it.
 fn strip_line_continuation(line: &str, escape: char) -> Option<&str> {
-    let body = line.trim_end_matches([' ', '\t']).strip_suffix(escape)?;
-    match body.chars().next_back() {
-        Some(previous) if previous != escape => Some(body),
-        _ => None,
-    }
+    let body = line
+        .trim_end_matches('\r')
+        .trim_end_matches([' ', '\t'])
+        .strip_suffix(escape)?;
+    (!body.ends_with(escape)).then_some(body)
 }
 
-/// The escape character set by a `# escape=` parser directive, which Docker
-/// only honours among the comment lines at the very top of the file.
+/// The escape character set by a `# escape=` parser directive. Docker reads
+/// directives only from the top of the file, and stops at the first line that
+/// is not a well-formed directive it knows, even if that line is a comment:
+/// an `escape` after it is an ordinary comment.
 fn dockerfile_escape_character(contents: &str) -> char {
     for line in contents.lines() {
-        let Some(directive) = line.trim().strip_prefix('#') else {
+        let Some((key, value)) = parser_directive(line) else {
             break;
         };
-        let Some((key, value)) = directive.split_once('=') else {
-            break;
-        };
-        if key.trim().eq_ignore_ascii_case("escape") {
-            if let Some(character @ ('\\' | '`')) = value.trim().chars().next() {
+        if key.eq_ignore_ascii_case("escape") {
+            if let Some(character @ ('\\' | '`')) = value.chars().next() {
                 return character;
             }
+        } else if !["syntax", "check"]
+            .iter()
+            .any(|known| key.eq_ignore_ascii_case(known))
+        {
+            break;
         }
     }
     '\\'
+}
+
+/// The key and value of a line shaped like a parser directive:
+/// `# key = value`, where the key is a letter followed by letters and digits
+/// and the value is not empty.
+fn parser_directive(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.trim().strip_prefix('#')?.split_once('=')?;
+    let (key, value) = (key.trim(), value.trim());
+    let well_formed = key.starts_with(|character: char| character.is_ascii_alphabetic())
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        && !value.is_empty();
+    well_formed.then_some((key, value))
 }
 
 /// Reject paths that could escape the extracted context on any supported OS.
@@ -1134,6 +1155,69 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["API_KEY", "LATER", "SIGNING_KEY"]
+        );
+    }
+
+    /// Lines read differently from how they look. A name missed here is a secret
+    /// left in the image, so these match what BuildKit does with each one.
+    #[test]
+    fn final_image_args_are_read_line_by_line_as_docker_reads_them() {
+        for dockerfile in [
+            "FROM a\nARG \\\n\\\nTOKEN\n",
+            "FROM a\nARG \\\n\\  \t\nTOKEN\n",
+            "FROM a\nARG \\\n\\\n\\\nTOKEN\n",
+            "FROM a\nARG \\\n   \\\nTOKEN\n",
+            "FROM a\r\nARG \\\r\n\\\r\nTOKEN\r\n",
+            "FROM a\nARG \\\r\r\nTOKEN\n",
+            "\\\nFROM a\nARG TOKEN\n",
+            "# escape=`\nFROM a\nARG `\n`\nTOKEN\n",
+            "# syntax=x\n# check=skip=all\n# escape=`\nFROM a\nARG `\nTOKEN\n",
+            // Each of these ends the directives, so the escape stays a backslash.
+            "# foo=bar\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# a b=c\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# 1a=c\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# foo=\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# escape=\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# note\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+        ] {
+            let names = dockerfile_final_image_arg_names(dockerfile);
+            assert_eq!(
+                names.as_ref().map(|names| names.contains("TOKEN")),
+                Some(true),
+                "{dockerfile:?} gave {names:?}"
+            );
+        }
+        // An escaped escape does not continue the line, alone or after text.
+        for dockerfile in [
+            "FROM a\nARG A=b\\\\\nENV TOKEN=c\n",
+            "FROM a\nARG A\n\\\\\n",
+        ] {
+            let names = dockerfile_final_image_arg_names(dockerfile);
+            assert_eq!(
+                names.as_ref().map(|names| names.contains("TOKEN")),
+                Some(false),
+                "{dockerfile:?} gave {names:?}"
+            );
+        }
+    }
+
+    /// Docker unquotes a base name before looking for a stage called that, and
+    /// which stage it means is not worth working out when a miss leaks a secret.
+    #[test]
+    fn a_base_name_with_quotes_or_escapes_may_be_any_earlier_stage() {
+        for base in ["\"build\"", "'build'", "bu\\ild"] {
+            let dockerfile = format!("FROM a AS build\nARG TOKEN\nFROM {base}\nARG OTHER\n");
+            let names = dockerfile_final_image_arg_names(&dockerfile);
+            assert_eq!(
+                names.map(|names| names.into_iter().collect::<Vec<_>>()),
+                Some(vec!["OTHER".to_string(), "TOKEN".to_string()]),
+                "{base}"
+            );
+        }
+        let backtick = "# escape=`\nFROM a AS build\nARG TOKEN\nFROM bu`ild\n";
+        assert!(
+            dockerfile_final_image_arg_names(backtick).is_some_and(|names| names.contains("TOKEN"))
         );
     }
 

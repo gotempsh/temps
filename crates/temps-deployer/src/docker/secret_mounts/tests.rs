@@ -143,6 +143,83 @@ async fn final_stage_build_arg_value_is_kept_in_the_image() {
     fixture.cleanup().await;
 }
 
+/// Dockerfiles Docker reads differently from how they look, each one keeping
+/// the value in the image. The analysis that decides which secrets to withhold
+/// has to name the argument in every one of them, or the value leaks.
+#[tokio::test]
+async fn final_image_analysis_names_every_argument_buildkit_keeps() {
+    let value = "kept-value-1725";
+    for (name, dockerfile) in [
+        (
+            "standalone continuation",
+            "FROM alpine:3.20\nARG \\\n\\\nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "standalone continuation with blanks",
+            "FROM alpine:3.20\nARG \\\n\\  \nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "standalone continuation with CRLF",
+            "FROM alpine:3.20\r\nARG \\\r\n\\\r\nAPI_KEY\r\nRUN echo UNIQUE\r\n",
+        ),
+        (
+            "continuation before two carriage returns",
+            "FROM alpine:3.20\nARG \\\r\r\nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "standalone continuation with a backtick escape",
+            "# escape=`\nFROM alpine:3.20\nARG `\n`\nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "escape directive after an unknown directive",
+            "# foo=bar\n# escape=`\nFROM alpine:3.20\nARG \\\nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "escape directive after a malformed key",
+            "# a b=c\n# escape=`\nFROM alpine:3.20\nARG \\\nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "escape directive after an empty value",
+            "# foo=\n# escape=`\nFROM alpine:3.20\nARG \\\nAPI_KEY\nRUN echo UNIQUE\n",
+        ),
+        (
+            "double-quoted base stage",
+            "FROM alpine:3.20 AS build\nARG API_KEY\nRUN echo UNIQUE\nFROM \"build\"\nRUN echo done\n",
+        ),
+        (
+            "single-quoted base stage",
+            "FROM alpine:3.20 AS build\nARG API_KEY\nRUN echo UNIQUE\nFROM 'build'\nRUN echo done\n",
+        ),
+        (
+            "escaped base stage",
+            "FROM alpine:3.20 AS build\nARG API_KEY\nRUN echo UNIQUE\nFROM bu\\ild\nRUN echo done\n",
+        ),
+    ] {
+        // Unique, so a step found in BuildKit's cache cannot hide the value.
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let dockerfile = dockerfile.replace("UNIQUE", &unique);
+        let Some(fixture) = SecretBuildFixture::new(&dockerfile).await else {
+            return;
+        };
+        let (result, logged) = fixture
+            .build(fixture.request(&[("API_KEY", value)], &[], Vec::new()))
+            .await;
+        assert!(result.is_ok(), "{name}: {result:?}\n{logged}");
+        assert!(
+            fixture.image_contains(value).await,
+            "{name}: BuildKit no longer keeps the value"
+        );
+        let analysed = crate::build_protocol::dockerfile_final_image_arg_names(&dockerfile);
+        assert!(
+            analysed
+                .as_ref()
+                .is_none_or(|names| names.contains("API_KEY")),
+            "{name}: the value is in the image but the analysis found {analysed:?}"
+        );
+        fixture.cleanup().await;
+    }
+}
+
 /// The other half of the issue's premise: a value used only in an earlier
 /// stage stays out, so it is safe to keep passing it.
 #[tokio::test]

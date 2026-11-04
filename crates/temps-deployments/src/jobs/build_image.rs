@@ -5893,6 +5893,22 @@ mod tests {
         assert!(log.contains("COPY --from"), "{log}");
     }
 
+    /// Docker reads `API_KEY` as the argument of `ARG` here, past a continuation
+    /// that stands alone on its line.
+    #[tokio::test]
+    async fn local_build_withholds_a_secret_declared_past_a_standalone_continuation() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\nARG \\\n\\\nAPI_KEY\nRUN build\n",
+        )])
+        .await;
+        assert!(!request.build_args.contains_key("API_KEY"));
+        assert!(
+            log.contains("Secret build arguments not passed: API_KEY"),
+            "{log}"
+        );
+    }
+
     #[tokio::test]
     async fn local_build_keeps_passing_a_secret_used_only_in_an_earlier_stage() {
         let (request, log) = local_custom_dockerfile_build(&[(
