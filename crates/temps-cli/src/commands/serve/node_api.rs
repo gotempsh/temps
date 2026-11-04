@@ -427,15 +427,22 @@ fn is_node_route(path: &str) -> bool {
             || route
                 .strip_prefix("instances/")
                 .and_then(|rest| rest.strip_suffix("/env"))
-                .is_some_and(is_id))
+                .is_some_and(is_big_id))
 }
 
 /// A database id as it appears in a path: ASCII digits that fit an `i32`
 /// (no sign, no percent-encoding).
 fn is_id(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment.bytes().all(|byte| byte.is_ascii_digit())
-        && segment.parse::<i32>().is_ok()
+    is_digits(segment) && segment.parse::<i32>().is_ok()
+}
+
+/// [`is_id`] for tables keyed by `i64`, such as workload instances.
+fn is_big_id(segment: &str) -> bool {
+    is_digits(segment) && segment.parse::<i64>().is_ok()
+}
+
+fn is_digits(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 async fn only_node_routes(request: Request, next: Next) -> Response {
@@ -796,6 +803,7 @@ mod tests {
             "/api/internal/nodes/7/state",
             "/api/internal/nodes/7/state/ack",
             "/api/internal/nodes/7/instances/12/env",
+            "/api/internal/nodes/7/instances/3000000000/env",
         ] {
             assert!(is_node_route(allowed), "{allowed}");
         }
@@ -821,6 +829,7 @@ mod tests {
             "/api/internal/nodes/7/instances/%31/env",
             "/api/internal/nodes/7/instances/../8/env",
             "/api/internal/nodes/7/instances/12/env/x",
+            "/api/internal/nodes/7/instances/9223372036854775808/env",
             "/api/nodes/pairings",
             "/api/settings",
             "/",

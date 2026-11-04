@@ -152,7 +152,8 @@ impl From<(String, GeoLocation)> for GeoLocationResponse {
         (status = 401, description = "Authentication required", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "IP address not found in database", body = ProblemDetails),
-        (status = 500, description = "Internal server error", body = ProblemDetails)
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "No GeoIP database is loaded yet", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
