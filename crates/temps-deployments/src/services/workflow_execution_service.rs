@@ -2259,12 +2259,10 @@ impl WorkflowExecutionService {
                             .add(deployments::Column::Id.lt(current_deployment.id)),
                     ),
             )
-            .filter(deployments::Column::State.is_in(vec![
-                "pending",
-                "running",
-                "built",
-                "completed",
-            ]))
+            .filter(
+                deployments::Column::State
+                    .is_in(crate::jobs::mark_deployment_complete::TEARDOWN_SWEPT_STATES),
+            )
             .order_by_desc(deployments::Column::CreatedAt)
             .limit(MAX_TEARDOWN_DEPLOYMENTS)
             .all(self.db.as_ref())
@@ -5262,6 +5260,34 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // A resume leaves a deployment "deployed", and a newer deployment
+        // supersedes it like any other. Older than the one above, so that one
+        // stays the first container stopped.
+        let resumed_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("resumed-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(7)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let resumed_container = deployment_containers::ActiveModel {
+            deployment_id: Set(resumed_deployment.id),
+            container_id: Set("resumed-container-1".to_string()),
+            container_name: Set("resumed-container-1".to_string()),
+            container_port: Set(Some(3000)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         // A failed readiness check retains its candidate for logs. The next
         // successful deployment must retire it just like the previous healthy
         // container, otherwise repeated failures leak live Docker resources.
@@ -5481,6 +5507,15 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let resumed_refreshed = deployment_containers::Entity::find_by_id(resumed_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("resumed container row still exists");
+        assert!(
+            resumed_refreshed.deleted_at.is_some(),
+            "a resumed deployment's container must not outlive a newer deployment"
+        );
 
         let retained_refreshed = deployment_containers::Entity::find_by_id(retained_container.id)
             .one(db.as_ref())
