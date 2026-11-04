@@ -212,6 +212,17 @@ pub struct GitHubAsset {
 }
 
 impl UpgradeCommand {
+    fn print_microsandbox_refresh_reminder(&self) {
+        // A running `temps serve` is the authority on its own data directory;
+        // the shell running this upgrade inherits none of its environment.
+        let home = dirs::home_dir();
+        let resolved =
+            super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref());
+        if let Some(reminder) = super::microsandbox::runtime_refresh_reminder(&resolved.dir) {
+            println!("  Note: {reminder}");
+        }
+    }
+
     pub fn execute(self) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(self.run())
@@ -441,6 +452,7 @@ impl UpgradeCommand {
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
+        self.print_microsandbox_refresh_reminder();
 
         println!();
         println!(
@@ -617,6 +629,7 @@ impl UpgradeCommand {
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
+        self.print_microsandbox_refresh_reminder();
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
