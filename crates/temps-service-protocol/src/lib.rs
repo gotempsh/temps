@@ -114,8 +114,16 @@ impl ServiceType {
 }
 
 /// A service type name no engine has.
+///
+/// The message lists what is accepted and does not repeat the input, which is
+/// whatever the caller put in that field, a pasted connection string included,
+/// and this crate has no redaction to apply to it. A caller that can redact
+/// reads `service_type`.
 #[derive(Debug, thiserror::Error)]
-#[error("Invalid service value: Invalid service type: {service_type}")]
+#[error(
+    "Invalid service type: expected one of mariadb, mongodb, postgres, redis, s3, rustfs, kv, \
+     blob, minio"
+)]
 pub struct ServiceTypeParseError {
     pub service_type: String,
 }
@@ -367,16 +375,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_type_names_round_trip_and_unknown_ones_are_named() {
+    fn service_type_names_round_trip_and_an_unknown_one_is_not_repeated() {
         for service_type in ServiceType::get_all() {
             let parsed = ServiceType::from_str(&service_type.to_string()).expect("known name");
             assert_eq!(parsed, service_type);
         }
-        let error = ServiceType::from_str("oracle").expect_err("unknown name");
-        assert_eq!(
-            error.to_string(),
-            "Invalid service value: Invalid service type: oracle"
-        );
+        let input = "postgres://admin:hunter2@db.internal/app";
+        let error = ServiceType::from_str(input).expect_err("unknown name");
+        let message = error.to_string();
+        assert!(!message.contains("hunter2"), "{message}");
+        assert_eq!(error.service_type, input);
+        for service_type in ServiceType::get_all() {
+            assert!(
+                message.contains(&service_type.to_string()),
+                "the message must list {service_type}: {message}"
+            );
+        }
     }
 
     /// The agent reads what the control plane sends, field for field, and a
