@@ -761,6 +761,9 @@ impl ComposeExecutor {
         self.stop_at(project_name, None, None).await
     }
 
+    /// Stop a project's containers and keep them stopped: a stopped
+    /// `restart: always` container would otherwise come back when the Docker
+    /// daemon restarts.
     pub async fn stop_at(
         &self,
         project_name: &str,
@@ -769,6 +772,7 @@ impl ComposeExecutor {
     ) -> Result<(), ComposeError> {
         // Fail before spawning `docker compose stop`.
         self.require_docker()?;
+        Self::disable_automatic_restart(project_name).await?;
 
         let project_dir = repo_dir
             .map(Path::to_path_buf)
@@ -801,6 +805,60 @@ impl ComposeExecutor {
     }
 
     // --- Internal methods ---
+
+    /// Clear the restart policy of every container in the project.
+    async fn disable_automatic_restart(project_name: &str) -> Result<(), ComposeError> {
+        let mut list = isolated_docker_command();
+        list.args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            &format!("label={COMPOSE_PROJECT_LABEL}={project_name}"),
+        ]);
+        let listed = Self::bounded_command_output(
+            list,
+            std::time::Duration::from_secs(15),
+            project_name,
+            "docker ps",
+        )
+        .await?;
+        if !listed.status.success() {
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "listing containers to clear their restart policy failed with status {}",
+                    listed.status
+                ),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        let containers: Vec<&str> = stdout.split_whitespace().collect();
+        if containers.is_empty() {
+            return Ok(());
+        }
+
+        let mut update = isolated_docker_command();
+        update.args(["update", "--restart", "no"]).args(&containers);
+        let updated = Self::bounded_command_output(
+            update,
+            std::time::Duration::from_secs(15),
+            project_name,
+            "docker update",
+        )
+        .await?;
+        if !updated.status.success() {
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "clearing the restart policy of {} container(s) failed with status {}",
+                    containers.len(),
+                    updated.status
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
