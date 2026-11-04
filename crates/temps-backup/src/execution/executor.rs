@@ -649,6 +649,9 @@ SELECT id FROM updated_backup
         }
     }
 
+    /// Record a finished engine run. Only a `running` backup can complete: a
+    /// row that has already reached a terminal state (the user cancelled it
+    /// while the engine was finishing) keeps that state and announces nothing.
     async fn finalize_completed(
         &self,
         backup_id: i32,
@@ -664,19 +667,24 @@ WITH updated_backup AS (
            size_bytes       = $2,
            compression_type = $3
      WHERE id               = $4
+       AND state            = 'running'
      RETURNING id
+), updated_children AS (
+    UPDATE external_service_backups
+       SET state            = 'completed',
+           finished_at      = COALESCE(finished_at, NOW()),
+           s3_location      = $1,
+           size_bytes       = $2,
+           compression_type = $3
+     WHERE backup_id IN (SELECT id FROM updated_backup)
+       AND state IN ('pending', 'running')
 )
-UPDATE external_service_backups
-   SET state            = 'completed',
-       finished_at      = COALESCE(finished_at, NOW()),
-       s3_location      = $1,
-       size_bytes       = $2,
-       compression_type = $3
- WHERE backup_id IN (SELECT id FROM updated_backup)
+SELECT id FROM updated_backup
         "#;
-        self.inner
+        let transitioned = self
+            .inner
             .db
-            .execute(Statement::from_sql_and_values(
+            .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 sql,
                 vec![
@@ -687,6 +695,22 @@ UPDATE external_service_backups
                 ],
             ))
             .await?;
+
+        if transitioned.is_none() {
+            // The row points at nothing it uploaded, so the artifact is not
+            // reachable through retention or deletion. Leave a trail for the
+            // operator; removing it is not this path's call to make.
+            warn!(
+                backup_id,
+                engine = engine_key,
+                location = %outcome.location,
+                size_bytes = ?outcome.size_bytes,
+                "BackupExecutor: engine finished after the backup left the running state; \
+                 keeping that state, the uploaded artifact is unreferenced",
+            );
+            let _ = mark_schedule_run_finished_if_done(self.inner.db.as_ref(), backup_id).await;
+            return Ok(());
+        }
 
         info!(
             backup_id,
@@ -1250,16 +1274,14 @@ mod tests {
     async fn completed_transition_copies_restore_metadata_to_external_service_child() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([
-                    MockExecResult {
-                        last_insert_id: 0,
-                        rows_affected: 2,
-                    },
-                    MockExecResult {
-                        last_insert_id: 0,
-                        rows_affected: 1,
-                    },
-                ])
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "id",
+                    SValue::from(42),
+                )])]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
         let executor = BackupExecutorBuilder::new(db.clone()).build();
@@ -1522,6 +1544,10 @@ mod tests {
         let db = test_db.connection_arc();
         let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
         let executor = BackupExecutorBuilder::new(db.clone()).build();
+        executor
+            .mark_backup_running(backup.id)
+            .await
+            .expect("mark running");
 
         executor
             .finalize_completed(
@@ -1555,6 +1581,160 @@ mod tests {
         assert_eq!(child.metadata["engine"], "postgres");
         assert!(parent.finished_at.is_some());
         assert!(child.finished_at.is_some());
+    }
+
+    /// Records every job the executor publishes.
+    #[derive(Default)]
+    struct CapturingQueue(std::sync::Mutex<Vec<Job>>);
+
+    #[async_trait]
+    impl JobQueue for CapturingQueue {
+        async fn send(&self, job: Job) -> Result<(), temps_core::QueueError> {
+            self.0.lock().expect("captured jobs lock").push(job);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("the executor only publishes in these tests")
+        }
+    }
+
+    fn walg_outcome() -> BackupOutcome {
+        BackupOutcome {
+            location: "s3://backup-transition-tests/late/walg".into(),
+            size_bytes: Some(1_024),
+            compression: "wal-g-native".into(),
+        }
+    }
+
+    /// No row left the `running` state: nothing may announce a completed
+    /// backup, and the guard must be part of the statement itself.
+    #[tokio::test]
+    async fn finalize_completed_announces_nothing_when_the_row_is_no_longer_running() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<std::collections::BTreeMap<&str, SValue>>::new()])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let queue = Arc::new(CapturingQueue::default());
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .with_event_publisher(queue.clone())
+            .build();
+
+        executor
+            .finalize_completed(42, "postgres_walg", walg_outcome())
+            .await
+            .expect("a lost race with cancel is not an error");
+        tokio::task::yield_now().await;
+
+        assert!(
+            queue.0.lock().expect("captured jobs lock").is_empty(),
+            "a backup that did not complete must not publish BackupCompleted",
+        );
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        let sql = &log[0].statements()[0].sql;
+        assert!(sql.contains("AND state            = 'running'"), "{sql}");
+        assert!(sql.contains("AND state IN ('pending', 'running')"), "{sql}");
+        assert!(
+            log[1].statements()[0].sql.contains("UPDATE schedule_runs"),
+            "the parent run still has to close: {log:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_completed_publishes_the_event_when_the_row_was_running() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "id",
+                    SValue::from(42),
+                )])]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let queue = Arc::new(CapturingQueue::default());
+        let executor = BackupExecutorBuilder::new(db)
+            .with_event_publisher(queue.clone())
+            .build();
+
+        executor
+            .finalize_completed(42, "postgres_walg", walg_outcome())
+            .await
+            .expect("completed transition should execute");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.0.lock().expect("captured jobs lock").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completion event is published");
+        let jobs = queue.0.lock().expect("captured jobs lock");
+        assert!(
+            matches!(&jobs[0], Job::BackupCompleted(job) if job.backup_id == 42),
+            "{:?}",
+            jobs[0],
+        );
+    }
+
+    /// The engine finishes after the row was failed: the failure and its
+    /// reason survive on both tables, and no artifact is attached to them.
+    #[tokio::test]
+    async fn finalize_completed_keeps_a_failed_backup_failed_on_both_tables() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping late completion test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+        executor
+            .mark_backup_running(backup.id)
+            .await
+            .expect("mark running");
+        executor
+            .mark_backup_failed(backup.id, "cancelled by user 7")
+            .await
+            .expect("fail the running backup");
+
+        executor
+            .finalize_completed(backup.id, "postgres_walg", walg_outcome())
+            .await
+            .expect("a lost race with cancel is not an error");
+
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "failed");
+        assert_eq!(child.state, "failed");
+        assert_eq!(parent.error_message.as_deref(), Some("cancelled by user 7"));
+        assert_eq!(child.error_message, parent.error_message);
+        assert_ne!(parent.s3_location, walg_outcome().location);
+        assert_ne!(child.s3_location, walg_outcome().location);
     }
 
     #[tokio::test]
