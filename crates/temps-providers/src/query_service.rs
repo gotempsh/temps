@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -24,6 +26,27 @@ use crate::externalsvc::rustfs::RustfsConfig;
 use crate::externalsvc::s3::S3InputConfig;
 use crate::ExternalServiceManager;
 use temps_providers_mariadb::query::MariaDbSource;
+
+/// Domain separation for the explorer role's password. Changing it changes
+/// every derived password, which is safe only because
+/// [`QueryService::ensure_readonly_user`] sets the password on each new
+/// connection instead of assuming the stored one still matches.
+const EXPLORER_PASSWORD_TAG: &str = "temps-explorer-password-v1";
+
+/// The password of the read-only explorer role on `host`. It is derived rather
+/// than stored, and changes when the administrator password does.
+fn derive_explorer_password(
+    host: &str,
+    admin_password: &str,
+) -> std::result::Result<String, DataError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(admin_password.as_bytes()).map_err(|error| {
+        DataError::InvalidConfiguration(format!(
+            "Cannot derive the explorer password for PostgreSQL host '{host}': {error}"
+        ))
+    })?;
+    mac.update(format!("{EXPLORER_PASSWORD_TAG}:{host}").as_bytes());
+    Ok(format!("te_{}", hex::encode(mac.finalize().into_bytes())))
+}
 
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
@@ -288,12 +311,10 @@ impl QueryService {
         database: &str,
         connection_policy: PostgresConnectionPolicy,
     ) -> std::result::Result<String, DataError> {
-        // Deterministic password derived from admin password so it's stable across calls
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        format!("temps_explorer_{}_{}", host, admin_password).hash(&mut hasher);
-        let explorer_password = format!("te_{:x}", hasher.finish());
+        // The role statement below sets this password even when the role
+        // already exists, so a role provisioned with an earlier derivation
+        // moves to this one the next time a connection is opened.
+        let explorer_password = derive_explorer_password(host, admin_password)?;
 
         // Connect as admin to the target database
         let pg_source = connection_policy
@@ -1363,6 +1384,134 @@ impl QueryService {
 mod tests {
     use super::*;
     use crate::externalsvc::ServiceType;
+
+    /// Pinned: this value is what a provisioned role holds, and a stable hash
+    /// is the point of moving off `DefaultHasher`, whose output may change
+    /// with the Rust release.
+    #[test]
+    fn explorer_password_is_a_stable_hmac_of_host_and_admin_password() {
+        assert_eq!(
+            derive_explorer_password("db.internal", "admin-password").unwrap(),
+            "te_4d59c2734e20f0770a21b65a09151b137a8ac423845a9aa5dfc4c9a82899cd0d"
+        );
+        assert_ne!(
+            derive_explorer_password("db.internal", "other-password").unwrap(),
+            derive_explorer_password("db.internal", "admin-password").unwrap(),
+            "a new administrator password must change it"
+        );
+        assert_ne!(
+            derive_explorer_password("other.internal", "admin-password").unwrap(),
+            derive_explorer_password("db.internal", "admin-password").unwrap(),
+            "each host gets its own"
+        );
+    }
+
+    /// A database provisioned by an earlier release holds the previous
+    /// `te_<64-bit hash>` password. The next connection moves the role to the
+    /// new one, without the operator doing anything, and retires the old one.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn existing_explorer_role_moves_to_the_new_password_on_next_connection() {
+        use testcontainers::{
+            core::ContainerPort, core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt,
+        };
+
+        const ADMIN_PASSWORD: &str = "explorer-rotation-admin";
+        const LEGACY_PASSWORD: &str = "te_1f2e3d4c5b6a7988";
+
+        let started = GenericImage::new("postgres", "17-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_env_var("POSTGRES_PASSWORD", ADMIN_PASSWORD)
+            .start()
+            .await;
+        let container = match started {
+            Ok(container) => container,
+            Err(error) => {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
+                    eprintln!("Skipping Docker-dependent test: {error}");
+                    return;
+                }
+                panic!("Failed to start PostgreSQL: {error}");
+            }
+        };
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let policy = PostgresConnectionPolicy::Standard;
+
+        // The image's temporary init server also logs "ready": wait for the
+        // final server, which listens on TCP.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let admin = loop {
+            match policy
+                .connect("127.0.0.1", port, "postgres", ADMIN_PASSWORD, "postgres")
+                .await
+            {
+                Ok(admin) => break admin,
+                Err(error) if std::time::Instant::now() > deadline => {
+                    panic!("PostgreSQL never accepted the admin login: {error}")
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        };
+        admin
+            .execute_raw(&format!(
+                "CREATE ROLE {} LOGIN PASSWORD '{LEGACY_PASSWORD}'",
+                QueryService::EXPLORER_USER
+            ))
+            .await
+            .unwrap();
+        policy
+            .connect(
+                "127.0.0.1",
+                port,
+                QueryService::EXPLORER_USER,
+                LEGACY_PASSWORD,
+                "postgres",
+            )
+            .await
+            .expect("the role starts on the password of the earlier derivation");
+
+        let password = QueryService::ensure_readonly_user(
+            "127.0.0.1",
+            port,
+            "postgres",
+            ADMIN_PASSWORD,
+            "postgres",
+            policy,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            password,
+            derive_explorer_password("127.0.0.1", ADMIN_PASSWORD).unwrap()
+        );
+        policy
+            .connect(
+                "127.0.0.1",
+                port,
+                QueryService::EXPLORER_USER,
+                &password,
+                "postgres",
+            )
+            .await
+            .expect("the explorer logs in with the new password");
+        assert!(
+            policy
+                .connect(
+                    "127.0.0.1",
+                    port,
+                    QueryService::EXPLORER_USER,
+                    LEGACY_PASSWORD,
+                    "postgres",
+                )
+                .await
+                .is_err(),
+            "the old password must stop working"
+        );
+    }
 
     /// Regression: a MariaDB service placed on a worker node is stored with
     /// host `localhost`, so the data explorer dialled the control plane and
