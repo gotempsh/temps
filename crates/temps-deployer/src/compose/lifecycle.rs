@@ -763,7 +763,10 @@ impl ComposeExecutor {
 
     /// Stop a project's containers and keep them stopped: a stopped
     /// `restart: always` container would otherwise come back when the Docker
-    /// daemon restarts.
+    /// daemon restarts. The policy is cleared after the stop, so a stop that fails
+    /// leaves running containers with their automatic recovery. Starting the stack
+    /// again goes through `up --force-recreate`, which applies the Compose file's
+    /// policy to new containers.
     pub async fn stop_at(
         &self,
         project_name: &str,
@@ -772,7 +775,6 @@ impl ComposeExecutor {
     ) -> Result<(), ComposeError> {
         // Fail before spawning `docker compose stop`.
         self.require_docker()?;
-        Self::disable_automatic_restart(project_name).await?;
 
         let project_dir = repo_dir
             .map(Path::to_path_buf)
@@ -801,12 +803,14 @@ impl ComposeExecutor {
             });
         }
 
-        Ok(())
+        Self::disable_automatic_restart(project_name).await
     }
 
     // --- Internal methods ---
 
-    /// Clear the restart policy of every container in the project.
+    /// Clear the restart policy of the project's service containers. One-off
+    /// `docker compose run` containers are not part of the stack and are not
+    /// stopped with it.
     async fn disable_automatic_restart(project_name: &str) -> Result<(), ComposeError> {
         let mut list = isolated_docker_command();
         list.args([
@@ -815,6 +819,8 @@ impl ComposeExecutor {
             "--quiet",
             "--filter",
             &format!("label={COMPOSE_PROJECT_LABEL}={project_name}"),
+            "--filter",
+            "label=com.docker.compose.oneoff=False",
         ]);
         let listed = Self::bounded_command_output(
             list,

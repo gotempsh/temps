@@ -51,11 +51,20 @@ async fn a_stopped_stack_will_not_be_restarted_by_docker() {
         command
     };
     let up = compose(&["up", "-d"]).output().await.unwrap();
-    assert!(
-        up.status.success(),
-        "{}",
-        String::from_utf8_lossy(&up.stderr)
-    );
+    if !up.status.success() {
+        // Compose can leave containers behind when startup fails.
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&up.stderr));
+    }
+    // An operator's one-off container is not part of the stack.
+    let one_off = compose(&["run", "-d", "--rm", "web"])
+        .output()
+        .await
+        .unwrap();
+    if !one_off.status.success() {
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&one_off.stderr));
+    }
 
     let stopped = executor
         .stop_at(
@@ -78,6 +87,23 @@ async fn a_stopped_stack_will_not_be_restarted_by_docker() {
         .unwrap();
     let mut policies = Vec::new();
     for container in &containers {
+        let one_off_container = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.oneoff"))
+            .is_some_and(|value| value == "True");
+        if one_off_container {
+            let _ = docker
+                .remove_container(
+                    container.id.as_deref().unwrap(),
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            continue;
+        }
         let inspected = docker
             .inspect_container(
                 container.id.as_deref().unwrap(),
@@ -102,6 +128,91 @@ async fn a_stopped_stack_will_not_be_restarted_by_docker() {
             Some(false),
             Some(bollard::models::RestartPolicyNameEnum::NO)
         )]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_stop_leaves_running_containers_their_restart_policy() {
+    let Some(executor) = test_executor() else {
+        return;
+    };
+    let docker = executor
+        .docker
+        .require()
+        .expect("test_executor only builds an available handle")
+        .clone();
+    let compose_available = tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !compose_available || docker.inspect_image("alpine:latest").await.is_err() {
+        println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let project_name = format!(
+        "temps-stop-fails-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::write(
+        project_dir.path().join("docker-compose.yml"),
+        "services:\n  web:\n    image: alpine:latest\n    restart: always\n    command: [\"sleep\", \"300\"]\n",
+    )
+    .unwrap();
+    let compose = |args: &[&str]| {
+        let mut command = tokio::process::Command::new("docker");
+        command
+            .args(["compose", "-p", &project_name])
+            .args(args)
+            .current_dir(project_dir.path());
+        command
+    };
+    let up = compose(&["up", "-d"]).output().await.unwrap();
+    if !up.status.success() {
+        // Compose can leave containers behind when startup fails.
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&up.stderr));
+    }
+
+    let stopped = executor
+        .stop_at(
+            &project_name,
+            Some(project_dir.path()),
+            Some("no-such-compose-file.yml"),
+        )
+        .await;
+
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{COMPOSE_PROJECT_LABEL}={project_name}")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let inspected = docker
+        .inspect_container(
+            containers[0].id.as_deref().unwrap(),
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .unwrap();
+    let _ = compose(&["down", "-v"]).output().await;
+
+    stopped.expect_err("the Compose file does not exist");
+    assert_eq!(inspected.state.and_then(|state| state.running), Some(true));
+    assert_eq!(
+        inspected
+            .host_config
+            .and_then(|config| config.restart_policy)
+            .and_then(|policy| policy.name),
+        Some(bollard::models::RestartPolicyNameEnum::ALWAYS)
     );
 }
 
