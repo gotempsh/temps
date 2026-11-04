@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -37,6 +38,10 @@ GIB = 1024**3
 # `check` may run while `watch` is still scanning for its report. Bounded so a
 # watcher that died mid-scan still fails the job, just without the report.
 REPORT_WAIT_SECONDS = 300.0
+# A healthy restore extracts about 0.3 GiB/s, and data that compresses very well
+# can go faster. This leaves room to notice and stop it between checks, to scan,
+# and for the runner's own log.
+DEFAULT_MIN_FREE_GIB = 6.0
 TOP_DIRECTORIES = 25
 TOP_FILES = 15
 # Directories deeper than this are added to their ancestor at this depth.
@@ -122,20 +127,32 @@ def watch(
     sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
     """Watch until told to stop. Returns whether the guard tripped."""
-    tripped = False
+    worker: threading.Thread | None = None
     while not stop_file.exists():
         free, total = usage(path)
         if free < limit:
             # First, so `check` cannot pass between stopping the process and the
             # report being written.
-            if not tripped:
-                trip_marker(report).touch()
+            trip_marker(report).touch()
             stop(process)
-            if not tripped:
-                tripped = True
-                write_report(report, build_report(path, inspect, limit, free, total))
+            # On its own thread: the scan can take a while, and an extraction
+            # that starts meanwhile still has to be stopped. A scan that crashes
+            # costs only the report, since `check` already fails on the marker.
+            if worker is None:
+                worker = threading.Thread(
+                    target=write_trip_report, args=(report, path, inspect, limit, free, total)
+                )
+                worker.start()
         sleep(interval)
-    return tripped
+    if worker is not None:
+        worker.join()
+    return worker is not None
+
+
+def write_trip_report(
+    report: Path, path: Path, inspect: list[Path], limit: int, free: int, total: int
+) -> None:
+    write_report(report, build_report(path, inspect, limit, free, total))
 
 
 def trip_marker(report: Path) -> Path:
@@ -157,13 +174,17 @@ def disk_usage(path: Path) -> tuple[int, int]:
 def check(
     path: Path,
     report: Path,
+    limit: int,
     wait: float = REPORT_WAIT_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    usage: Callable[[Path], tuple[int, int]] = disk_usage,
 ) -> int:
-    free, total = disk_usage(path)
+    free, total = usage(path)
     print(f"Free space on {path} after the restore: {free / GIB:.2f} GiB of {total / GIB:.2f} GiB")
-    if not trip_marker(report).exists():
+    # The restore can cross the limit after the watcher's last look. The watcher
+    # is still running and will report it, so this waits like any other trip.
+    if free >= limit and not trip_marker(report).exists():
         return 0
     deadline = clock() + wait
     while not report.exists() and clock() < deadline:
@@ -171,14 +192,14 @@ def check(
     if report.exists():
         print(report.read_text())
     else:
-        print(f"The guard tripped but wrote no report within {wait:.0f} seconds.")
+        print(f"Free space ran low, but the guard wrote no report within {wait:.0f} seconds.")
     print("::error::The cache restore was stopped because the disk was nearly full.")
     return 1
 
 
-def finish(path: Path, report: Path, stop_file: Path, **options) -> int:
+def finish(path: Path, report: Path, stop_file: Path, limit: int, **options) -> int:
     # Checked first: the watcher must not stop while a restore could still trip it.
-    code = check(path, report, **options)
+    code = check(path, report, limit, **options)
     stop_file.touch()
     return code
 
@@ -190,25 +211,23 @@ def main(argv: list[str] | None = None) -> int:
         command = commands.add_parser(name)
         command.add_argument("--path", type=Path, default=Path("/"))
         command.add_argument("--report", type=Path, required=True)
+        command.add_argument("--min-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB)
         if name != "check":
             command.add_argument("--stop-file", type=Path, required=True)
         if name == "watch":
-            # A healthy restore extracts about 0.3 GiB/s, and data that compresses
-            # very well can go faster. This leaves room to notice and stop it
-            # between checks, to scan, and for the runner's own log.
-            command.add_argument("--min-free-gib", type=float, default=6.0)
             command.add_argument("--process", default="tar")
             command.add_argument("--inspect", type=Path, action="append", default=[])
             command.add_argument("--interval", type=float, default=2.0)
     args = parser.parse_args(argv)
 
+    limit = int(args.min_free_gib * GIB)
     if args.command == "check":
-        return check(args.path, args.report)
+        return check(args.path, args.report, limit)
     if args.command == "finish":
-        return finish(args.path, args.report, args.stop_file)
+        return finish(args.path, args.report, args.stop_file, limit)
     watch(
         args.path,
-        int(args.min_free_gib * GIB),
+        limit,
         args.process,
         args.report,
         args.stop_file,
