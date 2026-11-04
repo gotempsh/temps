@@ -3779,9 +3779,9 @@ export type BuildSpec = {
      * `docker build --build-arg` would be (protocol v2). The control plane
      * decides which values may leave it -- never one marked secret or a
      * platform credential -- and sends only names the Dockerfile declares.
-     * They travel inside this spec over the node's authenticated build
-     * channel and are held in memory on both sides; neither side writes
-     * them to disk or to a log.
+     * A spec holding them is encrypted to the node's key
+     * ([`SEALED_BUILD_SPEC_FIELD`]). They are held in memory on both sides;
+     * neither side writes them to disk or to a log.
      */
     build_args?: {
         [key: string]: string;
@@ -52717,9 +52717,13 @@ export type AddClusterMemberErrors = {
      */
     403: unknown;
     /**
-     * Service not found
+     * Service or requested node not found
      */
     404: unknown;
+    /**
+     * The member cannot be placed as requested, or this process has no local Docker daemon
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -52764,6 +52768,10 @@ export type RemoveClusterMemberErrors = {
      * Service or member not found
      */
     404: unknown;
+    /**
+     * The member is still being provisioned
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -52844,6 +52852,10 @@ export type PromoteClusterMemberErrors = {
      * Service or member not found
      */
     404: unknown;
+    /**
+     * This process has no local Docker daemon to run the promotion on
+     */
+    409: unknown;
     /**
      * pg_autoctl perform promotion failed
      */
@@ -55428,6 +55440,10 @@ export type GetIpGeolocationErrors = {
      * Internal server error
      */
     500: ProblemDetails;
+    /**
+     * No GeoIP database is loaded yet
+     */
+    503: ProblemDetails;
 };
 
 export type GetIpGeolocationError = GetIpGeolocationErrors[keyof GetIpGeolocationErrors];

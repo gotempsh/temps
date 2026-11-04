@@ -7886,7 +7886,7 @@
             "additionalProperties": {
               "type": "string"
             },
-            "description": "Values for the Dockerfile's `ARG` instructions, applied exactly as\n`docker build --build-arg` would be (protocol v2). The control plane\ndecides which values may leave it -- never one marked secret or a\nplatform credential -- and sends only names the Dockerfile declares.\nThey travel inside this spec over the node's authenticated build\nchannel and are held in memory on both sides; neither side writes\nthem to disk or to a log.",
+            "description": "Values for the Dockerfile's `ARG` instructions, applied exactly as\n`docker build --build-arg` would be (protocol v2). The control plane\ndecides which values may leave it -- never one marked secret or a\nplatform credential -- and sends only names the Dockerfile declares.\nA spec holding them is encrypted to the node's key\n([`SEALED_BUILD_SPEC_FIELD`]). They are held in memory on both sides;\nneither side writes them to disk or to a log.",
             "propertyNames": {
               "type": "string"
             },
@@ -106315,7 +106315,10 @@
             "description": "Insufficient permissions or deployment-token caller"
           },
           "404": {
-            "description": "Service not found"
+            "description": "Service or requested node not found"
+          },
+          "409": {
+            "description": "The member cannot be placed as requested, or this process has no local Docker daemon"
           },
           "500": {
             "description": "Internal server error"
@@ -106370,6 +106373,9 @@
           },
           "404": {
             "description": "Service or member not found"
+          },
+          "409": {
+            "description": "The member is still being provisioned"
           },
           "500": {
             "description": "Internal server error"
@@ -106476,6 +106482,9 @@
           },
           "404": {
             "description": "Service or member not found"
+          },
+          "409": {
+            "description": "This process has no local Docker daemon to run the promotion on"
           },
           "500": {
             "description": "pg_autoctl perform promotion failed"
@@ -110406,6 +110415,16 @@
               }
             },
             "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No GeoIP database is loaded yet"
           }
         },
         "security": [
