@@ -91,8 +91,8 @@ pub enum GithubAppServiceError {
 }
 
 /// Check the JSON GitHub returns when a manifest `code` is converted into a
-/// GitHub App: the app needs an id, OAuth credentials, a webhook secret and a
-/// private key before Temps can use it. A reply without them (an error body,
+/// GitHub App: the app needs an id, a name, OAuth credentials, a webhook secret
+/// and a private key before Temps can use it. A reply without them (an error body,
 /// a partial answer) must not be stored as a provider.
 ///
 /// Only field names are reported, never their values.
@@ -105,7 +105,13 @@ pub(crate) fn validate_manifest_reply(
         Some(id) if id > 0 && i32::try_from(id).is_ok() => {}
         _ => missing.push("id"),
     }
-    for field in ["client_id", "client_secret", "webhook_secret", "pem"] {
+    for field in [
+        "name",
+        "client_id",
+        "client_secret",
+        "webhook_secret",
+        "pem",
+    ] {
         if app_data[field]
             .as_str()
             .is_none_or(|value| value.trim().is_empty())

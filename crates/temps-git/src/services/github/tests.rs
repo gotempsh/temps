@@ -33,14 +33,28 @@ fn github_error_body_is_rejected() {
         "message": "Not Found",
         "documentation_url": "https://docs.github.com/rest"
     }));
-    for field in ["id", "client_id", "client_secret", "webhook_secret", "pem"] {
+    for field in [
+        "id",
+        "name",
+        "client_id",
+        "client_secret",
+        "webhook_secret",
+        "pem",
+    ] {
         assert!(message.contains(field), "{field} missing from: {message}");
     }
 }
 
 #[test]
 fn each_required_field_is_checked() {
-    for field in ["id", "client_id", "client_secret", "webhook_secret", "pem"] {
+    for field in [
+        "id",
+        "name",
+        "client_id",
+        "client_secret",
+        "webhook_secret",
+        "pem",
+    ] {
         let mut reply = complete_reply();
         reply.as_object_mut().unwrap().remove(field);
         assert!(
@@ -53,6 +67,8 @@ fn each_required_field_is_checked() {
 #[test]
 fn empty_and_blank_values_are_rejected() {
     for (field, value) in [
+        ("name", json!("")),
+        ("name", json!("  ")),
         ("client_id", json!("")),
         ("client_secret", json!("   ")),
         ("webhook_secret", json!("")),
