@@ -34,6 +34,9 @@ pub struct RemoteServiceClient {
     token: String,
     node_name: String,
     client: reqwest::Client,
+    /// How environment, secrets and service parameters may reach this node.
+    /// Refuses them until [`Self::with_sealing`] says otherwise.
+    sealing: temps_core::sealed_request::NodeSealing,
 }
 
 /// Parameters needed to create a service on a remote node.
@@ -141,7 +144,7 @@ pub struct RemoteHealthProbeResponse {
 /// Docker driver, instead of the agent building its own request.
 ///
 /// The plan never holds a secret value; the values travel next to it in
-/// `secrets`, only inside the TLS-protected body, and are never logged
+/// `secrets`, only inside a body sealed to the node, and are never logged
 /// (`Debug` prints their names only).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServiceWorkloadCreateRequest {
@@ -205,6 +208,7 @@ impl RemoteServiceClient {
             token,
             node_name,
             client,
+            sealing: Default::default(),
         })
     }
 
@@ -252,6 +256,7 @@ impl RemoteServiceClient {
             token,
             node_name,
             client,
+            sealing: Default::default(),
         })
     }
 
@@ -303,7 +308,38 @@ impl RemoteServiceClient {
             token,
             node_name,
             client,
+            sealing: Default::default(),
         })
+    }
+
+    /// How requests carrying values reach this node (see
+    /// [`temps_core::sealed_request`]); from the node row's
+    /// `request_sealing()`.
+    pub fn with_sealing(mut self, sealing: temps_core::sealed_request::NodeSealing) -> Self {
+        self.sealing = sealing;
+        self
+    }
+
+    /// Encrypt `body` to the node, so nothing is sent if it cannot be.
+    fn with_sealed_body<B: serde::Serialize + ?Sized>(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+        body: &B,
+    ) -> Result<reqwest::RequestBuilder, temps_core::sealed_request::SealRequestError> {
+        let sealed = self.sealing.seal_json(&self.node_name, path, body)?;
+        Ok(request
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+            )
+            .body(sealed))
+    }
+
+    fn older_agent_error(&self) -> ExternalServiceError {
+        ExternalServiceError::InternalError {
+            reason: temps_core::sealed_request::older_agent_message(&self.node_name),
+        }
     }
 
     /// Create and start a service container on the remote node.
@@ -315,7 +351,9 @@ impl RemoteServiceClient {
             "Creating service '{}' on remote node '{}'",
             params.name, self.node_name
         );
-        self.agent_post("/agent/services", &params).await
+        // Always sealed: a database's password is not only in its environment
+        // (Redis takes it as `--requirepass` in the command).
+        self.agent_post_sealed("/agent/services", &params).await
     }
 
     /// Start an existing service container on the remote node.
@@ -374,7 +412,9 @@ impl RemoteServiceClient {
             "Exec in '{}' on remote node '{}': {:?}",
             params.container_name, self.node_name, params.command
         );
-        self.agent_post("/agent/services/exec", &params).await
+        // Always sealed: the command can hold a credential as well.
+        self.agent_post_sealed("/agent/services/exec", &params)
+            .await
     }
 
     /// Initialize the provider and provision its per-project resource on the
@@ -389,7 +429,8 @@ impl RemoteServiceClient {
             node = %self.node_name,
             "Provisioning external-service runtime environment on remote node"
         );
-        self.agent_post("/agent/services/runtime-env", &request)
+        // The service config holds the service's credentials.
+        self.agent_post_sealed("/agent/services/runtime-env", &request)
             .await
     }
 
@@ -406,13 +447,13 @@ impl RemoteServiceClient {
             node = %self.node_name,
             "Revoking managed S3 credentials on remote node"
         );
-        self.agent_post::<_, String>("/agent/services/revoke-s3-access", &request)
+        self.agent_post_sealed::<_, String>("/agent/services/revoke-s3-access", &request)
             .await
             .map(|_| ())
     }
 
     /// Run the provider's authenticated health probe inside the worker that
-    /// owns the service. Secrets are carried only in the TLS-protected JSON
+    /// owns the service. Secrets are carried only in the sealed JSON
     /// request body and are never included in URL or tracing fields.
     pub async fn probe_health(
         &self,
@@ -470,10 +511,17 @@ impl RemoteServiceClient {
             "Creating database container from its workload spec on remote node"
         );
         let path = "/agent/services/workload";
+        let builder = self.client.post(format!("{}{}", self.agent_url, path));
+        let builder = self
+            .with_sealed_body(builder, path, request)
+            .map_err(|error| ServiceWorkloadError::Agent {
+                node: self.node_name.clone(),
+                operation: "create",
+                container: request.plan.container_name.clone(),
+                reason: error.to_string(),
+            })?;
         self.workload_call(
-            self.client
-                .post(format!("{}{}", self.agent_url, path))
-                .json(request),
+            builder,
             path,
             &request.plan.container_name,
             "create a database container from its workload spec",
@@ -505,6 +553,12 @@ impl RemoteServiceClient {
             .send()
             .await
             .map_err(|e| agent_error(format!("failed to reach the agent at {url}: {e}")))?;
+        // Only a sealed request gets this: every plain one here is JSON or GET.
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(agent_error(
+                temps_core::sealed_request::older_agent_message(&self.node_name),
+            ));
+        }
         // An agent from before Phase 4 has no such route: `404`, or `405`
         // where the path matches `/agent/services/{name}`.
         if matches!(
@@ -577,17 +631,22 @@ impl RemoteServiceClient {
             })
     }
 
-    async fn agent_post<B: serde::Serialize, T: for<'de> Deserialize<'de>>(
+    /// POST `body` encrypted to the node. Every route this client calls with a
+    /// body can carry a credential somewhere in it, so none of them decide by
+    /// looking at one field.
+    async fn agent_post_sealed<B: serde::Serialize, T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         body: &B,
     ) -> Result<T, ExternalServiceError> {
         let url = format!("{}{}", self.agent_url, path);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(body)
+        let request = self.client.post(&url).bearer_auth(&self.token);
+        let request = self
+            .with_sealed_body(request, path, body)
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: error.to_string(),
+            })?;
+        let response = request
             .send()
             .await
             .map_err(|e| ExternalServiceError::InternalError {
@@ -596,6 +655,9 @@ impl RemoteServiceClient {
                     self.node_name, url, e
                 ),
             })?;
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.older_agent_error());
+        }
 
         let (status, body) = self.decode_agent_response(response, &url).await?;
 
@@ -629,12 +691,19 @@ impl RemoteServiceClient {
         timeout: Duration,
     ) -> Result<T, ExternalServiceError> {
         let url = format!("{}{}", self.agent_url, path);
+        // The health probe's service config holds the service's credentials.
         let response = self
-            .client
-            .post(&url)
-            .timeout(timeout)
-            .bearer_auth(&self.token)
-            .json(body)
+            .with_sealed_body(
+                self.client
+                    .post(&url)
+                    .timeout(timeout)
+                    .bearer_auth(&self.token),
+                path,
+                body,
+            )
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: error.to_string(),
+            })?
             .send()
             .await
             .map_err(|error| ExternalServiceError::InternalError {
@@ -643,6 +712,9 @@ impl RemoteServiceClient {
                     self.node_name, url, error
                 ),
             })?;
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.older_agent_error());
+        }
         let (status, body): (_, AgentResponse<T>) =
             self.decode_agent_response(response, &url).await?;
         if !body.success {
@@ -806,6 +878,273 @@ mod tests {
         routing::post,
         Router,
     };
+    use temps_core::sealed_request::{open_request, NodeSealing, SEALED_REQUEST_CONTENT_TYPE};
+
+    /// The fake worker's key. Handlers are plain `async fn`s, so it is shared.
+    fn test_keys() -> &'static (String, String) {
+        static KEYS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEYS.get_or_init(|| temps_core::worker_ingress::generate_ingress_key().unwrap())
+    }
+
+    fn test_sealing() -> NodeSealing {
+        NodeSealing::Key(test_keys().1.clone())
+    }
+
+    /// Open a request as the worker's agent would, checking it was sealed.
+    fn open_for_test<T: for<'de> Deserialize<'de>>(
+        headers: &HeaderMap,
+        path: &str,
+        sealed: &[u8],
+    ) -> T {
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(SEALED_REQUEST_CONTENT_TYPE)
+        );
+        let opened = open_request(&test_keys().0, path, sealed).unwrap();
+        serde_json::from_slice(&opened).unwrap()
+    }
+
+    /// The content type and raw body a fake worker last received.
+    type RecordedRequest = std::sync::Arc<std::sync::Mutex<Option<(String, Vec<u8>)>>>;
+
+    /// A fake worker on every route, answering `status` with `reply` and
+    /// recording the raw body and content type it received.
+    async fn recording_agent(
+        status: axum::http::StatusCode,
+        reply: serde_json::Value,
+    ) -> (String, RecordedRequest) {
+        let seen: RecordedRequest = Default::default();
+        let recorded = seen.clone();
+        let app = Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let recorded = recorded.clone();
+            let reply = reply.clone();
+            async move {
+                let content_type = headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                *recorded.lock().unwrap() = Some((content_type, body.to_vec()));
+                (status, Json(reply))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    fn client_at(url: String, sealing: NodeSealing) -> RemoteServiceClient {
+        RemoteServiceClient::new(url, "node-token".to_string(), "worker-1".to_string())
+            .unwrap()
+            .with_sealing(sealing)
+    }
+
+    fn create_params(environment: HashMap<String, String>) -> RemoteServiceCreateParams {
+        RemoteServiceCreateParams {
+            name: "orders-db".to_string(),
+            service_type: "postgres".to_string(),
+            image: "postgres:18".to_string(),
+            environment,
+            port_mappings: vec![],
+            volumes: HashMap::new(),
+            network: None,
+            command: None,
+            resource_limits: None,
+        }
+    }
+
+    fn password_env() -> HashMap<String, String> {
+        HashMap::from([("POSTGRES_PASSWORD".to_string(), "db-password".to_string())])
+    }
+
+    #[tokio::test]
+    async fn a_service_environment_crosses_the_wire_encrypted() {
+        let (url, seen) = recording_agent(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"success": false, "data": null, "error": "stop here"}),
+        )
+        .await;
+
+        let _ = client_at(url, test_sealing())
+            .create_service(create_params(password_env()))
+            .await;
+
+        let (content_type, body) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        let wire = String::from_utf8_lossy(&body);
+        assert!(!wire.contains("db-password"), "{wire}");
+        assert!(!wire.contains("POSTGRES_PASSWORD"), "{wire}");
+        let opened = open_request(&test_keys().0, "/agent/services", &body).unwrap();
+        assert!(String::from_utf8(opened).unwrap().contains("db-password"));
+    }
+
+    #[tokio::test]
+    async fn a_service_environment_is_not_sent_to_a_node_without_a_key() {
+        for (sealing, expected) in [
+            (NodeSealing::NoKey, "no encryption key"),
+            (NodeSealing::PlainHttp, "plain http://"),
+        ] {
+            let error = client_at("http://127.0.0.1:9".to_string(), sealing)
+                .create_service(create_params(password_env()))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("worker-1"), "{error}");
+        }
+    }
+
+    /// A Redis password is only in the command, the environment is empty.
+    fn redis_params() -> RemoteServiceCreateParams {
+        let mut params = create_params(HashMap::new());
+        params.command = Some(vec![
+            "redis-server".to_string(),
+            "--requirepass".to_string(),
+            "db-password".to_string(),
+        ]);
+        params
+    }
+
+    #[tokio::test]
+    async fn a_password_in_a_database_command_crosses_the_wire_encrypted() {
+        let (url, seen) = recording_agent(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"success": false, "data": null, "error": "stop here"}),
+        )
+        .await;
+
+        let _ = client_at(url, test_sealing())
+            .create_service(redis_params())
+            .await;
+
+        let (content_type, body) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        assert!(!String::from_utf8_lossy(&body).contains("db-password"));
+        let opened = open_request(&test_keys().0, "/agent/services", &body).unwrap();
+        assert!(String::from_utf8(opened).unwrap().contains("db-password"));
+    }
+
+    #[tokio::test]
+    async fn a_password_in_a_database_command_is_not_sent_to_a_node_without_a_key() {
+        for (sealing, expected) in [
+            (NodeSealing::NoKey, "no encryption key"),
+            (NodeSealing::PlainHttp, "plain http://"),
+        ] {
+            let error = client_at("http://127.0.0.1:9".to_string(), sealing)
+                .create_service(redis_params())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_database_workload_is_sealed_even_with_no_secret_named_in_its_request() {
+        use crate::workload::{DatabaseEngine, DatabaseIdentity, DatabaseProcess};
+        let (url, seen) = recording_agent(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"success": false, "data": null, "error": "stop here"}),
+        )
+        .await;
+        let mut params = create_params(HashMap::new());
+        params.port_mappings = vec![RemotePortMapping {
+            host_port: 0,
+            container_port: 5432,
+        }];
+        params.volumes = HashMap::from([(
+            "orders-db-data".to_string(),
+            "/var/lib/postgresql/data".to_string(),
+        )]);
+        let process = DatabaseProcess::from_remote_params(DatabaseEngine::Postgres, &params);
+        let plan = crate::workload::DatabaseWorkloadPlan::admit(
+            &DatabaseIdentity {
+                service_id: 1,
+                service_name: "orders-db".to_string(),
+                engine: DatabaseEngine::Postgres,
+                node_id: Some(1),
+                container_name: "orders-db".to_string(),
+            },
+            &process,
+        )
+        .unwrap();
+
+        let _ = client_at(url, test_sealing())
+            .create_service_workload(&ServiceWorkloadCreateRequest {
+                service_name: "orders-db".to_string(),
+                plan,
+                secrets: Default::default(),
+                network: None,
+                replace_existing: false,
+            })
+            .await;
+
+        let (content_type, body) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        assert!(open_request(&test_keys().0, "/agent/services/workload", &body).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_credential_in_a_service_exec_command_crosses_the_wire_encrypted() {
+        let (url, seen) = recording_agent(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"success": false, "data": null, "error": "stop here"}),
+        )
+        .await;
+
+        let _ = client_at(url, test_sealing())
+            .exec_in_service(RemoteExecParams {
+                container_name: "redis-1".to_string(),
+                command: vec!["redis-cli".into(), "-a".into(), "db-password".into()],
+                environment: HashMap::new(),
+                user: None,
+                detach: false,
+            })
+            .await;
+
+        let (content_type, body) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        assert!(!String::from_utf8_lossy(&body).contains("db-password"));
+        assert!(open_request(&test_keys().0, "/agent/services/exec", &body).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_older_agent_gets_an_upgrade_message() {
+        let (url, _) = recording_agent(
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            serde_json::json!({}),
+        )
+        .await;
+        let error = client_at(url, test_sealing())
+            .create_service(create_params(password_env()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too old"), "{error}");
+        assert!(error.contains("worker-1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn service_credentials_in_a_health_probe_are_not_sent_to_a_node_without_a_key() {
+        let error = client_at("http://127.0.0.1:9".to_string(), NodeSealing::NoKey)
+            .probe_health(RemoteHealthProbeRequest {
+                service_config: ServiceConfig {
+                    name: "orders-db".to_string(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::json!({"password": "db-password"}),
+                },
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no encryption key"), "{error}");
+    }
 
     #[test]
     fn test_remote_service_create_params_serialization() {
@@ -959,16 +1298,15 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_env_posts_to_agent_and_returns_typed_environment() {
-        async fn handler(
-            headers: HeaderMap,
-            Json(request): Json<RemoteRuntimeEnvRequest>,
-        ) -> Json<serde_json::Value> {
+        async fn handler(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
             assert_eq!(
                 headers
                     .get(AUTHORIZATION)
                     .and_then(|value| value.to_str().ok()),
                 Some("Bearer node-token")
             );
+            let request: RemoteRuntimeEnvRequest =
+                open_for_test(&headers, "/agent/services/runtime-env", &sealed);
             assert_eq!(request.service_config.name, "orders-db");
             assert_eq!(request.project_slug, "storefront");
             assert_eq!(request.environment_slug, "production");
@@ -999,7 +1337,8 @@ mod tests {
             "node-token".to_string(),
             "worker-1".to_string(),
         )
-        .unwrap();
+        .unwrap()
+        .with_sealing(test_sealing());
         let response = client
             .get_runtime_env_vars(RemoteRuntimeEnvRequest {
                 service_config: ServiceConfig {
@@ -1023,16 +1362,15 @@ mod tests {
 
     #[tokio::test]
     async fn health_probe_posts_authenticated_provider_config_and_returns_typed_result() {
-        async fn handler(
-            headers: HeaderMap,
-            Json(request): Json<RemoteHealthProbeRequest>,
-        ) -> Json<serde_json::Value> {
+        async fn handler(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
             assert_eq!(
                 headers
                     .get(AUTHORIZATION)
                     .and_then(|value| value.to_str().ok()),
                 Some("Bearer node-token")
             );
+            let request: RemoteHealthProbeRequest =
+                open_for_test(&headers, "/agent/services/health-probe", &sealed);
             assert_eq!(request.service_config.name, "orders-mongo");
             assert_eq!(
                 request.service_config.parameters["password"],
@@ -1067,7 +1405,8 @@ mod tests {
             "node-token".to_string(),
             "worker-1".to_string(),
         )
-        .unwrap();
+        .unwrap()
+        .with_sealing(test_sealing());
         let response = client
             .probe_health(RemoteHealthProbeRequest {
                 service_config: ServiceConfig {
@@ -1112,7 +1451,8 @@ mod tests {
             "node-token".to_string(),
             "worker-1".to_string(),
         )
-        .unwrap();
+        .unwrap()
+        .with_sealing(test_sealing());
         let error = client
             .probe_health(RemoteHealthProbeRequest {
                 service_config: ServiceConfig {

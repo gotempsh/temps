@@ -165,6 +165,7 @@ async fn local_workspace_archive_intersects_root_and_specific_rules() {
 #[test]
 fn buildkit_arguments_extend_user_arguments() {
     let request = BuildRequest {
+        build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: "test".into(),
         context_path: PathBuf::new(),
@@ -379,6 +380,7 @@ CMD ["cat", "/hello.txt"]
     match create_test_docker_runtime().await {
         Ok(runtime) => {
             let request = BuildRequest {
+                build_secrets: Default::default(),
                 cache_from: Vec::new(),
                 image_name: "docker-test:latest".to_string(),
                 context_path,
@@ -624,6 +626,7 @@ async fn buildkit_build_stage_sees_root_owned_context() {
     let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
     let log_dir = TempDir::new().unwrap();
     let request = BuildRequest {
+        build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: image.clone(),
         context_path: checkout.path().to_path_buf(),

@@ -7,6 +7,7 @@
 use super::build_failure::build_stream_error_text;
 use super::build_limits::describe_build_memory_request;
 use super::guards::{combine_extraction_and_cleanup, DockerContainerCleanupGuard};
+use super::secret_mounts::emit_buildkit_status;
 use super::static_archive::{
     static_archive_root, unpack_static_archive_stream, MAX_STATIC_ARCHIVE_STREAM_BYTES,
 };
@@ -110,7 +111,10 @@ fn append_root_owned_entry<W: Write>(
     }
 }
 
-fn docker_build_args(request: &BuildRequest, use_buildkit: bool) -> HashMap<String, String> {
+pub(super) fn docker_build_args(
+    request: &BuildRequest,
+    use_buildkit: bool,
+) -> HashMap<String, String> {
     let mut args = request.build_args.clone();
     if use_buildkit {
         args.extend(request.build_args_buildkit.clone());
@@ -239,10 +243,28 @@ impl DockerRuntime {
         context_path: PathBuf,
         dockerfile_path: Option<PathBuf>,
     ) -> Result<ImageImportStream, BuilderError> {
+        let tmp = Self::write_tar_context_file(context_path, dockerfile_path).await?;
+        // Read back in bounded chunks rather than a Vec.
+        let file = tokio::fs::File::from_std(tmp.reopen().map_err(BuilderError::IoError)?);
+        Ok(Box::pin(
+            tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new()).map(
+                move |result| {
+                    let _owner = &tmp;
+                    result.map(|chunk| chunk.freeze())
+                },
+            ),
+        ))
+    }
+
+    /// The build context, as a tar in a temporary file.
+    pub(super) async fn write_tar_context_file(
+        context_path: PathBuf,
+        dockerfile_path: Option<PathBuf>,
+    ) -> Result<tempfile::NamedTempFile, BuilderError> {
         let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
         // Keep ownership in the blocking task; cancellation must not leave
-        // an orphan archive. Read back in bounded chunks rather than a Vec.
-        let tmp = tokio::task::spawn_blocking(move || {
+        // an orphan archive.
+        tokio::task::spawn_blocking(move || {
             let dockerfile = dockerfile_path
                 .as_deref()
                 .and_then(|path| path.strip_prefix(&context_path).ok())
@@ -255,18 +277,7 @@ impl DockerRuntime {
             Ok::<_, BuilderError>(tmp)
         })
         .await
-        .map_err(|error| {
-            BuilderError::Other(format!("Build context tar task failed: {error}"))
-        })??;
-        let file = tokio::fs::File::from_std(tmp.reopen().map_err(BuilderError::IoError)?);
-        Ok(Box::pin(
-            tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new()).map(
-                move |result| {
-                    let _owner = &tmp;
-                    result.map(|chunk| chunk.freeze())
-                },
-            ),
-        ))
+        .map_err(|error| BuilderError::Other(format!("Build context tar task failed: {error}")))?
     }
 
     /// Detect the native platform for Docker builds.
@@ -276,7 +287,7 @@ impl DockerRuntime {
     /// fallback is never cached, so a daemon that comes up late (or recovers)
     /// is picked up by the next refresh — see the build paths, which refresh
     /// before using this.
-    fn detect_native_platform(&self) -> String {
+    pub(super) fn detect_native_platform(&self) -> String {
         self.daemon_platform
             .get()
             .cloned()
@@ -416,6 +427,12 @@ impl ImageBuilder for DockerRuntime {
             "Building image {} from context: {:?}",
             request.image_name, request.context_path
         );
+
+        if !request.build_secrets.is_empty() {
+            return self
+                .build_image_with_secret_mounts(request, None, start_time)
+                .await;
+        }
 
         // Create tar archive body from build context
         let tar_body = self
@@ -642,6 +659,12 @@ impl ImageBuilder for DockerRuntime {
             request.image_name, request.context_path
         );
 
+        if !request.build_secrets.is_empty() {
+            return self
+                .build_image_with_secret_mounts(request, log_callback, start_time)
+                .await;
+        }
+
         // Create tar archive body from build context
         let tar_body = self
             .create_tar_context_body(
@@ -770,47 +793,7 @@ impl ImageBuilder for DockerRuntime {
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
-                        // Emit vertex names (build step descriptions) when they
-                        // start or complete.  This gives visibility into cached
-                        // layers and overall build progress even when there is
-                        // no command output (logs).
-                        for vertex in &res.vertexes {
-                            if vertex.name.is_empty() {
-                                continue;
-                            }
-                            let status = if vertex.error.is_empty() {
-                                if vertex.completed.is_some() {
-                                    if vertex.cached {
-                                        "CACHED"
-                                    } else {
-                                        "DONE"
-                                    }
-                                } else if vertex.started.is_some() {
-                                    "RUNNING"
-                                } else {
-                                    continue; // Not started yet, skip
-                                }
-                            } else {
-                                "ERROR"
-                            };
-                            let line = format!("[{}] {}\n", status, vertex.name);
-                            let _ = log_file.write_all(line.as_bytes()).await;
-                            debug!("BuildKit vertex: {}", line.trim());
-
-                            if let Some(ref callback) = log_callback {
-                                callback(line).await;
-                            }
-                        }
-
-                        // Emit actual command output from build steps
-                        for log in res.logs {
-                            let _ = log_file.write_all(&log.msg[..]).await;
-                            debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
-
-                            if let Some(ref callback) = log_callback {
-                                callback(String::from_utf8_lossy(&log.msg[..]).to_string()).await;
-                            }
-                        }
+                        emit_buildkit_status(&res, &mut log_file, &log_callback).await;
                     }
                 }
                 Err(e) => {

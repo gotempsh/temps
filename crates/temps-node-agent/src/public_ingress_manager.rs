@@ -201,10 +201,10 @@ async fn run(
         }
         publish_mode(local.mode);
 
-        if local.mode != IngressMode::Off
-            && (key.is_none() || !key_registered)
-            && tokio::time::Instant::now() >= retry_at
-        {
+        // In every ingress mode: this key also opens the requests the control
+        // plane seals to this node, so a worker that joined before keys existed
+        // needs one even if it never serves public traffic.
+        if (key.is_none() || !key_registered) && tokio::time::Instant::now() >= retry_at {
             retry_at = tokio::time::Instant::now() + RETRY_INTERVAL;
             match ensure_key(&config, &client, &base, key.is_some()).await {
                 Ok((private, registered)) => {
@@ -730,6 +730,74 @@ async fn send_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker that joined before keys existed must get one even if it
+    /// never serves public traffic: the control plane has nothing else to
+    /// encrypt its environment variables and secrets to.
+    #[tokio::test]
+    async fn a_worker_with_ingress_off_still_provisions_and_registers_its_key() {
+        use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+
+        type Seen = Arc<std::sync::Mutex<Option<(String, String)>>>;
+        let seen: Seen = Default::default();
+        let recorded = seen.clone();
+        let registered = Arc::new(Notify::new());
+        let notify = registered.clone();
+        let app = Router::new().route(
+            "/api/internal/nodes/7/public-ingress/key",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let recorded = recorded.clone();
+                    let notify = notify.clone();
+                    async move {
+                        *recorded.lock().unwrap() = Some((
+                            headers["authorization"].to_str().unwrap().to_string(),
+                            body["public_key"].as_str().unwrap().to_string(),
+                        ));
+                        notify.notify_one();
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let data = tempfile::tempdir().unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let (_listen, receiver) = watch::channel(None);
+        let manager = tokio::spawn(run(
+            ManagerConfig {
+                private_key_b64: None,
+                data_dir: data.path().to_path_buf(),
+                control_plane_url: format!("http://{address}"),
+                control_plane_ca: None,
+                node_id: 7,
+                node_token: "node-token".to_string(),
+                ingress: LocalIngress::default(),
+                pinned: true,
+                config_path: data.path().join("agent.json"),
+            },
+            Arc::new(crate::route_store::RouteStore::new(
+                data.path().join("routes.json"),
+            )),
+            shutdown,
+            receiver,
+        ));
+        assert_eq!(LocalIngress::default().mode, IngressMode::Off);
+
+        tokio::time::timeout(Duration::from_secs(30), registered.notified())
+            .await
+            .expect("the worker never registered a key with ingress off");
+        manager.abort();
+
+        let (authorization, public) = seen.lock().unwrap().take().unwrap();
+        assert_eq!(authorization, "Bearer node-token");
+        let saved = std::fs::read_to_string(data.path().join("public-ingress.key")).unwrap();
+        assert_eq!(public_half(saved.trim()).unwrap(), public);
+    }
 
     // Checked a few at a time, the results keep the snapshot's order and the
     // pass stops at the limit. A listener that is not an address fails

@@ -1981,6 +1981,7 @@ mod tests {
         let build_service = service.clone();
         let build_target = target.clone();
         let request = BuildRequest {
+            build_secrets: Default::default(),
             context_path: context.path().into(),
             dockerfile_path: None,
             image_name: "app:build".into(),

@@ -16,6 +16,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
 use crate::sandbox_handlers::{self, SandboxHost, SandboxHostState, SANDBOX_UPLOAD_BODY_LIMIT};
+use crate::sealed_requests::{open_sealed_requests, open_sealed_uploads, SealedRequestState};
 use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::docker_socket_grant::DockerSocketGrant;
@@ -110,6 +111,7 @@ pub fn build_router(
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
+    let sealed_requests = SealedRequestState::from_config(config);
 
     let runtime_health_routes = crate::runtime_health::router(runtime_docker, config, auth.clone());
     let worker_metrics_routes = crate::worker_metrics::router(config, auth.clone());
@@ -267,13 +269,17 @@ pub fn build_router(
             "/agent/compose/remove-verified",
             post(crate::compose_handlers::remove_verified),
         )
+        // Layers run outermost-last: authentication comes first, so only an
+        // authenticated caller can make the agent decrypt anything.
+        .layer(middleware::from_fn(open_sealed_requests))
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth.clone()))
         .layer(Extension(resource_limits))
         .layer(Extension(compose_state))
+        .layer(Extension(sealed_requests.clone()))
         .with_state(state);
 
-    let sandbox_routes = sandbox_router(sandbox_state, auth);
+    let sandbox_routes = sandbox_router(sandbox_state, auth, sealed_requests);
 
     // Swagger UI — no auth required so it's accessible for documentation
     let mut api = AgentApiDoc::openapi();
@@ -293,7 +299,11 @@ pub fn build_router(
 /// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
 /// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
 /// other route keeps axum's 2 MiB default.
-pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
+pub(crate) fn sandbox_router(
+    sandbox_state: Arc<SandboxHostState>,
+    auth: Arc<AgentAuth>,
+    sealed_requests: Arc<SealedRequestState>,
+) -> Router {
     let upload_slot =
         || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
     Router::new()
@@ -320,6 +330,7 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
                 .layer(axum::extract::DefaultBodyLimit::max(
                     SANDBOX_UPLOAD_BODY_LIMIT,
                 ))
+                .layer(middleware::from_fn(open_sealed_uploads))
                 .layer(upload_slot()),
         )
         .route(
@@ -328,6 +339,7 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
                 .layer(axum::extract::DefaultBodyLimit::max(
                     SANDBOX_UPLOAD_BODY_LIMIT,
                 ))
+                .layer(middleware::from_fn(open_sealed_uploads))
                 .layer(upload_slot()),
         )
         .route(
@@ -387,8 +399,10 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
             sandbox_state.clone(),
             sandbox_handlers::redact_host_paths,
         ))
+        .layer(middleware::from_fn(open_sealed_requests))
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
+        .layer(Extension(sealed_requests))
         .with_state(sandbox_state)
 }
 
@@ -1721,7 +1735,14 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
         (
-            sandbox_router(state, Arc::new(AgentAuth::new("secret"))),
+            sandbox_router(
+                state,
+                Arc::new(AgentAuth::new("secret")),
+                Arc::new(SealedRequestState {
+                    key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                    node_name: "test-node".to_string(),
+                }),
+            ),
             root,
         )
     }
@@ -1737,6 +1758,278 @@ pub(crate) mod tests {
             request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
         }
         request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// The deploy routes and sandbox routes as the agent really mounts them:
+    /// authentication first, then the seal, then the handler.
+    fn sealed_test_app(private_key: Option<String>) -> Router {
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let mut config = test_agent_config(false);
+        config.public_ingress_private_key = private_key;
+        build_router(
+            remote.clone(),
+            remote,
+            None,
+            &config,
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
+            },
+            Default::default(),
+        )
+    }
+
+    fn sealed_request(
+        path: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+            );
+        if let Some(token) = token {
+            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sealed_requests_are_authenticated_then_opened_then_handled_on_every_router() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        for path in [
+            "/agent/containers/deploy",
+            "/agent/v2/containers/deploy",
+            "/agent/services",
+            "/agent/services/exec",
+            "/agent/services/workload",
+            "/agent/sandboxes",
+            "/agent/sandboxes/exec",
+            "/agent/sandboxes/write-file",
+            "/agent/sandboxes/write-directory",
+            "/agent/images/pull",
+        ] {
+            let sealed = NodeSealing::Key(public.clone())
+                .seal("test-node", path, br#"{"not":"a valid request"}"#)
+                .unwrap();
+
+            // No token: refused before anything is decrypted.
+            let response = sealed_test_app(Some(private.clone()))
+                .oneshot(sealed_request(path, None, sealed.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            // Authenticated: opened, and the handler's own validation answers.
+            // Without the seal being opened this would be 415 or 400.
+            let response = sealed_test_app(Some(private.clone()))
+                .oneshot(sealed_request(path, Some(&token), sealed))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+        }
+    }
+
+    /// A sealed attachment is bigger than the limit on other sealed requests.
+    #[tokio::test]
+    async fn sealed_sandbox_uploads_use_the_upload_limit_and_other_routes_do_not() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::{
+            NodeSealing, MAX_SEALED_REQUEST_BYTES, MAX_SEALED_UPLOAD_BYTES,
+        };
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let path = "/agent/sandboxes/write-file";
+        let body = format!(
+            r#"{{"padding":"{}"}}"#,
+            "x".repeat(MAX_SEALED_REQUEST_BYTES)
+        );
+        let sealed = NodeSealing::Key(public.clone())
+            .seal("test-node", path, body.as_bytes())
+            .unwrap();
+        assert!(sealed.len() > MAX_SEALED_REQUEST_BYTES);
+        assert!(sealed.len() < MAX_SEALED_UPLOAD_BYTES);
+
+        // Opened: the handler's own validation is what answers.
+        let response = sealed_test_app(Some(private.clone()))
+            .oneshot(sealed_request(path, Some(&token), sealed))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = sealed_test_app(Some(private.clone()))
+            .oneshot(sealed_request(
+                "/agent/sandboxes/exec",
+                Some(&token),
+                vec![b'x'; MAX_SEALED_REQUEST_BYTES + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(
+                path,
+                Some(&token),
+                vec![b'x'; MAX_SEALED_UPLOAD_BYTES + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Client to agent to container runtime: the values arrive complete. The
+    /// agent's runtime here is itself a remote deployer, so what it was handed
+    /// can be read back from the far side without Docker.
+    #[tokio::test]
+    async fn a_sealed_deploy_reaches_the_container_runtime_with_every_value() {
+        use temps_core::sealed_request::{open_request, NodeSealing};
+        use temps_deployer::{ContainerDeployer, DeployRequest};
+
+        let runtime_seen: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Default::default();
+        let recorded = runtime_seen.clone();
+        let runtime = Router::new().fallback(move |body: axum::body::Bytes| {
+            let recorded = recorded.clone();
+            async move {
+                *recorded.lock().unwrap() = Some(body.to_vec());
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "container_id": "abc",
+                        "container_name": "app-1",
+                        "container_port": 80,
+                        "host_port": 0,
+                        "status": { "Running": null },
+                    },
+                    "error": null,
+                }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+
+        let (runtime_private, runtime_public) =
+            temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                runtime_url,
+                "unused".into(),
+                "runtime".into(),
+            )
+            .unwrap()
+            .with_sealing(NodeSealing::Key(runtime_public)),
+        );
+
+        let (node_private, node_public) =
+            temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let mut config = test_agent_config(false);
+        config.public_ingress_private_key = Some(node_private);
+        let agent = build_router(
+            runtime.clone(),
+            runtime,
+            None,
+            &config,
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
+            },
+            Default::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, agent).await.unwrap() });
+
+        let control_plane = temps_deployer::remote::RemoteNodeDeployer::new(
+            agent_url,
+            config.token.clone(),
+            "worker-1".into(),
+        )
+        .unwrap()
+        .with_sealing(NodeSealing::Key(node_public));
+        let result = control_plane
+            .deploy_container(DeployRequest {
+                image_name: "registry.example/app:v1".to_string(),
+                container_name: "app-1".to_string(),
+                environment_vars: std::collections::HashMap::from([(
+                    "PUBLIC_NAME".to_string(),
+                    "a-variable".to_string(),
+                )]),
+                secrets: std::collections::HashMap::from([(
+                    "API_KEY".to_string(),
+                    "a-secret".to_string(),
+                )]),
+                port_mappings: vec![],
+                network_name: None,
+                extra_networks: Vec::new(),
+                resource_limits: temps_deployer::ResourceLimits::default(),
+                restart_policy: temps_deployer::RestartPolicy::Never,
+                log_path: std::path::PathBuf::from("/tmp/app-1.log"),
+                command: None,
+                entrypoint: None,
+                log_config: None,
+                labels: Default::default(),
+                project_slug: None,
+                control_plane_grants_socket: false,
+            })
+            .await
+            .expect("the sealed deploy should succeed end to end");
+        assert_eq!(result.container_id, "abc");
+
+        let received = runtime_seen.lock().unwrap().take().unwrap();
+        let opened = open_request(&runtime_private, "/agent/containers/deploy", &received).unwrap();
+        let handed_over: DeployRequest = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(handed_over.secrets["API_KEY"], "a-secret");
+        assert_eq!(handed_over.environment_vars["PUBLIC_NAME"], "a-variable");
+        assert_eq!(handed_over.image_name, "registry.example/app:v1");
+    }
+
+    #[tokio::test]
+    async fn a_request_sealed_for_another_route_never_reaches_a_handler() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let sealed = NodeSealing::Key(public)
+            .seal(
+                "test-node",
+                "/agent/services",
+                br#"{"not":"a valid request"}"#,
+            )
+            .unwrap();
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(
+                "/agent/containers/deploy",
+                Some(&token),
+                sealed,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

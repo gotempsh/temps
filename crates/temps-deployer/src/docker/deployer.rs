@@ -523,6 +523,15 @@ impl ContainerDeployer for DockerRuntime {
             let mut truncated = false;
             while let Some(frame) = output.next().await {
                 let frame = frame.map_err(|e| failure(e.to_string()))?;
+                // This exec has no TTY, so Docker multiplexes every frame. bollard
+                // reports the leftovers of a stream cut mid-frame as `Console` at
+                // EOF rather than as an error, and a probe must not read that
+                // ambiguous ending as a clean one.
+                if matches!(frame, bollard::container::LogOutput::Console { .. }) {
+                    return Err(failure(
+                        "command output stream ended in the middle of a frame".to_string(),
+                    ));
+                }
                 truncated |= crate::append_exec_output(&mut captured, frame.as_ref());
             }
             let inspect = docker

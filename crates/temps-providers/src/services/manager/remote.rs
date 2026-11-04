@@ -69,6 +69,7 @@ impl ExternalServiceManager {
                     })
             })?;
 
+        let sealing = node.request_sealing();
         if node.address.starts_with("https://") {
             let settings_row = settings::Entity::find_by_id(1)
                 .one(self.db.as_ref())
@@ -141,8 +142,10 @@ impl ExternalServiceManager {
                 );
             }
             RemoteServiceClient::new_mtls_at(&endpoint, token, node.name, &identity_pem, &ca_cert)
+                .map(|client| client.with_sealing(sealing))
         } else {
             RemoteServiceClient::new(node.address, token, node.name)
+                .map(|client| client.with_sealing(sealing))
         }
     }
 

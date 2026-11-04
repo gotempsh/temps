@@ -243,6 +243,7 @@ async fn build_and_push(
     };
     let build = builder.build_image_with_callback(BuildRequestWithCallback {
         request: BuildRequest {
+            build_secrets: Default::default(),
             context_path: context.clone(),
             dockerfile_path: Some(context.join(&work.spec.dockerfile)),
             image_name: work.registry_tag.clone(),

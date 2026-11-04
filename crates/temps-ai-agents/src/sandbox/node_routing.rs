@@ -499,12 +499,16 @@ pub fn is_https_address(address: &str) -> bool {
 }
 
 /// Everything a node's client is built from. A change in any of it (node
-/// re-joined at another address or with another token, sandbox defaults
-/// edited, cluster CA rotated) needs a new client.
+/// re-joined at another address or with another token, encryption key registered
+/// or changed, sandbox defaults edited, cluster CA rotated) needs a new client.
 #[derive(Debug, Clone, PartialEq)]
 struct NodeClientKey {
     address: String,
     token_encrypted: Option<String>,
+    /// What the client seals requests to. A worker that upgrades registers its
+    /// first key, and without this its old client would keep refusing to send
+    /// it anything.
+    edge_public_key: Option<String>,
     defaults: RemoteSandboxDefaults,
     /// The client trusts this cluster CA.
     cluster_ca_cert_pem: Option<String>,
@@ -515,6 +519,7 @@ impl NodeClientKey {
         Self {
             address: node.address.clone(),
             token_encrypted: node.token_encrypted.clone(),
+            edge_public_key: node.edge_public_key.clone(),
             defaults: sandbox_defaults(&settings.agent_sandbox),
             cluster_ca_cert_pem: settings.multi_node.cluster_ca_cert_pem.clone(),
         }
@@ -554,6 +559,7 @@ impl NodeProviderFactory for MtlsProviderFactory {
         defaults: RemoteSandboxDefaults,
     ) -> Result<Arc<dyn SandboxProvider>, String> {
         let endpoint = temps_deployments::cluster_ca::node_agent_endpoint(node);
+        let sealing = node.request_sealing();
         let client = temps_deployments::cluster_ca::build_node_http_client(
             &endpoint,
             self.config_service.as_ref(),
@@ -585,7 +591,8 @@ impl NodeProviderFactory for MtlsProviderFactory {
                 client,
             )
             .with_defaults(defaults)
-            .with_ws_connector(ws_connector),
+            .with_ws_connector(ws_connector)
+            .with_sealing(sealing),
         ))
     }
 }
@@ -1376,6 +1383,21 @@ mod tests {
         let mut ca = base.clone();
         ca.multi_node.cluster_ca_cert_pem = Some("rotated-ca".to_string());
         assert_ne!(key, NodeClientKey::new(&n, &ca), "cluster CA");
+    }
+
+    #[test]
+    fn a_node_registering_or_changing_its_key_needs_a_new_client() {
+        let settings = temps_core::AppSettings::default();
+        let keyless = node(7, "active", "https://10.0.0.7:3100", "token");
+        let mut registered = keyless.clone();
+        registered.edge_public_key = Some("first-key".to_string());
+        let mut rotated = keyless.clone();
+        rotated.edge_public_key = Some("second-key".to_string());
+
+        let key = |node: &nodes::Model| NodeClientKey::new(node, &settings);
+        assert_ne!(key(&keyless), key(&registered));
+        assert_ne!(key(&registered), key(&rotated));
+        assert_eq!(key(&registered), key(&registered.clone()));
     }
 
     #[tokio::test]

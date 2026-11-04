@@ -42,13 +42,15 @@ use temps_deployer::compose::{
 use temps_deployer::compose_protocol::{
     unpack_compose_stack, validate_stack_name, ComposeAck, ComposeGenerationRequest,
     ComposeHostEvent, ComposeHostFailure, ComposePrepareSpec, ComposePruneRequest,
-    ComposeRemoveVerifiedRequest, ComposeStackRequest, RemoteComposeError, MAX_COMPOSE_SPEC_BYTES,
-    MAX_COMPOSE_STACK_BYTES,
+    ComposeRemoveVerifiedRequest, ComposeStackRequest, RemoteComposeError, COMPOSE_PREPARE_PATH,
+    MAX_COMPOSE_SPEC_BYTES, MAX_COMPOSE_STACK_BYTES, SEALED_COMPOSE_SPEC_FIELD,
 };
 use tokio::io::AsyncWriteExt;
 
 use crate::auth::RequireAgentAuth;
 use crate::handlers::{AgentResourceLimits, AgentResponse};
+use crate::sealed_requests::SealedRequestState;
+use temps_core::sealed_request::MAX_SEALED_REQUEST_BYTES;
 
 /// Longest a prepare (build, pull) may run once admitted. Shared with the
 /// control plane, whose request timeout outlasts it.
@@ -502,27 +504,32 @@ pub async fn prepare(
     RequireAgentAuth(auth): RequireAgentAuth,
     Extension(state): Extension<Arc<ComposeHostState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    Extension(sealed_requests): Extension<Arc<SealedRequestState>>,
     mut multipart: Multipart,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, DeploymentsCreate);
     state.evict_stale().await;
 
-    let mut spec_field = match multipart.next_field().await {
-        Ok(Some(field)) if field.name() == Some("spec") => field,
+    let (mut spec_field, spec_is_sealed) = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("spec") => (field, false),
+        Ok(Some(field)) if field.name() == Some(SEALED_COMPOSE_SPEC_FIELD) => (field, true),
         _ => return Err(AgentComposeError::Invalid("Expected spec field first".into()).into()),
+    };
+    let spec_limit = if spec_is_sealed {
+        MAX_SEALED_REQUEST_BYTES
+    } else {
+        MAX_COMPOSE_SPEC_BYTES
     };
     let mut spec_bytes = Vec::new();
     loop {
         match spec_field.chunk().await {
-            Ok(Some(chunk))
-                if spec_bytes.len().saturating_add(chunk.len()) <= MAX_COMPOSE_SPEC_BYTES =>
-            {
+            Ok(Some(chunk)) if spec_bytes.len().saturating_add(chunk.len()) <= spec_limit => {
                 spec_bytes.extend_from_slice(&chunk);
             }
             Ok(None) => break,
             _ => {
                 return Err(AgentComposeError::TooLarge(format!(
-                    "Compose spec is unreadable or larger than {MAX_COMPOSE_SPEC_BYTES} bytes"
+                    "Compose spec is unreadable or larger than {spec_limit} bytes"
                 ))
                 .into())
             }
@@ -530,6 +537,26 @@ pub async fn prepare(
     }
     // Multer only advances to the next part once this field is dropped.
     drop(spec_field);
+    if spec_is_sealed {
+        spec_bytes = sealed_requests
+            .key
+            .open(
+                &sealed_requests.node_name,
+                COMPOSE_PREPARE_PATH,
+                &spec_bytes,
+            )
+            .await
+            .map_err(|refusal| {
+                tracing::warn!(error = %refusal, "refused a sealed Compose spec");
+                AgentComposeError::Invalid(refusal.to_string())
+            })?;
+        if spec_bytes.len() > MAX_COMPOSE_SPEC_BYTES {
+            return Err(AgentComposeError::TooLarge(format!(
+                "Compose spec is larger than {MAX_COMPOSE_SPEC_BYTES} bytes"
+            ))
+            .into());
+        }
+    }
     let spec: ComposePrepareSpec = serde_json::from_slice(&spec_bytes).map_err(|error| {
         AgentComposeError::Invalid(format!("Compose spec is not valid: {error}"))
     })?;
@@ -1405,5 +1432,126 @@ mod tests {
             state(data.path()).published_host_ip(),
             Some("10.20.0.5".parse().unwrap())
         );
+    }
+
+    /// The real route, through the real router layers it depends on.
+    fn prepare_app(data_dir: &Path, private_key: Option<String>) -> axum::Router {
+        use crate::sealed_requests::NodeRequestKey;
+        axum::Router::new()
+            .route(COMPOSE_PREPARE_PATH, axum::routing::post(prepare))
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new("token"))))
+            .layer(Extension(Arc::new(state(data_dir))))
+            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .layer(Extension(Arc::new(SealedRequestState {
+                key: NodeRequestKey::fixed(private_key),
+                node_name: "worker-a".to_string(),
+            })))
+    }
+
+    fn multipart_request(field: &str, value: &[u8]) -> axum::extract::Request {
+        const BOUNDARY: &str = "test-boundary";
+        let mut body =
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n")
+                .into_bytes();
+        body.extend_from_slice(value);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri(COMPOSE_PREPARE_PATH)
+            .header("authorization", "Bearer token")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn answer(app: axum::Router, request: axum::extract::Request) -> (u16, String) {
+        use tower::ServiceExt;
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// Valid JSON but not a valid spec: reaching this error proves the spec
+    /// was opened, without needing Docker for the prepare itself.
+    const UNACCEPTABLE_SPEC: &[u8] = br#"{"not":"a compose spec"}"#;
+
+    #[tokio::test]
+    async fn a_sealed_compose_spec_is_opened_before_it_is_read() {
+        use temps_core::sealed_request::NodeSealing;
+        let data = tempfile::tempdir().unwrap();
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let sealed = NodeSealing::Key(public)
+            .seal("worker-a", COMPOSE_PREPARE_PATH, UNACCEPTABLE_SPEC)
+            .unwrap();
+
+        let (status, body) = answer(
+            prepare_app(data.path(), Some(private)),
+            multipart_request(SEALED_COMPOSE_SPEC_FIELD, &sealed),
+        )
+        .await;
+
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("Compose spec is not valid"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_compose_spec_from_an_older_control_plane_is_still_read() {
+        let data = tempfile::tempdir().unwrap();
+        let (status, body) = answer(
+            prepare_app(data.path(), None),
+            multipart_request("spec", UNACCEPTABLE_SPEC),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("Compose spec is not valid"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_compose_spec_sealed_to_another_key_or_route_is_refused() {
+        use temps_core::sealed_request::NodeSealing;
+        let data = tempfile::tempdir().unwrap();
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (_, other_public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        for sealed in [
+            NodeSealing::Key(other_public)
+                .seal("worker-a", COMPOSE_PREPARE_PATH, UNACCEPTABLE_SPEC)
+                .unwrap(),
+            NodeSealing::Key(public)
+                .seal("worker-a", "/agent/containers/deploy", UNACCEPTABLE_SPEC)
+                .unwrap(),
+        ] {
+            let (status, body) = answer(
+                prepare_app(data.path(), Some(private.clone())),
+                multipart_request(SEALED_COMPOSE_SPEC_FIELD, &sealed),
+            )
+            .await;
+            assert_eq!(status, 400, "{body}");
+            assert!(body.contains("cannot be opened"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_without_a_key_says_so_for_a_sealed_compose_spec() {
+        use temps_core::sealed_request::NodeSealing;
+        let data = tempfile::tempdir().unwrap();
+        let (_, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let sealed = NodeSealing::Key(public)
+            .seal("worker-a", COMPOSE_PREPARE_PATH, UNACCEPTABLE_SPEC)
+            .unwrap();
+        let (status, body) = answer(
+            prepare_app(data.path(), None),
+            multipart_request(SEALED_COMPOSE_SPEC_FIELD, &sealed),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("worker-a"), "{body}");
+        assert!(body.contains("no key"), "{body}");
     }
 }

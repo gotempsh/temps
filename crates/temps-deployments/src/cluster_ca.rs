@@ -210,6 +210,7 @@ pub async fn build_node_deployer(
 ) -> Result<RemoteNodeDeployer, DeployerError> {
     let node_name = node.name.clone();
     let endpoint = node_agent_endpoint(node);
+    let sealing = node.request_sealing();
     if is_https_address(&endpoint.dial_url) {
         let ca = ensure_cluster_ca(config_service, encryption_service)
             .await
@@ -226,8 +227,10 @@ pub async fn build_node_deployer(
             ))
         })?;
         RemoteNodeDeployer::new_mtls_at(&endpoint, token, node_name, &identity, &ca.cert_pem)
+            .map(|deployer| deployer.with_sealing(sealing))
     } else {
         RemoteNodeDeployer::new(endpoint.dial_url, token, node_name)
+            .map(|deployer| deployer.with_sealing(sealing))
     }
 }
 

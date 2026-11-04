@@ -984,13 +984,13 @@ impl PostgresUpgradeOrchestrator {
                     bollard::models::Mount {
                         target: Some("/var/lib/postgresql".to_string()),
                         source: Some(rollback_volume.clone()),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                        typ: Some(bollard::models::MountType::VOLUME),
                         ..Default::default()
                     },
                     bollard::models::Mount {
                         target: Some("/dump".to_string()),
                         source: Some(dump_volume.clone()),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                        typ: Some(bollard::models::MountType::VOLUME),
                         ..Default::default()
                     },
                 ]),
@@ -1240,7 +1240,7 @@ impl PostgresUpgradeOrchestrator {
                 mounts: Some(vec![bollard::models::Mount {
                     target: Some("/dump".to_string()),
                     source: Some(dump_volume.clone()),
-                    typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                    typ: Some(bollard::models::MountType::VOLUME),
                     read_only: Some(true),
                     ..Default::default()
                 }]),
@@ -1463,7 +1463,7 @@ impl PostgresUpgradeOrchestrator {
                 mounts: Some(vec![bollard::models::Mount {
                     target: Some("/dump".to_string()),
                     source: Some(dump_volume.to_string()),
-                    typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                    typ: Some(bollard::models::MountType::VOLUME),
                     read_only: Some(true),
                     ..Default::default()
                 }]),
@@ -1758,14 +1758,14 @@ impl PostgresUpgradeOrchestrator {
                     bollard::models::Mount {
                         target: Some("/src".to_string()),
                         source: Some(source.to_string()),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                        typ: Some(bollard::models::MountType::VOLUME),
                         read_only: Some(true),
                         ..Default::default()
                     },
                     bollard::models::Mount {
                         target: Some("/dest".to_string()),
                         source: Some(dest.to_string()),
-                        typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                        typ: Some(bollard::models::MountType::VOLUME),
                         ..Default::default()
                     },
                 ]),
@@ -2719,13 +2719,13 @@ mod tests {
                         Mount {
                             target: Some("/var/lib/postgresql/data".to_string()),
                             source: Some(old_data_volume.clone()),
-                            typ: Some(MountTypeEnum::VOLUME),
+                            typ: Some(MountType::VOLUME),
                             ..Default::default()
                         },
                         Mount {
                             target: Some("/dump".to_string()),
                             source: Some(dump_volume.clone()),
-                            typ: Some(MountTypeEnum::VOLUME),
+                            typ: Some(MountType::VOLUME),
                             ..Default::default()
                         },
                     ]),
@@ -2961,7 +2961,7 @@ mod tests {
                     mounts: Some(vec![Mount {
                         target: Some("/dump".to_string()),
                         source: Some(dump_volume.clone()),
-                        typ: Some(MountTypeEnum::VOLUME),
+                        typ: Some(MountType::VOLUME),
                         read_only: Some(true),
                         ..Default::default()
                     }]),
@@ -3029,7 +3029,7 @@ mod tests {
                     mounts: Some(vec![Mount {
                         target: Some("/var/lib/postgresql/data".to_string()),
                         source: Some(new_data_volume.clone()),
-                        typ: Some(MountTypeEnum::VOLUME),
+                        typ: Some(MountType::VOLUME),
                         ..Default::default()
                     }]),
                     network_mode: Some(network_name.clone()),
@@ -3075,7 +3075,7 @@ mod tests {
                     mounts: Some(vec![Mount {
                         target: Some("/dump".to_string()),
                         source: Some(dump_volume.clone()),
-                        typ: Some(MountTypeEnum::VOLUME),
+                        typ: Some(MountType::VOLUME),
                         read_only: Some(true),
                         ..Default::default()
                     }]),
