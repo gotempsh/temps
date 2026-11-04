@@ -1582,6 +1582,8 @@ mod tests {
 
     /// The rule the whole phase order exists for: the first fallible step after
     /// the create is a log write, and it runs on an already tracked container.
+    /// The writer stays broken through cleanup too, as a full disk would: cleanup
+    /// has to remove the container without being able to log anything.
     #[tokio::test]
     async fn a_log_write_failure_right_after_create_cannot_leak_the_container() {
         for docker_socket_mounted in [false, true] {
@@ -1601,7 +1603,10 @@ mod tests {
                 .expect_err("the failing log write must fail the replica");
 
             assert_eq!(deployer.creations(), 1);
-            writer.failing.store(false, Ordering::SeqCst);
+            assert!(
+                writer.failing.load(Ordering::SeqCst),
+                "the writer must still be broken when cleanup runs"
+            );
             assert_tracked_and_removable(&job, &context, &deployer).await;
         }
     }

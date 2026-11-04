@@ -2788,10 +2788,21 @@ impl DeployImageJob {
         lock_deployment_state(&self.container_ids, "container_ids").push(container_id);
     }
 
-    async fn stop_background_log_stream(
-        &self,
-        context: &WorkflowContext,
-    ) -> Result<(), WorkflowError> {
+    /// Write a progress line on a cleanup path. Cleanup has to finish whether or
+    /// not log storage works (a full disk fails every write), so a failed write
+    /// is reported here and never returned to stop the cleanup.
+    async fn log_best_effort(&self, context: &WorkflowContext, message: String) {
+        if let Err(error) = self.log(context, message).await {
+            tracing::warn!(
+                job_id = %self.job_id,
+                deployment_id = ?self.deployment_id,
+                error = %error,
+                "Failed to write a deployment cleanup log line; continuing cleanup"
+            );
+        }
+    }
+
+    async fn stop_background_log_stream(&self, context: &WorkflowContext) {
         let should_log = {
             let mut task_handle = lock_deployment_state(&self.log_stream_task, "log_stream_task");
             if let Some(handle) = task_handle.take() {
@@ -2803,16 +2814,14 @@ impl DeployImageJob {
         };
 
         if should_log {
-            self.log(context, "🧹 Stopped background log streaming".to_string())
-                .await?;
+            self.log_best_effort(context, "🧹 Stopped background log streaming".to_string())
+                .await;
         }
-
-        Ok(())
     }
 
     /// Remove all containers if they exist (called on timeout/failure/cancellation)
     async fn cleanup_container(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
-        self.stop_background_log_stream(context).await?;
+        self.stop_background_log_stream(context).await;
 
         // Then clean up all containers
         let container_ids = {
@@ -2822,15 +2831,15 @@ impl DeployImageJob {
 
         let mut cleanup_errors = Vec::new();
         if !container_ids.is_empty() {
-            self.log(
+            self.log_best_effort(
                 context,
                 format!("🧹 Cleaning up {} container(s)", container_ids.len()),
             )
-            .await?;
+            .await;
 
             for container_id in &container_ids {
-                self.log(context, format!("🧹 Removing container: {}", container_id))
-                    .await?;
+                self.log_best_effort(context, format!("🧹 Removing container: {}", container_id))
+                    .await;
 
                 // Use per-replica deployer if available, otherwise fall back to local
                 let deployer = {
@@ -2844,21 +2853,24 @@ impl DeployImageJob {
 
                 match deployer.remove_container(container_id).await {
                     Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
-                        self.log(context, format!("✅ Container {} is absent", container_id))
-                            .await?;
                         lock_deployment_state(&self.replica_deployers, "replica_deployers")
                             .remove(container_id);
+                        self.log_best_effort(
+                            context,
+                            format!("✅ Container {} is absent", container_id),
+                        )
+                        .await;
                     }
                     Err(error) => {
                         cleanup_errors.push(format!("container {container_id}: {error}"));
-                        self.log(
+                        self.log_best_effort(
                             context,
                             format!(
                                 "⚠️  Warning: Failed to remove container {}: {}",
                                 container_id, error
                             ),
                         )
-                        .await?;
+                        .await;
                     }
                 }
             }
@@ -2912,7 +2924,7 @@ impl DeployImageJob {
             return self.cleanup_container(context).await;
         };
 
-        self.stop_background_log_stream(context).await?;
+        self.stop_background_log_stream(context).await;
         let replica_deployers =
             lock_deployment_state(&self.replica_deployers, "replica_deployers").clone();
         for candidate in &candidates {
@@ -3990,7 +4002,8 @@ impl WorkflowTask for DeployImageJob {
 
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         if self.retained_failure.load(Ordering::Acquire) {
-            return self.stop_background_log_stream(context).await;
+            self.stop_background_log_stream(context).await;
+            return Ok(());
         }
         // Use the stored container_id (set immediately after container creation)
         // This ensures cleanup works even if deployment fails before setting outputs
@@ -5763,6 +5776,9 @@ mod tests {
     struct TrackingMockContainerDeployer {
         deployed_containers: Arc<StdMutex<Vec<String>>>,
         stopped_containers: Arc<StdMutex<Vec<String>>>,
+        removed_containers: Arc<StdMutex<Vec<String>>>,
+        /// Containers whose removal the test wants to fail.
+        unremovable_containers: Arc<StdMutex<Vec<String>>>,
         requests: Arc<StdMutex<Vec<DeployRequest>>>,
     }
 
@@ -5771,9 +5787,169 @@ mod tests {
             Self {
                 deployed_containers: Arc::new(StdMutex::new(Vec::new())),
                 stopped_containers: Arc::new(StdMutex::new(Vec::new())),
+                removed_containers: Arc::new(StdMutex::new(Vec::new())),
+                unremovable_containers: Arc::new(StdMutex::new(Vec::new())),
                 requests: Arc::new(StdMutex::new(Vec::new())),
             }
         }
+    }
+
+    /// A log store that is broken for the whole test, as a full disk would be:
+    /// every write fails, including the ones made during cleanup.
+    struct BrokenLogWriter;
+
+    #[async_trait]
+    impl crate::workflow::LogWriter for BrokenLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Err(WorkflowError::Other("log storage is full".to_string()))
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    fn job_for_cleanup_test(deployer: Arc<TrackingMockContainerDeployer>) -> DeployImageJob {
+        DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("checkout".to_string())
+        .build(deployer)
+        .expect("valid deploy job")
+    }
+
+    /// Give the job a live log stream, so stopping it has a line to write.
+    fn start_idle_log_stream(job: &DeployImageJob) {
+        *job.log_stream_task.lock().expect("log stream lock") =
+            Some(tokio::spawn(std::future::pending()));
+    }
+
+    /// With log storage down, every cleanup log write fails. Each of them used
+    /// to return early with `?`, before the container it was announcing had
+    /// been removed, so every failed deployment left its container behind.
+    #[tokio::test]
+    async fn cleanup_removes_every_container_while_the_log_writer_stays_broken() {
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let job = job_for_cleanup_test(deployer.clone());
+        job.track_container("first".to_string(), deployer.clone());
+        job.track_container("second".to_string(), deployer.clone());
+        start_idle_log_stream(&job);
+        let context = WorkflowContext::new("run-1".to_string(), 1, 1, 1, Arc::new(BrokenLogWriter));
+
+        job.cleanup(&context)
+            .await
+            .expect("a broken log writer must not fail cleanup");
+
+        assert_eq!(
+            deployer.removed_containers.lock().unwrap().as_slice(),
+            ["first", "second"]
+        );
+        assert!(job.log_stream_task.lock().unwrap().is_none());
+        assert!(
+            job.container_ids.lock().unwrap().is_empty(),
+            "removed containers must no longer be tracked"
+        );
+    }
+
+    /// Logging is what may fail quietly. A real removal failure is still
+    /// returned, it does not stop the remaining removals, and the container
+    /// stays tracked so a later cleanup can retry it.
+    #[tokio::test]
+    async fn cleanup_with_a_broken_log_writer_still_reports_a_failed_removal() {
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        deployer
+            .unremovable_containers
+            .lock()
+            .unwrap()
+            .push("first".to_string());
+        let job = job_for_cleanup_test(deployer.clone());
+        job.track_container("first".to_string(), deployer.clone());
+        job.track_container("second".to_string(), deployer.clone());
+        let context = WorkflowContext::new("run-1".to_string(), 1, 1, 1, Arc::new(BrokenLogWriter));
+
+        let error = job
+            .cleanup_container(&context)
+            .await
+            .expect_err("a failed removal must be reported");
+
+        let message = error.to_string();
+        assert!(message.contains("container first"), "{message}");
+        assert!(!message.contains("log storage"), "{message}");
+        assert_eq!(
+            deployer.removed_containers.lock().unwrap().as_slice(),
+            ["second"]
+        );
+        assert_eq!(job.container_ids.lock().unwrap().as_slice(), ["first"]);
+    }
+
+    /// Retaining a failed candidate stops the log stream first. That line going
+    /// unwritten must not discard the candidate kept for log inspection.
+    #[tokio::test]
+    async fn retaining_a_failed_container_survives_a_broken_log_writer() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let deployer = Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new(
+            "test-project",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".to_string())
+        .build_job_id("build".to_string())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".to_string(),
+            network: None,
+        })
+        .service_name("checkout".to_string())
+        .failed_container_retention(db, 42)
+        .build(deployer.clone())
+        .expect("valid deploy job");
+        job.failed_candidates
+            .lock()
+            .expect("candidate lock")
+            .push(FailedContainerCandidate {
+                container_id: "failed-app-id".to_string(),
+                container_name: "checkout-production".to_string(),
+                container_port: Some(3000),
+                host_port: 18080,
+                image_name: "checkout:broken".to_string(),
+                node_id: None,
+            });
+        start_idle_log_stream(&job);
+        let context =
+            WorkflowContext::new("run-42".to_string(), 42, 2, 3, Arc::new(BrokenLogWriter));
+
+        job.retain_failed_containers(&context)
+            .await
+            .expect("a broken log writer must not abort retention");
+
+        assert!(job.retained_failure.load(Ordering::Acquire));
+        assert_eq!(
+            deployer.stopped_containers.lock().unwrap().as_slice(),
+            ["failed-app-id"]
+        );
+        assert!(deployer.removed_containers.lock().unwrap().is_empty());
+
+        // With the failure retained, the executor's later cleanup only stops
+        // the stream, and a failed log write there must not surface either.
+        start_idle_log_stream(&job);
+        job.cleanup(&context)
+            .await
+            .expect("a broken log writer must not fail cleanup of a retained candidate");
+        assert!(job.log_stream_task.lock().unwrap().is_none());
+        assert!(deployer.removed_containers.lock().unwrap().is_empty());
     }
 
     #[async_trait]
@@ -5847,7 +6023,22 @@ mod tests {
             Ok(())
         }
 
-        async fn remove_container(&self, _container_id: &str) -> Result<(), DeployerError> {
+        async fn remove_container(&self, container_id: &str) -> Result<(), DeployerError> {
+            if self
+                .unremovable_containers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == container_id)
+            {
+                return Err(DeployerError::Other(format!(
+                    "removal of {container_id} refused by test"
+                )));
+            }
+            self.removed_containers
+                .lock()
+                .unwrap()
+                .push(container_id.to_string());
             Ok(())
         }
 
