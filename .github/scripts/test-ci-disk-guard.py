@@ -59,6 +59,29 @@ class GuardCase(unittest.TestCase):
 
 
 class WatchTests(GuardCase):
+    def test_marks_the_trip_before_stopping_the_extractor(self) -> None:
+        seen: list[bool] = []
+        guard.watch(
+            Path("/"),
+            6 * GIB,
+            "tar",
+            self.report,
+            self.stop_file,
+            [],
+            0,
+            lambda _path: (0, 100 * GIB),
+            stop=lambda _name: (seen.append(guard.trip_marker(self.report).exists()), self.stop_file.touch()),
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(seen, [True])
+
+    def test_keeps_stopping_the_extractor_after_a_trip(self) -> None:
+        # The restore downloads first, so the first trip can find nothing to stop.
+        self.assertTrue(self.watch([5 * GIB, 5 * GIB, 4 * GIB]))
+        self.assertEqual(self.stopped, ["tar", "tar", "tar"])
+        self.assertEqual(self.report.read_text().count("fell to"), 1)
+        self.assertIn("fell to 5.00 GiB", self.report.read_text())
+
     def test_trips_below_the_limit_and_stops_the_extractor(self) -> None:
         self.assertTrue(self.watch([50 * GIB, 7 * GIB, 5 * GIB]))
         self.assertEqual(self.stopped, ["tar"])
@@ -76,7 +99,9 @@ class WatchTests(GuardCase):
 
     def test_leaves_no_partial_report(self) -> None:
         self.watch([0])
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["report"])
+        self.assertEqual(
+            sorted(p.name for p in self.root.iterdir()), ["report", "report.tripped", "stop"]
+        )
 
 
 class ReportTests(GuardCase):
@@ -132,11 +157,16 @@ class ReportTests(GuardCase):
 
 
 class FinishTests(GuardCase):
-    def finish(self) -> tuple[int, str]:
+    def finish(self, **options) -> tuple[int, str]:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            code = guard.finish(self.root, self.report, self.stop_file)
+            code = guard.finish(self.root, self.report, self.stop_file, **options)
         return code, output.getvalue()
+
+    def trip(self, text: str | None = "what filled the disk\n") -> None:
+        guard.trip_marker(self.report).touch()
+        if text is not None:
+            self.report.write_text(text)
 
     def test_passes_and_reports_free_space_when_not_tripped(self) -> None:
         code, output = self.finish()
@@ -145,11 +175,49 @@ class FinishTests(GuardCase):
         self.assertTrue(self.stop_file.exists(), "the watcher must be told to exit")
 
     def test_fails_with_the_report_when_tripped(self) -> None:
-        self.report.write_text("what filled the disk\n")
+        self.trip()
         code, output = self.finish()
         self.assertEqual(code, 1)
         self.assertIn("what filled the disk", output)
         self.assertIn("::error::", output)
+
+    def test_waits_for_a_report_still_being_written(self) -> None:
+        self.trip(text=None)
+        polls: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            polls.append(seconds)
+            self.report.write_text("written during the scan\n")
+
+        code, output = self.finish(sleep=sleep)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(len(polls), 1)
+        self.assertIn("written during the scan", output)
+
+    def test_still_fails_when_the_report_never_arrives(self) -> None:
+        self.trip(text=None)
+        ticks = iter([0.0, 1.0, 999.0])
+
+        code, output = self.finish(wait=10.0, sleep=lambda _s: None, clock=lambda: next(ticks))
+
+        self.assertEqual(code, 1)
+        self.assertIn("wrote no report within 10 seconds", output)
+        self.assertIn("::error::", output)
+
+
+class CheckTests(GuardCase):
+    def test_check_leaves_the_watcher_running(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = guard.check(self.root, self.report)
+        self.assertEqual(code, 0)
+        self.assertFalse(self.stop_file.exists())
+
+    def test_check_fails_on_a_trip(self) -> None:
+        guard.trip_marker(self.report).touch()
+        self.report.write_text("what filled the disk\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(guard.check(self.root, self.report), 1)
 
 
 if __name__ == "__main__":

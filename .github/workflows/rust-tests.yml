@@ -947,12 +947,11 @@ jobs:
             test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-${{ steps.cache-key.outputs.lock }}-
             test-target-v1-${{ runner.os }}-${{ steps.cache-key.outputs.rustc }}-
 
+      # Before the fallback restore below, so a failed restore does not start
+      # another download onto a nearly full disk. The watcher keeps running.
       - name: Check the restore had room
         if: ${{ !cancelled() }}
-        run: |
-          python3 .github/scripts/ci-disk-guard.py finish \
-            --report "$RUNNER_TEMP/disk-guard-report" \
-            --stop-file "$RUNNER_TEMP/disk-guard-stop"
+        run: python3 .github/scripts/ci-disk-guard.py check --report "$RUNNER_TEMP/disk-guard-report"
 
       # Only when no test-target entry exists at all -- before main has saved
       # one, or after a toolchain update changes the key. Without it, such a
@@ -965,6 +964,12 @@ jobs:
         with:
           shared-key: nextest-archive
           save-if: false
+
+      - name: Finish guarding the disk
+        run: |
+          python3 .github/scripts/ci-disk-guard.py finish \
+            --report "$RUNNER_TEMP/disk-guard-report" \
+            --stop-file "$RUNNER_TEMP/disk-guard-stop"
 
       - name: Restamp sources against the cached build
         id: restamp
