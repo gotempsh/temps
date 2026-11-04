@@ -303,6 +303,12 @@ pub enum GeoIpError {
     WriteFailed { path: String, reason: String },
     #[error("Failed to load geo database from '{path}' after refresh: {reason}")]
     ReloadFailed { path: String, reason: String },
+    #[error("'{path}' holds a '{found}' database, not the expected {expected}")]
+    WrongDatabaseKind {
+        path: String,
+        expected: &'static str,
+        found: String,
+    },
     #[error("Database error while accessing geo database refresh metadata: {0}")]
     Database(#[from] sea_orm::DbErr),
     /// Reading or writing `AppSettings::geo` failed. The geo refresh policy,
@@ -588,24 +594,23 @@ fn open_mmdb(
     }
 }
 
-/// [`open_mmdb`], refusing a readable database of the wrong kind. Opening a file
-/// only proves it is an `.mmdb`: a City file saved under the ASN name would load,
-/// decode to empty records and classify every address as "not hosting".
-fn open_mmdb_of_kind(
+/// Refuse a readable database of the wrong kind. Opening a file only proves it is
+/// an `.mmdb`: a City file saved under the ASN name would load, decode to empty
+/// records and classify every address as "not hosting".
+fn ensure_database_kind(
     kind: crate::refresh::GeoDatabaseKind,
     path: &std::path::Path,
-) -> Result<maxminddb::Reader<MmdbSource>, String> {
-    let reader = open_mmdb(path).map_err(|e| e.to_string())?;
+    reader: &maxminddb::Reader<MmdbSource>,
+) -> Result<(), GeoIpError> {
     let database_type = &reader.metadata().database_type;
-    if !kind.accepts_database_type(database_type) {
-        return Err(format!(
-            "expected a {} database ({}) but the file is '{}'",
-            kind.label(),
-            kind.filename(),
-            database_type
-        ));
+    if kind.accepts_database_type(database_type) {
+        return Ok(());
     }
-    Ok(reader)
+    Err(GeoIpError::WrongDatabaseKind {
+        path: path.display().to_string(),
+        expected: kind.filename(),
+        found: database_type.clone(),
+    })
 }
 
 /// Whether `TEMPS_GEO_MOCK=true` asks for the in-memory mock geolocation
@@ -714,11 +719,11 @@ impl GeoIpService {
     ) -> Result<Option<u64>, GeoIpError> {
         match self {
             Self::MaxMind(service) => {
-                let reader = open_mmdb_of_kind(crate::refresh::GeoDatabaseKind::City, path)
-                    .map_err(|reason| GeoIpError::ReloadFailed {
-                        path: path.display().to_string(),
-                        reason,
-                    })?;
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                ensure_database_kind(crate::refresh::GeoDatabaseKind::City, path, &reader)?;
                 let build_epoch = reader.metadata().build_epoch;
                 if service.build_epoch() == Some(build_epoch) {
                     return Ok(None);
@@ -743,11 +748,11 @@ impl GeoIpService {
     ) -> Result<Option<u64>, GeoIpError> {
         match self {
             Self::MaxMind(service) => {
-                let reader = open_mmdb_of_kind(crate::refresh::GeoDatabaseKind::Asn, path)
-                    .map_err(|reason| GeoIpError::ReloadFailed {
-                        path: path.display().to_string(),
-                        reason,
-                    })?;
+                let reader = open_mmdb(path).map_err(|e| GeoIpError::ReloadFailed {
+                    path: path.display().to_string(),
+                    reason: e.to_string(),
+                })?;
+                ensure_database_kind(crate::refresh::GeoDatabaseKind::Asn, path, &reader)?;
                 let build_epoch = reader.metadata().build_epoch;
                 if service.asn_build_epoch() == Some(build_epoch) {
                     return Ok(None);
@@ -837,8 +842,12 @@ impl MaxMindGeoIpService {
         // (asn_org/is_hosting_provider stay None) rather than failing startup when
         // the operator hasn't provisioned it, same as the City database's own
         // optional-file convention in Dockerfile/docker-compose.
-        let asn_reader = match open_mmdb_of_kind(crate::refresh::GeoDatabaseKind::Asn, asn_db_path)
-        {
+        let asn_reader = match open_mmdb(asn_db_path)
+            .map_err(GeoIpError::from)
+            .and_then(|reader| {
+                ensure_database_kind(crate::refresh::GeoDatabaseKind::Asn, asn_db_path, &reader)?;
+                Ok(reader)
+            }) {
             Ok(reader) => {
                 info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
                 Some(reader)

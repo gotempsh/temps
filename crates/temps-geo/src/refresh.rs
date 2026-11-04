@@ -2014,16 +2014,36 @@ mod tests {
             .refresh_asn_from_path_if_changed(&city_path)
             .expect_err("a City file is not an ASN database");
         assert!(
-            wrong_asn.to_string().contains("GeoLite2-City"),
-            "{wrong_asn}"
+            matches!(
+                &wrong_asn,
+                GeoIpError::WrongDatabaseKind { path, expected, found }
+                    if path == &city_path.display().to_string()
+                        && *expected == ASN_DB_FILENAME
+                        && found.contains("City")
+            ),
+            "{wrong_asn:?}"
         );
         let wrong_city = service
             .refresh_from_path_if_changed(&asn_path)
             .expect_err("an ASN file is not a City database");
         assert!(
-            wrong_city.to_string().contains("GeoLite2-ASN"),
-            "{wrong_city}"
+            matches!(
+                &wrong_city,
+                GeoIpError::WrongDatabaseKind { path, expected, found }
+                    if path == &asn_path.display().to_string()
+                        && *expected == CITY_DB_FILENAME
+                        && found.contains("ASN")
+            ),
+            "{wrong_city:?}"
         );
+
+        // An unreadable file is a different failure, and stays one.
+        let unreadable = dir.path().join("broken.mmdb");
+        std::fs::write(&unreadable, b"not a database").expect("write a broken file");
+        assert!(matches!(
+            service.refresh_asn_from_path_if_changed(&unreadable),
+            Err(GeoIpError::ReloadFailed { .. })
+        ));
 
         assert_eq!(service.asn_build_epoch(), asn_epoch);
         assert_eq!(service.build_epoch(), city_epoch);
