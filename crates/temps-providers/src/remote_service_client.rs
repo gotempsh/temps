@@ -358,9 +358,12 @@ impl RemoteServiceClient {
         &self,
         params: RemoteExecParams,
     ) -> Result<RemoteExecResult, ExternalServiceError> {
+        // Never the command itself: its arguments can hold a credential.
         info!(
-            "Exec in '{}' on remote node '{}': {:?}",
-            params.container_name, self.node_name, params.command
+            container = %params.container_name,
+            node = %self.node_name,
+            command_argc = params.command.len(),
+            "Executing command in service container on remote node"
         );
         // Always sealed: the command can hold a credential as well.
         self.agent_post_sealed("/agent/services/exec", &params)
@@ -1037,6 +1040,58 @@ mod tests {
         let (content_type, body) = seen.lock().unwrap().take().unwrap();
         assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
         assert!(open_request(&test_keys().0, "/agent/services/workload", &body).is_ok());
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_credential_in_a_service_exec_command_is_not_logged() {
+        let (url, _seen) = recording_agent(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"success": false, "data": null, "error": "stop here"}),
+        )
+        .await;
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _ = client_at(url, test_sealing())
+            .exec_in_service(RemoteExecParams {
+                container_name: "redis-1".to_string(),
+                command: vec!["redis-cli".into(), "-a".into(), "db-password".into()],
+                environment: HashMap::new(),
+                user: None,
+                detach: false,
+            })
+            .await;
+
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(captured.contains("redis-1"), "logs: {captured}");
+        assert!(captured.contains("command_argc"), "logs: {captured}");
+        assert!(!captured.contains("db-password"), "logs: {captured}");
     }
 
     #[tokio::test]

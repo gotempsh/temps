@@ -67,6 +67,7 @@ docker-tests = ["temps-providers-core/docker-tests", "temps-providers-postgres/d
 anyhow = { workspace = true }
 temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
+tracing-subscriber = { workspace = true }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 # ADR-055 golden captures of the container-create request.
