@@ -1113,7 +1113,7 @@ jobs:
               package(temps-query) or package(temps-analytics-session-replay) or
               package(temps-dns) or package(temps-email) or
               package(temps-analytics) or package(temps-analytics-events) or
-              package(temps-otel)) and kind(=lib)
+              package(temps-otel) or package(temps-ai-agents)) and kind(=lib)
               and not (package(temps-git) and test(/_real_api$/))
           - group: unit-integration
             # The kind(=test) counterpart to the two groups above: crates
