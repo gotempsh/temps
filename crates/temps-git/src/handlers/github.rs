@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 use super::types::GitAppState as AppState;
+use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::{new as problem_new, Problem};
 use temps_core::telemetry::{OperationFailureCode, TelemetryEvent, TelemetryEventKind};
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
@@ -130,23 +131,47 @@ async fn handle_manifest_conversion_with_source(
 
             Ok((response_headers, Redirect::to(&redirect_url)))
         }
-        Err(GithubAppServiceError::Validation(message)) => {
-            warn!("GitHub returned an unusable app: {}", message);
-            Err(problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Incomplete GitHub App")
-                .with_detail(message))
+        Err(e) => Err(app_creation_problem(e)),
+    }
+}
+
+/// The response for a failure to create the GitHub App from GitHub's reply.
+///
+/// Every variant is listed, so adding one forces a decision about its status.
+/// An unusable reply is GitHub's fault (502), an app that is already
+/// registered is a conflict (409), and everything else stays a 500.
+fn app_creation_problem(error: GithubAppServiceError) -> Problem {
+    match error {
+        GithubAppServiceError::Validation(message) => {
+            warn!(error = %message, "GitHub returned an unusable app");
+            ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Incomplete GitHub App")
+                .detail(message)
+                .build()
         }
-        Err(GithubAppServiceError::Conflict(message)) => {
-            warn!("GitHub App already registered: {}", message);
-            Err(problem_new(StatusCode::CONFLICT)
-                .with_title("GitHub App Already Registered")
-                .with_detail(message))
+        GithubAppServiceError::Conflict(message) => {
+            warn!(error = %message, "GitHub App already registered");
+            ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("GitHub App Already Registered")
+                .detail(message)
+                .build()
         }
-        Err(e) => {
-            error!("Failed to create GitHub app: {:?}", e);
-            Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("GitHub App Creation Failed")
-                .with_detail(format!("Failed to create GitHub app: {}", e)))
+        error @ (GithubAppServiceError::DatabaseError(_)
+        | GithubAppServiceError::GithubApiError(_)
+        | GithubAppServiceError::NotFound(_)
+        | GithubAppServiceError::DecryptionFailed(_)
+        | GithubAppServiceError::EncryptionFailed(_)
+        | GithubAppServiceError::PrivateKeyCreationFailed(_)
+        | GithubAppServiceError::InstallationNotFound
+        | GithubAppServiceError::InvalidWebhookSignature
+        | GithubAppServiceError::Unauthorized(_)
+        | GithubAppServiceError::InvalidConfiguration(_)
+        | GithubAppServiceError::Other(_)) => {
+            error!(error = ?error, "Failed to create GitHub app");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("GitHub App Creation Failed")
+                .detail(format!("Failed to create GitHub app: {}", error))
+                .build()
         }
     }
 }
@@ -173,29 +198,35 @@ async fn fetch_manifest_app(api_url: &str, code: &str) -> Result<serde_json::Val
         .await
         .map_err(|e| {
             let e = e.without_url();
-            error!("Failed to convert manifest: {}", e);
-            problem_new(StatusCode::BAD_GATEWAY)
-                .with_title("Manifest Conversion Failed")
-                .with_detail(format!("Failed to convert manifest: {}", e))
+            error!(error = %e, "Failed to convert manifest");
+            ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Manifest Conversion Failed")
+                .detail(format!("Failed to convert manifest: {}", e))
+                .build()
         })?;
 
     let status = response.status();
     if !status.is_success() {
-        warn!("GitHub rejected the manifest conversion: HTTP {}", status);
-        return Err(problem_new(StatusCode::BAD_GATEWAY)
-            .with_title("Manifest Conversion Failed")
-            .with_detail(format!(
+        warn!(
+            github_status = status.as_u16(),
+            "GitHub rejected the manifest conversion"
+        );
+        return Err(ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+            .title("Manifest Conversion Failed")
+            .detail(format!(
                 "GitHub answered the manifest conversion with HTTP {}",
                 status.as_u16()
-            )));
+            ))
+            .build());
     }
 
     response.json::<serde_json::Value>().await.map_err(|e| {
         let e = e.without_url();
-        error!("Failed to parse GitHub App response: {}", e);
-        problem_new(StatusCode::BAD_GATEWAY)
-            .with_title("Response Parse Failed")
-            .with_detail(format!("Failed to parse GitHub App response: {}", e))
+        error!(error = %e, "Failed to parse GitHub App response");
+        ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+            .title("Response Parse Failed")
+            .detail(format!("Failed to parse GitHub App response: {}", e))
+            .build()
     })
 }
 
@@ -1232,5 +1263,50 @@ mod tests {
 
         assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
         assert!(!detail_of(&problem).contains("one-time-code-value"));
+    }
+
+    #[test]
+    fn an_unusable_github_reply_is_a_502_that_names_the_missing_fields() {
+        let problem = app_creation_problem(GithubAppServiceError::Validation(
+            "GitHub's reply is missing a usable value for: pem".to_string(),
+        ));
+
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        assert!(detail_of(&problem).contains("pem"));
+    }
+
+    #[test]
+    fn an_app_that_is_already_registered_is_a_409() {
+        let problem = app_creation_problem(GithubAppServiceError::Conflict(
+            "GitHub App with id 7 already exists as provider 3".to_string(),
+        ));
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert!(detail_of(&problem).contains("provider 3"));
+    }
+
+    #[test]
+    fn every_other_failure_stays_a_500() {
+        for error in [
+            GithubAppServiceError::DatabaseError(sea_orm::DbErr::Custom("db".to_string())),
+            GithubAppServiceError::GithubApiError("api".to_string()),
+            GithubAppServiceError::NotFound("app".to_string()),
+            GithubAppServiceError::DecryptionFailed("key".to_string()),
+            GithubAppServiceError::EncryptionFailed("key".to_string()),
+            GithubAppServiceError::PrivateKeyCreationFailed("key".to_string()),
+            GithubAppServiceError::InstallationNotFound,
+            GithubAppServiceError::InvalidWebhookSignature,
+            GithubAppServiceError::Unauthorized("no".to_string()),
+            GithubAppServiceError::InvalidConfiguration("cfg".to_string()),
+            GithubAppServiceError::Other("other".to_string()),
+        ] {
+            let description = format!("{error:?}");
+            let problem = app_creation_problem(error);
+            assert_eq!(
+                problem.status_code,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{description}"
+            );
+        }
     }
 }
