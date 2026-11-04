@@ -163,9 +163,38 @@ mod registry_tests {
                 "migration order diverges from shipped history at position {position}: \
                  the fixture has '{expected}' but '{registered}' is registered there. A new \
                  migration must sort after '{}'; give it a later timestamp",
-                shipped.last().copied().unwrap_or_default()
+                latest_shipped(&shipped)
             );
         }
+    }
+
+    /// The name a new migration has to sort after. Not the fixture's last line:
+    /// the fixture is in run order, and `order_exceptions.txt` can run an
+    /// earlier-stamped migration last, so a name after the last line could still
+    /// sort into the middle of the file-name order.
+    fn latest_shipped<'a>(shipped: &[&'a str]) -> &'a str {
+        shipped.iter().copied().max().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_new_migration_is_told_to_sort_after_the_latest_shipped_name() {
+        // The middle migration ran last in the history, as an exception.
+        assert_eq!(
+            latest_shipped(&[
+                "m20260101_000001_a",
+                "m20260301_000001_c",
+                "m20260201_000001_b"
+            ]),
+            "m20260301_000001_c"
+        );
+        assert_eq!(latest_shipped(&[]), "");
+
+        // A name that follows the advice sorts after everything shipped, which
+        // is what keeps the shipped order a prefix of the registered one.
+        let shipped = shipped_history();
+        let bound = latest_shipped(&shipped);
+        let new_migration = format!("{bound}_later");
+        assert!(shipped.iter().all(|name| **name < *new_migration));
     }
 
     /// Every `mYYYYMMDD_NNNNNN_*.rs` file in the migration directory is a
