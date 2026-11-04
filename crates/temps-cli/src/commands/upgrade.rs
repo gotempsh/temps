@@ -190,7 +190,8 @@ pub struct UpgradeCommand {
     pub ee_api: Option<String>,
 
     /// Data dir whose `data/license.jwt` receives the license on `--tier ee`.
-    /// Defaults to `$TEMPS_DATA_DIR` or `~/.temps`.
+    /// Defaults to `$TEMPS_DATA_DIR`, then the directory of a running `temps
+    /// serve`, then the install layout under `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 }
@@ -212,15 +213,12 @@ pub struct GitHubAsset {
 }
 
 impl UpgradeCommand {
-    fn print_microsandbox_refresh_reminder(&self) {
-        // A running `temps serve` is the authority on its own data directory;
-        // the shell running this upgrade inherits none of its environment.
+    /// The data directory of the server this upgrade is for. A running `temps
+    /// serve` is the authority on its own; the shell running this upgrade
+    /// inherits none of its environment.
+    fn resolve_data_dir(&self) -> super::data_dir_discovery::ResolvedDataDir {
         let home = dirs::home_dir();
-        let resolved =
-            super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref());
-        if let Some(reminder) = super::microsandbox::runtime_refresh_reminder(&resolved.dir) {
-            println!("  Note: {reminder}");
-        }
+        super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref())
     }
 
     pub fn execute(self) -> anyhow::Result<()> {
@@ -452,7 +450,7 @@ impl UpgradeCommand {
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
-        self.print_microsandbox_refresh_reminder();
+        print_microsandbox_refresh_reminder(&self.resolve_data_dir().dir);
 
         println!();
         println!(
@@ -629,11 +627,12 @@ impl UpgradeCommand {
         install_vm_agent_reporting(staged_agent);
         install_pty_agent_reporting(staged_pty_agent);
         print_launcher_refresh_reminder();
-        self.print_microsandbox_refresh_reminder();
+
+        let resolved = self.resolve_data_dir();
+        print_microsandbox_refresh_reminder(&resolved.dir);
 
         // Install the license into the data dir so the binary finds it.
-        let data_dir = resolve_data_dir(&self.data_dir)?;
-        let installed_license = install_license(&data_dir, &license_jwt)?;
+        let installed_license = install_license_for_server(&resolved, &license_jwt)?;
         println!("  License installed at {}", installed_license.display());
 
         // Best-effort: point the systemd unit at the license so restarts
@@ -2084,6 +2083,12 @@ fn install_agent_reporting(agent: &ShippedAgent, staged: Option<StagedVmAgent>) 
     }
 }
 
+fn print_microsandbox_refresh_reminder(data_dir: &Path) {
+    if let Some(reminder) = super::microsandbox::runtime_refresh_reminder(data_dir) {
+        println!("  Note: {reminder}");
+    }
+}
+
 fn print_launcher_refresh_reminder() {
     if let Some(reminder) = super::firecracker::launcher_refresh_reminder() {
         println!("  Note: {reminder}");
@@ -2467,13 +2472,16 @@ async fn download_ee_asset_to_file(
 }
 
 /// Resolve the data dir: explicit flag/env > `~/.temps`.
-fn resolve_data_dir(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(p.clone());
+/// Install the license where the server this upgrade is for will read it,
+/// saying so first if that directory looks wrong.
+fn install_license_for_server(
+    resolved: &super::data_dir_discovery::ResolvedDataDir,
+    license_jwt: &str,
+) -> anyhow::Result<PathBuf> {
+    for warning in &resolved.warnings {
+        println!("  Note: {warning}");
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory for data dir"))?;
-    Ok(home.join(".temps"))
+    install_license(&resolved.dir, license_jwt)
 }
 
 /// Install the license JWT at `<data_dir>/data/license.jwt` (mode 0600).
@@ -2547,6 +2555,24 @@ fn update_systemd_license_env(license_path: &std::path::Path) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_license_goes_to_the_directory_the_running_server_uses() {
+        let home = tempfile::tempdir().unwrap();
+        let server_dir = tempfile::tempdir().unwrap();
+
+        let resolved = super::super::data_dir_discovery::resolve_with(
+            None,
+            Some(home.path()),
+            Some((42, server_dir.path().to_path_buf())),
+        );
+        let installed = install_license_for_server(&resolved, "license").unwrap();
+
+        assert_eq!(
+            installed,
+            server_dir.path().join("data").join("license.jwt")
+        );
+    }
 
     #[test]
     fn test_current_version_tag_exact_tag() {

@@ -59,7 +59,7 @@ pub(crate) fn resolve(explicit: Option<&Path>, home: Option<&Path>) -> ResolvedD
     resolve_with(explicit, home, running_server_data_dir())
 }
 
-fn resolve_with(
+pub(super) fn resolve_with(
     explicit: Option<&Path>,
     home: Option<&Path>,
     server: Option<(u32, PathBuf)>,
