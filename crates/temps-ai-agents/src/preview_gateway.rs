@@ -221,6 +221,16 @@ pub enum PreviewGatewayError {
         #[source]
         removal: Box<PreviewGatewayError>,
     },
+    /// Reconciliation found a gateway under this instance's container name
+    /// that another Temps instance created, and left it in place.
+    #[error(
+        "preview gateway container {container} was created by another Temps instance on this \
+         Docker host (it carries a different shared secret), so it was left running and this \
+         instance's previews are not served. Set a different container name and host port in \
+         the preview gateway settings, or, if that container is left over from an earlier \
+         install, restart the gateway from its settings to replace it"
+    )]
+    OwnedByAnotherInstance { container: String },
 }
 
 const PREVIEW_GATEWAY_NETWORK_LABEL: &str = "sh.temps.preview-gateway-control";
@@ -708,6 +718,7 @@ async fn reconcile_unrecorded(
     // the reconcile fails, the port it should be using is the configured one.
     export_host_port(spec.host_port);
 
+    refuse_another_instances_gateway(&docker, spec).await?;
     disable_unsafe_existing_gateway(&docker, &spec.container_name).await?;
     let legacy_owned_networks = owned_legacy_sandbox_networks(db).await?;
     ensure_network(&docker, &spec.network).await?;
@@ -764,6 +775,28 @@ async fn reconcile_unrecorded(
         "preview gateway ready on 127.0.0.1:{} → {}:{}",
         spec.host_port, spec.container_name, GATEWAY_CONTAINER_PORT
     );
+    Ok(())
+}
+
+/// Stop an unattended reconciliation before it touches a gateway another
+/// Temps instance created under this name: every removal below would take that
+/// instance's previews down, and it would then take the name back the same
+/// way. The error reaches the gateway's status through [`record_outcome`].
+///
+/// A container that cannot be inspected carries no evidence of who owns it, so
+/// it is left to [`disable_unsafe_existing_gateway`].
+async fn refuse_another_instances_gateway(
+    docker: &Docker,
+    spec: &PreviewGatewaySpec,
+) -> Result<(), PreviewGatewayError> {
+    let Ok(Some(existing)) = inspect(docker, &spec.container_name).await else {
+        return Ok(());
+    };
+    if created_by_another_instance(existing.shared_secret_env.as_deref(), &spec.shared_secret) {
+        return Err(PreviewGatewayError::OwnedByAnotherInstance {
+            container: spec.container_name.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -2993,6 +3026,103 @@ mod tests {
         let _ = remove_gateway_pair(&docker, &gateway_name).await;
         kept.expect("disabling leaves another instance's gateway alone");
         assert!(still_present, "another instance's gateway was removed");
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_another_instances_gateway_and_reports_the_conflict() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let image = crate::sandbox::docker::image_name_for_runtime("node");
+        if docker.inspect_image(&image).await.is_err() {
+            println!("Managed node sandbox image not present, skipping test");
+            return;
+        }
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        );
+        let gateway_name = format!("temps-preview-gateway-foreign-test-{suffix}");
+        let spec = PreviewGatewaySpec {
+            image: image.clone(),
+            container_name: gateway_name.clone(),
+            network: format!("temps-preview-gateway-foreign-test-net-{suffix}"),
+            host_port: 0,
+            shared_secret: "this-instance".to_string(),
+        };
+        // No query is expected: the conflict is found before the database.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let docker = Arc::new(docker);
+
+        docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::new()
+                        .name(&gateway_name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(image.clone()),
+                    env: Some(vec![
+                        "PREVIEW_GATEWAY_SHARED_SECRET=other-instance".to_string()
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the other instance's gateway");
+
+        // Held throughout: the failure record is shared with the other tests
+        // that run a gateway operation.
+        let held = lock_operations().await;
+        let reconciled = reconcile(&held, docker.clone(), &db, spec.clone()).await;
+        let reported = last_reconcile_failure();
+        LAST_FAILURE.clear();
+        let still_present = inspect(&docker, &gateway_name)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let own_spec = PreviewGatewaySpec {
+            shared_secret: "other-instance".to_string(),
+            ..spec
+        };
+        let own_gateway = refuse_another_instances_gateway(&docker, &own_spec).await;
+        let _ = remove_gateway_pair(&docker, &gateway_name).await;
+        drop(held);
+
+        let error = reconciled.expect_err("the conflict fails the reconciliation");
+        assert!(
+            matches!(
+                error.downcast_ref::<PreviewGatewayError>(),
+                Some(PreviewGatewayError::OwnedByAnotherInstance { container })
+                    if *container == gateway_name
+            ),
+            "{error:#}"
+        );
+        assert!(still_present, "another instance's gateway was removed");
+        let reported = reported.expect("the conflict is on the gateway's status");
+        assert!(reported.error.contains(&gateway_name), "{}", reported.error);
+        assert!(
+            reported.error.contains("another Temps instance"),
+            "{}",
+            reported.error
+        );
+        assert!(
+            !reported.error.contains("other-instance"),
+            "the status must not carry the other instance's secret: {}",
+            reported.error
+        );
+        own_gateway.expect("this instance's own gateway is not a conflict");
     }
 
     #[tokio::test]
