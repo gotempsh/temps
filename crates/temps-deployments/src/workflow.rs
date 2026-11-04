@@ -93,7 +93,7 @@ pub enum WorkflowError {
     #[error("{0}")]
     LocalWorkloadsDisabled(String),
 
-    /// A deployment the scheduler gated on the host Docker socket (ADR 045)
+    /// A deployment the scheduler gated on the host Docker socket (ADR 079)
     /// was started by a host that reported it did **not** mount it.
     ///
     /// This is a hard failure rather than a log line because the two possible
@@ -105,7 +105,7 @@ pub enum WorkflowError {
     /// running without it, reported as healthy.
     #[error(
         "Deployment of project '{project_slug}' was placed on host '{node}' because it requires \
-         host Docker access (ADR 045), but that host reported it did not mount \
+         host Docker access (ADR 079), but that host reported it did not mount \
          /var/run/docker.sock. Set {env}={project_slug} on '{node}' — `temps agent` on a worker \
          node, `temps serve` on the control plane — and restart it, then redeploy"
     )]
@@ -120,7 +120,7 @@ pub enum WorkflowError {
     },
 
     /// A deploy job for a project that holds host Docker access was built by a
-    /// caller without instance-admin authority (ADR 045).
+    /// caller without instance-admin authority (ADR 079).
     ///
     /// Raised by `DeployImageJobBuilder::build`, the one point every image
     /// deployment is structurally forced through, so a deployment route that
@@ -803,6 +803,21 @@ impl Default for WorkflowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 045 is now the console-access ADR, so an operator following the old
+    /// number from this error would land on an unrelated document.
+    #[test]
+    fn docker_socket_not_mounted_names_the_adr_that_holds_the_grant() {
+        let message = WorkflowError::DockerSocketNotMounted {
+            node: "worker-1".to_string(),
+            project_slug: "node-daemon".to_string(),
+            env: "TEMPS_DOCKER_SOCKET_PROJECTS",
+        }
+        .to_string();
+
+        assert!(message.contains("ADR 079"), "{message}");
+        assert!(!message.contains("ADR 045"), "{message}");
+    }
 
     #[test]
     fn workflow_error_detail_drops_only_the_job_execution_prefix() {
