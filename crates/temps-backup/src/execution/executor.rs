@@ -7,9 +7,11 @@
 //!
 //! 1. A handler or cron tick inserts a row into `backups` (and optionally
 //!    `backup_jobs` for the audit log) and calls `executor.spawn(backup_id)`.
-//! 2. The executor takes the global concurrency semaphore (default N=4),
-//!    holds a per-`backup_id` entry in an in-memory `HashMap` to prevent
-//!    duplicate spawns, then `tokio::spawn`s the engine task.
+//! 2. The executor records a per-`backup_id` entry in an in-memory `HashMap`
+//!    to prevent duplicate spawns, then `tokio::spawn`s the task and returns.
+//!    The task waits for the global concurrency semaphore (default N=4), so
+//!    the caller never blocks on a full pool and a queued backup can already
+//!    be cancelled.
 //! 3. The task runs the engine to completion, in an inner task so a panic
 //!    surfaces as a failure instead of unwinding past the finalization. On
 //!    any exit path (success / failure / panic / cancel / timeout) the row
@@ -225,11 +227,6 @@ pub enum SpawnError {
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
-
-    #[error(
-        "Backup {backup_id} could not acquire an executor slot: the executor's semaphore is closed"
-    )]
-    ExecutorClosed { backup_id: i32 },
 }
 
 /// Parameters passed by the caller to `spawn`. Mirrors the old
@@ -251,10 +248,12 @@ pub struct SpawnParams {
 
 impl BackupExecutor {
     /// Spawn a new backup task. Returns immediately once the task is
-    /// recorded in the in-flight map (the actual engine work runs in a
-    /// detached `tokio::spawn`).
+    /// recorded in the in-flight map, even when every slot is busy: the task
+    /// itself waits for a slot and then runs the engine, in a detached
+    /// `tokio::spawn`. Tasks queue in memory, one per backup requested, and
+    /// the row stays `pending` until a slot frees.
     ///
-    /// If the backup is already running in this process, returns
+    /// If the backup is already queued or running in this process, returns
     /// [`SpawnError::AlreadyInFlight`] without touching the semaphore or
     /// the database.
     ///
@@ -276,8 +275,8 @@ impl BackupExecutor {
             return Err(err);
         }
 
-        // Engine lookup happens first — no point acquiring a permit only
-        // to fail on a typo.
+        // Engine lookup happens first — no point queueing a task only to
+        // fail on a typo.
         let engine = match self.inner.engines.get(params.engine.as_str()) {
             Some(e) => Arc::clone(e),
             None => {
@@ -301,30 +300,10 @@ impl BackupExecutor {
             }
         };
 
-        // Dedup check before we acquire the permit so two rapid clicks of
-        // "Run now" can't both spawn the same backup.
-        {
-            let in_flight = self.inner.in_flight.lock().await;
-            if in_flight.contains_key(&params.backup_id) {
-                return Err(SpawnError::AlreadyInFlight {
-                    backup_id: params.backup_id,
-                });
-            }
-        }
-
-        // Acquire the global slot. If the pool is full this awaits until
-        // a slot frees — that's the back-pressure signal. Callers that
-        // want non-blocking semantics should `tokio::time::timeout` this.
-        let permit = Arc::clone(&self.inner.semaphore)
-            .acquire_owned()
-            .await
-            .map_err(|_| SpawnError::ExecutorClosed {
-                backup_id: params.backup_id,
-            })?;
-
-        // Re-check the dedup map under the same lock that records the
-        // handle, otherwise a second concurrent `spawn` for the same
-        // backup_id could slip past the first check.
+        // Check the dedup map under the same lock that records the handle, so
+        // two rapid clicks of "Run now" can't both spawn the same backup. The
+        // task can't remove its entry before it's inserted: that needs this
+        // lock too.
         let cancel = CancellationToken::new();
         {
             let mut in_flight = self.inner.in_flight.lock().await;
@@ -334,7 +313,7 @@ impl BackupExecutor {
                 });
             }
 
-            let join = self.spawn_task(engine, params.clone(), cancel.clone(), permit);
+            let join = self.spawn_task(engine, params.clone(), cancel.clone());
             in_flight.insert(
                 params.backup_id,
                 JobHandle {
@@ -437,7 +416,6 @@ SELECT (SELECT COUNT(*) FROM failed_backups)  AS backups,
         engine: Arc<dyn BackupEngine>,
         params: SpawnParams,
         cancel: CancellationToken,
-        permit: OwnedSemaphorePermit,
     ) -> JoinHandle<()> {
         let executor = self.clone();
         let backup_id = params.backup_id;
@@ -445,7 +423,13 @@ SELECT (SELECT COUNT(*) FROM failed_backups)  AS backups,
         tokio::spawn(async move {
             // Permit drops with this scope, releasing the slot whether
             // the engine returns Ok, returns Err, or panics.
-            let _permit = permit;
+            let Some(_permit) = executor
+                .wait_for_slot(backup_id, &params.engine, &cancel)
+                .await
+            else {
+                executor.remove_from_in_flight(backup_id).await;
+                return;
+            };
 
             // Flip backup -> running so the UI sees the state transition
             // immediately. The engine can run for hours; we don't want
@@ -529,6 +513,40 @@ SELECT (SELECT COUNT(*) FROM failed_backups)  AS backups,
 
             executor.remove_from_in_flight(backup_id).await;
         })
+    }
+
+    /// Wait for a global concurrency slot. `None` means the task must end
+    /// without running the engine: it was cancelled while queued, or no slot
+    /// can ever be had.
+    async fn wait_for_slot(
+        &self,
+        backup_id: i32,
+        engine_key: &str,
+        cancel: &CancellationToken,
+    ) -> Option<OwnedSemaphorePermit> {
+        let acquired = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // As for a cancelled engine: `BackupService::cancel_backup`
+                // already failed the row, only its schedule run may be open.
+                info!(backup_id, "BackupExecutor: backup cancelled while waiting for a slot");
+                let _ = mark_schedule_run_finished_if_done(self.inner.db.as_ref(), backup_id).await;
+                return None;
+            }
+            acquired = Arc::clone(&self.inner.semaphore).acquire_owned() => acquired,
+        };
+
+        match acquired {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let reason = format!(
+                    "Backup {backup_id} could not acquire an executor slot: the executor's semaphore is closed"
+                );
+                error!(backup_id, "BackupExecutor: {reason}");
+                self.finalize_failed(backup_id, engine_key, &reason).await;
+                None
+            }
+        }
     }
 
     async fn remove_from_in_flight(&self, backup_id: i32) {
@@ -849,7 +867,7 @@ async fn run_with_retries(
         }
 
         // Cancellation check before each attempt — covers the case where
-        // the user cancelled while we were waiting on the semaphore.
+        // the user cancelled just as the task got its slot.
         if ctx.cancel.is_cancelled() {
             return Err(BackupError::Cancelled);
         }
@@ -1872,6 +1890,204 @@ pub(super) mod tests {
         assert!(reason.contains("panicked"), "{reason}");
         assert!(!reason.contains("hunter2"), "{reason}");
         assert!(parent.finished_at.is_some());
+    }
+
+    /// Holds each run until the test hands out a release permit.
+    struct GatedEngine {
+        runs: AtomicUsize,
+        release: Semaphore,
+    }
+
+    impl GatedEngine {
+        fn closed_gate() -> Arc<Self> {
+            Arc::new(Self {
+                runs: AtomicUsize::new(0),
+                release: Semaphore::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl BackupEngine for GatedEngine {
+        fn engine(&self) -> &'static str {
+            "gated"
+        }
+
+        async fn run(&self, _ctx: &BackupContext) -> Result<BackupOutcome, BackupError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let released = self
+                .release
+                .acquire()
+                .await
+                .map_err(|error| BackupError::Failed {
+                    reason: error.to_string(),
+                })?;
+            released.forget();
+            Ok(walg_outcome())
+        }
+    }
+
+    fn gated_params(backup_id: i32) -> SpawnParams {
+        SpawnParams {
+            backup_id,
+            engine: "gated".to_string(),
+            params: serde_json::json!({}),
+            max_runtime_secs: 3600,
+        }
+    }
+
+    /// An executor with one slot, over a mock with results to spare: which
+    /// backup consumes which result does not matter to these tests.
+    fn one_slot_executor(engine: Arc<GatedEngine>) -> BackupExecutor {
+        let completed: Vec<Vec<std::collections::BTreeMap<&str, SValue>>> = (0..4)
+            .map(|_| vec![std::collections::BTreeMap::from([("id", SValue::from(1))])])
+            .collect();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(completed)
+                .append_exec_results((0..8).map(|_| MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }))
+                .into_connection(),
+        );
+        BackupExecutorBuilder::new(db)
+            .with_max_concurrent(1)
+            .register_engine(engine)
+            .build()
+    }
+
+    async fn wait_for_runs(engine: &GatedEngine, runs: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.runs.load(Ordering::SeqCst) < runs {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the engine is called");
+    }
+
+    /// With every slot busy, `spawn` still returns, a duplicate is still
+    /// refused, and a cancel reaches the queued task, which never runs.
+    #[tokio::test]
+    async fn a_full_executor_queues_the_backup_without_blocking_spawn() {
+        let engine = GatedEngine::closed_gate();
+        let executor = one_slot_executor(engine.clone());
+
+        executor.spawn(gated_params(1)).await.expect("first starts");
+        wait_for_runs(&engine, 1).await;
+
+        tokio::time::timeout(Duration::from_secs(5), executor.spawn(gated_params(2)))
+            .await
+            .expect("spawn must not wait for a slot")
+            .expect("second queues");
+        assert!(matches!(
+            executor.spawn(gated_params(2)).await,
+            Err(SpawnError::AlreadyInFlight { backup_id: 2 })
+        ));
+
+        assert!(executor.cancel(2).await, "a queued backup can be cancelled");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while executor.inner.in_flight.lock().await.contains_key(&2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the cancelled task ends without a slot");
+        assert!(
+            executor.inner.in_flight.lock().await.contains_key(&1),
+            "the running backup is untouched",
+        );
+
+        engine.release.add_permits(1);
+        wait_until_nothing_is_in_flight(&executor).await;
+        assert_eq!(
+            engine.runs.load(Ordering::SeqCst),
+            1,
+            "the cancelled backup must never reach the engine",
+        );
+        assert_eq!(executor.inner.semaphore.available_permits(), 1);
+    }
+
+    /// The limit still holds: a queued backup starts only when a slot frees.
+    #[tokio::test]
+    async fn a_queued_backup_runs_once_a_slot_frees() {
+        let engine = GatedEngine::closed_gate();
+        let executor = one_slot_executor(engine.clone());
+
+        executor.spawn(gated_params(1)).await.expect("first starts");
+        executor
+            .spawn(gated_params(2))
+            .await
+            .expect("second queues");
+        wait_for_runs(&engine, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            engine.runs.load(Ordering::SeqCst),
+            1,
+            "only one backup may run on a one-slot executor",
+        );
+
+        engine.release.add_permits(1);
+        wait_for_runs(&engine, 2).await;
+        engine.release.add_permits(1);
+        wait_until_nothing_is_in_flight(&executor).await;
+        assert_eq!(executor.inner.semaphore.available_permits(), 1);
+    }
+
+    /// The row of a backup cancelled while queued stays failed with the user's
+    /// reason, and its child row never goes back to running.
+    #[tokio::test]
+    async fn a_backup_cancelled_while_queued_keeps_its_failed_rows() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Docker/TestDatabase unavailable; skipping queued cancel test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (running, _) = setup_real_backup_pair(db.as_ref()).await;
+        let (queued, queued_child) = setup_real_backup_pair(db.as_ref()).await;
+        let engine = GatedEngine::closed_gate();
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .with_max_concurrent(1)
+            .register_engine(engine.clone())
+            .build();
+
+        executor
+            .spawn(gated_params(running.id))
+            .await
+            .expect("first starts");
+        wait_for_runs(&engine, 1).await;
+        executor
+            .spawn(gated_params(queued.id))
+            .await
+            .expect("second queues");
+
+        crate::execution::cancel_backup(db.as_ref(), queued.id, "cancelled by user 7")
+            .await
+            .expect("cancel the queued backup");
+        assert!(executor.cancel(queued.id).await);
+        engine.release.add_permits(1);
+        wait_until_nothing_is_in_flight(&executor).await;
+
+        let parent = backups::Entity::find_by_id(queued.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(queued_child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "failed");
+        assert_eq!(parent.error_message.as_deref(), Some("cancelled by user 7"));
+        assert_eq!(child.state, "failed");
+        assert_eq!(engine.runs.load(Ordering::SeqCst), 1);
     }
 
     /// Records every job the executor publishes.

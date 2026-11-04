@@ -143,12 +143,6 @@ impl BackupJobProcessor {
                             "BackupJobProcessor: spawn failed at DB layer",
                         );
                     }
-                    Err(SpawnError::ExecutorClosed { backup_id }) => {
-                        error!(
-                            backup_id,
-                            "BackupJobProcessor: executor semaphore closed; BackupRequested dropped",
-                        );
-                    }
                 }
             }
 
@@ -181,13 +175,17 @@ impl BackupJobProcessor {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult, Value};
     use temps_core::{BackupCancelRequestedJob, BackupRequestedJob, QueueError};
 
     use super::*;
-    use crate::execution::BackupExecutorBuilder;
+    use crate::execution::{
+        BackupContext, BackupEngine, BackupError, BackupExecutorBuilder, BackupOutcome,
+    };
 
     /// Hands out a fixed script of receive results, then reports the
     /// channel as closed.
@@ -198,6 +196,92 @@ mod tests {
         async fn recv(&mut self) -> Result<Job, QueueError> {
             self.0.pop_front().unwrap_or(Err(QueueError::ChannelClosed))
         }
+    }
+
+    /// Runs until it is cancelled, counting its runs.
+    #[derive(Default)]
+    struct UntilCancelledEngine(AtomicUsize);
+
+    #[async_trait]
+    impl BackupEngine for UntilCancelledEngine {
+        fn engine(&self) -> &'static str {
+            "until_cancelled"
+        }
+
+        async fn run(&self, ctx: &BackupContext) -> Result<BackupOutcome, BackupError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ctx.cancel.cancelled().await;
+            Err(BackupError::Cancelled)
+        }
+    }
+
+    fn requested(backup_id: i32) -> Job {
+        Job::BackupRequested(BackupRequestedJob {
+            backup_id,
+            engine: "until_cancelled".to_string(),
+            params: serde_json::json!({}),
+            max_runtime_secs: 3600,
+        })
+    }
+
+    /// The slot is taken for as long as the first backup runs, which can be
+    /// hours. Handling a job is what the loop awaits between reads, so it must
+    /// return: the second request queues and the cancel behind it is handled
+    /// now, not when the slot frees.
+    #[tokio::test]
+    async fn the_consumer_loop_keeps_reading_while_every_slot_is_busy() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results((0..6).map(|_| MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }))
+                .into_connection(),
+        );
+        let engine = Arc::new(UntilCancelledEngine::default());
+        let executor = Arc::new(
+            BackupExecutorBuilder::new(db)
+                .with_max_concurrent(1)
+                .register_engine(engine.clone())
+                .build(),
+        );
+        let processor = BackupJobProcessor::new(Arc::clone(&executor));
+
+        processor.handle_job(requested(1)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.0.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first backup takes the only slot");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            processor.handle_job(requested(2)).await;
+            processor
+                .handle_job(Job::BackupCancelRequested(BackupCancelRequestedJob {
+                    backup_id: 2,
+                }))
+                .await;
+        })
+        .await
+        .expect("the loop must not wait for a slot");
+
+        // The first backup still holds the slot, so the second can only have
+        // been stopped by its cancel. Free the slot and confirm it never runs.
+        assert!(
+            executor.cancel(1).await,
+            "the first backup is still running"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while executor.cancel(1).await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first backup ends");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(engine.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
