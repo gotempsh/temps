@@ -412,6 +412,49 @@ mod tests {
     /// Against a real PostgreSQL: the guard must not create the ledger table,
     /// must classify each ledger shape, and must report a newer database as a
     /// status (not an error).
+    /// What `temps migrate --dry-run` asks for: on an empty database everything
+    /// is pending and the question leaves nothing behind.
+    /// Skips when no container runtime or test database is available.
+    #[tokio::test]
+    async fn the_migration_plan_of_an_empty_database_creates_nothing() -> anyhow::Result<()> {
+        let test_db = match temps_test_utils::TestDatabase::new().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping migration plan database test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let db = test_db.db.as_ref();
+        let table_count = || async {
+            let row = db
+                .query_one(Statement::from_string(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT count(*) AS tables FROM pg_tables \
+                     WHERE schemaname = current_schema()"
+                        .to_owned(),
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no row"))?;
+            anyhow::Ok(row.try_get::<i64>("", "tables")?)
+        };
+
+        assert_eq!(table_count().await?, 0, "the test database starts empty");
+
+        let pending = crate::get_pending_migration_names(db).await?;
+
+        assert_eq!(pending, known_migration_names());
+        assert!(!pending.is_empty());
+        assert_eq!(
+            table_count().await?,
+            0,
+            "reading the migration plan must not create any table"
+        );
+        Ok(())
+    }
+
     /// Skips when no container runtime or test database is available.
     #[tokio::test]
     async fn guard_reads_the_real_ledger_without_creating_it() -> anyhow::Result<()> {

@@ -3,7 +3,7 @@
 
 //! Applying this binary's migrations, behind the schema guard.
 
-use crate::schema_guard::SchemaStatus;
+use crate::schema_guard::{known_migration_names, SchemaStatus};
 use sea_orm::sea_query::Query;
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
 use sea_orm_migration::{seaql_migrations, MigrationTrait, SchemaManager};
@@ -414,16 +414,18 @@ pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<Migrati
 /// are not yet recorded in `seaql_migrations`. Used by `temps migrate --dry-run`
 /// to show the plan and by the interactive `--confirm` gate to preview what
 /// would run before the operator commits. This is read-only: it never mutates
-/// the schema or the migration ledger.
+/// the schema or the migration ledger, and never creates the ledger. A database
+/// with no ledger has every migration pending.
+///
+/// Answered from the schema guard's read of the ledger rather than
+/// `Migrator::get_pending_migrations`, which creates `seaql_migrations` when it
+/// is missing.
 pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec<String>> {
     let status = ensure_schema_compatible(db).await?;
-    if let SchemaStatus::NewerThanBinary { pending, .. } = status {
-        return Ok(pending);
-    }
-    let pending = Migrator::get_pending_migrations(db)
-        .await
-        .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
-    Ok(pending.iter().map(|m| m.name().to_string()).collect())
+    Ok(match status {
+        SchemaStatus::Fresh => known_migration_names(),
+        other => other.pending().to_vec(),
+    })
 }
 
 /// Number of migrations defined in this binary. Compared with the pending
