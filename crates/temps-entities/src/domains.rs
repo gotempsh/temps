@@ -28,6 +28,7 @@ pub struct Model {
     pub id: i32,
     pub domain: String,
     pub certificate: Option<String>,
+    #[serde(skip_serializing)]
     pub private_key: Option<String>,
     pub expiration_time: Option<DBDateTime>,
     pub last_renewed: Option<DBDateTime>,
@@ -89,5 +90,40 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializing_a_domain_leaves_out_its_private_key() {
+        let now = chrono::Utc::now();
+        let domain = Model {
+            id: 1,
+            domain: "app.example.com".to_string(),
+            certificate: None,
+            private_key: Some("stored-private-key".to_string()),
+            expiration_time: None,
+            last_renewed: None,
+            status: "active".to_string(),
+            dns_challenge_token: None,
+            dns_challenge_value: None,
+            http_challenge_token: None,
+            http_challenge_key_authorization: None,
+            last_error: None,
+            last_error_type: None,
+            is_wildcard: false,
+            verification_method: "http-01".to_string(),
+            on_demand_backoff_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&domain).expect("serializes");
+
+        assert!(!json.contains("stored-private-key"), "{json}");
+        assert!(json.contains("app.example.com"), "{json}");
     }
 }

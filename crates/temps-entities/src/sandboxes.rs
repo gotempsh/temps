@@ -115,6 +115,7 @@ pub struct Model {
     /// the sandbox's preview URLs while `preview_access` is `password`:
     /// Pingora then presents a login form and expects a cookie minted
     /// against this hash. Ignored in the other modes.
+    #[serde(skip_serializing)]
     pub preview_password_hash: Option<String>,
 
     /// Last 4 characters of the plaintext password. Safe to surface in
@@ -159,6 +160,41 @@ impl ActiveModelBehavior for ActiveModel {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serializing_a_sandbox_leaves_out_its_preview_password_hash() {
+        let now = chrono::Utc::now();
+        let sandbox = Model {
+            id: 1,
+            public_id: "sbx_1".to_string(),
+            user_id: None,
+            agent_run_id: None,
+            name: "sandbox".to_string(),
+            status: "running".to_string(),
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
+            image: None,
+            work_dir: "/workspace".to_string(),
+            timeout_secs: 60,
+            metadata: None,
+            backend: None,
+            node_id: None,
+            egress_policy: StoredEgressPolicy::default(),
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: Some("stored-password-hash".to_string()),
+            preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&sandbox).expect("serializes");
+
+        assert!(!json.contains("stored-password-hash"), "{json}");
+        assert!(json.contains("sbx_1"), "{json}");
+    }
 
     #[test]
     fn the_default_policy_is_the_column_default() {

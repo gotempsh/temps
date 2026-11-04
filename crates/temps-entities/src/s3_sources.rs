@@ -17,7 +17,9 @@ pub struct Model {
     pub region: String,
     pub endpoint: Option<String>,
     pub bucket_path: String,
+    #[serde(skip_serializing)]
     pub access_key_id: String,
+    #[serde(skip_serializing)]
     pub secret_key: String,
     /// STS-style session token for a *temporary* credential, encrypted at rest
     /// with the same [`temps_core::EncryptionService`] as `secret_key`.
@@ -29,6 +31,7 @@ pub struct Model {
     /// this token accompanies it as `X-Amz-Security-Token`, so it has to reach
     /// both the in-process `aws-sdk-s3` clients and the `AWS_SESSION_TOKEN`
     /// environment of every shelled-out engine (`wal-g`, `mc`, `mariabackup`).
+    #[serde(skip_serializing)]
     pub session_token: Option<String>,
     /// When the credential in this row stops working, for a temporary
     /// credential. `None` means it does not expire.
@@ -480,6 +483,22 @@ mod tests {
         )
         .expect("decrypt")
         .is_none());
+    }
+
+    /// The stored columns are ciphertext, but ciphertext plus a leaked key is
+    /// the credential, so none of the three leaves through JSON.
+    #[test]
+    fn serializing_a_source_leaves_out_its_credential_columns() {
+        let mut model = model_with_session_token(Some("stored-session-token".to_string()));
+        model.access_key_id = "stored-access-key".to_string();
+        model.secret_key = "stored-secret-key".to_string();
+
+        let json = serde_json::to_string(&model).expect("serializes");
+
+        assert!(!json.contains("stored-access-key"), "{json}");
+        assert!(!json.contains("stored-secret-key"), "{json}");
+        assert!(!json.contains("stored-session-token"), "{json}");
+        assert!(json.contains("backups"), "{json}");
     }
 
     #[test]
