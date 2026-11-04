@@ -88,8 +88,9 @@ fn write_build_secret_files(
 
 /// What a `/build` call would send, for the gRPC solve. The memory and CPU
 /// options have no equivalent, and BuildKit ignores them on `/build` too. The
-/// network stays the default one: host networking needs an entitlement that
-/// bollard's solve does not request.
+/// network is the default one, as on the deployment path's `/build` call: host
+/// networking needs an entitlement that bollard's solve hardcodes to none, so
+/// neither this nor `RUN --network=host` can be granted here.
 fn secret_mount_frontend_options(
     request: &BuildRequest,
     default_platform: &str,
@@ -342,6 +343,52 @@ async fn follow_build_status(
     unavailable(last_error).await;
 }
 
+/// Start a solve on its own thread, since its future is not `Send`. Dropping the
+/// returned sender cancels it.
+///
+/// The thread runs its own runtime because bollard serves the BuildKit session
+/// from a task it spawns and never stops, and that task holds the session
+/// connection and the whole build context. The daemon does not close that
+/// connection when a build finishes, nor can a stalled one when a build is
+/// cancelled, so the task would outlive the build and its permit. Shutting the
+/// runtime down when the solve ends, however it ends, stops it.
+fn spawn_solve(
+    docker: std::sync::Arc<bollard::Docker>,
+    image_name: String,
+    options: bollard::grpc::build::ImageBuildFrontendOptions,
+    context: bytes::Bytes,
+    build_ref: bollard::grpc::BuildRef,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    let (cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let solve = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("could not start the build's runtime: {error}"))?;
+        let outcome = runtime.block_on(async move {
+            let build = bollard::grpc::driver::Build::docker_build(
+                bollard::grpc::driver::moby::Moby::new(&docker),
+                &image_name,
+                options,
+                bollard::grpc::build::ImageBuildLoadInput::Upload(context),
+                None,
+                Some(build_ref),
+            );
+            tokio::select! {
+                result = build => result.map_err(|error| grpc_build_error_text(&error)),
+                _ = cancelled => Err("the build was cancelled".to_string()),
+            }
+        });
+        // Not a plain drop, which would wait for blocking work with no limit.
+        runtime.shutdown_background();
+        outcome
+    });
+    (cancel_on_drop, solve)
+}
+
 impl DockerRuntime {
     /// The build context as a gzipped tar in memory, which is how bollard's
     /// session upload takes it. Refuses a context past
@@ -436,29 +483,14 @@ impl DockerRuntime {
             status_sender,
         );
 
-        // The solve future is not `Send`, so it runs on its own blocking thread.
-        // Dropping `_cancel_on_drop` (this future being dropped) ends the select,
-        // which closes the session and with it the build.
-        let (_cancel_on_drop, cancelled) = tokio::sync::oneshot::channel::<()>();
-        let image_name = request.image_name.clone();
-        let runtime = tokio::runtime::Handle::current();
-        let solve_docker = docker.clone();
-        let solve = tokio::task::spawn_blocking(move || {
-            runtime.block_on(async move {
-                let build = bollard::grpc::driver::Build::docker_build(
-                    bollard::grpc::driver::moby::Moby::new(&solve_docker),
-                    &image_name,
-                    options,
-                    bollard::grpc::build::ImageBuildLoadInput::Upload(context),
-                    None,
-                    Some(build_ref),
-                );
-                tokio::select! {
-                    result = build => result.map_err(|error| grpc_build_error_text(&error)),
-                    _ = cancelled => Err("the build was cancelled".to_string()),
-                }
-            })
-        });
+        // Dropping `_cancel_on_drop` (this future being dropped) ends the solve.
+        let (_cancel_on_drop, solve) = spawn_solve(
+            docker.clone(),
+            request.image_name.clone(),
+            options,
+            context,
+            build_ref,
+        );
         tokio::pin!(solve);
 
         let mut step_timer = BuildStepTimer::new();

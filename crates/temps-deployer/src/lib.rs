@@ -327,6 +327,11 @@ pub struct BuildRequest {
     pub log_path: PathBuf,
     /// Values served to the Dockerfile's `RUN --mount=type=secret` steps. Never
     /// serialized, so they cannot travel over the worker build protocol.
+    ///
+    /// When this is not empty the whole build runs on BuildKit's default network,
+    /// including through [`ImageBuilder::build_image`], which otherwise uses the
+    /// host network: secrets are only available on a solve that cannot be granted
+    /// host networking.
     #[serde(skip)]
     pub build_secrets: BuildSecrets,
 }

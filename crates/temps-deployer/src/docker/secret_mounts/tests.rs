@@ -347,15 +347,16 @@ fn status_connection_uses_the_socket_bollard_connects_to() {
 }
 
 /// Read from a fake daemon's end of the connection until `marker` has arrived.
-async fn read_until(daemon: &mut tokio::net::UnixStream, marker: &[u8]) {
+async fn read_until(daemon: &mut tokio::net::UnixStream, marker: &[u8]) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
     let mut seen = Vec::new();
     let mut chunk = [0u8; 1024];
     while !seen.windows(marker.len()).any(|window| window == marker) {
         let read = daemon.read(&mut chunk).await.unwrap();
-        assert_ne!(read, 0, "the follower closed the connection early");
+        assert_ne!(read, 0, "the client closed the connection early");
         seen.extend_from_slice(&chunk[..read]);
     }
+    seen
 }
 
 /// A cancelled build drops its future and, with it, the follower. A daemon that
@@ -397,4 +398,136 @@ async fn dropping_the_follower_closes_a_stalled_status_connection() {
         .await
         .expect("dropping the follower should close its connection")
         .expect("the closed connection should read to its end");
+}
+
+/// A solve talking to a fake daemon that upgrades both of its connections and
+/// then goes quiet, as a stalled daemon does.
+struct StalledSolve {
+    cancel: tokio::sync::oneshot::Sender<()>,
+    solve: tokio::task::JoinHandle<Result<(), String>>,
+    /// The daemon's end of the control connection the solve request goes over.
+    control: tokio::net::UnixStream,
+    /// The daemon's end of the session connection bollard's detached task serves.
+    session: tokio::net::UnixStream,
+    _socket_dir: TempDir,
+}
+
+const SESSION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl StalledSolve {
+    async fn start() -> Self {
+        use tokio::io::AsyncReadExt;
+        let socket_dir = TempDir::new().unwrap();
+        let socket = socket_dir.path().join("docker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let docker = bollard::Docker::connect_with_unix(
+            socket.to_str().unwrap(),
+            120,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let options = bollard::grpc::build::ImageBuildFrontendOptions::builder().build();
+        let (cancel, solve) = spawn_solve(
+            Arc::new(docker),
+            "stalled:test".to_string(),
+            options,
+            bytes::Bytes::from_static(b"context"),
+            bollard::grpc::BuildRef::random(),
+        );
+        let upgrade = |listener: tokio::net::UnixListener, path: &'static [u8]| async move {
+            let (mut daemon, _) = listener.accept().await.unwrap();
+            let head = read_until(&mut daemon, b"\r\n\r\n").await;
+            assert!(
+                head.windows(path.len()).any(|window| window == path),
+                "expected a request for {}: {}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(&head)
+            );
+            daemon
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                      Upgrade: h2c\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            (listener, daemon)
+        };
+        let (control, session, listener) = tokio::time::timeout(SESSION_WAIT, async {
+            let (listener, control) = upgrade(listener, b"/grpc").await;
+            let (listener, mut session) = upgrade(listener, b"/session").await;
+            // The session server speaks first, so it is running from here on.
+            let mut first = [0u8; 1];
+            session.read_exact(&mut first).await.unwrap();
+            (control, session, listener)
+        })
+        .await
+        .expect("the solve should open its control and session connections");
+        drop(listener);
+        Self {
+            cancel,
+            solve,
+            control,
+            session,
+            _socket_dir: socket_dir,
+        }
+    }
+}
+
+/// Wait for the client to close the session connection. A session server left
+/// running keeps it open, along with the build context it holds.
+async fn session_closes(session: &mut tokio::net::UnixStream) {
+    use tokio::io::AsyncReadExt;
+    let mut rest = Vec::new();
+    tokio::time::timeout(SESSION_WAIT, session.read_to_end(&mut rest))
+        .await
+        .expect("the session connection should close, releasing the build context")
+        .expect("the closed connection should read to its end");
+}
+
+/// bollard serves the session from a task it detaches, so dropping the solve
+/// future alone would leave that task and the build context behind.
+#[tokio::test]
+async fn cancelling_a_solve_closes_its_session_on_a_stalled_daemon() {
+    let mut stalled = StalledSolve::start().await;
+    drop(stalled.cancel);
+    session_closes(&mut stalled.session).await;
+}
+
+/// The same when the solve ends by itself: nothing in bollard closes the
+/// session afterwards, and a daemon need not close it either.
+#[tokio::test]
+async fn a_solve_that_ends_closes_its_session() {
+    let mut stalled = StalledSolve::start().await;
+    drop(stalled.control);
+    let outcome = tokio::time::timeout(SESSION_WAIT, &mut stalled.solve)
+        .await
+        .expect("the solve should end when its control connection does")
+        .unwrap();
+    assert!(outcome.is_err(), "{outcome:?}");
+    session_closes(&mut stalled.session).await;
+}
+
+/// A healthy daemon does not close the session after a build either, so without
+/// this every build would leave a task behind, holding its whole build context.
+#[tokio::test]
+async fn finished_builds_leave_no_session_task_behind() {
+    let dockerfile = "FROM alpine:3.20\n\
+         RUN --mount=type=secret,id=API_KEY,required=true test -s /run/secrets/API_KEY\n";
+    let Some(fixture) = SecretBuildFixture::new(dockerfile).await else {
+        return;
+    };
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let mut alive = Vec::new();
+    for _ in 0..3 {
+        let (result, logged) = fixture
+            .build(fixture.request(&[], &[("API_KEY", "value")], Vec::new()))
+            .await;
+        assert!(result.is_ok(), "{result:?}\n{logged}");
+        alive.push(metrics.num_alive_tasks());
+    }
+    assert!(
+        alive[2] <= alive[0],
+        "tasks alive after each build: {alive:?}"
+    );
+    fixture.cleanup().await;
 }
