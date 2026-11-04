@@ -40,6 +40,7 @@ pub mod route_store;
 pub mod route_sync_client;
 mod runtime_health;
 pub mod sandbox_handlers;
+pub mod sealed_requests;
 pub mod server;
 pub mod service_handlers;
 pub mod shield;
@@ -360,7 +361,8 @@ pub struct AgentConfig {
     /// against an older IP-only control plane. Never downloaded automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane_legacy_cert_path: Option<std::path::PathBuf>,
-    /// X25519 private key used only to decrypt this node's certificate bundles.
+    /// X25519 private key that decrypts what the control plane seals to this
+    /// node: certificate bundles, Shield keys and requests carrying values.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
     /// What this worker lets its control plane do with public ingress (ADR
@@ -507,6 +509,12 @@ impl AgentConfig {
             "Resolved agent data paths; sandbox work directories on this node live under sandbox_work_root"
         );
         Ok(work_root)
+    }
+
+    /// Where the ingress manager saves the key it provisions when `temps
+    /// join` gave none.
+    pub fn provisioned_key_file(&self) -> std::path::PathBuf {
+        self.compose_data_dir().join("public-ingress.key")
     }
 
     /// The agent data directory (the parent of `dns_data_dir`), where Compose

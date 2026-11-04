@@ -47,8 +47,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use bollard::models::{
-    ContainerInspectResponse, ContainerUpdateBody, MountPointTypeEnum, RestartPolicy,
-    RestartPolicyNameEnum,
+    ContainerInspectResponse, ContainerUpdateBody, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
     DownloadFromContainerOptions, InspectContainerOptions, ListContainersOptions, LogsOptions,
@@ -335,21 +334,19 @@ impl ContainerSnapshot {
             .iter()
             .filter_map(|m| {
                 let destination = normalize_path(m.destination.as_deref()?);
-                let kind = match m.typ {
-                    Some(MountPointTypeEnum::VOLUME)
-                        if subpath_destinations.contains(&destination) =>
-                    {
+                let kind = match m.typ.as_deref() {
+                    Some("volume") if subpath_destinations.contains(&destination) => {
                         StorageKind::Other("volume subpath".to_string())
                     }
-                    Some(MountPointTypeEnum::VOLUME) => {
+                    Some("volume") => {
                         if m.name.as_deref().is_some_and(is_anonymous_volume_name) {
                             StorageKind::AnonymousVolume
                         } else {
                             StorageKind::NamedVolume
                         }
                     }
-                    Some(MountPointTypeEnum::BIND) => StorageKind::Bind,
-                    Some(MountPointTypeEnum::TMPFS) => StorageKind::Tmpfs,
+                    Some("bind") => StorageKind::Bind,
+                    Some("tmpfs") => StorageKind::Tmpfs,
                     Some(other) => StorageKind::Other(other.to_string()),
                     None => StorageKind::Other("unknown".to_string()),
                 };
@@ -2779,7 +2776,7 @@ pub mod test_support {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum, PortBinding};
+    use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountType, PortBinding};
     use bollard::query_parameters::{
         CreateContainerOptionsBuilder, ListContainersOptions, RemoveContainerOptions,
         StartContainerOptions,
@@ -2991,7 +2988,7 @@ pub mod test_support {
         Mount {
             source: Some(source.to_string()),
             target: Some(target.to_string()),
-            typ: Some(MountTypeEnum::VOLUME),
+            typ: Some(MountType::VOLUME),
             ..Default::default()
         }
     }
@@ -3000,7 +2997,7 @@ pub mod test_support {
         Mount {
             source: Some(source.to_string()),
             target: Some(target.to_string()),
-            typ: Some(MountTypeEnum::BIND),
+            typ: Some(MountType::BIND),
             bind_options: Some(bollard::models::MountBindOptions {
                 create_mountpoint: Some(true),
                 ..Default::default()

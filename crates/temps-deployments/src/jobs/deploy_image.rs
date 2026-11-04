@@ -2096,7 +2096,8 @@ impl DeployImageJob {
                 node.address.clone(),
                 token,
                 node.name.clone(),
-            ),
+            )
+            .map(|remote| remote.with_sealing(node.request_sealing())),
         }
         .map_err(|error| {
             WorkflowError::JobExecutionFailed(format!(
@@ -3429,7 +3430,8 @@ impl DeployImageJob {
                             address.clone(),
                             token,
                             node_name.clone(),
-                        ),
+                        )
+                        .map(|remote| remote.with_sealing(node.request_sealing())),
                     };
                     let remote = match build_result {
                         // Teach the deployer which architecture this node runs

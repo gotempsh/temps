@@ -457,7 +457,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/var/lib/postgresql".to_string()),
                 source: Some(volume_name.clone()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             log_config: Some(crate::utils::default_service_log_config()),

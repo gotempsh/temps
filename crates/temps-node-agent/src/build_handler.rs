@@ -20,13 +20,16 @@ use serde::Deserialize;
 use std::{convert::Infallible, path::Path, sync::Arc};
 use temps_deployer::{
     build_protocol::{
-        safe_extract_context, BuildEvent, BuildFailure, BuildFailureKind, BuildSpec,
-        MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_SPEC_BYTES,
+        safe_extract_context, BuildEvent, BuildFailure, BuildFailureKind, BuildSpec, BUILD_PATH,
+        MAX_BUILD_CONTEXT_BYTES, MAX_BUILD_SPEC_BYTES, MAX_SEALED_BUILD_SPEC_BYTES,
+        SEALED_BUILD_SPEC_FIELD,
     },
     image_scan::{ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS},
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError,
 };
 use tokio::io::AsyncWriteExt;
+
+use crate::sealed_requests::SealedRequestState;
 
 use crate::auth::RequireAgentAuth;
 use crate::handlers::{AgentResourceLimits, AgentState};
@@ -151,6 +154,7 @@ pub async fn build_image(
     RequireAgentAuth(auth): RequireAgentAuth,
     State(state): State<Arc<AgentState>>,
     Extension(limits): Extension<Arc<AgentResourceLimits>>,
+    Extension(sealed_requests): Extension<Arc<SealedRequestState>>,
     headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, Problem> {
@@ -211,6 +215,7 @@ pub async fn build_image(
         receive_build(
             state,
             limits,
+            sealed_requests,
             multipart,
             deadline,
             settings,
@@ -226,25 +231,34 @@ pub async fn build_image(
     })?
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "what the handler has already resolved; a struct would only rename them"
+)]
 async fn receive_build(
     state: Arc<AgentState>,
     limits: Arc<AgentResourceLimits>,
+    sealed_requests: Arc<SealedRequestState>,
     mut multipart: Multipart,
     deadline: tokio::time::Instant,
     settings: temps_deployer::build_protocol::BuildLimits,
     settings_version: u64,
     request_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<Response, Problem> {
-    let mut spec_field = match multipart.next_field().await {
-        Ok(Some(field)) if field.name() == Some("spec") => field,
+    let (mut spec_field, spec_is_sealed) = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("spec") => (field, false),
+        Ok(Some(field)) if field.name() == Some(SEALED_BUILD_SPEC_FIELD) => (field, true),
         _ => return Err(AgentImageError::Invalid("Expected spec field first".into()).into()),
+    };
+    let spec_limit = if spec_is_sealed {
+        MAX_SEALED_BUILD_SPEC_BYTES
+    } else {
+        MAX_BUILD_SPEC_BYTES
     };
     let mut spec_bytes = Vec::new();
     loop {
         match spec_field.chunk().await {
-            Ok(Some(chunk))
-                if spec_bytes.len().saturating_add(chunk.len()) <= MAX_BUILD_SPEC_BYTES =>
-            {
+            Ok(Some(chunk)) if spec_bytes.len().saturating_add(chunk.len()) <= spec_limit => {
                 spec_bytes.extend_from_slice(&chunk);
             }
             Ok(None) => break,
@@ -258,6 +272,21 @@ async fn receive_build(
     // Multer only advances to the next part after this Field is dropped,
     // even when chunk() has returned None. Keep this before next_field().
     drop(spec_field);
+    if spec_is_sealed {
+        spec_bytes = sealed_requests
+            .key
+            .open(&sealed_requests.node_name, BUILD_PATH, &spec_bytes)
+            .await
+            .map_err(|refusal| {
+                tracing::warn!(error = %refusal, "refused a sealed build spec");
+                AgentImageError::Invalid(refusal.to_string())
+            })?;
+        if spec_bytes.len() > MAX_BUILD_SPEC_BYTES {
+            return Err(
+                AgentImageError::Invalid("Build spec is invalid or too large".into()).into(),
+            );
+        }
+    }
     let spec: BuildSpec = match serde_json::from_slice(&spec_bytes) {
         Ok(spec) => spec,
         Err(_) => {
@@ -411,6 +440,7 @@ async fn receive_build(
         })
     });
     let request = BuildRequest {
+        build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: spec.image_name,
         context_path: context_dir,
@@ -1046,6 +1076,10 @@ mod tests {
                 "node-token",
             ))))
             .layer(Extension(limits.clone()))
+            .layer(Extension(Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "worker-a".to_string(),
+            })))
             .with_state(state);
         for (method, path) in [
             ("POST", "/build"),
@@ -1191,8 +1225,10 @@ mod tests {
     /// hands the Dockerfile's build-argument values to the local daemon --
     /// and nothing it streams back quotes them.
     #[tokio::test]
-    async fn worker_build_receives_build_argument_values_over_the_authenticated_channel() {
+    async fn worker_build_receives_build_argument_values_sealed_to_the_node() {
         use axum::{routing::post, Router};
+        let (node_private_key, node_public_key) =
+            temps_core::worker_ingress::generate_ingress_key().unwrap();
         let builder = Arc::new(RecordingBuilder::default());
         let remote_for_containers = Arc::new(
             temps_deployer::remote::RemoteNodeDeployer::new(
@@ -1220,6 +1256,10 @@ mod tests {
                 "node-token",
             ))))
             .layer(Extension(limits.clone()))
+            .layer(Extension(Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(Some(node_private_key)),
+                node_name: "worker-1".to_string(),
+            })))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1242,11 +1282,15 @@ mod tests {
             "worker-1".into(),
         )
         .unwrap();
-        let remote = remote.with_build_limits(temps_deployer::build_protocol::BuildLimits {
-            concurrency: 3,
-            queue_wait_seconds: 2,
-            build_timeout_seconds: 7,
-        });
+        let remote = remote
+            .with_sealing(temps_core::sealed_request::NodeSealing::Key(
+                node_public_key,
+            ))
+            .with_build_limits(temps_deployer::build_protocol::BuildLimits {
+                concurrency: 3,
+                queue_wait_seconds: 2,
+                build_timeout_seconds: 7,
+            });
         let logs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let log_sink = logs.clone();
         let callback: temps_deployer::LogCallback = Arc::new(move |line| {
@@ -1259,6 +1303,7 @@ mod tests {
             &remote,
             BuildRequestWithCallback {
                 request: BuildRequest {
+                    build_secrets: Default::default(),
                     cache_from: Vec::new(),
                     image_name: "web:worker".into(),
                     context_path: source.path().to_path_buf(),
@@ -1305,6 +1350,100 @@ mod tests {
                 assert!(!line.contains(value), "log line quotes a value: {line}");
             }
         }
+    }
+
+    /// One request's `sealed_spec` field, against a router holding `private_key`.
+    async fn post_sealed_spec(private_key: Option<String>, sealed: &[u8]) -> (StatusCode, String) {
+        use axum::{routing::post, Router};
+        use tower::ServiceExt;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let router = Router::new()
+            .route("/agent/images/build", post(build_image))
+            .layer(Extension(Arc::new(crate::auth::AgentAuth::new(
+                "node-token",
+            ))))
+            .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .layer(Extension(Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(private_key),
+                node_name: "worker-1".to_string(),
+            })))
+            .with_state(Arc::new(AgentState {
+                container_deployer: remote,
+                image_builder: Arc::new(RecordingBuilder::default()),
+                docker: None,
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                platform: Default::default(),
+                host_bind_address: std::sync::Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            }));
+        let mut body = format!(
+            "--test\r\nContent-Disposition: form-data; name=\"{SEALED_BUILD_SPEC_FIELD}\"\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(sealed);
+        body.extend_from_slice(b"\r\n--test--\r\n");
+        let response = router
+            .oneshot(
+                axum::http::Request::post("/agent/images/build")
+                    .header("authorization", "Bearer node-token")
+                    .header("content-type", "multipart/form-data; boundary=test")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn a_sealed_build_spec_is_refused_without_the_right_key_or_for_another_route() {
+        use temps_core::sealed_request::NodeSealing;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (other_private, _) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let spec =
+            br#"{"version":1,"image_name":"web:worker","dockerfile":"Dockerfile","platform":null}"#;
+        let sealing = NodeSealing::Key(public);
+        let for_build = sealing.seal("worker-1", BUILD_PATH, spec).unwrap();
+        let for_another_route = sealing.seal("worker-1", "/agent/services", spec).unwrap();
+
+        for (key, sealed, expected) in [
+            (Some(other_private), &for_build, "cannot be opened"),
+            (Some(private), &for_another_route, "cannot be opened"),
+            (None, &for_build, "no key"),
+        ] {
+            let (status, body) = post_sealed_spec(key, sealed).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains(expected), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sealed_build_spec_may_not_exceed_what_a_plain_one_may() {
+        use temps_core::sealed_request::NodeSealing;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let oversized = vec![b'x'; MAX_BUILD_SPEC_BYTES + 1];
+        let sealed = NodeSealing::Key(public)
+            .seal("worker-1", BUILD_PATH, &oversized)
+            .unwrap();
+        assert!(sealed.len() <= MAX_SEALED_BUILD_SPEC_BYTES);
+
+        let (status, body) = post_sealed_spec(Some(private), &sealed).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("too large"), "{body}");
     }
 
     #[tokio::test]
@@ -1370,6 +1509,10 @@ mod tests {
                 "node-token",
             ))))
             .layer(Extension(limits.clone()))
+            .layer(Extension(Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "worker-a".to_string(),
+            })))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1391,6 +1534,7 @@ mod tests {
         })
         .with_build_limits_version(19);
         let request = || BuildRequest {
+            build_secrets: Default::default(),
             context_path: source.path().into(),
             dockerfile_path: None,
             image_name: "app:limited".into(),
@@ -1932,6 +2076,10 @@ mod tests {
                 "node-token",
             ))))
             .layer(Extension(Arc::new(AgentResourceLimits::new())))
+            .layer(Extension(Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "worker-a".to_string(),
+            })))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1948,6 +2096,7 @@ mod tests {
                 std::fs::write(source.path().join("Dockerfile"), "FROM scratch\nWORKDIR /srv\nCOPY public /srv/public\nEXPOSE 8080\nENV PUBLIC_MARKER=fixture-value\nUSER 10001\nENTRYPOINT [\"/app\"]\n").unwrap();
                 let remote = temps_deployer::remote::RemoteNodeDeployer::new(format!("http://{address}"), "node-token".into(), "real-worker".into()).unwrap();
                 let result = remote.build_image(BuildRequest {
+                    build_secrets: Default::default(),
                     context_path: source.path().into(), dockerfile_path: None,
                     image_name: image_name.clone(), build_args: Default::default(),
                     build_args_buildkit: Default::default(), cache_from: vec![],

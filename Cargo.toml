@@ -373,7 +373,7 @@ octocrab = "0.54.1"
 # `time` decides the type of bollard's timestamps, which temps-deployer reads as
 # `time::OffsetDateTime`. It has to be named here: testcontainers enables it too,
 # but only in test builds, so a release build would otherwise not compile.
-bollard = { version = "0.20.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content", "time"] }
+bollard = { version = "0.21.1", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content", "time"] }
 
 # ============================================================================
 # Scheduling & Background Jobs
@@ -430,8 +430,8 @@ woothee = "0.13.0"
 # ============================================================================
 # Using git version for security fixes:
 # - Uses astral-tokio-tar instead of vulnerable tokio-tar (RUSTSEC-2025-0111)
-# - Compatible with bollard 0.19.x
-testcontainers =  "0.27.2"
+# - 0.28 is the first release compatible with bollard 0.21.x
+testcontainers =  "0.28.0"
 
 # Centralised from per-crate pins (P1.7). Keep them here, not in member crates.
 autopack-core = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.6" }

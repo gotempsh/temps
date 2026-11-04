@@ -989,13 +989,13 @@ impl RustfsService {
                 bollard::models::Mount {
                     target: Some("/data".to_string()),
                     source: Some(data_volume_name.clone()),
-                    typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                    typ: Some(bollard::models::MountType::VOLUME),
                     ..Default::default()
                 },
                 bollard::models::Mount {
                     target: Some("/logs".to_string()),
                     source: Some(logs_volume_name.clone()),
-                    typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                    typ: Some(bollard::models::MountType::VOLUME),
                     ..Default::default()
                 },
             ]),

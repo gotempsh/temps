@@ -24,6 +24,7 @@ mod image_builder;
 mod log_tail;
 mod network;
 mod runtime;
+mod secret_mounts;
 mod static_archive;
 #[cfg(test)]
 mod test_support;

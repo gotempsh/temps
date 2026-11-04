@@ -111,6 +111,7 @@ pub mod preview_grant;
 pub mod repo_config;
 mod request_metadata;
 pub mod route_table;
+pub mod sealed_request;
 pub mod stages;
 pub mod types;
 pub mod url_validation;

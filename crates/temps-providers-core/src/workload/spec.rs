@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use bollard::models::{ContainerCreateBody, ContainerInspectResponse, MountPointTypeEnum};
+use bollard::models::{ContainerCreateBody, ContainerInspectResponse};
 use serde::{Deserialize, Serialize};
 use temps_workload::{
     labels as workload_labels, Artifact, Attachments, EnvSpec, InstanceLimits, InstanceSpec,
@@ -523,9 +523,9 @@ impl DatabaseProcess {
             .iter()
             .flatten()
             .filter_map(|mount| {
-                let source = match mount.typ {
-                    Some(MountPointTypeEnum::VOLUME) => mount.name.clone()?,
-                    Some(MountPointTypeEnum::BIND) => mount.source.clone()?,
+                let source = match mount.typ.as_deref() {
+                    Some("volume") => mount.name.clone()?,
+                    Some("bind") => mount.source.clone()?,
                     _ => return None,
                 };
                 Some((source, mount.destination.clone()?))

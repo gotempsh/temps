@@ -1103,7 +1103,7 @@ impl GarageService {
             mounts: Some(vec![bollard::models::Mount {
                 target: Some(GARAGE_DATA_MOUNT.to_string()),
                 source: Some(data_volume.to_string()),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             log_config: Some(crate::utils::default_service_log_config()),

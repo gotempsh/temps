@@ -581,6 +581,9 @@ pub struct RemoteSandboxProvider {
     /// control-plane identity as `client`. `None` for `http://` agents
     /// (tests) — sandbox calls to a real node are always `https://`.
     ws_connector: Option<tokio_tungstenite::Connector>,
+    /// How environment variables may reach this node. Refuses them until
+    /// [`Self::with_sealing`] says otherwise.
+    sealing: temps_core::sealed_request::NodeSealing,
 }
 
 /// Control-plane sandbox defaults applied when a create request leaves them
@@ -729,7 +732,37 @@ impl RemoteSandboxProvider {
             defaults: RemoteSandboxDefaults::default(),
             exec_stream_idle_timeout: EXEC_STREAM_IDLE_TIMEOUT,
             ws_connector: None,
+            sealing: Default::default(),
         }
+    }
+
+    /// How requests carrying values reach this node (see
+    /// [`temps_core::sealed_request`]); from the node row's
+    /// `request_sealing()`.
+    pub fn with_sealing(mut self, sealing: temps_core::sealed_request::NodeSealing) -> Self {
+        self.sealing = sealing;
+        self
+    }
+
+    /// Attach `body`: encrypted to the node when it carries values, so nothing
+    /// is sent if it cannot be, otherwise as JSON.
+    fn with_body<B: Serialize + ?Sized>(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+        body: &B,
+        carries_values: bool,
+    ) -> Result<reqwest::RequestBuilder, temps_core::sealed_request::SealRequestError> {
+        if !carries_values {
+            return Ok(request.json(body));
+        }
+        let sealed = self.sealing.seal_json(&self.node_name, path, body)?;
+        Ok(request
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+            )
+            .body(sealed))
     }
 
     pub fn with_defaults(mut self, defaults: RemoteSandboxDefaults) -> Self {
@@ -1000,16 +1033,47 @@ impl RemoteSandboxProvider {
         operation: &str,
         response_cap: usize,
     ) -> Result<R, AgentError> {
+        self.call_body(path, body, false, timeout, handle, operation, response_cap)
+            .await
+    }
+
+    /// [`Self::call`] for a body that may carry values.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "`call` plus whether the body carries values; a struct would only rename them"
+    )]
+    async fn call_body<B: Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        carries_values: bool,
+        timeout: Duration,
+        handle: Option<&SandboxHandle>,
+        operation: &str,
+        response_cap: usize,
+    ) -> Result<R, AgentError> {
         let url = format!("{}{}", self.agent_url, path);
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .timeout(timeout)
-            .json(body)
+            .with_body(
+                self.client
+                    .post(&url)
+                    .bearer_auth(&self.token)
+                    .timeout(timeout),
+                path,
+                body,
+                carries_values,
+            )
+            .map_err(|error| self.failed(handle, operation, error.to_string()))?
             .send()
             .await
             .map_err(|e| self.transport_unavailable(operation, e))?;
+        if carries_values && response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.failed(
+                handle,
+                operation,
+                temps_core::sealed_request::older_agent_message(&self.node_name),
+            ));
+        }
         if !response.status().is_success() {
             return Err(self.error_response(response, handle, operation).await);
         }
@@ -1219,6 +1283,30 @@ impl RemoteSandboxProvider {
         Ok(())
     }
 
+    /// [`Self::call_ok`] encrypted to the node: for files, which is how secrets
+    /// and credentials reach a sandbox.
+    async fn upload_ok<B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+        handle: &SandboxHandle,
+        operation: &str,
+    ) -> Result<(), AgentError> {
+        let _: RemoteOkResponse = self
+            .call_body(
+                path,
+                body,
+                true,
+                timeout,
+                Some(handle),
+                operation,
+                SMALL_RESPONSE_CAP,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn status(&self) -> Result<RemoteStatusResponse, AgentError> {
         self.call(
             "/agent/sandboxes/status",
@@ -1246,10 +1334,13 @@ impl RemoteSandboxProvider {
             user,
             as_root,
         };
+        // Sealed however empty the environment: the command line can hold a
+        // credential as well.
         let r: RemoteExecResponse = self
-            .call(
+            .call_body(
                 "/agent/sandboxes/exec",
                 &body,
+                true,
                 EXEC_TIMEOUT,
                 Some(handle),
                 "exec",
@@ -1288,34 +1379,43 @@ impl RemoteSandboxProvider {
             user,
             as_root,
         };
-        let url = format!("{}/agent/sandboxes/exec-stream", self.agent_url);
+        let path = "/agent/sandboxes/exec-stream";
+        let url = format!("{}{path}", self.agent_url);
+        let request = self
+            .with_body(
+                self.client.post(&url).bearer_auth(&self.token),
+                path,
+                &body,
+                true,
+            )
+            .map_err(|error| self.failed(Some(handle), OPERATION, error.to_string()))?;
         // Only the wait for the response head is bounded here: the worker
         // answers it once it has resolved the sandbox, before the command
         // produces anything.
-        let response = tokio::time::timeout(
-            SHORT_TIMEOUT,
-            self.client
-                .post(&url)
-                .bearer_auth(&self.token)
-                .json(&body)
-                .send(),
-        )
-        .await
-        .map_err(|_| {
-            tracing::warn!(
-                node_id = self.node_id,
-                node_name = %self.node_name,
-                sandbox = %handle.sandbox_name,
-                timeout_secs = SHORT_TIMEOUT.as_secs(),
-                "Worker node did not start a streamed sandbox exec in time"
-            );
-            self.unavailable(format!(
-                "the node's agent did not start the command within {}s ({})",
-                SHORT_TIMEOUT.as_secs(),
-                OPERATION
-            ))
-        })?
-        .map_err(|e| self.transport_unavailable(OPERATION, e))?;
+        let response = tokio::time::timeout(SHORT_TIMEOUT, request.send())
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    sandbox = %handle.sandbox_name,
+                    timeout_secs = SHORT_TIMEOUT.as_secs(),
+                    "Worker node did not start a streamed sandbox exec in time"
+                );
+                self.unavailable(format!(
+                    "the node's agent did not start the command within {}s ({})",
+                    SHORT_TIMEOUT.as_secs(),
+                    OPERATION
+                ))
+            })?
+            .map_err(|e| self.transport_unavailable(OPERATION, e))?;
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.failed(
+                Some(handle),
+                OPERATION,
+                temps_core::sealed_request::older_agent_message(&self.node_name),
+            ));
+        }
         if !response.status().is_success() {
             return Err(self.error_response(response, Some(handle), OPERATION).await);
         }
@@ -1515,10 +1615,13 @@ impl SandboxProvider for RemoteSandboxProvider {
             idle_timeout_secs: config.idle_timeout.as_secs(),
             backend: config.backend,
         };
+        // Only `env_vars` can hold a value in this body.
+        let carries_values = !body.env_vars.is_empty();
         let handle: SandboxHandle = self
-            .call(
+            .call_body(
                 "/agent/sandboxes",
                 &body,
+                carries_values,
                 LIFECYCLE_TIMEOUT,
                 None,
                 "create",
@@ -1707,7 +1810,7 @@ impl SandboxProvider for RemoteSandboxProvider {
             contents_b64: base64::engine::general_purpose::STANDARD.encode(contents),
             mode,
         };
-        self.call_ok(
+        self.upload_ok(
             "/agent/sandboxes/write-file",
             &body,
             SHORT_TIMEOUT,
@@ -1771,7 +1874,7 @@ impl SandboxProvider for RemoteSandboxProvider {
             target_path: target_path.to_string(),
             tar_b64: base64::engine::general_purpose::STANDARD.encode(archive),
         };
-        self.call_ok(
+        self.upload_ok(
             "/agent/sandboxes/write-directory",
             &body,
             LIFECYCLE_TIMEOUT,
@@ -2184,7 +2287,49 @@ mod tests {
     type Seen = std::sync::Arc<tokio::sync::Mutex<Option<serde_json::Value>>>;
     type Reply = std::sync::Arc<(u16, Option<serde_json::Value>)>;
 
+    /// The key of every fake worker built with [`serve`] and client built with
+    /// [`provider_at`]: `(private, public)`.
+    fn test_node_key() -> &'static (String, String) {
+        static KEY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| temps_core::worker_ingress::generate_ingress_key().unwrap())
+    }
+
+    /// What the real agent's middleware does, so a fake worker's handlers see
+    /// the JSON a sealed request holds.
+    async fn open_sealed_for_test(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        use axum::http::{header::CONTENT_TYPE, HeaderValue};
+        use temps_core::sealed_request::{open_request, SEALED_REQUEST_CONTENT_TYPE};
+        let sealed = request
+            .headers()
+            .get(CONTENT_TYPE)
+            .is_some_and(|value| value == SEALED_REQUEST_CONTENT_TYPE);
+        if !sealed {
+            return next.run(request).await;
+        }
+        let path = request.uri().path().to_string();
+        let (mut parts, body) = request.into_parts();
+        let envelope = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let opened = open_request(&test_node_key().0, &path, &envelope).unwrap();
+        parts
+            .headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        next.run(axum::extract::Request::from_parts(
+            parts,
+            axum::body::Body::from(opened),
+        ))
+        .await
+    }
+
     async fn serve(app: axum::Router) -> String {
+        serve_raw(app.layer(axum::middleware::from_fn(open_sealed_for_test))).await
+    }
+
+    /// [`serve`] for a fake worker that looks at the bytes on the wire.
+    async fn serve_raw(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2279,6 +2424,9 @@ mod tests {
             "tok".into(),
             reqwest::Client::new(),
         )
+        .with_sealing(temps_core::sealed_request::NodeSealing::Key(
+            test_node_key().1.clone(),
+        ))
     }
 
     fn remote_handle() -> SandboxHandle {
@@ -3578,5 +3726,240 @@ mod tests {
             let body = seen.lock().await.clone().unwrap();
             assert_eq!(body["image"], expected, "requested {requested:?}");
         }
+    }
+
+    /// The content type and raw body a fake worker last received.
+    type RecordedRequest = std::sync::Arc<tokio::sync::Mutex<Option<(String, Vec<u8>)>>>;
+
+    /// A fake worker on every route that records the raw request.
+    async fn recording_agent(status: u16) -> (String, RecordedRequest) {
+        use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
+        let seen: RecordedRequest = Default::default();
+        let recorded = seen.clone();
+        let app =
+            axum::Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                async move {
+                    let content_type = headers
+                        .get(CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    *recorded.lock().await = Some((content_type, body.to_vec()));
+                    StatusCode::from_u16(status).unwrap()
+                }
+            });
+        (serve_raw(app).await, seen)
+    }
+
+    fn secret_env() -> HashMap<String, String> {
+        HashMap::from([("API_KEY".to_string(), "sandbox-secret-value".to_string())])
+    }
+
+    #[tokio::test]
+    async fn sandbox_create_and_exec_environments_cross_the_wire_encrypted() {
+        use temps_core::sealed_request::{open_request, NodeSealing, SEALED_REQUEST_CONTENT_TYPE};
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (url, seen) = recording_agent(500).await;
+        let provider = provider_at(&url).with_sealing(NodeSealing::Key(public));
+
+        let mut config = create_config();
+        config.env_vars = secret_env();
+        let _ = provider.create(config).await;
+        let (content_type, body) = seen.lock().await.take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        assert!(!String::from_utf8_lossy(&body).contains("sandbox-secret-value"));
+        let opened = open_request(&private, "/agent/sandboxes", &body).unwrap();
+        assert!(String::from_utf8(opened)
+            .unwrap()
+            .contains("sandbox-secret-value"));
+
+        let _ = provider
+            .run_exec(
+                &remote_handle(),
+                vec!["env".to_string()],
+                secret_env(),
+                None,
+                false,
+            )
+            .await;
+        let (content_type, body) = seen.lock().await.take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        assert!(!String::from_utf8_lossy(&body).contains("sandbox-secret-value"));
+        assert!(open_request(&private, "/agent/sandboxes/exec", &body).is_ok());
+
+        let _ = provider
+            .run_exec_streamed(
+                &remote_handle(),
+                vec!["env".to_string()],
+                secret_env(),
+                None,
+                false,
+                None,
+            )
+            .await;
+        let (content_type, body) = seen.lock().await.take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE);
+        assert!(!String::from_utf8_lossy(&body).contains("sandbox-secret-value"));
+        assert!(open_request(&private, "/agent/sandboxes/exec-stream", &body).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_environment_is_not_sent_to_a_node_without_a_key() {
+        let provider = provider_at("http://127.0.0.1:9")
+            .with_sealing(temps_core::sealed_request::NodeSealing::NoKey);
+        let mut config = create_config();
+        config.env_vars = secret_env();
+        let error = provider.create(config).await.unwrap_err().to_string();
+        assert!(error.contains("no encryption key"), "{error}");
+
+        let error = provider
+            .run_exec(
+                &remote_handle(),
+                vec!["env".to_string()],
+                secret_env(),
+                None,
+                false,
+            )
+            .await
+            .err()
+            .expect("the exec must be refused")
+            .to_string();
+        assert!(error.contains("no encryption key"), "{error}");
+    }
+
+    const SANDBOX_SECRET: &str = "sandbox-secret-only-the-node-may-read";
+
+    /// Assert the recorded request is sealed for `path`, hides the secret, and
+    /// holds `expected` once opened.
+    async fn assert_sealed_for(seen: &RecordedRequest, private: &str, path: &str, expected: &str) {
+        use temps_core::sealed_request::{open_request, SEALED_REQUEST_CONTENT_TYPE};
+        let (content_type, body) = seen.lock().await.take().unwrap();
+        assert_eq!(content_type, SEALED_REQUEST_CONTENT_TYPE, "{path}");
+        assert!(
+            !String::from_utf8_lossy(&body).contains(SANDBOX_SECRET),
+            "{path}: the secret is readable on the wire"
+        );
+        let opened = String::from_utf8(open_request(private, path, &body).unwrap()).unwrap();
+        assert!(opened.contains(expected), "{path}: {opened}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_in_a_sandbox_command_crosses_the_wire_encrypted() {
+        use temps_core::sealed_request::NodeSealing;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let command = || vec!["login".to_string(), SANDBOX_SECRET.to_string()];
+
+        let (url, seen) = recording_agent(500).await;
+        let _ = provider_at(&url)
+            .with_sealing(NodeSealing::Key(public.clone()))
+            .run_exec(&remote_handle(), command(), HashMap::new(), None, false)
+            .await;
+        assert_sealed_for(&seen, &private, "/agent/sandboxes/exec", SANDBOX_SECRET).await;
+
+        let (url, seen) = recording_agent(500).await;
+        let _ = provider_at(&url)
+            .with_sealing(NodeSealing::Key(public))
+            .exec_streamed(&remote_handle(), command(), HashMap::new(), None)
+            .await;
+        assert_sealed_for(
+            &seen,
+            &private,
+            "/agent/sandboxes/exec-stream",
+            SANDBOX_SECRET,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_secret_file_written_into_a_sandbox_crosses_the_wire_encrypted() {
+        use base64::Engine;
+        use temps_core::sealed_request::NodeSealing;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (url, seen) = recording_agent(500).await;
+
+        let _ = provider_at(&url)
+            .with_sealing(NodeSealing::Key(public))
+            .write_file(
+                &remote_handle(),
+                "/home/temps/.auth.json",
+                SANDBOX_SECRET.as_bytes(),
+                0o600,
+            )
+            .await;
+
+        // Base64 in the body, so a raw search of the opened body would not find it.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(SANDBOX_SECRET);
+        assert_sealed_for(&seen, &private, "/agent/sandboxes/write-file", &encoded).await;
+    }
+
+    #[tokio::test]
+    async fn a_directory_of_resolved_secrets_crosses_the_wire_encrypted() {
+        use temps_core::sealed_request::NodeSealing;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (url, seen) = recording_agent(500).await;
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("settings.json"), SANDBOX_SECRET).unwrap();
+
+        let _ = provider_at(&url)
+            .with_sealing(NodeSealing::Key(public))
+            .write_directory(&remote_handle(), staging.path(), "/home/temps/.claude")
+            .await;
+
+        assert_sealed_for(
+            &seen,
+            &private,
+            "/agent/sandboxes/write-directory",
+            "/home/temps/.claude",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sandbox_files_are_not_sent_to_a_node_that_cannot_receive_them_sealed() {
+        use temps_core::sealed_request::NodeSealing;
+        let staging = tempfile::tempdir().unwrap();
+        for (sealing, expected) in [
+            (NodeSealing::NoKey, "no encryption key"),
+            (NodeSealing::PlainHttp, "plain http://"),
+        ] {
+            let provider = provider_at("http://127.0.0.1:9").with_sealing(sealing);
+            let error = provider
+                .write_file(&remote_handle(), "/x", SANDBOX_SECRET.as_bytes(), 0o600)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            let error = provider
+                .write_directory(&remote_handle(), staging.path(), "/x")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_created_without_values_stays_plain() {
+        let (url, seen) = recording_agent(500).await;
+        let _ = provider_at(&url).create(create_config()).await;
+        let (content_type, _) = seen.lock().await.take().unwrap();
+        assert_eq!(content_type, "application/json");
+    }
+
+    #[tokio::test]
+    async fn an_older_agent_gets_an_upgrade_message_for_a_sandbox() {
+        use temps_core::sealed_request::NodeSealing;
+        let (_, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (url, _) = recording_agent(415).await;
+        let mut config = create_config();
+        config.env_vars = secret_env();
+        let error = provider_at(&url)
+            .with_sealing(NodeSealing::Key(public))
+            .create(config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too old"), "{error}");
     }
 }

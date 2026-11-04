@@ -997,12 +997,11 @@ impl DockerImporter {
                 mounts
                     .iter()
                     .map(|mount| {
-                        use bollard::models::MountPointTypeEnum;
                         use temps_import_types::VolumeType;
-                        let volume_type = match &mount.typ {
-                            Some(MountPointTypeEnum::BIND) => VolumeType::Bind,
-                            Some(MountPointTypeEnum::VOLUME) => VolumeType::Volume,
-                            Some(MountPointTypeEnum::TMPFS) => VolumeType::Tmpfs,
+                        let volume_type = match mount.typ.as_deref() {
+                            Some("bind") => VolumeType::Bind,
+                            Some("volume") => VolumeType::Volume,
+                            Some("tmpfs") => VolumeType::Tmpfs,
                             _ => VolumeType::Volume, // Default to volume
                         };
                         VolumeMount {

@@ -576,7 +576,7 @@ impl MongodbService {
             mounts: Some(vec![bollard::models::Mount {
                 target: Some("/data/db".to_string()),
                 source: Some(volume_name),
-                typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
             }]),
             log_config: Some(crate::utils::default_service_log_config()),

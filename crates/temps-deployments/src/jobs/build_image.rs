@@ -210,6 +210,77 @@ pub(crate) fn build_inlined_variables<'a>(names: impl IntoIterator<Item = &'a st
     inlined
 }
 
+/// What a local build of a user's own Dockerfile does with its variables.
+#[derive(Default)]
+struct CustomDockerfileBuildArgs {
+    /// Not passed: Docker would keep the value in the final image's metadata.
+    withheld: Vec<String>,
+    /// Passed anyway, because `.temps.yaml` `build.secret_build_args` says so.
+    opted_in: Vec<String>,
+    /// The Dockerfile could not be analysed, so everything non-public counted.
+    unreadable: bool,
+    /// Served to the Dockerfile's `RUN --mount=type=secret` steps.
+    secrets: temps_deployer::BuildSecrets,
+    /// Secret mounts naming no variable of this build.
+    unmatched_secret_mounts: Vec<String>,
+}
+
+/// Decide what a user's own Dockerfile receives on a local build.
+///
+/// A value is at risk when the planner did not record it as public (so linked
+/// service credentials and platform tokens count, as they do for worker
+/// builds) and the Dockerfile declares it in the final stage or a stage that
+/// stage is built `FROM`. Framework-public variables end up in the client
+/// bundle anyway, and `BUILDKIT_*` arguments are settings rather than values.
+fn plan_custom_dockerfile_build_args(
+    dockerfile: &str,
+    build_args: &[(String, String)],
+    public_names: &BTreeSet<String>,
+    opted_in: &[String],
+) -> CustomDockerfileBuildArgs {
+    use temps_deployer::build_protocol::{
+        dockerfile_final_image_arg_names, dockerfile_secret_mount_ids,
+    };
+    let is_setting = |name: &str| name.to_ascii_uppercase().starts_with("BUILDKIT_");
+    let in_final_image = dockerfile_final_image_arg_names(dockerfile);
+    let mut plan = CustomDockerfileBuildArgs {
+        unreadable: in_final_image.is_none(),
+        ..Default::default()
+    };
+    for (name, _) in build_args {
+        let at_risk = !public_names.contains(name)
+            && !is_setting(name)
+            && build_inlined_variables([name.as_str()]).is_empty()
+            && in_final_image
+                .as_ref()
+                .is_none_or(|declared| declared.contains(name));
+        if at_risk {
+            if opted_in.contains(name) {
+                plan.opted_in.push(name.clone());
+            } else {
+                plan.withheld.push(name.clone());
+            }
+        }
+    }
+    plan.withheld.sort();
+    plan.opted_in.sort();
+
+    let mut secrets = std::collections::BTreeMap::new();
+    for id in dockerfile_secret_mount_ids(dockerfile) {
+        let value = build_args
+            .iter()
+            .find(|(name, value)| *name == id && !value.is_empty() && !is_setting(name));
+        match value {
+            Some((_, value)) => {
+                secrets.insert(id, value.clone());
+            }
+            None => plan.unmatched_secret_mounts.push(id),
+        }
+    }
+    plan.secrets = temps_deployer::BuildSecrets::new(secrets);
+    plan
+}
+
 fn validate_relative_build_path(path: &Path, label: &str) -> Result<(), WorkflowError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -915,6 +986,10 @@ pub struct BuildImageJob {
     /// browser Sentry DSN). Every other value -- secrets, linked-service
     /// credentials, platform tokens -- never leaves the control plane.
     /// Empty for a job planned before this existed: nothing is sent.
+    ///
+    /// A local build reads the same names to tell a public value from a secret
+    /// in a repository's own Dockerfile, so a build that falls back to the
+    /// control plane keeps them.
     worker_build_arg_keys: BTreeSet<String>,
     /// A mixed-architecture worker build: one worker per target platform,
     /// each building its own architecture natively, in parallel. Empty for
@@ -1063,7 +1138,6 @@ impl BuildImageJob {
         job.remote_builder_node_id = None;
         job.control_plane_copy = None;
         job.offload_fallback = None;
-        job.worker_build_arg_keys = BTreeSet::new();
         job.build_config.target_platforms = fallback.control_plane_target_platforms.clone();
         job.build_location_notice = Some(format!(
             "⚠️ Build location is set to 'node', but this build runs on the control plane: \
@@ -1749,7 +1823,7 @@ impl BuildImageJob {
         let nodes = self.worker_nodes_phrase(node_id);
         let plural = self.is_per_architecture_worker_build();
         use temps_deployer::build_protocol::{
-            dockerfile_build_arg_names, dockerfile_reads_build_arg,
+            dockerfile_build_arg_names, dockerfile_reads_build_arg, dockerfile_secret_mount_ids,
         };
         let contents = fs::read_to_string(dockerfile_path).map_err(WorkflowError::IoError)?;
         let shown = self
@@ -1757,6 +1831,25 @@ impl BuildImageJob {
             .dockerfile_path
             .as_deref()
             .unwrap_or("Dockerfile");
+        // A secret mount naming a withheld variable would silently be empty on
+        // the worker, unless it sets required=true, so it fails the same way.
+        let unserved: Vec<String> = dockerfile_secret_mount_ids(&contents)
+            .into_iter()
+            .filter(|id| split.withheld.contains(id))
+            .collect();
+        if !unserved.is_empty() {
+            let message = format!(
+                "Worker builds cannot serve secret values: '{shown}' mounts {} with \
+                 RUN --mount=type=secret, and secret values never leave the control plane, so \
+                 this build on {nodes} would find those mounts empty. On a server that builds \
+                 locally, set this environment's build location to the control plane, or read \
+                 the value when the container runs.",
+                name_list(&unserved),
+            );
+            self.log_with_level(context, LogLevel::Error, format!("ERROR: {message}"))
+                .await?;
+            return Err(WorkflowError::JobExecutionFailed(message));
+        }
         let declared = dockerfile_build_arg_names(&contents);
         let message = match &declared {
             Some(declared) => {
@@ -1823,6 +1916,85 @@ impl BuildImageJob {
                     received.len(),
                     if plural { "its own" } else { "its" },
                     name_list(&received)
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Say in the build log what a local build of a user's own Dockerfile did
+    /// with its secrets. Names only, never values.
+    async fn log_custom_dockerfile_build_args(
+        &self,
+        context: &WorkflowContext,
+        plan: &CustomDockerfileBuildArgs,
+    ) -> Result<(), WorkflowError> {
+        let shown = self
+            .build_config
+            .dockerfile_path
+            .as_deref()
+            .unwrap_or("Dockerfile");
+        if !plan.withheld.is_empty() {
+            let reason = if plan.unreadable {
+                format!(
+                    "Temps could not tell which stages of '{shown}' reach the final image (name \
+                     each ARG literally and close every heredoc), so none of them are passed"
+                )
+            } else {
+                format!(
+                    "'{shown}' declares them with ARG in its final stage, or a stage it is built \
+                     FROM, where Docker keeps the value in the image history"
+                )
+            };
+            self.log_with_level(
+                context,
+                LogLevel::Warning,
+                format!(
+                    "Secret build arguments not passed: {}. {reason}, so they are empty in this \
+                     build. To use a value while building: mount it with RUN \
+                     --mount=type=secret,id=NAME,env=NAME; or use it only in an earlier stage and \
+                     COPY --from the result; or read it when the container runs; or, to keep it \
+                     in the image knowingly, list it under build.secret_build_args in .temps.yaml.",
+                    name_list(&plan.withheld),
+                ),
+            )
+            .await?;
+        }
+        if !plan.opted_in.is_empty() {
+            self.log_with_level(
+                context,
+                LogLevel::Warning,
+                format!(
+                    "Passing secret build arguments as .temps.yaml build.secret_build_args asks: \
+                     {}. '{shown}' declares them where Docker keeps the value in the image \
+                     history, so anyone who can pull this image can read them.",
+                    name_list(&plan.opted_in),
+                ),
+            )
+            .await?;
+        }
+        let served: Vec<String> = plan.secrets.iter().map(|(name, _)| name.clone()).collect();
+        if !served.is_empty() {
+            self.log(
+                context,
+                format!(
+                    "Serving {} build secret(s) to '{shown}' through BuildKit secret mounts, \
+                     which leave nothing in the image: {}",
+                    served.len(),
+                    name_list(&served),
+                ),
+            )
+            .await?;
+        }
+        if !plan.unmatched_secret_mounts.is_empty() {
+            self.log_with_level(
+                context,
+                LogLevel::Warning,
+                format!(
+                    "'{shown}' mounts build secrets with no value in this environment: {}. Those \
+                     mounts are empty, or fail the build if they set required=true.",
+                    name_list(&plan.unmatched_secret_mounts),
                 ),
             )
             .await?;
@@ -2084,7 +2256,10 @@ impl BuildImageJob {
         self.ensure_npmrc(context, &build_context).await?;
 
         // A worker build receives only the values that may leave the control
-        // plane; a local build receives every value, as it always has.
+        // plane. A local build receives every value, except that a user's own
+        // Dockerfile does not get a secret where Docker would keep it in the
+        // image (see `plan_custom_dockerfile_build_args`).
+        let mut build_secrets = temps_deployer::BuildSecrets::default();
         let (mut build_args, buildkit_args) = match self
             .remote_builder_node_id
             .or(self.external_build.then_some(0))
@@ -2097,10 +2272,29 @@ impl BuildImageJob {
                 }
                 (split.sent.into_iter().collect::<Vec<_>>(), Vec::new())
             }
-            None => (
-                self.build_config.build_args.clone(),
-                self.build_config.build_args_buildkit.clone(),
-            ),
+            None => {
+                let mut build_args = self.build_config.build_args.clone();
+                if !dockerfile.generated {
+                    let contents =
+                        fs::read_to_string(&dockerfile_path).map_err(WorkflowError::IoError)?;
+                    let opted_in = self
+                        .load_temps_config(&build_context)?
+                        .and_then(|config| config.build)
+                        .and_then(|build| build.secret_build_args)
+                        .unwrap_or_default();
+                    let plan = plan_custom_dockerfile_build_args(
+                        &contents,
+                        &build_args,
+                        &self.worker_build_arg_keys,
+                        &opted_in,
+                    );
+                    self.log_custom_dockerfile_build_args(context, &plan)
+                        .await?;
+                    build_args.retain(|(name, _)| !plan.withheld.contains(name));
+                    build_secrets = plan.secrets;
+                }
+                (build_args, self.build_config.build_args_buildkit.clone())
+            }
         };
 
         // Merge preset build args with user-provided build args. User-provided
@@ -2218,6 +2412,7 @@ impl BuildImageJob {
             }
 
             let build_request = BuildRequest {
+                build_secrets: build_secrets.clone(),
                 cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
                 context_path: build_context.clone(),
@@ -2589,6 +2784,7 @@ impl BuildImageJob {
         .await?;
         let request = temps_deployer::BuildRequestWithCallback {
             request: BuildRequest {
+                build_secrets: Default::default(),
                 cache_from: self.build_config.cache_from.clone(),
                 image_name: tag.clone(),
                 context_path: build_context.to_path_buf(),
@@ -3337,6 +3533,12 @@ pub(crate) mod fake_worker {
         pub(crate) files: std::collections::BTreeMap<String, String>,
     }
 
+    /// The stand-in worker's key: `(private, public)`.
+    fn fake_worker_key() -> &'static (String, String) {
+        static KEY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| temps_core::worker_ingress::generate_ingress_key().expect("node key"))
+    }
+
     /// A running stand-in worker. Dropping it stops the server.
     pub(crate) struct FakeWorker {
         pub(crate) captured: Arc<Mutex<CapturedWorkerBuild>>,
@@ -3370,7 +3572,10 @@ pub(crate) mod fake_worker {
                 "worker-token".to_string(),
                 "worker-1".to_string(),
             )
-            .expect("remote deployer"),
+            .expect("remote deployer")
+            .with_sealing(temps_core::sealed_request::NodeSealing::Key(
+                fake_worker_key().1.clone(),
+            )),
         );
         FakeWorker {
             captured,
@@ -3398,11 +3603,25 @@ pub(crate) mod fake_worker {
         let Ok(Some(spec_field)) = multipart.next_field().await else {
             return refuse("expected spec field first".into());
         };
-        if spec_field.name() != Some("spec") {
+        let spec_is_sealed =
+            spec_field.name() == Some(temps_deployer::build_protocol::SEALED_BUILD_SPEC_FIELD);
+        if !spec_is_sealed && spec_field.name() != Some("spec") {
             return refuse("expected spec field first".into());
         }
-        let Ok(spec_json) = spec_field.text().await else {
+        let Ok(spec_bytes) = spec_field.bytes().await else {
             return refuse("unreadable spec".into());
+        };
+        let spec_json = if spec_is_sealed {
+            match temps_core::sealed_request::open_request(
+                &fake_worker_key().0,
+                temps_deployer::build_protocol::BUILD_PATH,
+                &spec_bytes,
+            ) {
+                Ok(opened) => String::from_utf8_lossy(&opened).to_string(),
+                Err(error) => return refuse(error.to_string()),
+            }
+        } else {
+            String::from_utf8_lossy(&spec_bytes).to_string()
         };
         let spec: temps_deployer::build_protocol::BuildSpec = match serde_json::from_str(&spec_json)
         {
@@ -4667,6 +4886,110 @@ mod tests {
         assert!(legacy.worker_build_args().variable_names().is_empty());
     }
 
+    fn custom_dockerfile_plan(
+        dockerfile: &str,
+        public: &[&str],
+        opted_in: &[&str],
+    ) -> CustomDockerfileBuildArgs {
+        let build_args: Vec<(String, String)> = [
+            "API_KEY",
+            "PUBLIC_URL_BASE",
+            "NEXT_PUBLIC_TOKEN",
+            "BUILDKIT_INLINE_CACHE",
+            "DATABASE_URL",
+        ]
+        .iter()
+        .map(|name| (name.to_string(), format!("value-of-{name}")))
+        .collect();
+        plan_custom_dockerfile_build_args(
+            dockerfile,
+            &build_args,
+            &public.iter().map(|name| name.to_string()).collect(),
+            &opted_in
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Issue #1725: a secret declared where Docker keeps it in the final image
+    /// is not passed.
+    #[test]
+    fn custom_dockerfile_final_stage_secret_is_withheld() {
+        let plan = custom_dockerfile_plan("FROM alpine\nARG API_KEY\nRUN build\n", &[], &[]);
+        assert_eq!(plan.withheld, vec!["API_KEY"]);
+        assert!(plan.opted_in.is_empty());
+        assert!(!plan.unreadable);
+    }
+
+    #[test]
+    fn custom_dockerfile_secret_in_a_parent_stage_is_withheld() {
+        let plan = custom_dockerfile_plan(
+            "FROM alpine AS base\nARG DATABASE_URL\nFROM base\nRUN build\n",
+            &[],
+            &[],
+        );
+        assert_eq!(plan.withheld, vec!["DATABASE_URL"]);
+    }
+
+    #[test]
+    fn custom_dockerfile_secret_used_only_in_an_earlier_stage_is_passed() {
+        let plan = custom_dockerfile_plan(
+            "FROM node AS build\nARG API_KEY\nRUN build\nFROM nginx\nCOPY --from=build /a /b\n",
+            &[],
+            &[],
+        );
+        assert!(plan.withheld.is_empty());
+    }
+
+    #[test]
+    fn custom_dockerfile_public_values_and_settings_are_unaffected() {
+        let plan = custom_dockerfile_plan(
+            "FROM alpine\nARG PUBLIC_URL_BASE\nARG NEXT_PUBLIC_TOKEN\nARG BUILDKIT_INLINE_CACHE\n",
+            &["PUBLIC_URL_BASE"],
+            &[],
+        );
+        assert!(plan.withheld.is_empty());
+    }
+
+    #[test]
+    fn custom_dockerfile_opt_in_passes_only_the_named_secret() {
+        let plan = custom_dockerfile_plan(
+            "FROM alpine\nARG API_KEY\nARG DATABASE_URL\n",
+            &[],
+            &["API_KEY"],
+        );
+        assert_eq!(plan.opted_in, vec!["API_KEY"]);
+        assert_eq!(plan.withheld, vec!["DATABASE_URL"]);
+    }
+
+    #[test]
+    fn custom_dockerfile_that_cannot_be_read_withholds_every_secret() {
+        let plan = custom_dockerfile_plan("FROM alpine\nARG $DYNAMIC\n", &["PUBLIC_URL_BASE"], &[]);
+        assert!(plan.unreadable);
+        assert_eq!(plan.withheld, vec!["API_KEY", "DATABASE_URL"]);
+    }
+
+    #[test]
+    fn custom_dockerfile_secret_mounts_are_served_only_when_asked_for() {
+        let plan = custom_dockerfile_plan(
+            "FROM alpine\nRUN --mount=type=secret,id=API_KEY,env=API_KEY build\n\
+             RUN --mount=type=secret,id=MISSING x\n\
+             RUN --mount=type=secret,id=BUILDKIT_INLINE_CACHE x\n",
+            &[],
+            &[],
+        );
+        let served: Vec<(&String, &String)> = plan.secrets.iter().collect();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, "API_KEY");
+        assert_eq!(served[0].1, "value-of-API_KEY");
+        assert_eq!(
+            plan.unmatched_secret_mounts,
+            vec!["BUILDKIT_INLINE_CACHE", "MISSING"]
+        );
+        assert!(plan.withheld.is_empty());
+    }
+
     #[test]
     fn build_inlined_variables_matches_framework_prefixes_only() {
         assert_eq!(
@@ -4970,6 +5293,53 @@ mod tests {
         let lines = logs.lines.lock().unwrap().join("\n");
         assert!(lines.contains("refused the build"), "{lines}");
         assert!(lines.contains("Builder is busy"), "{lines}");
+    }
+
+    /// A build that falls back to the control plane is planned like any local
+    /// build, so a public value reaches a repository's own Dockerfile and only
+    /// the secret is withheld.
+    #[tokio::test]
+    async fn a_control_plane_fallback_still_passes_public_values_to_a_custom_dockerfile() {
+        use temps_deployer::remote::BuildCapacity;
+        let worker = Arc::new(RecordingImageBuilder::default());
+        let control_plane = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .preset(StoredPreset::Dockerfile)
+            .build_args(vec![
+                ("API_KEY".into(), "synthetic-secret-1725".into()),
+                ("API_URL".into(), "https://api.example.test".into()),
+            ])
+            .worker_build_arg_keys(BTreeSet::from(["API_URL".to_string()]))
+            .offload_fallback(OffloadFallback::new(
+                Arc::new(FixedCapacity(BuildCapacity::Busy)),
+                7,
+                "builder-1",
+                Duration::from_secs(300),
+                control_plane.clone(),
+            ))
+            .remote_builder_node_id(7)
+            .target_platforms(vec!["linux/arm64".to_string()])
+            .build(worker.clone())
+            .unwrap();
+        let (_dir, _repo, context, logs) = worker_checkout(&[(
+            "Dockerfile",
+            "FROM alpine\nARG API_KEY\nARG API_URL\nRUN build\n",
+        )]);
+
+        job.execute(context).await.expect("the build succeeds");
+
+        assert!(worker.builds().is_empty(), "a busy node must get no build");
+        let request = control_plane.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.build_args["API_URL"], "https://api.example.test");
+        assert!(!request.build_args.contains_key("API_KEY"));
+        let lines = logs.lines.lock().unwrap().join("\n");
+        assert!(
+            lines.contains("Secret build arguments not passed: API_KEY."),
+            "{lines}"
+        );
     }
 
     /// The refusal leaves the checkout as it found it, so the second attempt
@@ -5479,6 +5849,189 @@ mod tests {
             class.code,
             crate::services::failure_classifier::DeploymentFailureCode::InvalidConfiguration
         );
+    }
+
+    /// Run the real job for a local build of `files`, with `API_KEY` secret and
+    /// `API_URL` public, and return what reached the builder.
+    async fn local_custom_dockerfile_build(files: &[(&str, &str)]) -> (BuildRequest, String) {
+        let (_dir, repo, context, logs) = worker_checkout(files);
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("custom:local".into())
+            .preset(StoredPreset::Dockerfile)
+            .build_args(vec![
+                ("API_KEY".into(), "synthetic-secret-1725".into()),
+                ("API_URL".into(), "https://api.example.test".into()),
+            ])
+            .worker_build_arg_keys(BTreeSet::from(["API_URL".to_string()]))
+            .build(builder.clone())
+            .unwrap();
+        job.build_image(&repo, &context).await.unwrap();
+        let request = builder.requests.lock().unwrap()[0].clone();
+        let log = logs.lines.lock().unwrap().join("\n");
+        assert!(!log.contains("synthetic-secret-1725"), "{log}");
+        (request, log)
+    }
+
+    /// Issue #1725: the value of a secret declared where Docker keeps it in the
+    /// image must not reach the builder, and the log must say why.
+    #[tokio::test]
+    async fn local_build_withholds_a_secret_declared_in_the_final_stage() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\nARG API_KEY\nARG API_URL\nRUN build\n",
+        )])
+        .await;
+        assert!(!request.build_args.contains_key("API_KEY"));
+        assert_eq!(request.build_args["API_URL"], "https://api.example.test");
+        assert!(
+            log.contains("Secret build arguments not passed: API_KEY"),
+            "{log}"
+        );
+        assert!(log.contains("build.secret_build_args"), "{log}");
+        assert!(log.contains("type=secret"), "{log}");
+        assert!(log.contains("COPY --from"), "{log}");
+    }
+
+    /// Docker reads `API_KEY` as the argument of `ARG` here, past a continuation
+    /// that stands alone on its line.
+    #[tokio::test]
+    async fn local_build_withholds_a_secret_declared_past_a_standalone_continuation() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\nARG \\\n\\\nAPI_KEY\nRUN build\n",
+        )])
+        .await;
+        assert!(!request.build_args.contains_key("API_KEY"));
+        assert!(
+            log.contains("Secret build arguments not passed: API_KEY"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_build_keeps_passing_a_secret_used_only_in_an_earlier_stage() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM node AS build\nARG API_KEY\nRUN build\nFROM nginx\nCOPY --from=build /a /b\n",
+        )])
+        .await;
+        assert_eq!(request.build_args["API_KEY"], "synthetic-secret-1725");
+        assert!(!log.contains("not passed"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn local_build_passes_an_opted_in_secret_with_a_warning() {
+        let (request, log) = local_custom_dockerfile_build(&[
+            ("Dockerfile", "FROM alpine\nARG API_KEY\nRUN build\n"),
+            (".temps.yaml", "build:\n  secret_build_args: [API_KEY]\n"),
+        ])
+        .await;
+        assert_eq!(request.build_args["API_KEY"], "synthetic-secret-1725");
+        assert!(log.contains("anyone who can pull this image"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn local_build_serves_a_secret_mount_but_not_its_final_stage_arg() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\nARG API_KEY\n\
+             RUN --mount=type=secret,id=API_KEY,env=API_KEY build\n",
+        )])
+        .await;
+        assert!(!request.build_args.contains_key("API_KEY"));
+        let served: Vec<_> = request.build_secrets.iter().collect();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, "API_KEY");
+        assert_eq!(served[0].1, "synthetic-secret-1725");
+        assert!(log.contains("Serving 1 build secret"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn local_build_serves_a_secret_mount_named_by_its_source() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\n\
+             RUN --mount=type=secret,source=API_KEY,target=/run/secrets/key,required=true build\n",
+        )])
+        .await;
+        let served: Vec<_> = request.build_secrets.iter().collect();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, "API_KEY");
+        assert_eq!(served[0].1, "synthetic-secret-1725");
+        assert!(log.contains("Serving 1 build secret"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn local_build_serves_a_secret_mount_with_a_quoted_id() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\nRUN --mount=type=secret,id=\"API_KEY\",required=true build\n",
+        )])
+        .await;
+        let served: Vec<_> = request.build_secrets.iter().collect();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, "API_KEY");
+        assert!(log.contains("Serving 1 build secret"), "{log}");
+    }
+
+    /// Generated Dockerfiles declare these only in a build stage, so they keep
+    /// receiving every value.
+    #[tokio::test]
+    async fn local_build_of_a_generated_dockerfile_is_unchanged() {
+        let (args, public) = planned_build_args(StoredPreset::Vite);
+        let secret = args
+            .iter()
+            .find(|(name, _)| name == "DATABASE_URL")
+            .expect("the planner provides a secret variable")
+            .clone();
+        let (_dir, repo, context, logs) = worker_checkout(VITE_APP);
+        let builder = Arc::new(RecordingImageBuilder::default());
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("app:latest".into())
+            .preset(StoredPreset::Vite)
+            .build_args(args)
+            .worker_build_arg_keys(public)
+            .build(builder.clone())
+            .unwrap();
+        job.build_image(&repo, &context).await.unwrap();
+        let request = builder.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.build_args[&secret.0], secret.1);
+        assert!(request.build_secrets.is_empty());
+        assert!(!logs.lines.lock().unwrap().join("\n").contains("not passed"));
+    }
+
+    #[tokio::test]
+    async fn user_dockerfile_secret_mount_for_a_secret_is_refused_on_a_worker() {
+        let worker = fake_worker::spawn().await;
+        let (_dir, repo, context, _logs) = worker_checkout(&[(
+            "Dockerfile",
+            "FROM node:22-alpine\nRUN --mount=type=secret,id=DATABASE_URL build\n",
+        )]);
+        let (args, public) = planned_build_args(StoredPreset::Dockerfile);
+        let job = BuildImageJobBuilder::new()
+            .job_id("build".into())
+            .download_job_id("download_repo".into())
+            .image_tag("custom:worker".into())
+            .preset(StoredPreset::Dockerfile)
+            .remote_builder_node_id(7)
+            .build_args(args)
+            .worker_build_arg_keys(public)
+            .build(worker.deployer.clone())
+            .unwrap();
+        let error = job.build_image(&repo, &context).await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Worker builds cannot serve"), "{message}");
+        assert!(message.contains("DATABASE_URL"), "{message}");
+        assert!(
+            !message.contains("synthetic-database_url-value"),
+            "{message}"
+        );
+        assert!(worker.captured.lock().unwrap().spec.is_none());
     }
 
     #[tokio::test]
