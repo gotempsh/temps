@@ -2531,6 +2531,23 @@ impl DeployImageJob {
         }
     }
 
+    /// Find an available port on the host machine
+    fn find_available_port() -> Result<u16, WorkflowError> {
+        use std::net::TcpListener;
+
+        // Bind to 0.0.0.0:0 to match Docker's binding address and avoid port collisions
+        // where a port appears free on 127.0.0.1 but is occupied on 0.0.0.0
+        let listener = TcpListener::bind("0.0.0.0:0")
+            .map_err(|e| WorkflowError::Other(format!("Failed to find available port: {}", e)))?;
+
+        let port = listener
+            .local_addr()
+            .map_err(|e| WorkflowError::Other(format!("Failed to get port: {}", e)))?
+            .port();
+
+        Ok(port)
+    }
+
     /// Resolve the actual container port to expose
     ///
     /// Priority order:

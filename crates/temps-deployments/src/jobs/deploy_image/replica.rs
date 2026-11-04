@@ -13,6 +13,7 @@
 use super::*;
 use temps_core::repo_config::HealthCheckConfig;
 use temps_deployer::DeployResult;
+use temps_providers::externalsvc::port_util::is_port_conflict_error;
 
 use crate::services::NodeAssignment;
 
@@ -101,6 +102,17 @@ fn replica_labels(context: &WorkflowContext, service_name: &str) -> HashMap<Stri
         context.deployment_id.to_string(),
     );
     labels
+}
+
+/// How many host ports a local replica tries before its deployment fails.
+const LOCAL_HOST_PORT_ATTEMPTS: u32 = 3;
+
+/// Whether this request names a host port, rather than letting Docker pick one.
+fn has_a_picked_host_port(request: &DeployRequest) -> bool {
+    request
+        .port_mappings
+        .iter()
+        .any(|mapping| mapping.host_port != 0)
 }
 
 /// Where the control plane reaches a replica: a remote node through its
@@ -395,20 +407,36 @@ impl DeployImageJob {
         })
     }
 
-    /// Publish the container port on a host port Docker picks while creating
-    /// the container, bound to the node's private address on a remote node.
-    /// The create result reports the port it chose. Choosing one here instead
-    /// would leave it free for anything to take until Docker bound it.
+    /// Publish the container port. For local deployments, allocate a port on
+    /// this host: the route and the proxy use the recorded port, and Docker can
+    /// give a dynamic binding a new port each time the container starts. For
+    /// remote deployments, set host_port=0 so Docker on the agent picks an
+    /// available port, bound to the node's private address.
     async fn replica_port_mappings(
         &self,
         context: &WorkflowContext,
         assignment: &NodeAssignment,
         container_port: Option<u16>,
     ) -> Result<Vec<PortMapping>, WorkflowError> {
+        let host_port = if assignment.is_local() && container_port.is_some() {
+            Self::find_available_port()?
+        } else {
+            0
+        };
         self.log(
             context,
             format!(
-                "🔌 Requesting dynamic host port → container port: {}",
+                "🔌 {} host port: {} → container port: {}",
+                if assignment.is_local() {
+                    "Allocated"
+                } else {
+                    "Requesting dynamic"
+                },
+                if host_port == 0 {
+                    "auto".to_string()
+                } else {
+                    host_port.to_string()
+                },
                 container_port
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "none (background worker)".to_string())
@@ -422,7 +450,7 @@ impl DeployImageJob {
             .transpose()?;
         Ok(container_port
             .map(|container_port| PortMapping {
-                host_port: 0,
+                host_port,
                 container_port,
                 protocol: Protocol::Tcp,
                 host_ip,
@@ -545,12 +573,45 @@ impl DeployImageJob {
     /// Nothing fallible may run between the create and `track_container`.
     async fn create_tracked_container(
         &self,
-        request: DeployRequest,
+        mut request: DeployRequest,
         deployer: &Arc<dyn ContainerDeployer>,
     ) -> Result<DeployResult, WorkflowError> {
-        let deploy_result = deployer.deploy_container(request).await.map_err(|e| {
-            WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
-        })?;
+        let mut attempt = 1;
+        let deploy_result = loop {
+            match deployer.deploy_container(request.clone()).await {
+                Ok(result) => break result,
+                // The port this job picked is free until Docker binds it, so
+                // something else can take it first. A dynamic binding (port 0)
+                // has no port to pick again.
+                Err(error)
+                    if attempt < LOCAL_HOST_PORT_ATTEMPTS
+                        && has_a_picked_host_port(&request)
+                        && is_port_conflict_error(&error.to_string()) =>
+                {
+                    let host_port = Self::find_available_port()?;
+                    tracing::warn!(
+                        container = %request.container_name,
+                        attempt,
+                        host_port,
+                        error = %error,
+                        "Replica's host port was taken before Docker could bind it; retrying with \
+                         another port"
+                    );
+                    for mapping in &mut request.port_mappings {
+                        if mapping.host_port != 0 {
+                            mapping.host_port = host_port;
+                        }
+                    }
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(WorkflowError::JobExecutionFailed(format!(
+                        "Failed to deploy container: {}",
+                        error
+                    )));
+                }
+            }
+        };
 
         // Store both the ID and its owning deployer before status checks,
         // startup log streaming, health checks, or ANY other fallible work —
@@ -1112,6 +1173,8 @@ mod tests {
     #[derive(Default)]
     struct ScriptedDeployer {
         create_error: Option<String>,
+        /// Failures for the next create calls, before `create_error` applies.
+        create_errors: Mutex<VecDeque<String>>,
         docker_socket_mounted: bool,
         /// Host port the agent reports it picked; the request's otherwise.
         reported_host_port: Option<u16>,
@@ -1164,6 +1227,9 @@ mod tests {
             request: DeployRequest,
         ) -> Result<DeployResult, DeployerError> {
             self.requests.lock().unwrap().push(request.clone());
+            if let Some(reason) = self.create_errors.lock().unwrap().pop_front() {
+                return Err(DeployerError::Other(reason));
+            }
             if let Some(reason) = &self.create_error {
                 return Err(DeployerError::Other(reason.clone()));
             }
@@ -1542,10 +1608,28 @@ mod tests {
         assert_eq!(env["TEMPS_REPLICA"], "1");
     }
 
+    // Create phase.
+
+    const PORT_TAKEN: &str = "failed to bind host port for 0.0.0.0:41000: address already in use";
+
     #[tokio::test]
-    async fn a_local_replica_lets_docker_pick_its_host_port() {
+    async fn a_local_replica_pins_a_host_port_so_a_restart_cannot_move_it() {
+        let deployer = Arc::new(ScriptedDeployer::default());
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+            .await
+            .expect("a replica with no health path is ready once running");
+
+        let requests = deployer.requests.lock().unwrap();
+        assert_ne!(requests[0].port_mappings[0].host_port, 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_replica_that_loses_its_port_retries_on_another() {
         let deployer = Arc::new(ScriptedDeployer {
-            reported_host_port: Some(49000),
+            create_errors: Mutex::new(VecDeque::from([PORT_TAKEN.to_string()])),
             ..ScriptedDeployer::default()
         });
         let job = builder().build(deployer.clone()).unwrap();
@@ -1553,20 +1637,69 @@ mod tests {
 
         let (_, host_port, _) = deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
             .await
-            .expect("a replica with no health path is ready once running");
+            .expect("the second port is free");
 
         let requests = deployer.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let retried = requests[1].port_mappings[0].host_port;
+        assert_ne!(retried, 0);
         assert_eq!(
-            requests[0].port_mappings[0].host_port, 0,
-            "a port chosen before the create call can be taken before Docker binds it"
-        );
-        assert_eq!(
-            host_port, 49000,
-            "the port Docker chose is the one reported"
+            host_port, retried,
+            "the port it ended up on is the one reported"
         );
     }
 
-    // Create phase.
+    #[tokio::test]
+    async fn a_local_replica_stops_retrying_when_ports_keep_being_taken() {
+        let deployer = Arc::new(ScriptedDeployer {
+            create_error: Some(PORT_TAKEN.to_string()),
+            ..ScriptedDeployer::default()
+        });
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        let error = deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(deployer.creations(), LOCAL_HOST_PORT_ATTEMPTS as usize);
+        assert!(
+            error.to_string().contains("address already in use"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_lost_port_makes_a_local_replica_retry() {
+        let deployer = Arc::new(ScriptedDeployer {
+            create_error: Some("no space left on device".to_string()),
+            ..ScriptedDeployer::default()
+        });
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(deployer.creations(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_remote_replica_has_no_picked_port_to_retry() {
+        let deployer = Arc::new(ScriptedDeployer {
+            create_error: Some(PORT_TAKEN.to_string()),
+            ..ScriptedDeployer::default()
+        });
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        deploy(&job, &context, &deployer, &remote_on("127.0.0.1"), false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(deployer.creations(), 1);
+    }
 
     #[tokio::test]
     async fn a_failed_create_leaves_nothing_tracked() {
