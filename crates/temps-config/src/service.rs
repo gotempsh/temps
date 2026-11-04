@@ -519,10 +519,10 @@ impl ServerConfig {
         let auth_secret = installation_secrets.auth_secret;
         let encryption_key = installation_secrets.encryption_key;
 
-        // Get console address - use a random available port
+        // Get console address - hold a random available port until it is served
         let console_address = match console_address {
             Some(address) => address,
-            None => Self::get_random_console_address()?,
+            None => crate::loopback_reservation::reserve_loopback_address()?,
         };
 
         // Admin listener (opt-in). When unset, the existing single-listener
@@ -661,7 +661,8 @@ impl ServerConfig {
     /// only bound when `--console-ingress-address` names one.
     pub fn with_default_ingress_listener(mut self) -> std::io::Result<Self> {
         if self.public_surface_address().is_none() {
-            self.console_ingress_address = Some(Self::get_random_console_address()?);
+            self.console_ingress_address =
+                Some(crate::loopback_reservation::reserve_loopback_address()?);
         }
         Ok(self)
     }
@@ -680,18 +681,6 @@ impl ServerConfig {
         self.console_ingress_address
             .as_deref()
             .filter(|address| !address.is_empty())
-    }
-
-    /// Get a random available port for console address
-    fn get_random_console_address() -> std::io::Result<String> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("Failed to reserve a random loopback port on 127.0.0.1: {e}"),
-            )
-        })?;
-        let port = listener.local_addr()?.port();
-        Ok(format!("127.0.0.1:{}", port))
     }
 
     // Helper methods
@@ -6827,6 +6816,48 @@ mod tests {
             .with_default_ingress_listener()
             .unwrap();
         assert!(blank.public_surface_address().is_some());
+    }
+
+    #[test]
+    fn a_random_console_port_stays_held_until_the_console_takes_it() {
+        let config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test".to_string(),
+            None,
+            None,
+        )
+        .expect("ServerConfig::new");
+
+        let error = std::net::TcpListener::bind(&config.console_address)
+            .expect_err("the console's port must stay held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        crate::loopback_reservation::take_reserved_socket(&config.console_address)
+            .expect("the console takes the socket that holds its port");
+    }
+
+    #[test]
+    fn a_random_ingress_port_stays_held_until_the_console_takes_it() {
+        let config = config_with_listeners(None, None)
+            .with_default_ingress_listener()
+            .unwrap();
+        let address = config.public_surface_address().unwrap();
+
+        let error =
+            std::net::TcpListener::bind(address).expect_err("the ingress port must stay held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        crate::loopback_reservation::take_reserved_socket(address)
+            .expect("the console takes the socket that holds its port");
+    }
+
+    #[test]
+    fn a_named_console_address_is_not_reserved() {
+        let config = test_config();
+
+        assert!(
+            crate::loopback_reservation::take_reserved_socket(&config.console_address).is_none()
+        );
     }
 
     /// Count occurrences of `needle` in every `.rs` file under `dir`, keyed by

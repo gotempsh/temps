@@ -106,6 +106,16 @@ enum LocalStartupMigrationError {
     },
 }
 
+/// Open the pool every subsystem of `temps serve` shares, sized by `TEMPS_DB_*`.
+/// Migrations run later, once startup has decided they may.
+async fn connect_server_database(
+    database_url: &str,
+) -> temps_core::ServiceResult<Arc<temps_database::DbConnection>> {
+    temps_database::connect_pooled(database_url)
+        .await
+        .map(Arc::new)
+}
+
 async fn run_local_mode_migrations(
     db: &sea_orm::DatabaseConnection,
     database_url: &str,
@@ -608,9 +618,7 @@ impl ServeCommand {
         } else {
             None
         };
-        let db = rt.block_on(temps_database::connect_without_migrations(
-            &self.database_url,
-        ))?;
+        let db = rt.block_on(connect_server_database(&self.database_url))?;
         let persisted_mode = rt.block_on(temps_config::installation_mode(db.as_ref()))?;
         if persisted_mode.is_stateless() && !bootstrap_stateless {
             rt.block_on(stateless::reject_local_mode_for_managed_database(
@@ -2059,6 +2067,46 @@ mod serve_profile_tests {
             ServeProfile::ControlPlane.as_str(),
             temps_core::PROFILE_CONTROL_PLANE
         );
+    }
+}
+
+#[cfg(test)]
+mod server_database_tests {
+    use super::*;
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test: an operator's pool settings change what this test expects"
+    )]
+    fn pool_settings_are_defaults() -> bool {
+        std::env::var_os("TEMPS_DB_MAX_CONNECTIONS").is_none()
+            && std::env::var_os("TEMPS_DB_MIN_CONNECTIONS").is_none()
+    }
+
+    #[tokio::test]
+    async fn the_server_pool_is_sized_by_the_documented_defaults() {
+        if !pool_settings_are_defaults() {
+            eprintln!("Skipping: TEMPS_DB_* pool settings are set in this environment");
+            return;
+        }
+        let database = match temps_test_utils::TestDatabase::new().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping server pool test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("server pool test database failed: {error}"),
+        };
+
+        let db = connect_server_database(&database.database_url)
+            .await
+            .unwrap();
+
+        let pool = db.get_postgres_connection_pool();
+        assert_eq!(pool.options().get_max_connections(), 100);
+        assert_eq!(pool.options().get_min_connections(), 5);
     }
 }
 

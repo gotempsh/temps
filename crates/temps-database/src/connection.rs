@@ -386,7 +386,8 @@ pub async fn connect_pooled(database_url: &str) -> ServiceResult<DbConnection> {
 /// Used by the standalone `temps migrate` command (which runs migrations
 /// explicitly afterwards) and by any caller that must not trigger schema
 /// changes. Performs the same connectivity check as [`connect_pooled`], with
-/// Sea-ORM's default pool.
+/// Sea-ORM's default pool of 10 connections, which ignores `TEMPS_DB_*`. A
+/// long-running server wants [`connect_pooled`].
 pub async fn connect_without_migrations(database_url: &str) -> ServiceResult<Arc<DbConnection>> {
     let (host, port) = parse_database_url(database_url)
         .map_err(|e| ServiceError::Database(format!("Invalid database URL: {}", e)))?;
