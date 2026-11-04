@@ -2052,8 +2052,10 @@ async fn test_kill_processes_term_and_kill() {
     // Kill with SIGTERM via our typed enum. The pattern names only the sleep
     // this test started: the sandbox keeps itself alive with `sleep infinity`,
     // which must outlive this, so counting every `sleep` never reaches zero.
+    // Anchored because `kill_processes` runs `pgrep -f` inside `sh -c`, whose
+    // own command line would otherwise contain the pattern and match too.
     provider
-        .kill_processes(&handle, "sleep 9999", crate::sandbox::KillSignal::Term)
+        .kill_processes(&handle, "^sleep 9999$", crate::sandbox::KillSignal::Term)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2106,7 +2108,7 @@ async fn test_kill_processes_term_and_kill() {
 
     // SIGKILL — cannot be trapped
     provider
-        .kill_processes(&handle, "sleep 9999", crate::sandbox::KillSignal::Kill)
+        .kill_processes(&handle, "^sleep 9999$", crate::sandbox::KillSignal::Kill)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
