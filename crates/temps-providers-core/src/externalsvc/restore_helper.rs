@@ -25,7 +25,8 @@
 use std::collections::HashMap;
 
 use bollard::query_parameters::{
-    ListContainersOptionsBuilder, RemoveContainerOptions, StopContainerOptions,
+    ListContainersOptionsBuilder, RemoveContainerOptions, RemoveContainerOptionsBuilder,
+    StopContainerOptions,
 };
 use bollard::Docker;
 use tracing::{info, warn};
@@ -226,9 +227,120 @@ pub async fn fence_restore_helpers(
     Ok(report)
 }
 
+/// How to remove a one-shot helper container. `v` takes along the anonymous
+/// volumes its image declares: the `mongo` and `postgres` images both have a
+/// `VOLUME`, so without it every run leaves one behind that nothing owns.
+/// Docker keeps named volumes whatever this says, so a service's data is safe.
+pub fn helper_container_removal() -> RemoveContainerOptions {
+    RemoveContainerOptionsBuilder::new()
+        .force(true)
+        .v(true)
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How many of `volumes` still exist. Only ever asked about volumes the
+    /// calling test created, so other work on the daemon cannot change it.
+    async fn surviving_volumes(docker: &Docker, volumes: &[&str]) -> usize {
+        let mut surviving = 0;
+        for volume in volumes {
+            if docker.inspect_volume(volume).await.is_ok() {
+                surviving += 1;
+            }
+        }
+        surviving
+    }
+
+    #[tokio::test]
+    async fn helper_removal_takes_anonymous_volumes_and_keeps_named_ones() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker unavailable, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+        crate::utils::pull_image_with_retry(&docker, "busybox:latest", None)
+            .await
+            .unwrap();
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let helper = format!("temps-helper-removal-test-{suffix}");
+        let named = format!("temps-helper-removal-test-{suffix}");
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&helper)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some("busybox:latest".to_string()),
+                    // As an image's `VOLUME` does: Docker makes up the name.
+                    volumes: Some(vec!["/anonymous".to_string()]),
+                    host_config: Some(bollard::models::HostConfig {
+                        binds: Some(vec![format!("{named}:/named")]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mounts = docker
+            .inspect_container(
+                &helper,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .unwrap()
+            .mounts
+            .unwrap_or_default();
+        let anonymous = mounts
+            .iter()
+            .find(|mount| mount.destination.as_deref() == Some("/anonymous"))
+            .and_then(|mount| mount.name.clone())
+            .expect("the container has an anonymous volume");
+        let volumes = [anonymous.as_str(), named.as_str()];
+        let before = surviving_volumes(&docker, &volumes).await;
+
+        let removed = docker
+            .remove_container(&helper, Some(helper_container_removal()))
+            .await;
+
+        let after = surviving_volumes(&docker, &volumes).await;
+        let anonymous_survived = docker.inspect_volume(&anonymous).await.is_ok();
+        // Only what this test created, whatever the assertions below decide.
+        if removed.is_err() {
+            let _ = docker
+                .remove_container(
+                    &helper,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+        for volume in volumes {
+            let _ = docker
+                .remove_volume(
+                    volume,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await;
+        }
+
+        removed.unwrap();
+        assert_eq!(before, 2, "the helper starts with both of its volumes");
+        assert!(!anonymous_survived, "the anonymous volume must go with it");
+        assert_eq!(after, 1, "the named volume must survive");
+    }
 
     #[test]
     fn labels_name_the_target_container() {

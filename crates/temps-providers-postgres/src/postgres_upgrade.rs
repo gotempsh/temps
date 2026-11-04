@@ -1020,10 +1020,7 @@ impl PostgresUpgradeOrchestrator {
             .docker
             .remove_container(
                 &dump_container,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(crate::externalsvc::restore_helper::helper_container_removal()),
             )
             .await;
 
@@ -1100,10 +1097,7 @@ impl PostgresUpgradeOrchestrator {
             .docker
             .remove_container(
                 &dump_container,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(crate::externalsvc::restore_helper::helper_container_removal()),
             )
             .await;
 
@@ -1276,10 +1270,7 @@ impl PostgresUpgradeOrchestrator {
             .docker
             .remove_container(
                 &restore_container,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(crate::externalsvc::restore_helper::helper_container_removal()),
             )
             .await;
 
@@ -1319,10 +1310,7 @@ impl PostgresUpgradeOrchestrator {
             .docker
             .remove_container(
                 &restore_container,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(crate::externalsvc::restore_helper::helper_container_removal()),
             )
             .await;
 

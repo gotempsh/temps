@@ -7,8 +7,8 @@ use super::error::{EngineError, Result};
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{
-    AttachContainerOptionsBuilder, InspectContainerOptions, RemoveContainerOptionsBuilder,
-    StopContainerOptions, WaitContainerOptionsBuilder,
+    AttachContainerOptionsBuilder, InspectContainerOptions, StopContainerOptions,
+    WaitContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -2110,7 +2110,7 @@ impl MongodbService {
                 .docker
                 .remove_container(
                     &sidecar_name,
-                    Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                    Some(crate::externalsvc::restore_helper::helper_container_removal()),
                 )
                 .await;
             return Err(EngineError::failed(
@@ -2152,7 +2152,7 @@ impl MongodbService {
                     let _ = docker
                         .remove_container(
                             &name,
-                            Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                            Some(crate::externalsvc::restore_helper::helper_container_removal()),
                         )
                         .await;
                 });
@@ -2228,7 +2228,7 @@ impl MongodbService {
             .docker
             .remove_container(
                 &sidecar_name,
-                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                Some(crate::externalsvc::restore_helper::helper_container_removal()),
             )
             .await;
 
