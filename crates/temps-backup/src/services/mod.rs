@@ -5,7 +5,6 @@ mod alerts;
 mod backup;
 mod capability;
 mod notifier;
-mod reconcile;
 mod restore;
 mod restore_cancel;
 mod restore_reconcile;
@@ -25,7 +24,6 @@ pub use backup::{
 };
 pub use capability::{BackupCapabilityError, ExternalServiceBackupCapability};
 pub use notifier::BackupNotificationAdapter;
-pub use reconcile::reconcile_orphan_backups;
 pub use restore::{
     BackupProducerServices, BackupSelector, PlanSourceBackup, PlanTarget, RestoreError,
     RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunSourceBackup, RestoreRunView,

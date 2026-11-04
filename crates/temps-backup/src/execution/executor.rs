@@ -15,8 +15,9 @@
 //!    any exit path (success / failure / panic / cancel / timeout) the row
 //!    leaves `running` and the task removes its map entry and releases the
 //!    permit.
-//! 4. On boot, [`reconcile_orphans_on_startup`] flips every `state='running'`
-//!    row to `failed("process restarted")` — the runtime is the source of
+//! 4. On boot, [`reconcile_orphans_on_startup`] flips every live row in
+//!    `backups` and `external_service_backups` to
+//!    `failed("process restarted")` — the runtime is the source of
 //!    truth, so anything the DB thinks is running but isn't in our HashMap
 //!    is definitively dead.
 //!
@@ -37,7 +38,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, Value as SValue};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement,
+    Value as SValue,
+};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -47,7 +51,7 @@ use temps_core::{BackupCompletedJob, BackupFailedJob, BackupStartedJob, Job, Job
 
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 use crate::execution::notifier::{BackupFailureContext, BackupFailureNotifier};
-use crate::execution::queue::mark_schedule_run_finished_if_done;
+use crate::execution::queue::{fail_live_backup, mark_schedule_run_finished_if_done};
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -361,41 +365,69 @@ impl BackupExecutor {
         }
     }
 
-    /// On boot, flip every `state='running'` row in `backups` to
-    /// `failed`. The previous process owned those tasks; we don't, so
-    /// they're dead by definition.
+    /// On boot, flip every live row in `backups` and
+    /// `external_service_backups` to `failed`. The previous process owned
+    /// those tasks; we don't, so they're dead by definition. `pending` rows
+    /// count too: the queue is in memory, so nothing will ever dispatch them.
+    ///
+    /// Child rows are matched on their own state, not through their parent, so
+    /// a child left live under an already-terminal parent is repaired as well.
     ///
     /// Same SQL as `reclaim_orphan_jobs_on_startup` but with terminal
     /// semantics (failed instead of pending) — the executor cannot
     /// "resume" a partially-completed backup, so the cleanest UX is to
     /// surface the failure and let the user re-trigger.
+    ///
+    /// Returns the number of `backups` rows flipped.
     pub async fn reconcile_orphans_on_startup(&self) -> Result<u64, sea_orm::DbErr> {
+        #[derive(FromQueryResult)]
+        struct FlippedCounts {
+            backups: i64,
+            children: i64,
+        }
+
         let sql = r#"
-UPDATE backups
-   SET state         = 'failed',
-       finished_at   = COALESCE(finished_at, NOW()),
-       error_message = COALESCE(error_message, 'Process restarted while backup was running')
- WHERE state IN ('pending', 'running')
+WITH failed_backups AS (
+    UPDATE backups
+       SET state         = 'failed',
+           finished_at   = COALESCE(finished_at, NOW()),
+           error_message = COALESCE(error_message, 'Process restarted while backup was running')
+     WHERE state IN ('pending', 'running')
+     RETURNING id
+), failed_children AS (
+    UPDATE external_service_backups
+       SET state         = 'failed',
+           finished_at   = COALESCE(finished_at, NOW()),
+           error_message = COALESCE(error_message, 'Process restarted while backup was running')
+     WHERE state IN ('pending', 'running')
+     RETURNING id
+)
+SELECT (SELECT COUNT(*) FROM failed_backups)  AS backups,
+       (SELECT COUNT(*) FROM failed_children) AS children
         "#;
 
-        let result = self
-            .inner
-            .db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                vec![],
-            ))
-            .await?;
+        let flipped = FlippedCounts::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![],
+        ))
+        .one(self.inner.db.as_ref())
+        .await?;
 
-        let n = result.rows_affected();
-        if n > 0 {
+        let (backups, children) = flipped.map_or((0, 0), |counts| {
+            (
+                u64::try_from(counts.backups).unwrap_or(0),
+                u64::try_from(counts.children).unwrap_or(0),
+            )
+        });
+        if backups > 0 || children > 0 {
             warn!(
-                count = n,
+                backups,
+                children,
                 "BackupExecutor: flipped orphan running/pending backups to failed on startup",
             );
         }
-        Ok(n)
+        Ok(backups)
     }
 
     // ── Internal ──────────────────────────────────────────────────────────
@@ -538,35 +570,7 @@ UPDATE external_service_backups
         backup_id: i32,
         reason: &str,
     ) -> Result<bool, sea_orm::DbErr> {
-        let sql = r#"
-WITH updated_backup AS (
-    UPDATE backups
-       SET state         = 'failed',
-           error_message = $1,
-           finished_at   = COALESCE(finished_at, NOW())
-     WHERE id            = $2
-       AND state IN ('pending', 'running')
-     RETURNING id
-), updated_children AS (
-    UPDATE external_service_backups
-       SET state         = 'failed',
-           error_message = $1,
-           finished_at   = COALESCE(finished_at, NOW())
-     WHERE backup_id IN (SELECT id FROM updated_backup)
-       AND state IN ('pending', 'running')
-)
-SELECT id FROM updated_backup
-        "#;
-        let transitioned = self
-            .inner
-            .db
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                vec![SValue::from(reason.to_owned()), SValue::from(backup_id)],
-            ))
-            .await?;
-        Ok(transitioned.is_some())
+        fail_live_backup(self.inner.db.as_ref(), backup_id, reason).await
     }
 
     /// Terminal failure for a task that has no caller left to report to: the
@@ -892,7 +896,7 @@ async fn run_with_retries(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -1389,7 +1393,7 @@ mod tests {
         assert!(sql.contains("compression_type = $3"));
     }
 
-    async fn setup_real_backup_pair(
+    pub(in crate::execution) async fn setup_real_backup_pair(
         db: &DatabaseConnection,
     ) -> (
         temps_entities::backups::Model,
@@ -1974,7 +1978,7 @@ mod tests {
         );
     }
 
-    /// The engine finishes after the row was failed: the failure and its
+    /// The engine finishes after the user cancelled: the failure and its
     /// reason survive on both tables, and no artifact is attached to them.
     #[tokio::test]
     async fn finalize_completed_keeps_a_failed_backup_failed_on_both_tables() {
@@ -1996,10 +2000,9 @@ mod tests {
             .mark_backup_running(backup.id)
             .await
             .expect("mark running");
-        executor
-            .mark_backup_failed(backup.id, "cancelled by user 7")
+        crate::execution::cancel_backup(db.as_ref(), backup.id, "cancelled by user 7")
             .await
-            .expect("fail the running backup");
+            .expect("cancel the running backup");
 
         executor
             .finalize_completed(backup.id, "postgres_walg", walg_outcome())
@@ -2028,10 +2031,10 @@ mod tests {
     async fn reconcile_orphans_on_startup_fails_every_live_backup() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 3,
-                }])
+                .append_query_results([[std::collections::BTreeMap::from([
+                    ("backups", SValue::from(3i64)),
+                    ("children", SValue::from(2i64)),
+                ])]])
                 .into_connection(),
         );
         let executor = BackupExecutorBuilder::new(db.clone()).build();
@@ -2043,10 +2046,117 @@ mod tests {
 
         assert_eq!(flipped, 3);
         let sql = executed_sql(executor, db);
+        assert!(sql.contains("UPDATE backups"), "{sql}");
+        assert!(sql.contains("UPDATE external_service_backups"), "{sql}");
         assert!(sql.contains("SET state         = 'failed'"), "{sql}");
         assert!(
             sql.contains("WHERE state IN ('pending', 'running')"),
             "{sql}"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphans_on_startup_reports_a_database_error() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+                .into_connection(),
+        );
+        let executor = BackupExecutorBuilder::new(db).build();
+
+        let error = executor
+            .reconcile_orphans_on_startup()
+            .await
+            .expect_err("the sweep fails");
+
+        assert!(error.to_string().contains("connection reset"), "{error}");
+    }
+
+    /// Nothing is left live in either table, including a child stranded under a
+    /// parent that is already terminal, and finished rows are left alone.
+    #[tokio::test]
+    async fn reconcile_orphans_on_startup_fails_parent_and_child_rows() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Docker/TestDatabase unavailable; skipping reconcile test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        // Interrupted mid-run.
+        let (running, running_child) = setup_real_backup_pair(db.as_ref()).await;
+        executor
+            .mark_backup_running(running.id)
+            .await
+            .expect("mark running");
+        // Queued, never dispatched.
+        let (pending, pending_child) = setup_real_backup_pair(db.as_ref()).await;
+        // Terminal parent over a child an earlier cancel left running.
+        let (stranded, stranded_child) = setup_real_backup_pair(db.as_ref()).await;
+        let mut parent: backups::ActiveModel = stranded.clone().into();
+        parent.state = Set("failed".to_string());
+        parent.error_message = Set(Some("cancelled by user 7".to_string()));
+        parent.update(db.as_ref()).await.expect("fail parent");
+        let mut child: external_service_backups::ActiveModel = stranded_child.clone().into();
+        child.state = Set("running".to_string());
+        child.update(db.as_ref()).await.expect("strand child");
+        // Finished: must not change.
+        let (finished, finished_child) = setup_real_backup_pair(db.as_ref()).await;
+        executor
+            .mark_backup_running(finished.id)
+            .await
+            .expect("mark running");
+        executor
+            .finalize_completed(finished.id, "postgres_walg", walg_outcome())
+            .await
+            .expect("complete");
+
+        let flipped = executor
+            .reconcile_orphans_on_startup()
+            .await
+            .expect("reconcile succeeds");
+
+        assert_eq!(flipped, 2, "the running and the pending parent");
+        let parents = backups::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("query parents");
+        let children = external_service_backups::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("query children");
+        let parent_of = |id: i32| {
+            parents
+                .iter()
+                .find(|row| row.id == id)
+                .expect("parent exists")
+        };
+        let child_of = |id: i32| {
+            children
+                .iter()
+                .find(|row| row.id == id)
+                .expect("child exists")
+        };
+        for id in [running.id, pending.id, stranded.id] {
+            assert_eq!(parent_of(id).state, "failed");
+        }
+        for id in [running_child.id, pending_child.id, stranded_child.id] {
+            let child = child_of(id);
+            assert_eq!(child.state, "failed");
+            assert!(child.finished_at.is_some());
+            assert!(child.error_message.is_some());
+        }
+        assert_eq!(
+            parent_of(stranded.id).error_message.as_deref(),
+            Some("cancelled by user 7"),
+            "an existing reason is kept",
+        );
+        assert_eq!(parent_of(finished.id).state, "completed");
+        assert_eq!(child_of(finished_child.id).state, "completed");
     }
 }

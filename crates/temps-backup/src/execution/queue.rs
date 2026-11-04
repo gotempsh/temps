@@ -5,8 +5,10 @@
 //! `BackupService`.
 //!
 //! What's here:
-//! - `cancel_backup` flips a `backups` row (and any stale `backup_jobs`
-//!   sibling rows) to `failed` with a caller-provided reason.
+//! - `fail_live_backup` atomically fails a live `backups` row and its
+//!   `external_service_backups` child rows.
+//! - `cancel_backup` applies that with a caller-provided reason and closes
+//!   the parent schedule run.
 //! - `cancel_schedule_run` cancels every non-terminal child of a
 //!   `schedule_runs` row by iterating `cancel_backup`.
 //! - `mark_schedule_run_finished_if_done` closes a `schedule_runs` row when
@@ -14,7 +16,7 @@
 //!
 //! Historical note: this file once hosted the queue-based BackupRunner's
 //! claim/lease/step-persist machinery. After the migration to the in-process
-//! `BackupExecutor` the runner went away; these three helpers survive because
+//! `BackupExecutor` the runner went away; these helpers survive because
 //! they operate on the `backups` and `schedule_runs` tables, which are
 //! orthogonal to the runner's execution model.
 
@@ -33,7 +35,44 @@ pub enum BackupQueueError {
     },
 }
 
-/// Cancel one backup. Idempotent: returns `rows_affected == 0` if the backup
+/// Atomically fail a live backup and its `external_service_backups` child
+/// rows. Returns whether the parent changed, which also holds for backup types
+/// that have no child row; `false` means it was already terminal.
+pub(crate) async fn fail_live_backup(
+    db: &DatabaseConnection,
+    backup_id: i32,
+    reason: &str,
+) -> Result<bool, sea_orm::DbErr> {
+    let sql = r#"
+WITH updated_backup AS (
+    UPDATE backups
+       SET state         = 'failed',
+           error_message = $1,
+           finished_at   = COALESCE(finished_at, NOW())
+     WHERE id            = $2
+       AND state IN ('pending', 'running')
+     RETURNING id
+), updated_children AS (
+    UPDATE external_service_backups
+       SET state         = 'failed',
+           error_message = $1,
+           finished_at   = COALESCE(finished_at, NOW())
+     WHERE backup_id IN (SELECT id FROM updated_backup)
+       AND state IN ('pending', 'running')
+)
+SELECT id FROM updated_backup
+    "#;
+    let transitioned = db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![SValue::from(reason.to_owned()), SValue::from(backup_id)],
+        ))
+        .await?;
+    Ok(transitioned.is_some())
+}
+
+/// Cancel one backup and its child rows. Idempotent: returns `0` if the backup
 /// was already terminal. After flipping rows, calls
 /// `mark_schedule_run_finished_if_done` so the parent `schedule_runs` row
 /// closes when this was the last live child.
@@ -42,42 +81,17 @@ pub async fn cancel_backup(
     backup_id: i32,
     reason: &str,
 ) -> Result<u64, BackupQueueError> {
-    use sea_orm::TransactionTrait;
-
-    let txn = db.begin().await.map_err(|e| BackupQueueError::Database {
-        operation: "cancel_backup:begin",
-        source: e,
-    })?;
-
-    let backup_sql = r#"
-UPDATE backups
-   SET state         = 'failed',
-       error_message = $1,
-       finished_at   = COALESCE(finished_at, NOW())
- WHERE id            = $2
-   AND state IN ('pending', 'running')
-    "#;
-
-    let result = txn
-        .execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            backup_sql,
-            vec![SValue::from(reason.to_owned()), SValue::from(backup_id)],
-        ))
-        .await
-        .map_err(|e| BackupQueueError::Database {
-            operation: "cancel_backup:update_backup",
-            source: e,
-        })?;
-
-    txn.commit().await.map_err(|e| BackupQueueError::Database {
-        operation: "cancel_backup:commit",
-        source: e,
-    })?;
+    let transitioned =
+        fail_live_backup(db, backup_id, reason)
+            .await
+            .map_err(|e| BackupQueueError::Database {
+                operation: "cancel_backup:update_backup",
+                source: e,
+            })?;
 
     mark_schedule_run_finished_if_done(db, backup_id).await?;
 
-    Ok(result.rows_affected())
+    Ok(u64::from(transitioned))
 }
 
 /// Cancel every non-terminal backup belonging to a `schedule_runs` row.
@@ -183,10 +197,15 @@ mod tests {
             .collect()
     }
 
+    fn transitioned(backup_id: i32) -> Vec<BTreeMap<&'static str, SValue>> {
+        vec![BTreeMap::from([("id", SValue::from(backup_id))])]
+    }
+
     #[tokio::test]
     async fn cancel_backup_fails_the_live_row_then_closes_its_schedule_run() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results([exec(1), exec(1)])
+            .append_query_results([transitioned(42)])
+            .append_exec_results([exec(1)])
             .into_connection();
 
         let flipped = cancel_backup(&db, 42, "cancelled by user 7")
@@ -197,6 +216,10 @@ mod tests {
         let statements = statements(&db.into_transaction_log());
         assert_eq!(statements.len(), 2, "{statements:?}");
         assert!(statements[0].0.contains("UPDATE backups"), "{statements:?}");
+        assert!(
+            statements[0].0.contains("UPDATE external_service_backups"),
+            "the child rows change in the same statement: {statements:?}"
+        );
         assert_eq!(
             statements[0].1,
             Some(Values(vec![
@@ -212,9 +235,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_backup_reports_nothing_flipped_for_a_terminal_backup() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<BTreeMap<&str, SValue>>::new()])
+            .append_exec_results([exec(0)])
+            .into_connection();
+
+        let flipped = cancel_backup(&db, 42, "cancelled by user 7")
+            .await
+            .expect("cancelling a finished backup is idempotent");
+
+        assert_eq!(flipped, 0);
+    }
+
+    /// A cancelled backup leaves no live row in either table, and a backup type
+    /// without a child row still reports the cancel.
+    #[tokio::test]
+    async fn cancel_backup_fails_the_parent_and_child_rows() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Docker/TestDatabase unavailable; skipping cancel test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) =
+            crate::execution::executor::tests::setup_real_backup_pair(db.as_ref()).await;
+        let mut running: external_service_backups::ActiveModel = child.clone().into();
+        running.state = Set("running".to_string());
+        running.update(db.as_ref()).await.expect("child running");
+
+        let flipped = cancel_backup(db.as_ref(), backup.id, "cancelled by user 7")
+            .await
+            .expect("cancel succeeds");
+
+        assert_eq!(flipped, 1);
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let cancelled_child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "failed");
+        assert_eq!(cancelled_child.state, "failed");
+        assert_eq!(
+            cancelled_child.error_message.as_deref(),
+            Some("cancelled by user 7")
+        );
+        assert!(cancelled_child.finished_at.is_some());
+
+        let again = cancel_backup(db.as_ref(), backup.id, "second cancel")
+            .await
+            .expect("idempotent");
+        assert_eq!(again, 0);
+
+        external_service_backups::Entity::delete_by_id(child.id)
+            .exec(db.as_ref())
+            .await
+            .expect("remove child");
+        let mut live: backups::ActiveModel = parent.into();
+        live.state = Set("running".to_string());
+        live.update(db.as_ref()).await.expect("reset fixture");
+        let parent_only = cancel_backup(db.as_ref(), backup.id, "parent only")
+            .await
+            .expect("cancel a backup with no child row");
+        assert_eq!(parent_only, 1);
+    }
+
+    #[tokio::test]
     async fn cancel_backup_names_the_failed_step_on_a_database_error() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors([DbErr::Custom("connection reset".to_string())])
+            .append_query_errors([DbErr::Custom("connection reset".to_string())])
             .into_connection();
 
         let error = cancel_backup(&db, 42, "cancelled by user 7")
@@ -234,7 +333,8 @@ mod tests {
                 BTreeMap::from([("id", SValue::from(9))]),
             ]])
             // Per child: the backup update, then the schedule-run close.
-            .append_exec_results([exec(1), exec(0), exec(1), exec(1)])
+            .append_query_results([transitioned(7), transitioned(9)])
+            .append_exec_results([exec(0), exec(1)])
             .into_connection();
 
         let cancelled = cancel_schedule_run(&db, 55, "schedule run cancelled")
