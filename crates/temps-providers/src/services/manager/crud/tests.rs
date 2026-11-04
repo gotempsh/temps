@@ -1087,6 +1087,121 @@ async fn upgrading_imported_postgres_answers_409_and_creates_nothing() {
     );
 }
 
+#[test]
+fn only_a_named_container_marks_a_service_as_imported() {
+    for (key, value, want) in [
+        (
+            "container_name",
+            serde_json::json!("operator-db"),
+            Some("operator-db"),
+        ),
+        ("container_name", serde_json::json!(""), None),
+        ("container_name", serde_json::json!(null), None),
+        ("port", serde_json::json!("5432"), None),
+    ] {
+        let parameters = HashMap::from([(key.to_string(), value)]);
+        assert_eq!(imported_container_name(&parameters), want, "{parameters:?}");
+    }
+}
+
+/// Deletes an imported service whose operator container is named `container`,
+/// and asserts the delete, the row and the container agree: the delete
+/// succeeds, the row is gone, and the container is still there.
+#[cfg(feature = "docker-tests")]
+async fn assert_deleting_imported_service_leaves_its_container(
+    manager: &ExternalServiceManager,
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+    container: &str,
+) {
+    const IMAGE: &str = "busybox:latest";
+    let docker = manager.require_docker().unwrap();
+    crate::utils::pull_image_with_retry(docker.as_ref(), IMAGE, None)
+        .await
+        .unwrap();
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                    .name(container)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(IMAGE.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let service =
+        insert_imported_service(manager, db, name, "mongodb", container, "mongo:7.0").await;
+
+    let deleted = manager.delete_service(service.id).await;
+    let row = external_services::Entity::find_by_id(service.id)
+        .one(db)
+        .await
+        .unwrap();
+    let survived = docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .is_ok();
+    let _ = docker
+        .remove_container(
+            container,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                    .force(true)
+                    .v(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    deleted.expect("deleting an imported service must succeed");
+    assert!(row.is_none(), "a successful delete must remove the row");
+    assert!(survived, "the operator's container must not be removed");
+}
+
+/// The reported case: the removal looked for the derived name, found nothing,
+/// and answered 500 for a delete that had already removed the row.
+#[cfg(feature = "docker-tests")]
+#[tokio::test]
+async fn deleting_imported_mongodb_succeeds_and_leaves_the_operators_container() {
+    let (manager, test_db) = setup_test_manager_or_skip!();
+    let name = format!("imported-delete-{}", uuid::Uuid::new_v4());
+    assert_deleting_imported_service_leaves_its_container(
+        &manager,
+        test_db.db.as_ref(),
+        &name,
+        &format!("operator-{name}"),
+    )
+    .await;
+}
+
+/// The operator's container may be named exactly what Temps would have derived.
+/// The engine's removal would then force-remove it, and its volume with it.
+#[cfg(feature = "docker-tests")]
+#[tokio::test]
+async fn deleting_imported_service_spares_a_container_under_the_derived_name() {
+    let (manager, test_db) = setup_test_manager_or_skip!();
+    let name = format!("imported-delete-{}", uuid::Uuid::new_v4());
+    let derived = manager
+        .create_service_instance(name.clone(), ServiceType::Mongodb)
+        .unwrap()
+        .get_docker_container_name();
+    assert_deleting_imported_service_leaves_its_container(
+        &manager,
+        test_db.db.as_ref(),
+        &name,
+        &derived,
+    )
+    .await;
+}
+
 #[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_delete_service() {

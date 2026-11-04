@@ -27,6 +27,17 @@ fn generated_schedule_loses_last_target(
     generated_kind.is_some() && remaining_targets == 0
 }
 
+/// The operator's container behind an imported service, as import stamped it
+/// into the stored parameters. Managed services have no such parameter.
+fn imported_container_name(
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<&str> {
+    parameters
+        .get("container_name")
+        .and_then(|name| name.as_str())
+        .filter(|name| !name.is_empty())
+}
+
 impl ExternalServiceManager {
     pub async fn get_service_by_name(
         &self,
@@ -991,6 +1002,15 @@ impl ExternalServiceManager {
         // once the row is gone.
         let parameters = self.get_service_parameters(service_id).await?;
 
+        // Deleting an imported service only forgets it. An engine's removal
+        // works on the derived name, which an imported service has no container
+        // under, or worse, one the operator happens to own.
+        let imported_container = service
+            .node_id
+            .is_none()
+            .then(|| imported_container_name(&parameters))
+            .flatten();
+
         // Delete from database first
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
@@ -1217,7 +1237,13 @@ impl ExternalServiceManager {
         } else {
             // Standalone: remove single container
             info!("Removing service {} container", service_id);
-            if let Some(node_id) = service.node_id {
+            if let Some(container) = imported_container {
+                info!(
+                    service_id,
+                    container,
+                    "Deregistered imported service; its container and volumes belong to the operator and were left in place"
+                );
+            } else if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
                 let service_instance = self.create_service_instance_for_parameters(
                     service.name.clone(),
@@ -1273,7 +1299,7 @@ impl ExternalServiceManager {
         // Best-effort. A missing legacy container is the normal case on any
         // install created after the fix, and a Docker hiccup here must not
         // turn an otherwise successful delete into a 500.
-        if service.node_id.is_none() {
+        if service.node_id.is_none() && imported_container.is_none() {
             for legacy_name in legacy_managed_instance_names(&service.name, service_type_enum) {
                 match self.create_service_instance(legacy_name.clone(), service_type_enum) {
                     Ok(instance) => match instance.remove().await {

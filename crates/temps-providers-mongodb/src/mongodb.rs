@@ -2857,11 +2857,22 @@ impl ExternalService for MongodbService {
                 }),
             )
             .await
-            .map_err(|e| {
-                EngineError::failed(
+            .or_else(|e| match e {
+                // Already gone is what removal asked for, and answering an
+                // error would fail a delete whose row is already deleted.
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => {
+                    info!("MongoDB container {} was already gone", container_name);
+                    Ok(())
+                }
+                e => Err(EngineError::failed(
                     &self.name,
-                    format!("Failed to remove MongoDB container: {}", e),
-                )
+                    format!(
+                        "Failed to remove MongoDB container {}: {}",
+                        container_name, e
+                    ),
+                )),
             })?;
 
         // Remove the volume
@@ -4113,6 +4124,25 @@ mod tests {
                 .map(|runtime| runtime.port.as_str()),
             Some(persisted_port.to_string().as_str())
         );
+    }
+
+    /// Removing a service whose container is already gone is not a failure.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn remove_succeeds_when_the_container_is_already_gone() {
+        let Ok(docker) = Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let name = format!("absent-{}", uuid::Uuid::new_v4().simple());
+        MongodbService::new(name, Arc::new(docker))
+            .remove()
+            .await
+            .unwrap();
     }
 
     /// An imported service is refused before any Docker call. This client has
