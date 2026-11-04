@@ -56,12 +56,11 @@ pub const PROVIDER_NAME: &str = "microsandbox";
 /// pair (`msb` + `libkrunfw`) installed by `temps microsandbox setup` is the
 /// matching release; the SDK refuses a mismatched pair.
 ///
-/// Must equal the exact `microsandbox` version pinned in
-/// `crates/temps-ai-agents/Cargo.toml`. A test in `sdk.rs` compares it with the
-/// SDK's own default runtime version so a dependency bump that forgets this
-/// constant fails CI instead of shipping a backend that installs a runtime
-/// the SDK then rejects.
-pub const MICROSANDBOX_VERSION: &str = "0.7.8";
+/// Must equal the exact `microsandbox` version pinned in the root `Cargo.toml`.
+/// A test in `sdk.rs` compares it with the SDK's own default runtime version so
+/// a dependency bump that forgets this constant fails CI instead of shipping a
+/// backend that installs a runtime the SDK then rejects.
+pub const MICROSANDBOX_VERSION: &str = "0.7.11";
 
 /// Console page that shows backend status and setup instructions.
 pub const SETUP_PATH: &str = "/agent-sandbox/sandbox";
