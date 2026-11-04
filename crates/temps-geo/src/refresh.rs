@@ -1052,6 +1052,19 @@ pub fn spawn_refresh_job(
 /// whatever the download cadence is. One `stat` a minute is not measurable.
 pub const DB_FILE_WATCH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long startup waits for missing geo databases before carrying on while
+/// they download. Long enough for a normal first download to be loaded straight
+/// away, short enough that a stalled one cannot keep the console down.
+pub const STARTUP_DOWNLOAD_WAIT: Duration = Duration::from_secs(30);
+
+/// When startup stops waiting for missing geo databases. There is one deadline
+/// per process, counted from the first caller, so the console's wait and plugin
+/// registration's wait do not add up.
+pub fn startup_download_deadline() -> std::time::Instant {
+    static DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *DEADLINE.get_or_init(|| std::time::Instant::now() + STARTUP_DOWNLOAD_WAIT)
+}
+
 /// Ensures at most one file watcher per process, for the same reason
 /// [`REFRESH_JOB_SPAWNED`] exists: the monolithic `temps serve` registers
 /// `GeoPlugin` twice (proxy registry and console registry) in one process.
@@ -1227,6 +1240,13 @@ fn watch_db_file(service: std::sync::Weak<GeoIpService>, path: PathBuf, interval
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn every_caller_shares_one_startup_download_deadline() {
+        let first = startup_download_deadline();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(startup_download_deadline(), first);
+    }
 
     /// Build an archive whose member names are written straight into the tar
     /// header, bypassing `Builder::append_data`'s own path validation. A

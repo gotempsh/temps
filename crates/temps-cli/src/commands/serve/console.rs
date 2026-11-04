@@ -1872,11 +1872,6 @@ async fn configured_maxmind_license_key(
     }
 }
 
-/// How long startup waits for missing geo databases before carrying on while
-/// they download. Long enough for a normal first download to be loaded straight
-/// away, short enough that a stalled one cannot keep the console down.
-const GEO_DOWNLOAD_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Make sure the optional geo databases are present, without letting a slow or
 /// stalled download hold up the console.
 async fn ensure_geolite2_databases(data_dir: &Path, license_key: Option<String>) {
@@ -1887,9 +1882,11 @@ async fn ensure_geolite2_databases(data_dir: &Path, license_key: Option<String>)
         ensure_geolite2_database(&city, license_key.as_deref()).await;
         ensure_geolite2_asn_database(&asn, license_key.as_deref()).await;
     };
-    if !finished_within(downloads, GEO_DOWNLOAD_STARTUP_WAIT).await {
+    let wait = temps_geo::refresh::startup_download_deadline()
+        .saturating_duration_since(std::time::Instant::now());
+    if !finished_within(downloads, wait).await {
         warn!(
-            wait_seconds = GEO_DOWNLOAD_STARTUP_WAIT.as_secs(),
+            wait_seconds = temps_geo::refresh::STARTUP_DOWNLOAD_WAIT.as_secs(),
             "GeoLite2 downloads are still running; starting without waiting for them. \
              Geolocation loads when the city database arrives. Datacenter traffic detection \
              needs a restart after the ASN database arrives"
