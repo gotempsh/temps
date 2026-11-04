@@ -67,10 +67,11 @@ pub mod test_utils;
 #[cfg(test)]
 mod runtime_provisioning_tests {
     use super::{
-        exact_named_container, is_container_not_found, missing_required_probe_credential,
-        resolve_managed_probe_target, sanitize_probe_result, set_runtime_container_name,
-        validate_managed_probe_target, validate_runtime_target, HealthProbeResult,
-        RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError, ServiceType,
+        apply_runtime_probe_address, exact_named_container, is_container_not_found,
+        missing_required_probe_credential, resolve_managed_probe_target, sanitize_probe_result,
+        set_runtime_container_name, validate_managed_probe_target, validate_runtime_target,
+        HealthProbeResult, RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError,
+        ServiceType,
     };
 
     #[test]
@@ -175,6 +176,55 @@ mod runtime_provisioning_tests {
                 config.parameters["host"], "localhost",
                 "published {published:?}"
             );
+        }
+    }
+
+    /// When Temps runs in a container, loopback is the Temps container, so a
+    /// probe of a managed service stored as `localhost:<published port>` must
+    /// dial the service container on the workload network instead.
+    #[test]
+    fn runtime_probe_address_replaces_a_loopback_target() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            let mut config = redis_config(serde_json::json!({"host": host, "port": "5765"}));
+            assert!(
+                apply_runtime_probe_address(
+                    &mut config,
+                    "redis-orders-cache".to_string(),
+                    "6379".to_string()
+                ),
+                "host {host} should be rewritten"
+            );
+            assert_eq!(config.parameters["host"], "redis-orders-cache");
+            assert_eq!(config.parameters["port"], "6379");
+        }
+
+        // No stored host means the provider default, localhost.
+        let mut config = redis_config(serde_json::json!({"port": "5765"}));
+        assert!(apply_runtime_probe_address(
+            &mut config,
+            "redis-orders-cache".to_string(),
+            "6379".to_string()
+        ));
+        assert_eq!(config.parameters["host"], "redis-orders-cache");
+        assert_eq!(config.parameters["port"], "6379");
+    }
+
+    /// A service configured with a non-loopback host is not a container on
+    /// this node's published loopback; its probe target must not be replaced.
+    #[test]
+    fn runtime_probe_address_keeps_a_non_loopback_target() {
+        for host in ["db.example.com", "10.42.0.22", "169.254.169.254"] {
+            let mut config = redis_config(serde_json::json!({"host": host, "port": "6380"}));
+            assert!(
+                !apply_runtime_probe_address(
+                    &mut config,
+                    "redis-orders-cache".to_string(),
+                    "6379".to_string()
+                ),
+                "host {host} must not be rewritten"
+            );
+            assert_eq!(config.parameters["host"], host);
+            assert_eq!(config.parameters["port"], "6380");
         }
     }
 
@@ -502,6 +552,29 @@ fn resolve_managed_probe_target(
         );
     }
     Ok(())
+}
+
+/// Point a node-local health probe at the runtime address the provider
+/// resolved (see [`ExternalService::health_probe_address`]).
+///
+/// Only a target stored as the owning node's loopback is rewritten: that is
+/// the host-published port of a container Temps manages. Any other stored
+/// host is left as is, so this never redirects a probe away from a host the
+/// service was configured with. Returns whether the target was rewritten.
+pub(crate) fn apply_runtime_probe_address(
+    config: &mut ServiceConfig,
+    host: String,
+    port: String,
+) -> bool {
+    if validate_managed_probe_target(config).is_err() {
+        return false;
+    }
+    let Some(parameters) = config.parameters.as_object_mut() else {
+        return false;
+    };
+    parameters.insert("host".to_string(), serde_json::Value::String(host));
+    parameters.insert("port".to_string(), serde_json::Value::String(port));
+    true
 }
 
 fn validate_managed_probe_target(
@@ -1994,6 +2067,24 @@ pub trait ExternalService: Send + Sync {
         Ok(HealthProbeResult::down(
             "health_probe not implemented for this service type",
         ))
+    }
+
+    /// Host and port a node-local health probe dials when this process runs
+    /// in `execution_environment`, or `None` to keep the stored target.
+    ///
+    /// The stored `host`/`port` are the port published on the host loopback.
+    /// That is reachable when Temps runs on the host, but when Temps itself
+    /// runs in a container (`ExecutionEnvironment::Docker`) loopback is the
+    /// Temps container, so the probe could never connect. Engines that know
+    /// their Docker-runtime address (container name and internal port on the
+    /// shared workload network) override this; the default keeps the stored
+    /// target.
+    fn health_probe_address(
+        &self,
+        _service_config: &ServiceConfig,
+        _execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<Option<(String, String)>> {
+        Ok(None)
     }
 
     /// Restart the service container so that a freshly stored `metrics_ingest_key`

@@ -1356,6 +1356,22 @@ impl ExternalService for S3Service {
         )
     }
 
+    fn health_probe_address(
+        &self,
+        service_config: &ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<Option<(String, String)>> {
+        match execution_environment {
+            temps_core::ExecutionEnvironment::Host => Ok(None),
+            temps_core::ExecutionEnvironment::Docker => self
+                .get_effective_address_for_environment(
+                    service_config.clone(),
+                    execution_environment,
+                )
+                .map(Some),
+        }
+    }
+
     fn get_docker_container_name(&self) -> String {
         self.get_container_name()
     }

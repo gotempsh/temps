@@ -7,7 +7,7 @@ use crate::externalsvc::{HealthProbeStatus, ServiceType};
 use crate::services::*;
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use temps_entities::{external_service_health_checks, external_services};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Format a `tokio_postgres::Error` (or any `std::error::Error`) by
 /// walking its `source()` chain. `tokio_postgres::Error::Display` only
@@ -752,6 +752,34 @@ impl ExternalServiceManager {
             service_type,
             &service_config.parameters,
         )?;
+        let mut service_config = service_config;
+        let execution_environment = temps_core::runtime::execution_environment_compatibility();
+        match service_instance.health_probe_address(&service_config, execution_environment) {
+            Ok(Some((host, port))) => {
+                if crate::externalsvc::apply_runtime_probe_address(
+                    &mut service_config,
+                    host.clone(),
+                    port.clone(),
+                ) {
+                    debug!(
+                        service_id = service.id,
+                        host = %host,
+                        port = %port,
+                        ?execution_environment,
+                        "Probing external service at its runtime address"
+                    );
+                }
+            }
+            Ok(None) => {}
+            // The error comes from parsing the stored configuration, which holds
+            // credentials, so it is not logged; the probe below reports the same
+            // invalid configuration through the provider's own error path.
+            Err(_) => warn!(
+                service_id = service.id,
+                ?execution_environment,
+                "Could not resolve the runtime health-probe address; probing the stored target"
+            ),
+        }
         service_instance
             .health_probe(service_config)
             .await
