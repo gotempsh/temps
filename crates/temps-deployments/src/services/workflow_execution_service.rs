@@ -2272,6 +2272,22 @@ impl WorkflowExecutionService {
         let mut total_containers_cleaned = 0;
 
         for deployment in previous_deployments {
+            let lifecycle_lock =
+                crate::jobs::mark_deployment_complete::environment_lifecycle_lock(environment_id);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let Some(deployment) = crate::jobs::mark_deployment_complete::deployment_still_swept(
+                self.db.as_ref(),
+                deployment.id,
+            )
+            .await?
+            else {
+                debug!(
+                    deployment_id = deployment.id,
+                    "Deployment changed state before teardown; leaving it as is"
+                );
+                continue;
+            };
+
             // Get all non-deleted containers for this deployment
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
@@ -2289,6 +2305,7 @@ impl WorkflowExecutionService {
                 containers.len()
             );
 
+            let mut removed_every_container = true;
             for container in containers {
                 match self.teardown_registered_container(container, false).await {
                     Ok(Some(container_id)) => {
@@ -2298,8 +2315,38 @@ impl WorkflowExecutionService {
                         }
                         total_containers_cleaned += 1;
                     }
-                    Ok(None) => {}
-                    Err(error) => warn!("Failed to teardown previous container: {error}"),
+                    // Another task claimed it, and that task may yet fail.
+                    Ok(None) => removed_every_container = false,
+                    Err(error) => {
+                        removed_every_container = false;
+                        warn!("Failed to teardown previous container: {error}");
+                    }
+                }
+            }
+
+            // Nothing is left running, so it is no longer active. Only after
+            // removing containers: a deployment with none may still be building,
+            // and one with a live row stays swept so the next deploy retries it.
+            // Guarded so a concurrent transition is not overwritten.
+            if removed_every_container {
+                let stopped = deployments::Entity::update_many()
+                    .col_expr(deployments::Column::State, Expr::value("stopped"))
+                    .col_expr(
+                        deployments::Column::UpdatedAt,
+                        Expr::value(chrono::Utc::now()),
+                    )
+                    .filter(deployments::Column::Id.eq(deployment.id))
+                    .filter(
+                        deployments::Column::State
+                            .is_in(crate::jobs::mark_deployment_complete::TEARDOWN_SWEPT_STATES),
+                    )
+                    .exec(self.db.as_ref())
+                    .await;
+                if let Err(error) = stopped {
+                    warn!(
+                        deployment_id = deployment.id,
+                        "Failed to mark a torn-down deployment stopped; the next deploy will: {error}"
+                    );
                 }
             }
         }
@@ -5288,6 +5335,33 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // Paused once this sweep has selected it, while it waits for the lock
+        // below: a resume needs its containers.
+        let pausing_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("pausing-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(8)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let pausing_container = deployment_containers::ActiveModel {
+            deployment_id: Set(pausing_deployment.id),
+            container_id: Set("pausing-container-1".to_string()),
+            container_name: Set("pausing-container-1".to_string()),
+            container_port: Set(Some(3000)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         // A failed readiness check retains its candidate for logs. The next
         // successful deployment must retire it just like the previous healthy
         // container, otherwise repeated failures leak live Docker resources.
@@ -5400,6 +5474,51 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // One container this sweep cannot reach, so the deployment still has a
+        // live row and must stay in a swept state for the next deploy to retry.
+        let unreachable_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("unreachable-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(9)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(unreachable_deployment.id),
+            container_id: Set("unreachable-container-1".to_string()),
+            container_name: Set("unreachable-container-1".to_string()),
+            container_port: Set(Some(3000)),
+            node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Older and still building: it has no containers yet, so there is
+        // nothing to say it is finished.
+        let building_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("building-deployment".to_string()),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(10)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         let legacy_retry_container = deployment_containers::ActiveModel {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("legacy-remote-failure".to_string()),
@@ -5495,11 +5614,70 @@ mod tests {
             docker,
         );
 
-        let stopped_container_id = service
-            .teardown_previous_deployment(project.id, environment.id, &current_deployment)
+        // The sweep waits for a pause holding the lifecycle lock, and what it
+        // selected before that is checked again once it gets the lock.
+        let lifecycle_lock =
+            crate::jobs::mark_deployment_complete::environment_lifecycle_lock(environment.id);
+        let pause_in_progress = lifecycle_lock.lock().await;
+        let teardown =
+            service.teardown_previous_deployment(project.id, environment.id, &current_deployment);
+        tokio::pin!(teardown);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut teardown)
+                .await
+                .is_err(),
+            "the sweep must wait for the lifecycle lock"
+        );
+        deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("paused"))
+            .filter(deployments::Column::Id.eq(pausing_deployment.id))
+            .exec(db.as_ref())
             .await?;
+        drop(pause_in_progress);
+        let stopped_container_id = teardown.await?;
 
         assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
+
+        let state_of = |id: i32| {
+            let db = db.clone();
+            async move {
+                deployments::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .map(|deployment| deployment.map(|deployment| deployment.state))
+            }
+        };
+        assert_eq!(
+            state_of(previous_deployment.id).await?.as_deref(),
+            Some("stopped"),
+            "a deployment with every container removed is no longer active"
+        );
+        assert_eq!(
+            state_of(resumed_deployment.id).await?.as_deref(),
+            Some("stopped")
+        );
+        assert_eq!(
+            state_of(unreachable_deployment.id).await?.as_deref(),
+            Some("completed"),
+            "a live container keeps the deployment in a swept state for a retry"
+        );
+        assert_eq!(
+            state_of(building_deployment.id).await?.as_deref(),
+            Some("running"),
+            "no container was removed, so nothing says this one is finished"
+        );
+        assert_eq!(
+            state_of(pausing_deployment.id).await?.as_deref(),
+            Some("paused")
+        );
+        let pausing_refreshed = deployment_containers::Entity::find_by_id(pausing_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("paused container row still exists");
+        assert!(
+            pausing_refreshed.deleted_at.is_none(),
+            "a resume needs the containers of a deployment paused during the sweep"
+        );
 
         let refreshed = deployment_containers::Entity::find_by_id(container.id)
             .one(db.as_ref())
