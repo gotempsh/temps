@@ -2053,8 +2053,12 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// Startup failure to connect is non-fatal — the TTL still refreshes the
     /// cache, just with up to 5s of latency. Mirrors the listener structure in
     /// `temps-routes::project_change_listener`.
+    ///
+    /// The task holds the service weakly. [`Drop`] is what stops it, and a strong
+    /// reference would keep that from ever running, leaving the task and its
+    /// database connection alive after everything else let go of the service.
     pub fn start_settings_listener(self: &std::sync::Arc<Self>) {
-        let service = self.clone();
+        let service = std::sync::Arc::downgrade(self);
         let database_url = self.get_database_url();
 
         let handle = tokio::spawn(async move {
@@ -2105,6 +2109,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             loop {
                 match pg_listener.recv().await {
                     Ok(_notification) => {
+                        let Some(service) = service.upgrade() else {
+                            return;
+                        };
                         service.invalidate_settings_cache().await;
                     }
                     Err(e) => {
@@ -2129,6 +2136,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
                         // Recovery: invalidate so a NOTIFY missed during the gap
                         // can't leave the cache holding stale settings.
+                        let Some(service) = service.upgrade() else {
+                            return;
+                        };
                         service.invalidate_settings_cache().await;
                     }
                 }
@@ -3674,6 +3684,48 @@ mod tests {
                 if operation == "testing config entropy"
                     && reason.contains("config entropy unavailable")
         ));
+    }
+
+    /// A server that accepts a connection and never answers holds the listener
+    /// where a real one would sit between events: running, with a socket open.
+    #[tokio::test]
+    async fn dropping_the_service_stops_its_settings_listener() {
+        use tokio::io::AsyncReadExt;
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            format!(
+                "postgresql://user:pass@{}/temps",
+                server.local_addr().unwrap()
+            ),
+            None,
+            Some("127.0.0.1:8000".to_string()),
+        )
+        .expect("ServerConfig::new");
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = Arc::new(ConfigService::new(Arc::new(config), Arc::new(db)));
+
+        service.start_settings_listener();
+        let (mut connection, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), server.accept())
+                .await
+                .expect("the listener should connect")
+                .unwrap();
+
+        let weak = Arc::downgrade(&service);
+        drop(service);
+        assert!(
+            weak.upgrade().is_none(),
+            "the listener must not keep the service alive"
+        );
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut buffer = [0u8; 1024];
+            while matches!(connection.read(&mut buffer).await, Ok(read) if read > 0) {}
+        })
+        .await;
+        assert!(closed.is_ok(), "the listener's connection was never closed");
     }
 
     fn test_config() -> Arc<ServerConfig> {

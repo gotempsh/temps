@@ -499,7 +499,7 @@ fn shared_runtime(
 /// moment, so it shows up as an occasional failed startup.
 ///
 /// Anything the work spawns also keeps running, such as the `settings_change`
-/// listener `ConfigPlugin` starts.
+/// listener `ConfigPlugin` starts, which stops when its `ConfigService` is dropped.
 fn block_on_refresh_runtime<F: Future>(future: F) -> Result<F::Output> {
     Ok(refresh_runtime()?.block_on(future))
 }
