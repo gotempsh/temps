@@ -10,9 +10,11 @@
 //! 2. The executor takes the global concurrency semaphore (default N=4),
 //!    holds a per-`backup_id` entry in an in-memory `HashMap` to prevent
 //!    duplicate spawns, then `tokio::spawn`s the engine task.
-//! 3. The task runs the engine to completion. On any exit path
-//!    (success / failure / panic / cancel / timeout) the `JobHandle`'s
-//!    `Drop` impl removes the map entry and releases the permit.
+//! 3. The task runs the engine to completion, in an inner task so a panic
+//!    surfaces as a failure instead of unwinding past the finalization. On
+//!    any exit path (success / failure / panic / cancel / timeout) the row
+//!    leaves `running` and the task removes its map entry and releases the
+//!    permit.
 //! 4. On boot, [`reconcile_orphans_on_startup`] flips every `state='running'`
 //!    row to `failed("process restarted")` — the runtime is the source of
 //!    truth, so anything the DB thinks is running but isn't in our HashMap
@@ -59,6 +61,9 @@ const DEFAULT_MAX_CONCURRENT: usize = 4;
 /// number, value = sleep duration before that attempt. Length is the
 /// implicit `max_attempts`.
 const RETRY_BACKOFFS_SECS: &[u64] = &[0, 30, 60, 120];
+
+/// How long a panicked engine's cleanup may hold up recording the failure.
+const PANIC_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 // ── Executor ─────────────────────────────────────────────────────────────────
 
@@ -457,7 +462,7 @@ UPDATE backups
 
             // Engine call with wall-clock timeout. Floor of 60s.
             let runtime_limit = Duration::from_secs(params.max_runtime_secs.max(60) as u64);
-            let outcome = run_with_retries(&engine, &ctx, runtime_limit).await;
+            let outcome = run_engine_catching_panics(engine, ctx, runtime_limit).await;
 
             match outcome {
                 Ok(o) => {
@@ -745,6 +750,74 @@ SELECT id FROM updated_backup
 }
 
 // ── Engine invocation with timeout + retries ────────────────────────────────
+
+/// Run the engine in its own task, turning a panic into a permanent failure so
+/// the caller finalizes the row and releases its in-flight entry as usual.
+///
+/// The panic message is left out of the returned reason because it ends up on
+/// the backup row, shown to users, and can embed connection strings or other
+/// values. The panic hook has already written it to the server log.
+async fn run_engine_catching_panics(
+    engine: Arc<dyn BackupEngine>,
+    ctx: BackupContext,
+    runtime_limit: Duration,
+) -> Result<BackupOutcome, BackupError> {
+    let run = {
+        let engine = Arc::clone(&engine);
+        let ctx = ctx.clone();
+        tokio::spawn(async move { run_with_retries(&engine, &ctx, runtime_limit).await })
+    };
+    let join_error = match run.await {
+        Ok(result) => return result,
+        Err(join_error) => join_error,
+    };
+
+    let backup_id = ctx.backup_id;
+    let engine_key = ctx.engine_key.clone();
+    let how = if join_error.is_panic() {
+        "panicked"
+    } else {
+        "was aborted"
+    };
+    error!(
+        backup_id,
+        engine = %engine_key,
+        how,
+        "BackupExecutor: engine task ended without a result",
+    );
+
+    // The panic skipped the cleanup `run_with_retries` does on an error. It
+    // gets its own task too: the same engine may panic again.
+    let cleanup = tokio::spawn(async move { engine.cleanup(&ctx).await });
+    match tokio::time::timeout(PANIC_CLEANUP_TIMEOUT, cleanup).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(cleanup_error))) => warn!(
+            backup_id,
+            engine = %engine_key,
+            error = %cleanup_error,
+            "BackupExecutor: cleanup failed after the engine task ended",
+        ),
+        Ok(Err(_)) => warn!(
+            backup_id,
+            engine = %engine_key,
+            "BackupExecutor: cleanup panicked after the engine task ended",
+        ),
+        Err(_) => warn!(
+            backup_id,
+            engine = %engine_key,
+            timeout_secs = PANIC_CLEANUP_TIMEOUT.as_secs(),
+            "BackupExecutor: cleanup is still running after the engine task ended; \
+             recording the failure without waiting for it",
+        ),
+    }
+
+    Err(BackupError::PermanentFailure {
+        reason: format!(
+            "Backup engine '{engine_key}' {how} while running backup {backup_id}; \
+             see the server log for details"
+        ),
+    })
+}
 
 async fn run_with_retries(
     engine: &Arc<dyn BackupEngine>,
@@ -1581,6 +1654,220 @@ mod tests {
         assert_eq!(child.metadata["engine"], "postgres");
         assert!(parent.finished_at.is_some());
         assert!(child.finished_at.is_some());
+    }
+
+    /// Panics on every run, with a message that must not reach the backup row.
+    #[derive(Default)]
+    struct PanickingEngine {
+        runs: AtomicUsize,
+        cleanups: AtomicUsize,
+    }
+
+    const PANIC_PAYLOAD: &str = "connection to postgres://user:hunter2@db failed";
+
+    #[async_trait]
+    impl BackupEngine for PanickingEngine {
+        fn engine(&self) -> &'static str {
+            "panicking"
+        }
+
+        async fn run(&self, _ctx: &BackupContext) -> Result<BackupOutcome, BackupError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            panic!("{PANIC_PAYLOAD}");
+        }
+
+        async fn cleanup(&self, _ctx: &BackupContext) -> Result<(), BackupError> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn panicking_params(backup_id: i32) -> SpawnParams {
+        SpawnParams {
+            backup_id,
+            engine: "panicking".to_string(),
+            params: serde_json::json!({}),
+            max_runtime_secs: 3600,
+        }
+    }
+
+    async fn wait_until_nothing_is_in_flight(executor: &BackupExecutor) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !executor.inner.in_flight.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the in-flight entry is released");
+    }
+
+    /// A panic goes down the normal failure path: the row is failed, the
+    /// operator hears about it, the entry and the slot are released, and the
+    /// engine gets its cleanup. A retry would only panic again.
+    #[tokio::test]
+    async fn an_engine_panic_goes_through_the_failure_path() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "id",
+                    SValue::from(42),
+                )])]])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 2,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                ])
+                .into_connection(),
+        );
+        let engine = Arc::new(PanickingEngine::default());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .with_max_concurrent(1)
+            .register_engine(engine.clone())
+            .with_notifier(Arc::new(CapturingNotifier(sender)))
+            .build();
+
+        executor
+            .spawn(panicking_params(42))
+            .await
+            .expect("the task starts");
+        wait_until_nothing_is_in_flight(&executor).await;
+
+        let notification = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("failure notification arrives")
+            .expect("notification present");
+        assert_eq!(notification.backup_id, 42);
+        assert!(
+            notification.error_message.contains("panicked"),
+            "{}",
+            notification.error_message,
+        );
+        assert!(
+            !notification.error_message.contains("hunter2"),
+            "the panic message must stay out of the row: {}",
+            notification.error_message,
+        );
+        assert_eq!(
+            engine.runs.load(Ordering::SeqCst),
+            1,
+            "a panic is not retried"
+        );
+        assert_eq!(engine.cleanups.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.inner.semaphore.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the concurrency slot is released");
+
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        assert!(
+            log.iter()
+                .flat_map(|txn| txn.statements().iter())
+                .any(|statement| statement.sql.contains("state         = 'failed'")),
+            "{log:?}",
+        );
+    }
+
+    /// A cleanup that panics as well still ends in a recorded failure.
+    #[tokio::test]
+    async fn a_panic_in_cleanup_does_not_lose_the_failure() {
+        struct PanicsEverywhere;
+
+        #[async_trait]
+        impl BackupEngine for PanicsEverywhere {
+            fn engine(&self) -> &'static str {
+                "panicking"
+            }
+
+            async fn run(&self, _ctx: &BackupContext) -> Result<BackupOutcome, BackupError> {
+                panic!("run failed");
+            }
+
+            async fn cleanup(&self, _ctx: &BackupContext) -> Result<(), BackupError> {
+                panic!("cleanup failed");
+            }
+        }
+
+        let result = run_engine_catching_panics(
+            Arc::new(PanicsEverywhere),
+            retry_context(),
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(BackupError::PermanentFailure { .. })),
+            "{result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_engine_result_passes_through_the_inner_task_unchanged() {
+        let engine = Arc::new(FlakyEngine {
+            failures_before_success: 0,
+            calls: AtomicUsize::new(0),
+            cleanups: AtomicUsize::new(0),
+        });
+
+        let outcome =
+            run_engine_catching_panics(engine.clone(), retry_context(), Duration::from_secs(60))
+                .await
+                .expect("the engine succeeds");
+
+        assert_eq!(outcome.location, "s3://bench/resumed");
+        assert_eq!(engine.cleanups.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_engine_panic_fails_parent_and_child_rows() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Docker/TestDatabase unavailable; skipping engine panic test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone())
+            .register_engine(Arc::new(PanickingEngine::default()))
+            .build();
+
+        executor
+            .spawn(panicking_params(backup.id))
+            .await
+            .expect("the task starts");
+        wait_until_nothing_is_in_flight(&executor).await;
+
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "failed");
+        assert_eq!(child.state, "failed");
+        let reason = parent.error_message.expect("the failure has a reason");
+        assert!(reason.contains("panicked"), "{reason}");
+        assert!(!reason.contains("hunter2"), "{reason}");
+        assert!(parent.finished_at.is_some());
     }
 
     /// Records every job the executor publishes.
