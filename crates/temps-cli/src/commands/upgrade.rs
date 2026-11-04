@@ -2481,9 +2481,8 @@ async fn download_ee_asset_to_file(
     stream_response_to_file(resp, dest, dest_path).await
 }
 
-/// Resolve the data dir: explicit flag/env > `~/.temps`.
-/// Data dir that receives the license: the one the operator named, or the
-/// default. Never one discovered from a running process: any local user can start
+/// Data dir that receives the license: the one the operator named (flag or
+/// `TEMPS_DATA_DIR`), or `~/.temps`. Never one discovered from a running process: any local user can start
 /// a process claiming any directory, and a privileged upgrade would then write the
 /// license into a directory, and possibly a file, that user owns.
 fn resolve_data_dir(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -2521,7 +2520,7 @@ fn license_location_note(
              license went to {}. If that server is yours, re-run with `--data-dir {}`.",
             discovered.dir.display(),
             license_dir.display(),
-            discovered.dir.display()
+            super::data_dir_discovery::quoted_for_shell(&discovered.dir)
         )
     })
 }
@@ -2617,6 +2616,25 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("--data-dir"), "{note}");
+    }
+
+    #[test]
+    fn the_directory_in_the_note_cannot_run_a_command() {
+        let home = tempfile::tempdir().unwrap();
+        let license_dir = tempfile::tempdir().unwrap();
+        let discovered = super::super::data_dir_discovery::resolve_with(
+            None,
+            Some(home.path()),
+            Some((42, PathBuf::from("/tmp/$(touch pwned)"))),
+        );
+
+        let note = license_location_note(license_dir.path(), &discovered)
+            .expect("the server reports another directory");
+
+        assert!(
+            note.contains("`--data-dir '/tmp/$(touch pwned)'`"),
+            "{note}"
+        );
     }
 
     #[test]

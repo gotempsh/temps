@@ -80,7 +80,7 @@ pub(super) fn resolve_with(
                          directory that server reads",
                         server_dir.display(),
                         dir.display(),
-                        server_dir.display()
+                        quoted_for_shell(server_dir)
                     ));
                 }
             }
@@ -116,6 +116,13 @@ pub(super) fn resolve_with(
         warnings,
         server_disagrees,
     }
+}
+
+/// `dir` as a shell argument. A directory read from a running process is whatever
+/// that process claims, so one printed for the operator to paste must not be able
+/// to run anything.
+pub(super) fn quoted_for_shell(dir: &Path) -> String {
+    temps_sandbox_providers::microsandbox::shell_quote(&dir.to_string_lossy())
 }
 
 pub(super) fn same_path(a: &Path, b: &Path) -> bool {
@@ -331,6 +338,23 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("pid 4242") && w.contains(&*server_dir.to_string_lossy())),
+            "{:?}",
+            resolved.warnings
+        );
+    }
+
+    #[test]
+    fn the_suggested_server_directory_cannot_run_a_command() {
+        let chosen = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let server_dir = PathBuf::from("/tmp/$(touch pwned)");
+        let resolved = resolve_with(
+            Some(chosen.path()),
+            Some(home.path()),
+            Some((4242, server_dir)),
+        );
+        assert!(
+            resolved.warnings[0].contains("`--data-dir '/tmp/$(touch pwned)'`"),
             "{:?}",
             resolved.warnings
         );

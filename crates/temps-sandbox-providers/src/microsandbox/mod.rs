@@ -368,7 +368,7 @@ fn default_data_dir() -> PathBuf {
 
 /// Quote `value` for a POSIX shell only when it needs it, so the common
 /// case stays copy-paste readable.
-fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     let plain = !value.is_empty()
         && value
             .bytes()
