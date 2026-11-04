@@ -22,7 +22,9 @@ function list(
   expired = false,
   unhealthy = false,
   variant: 'single-line' | 'two-line' | 'avatar' = 'single-line',
-  owner: number | null = 4
+  owner: number | null = 4,
+  providerType = 'github',
+  healthMessage: string | null = null
 ) {
   const connection = {
     id: 11,
@@ -38,7 +40,7 @@ function list(
     synced_repository_count: 0,
     last_synced_at: null,
     health_status: unhealthy ? 'unhealthy' : 'healthy',
-    health_message: null,
+    health_message: healthMessage,
     last_health_check_at: null,
     consecutive_health_failures: 0,
     last_sync_error: null,
@@ -48,7 +50,7 @@ function list(
   } as ConnectionResponse
   const provider = {
     id: 7,
-    provider_type: 'github',
+    provider_type: providerType,
     auth_method: authMethod,
   } as ProviderResponse
   return render(
@@ -124,3 +126,46 @@ for (const owner of [null, 9]) {
     expect(view.queryByRole('menuitem', { name: 'Reauthorize' })).toBeNull()
   })
 }
+
+const REJECTED = "GitLab no longer accepts this connection's authorization"
+const RAW_RESPONSE =
+  'Failed to refresh token: 400 Bad Request - {"error":"invalid_grant","error_description":"raw provider response"}'
+
+for (const variant of ['single-line', 'two-line', 'avatar'] as const) {
+  test(`a rejected GitLab authorization replaces the raw response beside Reauthorize (${variant})`, () => {
+    const view = list('oauth', false, true, variant, 4, 'gitlab', RAW_RESPONSE)
+    const message = view.getByText(REJECTED)
+    const reauthorize = view.getByRole('button', { name: 'Reauthorize' })
+    expect(
+      message.parentElement?.contains(reauthorize),
+      'the message must sit next to the action'
+    ).toBe(true)
+    expect(view.queryByText(/raw provider response/)).toBeNull()
+  })
+
+  test(`a blocked GitLab connection with stale healthy status still says so (${variant})`, () => {
+    const view = list('oauth', true, false, variant, 4, 'gitlab')
+    expect(view.getByText(REJECTED)).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Reauthorize' })).toBeTruthy()
+  })
+}
+
+test('another unhealthy reason keeps its own message and no rejection copy', () => {
+  const view = list(
+    'oauth',
+    false,
+    true,
+    'single-line',
+    4,
+    'gitlab',
+    'Provider error: HTTP 503'
+  )
+  expect(view.queryByText(REJECTED)).toBeNull()
+  expect(view.getByText('Provider error: HTTP 503')).toBeTruthy()
+})
+
+test('a user who cannot reauthorize still sees why the connection stopped', () => {
+  const view = list('oauth', true, false, 'single-line', 99, 'gitlab')
+  expect(view.getByText(REJECTED)).toBeTruthy()
+  expect(view.queryByRole('button', { name: 'Reauthorize' })).toBeNull()
+})

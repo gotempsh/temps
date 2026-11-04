@@ -11,6 +11,7 @@ import {
   runConnectionHealthCheckMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
+  authorizationRejectedMessage,
   canReauthorizeConnection,
   needsReauthorization,
 } from './reauthorization'
@@ -122,7 +123,10 @@ export function ConnectionsCompactList({
         toast.success(`Connection "${data.account_name}" is healthy`)
       } else if (data.health_status === 'unhealthy') {
         toast.error(`Connection "${data.account_name}" is unhealthy`, {
-          description: data.health_message ?? undefined,
+          description:
+            authorizationRejectedMessage(data, provider) ??
+            data.health_message ??
+            undefined,
         })
       } else {
         toast.message(`Health status: ${data.health_status}`)
@@ -175,6 +179,24 @@ export function ConnectionsCompactList({
           : 'Reauthorize'}
       </Button>
     ) : null
+
+  // The message sits beside the action that resolves it, in every variant. A
+  // provider's response never reaches this list for a rejected authorization.
+  const renderReauthorizeAction = (c: ConnectionResponse) => {
+    const message = authorizationRejectedMessage(c, provider)
+    const button = renderReauthorizeButton(c)
+    if (!message && !button) return null
+    return (
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+        {message && (
+          <span className="text-xs font-medium text-destructive">
+            {message}
+          </span>
+        )}
+        {button}
+      </div>
+    )
+  }
 
   const isPATProvider =
     provider &&
@@ -352,6 +374,8 @@ export function ConnectionsCompactList({
     })()
 
     const tooltip = (() => {
+      const rejected = authorizationRejectedMessage(c, provider)
+      if (rejected) return rejected
       if (c.health_status === 'unhealthy' && c.health_message) {
         return c.health_message
       }
@@ -404,7 +428,7 @@ export function ConnectionsCompactList({
             <StatusBadge c={c} />
             <SyncBadge c={c} />
             <div className="ml-auto flex items-center gap-2">
-              {renderReauthorizeButton(c)}
+              {renderReauthorizeAction(c)}
               <ActionsMenu c={c} />
             </div>
           </div>
@@ -418,11 +442,13 @@ export function ConnectionsCompactList({
                     : ''
               }
             >
-              {unhealthy && c.health_message
-                ? c.health_message
-                : healthy
-                  ? 'Healthy'
-                  : 'Not checked yet'}
+              {authorizationRejectedMessage(c, provider)
+                ? 'Reauthorization required'
+                : unhealthy && c.health_message
+                  ? c.health_message
+                  : healthy
+                    ? 'Healthy'
+                    : 'Not checked yet'}
             </span>
             <span aria-hidden>·</span>
             <span className="flex items-center gap-1">
@@ -481,7 +507,7 @@ export function ConnectionsCompactList({
               </span>
             </div>
           </div>
-          {renderReauthorizeButton(c)}
+          {renderReauthorizeAction(c)}
           <ActionsMenu c={c} />
         </li>
       )
@@ -527,7 +553,7 @@ export function ConnectionsCompactList({
           <StatusBadge c={c} />
           <HealthBadge c={c} />
           <SyncBadge c={c} />
-          {renderReauthorizeButton(c)}
+          {renderReauthorizeAction(c)}
           <ActionsMenu c={c} />
         </div>
       </li>

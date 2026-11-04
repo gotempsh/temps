@@ -50,6 +50,7 @@ import type {
   RepositoryResponse,
 } from '@/api/client/types.gen'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
+import { authorizationRejectedMessage } from '@/components/git/reauthorization'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
@@ -277,7 +278,10 @@ export default function GitConnectionDetail() {
         toast.error(
           `Connection "${data.account_name}" is ${data.health_status}`,
           {
-            description: data.health_message ?? undefined,
+            description:
+              authorizationRejectedMessage(data, provider) ??
+              data.health_message ??
+              undefined,
           }
         )
       refreshConnection()
@@ -676,6 +680,7 @@ export default function GitConnectionDetail() {
           )}
           <ConnectionProblems
             connection={connection}
+            provider={provider}
             providerId={provider.id}
           />
           {connection.last_sync_error && !connection.syncing && (
@@ -782,16 +787,33 @@ function HealthValue({ connection }: { connection: ConnectionResponse }) {
 /** States that stop this connection from working, each with the way out. */
 function ConnectionProblems({
   connection,
+  provider,
   providerId,
 }: {
   connection: ConnectionResponse
+  provider: ProviderResponse
   providerId: number
 }) {
+  const authorizationRejected = authorizationRejectedMessage(
+    connection,
+    provider
+  )
   if (!connection.is_active)
     return (
       <Callout tone="warning" title="This connection is inactive">
         Services can&apos;t deploy from it and its repositories won&apos;t sync.
         Activate it from the{' '}
+        <Link to={`/git-providers/${providerId}`} className="underline">
+          provider&apos;s connections
+        </Link>
+        .
+      </Callout>
+    )
+  if (authorizationRejected)
+    return (
+      <Callout tone="error" title={authorizationRejected}>
+        Syncing and deployments fail until the connection is reauthorized. Use
+        Reauthorize on the{' '}
         <Link to={`/git-providers/${providerId}`} className="underline">
           provider&apos;s connections
         </Link>

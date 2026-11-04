@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  authorizationRejectedMessage,
   canReauthorizeConnection,
   needsReauthorization,
   readReauthorizationCallback,
@@ -72,4 +73,55 @@ test('callback reads only one-time code and state, never a target connection', (
     code: '',
   })
   expect(readReauthorizationCallback('#unrelated')).toBeNull()
+})
+
+describe('Rejected authorization message', () => {
+  const gitlab = { auth_method: 'oauth', provider_type: 'gitlab' }
+  const message = "GitLab no longer accepts this connection's authorization"
+
+  test('a blocked GitLab OAuth connection gets the fixed message', () => {
+    expect(
+      authorizationRejectedMessage(
+        { is_expired: true, health_message: null },
+        gitlab
+      )
+    ).toBe(message)
+  })
+
+  test('a raw response stored by an older server is replaced', () => {
+    expect(
+      authorizationRejectedMessage(
+        {
+          is_expired: false,
+          health_message:
+            'Failed to refresh token: 400 Bad Request - {"error":"invalid_grant"}',
+        },
+        gitlab
+      )
+    ).toBe(message)
+  })
+
+  test('other failures and connections keep their own message', () => {
+    expect(
+      authorizationRejectedMessage(
+        { is_expired: false, health_message: 'Provider error: HTTP 503' },
+        gitlab
+      )
+    ).toBeNull()
+    expect(
+      authorizationRejectedMessage(
+        { is_expired: true, health_message: null },
+        { auth_method: 'gitlab_pat', provider_type: 'gitlab' }
+      )
+    ).toBeNull()
+    expect(
+      authorizationRejectedMessage(
+        { is_expired: true, health_message: null },
+        { auth_method: 'oauth', provider_type: 'github' }
+      )
+    ).toBeNull()
+    expect(
+      authorizationRejectedMessage({ is_expired: true, health_message: null })
+    ).toBeNull()
+  })
 })
