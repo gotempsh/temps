@@ -5931,6 +5931,34 @@ mod tests {
         assert!(log.contains("Serving 1 build secret"), "{log}");
     }
 
+    #[tokio::test]
+    async fn local_build_serves_a_secret_mount_named_by_its_source() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\n\
+             RUN --mount=type=secret,source=API_KEY,target=/run/secrets/key,required=true build\n",
+        )])
+        .await;
+        let served: Vec<_> = request.build_secrets.iter().collect();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, "API_KEY");
+        assert_eq!(served[0].1, "synthetic-secret-1725");
+        assert!(log.contains("Serving 1 build secret"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn local_build_serves_a_secret_mount_with_a_quoted_id() {
+        let (request, log) = local_custom_dockerfile_build(&[(
+            "Dockerfile",
+            "FROM alpine\nRUN --mount=type=secret,id=\"API_KEY\",required=true build\n",
+        )])
+        .await;
+        let served: Vec<_> = request.build_secrets.iter().collect();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].0, "API_KEY");
+        assert!(log.contains("Serving 1 build secret"), "{log}");
+    }
+
     /// Generated Dockerfiles declare these only in a build stage, so they keep
     /// receiving every value.
     #[tokio::test]

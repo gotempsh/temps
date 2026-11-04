@@ -206,6 +206,47 @@ async fn secret_mount_serves_the_value_and_leaves_no_trace() {
     fixture.cleanup().await;
 }
 
+/// Every way of naming a secret, with the mount required so that a name read
+/// differently from BuildKit fails the build. What is served is exactly what
+/// the Dockerfile parser found, as a real deployment does.
+#[tokio::test]
+async fn secret_mount_names_are_read_the_way_buildkit_reads_them() {
+    // The first step is unique so every later one runs: BuildKit does not ask for
+    // the secret of a step it finds in its cache.
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    let dockerfile = format!(
+        "FROM alpine:3.20\nRUN echo {unique}\n\
+         RUN --mount=type=secret,source=BY_SOURCE,required=true test -s /run/secrets/BY_SOURCE\n\
+         RUN --mount=type=secret,src=BY_SRC,required=true test -s /run/secrets/BY_SRC\n\
+         RUN --mount=type=secret,source=RENAMED,target=/run/secrets/other,required=true \
+         test -s /run/secrets/other\n\
+         RUN --mount=type=secret,id=BY_ID,target=/run/secrets/unused,required=true \
+         test -s /run/secrets/unused\n\
+         RUN --mount=type=secret,target=/run/secrets/BY_TARGET,required=true \
+         test -s /run/secrets/BY_TARGET\n\
+         RUN --mount=type=secret,id=\"QUOTED_VALUE\",required=true \
+         test -s /run/secrets/QUOTED_VALUE\n\
+         RUN --mount=\"type=secret,id=QUOTED_FLAG,required=true\" \
+         test -s /run/secrets/QUOTED_FLAG\n\
+         RUN --mount='type=secret,source=SINGLE_QUOTED,required=true' \
+         test -s /run/secrets/SINGLE_QUOTED\n\
+         RUN --mount='type=secret,\"id=CSV_QUOTED\",required=true' \
+         test -s /run/secrets/CSV_QUOTED\n\
+         RUN --mount=\"type=secret,target=/run/secrets/with space/SPACED,required=true\" \
+         test -s '/run/secrets/with space/SPACED'\n"
+    );
+    let Some(fixture) = SecretBuildFixture::new(&dockerfile).await else {
+        return;
+    };
+    let ids = crate::build_protocol::dockerfile_secret_mount_ids(&dockerfile);
+    let secrets: Vec<(&str, &str)> = ids.iter().map(|id| (id.as_str(), "value")).collect();
+    let (result, logged) = fixture
+        .build(fixture.request(&[], &secrets, Vec::new()))
+        .await;
+    assert!(result.is_ok(), "served {ids:?}: {result:?}\n{logged}");
+    fixture.cleanup().await;
+}
+
 /// bollard's solve reports only an exit code, so a failing step's output
 /// has to arrive through the status stream.
 #[tokio::test]

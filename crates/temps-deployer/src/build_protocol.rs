@@ -364,27 +364,21 @@ pub fn dockerfile_final_image_arg_names(contents: &str) -> Option<BTreeSet<Strin
 /// The secret ids a Dockerfile's `RUN --mount=type=secret` instructions ask
 /// for, in any stage: a secret mount never reaches the image, wherever it is.
 ///
-/// BuildKit defaults `id` to the basename of the target path. An id naming a
-/// variable reference cannot be read and is left out, as is anything after an
-/// unterminated heredoc.
+/// BuildKit names the secret after `source` (or `src`), then `id`, then the
+/// basename of the target path. A name holding a variable reference cannot be
+/// read and is left out, as is anything after an unterminated heredoc.
 pub fn dockerfile_secret_mount_ids(contents: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let mut instructions = DockerfileInstructions::new(contents);
     while let Some(instruction) = instructions.next_instruction() {
         let terminated = instructions.skip_heredocs(&instruction);
-        let mut words = instruction.split_whitespace().peekable();
-        if words
-            .peek()
-            .is_some_and(|word| word.eq_ignore_ascii_case("ONBUILD"))
-        {
-            words.next();
+        let (mut keyword, mut rest) = split_first_word(&instruction);
+        if keyword.eq_ignore_ascii_case("ONBUILD") {
+            (keyword, rest) = split_first_word(rest);
         }
-        if words
-            .next()
-            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("RUN"))
-        {
-            let flags = words.take_while(|word| word.starts_with("--"));
-            ids.extend(flags.filter_map(secret_mount_id));
+        if keyword.eq_ignore_ascii_case("RUN") {
+            let flags = instruction_flags(rest, instructions.escape);
+            ids.extend(flags.iter().filter_map(|flag| secret_mount_id(flag)));
         }
         if !terminated {
             break;
@@ -393,21 +387,90 @@ pub fn dockerfile_secret_mount_ids(contents: &str) -> BTreeSet<String> {
     ids
 }
 
-/// The secret id of one `RUN` flag, when it is a `--mount=type=secret` flag.
+fn split_first_word(line: &str) -> (&str, &str) {
+    let line = line.trim_start();
+    line.split_at(line.find(char::is_whitespace).unwrap_or(line.len()))
+}
+
+/// The leading `--flags` of an instruction's arguments, as BuildKit's
+/// `extractBuilderFlags` reads them: quotes and escapes are removed and a quoted
+/// space does not end a flag. They stop at the first word that is not a flag,
+/// or at a bare `--`.
+fn instruction_flags(mut arguments: &str, escape: char) -> Vec<String> {
+    let mut flags = Vec::new();
+    loop {
+        arguments = arguments.trim_start();
+        if !arguments.starts_with("--") {
+            return flags;
+        }
+        let mut flag = String::new();
+        let mut quote = None;
+        let mut chars = arguments.chars();
+        while let Some(ch) = chars.next() {
+            match quote {
+                None if ch.is_whitespace() => break,
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                Some(open) if ch == open => quote = None,
+                _ if ch == escape => flag.extend(chars.next()),
+                _ => flag.push(ch),
+            }
+        }
+        if flag == "--" {
+            return flags;
+        }
+        flags.push(flag);
+        arguments = chars.as_str();
+    }
+}
+
+/// The fields of a `--mount` value, which BuildKit reads as a CSV record once
+/// the flag itself has been unquoted.
+fn mount_fields(mount: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = mount.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                field.push('"');
+            }
+            '"' if quoted => quoted = false,
+            '"' if field.is_empty() => quoted = true,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// The secret id of one unquoted `RUN` flag, when it is a
+/// `--mount=type=secret` flag.
 fn secret_mount_id(flag: &str) -> Option<String> {
-    let mount = flag.strip_prefix("--mount=")?.trim_matches(['"', '\'']);
+    let fields = mount_fields(flag.strip_prefix("--mount=")?);
     let mut is_secret = false;
+    let mut source = None;
     let mut id = None;
     let mut target = None;
-    for field in mount.split(',') {
-        match field.split_once('=') {
-            Some(("type", value)) => is_secret = value.eq_ignore_ascii_case("secret"),
-            Some(("id", value)) => id = Some(value),
-            Some(("target" | "dst" | "destination", value)) => target = Some(value),
+    for field in &fields {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "type" => is_secret = value.eq_ignore_ascii_case("secret"),
+            "source" | "src" => source = Some(value),
+            "id" => id = Some(value),
+            "target" | "dst" | "destination" => target = Some(value),
             _ => {}
         }
     }
-    let id = id.or_else(|| target?.rsplit('/').next())?;
+    let named = [source, id]
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty());
+    let id = named.or_else(|| target?.rsplit('/').next())?;
     (is_secret && !id.is_empty() && !id.contains('$')).then(|| id.to_string())
 }
 
@@ -1072,6 +1135,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["API_KEY", "LATER", "SIGNING_KEY"]
         );
+    }
+
+    /// The order BuildKit's `dispatchSecret` uses, since a mount read differently
+    /// here is a required secret that never gets served.
+    #[test]
+    fn secret_mount_id_follows_buildkit_precedence() {
+        let id_of = |mount: &str| {
+            let contents = format!("FROM a\nRUN --mount={mount} make\n");
+            dockerfile_secret_mount_ids(&contents)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        for (mount, expected) in [
+            ("type=secret,source=API_KEY,required=true", "API_KEY"),
+            ("type=secret,src=API_KEY", "API_KEY"),
+            (
+                "type=secret,source=API_KEY,target=/run/secrets/key",
+                "API_KEY",
+            ),
+            ("type=secret,id=API_KEY,target=/run/secrets/key", "API_KEY"),
+            ("type=secret,source=,id=API_KEY", "API_KEY"),
+            ("type=secret,id=,target=/run/secrets/API_KEY", "API_KEY"),
+            ("TYPE=secret,SOURCE=API_KEY", "API_KEY"),
+        ] {
+            assert_eq!(id_of(mount), vec![expected], "{mount}");
+        }
+        // Quoted the ways BuildKit accepts, which it removes before reading the
+        // fields, first from the flag and then as CSV.
+        for mount in [
+            r#"type=secret,id="API_KEY",required=true"#,
+            r#""type=secret,id=API_KEY,required=true""#,
+            r#"'type=secret,id=API_KEY'"#,
+            r#"type=secret,source='API_KEY'"#,
+            r#"type=secret,id=API_"KEY""#,
+            r#"type=secret,id=API\_KEY"#,
+            r#"'type=secret,"id=API_KEY",required=true'"#,
+        ] {
+            assert_eq!(id_of(mount), vec!["API_KEY"], "{mount}");
+        }
+        assert_eq!(
+            id_of(r#""type=secret,target=/run/my dir/API_KEY""#),
+            vec!["API_KEY"]
+        );
+        assert!(id_of("type=secret,source=$DYNAMIC,id=API_KEY").is_empty());
+        assert!(id_of("type=bind,source=API_KEY,target=/key").is_empty());
+    }
+
+    /// `RUN` flags end at the first word that is not one, or at a bare `--`, and
+    /// a quoted space does not end a word.
+    #[test]
+    fn secret_mount_ids_stop_where_the_flags_stop() {
+        let ids = |line: &str| {
+            dockerfile_secret_mount_ids(&format!("FROM a\n{line}\n"))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(r#"RUN --network="none" --mount=type=secret,id=A make"#),
+            vec!["A"]
+        );
+        assert_eq!(
+            ids(r#"RUN --mount="type=secret,target=/a b/B" --mount=type=secret,id=C make"#),
+            vec!["B", "C"]
+        );
+        assert!(ids("RUN -- --mount=type=secret,id=AFTER_END make").is_empty());
+        assert!(ids("RUN make --mount=type=secret,id=AN_ARGUMENT").is_empty());
     }
 
     #[test]
