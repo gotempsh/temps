@@ -243,6 +243,9 @@ pub struct DeployComposeJob {
     /// deployment that never got as far as replacing it. Stays set across
     /// attempts, because the stack an earlier attempt stopped does not come back.
     replacing_running_stack: AtomicBool,
+    /// The failed stack was stopped and recorded so its logs stay readable.
+    /// [`WorkflowTask::cleanup`] leaves it in place; the next attempt removes it.
+    retained_failed_stack: AtomicBool,
     /// Unique to this in-memory job construction, including a replay of the
     /// same durable deployment/workflow identifiers.
     secret_generation: String,
@@ -499,6 +502,7 @@ impl DeployComposeJobBuilder {
                 .ok_or_else(|| WorkflowError::JobValidationFailed("log_service required".into()))?,
             cancellation_requested: AtomicBool::new(false),
             replacing_running_stack: AtomicBool::new(false),
+            retained_failed_stack: AtomicBool::new(false),
             secret_generation: secret_generation_for_attempt(
                 deployment_id,
                 &uuid::Uuid::new_v4().simple().to_string(),
@@ -2035,6 +2039,7 @@ impl DeployComposeJob {
                 };
 
                 if retained {
+                    self.retained_failed_stack.store(true, Ordering::Release);
                     if let Some(ref log_id) = self.log_id {
                         let _ = self
                             .log_service
@@ -2260,6 +2265,7 @@ impl WorkflowTask for DeployComposeJob {
 
     async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         self.cancellation_requested.store(false, Ordering::Release);
+        self.retained_failed_stack.store(false, Ordering::Release);
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
         let _lifecycle_guard = self
             .compose_executor
@@ -2320,6 +2326,27 @@ impl WorkflowTask for DeployComposeJob {
     /// Docker keeps crash-looping the containers forever on the node.
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        if self.retained_failed_stack.load(Ordering::Acquire) {
+            // Removing the stack now would undo the retention and leave its
+            // container records pointing at nothing. Stopped containers do not
+            // need the attempt's secret files, so those still go.
+            return self
+                .host
+                .discard_generation(
+                    &self.compose_executor,
+                    &project_name,
+                    &self.secret_generation,
+                )
+                .await
+                .map_err(|error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to clean candidate generation '{}' of retained compose stack \
+                         {project_name} on {} after job failure: {error}",
+                        self.secret_generation,
+                        self.host.describe()
+                    ))
+                });
+        }
         if !self.replacing_running_stack.load(Ordering::Acquire) {
             // The deployment failed before touching the running stack (a bad
             // image, a refused request, a cancelled pull). It keeps serving,
@@ -3511,6 +3538,7 @@ services:
     const DISCARD: &str = "/agent/compose/discard";
     const TEARDOWN: &str = "/agent/compose/teardown";
     const DEPLOY: &str = "/agent/compose/deploy";
+    const STOP: &str = "/agent/compose/stop";
 
     /// `prepare_event` is the line the agent streams for a prepare, and
     /// `failing_route` answers 500.
@@ -3518,13 +3546,25 @@ services:
         prepare_event: ComposeHostEvent,
         failing_route: Option<&'static str>,
     ) -> FakeComposeAgent {
+        fake_compose_agent_with_deploy(prepare_event, failing_route, None).await
+    }
+
+    /// Like [`fake_compose_agent`], and the deploy route answers with this event.
+    async fn fake_compose_agent_with_deploy(
+        prepare_event: ComposeHostEvent,
+        failing_route: Option<&'static str>,
+        deploy_event: Option<ComposeHostEvent>,
+    ) -> FakeComposeAgent {
         let routes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = routes.clone();
         let prepare_line = format!("{}\n", serde_json::to_string(&prepare_event).unwrap());
+        let deploy_line =
+            deploy_event.map(|event| format!("{}\n", serde_json::to_string(&event).unwrap()));
         let app =
             axum::Router::new().fallback(move |uri: axum::http::Uri, _: axum::body::Bytes| {
                 let recorded = recorded.clone();
                 let prepare_line = prepare_line.clone();
+                let deploy_line = deploy_line.clone();
                 async move {
                     let path = uri.path().to_string();
                     recorded.lock().unwrap().push(path.clone());
@@ -3533,6 +3573,9 @@ services:
                     }
                     if path == PREPARE {
                         return (axum::http::StatusCode::OK, prepare_line);
+                    }
+                    if let (DEPLOY, Some(deploy_line)) = (path.as_str(), deploy_line) {
+                        return (axum::http::StatusCode::OK, deploy_line);
                     }
                     (
                         axum::http::StatusCode::OK,
@@ -3705,6 +3748,104 @@ services:
             "one to replace the stack and one from cleanup: {routes:?}"
         );
         assert_eq!(routes.last().map(String::as_str), Some(TEARDOWN));
+    }
+
+    /// A placement on that worker, and room to record the retained containers.
+    fn db_that_can_record_a_retained_stack() -> Arc<DbConnection> {
+        let now = chrono::Utc::now();
+        Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![temps_entities::compose_placements::Model {
+                    environment_id: 3,
+                    node_id: Some(9),
+                    pinned_at: now,
+                    vacate_pending: false,
+                    vacate_node_id: None,
+                    updated_at: now,
+                }]])
+                .append_query_results([Vec::<deployments::Model>::new()])
+                // The job writes status updates as well as the container record.
+                .append_exec_results(std::iter::repeat_n(
+                    sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    },
+                    4,
+                ))
+                .into_connection(),
+        )
+    }
+
+    fn failed_deploy_with_a_container() -> ComposeHostEvent {
+        ComposeHostEvent::Failed(ComposeHostFailure {
+            error: RemoteComposeError::from(&ComposeError::CommandFailed {
+                project: "temps-2-3".to_string(),
+                reason: "service web did not become healthy".to_string(),
+            }),
+            containers: vec![temps_deployer::compose::ComposeServiceResult {
+                container_id: "failed-web-id".to_string(),
+                container_name: "temps-2-3-web-1".to_string(),
+                service_name: "web".to_string(),
+                image_name: "example/web:1".to_string(),
+                ports: Vec::new(),
+                status: "exited".to_string(),
+            }],
+            cleanup_containers: Vec::new(),
+            retention_error: None,
+        })
+    }
+
+    /// Execute records the stack for log access, so cleanup must not remove it.
+    #[tokio::test]
+    async fn a_retained_failed_stack_survives_cleanup_and_loses_its_secret_files() {
+        let agent = fake_compose_agent_with_deploy(
+            ComposeHostEvent::Prepared,
+            None,
+            Some(failed_deploy_with_a_container()),
+        )
+        .await;
+        let job = job_on_worker(
+            db_that_can_record_a_retained_stack(),
+            &agent,
+            sealed_to_a_key(),
+        );
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        let deployed = routes
+            .iter()
+            .position(|route| route == DEPLOY)
+            .unwrap_or_else(|| panic!("the stack must start: {routes:?}"));
+        let after_deploy = &routes[deployed + 1..];
+        assert_eq!(
+            after_deploy,
+            [STOP, DISCARD],
+            "the stack is stopped, its secret files go, and nothing removes it"
+        );
+    }
+
+    /// A stack that could not be recorded has no log access to keep it for.
+    #[tokio::test]
+    async fn a_failed_stack_that_could_not_be_recorded_is_removed() {
+        let agent = fake_compose_agent_with_deploy(
+            ComposeHostEvent::Prepared,
+            None,
+            Some(failed_deploy_with_a_container()),
+        )
+        .await;
+        // No exec result, so recording the containers fails.
+        let job = job_on_worker(db_with_placement_on_worker(), &agent, sealed_to_a_key());
+
+        fail_and_clean_up(&job).await;
+
+        let routes = agent.routes();
+        assert!(routes.iter().any(|route| route == STOP), "{routes:?}");
+        assert_eq!(
+            routes.last().map(String::as_str),
+            Some(TEARDOWN),
+            "{routes:?}"
+        );
     }
 
     /// The old stack is gone by now, and what started in its place failed.
