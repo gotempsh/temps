@@ -1872,6 +1872,37 @@ async fn configured_maxmind_license_key(
     }
 }
 
+/// Make sure the optional geo databases are present, without letting a slow or
+/// stalled download hold up the console.
+async fn ensure_geolite2_databases(data_dir: &Path, license_key: Option<String>) {
+    let city = data_dir.join("GeoLite2-City.mmdb");
+    let asn = data_dir.join(temps_geo::ASN_DB_FILENAME);
+    // One after the other: each download is held in memory until it is written.
+    let downloads = async move {
+        ensure_geolite2_database(&city, license_key.as_deref()).await;
+        ensure_geolite2_asn_database(&asn, license_key.as_deref()).await;
+    };
+    let wait = temps_geo::refresh::startup_download_deadline()
+        .saturating_duration_since(std::time::Instant::now());
+    if !finished_within(downloads, wait).await {
+        warn!(
+            wait_seconds = temps_geo::refresh::STARTUP_DOWNLOAD_WAIT.as_secs(),
+            "GeoLite2 downloads are still running; starting without waiting for them. \
+             Geolocation and datacenter traffic detection turn on when their databases arrive"
+        );
+    }
+}
+
+/// Run `task` in the background and wait up to `wait` for it. Returns whether
+/// it finished; when it has not, it keeps running.
+async fn finished_within<F>(task: F, wait: std::time::Duration) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // Dropping a task's handle detaches the task rather than cancelling it.
+    tokio::time::timeout(wait, tokio::spawn(task)).await.is_ok()
+}
+
 /// Make sure the optional GeoLite2-ASN database is present, downloading the
 /// copy committed to the repository (or MaxMind's, with a license key) into
 /// the data directory when neither the working directory nor the data
@@ -2358,6 +2389,49 @@ async fn public_only_not_found(req: Request) -> Response {
         temps_proxy::branded_404::render(host, request_id),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod geo_download_wait_tests {
+    use super::finished_within;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn a_stalled_download_does_not_hold_up_startup_and_keeps_running() {
+        let (release, released) = oneshot::channel::<()>();
+        let (finish, finished) = oneshot::channel::<()>();
+        let download = async move {
+            let _ = released.await;
+            let _ = finish.send(());
+        };
+
+        let in_time = tokio::time::timeout(
+            Duration::from_secs(5),
+            finished_within(download, Duration::from_millis(50)),
+        )
+        .await
+        .expect("startup must stop waiting for a stalled download");
+        assert!(!in_time);
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finished)
+            .await
+            .expect("the download must keep running after startup moves on")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_a_download_that_finishes_in_time() {
+        let (finish, mut finished) = oneshot::channel::<()>();
+        let download = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = finish.send(());
+        };
+
+        assert!(finished_within(download, Duration::from_secs(30)).await);
+        assert!(finished.try_recv().is_ok());
+    }
 }
 
 #[cfg(test)]

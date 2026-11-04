@@ -42,6 +42,8 @@ pub(crate) struct ResolvedDataDir {
     pub source: DataDirSource,
     /// Problems the operator should see before anything is installed.
     pub warnings: Vec<String>,
+    /// A running `temps serve` uses a different directory from the one chosen.
+    pub server_disagrees: bool,
 }
 
 /// A directory holds Temps state once the server has generated its keys.
@@ -59,24 +61,26 @@ pub(crate) fn resolve(explicit: Option<&Path>, home: Option<&Path>) -> ResolvedD
     resolve_with(explicit, home, running_server_data_dir())
 }
 
-fn resolve_with(
+pub(super) fn resolve_with(
     explicit: Option<&Path>,
     home: Option<&Path>,
     server: Option<(u32, PathBuf)>,
 ) -> ResolvedDataDir {
     let mut warnings = Vec::new();
+    let mut server_disagrees = false;
 
     let (dir, source) = match (explicit, server.as_ref()) {
         (Some(dir), server) => {
             if let Some((pid, server_dir)) = server {
                 if !same_path(dir, server_dir) {
+                    server_disagrees = true;
                     warnings.push(format!(
                         "the running `temps serve` (pid {pid}) uses {}, not {}; it will not \
                          see anything installed there. Use `--data-dir {}` to set up the \
                          directory that server reads",
                         server_dir.display(),
                         dir.display(),
-                        server_dir.display()
+                        quoted_for_shell(server_dir)
                     ));
                 }
             }
@@ -110,10 +114,18 @@ fn resolve_with(
         dir,
         source,
         warnings,
+        server_disagrees,
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+/// `dir` as a shell argument. A directory read from a running process is whatever
+/// that process claims, so one printed for the operator to paste must not be able
+/// to run anything.
+pub(super) fn quoted_for_shell(dir: &Path) -> String {
+    temps_sandbox_providers::microsandbox::shell_quote(&dir.to_string_lossy())
+}
+
+pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canonical(a) == canonical(b)
 }
@@ -326,6 +338,23 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("pid 4242") && w.contains(&*server_dir.to_string_lossy())),
+            "{:?}",
+            resolved.warnings
+        );
+    }
+
+    #[test]
+    fn the_suggested_server_directory_cannot_run_a_command() {
+        let chosen = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let server_dir = PathBuf::from("/tmp/$(touch pwned)");
+        let resolved = resolve_with(
+            Some(chosen.path()),
+            Some(home.path()),
+            Some((4242, server_dir)),
+        );
+        assert!(
+            resolved.warnings[0].contains("`--data-dir '/tmp/$(touch pwned)'`"),
             "{:?}",
             resolved.warnings
         );

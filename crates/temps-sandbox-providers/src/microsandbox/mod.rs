@@ -331,6 +331,19 @@ pub fn setup_command_for(data_dir: &Path) -> String {
     command_with_data_dir(SETUP_COMMAND, data_dir)
 }
 
+/// The setup command for `data_dir`, run by `binary` rather than whichever
+/// `temps` is first on `PATH`: a different binary would install the runtime that
+/// it pins. Always names the directory, so `TEMPS_DATA_DIR` in the shell that runs
+/// it cannot send the runtime somewhere else.
+pub fn setup_command_with_binary(binary: &Path, data_dir: &Path) -> String {
+    let arguments = SETUP_COMMAND.strip_prefix("temps").unwrap_or(SETUP_COMMAND);
+    format!(
+        "{}{arguments} --data-dir {}",
+        shell_quote(&binary.to_string_lossy()),
+        shell_quote(&data_dir.to_string_lossy())
+    )
+}
+
 /// `command`, with `--data-dir <data_dir>` appended when `data_dir` is not
 /// the directory a shell without `TEMPS_DATA_DIR` would pick (`~/.temps`).
 /// Shared by every microVM backend's setup hint.
@@ -355,7 +368,7 @@ fn default_data_dir() -> PathBuf {
 
 /// Quote `value` for a POSIX shell only when it needs it, so the common
 /// case stays copy-paste readable.
-fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     let plain = !value.is_empty()
         && value
             .bytes()
@@ -584,6 +597,21 @@ mod tests {
         let command = setup_command_for(&nested);
         assert!(command.starts_with("temps microsandbox setup --data-dir "));
         assert!(command.ends_with(&*nested.to_string_lossy()), "{command}");
+    }
+
+    #[test]
+    fn the_setup_command_names_the_binary_that_runs_it_and_its_directory() {
+        assert_eq!(
+            setup_command_with_binary(Path::new("/opt/my temps/temps"), &default_data_dir()),
+            format!(
+                "'/opt/my temps/temps' microsandbox setup --data-dir {}",
+                shell_quote(&default_data_dir().to_string_lossy())
+            )
+        );
+        assert_eq!(
+            setup_command_with_binary(Path::new("/usr/bin/temps"), Path::new("/srv/temps")),
+            "/usr/bin/temps microsandbox setup --data-dir /srv/temps"
+        );
     }
 
     #[test]

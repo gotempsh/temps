@@ -68,13 +68,12 @@ impl TempsPlugin for GeoPlugin {
                 if !city_db_path.exists() {
                     tracing::info!(
                         path = %city_db_path.display(),
-                        "GeoLite2-City.mmdb not present yet -- waiting up to 30s for the \
-                         concurrent startup download to finish before registering the geo plugin",
+                        "GeoLite2-City.mmdb not present yet -- waiting for the concurrent startup \
+                         download to finish before registering the geo plugin, until the startup \
+                         deadline"
                     );
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-                    while !city_db_path.exists() && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    }
+                    wait_for_file_until(&city_db_path, crate::refresh::startup_download_deadline())
+                        .await;
                 }
             }
 
@@ -179,9 +178,52 @@ impl TempsPlugin for GeoPlugin {
     }
 }
 
+/// Wait for `path` to appear, no later than `deadline`.
+async fn wait_for_file_until(path: &std::path::Path, deadline: std::time::Instant) {
+    while !path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_passed_deadline_does_not_wait_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            wait_for_file_until(&dir.path().join("missing"), std::time::Instant::now()),
+        )
+        .await
+        .expect("the deadline has already passed");
+    }
+
+    #[tokio::test]
+    async fn waiting_ends_when_the_file_arrives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arrives");
+        let writer = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                std::fs::write(path, b"").unwrap();
+            })
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_file_until(
+                &path,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("the file arrived well before the deadline");
+        writer.await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_geo_plugin_name() {

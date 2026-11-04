@@ -488,6 +488,22 @@ fn shared_runtime(
     }
 }
 
+/// Run startup work that may use the shared pool on a runtime that lasts as
+/// long as the process.
+///
+/// A connection stays registered with the runtime that opened it, and goes back
+/// into the pool when released. Had this work run on a temporary runtime, a
+/// connection it opened would outlive that runtime, and the next acquire to pick
+/// it would hang on its health check until the acquire timeout. Whether that
+/// happens depends on whether the console has left an idle connection at that
+/// moment, so it shows up as an occasional failed startup.
+///
+/// Anything the work spawns also keeps running, such as the `settings_change`
+/// listener `ConfigPlugin` starts, which stops when its `ConfigService` is dropped.
+fn block_on_refresh_runtime<F: Future>(future: F) -> Result<F::Output> {
+    Ok(refresh_runtime()?.block_on(future))
+}
+
 /// Loads every project's edge rules (ADR-089) and starts the loops that keep
 /// them current and record their match counts. The initial load must
 /// succeed: serving a project without the rules its operator saved would
@@ -561,21 +577,7 @@ pub fn setup_proxy_server(
     preflight_check_listen_addresses(&proxy_config)?;
 
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and otherwise does sync work, so a worker
-    // thread per core would be stood up and torn down purely to drive that.
-    //
-    // Registration is not entirely free of spawns: `ConfigPlugin` starts the
-    // `settings_change` LISTEN/NOTIFY task with `tokio::spawn`. That task does
-    // not survive this runtime being dropped at the end of the statement, and
-    // did not survive the previous multi-threaded one either -- the settings
-    // cache falls back to its 5s TTL, which is the documented non-fatal
-    // behaviour. This is pre-existing and unchanged here; it is called out so
-    // the lifetime is not mistaken for something this runtime guarantees.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -1064,14 +1066,7 @@ pub fn create_proxy_service(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and does sync work, and it spawns nothing
-    // that outlives this call. `Runtime::new()` would stand up (and tear down)
-    // one worker thread per core purely to drive that.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -1190,6 +1185,48 @@ pub fn create_proxy_service(
     .with_netwatch(spawn_netwatch()?);
 
     Ok(lb)
+}
+
+#[cfg(test)]
+mod plugin_setup_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_opened_during_setup_stays_usable_afterwards() {
+        let other_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = other_runtime.enter();
+        let database = match other_runtime.block_on(temps_test_utils::TestDatabase::new()) {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping plugin setup runtime test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("plugin setup runtime test database failed: {error}"),
+        };
+        // One connection, so the acquire below must get the one setup opened.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect_lazy(&database.database_url)
+            .unwrap();
+
+        let setup_pool = pool.clone();
+        block_on_refresh_runtime(async move {
+            drop(setup_pool.acquire().await.unwrap());
+            // Gives the connection time to go back into the pool.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .unwrap();
+
+        other_runtime
+            .block_on(pool.acquire())
+            .expect("a connection opened during setup must stay usable");
+    }
 }
 
 #[cfg(test)]

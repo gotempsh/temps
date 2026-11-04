@@ -12,6 +12,327 @@ use crate::compose::{
 use bollard::Docker;
 
 #[tokio::test]
+async fn a_stopped_stack_will_not_be_restarted_by_docker() {
+    let Some(executor) = test_executor() else {
+        return;
+    };
+    let docker = executor
+        .docker
+        .require()
+        .expect("test_executor only builds an available handle")
+        .clone();
+    let compose_available = tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !compose_available || docker.inspect_image("alpine:latest").await.is_err() {
+        println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let project_name = format!(
+        "temps-stop-no-restart-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::write(
+        project_dir.path().join("docker-compose.yml"),
+        "services:\n  web:\n    image: alpine:latest\n    restart: always\n    command: [\"sleep\", \"300\"]\n",
+    )
+    .unwrap();
+    let compose = |args: &[&str]| {
+        let mut command = tokio::process::Command::new("docker");
+        command
+            .args(["compose", "-p", &project_name])
+            .args(args)
+            .current_dir(project_dir.path());
+        command
+    };
+    let up = compose(&["up", "-d"]).output().await.unwrap();
+    if !up.status.success() {
+        // Compose can leave containers behind when startup fails.
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&up.stderr));
+    }
+    // An operator's one-off container is not part of the stack.
+    let one_off = compose(&["run", "-d", "--rm", "web"])
+        .output()
+        .await
+        .unwrap();
+    if !one_off.status.success() {
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&one_off.stderr));
+    }
+
+    let stopped = executor
+        .stop_at(
+            &project_name,
+            Some(project_dir.path()),
+            Some("docker-compose.yml"),
+        )
+        .await;
+
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{COMPOSE_PROJECT_LABEL}={project_name}")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut policies = Vec::new();
+    for container in &containers {
+        let one_off_container = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.oneoff"))
+            .is_some_and(|value| value == "True");
+        if one_off_container {
+            let _ = docker
+                .remove_container(
+                    container.id.as_deref().unwrap(),
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            continue;
+        }
+        let inspected = docker
+            .inspect_container(
+                container.id.as_deref().unwrap(),
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .unwrap();
+        policies.push((
+            inspected.state.and_then(|state| state.running),
+            inspected
+                .host_config
+                .and_then(|config| config.restart_policy)
+                .and_then(|policy| policy.name),
+        ));
+    }
+    let _ = compose(&["down", "-v"]).output().await;
+
+    stopped.expect("stop should succeed");
+    assert_eq!(
+        policies,
+        vec![(
+            Some(false),
+            Some(bollard::models::RestartPolicyNameEnum::NO)
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_stop_leaves_running_containers_their_restart_policy() {
+    let Some(executor) = test_executor() else {
+        return;
+    };
+    let docker = executor
+        .docker
+        .require()
+        .expect("test_executor only builds an available handle")
+        .clone();
+    let compose_available = tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !compose_available || docker.inspect_image("alpine:latest").await.is_err() {
+        println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let project_name = format!(
+        "temps-stop-fails-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::write(
+        project_dir.path().join("docker-compose.yml"),
+        "services:\n  web:\n    image: alpine:latest\n    restart: always\n    command: [\"sleep\", \"300\"]\n",
+    )
+    .unwrap();
+    let compose = |args: &[&str]| {
+        let mut command = tokio::process::Command::new("docker");
+        command
+            .args(["compose", "-p", &project_name])
+            .args(args)
+            .current_dir(project_dir.path());
+        command
+    };
+    let up = compose(&["up", "-d"]).output().await.unwrap();
+    if !up.status.success() {
+        // Compose can leave containers behind when startup fails.
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&up.stderr));
+    }
+
+    let stopped = executor
+        .stop_at(
+            &project_name,
+            Some(project_dir.path()),
+            Some("no-such-compose-file.yml"),
+        )
+        .await;
+
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{COMPOSE_PROJECT_LABEL}={project_name}")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let inspected = docker
+        .inspect_container(
+            containers[0].id.as_deref().unwrap(),
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .unwrap();
+    let _ = compose(&["down", "-v"]).output().await;
+
+    stopped.expect_err("the Compose file does not exist");
+    assert_eq!(inspected.state.and_then(|state| state.running), Some(true));
+    assert_eq!(
+        inspected
+            .host_config
+            .and_then(|config| config.restart_policy)
+            .and_then(|policy| policy.name),
+        Some(bollard::models::RestartPolicyNameEnum::ALWAYS)
+    );
+}
+
+#[tokio::test]
+async fn a_running_service_outside_the_compose_file_keeps_its_restart_policy() {
+    let Some(executor) = test_executor() else {
+        return;
+    };
+    let docker = executor
+        .docker
+        .require()
+        .expect("test_executor only builds an available handle")
+        .clone();
+    let compose_available = tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !compose_available || docker.inspect_image("alpine:latest").await.is_err() {
+        println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let project_name = format!(
+        "temps-stop-orphan-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let service = |name: &str| {
+        format!(
+            "  {name}:\n    image: alpine:latest\n    restart: always\n    command: [\"sleep\", \"300\"]\n"
+        )
+    };
+    // The running deployment has a service the next one dropped.
+    std::fs::write(
+        project_dir.path().join("docker-compose.yml"),
+        format!("services:\n{}{}", service("web"), service("retired")),
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("next.yml"),
+        format!("services:\n{}", service("web")),
+    )
+    .unwrap();
+    let compose = |args: &[&str]| {
+        let mut command = tokio::process::Command::new("docker");
+        command
+            .args(["compose", "-p", &project_name])
+            .args(args)
+            .current_dir(project_dir.path());
+        command
+    };
+    let up = compose(&["up", "-d"]).output().await.unwrap();
+    if !up.status.success() {
+        // Compose can leave containers behind when startup fails.
+        let _ = compose(&["down", "-v"]).output().await;
+        panic!("{}", String::from_utf8_lossy(&up.stderr));
+    }
+
+    let stopped = executor
+        .stop_at(&project_name, Some(project_dir.path()), Some("next.yml"))
+        .await;
+
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{COMPOSE_PROJECT_LABEL}={project_name}")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let mut services = Vec::new();
+    for container in &containers {
+        let name = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.docker.compose.service"))
+            .cloned();
+        let inspected = docker
+            .inspect_container(
+                container.id.as_deref().unwrap(),
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .unwrap();
+        services.push((
+            name,
+            inspected.state.and_then(|state| state.running),
+            inspected
+                .host_config
+                .and_then(|config| config.restart_policy)
+                .and_then(|policy| policy.name),
+        ));
+    }
+    services.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = compose(&["down", "-v"]).output().await;
+
+    stopped.expect("stop should succeed");
+    assert_eq!(
+        services,
+        vec![
+            (
+                Some("retired".to_string()),
+                Some(true),
+                Some(bollard::models::RestartPolicyNameEnum::ALWAYS)
+            ),
+            (
+                Some("web".to_string()),
+                Some(false),
+                Some(bollard::models::RestartPolicyNameEnum::NO)
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn failed_compose_startup_returns_containers_without_removing_them() {
     let Some(executor) = test_executor() else {
         return;

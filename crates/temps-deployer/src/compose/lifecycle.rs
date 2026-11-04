@@ -761,6 +761,12 @@ impl ComposeExecutor {
         self.stop_at(project_name, None, None).await
     }
 
+    /// Stop a project's containers and keep them stopped: a stopped
+    /// `restart: always` container would otherwise come back when the Docker
+    /// daemon restarts. The policy is cleared after the stop, so a stop that fails
+    /// leaves running containers with their automatic recovery. Starting the stack
+    /// again goes through `up --force-recreate`, which applies the Compose file's
+    /// policy to new containers.
     pub async fn stop_at(
         &self,
         project_name: &str,
@@ -797,10 +803,73 @@ impl ComposeExecutor {
             });
         }
 
-        Ok(())
+        Self::disable_automatic_restart(project_name).await
     }
 
     // --- Internal methods ---
+
+    /// Clear the restart policy of the project's stopped service containers.
+    /// Compose stops only the services in the file it was given, so a container
+    /// from an older deployment that is not in that file keeps running and keeps
+    /// its automatic recovery. One-off `docker compose run` containers are not part
+    /// of the stack and are not stopped with it. A container that never started has
+    /// no need for this: Docker does not start it when the daemon restarts.
+    async fn disable_automatic_restart(project_name: &str) -> Result<(), ComposeError> {
+        let mut list = isolated_docker_command();
+        list.args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            &format!("label={COMPOSE_PROJECT_LABEL}={project_name}"),
+            "--filter",
+            "label=com.docker.compose.oneoff=False",
+            "--filter",
+            "status=exited",
+        ]);
+        let listed = Self::bounded_command_output(
+            list,
+            std::time::Duration::from_secs(15),
+            project_name,
+            "docker ps",
+        )
+        .await?;
+        if !listed.status.success() {
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "listing containers to clear their restart policy failed with status {}",
+                    listed.status
+                ),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        let containers: Vec<&str> = stdout.split_whitespace().collect();
+        if containers.is_empty() {
+            return Ok(());
+        }
+
+        let mut update = isolated_docker_command();
+        update.args(["update", "--restart", "no"]).args(&containers);
+        let updated = Self::bounded_command_output(
+            update,
+            std::time::Duration::from_secs(15),
+            project_name,
+            "docker update",
+        )
+        .await?;
+        if !updated.status.success() {
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "clearing the restart policy of {} container(s) failed with status {}",
+                    containers.len(),
+                    updated.status
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -83,6 +83,7 @@ impl From<GeoIpError> for Problem {
             | GeoIpError::InvalidDatabase { .. }
             | GeoIpError::WriteFailed { .. }
             | GeoIpError::ReloadFailed { .. }
+            | GeoIpError::WrongDatabaseKind { .. }
             | GeoIpError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Error")
                 .with_detail(error.to_string()),
