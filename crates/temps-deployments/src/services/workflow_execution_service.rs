@@ -471,6 +471,9 @@ pub struct WorkflowExecutionService {
     /// capture never overlaps one of the same deployment.
     capture_guard: Arc<crate::jobs::DeploymentCaptureGuard>,
     docker_handle: Arc<DockerHandle>,
+    /// How long one container's stop and removal may take in a teardown. Always
+    /// `CONTAINER_TEARDOWN_TIMEOUT_SECS` outside tests, which shorten it.
+    container_teardown_timeout: std::time::Duration,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
     /// ADR-055 Phase 5: the unified scheduler's inputs, for `shadow` and
@@ -528,6 +531,9 @@ impl WorkflowExecutionService {
             screenshot_service,
             capture_guard,
             docker_handle,
+            container_teardown_timeout: std::time::Duration::from_secs(
+                crate::jobs::mark_deployment_complete::CONTAINER_TEARDOWN_TIMEOUT_SECS,
+            ),
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
             workload_placement: OnceCell::new(),
@@ -2130,16 +2136,29 @@ impl WorkflowExecutionService {
                 .map_err(|error| error.to_string())
             }
             TeardownPath::Deployer(deployer) => {
-                if let Err(error) = deployer.stop_container(&container_id).await {
-                    warn!(
-                        "Failed to stop container {} on node {:?}: {}",
-                        container_id, container.node_id, error
-                    );
-                }
-                match deployer.remove_container(&container_id).await {
-                    Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => Ok(()),
-                    Err(error) => Err(error.to_string()),
-                }
+                // Bounded here, around the runtime calls only, so that a timeout
+                // still reaches the code below, which restores the row claimed
+                // above. An unanswering worker's client would otherwise take
+                // minutes per call while a sweep holds the lifecycle lock.
+                let removal = tokio::time::timeout(self.container_teardown_timeout, async {
+                    if let Err(error) = deployer.stop_container(&container_id).await {
+                        warn!(
+                            "Failed to stop container {} on node {:?}: {}",
+                            container_id, container.node_id, error
+                        );
+                    }
+                    match deployer.remove_container(&container_id).await {
+                        Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })
+                .await;
+                removal.unwrap_or_else(|_| {
+                    Err(format!(
+                        "no answer after {}s; it may still be running",
+                        self.container_teardown_timeout.as_secs()
+                    ))
+                })
             }
         };
 
@@ -2305,9 +2324,19 @@ impl WorkflowExecutionService {
                 containers.len()
             );
 
+            // Several at once, so a worker that stops answering costs this lock
+            // one timeout per batch rather than one per replica.
+            let removals: Vec<_> = futures::stream::iter(
+                containers
+                    .into_iter()
+                    .map(|container| self.teardown_registered_container(container, false)),
+            )
+            .buffered(crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS)
+            .collect()
+            .await;
             let mut removed_every_container = true;
-            for container in containers {
-                match self.teardown_registered_container(container, false).await {
+            for removal in removals {
+                match removal {
                     Ok(Some(container_id)) => {
                         info!("Removed container {}", container_id);
                         if first_stopped_container_id.is_none() {
@@ -5006,6 +5035,36 @@ mod tests {
         db: Arc<DbConnection>,
         fail_remove_container: Option<&'static str>,
         remove_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// A stop of a container with this prefix never answers, like an
+        /// unreachable worker's.
+        hang_stop_prefix: Option<&'static str>,
+        stops: Arc<StopLoad>,
+    }
+
+    #[derive(Default)]
+    struct StopLoad {
+        in_flight: std::sync::atomic::AtomicUsize,
+        most_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Counts one stop as in flight until it finishes or is abandoned.
+    struct StopInFlight(Arc<StopLoad>);
+
+    impl StopInFlight {
+        fn enter(load: Arc<StopLoad>) -> Self {
+            use std::sync::atomic::Ordering::SeqCst;
+            let in_flight = load.in_flight.fetch_add(1, SeqCst) + 1;
+            load.most_in_flight.fetch_max(in_flight, SeqCst);
+            Self(load)
+        }
+    }
+
+    impl Drop for StopInFlight {
+        fn drop(&mut self) {
+            self.0
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -5040,6 +5099,7 @@ mod tests {
             &self,
             container_id: &str,
         ) -> Result<(), temps_deployer::DeployerError> {
+            let _in_flight = StopInFlight::enter(self.stops.clone());
             let container = temps_entities::deployment_containers::Entity::find()
                 .filter(temps_entities::deployment_containers::Column::ContainerId.eq(container_id))
                 .one(self.db.as_ref())
@@ -5053,6 +5113,12 @@ mod tests {
                  observe an Exited container with no signal that the exit is an \
                  intentional teardown, and fires a false ContainerCrash alarm"
             );
+            if self
+                .hang_stop_prefix
+                .is_some_and(|prefix| container_id.starts_with(prefix))
+            {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -5262,6 +5328,129 @@ mod tests {
             Some(handled_at.timestamp_micros()),
             "containers on an offline node are not attempted"
         );
+        Ok(())
+    }
+
+    /// A worker that stops answering must not hold the environment's lifecycle
+    /// lock for minutes per replica, which would block pausing and resuming its
+    /// healthy deployments. Each replica gets one bounded attempt, several at
+    /// once, and what could not be removed stays recorded for the next deploy.
+    #[tokio::test]
+    async fn test_teardown_bounds_how_long_an_unanswering_worker_can_hold_it_up(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Skipping container teardown integration test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        let previous = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("previous-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let replicas = crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS + 1;
+        let mut container_ids: Vec<String> = (0..replicas).map(|n| format!("hung-{n}")).collect();
+        container_ids.push("answers-1".to_string());
+        for container_id in &container_ids {
+            deployment_containers::ActiveModel {
+                deployment_id: Set(previous.id),
+                container_id: Set(container_id.clone()),
+                container_name: Set(container_id.clone()),
+                container_port: Set(Some(3000)),
+                status: Set(Some("running".to_string())),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(10);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let stops = Arc::new(StopLoad::default());
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer {
+            db: db.clone(),
+            fail_remove_container: None,
+            remove_calls: Arc::default(),
+            hang_stop_prefix: Some("hung-"),
+            stops: stops.clone(),
+        });
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(DockerHandle::available(Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        )));
+        let mut service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            container_deployer,
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            docker,
+        );
+        service.container_teardown_timeout = std::time::Duration::from_secs(2);
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            service.teardown_previous_deployment(project.id, environment.id, &current_deployment),
+        )
+        .await
+        .expect("a worker that never answers must not hang the sweep")?;
+        assert_eq!(stopped.as_deref(), Some("answers-1"));
+
+        let most = stops
+            .most_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            most > 1 && most <= crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS,
+            "stops overlap, within the limit: {most} at once"
+        );
+        let rows = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(previous.id))
+            .all(db.as_ref())
+            .await?;
+        assert_eq!(rows.len(), container_ids.len());
+        for row in rows {
+            if row.container_id == "answers-1" {
+                assert!(row.deleted_at.is_some(), "{} was removed", row.container_id);
+            } else {
+                assert!(
+                    row.deleted_at.is_none(),
+                    "{} may still be running, so a later deploy must find it",
+                    row.container_id
+                );
+                assert_eq!(row.status.as_deref(), Some("running"));
+            }
+        }
+        let after = deployments::Entity::find_by_id(previous.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("deployment row")?;
+        assert_eq!(after.state, "completed", "stays eligible for a retry");
         Ok(())
     }
 
@@ -5584,6 +5773,8 @@ mod tests {
             db: db.clone(),
             fail_remove_container: Some("legacy-remove-error"),
             remove_calls: remove_calls.clone(),
+            hang_stop_prefix: None,
+            stops: Arc::default(),
         });
         let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));

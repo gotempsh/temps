@@ -35,9 +35,10 @@ static ENVIRONMENT_LIFECYCLE_LOCKS: std::sync::LazyLock<EnvironmentLocks> =
 ///
 /// Nothing holding it waits for `ENVIRONMENT_LOCKS`, so a deploy holding that
 /// one and waiting for this one cannot deadlock. Holders only wait on replica
-/// operations, each bounded by a timeout or its client's, and hold no database
-/// connection meanwhile. The teardown sweeps take it per deployment, so a pause
-/// waits for at most one deployment's containers, not a whole sweep.
+/// operations, each bounded by a timeout, and hold no database connection
+/// meanwhile. The teardown sweeps take it per deployment, so a pause waits for
+/// at most one deployment's containers, not a whole sweep, and a worker that
+/// stops answering costs each batch of them one timeout.
 /// Process-level, like `ENVIRONMENT_LOCKS`.
 pub(crate) fn environment_lifecycle_lock(environment_id: i32) -> Arc<tokio::sync::Mutex<()>> {
     ENVIRONMENT_LIFECYCLE_LOCKS.get(environment_id)

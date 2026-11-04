@@ -112,7 +112,7 @@ const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
 /// Docker's graceful stop alone can take ~10s; without a ceiling a single hung
 /// container would block the whole teardown loop indefinitely. On timeout we
 /// log and move on — the container row is left for the next sweep to retry.
-const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
