@@ -978,6 +978,115 @@ async fn test_create_s3_service() {
         .expect("Failed to delete owned S3 fixture");
 }
 
+/// A service row as `import_service` leaves it: the operator's container name
+/// in the stored parameters and in the plaintext column. The container is not
+/// looked at here, so a test decides whether it exists.
+#[cfg(feature = "docker-tests")]
+async fn insert_imported_service(
+    manager: &ExternalServiceManager,
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+    service_type: &str,
+    container: &str,
+    docker_image: &str,
+) -> external_services::Model {
+    let now = Utc::now();
+    let parameters = serde_json::json!({
+        "host": "localhost",
+        "port": "45432",
+        "database": "app",
+        "username": "app",
+        "password": "imported-test-password",
+        "docker_image": docker_image,
+        "container_name": container,
+    });
+    external_services::ActiveModel {
+        name: Set(name.to_string()),
+        service_type: Set(service_type.to_string()),
+        status: Set("running".to_string()),
+        config: Set(Some(
+            manager
+                .encryption_service
+                .encrypt_string(&parameters.to_string())
+                .unwrap(),
+        )),
+        container_name: Set(Some(container.to_string())),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .unwrap()
+}
+
+/// The reported case: a same-major image swap on an imported Postgres service
+/// answered 200 and left a second managed container and volume behind.
+#[cfg(feature = "docker-tests")]
+#[tokio::test]
+async fn upgrading_imported_postgres_answers_409_and_creates_nothing() {
+    let (manager, test_db) = setup_test_manager_or_skip!();
+    let name = format!("imported-upgrade-{}", uuid::Uuid::new_v4());
+    let original_image = "postgres:17-alpine";
+    let service = insert_imported_service(
+        &manager,
+        test_db.db.as_ref(),
+        &name,
+        "postgres",
+        &format!("operator-{name}"),
+        original_image,
+    )
+    .await;
+
+    let error = manager
+        .upgrade_service(service.id, "gotempsh/postgres-walg:17-bookworm".to_string())
+        .await
+        .expect_err("an imported service must not be upgraded");
+
+    let problem =
+        crate::handlers::handlers::external_service_problem(&error, "unclassified".to_string());
+    assert_eq!(problem.status_code.as_u16(), 409, "{error}");
+    assert_eq!(
+        problem.body.get("service_id").and_then(|v| v.as_i64()),
+        Some(i64::from(service.id))
+    );
+
+    let docker = manager.require_docker().unwrap();
+    assert!(
+        matches!(
+            docker
+                .inspect_container(
+                    &postgres_container_name(&name),
+                    None::<bollard::query_parameters::InspectContainerOptions>
+                )
+                .await,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })
+        ),
+        "no managed container may appear beside the imported one"
+    );
+    for volume in postgres_volume_names(&name) {
+        assert!(
+            matches!(
+                docker.inspect_volume(&volume).await,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ),
+            "no managed volume may appear beside the imported container: {volume}"
+        );
+    }
+    let stored = manager.get_service_parameters(service.id).await.unwrap();
+    assert_eq!(
+        stored.get("docker_image").and_then(|v| v.as_str()),
+        Some(original_image),
+        "a refused upgrade must not change the stored image"
+    );
+}
+
 #[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_delete_service() {

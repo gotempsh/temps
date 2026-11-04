@@ -3169,6 +3169,20 @@ impl ExternalService for S3Service {
         let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let mut new_s3_config = self.get_s3_config(new_config)?;
 
+        // Everything below works on the derived container name: on an imported
+        // service that creates a second, empty server beside the operator's
+        // real one. Refuse before any Docker call.
+        if new_s3_config.container_name.is_some() {
+            return Err(EngineError::conflict(
+                &self.name,
+                format!(
+                    "Refusing to change the image of imported S3/MinIO service '{}': Temps does \
+                     not manage that container's lifecycle or storage. Nothing was changed",
+                    self.name
+                ),
+            ));
+        }
+
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
             "Verifying new Docker image is available: {}",
@@ -4008,6 +4022,51 @@ mod tests {
             let runtime_config: S3Config = input_config.into();
             assert_eq!(runtime_config.docker_image, custom);
         }
+    }
+
+    /// An imported service is refused before any Docker call. This client has
+    /// no daemon behind it, so a call would surface as a Docker error, not as
+    /// the conflict: nothing was pulled, and no container or volume created.
+    #[tokio::test]
+    async fn upgrade_of_imported_service_is_refused_before_any_docker_call() {
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap(),
+        );
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service = S3Service::new("imported-svc".to_string(), docker, encryption_service);
+        let config = |image: &str| ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::S3,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "9000",
+                "access_key": "minioadmin",
+                "secret_key": "minioadmin",
+                "region": "us-east-1",
+                "docker_image": image,
+                "container_name": "operator-minio",
+            }),
+        };
+
+        let error = service
+            .upgrade(
+                config("minio/minio:RELEASE.2025-01-01T00-00-00Z"),
+                config("minio/minio:RELEASE.2025-06-01T00-00-00Z"),
+            )
+            .await
+            .expect_err("an imported service must not be upgraded");
+
+        assert!(matches!(error, EngineError::Conflict { .. }), "{error}");
+        assert!(error.to_string().contains("imported"), "{error}");
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(&error)
+                .status_code
+                .as_u16(),
+            409
+        );
     }
 
     #[test]

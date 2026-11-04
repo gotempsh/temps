@@ -13,6 +13,53 @@ use std::time::Duration;
 #[cfg(feature = "docker-tests")]
 use urlencoding;
 
+/// An imported service is refused before any Docker call. This client has no
+/// daemon behind it, so a call would surface as a Docker error, not as the
+/// conflict: nothing was pulled, and no container or volume created. The two
+/// images differ only by tag, the same-major swap that used to return 200 and
+/// create a second `postgres-{name}` container and volume.
+#[tokio::test]
+async fn upgrade_of_imported_service_is_refused_before_any_docker_call() {
+    let docker = Arc::new(
+        Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION).unwrap(),
+    );
+    let service = PostgresService::new("imported-svc".to_string(), docker);
+    let config = |image: &str| ServiceConfig {
+        name: "imported-svc".to_string(),
+        service_type: ServiceType::Postgres,
+        version: None,
+        parameters: serde_json::json!({
+            "host": "localhost",
+            "port": "5433",
+            "database": "app",
+            "username": "app",
+            "password": "testpass",
+            "docker_image": image,
+            "container_name": "operator-postgres",
+        }),
+    };
+
+    let error = service
+        .upgrade(
+            config("postgres:17-alpine"),
+            config("gotempsh/postgres-walg:17-bookworm"),
+        )
+        .await
+        .expect_err("an imported service must not be upgraded");
+
+    assert!(
+        matches!(error, crate::externalsvc::EngineError::Conflict { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("imported"), "{error}");
+    assert_eq!(
+        temps_core::problemdetails::Problem::from(&error)
+            .status_code
+            .as_u16(),
+        409
+    );
+}
+
 #[test]
 fn postgres_restores_defer_target_writes_to_the_gate() {
     let docker = match bollard::Docker::connect_with_local_defaults() {

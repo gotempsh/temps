@@ -1001,6 +1001,27 @@ impl ExternalService for PostgresService {
     }
 
     async fn upgrade(&self, old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        // The swap below only ever creates the derived `postgres-{name}`
+        // container: on an imported service that is a second, empty database
+        // beside the operator's real one. Refuse before any Docker call, and
+        // before parsing: an imported container may run an image outside the
+        // allow-list, and "not supported" is the wrong reason to give.
+        if new_config
+            .parameters
+            .get("container_name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| !name.is_empty())
+        {
+            return Err(EngineError::conflict(
+                &self.name,
+                format!(
+                    "Refusing to change the image of imported PostgreSQL service '{}': Temps does \
+                     not manage that container's lifecycle or storage. Nothing was changed",
+                    self.name
+                ),
+            ));
+        }
+
         let old_pg_config = self.get_postgres_config(old_config)?;
         // The service's own limits: a provider built for this call has
         // none loaded, and the new container must keep them.
@@ -1065,18 +1086,16 @@ impl ExternalService for PostgresService {
 
         // The swap stops the container before recreating it. Refuse first,
         // while it still runs, if the new container would not see its data.
-        if new_pg_config.container_name.is_none() {
-            let replacement = self.replacement_storage(&new_pg_config)?;
-            crate::externalsvc::recreate_guard::preflight(
-                &self.docker,
-                crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
-                &self.name,
-                &self.get_container_name(),
-                &replacement,
-                "changing its image",
-            )
-            .await?;
-        }
+        let replacement = self.replacement_storage(&new_pg_config)?;
+        crate::externalsvc::recreate_guard::preflight(
+            &self.docker,
+            crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
+            &self.name,
+            &self.get_container_name(),
+            &replacement,
+            "changing its image",
+        )
+        .await?;
 
         // Same major version — image swap only (e.g., postgres:18 -> gotempsh/postgres-walg:18).
         // No pg_upgrade needed. Just recreate the container with the new image;

@@ -3572,6 +3572,20 @@ impl ExternalService for RedisService {
         let upgrade_limits = ServiceResourceLimits::from_parameters(&new_config.parameters);
         let mut new_redis_config = self.get_redis_config(new_config)?;
 
+        // Everything below works on the derived container name: on an imported
+        // service that creates a second, empty server beside the operator's
+        // real one. Refuse before any Docker call.
+        if new_redis_config.container_name.is_some() {
+            return Err(EngineError::conflict(
+                self.instance_name(),
+                format!(
+                    "Refusing to change the image of imported Redis service '{}': Temps does not \
+                     manage that container's lifecycle or storage. Nothing was changed",
+                    self.instance_name()
+                ),
+            ));
+        }
+
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
             "Verifying new Docker image is available: {}",
@@ -5126,6 +5140,44 @@ mod tests {
         // In Docker mode, should return container name with internal port
         assert_eq!(host, "redis-test-effective-addr-docker");
         assert_eq!(port, "6379"); // Internal port
+    }
+
+    /// An imported service is refused before any Docker call. This client has
+    /// no daemon behind it, so a call would surface as a Docker error, not as
+    /// the conflict: nothing was pulled, and no container or volume created.
+    #[tokio::test]
+    async fn upgrade_of_imported_service_is_refused_before_any_docker_call() {
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                .unwrap(),
+        );
+        let service = RedisService::new("imported-svc".to_string(), docker);
+        let config = |image: &str| ServiceConfig {
+            name: "imported-svc".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "6380",
+                "password": "testpass",
+                "docker_image": image,
+                "container_name": "operator-redis",
+            }),
+        };
+
+        let error = service
+            .upgrade(config("redis:7"), config("redis:8"))
+            .await
+            .expect_err("an imported service must not be upgraded");
+
+        assert!(matches!(error, EngineError::Conflict { .. }), "{error}");
+        assert!(error.to_string().contains("imported"), "{error}");
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(&error)
+                .status_code
+                .as_u16(),
+            409
+        );
     }
 
     #[test]

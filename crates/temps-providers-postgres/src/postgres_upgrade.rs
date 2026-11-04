@@ -85,6 +85,15 @@ pub trait PostgresContainerLifecycle: Send + Sync {
     /// cannot use the upgrade API as an arbitrary image execution primitive.
     async fn docker_image(&self, service_id: i32) -> Result<String, String>;
 
+    /// The real container of a service imported from an existing one. Every
+    /// other method here works on the derived `postgres-{name}` container, so
+    /// such a service must not enter the migration at all. A service placed on
+    /// a worker node is not imported, even though its parameters also record a
+    /// container name.
+    async fn imported_container(&self, _service_id: i32) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// Stop (best-effort) and remove any existing container for this
     /// service, preserving its named volume. Safe to call on a
     /// non-existent container.
@@ -140,6 +149,12 @@ pub enum PostgresUpgradeError {
 
     #[error("Could not validate PostgreSQL service {service_id} configuration: {reason}")]
     ServiceConfiguration { service_id: i32, reason: String },
+
+    #[error(
+        "Refusing to upgrade imported PostgreSQL service {service_id}: Temps does not manage the \
+         lifecycle or storage of container '{container}'. Nothing was changed"
+    )]
+    ImportedService { service_id: i32, container: String },
 
     #[error(
         "Cannot upgrade service {service_id} from {from_image} to {to_image}: OS family mismatch ({from_os} -> {to_os}). Cross-OS-family upgrades are unsupported."
@@ -2366,6 +2381,12 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
             PostgresUpgradeError::SourceImageMismatch { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("PostgreSQL Service Changed")
+                    .with_detail(error.to_string())
+            }
+
+            PostgresUpgradeError::ImportedService { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Imported Service Not Managed")
                     .with_detail(error.to_string())
             }
 

@@ -370,6 +370,13 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         Ok(self.load_postgres_config(service_id).await?.docker_image)
     }
 
+    async fn imported_container(&self, service_id: i32) -> Result<Option<String>, String> {
+        if self.load_service_row(service_id).await?.node_id.is_some() {
+            return Ok(None);
+        }
+        Ok(self.load_postgres_config(service_id).await?.container_name)
+    }
+
     async fn stop_and_remove(&self, service_id: i32) -> Result<(), String> {
         let docker = self.docker_handle.require().map_err(|e| e.to_string())?;
         let svc = self.load_service_row(service_id).await?;
