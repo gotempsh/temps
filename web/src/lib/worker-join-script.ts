@@ -28,13 +28,16 @@ const AS_ROOT = 'sudo -H'
  * The control plane reports its running version (`v0.1.0`,
  * `v0.1.0-beta.2`, `v0.1.0-nightly.20261104.0123abcde`). Anything else, such
  * as a local development build or an unreadable version, is not pinned: the
- * installer would fail to download it. The pattern also keeps the value safe
- * to paste into a shell.
+ * installer would fail to download it. The pattern is a subset of the
+ * installer's own plain-tag check (`[0-9A-Za-z._-]`), so the value is also
+ * safe to paste into a shell.
  */
 export function releaseTag(version: string | null | undefined): string | null {
   const tag = version?.trim()
   if (!tag) return null
-  return /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.]*)?$/.test(tag) ? tag : null
+  return /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/.test(tag)
+    ? tag
+    : null
 }
 
 /**

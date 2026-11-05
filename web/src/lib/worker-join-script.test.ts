@@ -19,6 +19,8 @@ describe('releaseTag', () => {
       'v0.1.0-nightly.20261104.0123abcde'
     )
     expect(releaseTag('  v1.2.3\n')).toBe('v1.2.3')
+    // Hyphens inside a prerelease, as the installer's own tag check allows.
+    expect(releaseTag('v1.2.3-rc-1')).toBe('v1.2.3-rc-1')
   })
 
   test('does not pin what is not a release', () => {
