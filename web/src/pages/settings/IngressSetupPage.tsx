@@ -107,7 +107,8 @@ import { addressScope } from '@/lib/worker-ingress'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { cn } from '@/lib/utils'
 
-const EXAMPLE_APP = 'app'
+/** A concrete app name for the hostname examples; the pattern says `<app-name>`. */
+const EXAMPLE_APP = 'shop'
 
 function workerUrl(id: number) {
   return `${WORKER_NODES_URL}/${id}#public-ingress`
@@ -128,7 +129,12 @@ export function IngressSetupPage() {
     searchParams.get('via') === 'ports' ? 'ports' : 'tunnel'
   const preferredWorker = Number(searchParams.get('worker')) || null
 
-  const nodesQuery = useQuery(adminListNodesOptions())
+  // Polled, so a worker that stops while the page is open stops being
+  // offered; the run checks the picked ones again before creating anything.
+  const nodesQuery = useQuery({
+    ...adminListNodesOptions(),
+    refetchInterval: 15_000,
+  })
   const workers = (nodesQuery.data?.nodes ?? []).filter(
     (n) => n.role === 'worker'
   )
@@ -183,7 +189,7 @@ export function IngressSetupPage() {
           <Skeleton className="h-24 w-full" />
           <Skeleton className="h-24 w-full" />
         </div>
-      ) : nodesQuery.isError ? (
+      ) : nodesQuery.isError && !nodesQuery.data ? (
         <Alert variant="destructive">
           <AlertTitle>Could not load the worker nodes</AlertTitle>
           <AlertDescription>
@@ -199,7 +205,19 @@ export function IngressSetupPage() {
         </Alert>
       ) : workers.length === 0 ? (
         <NoWorkers />
-      ) : via === 'ports' ? (
+      ) : null}
+      {/* A failed poll keeps the last list: replacing the wizard here would
+          abort a run in progress and lose what it reported. */}
+      {nodesQuery.isError && nodesQuery.data && workers.length > 0 && (
+        <p className="text-xs text-amber-700 dark:text-amber-300">
+          The worker list may be out of date: the last refresh failed (
+          {deliveryError(nodesQuery.error)}). Creating a tunnel checks the
+          workers again first.
+        </p>
+      )}
+      {nodesQuery.isLoading ||
+      (nodesQuery.isError && !nodesQuery.data) ||
+      workers.length === 0 ? null : via === 'ports' ? (
         <OpenPortsPanel workers={workers} />
       ) : (
         <TunnelSetup workers={workers} preferredWorker={preferredWorker} />
@@ -1105,7 +1123,13 @@ function SchemePicker({
   const sub = label.trim().toLowerCase() || 'lab'
   return (
     <div className="space-y-3">
-      <p className="text-sm font-medium">Hostnames</p>
+      <div className="space-y-1">
+        <p className="text-sm font-medium">Hostnames</p>
+        <p className="text-xs text-muted-foreground">
+          Each app gets its own hostname from a pattern: the tunnel serves every
+          name it matches.
+        </p>
+      </div>
       <RadioGroup
         value={scheme}
         onValueChange={(value) => onScheme(value as HostnameScheme['kind'])}
@@ -1117,12 +1141,18 @@ function SchemePicker({
           className="flex cursor-pointer items-start gap-2 font-normal"
         >
           <RadioGroupItem id="scheme-zone" value="zone" className="mt-0.5" />
-          <span className="text-sm">
-            <code>
-              {EXAMPLE_APP}.{zone}
-            </code>{' '}
-            <span className="text-muted-foreground">
-              (recommended: Cloudflare&apos;s free certificate covers it)
+          <span className="grid gap-0.5 text-sm">
+            <span>
+              <code>&lt;app-name&gt;.{zone}</code>{' '}
+              <span className="text-muted-foreground">
+                (recommended: Cloudflare&apos;s free certificate covers it)
+              </span>
+            </span>
+            <span className="text-xs text-muted-foreground">
+              For example{' '}
+              <code>
+                {EXAMPLE_APP}.{zone}
+              </code>
             </span>
           </span>
         </Label>
@@ -1135,11 +1165,19 @@ function SchemePicker({
             value="subdomain"
             className="mt-0.5"
           />
-          <span className="text-sm">
-            Under a subdomain, such as{' '}
-            <code>
-              {EXAMPLE_APP}.{sub}.{zone}
-            </code>
+          <span className="grid gap-0.5 text-sm">
+            <span>
+              Under a subdomain:{' '}
+              <code>
+                &lt;app-name&gt;.{sub}.{zone}
+              </code>
+            </span>
+            <span className="text-xs text-muted-foreground">
+              For example{' '}
+              <code>
+                {EXAMPLE_APP}.{sub}.{zone}
+              </code>
+            </span>
           </span>
         </Label>
       </RadioGroup>
@@ -1382,8 +1420,18 @@ function OutcomePanel({
       <Alert variant="destructive">
         <AlertTitle>Setup failed: {outcome.error}</AlertTitle>
         <AlertDescription className="space-y-2">
-          <p>What this page had created is undone:</p>
-          <UndoList results={outcome.undo} />
+          {outcome.stoppedBeforeChanges ? (
+            <p>
+              Nothing was created.
+              {addedAccount &&
+                ` The Cloudflare account ${addedAccount} you added stays, so you can try again.`}
+            </p>
+          ) : (
+            <>
+              <p>What this page had created is undone:</p>
+              <UndoList results={outcome.undo} />
+            </>
+          )}
           {leftovers && (
             <p>
               Remove what is left from its{' '}

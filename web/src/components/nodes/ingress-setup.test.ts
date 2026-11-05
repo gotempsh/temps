@@ -17,6 +17,7 @@ import {
   tunnelDomainFor,
   uniqueProviderName,
   uniqueTunnelName,
+  unavailableWorker,
   workerEligibility,
 } from './ingress-setup'
 
@@ -81,6 +82,10 @@ function fakeApi(overrides: Partial<IngressSetupApi> = {}) {
     removeManagedDomain: async (id, domain) => {
       calls.push(`remove-domain ${id} ${domain}`)
     },
+    listNodes: async () => {
+      calls.push('nodes')
+      return [{ id: 1, name: 'worker-a', role: 'worker', status: 'active' }]
+    },
     createConnector: async (request) => {
       calls.push(`create ${request.name} ${request.node_ids.join(',')}`)
       return connector([{ node_id: 1, state: 'pending' }])
@@ -121,20 +126,34 @@ describe('runTunnelSetup', () => {
     const outcome = await runTunnelSetup(plan, api, (s) => reports.push(s))
     expect(outcome.kind).toBe('done')
     expect(calls).toEqual([
+      'nodes',
       'add 1 example.com',
       'verify 1 example.com',
       'create example-com 1',
       'get 9',
     ])
     const last = reports[reports.length - 1]
-    expect(last.map((s) => s.status)).toEqual(['done', 'done', 'done', 'done'])
-    expect(last[3].detail).toBe('4 connections to Cloudflare')
+    expect(last.map((s) => s.key)).toEqual([
+      'account',
+      'workers',
+      'domain',
+      'tunnel',
+      'node-1',
+    ])
+    expect(last.map((s) => s.status)).toEqual([
+      'done',
+      'done',
+      'done',
+      'done',
+      'done',
+    ])
+    expect(last[4].detail).toBe('4 connections to Cloudflare')
   })
 
   test('a verified managed domain is used as it is', async () => {
     const { api, calls } = fakeApi()
     await runTunnelSetup({ ...plan, managed: managed() }, api, () => {})
-    expect(calls[0]).toBe('create example-com 1')
+    expect(calls.slice(0, 2)).toEqual(['nodes', 'create example-com 1'])
   })
 
   test('a domain the token cannot manage fails with its reason and undoes only what the run added', async () => {
@@ -172,7 +191,63 @@ describe('runTunnelSetup', () => {
     )
     expect(outcome.kind).toBe('failed')
     // Only the lookup for a half-saved tunnel: nothing pre-existing is touched.
-    expect(calls).toEqual(['find example-com'])
+    expect(calls).toEqual(['nodes', 'find example-com'])
+  })
+
+  test('a worker that went offline stops the run before anything is created', async () => {
+    const { api, calls } = fakeApi({
+      listNodes: async () => {
+        calls.push('nodes')
+        return [{ id: 1, name: 'worker-a', role: 'worker', status: 'offline' }]
+      },
+    })
+    const reports: SetupStep[][] = []
+    const outcome = await runTunnelSetup(plan, api, (s) => reports.push(s))
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind !== 'failed') return
+    expect(outcome.error).toBe(
+      "Worker 'worker-a' is offline, so it cannot run a tunnel. Start its agent on that machine (sudo systemctl start temps-agent) or untick it under Workers, then try again."
+    )
+    // No domain, no tunnel: nothing to roll back.
+    expect(calls).toEqual(['nodes'])
+    expect(outcome.undo).toEqual([])
+    expect(outcome.stoppedBeforeChanges).toBe(true)
+    const last = reports[reports.length - 1]
+    expect(last.find((s) => s.key === 'workers')?.status).toBe('failed')
+    expect(last.find((s) => s.key === 'domain')?.status).toBe('pending')
+  })
+
+  test('a worker the run cannot read the nodes for creates nothing either', async () => {
+    const { api, calls } = fakeApi({
+      listNodes: async () => {
+        calls.push('nodes')
+        throw new Error('Could not list nodes (HTTP 503)')
+      },
+    })
+    const outcome = await runTunnelSetup(plan, api, () => {})
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind !== 'failed') return
+    expect(outcome.error).toBe('Could not list nodes (HTTP 503)')
+    expect(calls).toEqual(['nodes'])
+  })
+
+  test('a token added on this page is kept when the workers check fails, for a retry', async () => {
+    const { api, calls } = fakeApi({
+      listNodes: async () => [],
+    })
+    const outcome = await runTunnelSetup(
+      { ...plan, provider: { ...plan.provider, createdThisRun: true } },
+      api,
+      () => {}
+    )
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind !== 'failed') return
+    expect(outcome.error).toContain(
+      "Worker 'worker-a' is no longer in this cluster"
+    )
+    expect(outcome.stoppedBeforeChanges).toBe(true)
+    expect(outcome.undo).toEqual([])
+    expect(calls).toEqual([])
   })
 
   test('a tunnel saved before its setup failed is found by name and deleted', async () => {
@@ -205,6 +280,7 @@ describe('runTunnelSetup', () => {
     if (outcome.kind !== 'failed') return
     expect(outcome.error).toBe('Tunnel quota reached')
     expect(calls).toEqual([
+      'nodes',
       'auto 1 example.com true',
       'create example-com 1',
       'delete-connector 9',
@@ -280,10 +356,23 @@ describe('helpers', () => {
     const fixed = workerEligibility(node, 'fixed', [])
     expect(fixed.selectable).toBe(false)
     expect(fixed.command).toBe('temps agent ingress delegated')
-    expect(
-      workerEligibility({ ...node, status: 'offline' }, 'delegated', [])
-        .selectable
-    ).toBe(false)
+    const offline = workerEligibility(
+      { ...node, status: 'offline' },
+      'delegated',
+      []
+    )
+    expect(offline.selectable).toBe(false)
+    expect(offline.reason).toContain('It is offline, so it cannot run a tunnel')
+    expect(offline.command).toBe('sudo systemctl start temps-agent')
+    // Starting the agent does not bring back a drained worker.
+    const drained = workerEligibility(
+      { ...node, status: 'drained' },
+      'delegated',
+      []
+    )
+    expect(drained.selectable).toBe(false)
+    expect(drained.command).toBeUndefined()
+    expect(drained.reason).toContain('Bring it back from its page')
     const served = workerEligibility(node, 'delegated', [
       { provider: 'cloudflare_tunnel', nodes: [{ node_id: 1 }] },
     ])
@@ -295,5 +384,44 @@ describe('helpers', () => {
     expect(ingressSetupUrl({ worker: 4, via: 'ports' })).toBe(
       '/settings/nodes/ingress?via=ports&worker=4'
     )
+  })
+})
+
+describe('unavailableWorker', () => {
+  const nodes = [
+    { id: 1, name: 'worker-a', role: 'worker', status: 'active' },
+    { id: 2, name: 'worker-b', role: 'worker', status: 'offline' },
+    { id: 3, name: 'cp', role: 'control_plane', status: 'active' },
+  ]
+
+  test('accepts active workers', () => {
+    expect(
+      unavailableWorker([{ id: 1, name: 'worker-a' }], nodes)
+    ).toBeUndefined()
+  })
+
+  test('names the worker that is not active, removed or not a worker', () => {
+    expect(
+      unavailableWorker(
+        [
+          { id: 1, name: 'worker-a' },
+          { id: 2, name: 'worker-b' },
+        ],
+        nodes
+      )
+    ).toContain("Worker 'worker-b' is offline")
+    expect(unavailableWorker([{ id: 9, name: 'gone' }], nodes)).toContain(
+      "Worker 'gone' is no longer in this cluster"
+    )
+    expect(unavailableWorker([{ id: 3, name: 'cp' }], nodes)).toContain(
+      'not a worker'
+    )
+    const draining = unavailableWorker(
+      [{ id: 4, name: 'worker-d' }],
+      [{ id: 4, name: 'worker-d', role: 'worker', status: 'draining' }]
+    )
+    expect(draining).toContain("Worker 'worker-d' is draining")
+    expect(draining).toContain('Bring it back from its page')
+    expect(draining).not.toContain('systemctl')
   })
 })

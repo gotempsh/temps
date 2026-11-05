@@ -7,6 +7,7 @@
 
 import {
   addManagedDomain,
+  adminListNodes,
   createIngressConnector,
   deleteDnsProvider,
   deleteIngressConnector,
@@ -139,7 +140,10 @@ export function workerEligibility(
       selectable: false,
       hasIngress,
       defaultOn: false,
-      reason: `It is ${node.status}: its agent must be running and connected.`,
+      reason: offlineWorkerReason(node.status),
+      // Only a stopped agent is fixed by starting it; a drained or disabled
+      // worker is brought back from its page.
+      command: node.status === 'offline' ? START_AGENT_COMMAND : undefined,
     }
   }
   // Agents that report no mode predate the rule and are accepted (ADR 058 D7).
@@ -156,6 +160,16 @@ export function workerEligibility(
     }
   }
   return { selectable: true, hasIngress, defaultOn: !hasIngress }
+}
+
+/** Starts a worker's agent where `temps agent service install` set it up. */
+export const START_AGENT_COMMAND = 'sudo systemctl start temps-agent'
+
+/** Why a worker that is not active cannot run a tunnel, and how to fix it. */
+export function offlineWorkerReason(status: string): string {
+  return status === 'offline'
+    ? 'It is offline, so it cannot run a tunnel. Start its agent on that machine, then it shows as active here within a minute.'
+    : `It is ${status}, so it cannot run a tunnel. Bring it back from its page under Worker nodes.`
 }
 
 // ----- the run --------------------------------------------------------------
@@ -205,6 +219,11 @@ export type SetupOutcome =
       error: string
       created: SetupCreated
       undo: UndoResult[]
+      /**
+       * The run stopped before it changed anything (the workers check), so
+       * nothing was undone: an account added on this page stays for a retry.
+       */
+      stoppedBeforeChanges?: boolean
     }
   | { kind: 'aborted'; created: SetupCreated }
 
@@ -225,6 +244,10 @@ export interface IngressSetupApi {
   ): Promise<ManagedDomainResponse>
   removeManagedDomain(providerId: number, domain: string): Promise<void>
   createConnector(request: CreateConnectorRequest): Promise<ConnectorView>
+  /** The nodes as they are now, to re-check the workers before creating. */
+  listNodes(): Promise<
+    Pick<NodeInfoResponse, 'id' | 'name' | 'role' | 'status'>[]
+  >
   findConnectorByName(name: string): Promise<ConnectorView | undefined>
   getConnector(id: number): Promise<ConnectorView>
   deleteConnector(id: number): Promise<void>
@@ -274,6 +297,7 @@ export const sdkIngressSetupApi: IngressSetupApi = {
   },
   getConnector: async (id) =>
     requireDeliveryData(await getIngressConnector({ path: { id } })),
+  listNodes: async () => requireDeliveryData(await adminListNodes()).nodes,
   deleteConnector: (id) => noContent(deleteIngressConnector({ path: { id } })),
   deleteDnsProvider: (id) => noContent(deleteDnsProvider({ path: { id } })),
   sleep: (ms, signal) =>
@@ -350,6 +374,35 @@ export async function undoSetup(
 class StepFailure extends Error {}
 
 /**
+ * The first of `chosen` that cannot run a tunnel now, and why. The page's
+ * node list can be minutes old, so the run reads it again before it creates
+ * anything: a worker that went offline would otherwise fail only at the
+ * tunnel, after the domain was added.
+ */
+export function unavailableWorker(
+  chosen: { id: number; name: string }[],
+  nodes: Pick<NodeInfoResponse, 'id' | 'name' | 'role' | 'status'>[]
+): string | undefined {
+  for (const pick of chosen) {
+    const node = nodes.find((n) => n.id === pick.id)
+    if (!node) {
+      return `Worker '${pick.name}' is no longer in this cluster. Untick it under Workers and try again.`
+    }
+    if (node.role !== 'worker') {
+      return `Node '${node.name}' is a ${node.role}, not a worker; only workers run tunnels.`
+    }
+    if (node.status !== 'active') {
+      const fix =
+        node.status === 'offline'
+          ? `Start its agent on that machine (${START_AGENT_COMMAND})`
+          : 'Bring it back from its page under Worker nodes'
+      return `Worker '${node.name}' is ${node.status}, so it cannot run a tunnel. ${fix} or untick it under Workers, then try again.`
+    }
+  }
+  return undefined
+}
+
+/**
  * Domain, tunnel, then each worker's connection, reporting every change.
  * A failure undoes what the run created; a worker that is merely slow is
  * not a failure, and the run hands over with everything kept.
@@ -372,6 +425,11 @@ export async function runTunnelSetup(
       detail: plan.provider.createdThisRun
         ? 'Added with the token you pasted; Cloudflare accepted it.'
         : 'Already in Temps.',
+    },
+    {
+      key: 'workers',
+      label: `Workers ${plan.nodes.map((n) => n.name).join(', ')} online`,
+      status: 'pending',
     },
     { key: 'domain', label: `Domain ${plan.zone}`, status: 'pending' },
     {
@@ -398,7 +456,30 @@ export async function runTunnelSetup(
     const undo = await undoSetup(created, api)
     return { kind: 'failed', error, created, undo }
   }
+  // Nothing is undone here: the run has changed nothing yet, and an account
+  // added with a pasted token stays so the user can fix the worker and retry.
+  const stopBeforeChanges = (error: string): SetupOutcome => {
+    set('workers', 'failed', error)
+    return {
+      kind: 'failed',
+      error,
+      created,
+      undo: [],
+      stoppedBeforeChanges: true,
+    }
+  }
   report(steps.map((s) => ({ ...s })))
+
+  // 0. The workers, read again: nothing is created for a tunnel that
+  // cannot run.
+  set('workers', 'running', 'Checking they are connected…')
+  try {
+    const unavailable = unavailableWorker(plan.nodes, await api.listNodes())
+    if (unavailable) return stopBeforeChanges(unavailable)
+  } catch (error) {
+    return stopBeforeChanges(message(error))
+  }
+  set('workers', 'done', 'Connected.')
 
   // 1. The domain, managed and verified: a tunnel only takes one.
   set('domain', 'running', 'Adding it to Temps…')
