@@ -27,7 +27,6 @@
 
 set -uo pipefail
 
-TEMPS="${TEMPS_BIN:-$HOME/.temps/bin/temps}"
 DATA_DIR="${TEMPS_DATA_DIR:-$HOME/.temps}"
 SIDECAR=temps-mac-mesh
 LABEL=sh.temps.agent
@@ -147,9 +146,19 @@ if [[ "$network_change" -eq 1 ]]; then
   old_port=$(in_sidecar wg show temps-wg0 listen-port)
   if [[ "$old_port" -lt 64000 ]]; then new_port=$((old_port + 1000)); else new_port=$((old_port - 1000)); fi
   echo "Moving the worker's WireGuard port $old_port -> $new_port..."
+  # Put the original port back however the script ends, so a failed run does
+  # not leave the worker on a port the agent did not choose.
+  trap 'in_sidecar wg set temps-wg0 listen-port "$old_port" >/dev/null 2>&1 || echo "WARNING: could not restore WireGuard port $old_port" >&2' EXIT
   before=$(date +%s)
-  in_sidecar wg set temps-wg0 listen-port "$new_port"
-  if wait_for_handshake 90 "$before"; then pass "a fresh handshake from the new port"; else fail "no handshake from the new port"; fi
+  if ! in_sidecar wg set temps-wg0 listen-port "$new_port"; then
+    fail "could not move the WireGuard port to $new_port"
+  elif [[ "$(in_sidecar wg show temps-wg0 listen-port)" != "$new_port" ]]; then
+    fail "the WireGuard port did not change to $new_port"
+  elif wait_for_handshake 90 "$before"; then
+    pass "a fresh handshake from the new port"
+  else
+    fail "no handshake from the new port"
+  fi
   check "the control plane answers after the change" in_sidecar ping -c 1 -W 3 "$control_plane"
   if [[ -n "$app_url" ]]; then
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$app_url")
