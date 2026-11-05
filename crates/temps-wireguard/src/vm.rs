@@ -235,31 +235,43 @@ fn none_or<T>(value: &str, parse: impl FnOnce(&str) -> Option<T>) -> Option<T> {
 
 /// Parse `wg show <iface> dump` (tab-separated; see wg(8)).
 pub fn parse_dump(text: &str) -> Result<Dump, WireGuardError> {
-    let bad = |line: &str, why: &str| {
+    // Never echo a line: the interface line holds the private key and a peer
+    // line its preshared key, and these errors reach the agent's logs.
+    let bad = |what: String, why: &str| {
         WireGuardError::InterfaceError(format!(
-            "unexpected `wg show {MESH_INTERFACE} dump` output ({why}): {line:?}"
+            "unexpected `wg show {MESH_INTERFACE} dump` output ({why}): {what}"
         ))
     };
+    let interface_line = |fields: &[&str]| format!("the interface line, {} fields", fields.len());
+    let peer_line =
+        |fields: &[&str]| format!("the line of peer {:?}, {} fields", fields[0], fields.len());
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let head = lines.next().ok_or_else(|| bad("", "empty"))?;
+    let head = lines
+        .next()
+        .ok_or_else(|| bad("no lines".to_string(), "empty"))?;
     let fields: Vec<&str> = head.split('\t').collect();
     // private-key, public-key, listen-port, fwmark
     if fields.len() != 4 {
-        return Err(bad(head, "the interface line needs 4 fields"));
+        return Err(bad(
+            interface_line(&fields),
+            "the interface line needs 4 fields",
+        ));
     }
     let private_key = none_or(fields[0], |value| Some(value.to_string()));
     let listen_port = fields[2]
         .parse::<u16>()
-        .map_err(|_| bad(head, "listen port"))?;
+        .map_err(|_| bad(interface_line(&fields), "listen port"))?;
     let mut peers = Vec::new();
     for line in lines {
         let fields: Vec<&str> = line.split('\t').collect();
         // public-key, preshared-key, endpoint, allowed-ips, latest-handshake,
         // rx, tx, persistent-keepalive
         if fields.len() != 8 {
-            return Err(bad(line, "a peer line needs 8 fields"));
+            return Err(bad(peer_line(&fields), "a peer line needs 8 fields"));
         }
-        let handshake: u64 = fields[4].parse().map_err(|_| bad(line, "handshake"))?;
+        let handshake: u64 = fields[4]
+            .parse()
+            .map_err(|_| bad(peer_line(&fields), "handshake"))?;
         peers.push(DumpPeer {
             public_key: fields[0].to_string(),
             endpoint: none_or(fields[2], |value| value.parse().ok()),
@@ -269,8 +281,12 @@ pub fn parse_dump(text: &str) -> Result<Dump, WireGuardError> {
             .unwrap_or_default(),
             latest_handshake: (handshake > 0)
                 .then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(handshake)),
-            rx_bytes: fields[5].parse().map_err(|_| bad(line, "rx bytes"))?,
-            tx_bytes: fields[6].parse().map_err(|_| bad(line, "tx bytes"))?,
+            rx_bytes: fields[5]
+                .parse()
+                .map_err(|_| bad(peer_line(&fields), "rx bytes"))?,
+            tx_bytes: fields[6]
+                .parse()
+                .map_err(|_| bad(peer_line(&fields), "tx bytes"))?,
         });
     }
     Ok(Dump {
@@ -437,9 +453,23 @@ QkJCQg==\t(none)\t(none)\t10.210.0.7/32,10.210.0.9/32\t0\t0\t0\toff
     }
 
     #[test]
-    fn malformed_dumps_are_refused_with_the_line() {
-        let error = parse_dump("garbage").unwrap_err().to_string();
-        assert!(error.contains("garbage"), "{error}");
+    fn malformed_dumps_are_refused_without_echoing_keys() {
+        let error = parse_dump("SECRETPRIVATEKEY\tpub\tnot-a-port\toff")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("listen port"), "{error}");
+        assert!(!error.contains("SECRETPRIVATEKEY"), "{error}");
+        let error = parse_dump("SECRETPRIVATEKEY").unwrap_err().to_string();
+        assert!(error.contains("1 fields"), "{error}");
+        assert!(!error.contains("SECRETPRIVATEKEY"), "{error}");
+        let error = parse_dump("k\tp\t51820\toff\nPUB\tSECRETPSK\tx\ty\tnope\t1\t2\t25\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("PUB") && error.contains("handshake"),
+            "{error}"
+        );
+        assert!(!error.contains("SECRETPSK"), "{error}");
         assert!(parse_dump("").is_err());
         assert!(parse_dump("k\tp\t51820\toff\nonly\ttwo\n").is_err());
     }
