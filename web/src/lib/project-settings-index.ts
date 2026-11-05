@@ -242,6 +242,9 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
       'health path',
       'healthcheck',
       'startup timeout',
+      'stop timeout',
+      'graceful shutdown',
+      'sigterm',
       'liveness',
       'readiness',
     ],
@@ -359,6 +362,13 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
     page: ENVIRONMENT,
     query: ENVIRONMENT_SETTINGS,
     keywords: ['timeout', 'request timeout', 'proxy timeout'],
+  },
+  {
+    anchor: settingAnchor('environment-stop-timeout'),
+    title: 'Stop timeout',
+    page: ENVIRONMENT,
+    query: ENVIRONMENT_SETTINGS,
+    keywords: ['stop timeout', 'graceful shutdown', 'sigterm', 'drain'],
   },
   {
     anchor: settingAnchor('environment-connection-limits'),
