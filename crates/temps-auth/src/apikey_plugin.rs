@@ -130,4 +130,26 @@ mod tests {
         let apikey_plugin = ApiKeyPlugin;
         assert_eq!(apikey_plugin.name(), "apikey");
     }
+
+    /// The router serves the update as PATCH. The OpenAPI document must say
+    /// the same, or the generated clients send a method the server refuses
+    /// with 405 (the console's Edit API key page did exactly that).
+    #[test]
+    fn update_api_key_is_documented_as_the_patch_it_is_routed_as() {
+        let doc = <ApiKeyApiDoc as OpenApiTrait>::openapi();
+        let item = doc
+            .paths
+            .paths
+            .get("/api-keys/{id}")
+            .expect("the API key item path is documented");
+        let patch = item
+            .patch
+            .as_ref()
+            .expect("the update is documented as PATCH");
+        assert_eq!(patch.operation_id.as_deref(), Some("update_api_key"));
+        assert!(
+            item.put.is_none(),
+            "no PUT route exists for /api-keys/{{id}}, so none may be documented"
+        );
+    }
 }

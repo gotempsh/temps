@@ -268,7 +268,7 @@ pub async fn get_api_key(
 }
 
 #[utoipa::path(
-    put,
+    patch,
     path = "/api-keys/{id}",
     params(
         ("id" = i32, Path, description = "API key ID")
