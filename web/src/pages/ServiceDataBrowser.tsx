@@ -136,6 +136,11 @@ import {
 } from '@/components/ui/resizable'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { isVerifiedNotFound } from '@/lib/read-failure'
+import { toast } from 'sonner'
+import {
+  downloadServiceObject,
+  saveBlobInBrowser,
+} from './service-object-download'
 import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   containerPathLevel,
@@ -3139,54 +3144,26 @@ function ContainerEntitiesView({
                                     variant="ghost"
                                     size="sm"
                                     className="h-8 px-2"
-                                    onClick={async () => {
-                                      try {
-                                        const response = await downloadObject({
-                                          path: {
-                                            service_id: parseInt(serviceId),
-                                            path: containerPath,
-                                            entity: entity.name,
-                                          },
-                                        })
-
-                                        // Ensure we have a Blob
-                                        let blob: Blob
-                                        const data = response.data as any
-                                        if (data instanceof Blob) {
-                                          blob = data
-                                        } else if (typeof data === 'string') {
-                                          // Convert string to Blob
-                                          blob = new Blob([data], {
-                                            type: 'application/octet-stream',
-                                          })
-                                        } else if (data) {
-                                          // Convert other data types to JSON string then Blob
-                                          const jsonStr = JSON.stringify(data)
-                                          blob = new Blob([jsonStr], {
-                                            type: 'application/json',
-                                          })
-                                        } else {
-                                          throw new Error(
-                                            'No data received from server'
-                                          )
-                                        }
-
-                                        const url =
-                                          window.URL.createObjectURL(blob)
-                                        const a = document.createElement('a')
-                                        a.href = url
-                                        a.download = entity.name
-                                        document.body.appendChild(a)
-                                        a.click()
-                                        window.URL.revokeObjectURL(url)
-                                        document.body.removeChild(a)
-                                      } catch (error) {
-                                        console.error(
-                                          'Failed to download object:',
-                                          error
-                                        )
-                                      }
-                                    }}
+                                    onClick={() =>
+                                      downloadServiceObject({
+                                        fetchObject: async () =>
+                                          (
+                                            await downloadObject({
+                                              path: {
+                                                service_id: parseInt(serviceId),
+                                                path: containerPath,
+                                                entity: entity.name,
+                                              },
+                                              parseAs: 'blob',
+                                              throwOnError: true,
+                                            })
+                                          ).data,
+                                        save: saveBlobInBrowser,
+                                        reportFailure: (title, description) =>
+                                          toast.error(title, { description }),
+                                        fileName: entity.name,
+                                      })
+                                    }
                                     title="Download"
                                   >
                                     <Download className="h-4 w-4" />
@@ -3653,32 +3630,24 @@ function EntityDataView({
 
     try {
       setIsDownloading(true)
-
-      // Construct the download URL using the correct endpoint
-      const downloadUrl = `/api/external-services/${serviceId}/query/containers/${containerPath}/entities/${entityName}/download`
-
-      // Fetch the file as a stream
-      const response = await fetch(downloadUrl)
-
-      if (!response.ok) {
-        throw new Error(`Download failed: ${response.statusText}`)
-      }
-
-      // Get the blob from the response
-      const blob = await response.blob()
-
-      // Create a download link
-      const url = window.URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = entityName
-      document.body.appendChild(link)
-      link.click()
-      document.body.removeChild(link)
-      window.URL.revokeObjectURL(url)
-    } catch (error) {
-      console.error('Download failed:', error)
-      // You might want to show a toast notification here
+      await downloadServiceObject({
+        fetchObject: async () =>
+          (
+            await downloadObject({
+              path: {
+                service_id: parseInt(serviceId),
+                path: containerPath,
+                entity: entityName,
+              },
+              parseAs: 'blob',
+              throwOnError: true,
+            })
+          ).data,
+        save: saveBlobInBrowser,
+        reportFailure: (title, description) =>
+          toast.error(title, { description }),
+        fileName: entityName,
+      })
     } finally {
       setIsDownloading(false)
     }

@@ -55,6 +55,7 @@ import {
   retryRun,
   startFix,
 } from '@/api/client/sdk.gen'
+import { useCancelRun } from './useCancelRun'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import {
@@ -991,6 +992,9 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   // Retry/start-over config dialog: prefilled from the run's stored config
   // so the user can change harness/model/turns/branch and add retry notes.
   const [showRetryConfig, setShowRetryConfig] = useState(false)
+  const cancelMutation = useCancelRun(project.id, Number(runId), () =>
+    window.location.reload()
+  )
 
   const runQueryOptions = getRunWithLogsOptions({
     path: { project_id: project.id, run_id: Number(runId) },
@@ -1235,16 +1239,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     setShowRetryConfig(true)
   }
 
-  const onCancel = async () => {
-    try {
-      await fetch(`/api/projects/${project.id}/agents/runs/${run.id}/cancel`, {
-        method: 'POST',
-      })
-      window.location.reload()
-    } catch {
-      // ignore
-    }
-  }
+  const onCancel = () => cancelMutation.mutate()
 
   const durationText = formatDuration(run.started_at, run.completed_at)
   const costText =
@@ -1304,7 +1299,15 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         </Button>
       )}
       {isActive && (
-        <Button size="sm" variant="destructive" onClick={onCancel}>
+        <Button
+          size="sm"
+          variant="destructive"
+          onClick={onCancel}
+          disabled={cancelMutation.isPending}
+        >
+          {cancelMutation.isPending && (
+            <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+          )}
           Cancel
         </Button>
       )}
