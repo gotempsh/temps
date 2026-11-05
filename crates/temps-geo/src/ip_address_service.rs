@@ -1116,6 +1116,65 @@ mod tests {
         assert_eq!(cached.is_hosting_provider, Some(true), "cached again");
     }
 
+    /// The city database arriving must clear a cached answer too: on a fresh
+    /// server it is usually the first one missing.
+    #[tokio::test]
+    async fn a_cached_address_is_located_when_the_city_database_arrives() {
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../temps-cli")
+            .join(crate::refresh::CITY_DB_FILENAME);
+        if !bundled.exists() {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let maxmind = crate::MaxMindGeoIpService::load(
+            &dir.path().join(crate::refresh::CITY_DB_FILENAME),
+            &dir.path().join(crate::refresh::ASN_DB_FILENAME),
+        )
+        .expect("missing databases must not fail startup");
+        let geo = Arc::new(GeoIpService::MaxMind(Arc::new(maxmind)));
+        let now = Utc::now();
+        let unlocated = unlocated_row(now);
+        let located = ip_geolocations::Model {
+            country: "United States".to_string(),
+            ..unlocated.clone()
+        };
+        // Exactly: the first lookup's read, then the one after the database
+        // arrives, then its write. Any other query would run out of results.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([
+                    vec![unlocated.clone()],
+                    vec![unlocated.clone()],
+                    vec![located.clone()],
+                ])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(db, geo.clone());
+
+        let before = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(before.country.as_deref(), Some(""));
+        let repeated = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(
+            repeated.country.as_deref(),
+            Some(""),
+            "still served from memory"
+        );
+
+        geo.refresh_from_path(&bundled)
+            .expect("load the city database");
+
+        let after = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(after.country.as_deref(), Some("United States"));
+        let cached = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(
+            cached.country.as_deref(),
+            Some("United States"),
+            "cached again"
+        );
+    }
+
     /// With no ASN database at all, the classifier check never fires, so nothing
     /// else would locate this row until the staleness window expired.
     #[tokio::test]
