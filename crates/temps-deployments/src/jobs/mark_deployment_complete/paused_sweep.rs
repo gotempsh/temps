@@ -25,19 +25,37 @@ pub(crate) const MAX_CONCURRENT_REPLICA_STOPS: usize = 8;
 static ENVIRONMENT_LIFECYCLE_LOCKS: std::sync::LazyLock<EnvironmentLocks> =
     std::sync::LazyLock::new(EnvironmentLocks::default);
 
-/// Held by whatever is stopping or starting the replicas of a paused
-/// deployment in an environment: a pause, a resume, a deploy's sweep. Each
-/// reads the deployment's state after taking it, so the state it acts on is
-/// still true when its stops and starts land. Without it, a sweep that read
-/// "paused" could stop a container a resume had just started, leaving a
-/// "deployed" deployment with nothing running.
+/// Held by whatever stops, starts or removes the replicas of a live or paused
+/// deployment in an environment: a pause, a resume, a deploy's sweeps. Each reads
+/// the deployment's state after taking it, so the state it acts on is still true
+/// when its operations land. Without it, a sweep that read "paused" could stop a
+/// container a resume had just started, leaving a "deployed" deployment with
+/// nothing running, and a teardown that read "deployed" could remove the
+/// containers of a deployment just paused, leaving a resume nothing to start.
 ///
 /// Nothing holding it waits for `ENVIRONMENT_LOCKS`, so a deploy holding that
 /// one and waiting for this one cannot deadlock. Holders only wait on replica
 /// operations, each bounded by a timeout, and hold no database connection
-/// meanwhile. Process-level, like `ENVIRONMENT_LOCKS`.
+/// meanwhile. The teardown sweeps take it per deployment, so a pause waits for
+/// at most one deployment's containers, not a whole sweep, and a worker that
+/// stops answering costs each batch of them one timeout.
+/// Process-level, like `ENVIRONMENT_LOCKS`.
 pub(crate) fn environment_lifecycle_lock(environment_id: i32) -> Arc<tokio::sync::Mutex<()>> {
     ENVIRONMENT_LIFECYCLE_LOCKS.get(environment_id)
+}
+
+/// The deployment as it is now, if a teardown sweep may still remove its
+/// containers. A sweep selects deployments before taking
+/// [`environment_lifecycle_lock`], so it reads this under the lock: a deployment
+/// paused in between must keep its containers for a resume.
+pub(crate) async fn deployment_still_swept(
+    db: &sea_orm::DatabaseConnection,
+    deployment_id: i32,
+) -> Result<Option<deployments::Model>, sea_orm::DbErr> {
+    deployments::Entity::find_by_id(deployment_id)
+        .filter(deployments::Column::State.is_in(TEARDOWN_SWEPT_STATES))
+        .one(db)
+        .await
 }
 
 /// Why a container of a paused deployment was not stopped. Each of these leaves

@@ -35,10 +35,16 @@ use tracing::{debug, info, warn};
 const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
 
 mod paused_sweep;
-pub(crate) use paused_sweep::{environment_lifecycle_lock, MAX_CONCURRENT_REPLICA_STOPS};
+pub(crate) use paused_sweep::{
+    deployment_still_swept, environment_lifecycle_lock, MAX_CONCURRENT_REPLICA_STOPS,
+};
 
-/// Deployment states the previous-deployment teardown sweep picks up.
-const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "completed"];
+/// Deployment states the previous-deployment teardown sweeps pick up. "deployed"
+/// is what `resume_deployment` leaves behind, and a later deploy supersedes it
+/// like "completed". "paused" is not here: it stays resumable, so its containers
+/// are stopped rather than removed (see `paused_sweep`).
+pub(crate) const TEARDOWN_SWEPT_STATES: [&str; 5] =
+    ["pending", "running", "built", "completed", "deployed"];
 
 /// Process-level locks keyed by environment_id to serialize mark_complete
 /// operations for the same environment. This replaces PostgreSQL advisory
@@ -106,7 +112,7 @@ const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
 /// Docker's graceful stop alone can take ~10s; without a ceiling a single hung
 /// container would block the whole teardown loop indefinitely. On timeout we
 /// log and move on — the container row is left for the next sweep to retry.
-const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2589,9 +2595,9 @@ WHERE project.id = $2
         // deployment is torn down here its state is flipped to "stopped" (see
         // below), so it drops out of this filter and is never re-scanned — that
         // is what keeps this query bounded as deployment history grows. We still
-        // include "completed" to catch a previously-current deployment that this
-        // new deploy is superseding (and any legacy rows left un-torn-down before
-        // the state-flip fix existed).
+        // include "completed" and "deployed" (a resumed deployment) to catch a
+        // previously-current deployment that this new deploy is superseding (and
+        // any legacy rows left un-torn-down before the state-flip fix existed).
         //
         // The result is additionally capped (newest-first) so that even a large
         // backlog of un-processed rows can't make a single pass run for minutes;
@@ -2635,6 +2641,28 @@ WHERE project.id = $2
         let mut incomplete_teardowns = 0usize;
         for deployment in previous_deployments {
             let deployment_id = deployment.id;
+            let lifecycle_lock = environment_lifecycle_lock(environment_id);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let deployment = match deployment_still_swept(self.db.as_ref(), deployment_id).await {
+                Ok(Some(deployment)) => deployment,
+                Ok(None) => {
+                    self.log(format!(
+                        "Deployment {deployment_id} changed state before teardown; leaving it as is"
+                    ))
+                    .await
+                    .ok();
+                    continue;
+                }
+                Err(e) => {
+                    self.log(format!(
+                        "Failed to re-read deployment {deployment_id} before teardown: {e}"
+                    ))
+                    .await
+                    .ok();
+                    incomplete_teardowns += 1;
+                    continue;
+                }
+            };
             self.log(format!(
                 "Tearing down deployment {} (state: {})",
                 deployment_id, deployment.state
@@ -4766,6 +4794,108 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.state, "stopped");
+    }
+
+    /// A resume leaves a deployment "deployed", and a later deploy supersedes it
+    /// like any other: nothing else would ever stop its containers.
+    #[tokio::test]
+    async fn test_teardown_includes_an_older_resumed_deployment() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let resumed =
+            insert_deployment(&db, project.id, env.id, "resumed-deploy", "deployed").await;
+        let container = insert_container(&db, resumed.id, "resumed-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert_eq!(*deployer.removed.lock().unwrap(), ["resumed-container"]);
+        let after = deployments::Entity::find_by_id(resumed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, "stopped");
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_some());
+    }
+
+    /// A deployment paused after a sweep selected it must keep its containers,
+    /// or a resume has nothing to start. So the sweep holds the lifecycle lock
+    /// while it removes containers, and reads the state again under it.
+    #[tokio::test]
+    async fn test_teardown_keeps_a_deployment_paused_after_it_was_selected() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let older = insert_deployment(&db, project.id, env.id, "older-deploy", "deployed").await;
+        let older_container = insert_container(&db, older.id, "older-container").await;
+        let newer = insert_deployment(&db, project.id, env.id, "newer-deploy", "deployed").await;
+        insert_container(&db, newer.id, "newer-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        // Newest first, so holding this stop leaves `older` selected but not
+        // yet torn down, which is where a pause can land.
+        let deployer = Arc::new(RecordingDeployer::new());
+        let stops = deployer.hold_stops();
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        let (env_id, new_created_at) = (env.id, new.created_at);
+        let sweep = tokio::spawn(async move {
+            job.cancel_previous_deployments(env_id, new_created_at)
+                .await;
+        });
+        stops.reached().await;
+        assert!(
+            environment_lifecycle_lock(env.id).try_lock().is_err(),
+            "removing containers must hold the lock a pause takes"
+        );
+
+        deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("paused"))
+            .filter(deployments::Column::Id.eq(older.id))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        *deployer.stop_gate.lock().unwrap() = None;
+        stops.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(120), sweep)
+            .await
+            .expect("the sweep finishes")
+            .unwrap();
+
+        assert_eq!(*deployer.removed.lock().unwrap(), ["newer-container"]);
+        let older_row = deployment_containers::Entity::find_by_id(older_container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(older_row.deleted_at.is_none());
+        let older_after = deployments::Entity::find_by_id(older.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(older_after.state, "paused");
     }
 
     /// A sweep that read "paused" must finish before a resume starts anything:
