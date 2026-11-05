@@ -119,6 +119,9 @@ const Revenue = lazy(() =>
 const StatusPages = lazy(() =>
   import('./pages/StatusPages').then((m) => ({ default: m.StatusPages }))
 )
+const NewStatusPagePage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.NewStatusPagePage }))
+)
 const StatusPageDetailPage = lazy(() =>
   import('./pages/StatusPages').then((m) => ({
     default: m.StatusPageDetailPage,
@@ -760,6 +763,10 @@ const FullAppRoutes = () => {
                         />
                         <Route path="/revenue" element={<Revenue />} />
                         <Route path="/status-pages" element={<StatusPages />} />
+                        <Route
+                          path="/status-pages/new"
+                          element={<NewStatusPagePage />}
+                        />
                         <Route
                           path="/status-pages/:statusPageId"
                           element={<StatusPageDetailPage />}

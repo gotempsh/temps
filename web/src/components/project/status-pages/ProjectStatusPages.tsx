@@ -1,38 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  createStatusPageMutation,
-  listStatusPagesOptions,
-  publishStatusPageMutation,
-} from '@/api/client/@tanstack/react-query.gen'
+import { listStatusPagesOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse, StatusPageResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { RecordLink } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
-import { Input } from '@/components/ui/input'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -42,30 +19,15 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import { Globe, Plus } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import { useForm, useWatch } from 'react-hook-form'
-import { Link, Navigate, useNavigate, useParams } from 'react-router'
-import { toast } from 'sonner'
-import { StatusPageComponentsEditor } from './StatusPageComponentsEditor'
+import { useState } from 'react'
+import { Link, Navigate, useParams } from 'react-router'
 import { PublicLinkCell } from './StatusPagePublicLink'
-import {
-  createDefaults,
-  createStatusPageSchema,
-  operationQueries,
-  toSelection,
-  type CreateStatusPageValues,
-} from './status-page-form'
+import { newStatusPageUrl, statusPageUrl } from './status-page-form'
 
 const PAGE_SIZE = 20
-
-/** Console URL of a status page. Pages are platform-level, not per project. */
-function statusPageUrl(id: number) {
-  return `/status-pages/${id}`
-}
 
 export function StatusPageStateBadge({ page }: { page: StatusPageResponse }) {
   return page.is_published ? (
@@ -104,160 +66,6 @@ export function StatusPageProjects({
   )
 }
 
-export function CreateStatusPageDialog({
-  initialProject,
-  open,
-  onOpenChange,
-}: {
-  /** The project the user came from: its picker opens on it. */
-  initialProject?: Pick<ProjectResponse, 'id' | 'name'>
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}) {
-  const navigate = useNavigate()
-  const queryClient = useQueryClient()
-  const form = useForm<CreateStatusPageValues>({
-    resolver: zodResolver(createStatusPageSchema),
-    defaultValues: createDefaults(initialProject?.name ?? '', []),
-  })
-  const publishOnCreate = useWatch({ control: form.control, name: 'publish' })
-  // Start from a clean form each time the dialog opens.
-  useEffect(() => {
-    if (open) form.reset(createDefaults(initialProject?.name ?? '', []))
-  }, [open, form, initialProject?.name])
-
-  const publish = useMutation({
-    ...publishStatusPageMutation(),
-    meta: { errorTitle: 'Created, but publishing failed' },
-  })
-  const create = useMutation({
-    ...createStatusPageMutation(),
-    meta: { errorTitle: 'Failed to create status page' },
-    onSuccess: async (page, variables) => {
-      let published = false
-      if (form.getValues('publish')) {
-        try {
-          await publish.mutateAsync({ path: { status_page_id: page.id } })
-          published = true
-        } catch {
-          // Reported by the mutation's error toast; the draft still exists.
-        }
-      }
-      await queryClient.invalidateQueries(operationQueries('listStatusPages'))
-      toast.success(
-        published
-          ? 'Status page is live. Share the public link from the overview.'
-          : `Draft created with ${variables.body.monitors.length} component(s). Publish when ready.`
-      )
-      onOpenChange(false)
-      navigate(statusPageUrl(page.id))
-    },
-  })
-  const busy = create.isPending || publish.isPending
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
-        <DialogHeader>
-          <DialogTitle>Create status page</DialogTitle>
-          <DialogDescription>
-            Add the services your users care about, from any of your projects,
-            and group them (e.g. “Cloud → API, Dashboard”). Each one shows its
-            live state, 90-day uptime and response times under the public name
-            you choose — never its URL or errors.
-          </DialogDescription>
-        </DialogHeader>
-        <Form {...form}>
-          <form
-            className="space-y-5"
-            onSubmit={form.handleSubmit((values) =>
-              create.mutate({
-                body: {
-                  title: values.title,
-                  monitors: toSelection(values.components),
-                },
-              })
-            )}
-          >
-            <FormField
-              control={form.control}
-              name="title"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Page title</FormLabel>
-                  <FormControl>
-                    <Input placeholder="Acme status" {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="components"
-              render={({ field, fieldState }) => (
-                <FormItem>
-                  <FormLabel>Components</FormLabel>
-                  <StatusPageComponentsEditor
-                    value={field.value}
-                    onChange={field.onChange}
-                    errors={form.formState.errors.components}
-                    initialProjectId={initialProject?.id}
-                  />
-                  {fieldState.error?.message && (
-                    <p className="text-sm font-medium text-destructive">
-                      {fieldState.error.message}
-                    </p>
-                  )}
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="publish"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-center justify-between gap-4 space-y-0 rounded-lg border p-3">
-                  <div>
-                    <FormLabel>Publish right away</FormLabel>
-                    <FormDescription>
-                      Off creates a draft you can preview and style first.
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => onOpenChange(false)}
-              >
-                Cancel
-              </Button>
-              <Button type="submit" disabled={busy}>
-                {busy
-                  ? 'Creating...'
-                  : publishOnCreate
-                    ? 'Create and publish'
-                    : 'Create draft'}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 function StatusPagesSkeleton() {
   return (
     <div className="space-y-2">
@@ -273,7 +81,7 @@ function StatusPagesSkeleton() {
  * are platform-level: one page can show services from many projects.
  */
 export function StatusPagesList({ project }: { project?: ProjectResponse }) {
-  const [createOpen, setCreateOpen] = useState(false)
+  const createUrl = newStatusPageUrl(project?.id)
   const [page, setPage] = useState(1)
   const pages = useQuery(
     listStatusPagesOptions({
@@ -301,10 +109,7 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
           </p>
         </div>
         {items.length > 0 && (
-          <CreateActionButton
-            onClick={() => setCreateOpen(true)}
-            label="Create status page"
-          />
+          <CreateActionButton to={createUrl} label="Create status page" />
         )}
       </div>
 
@@ -331,9 +136,11 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
           }
           description="Show customers whether your services are up, e.g. “API — Operational, 99.98% uptime over 90 days”, without exposing anything internal."
           action={
-            <Button onClick={() => setCreateOpen(true)}>
-              <Plus className="mr-2 size-4" />
-              Create status page
+            <Button asChild>
+              <Link to={createUrl}>
+                <Plus className="mr-2 size-4" />
+                Create status page
+              </Link>
             </Button>
           }
         />
@@ -395,12 +202,6 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
           )}
         </div>
       )}
-
-      <CreateStatusPageDialog
-        initialProject={project}
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-      />
     </div>
   )
 }

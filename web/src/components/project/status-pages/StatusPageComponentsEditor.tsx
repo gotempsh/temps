@@ -17,9 +17,9 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
-import { useQuery } from '@tanstack/react-query'
-import { ArrowDown, ArrowUp, Plus, Trash2 } from 'lucide-react'
-import { useId, useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ArrowDown, ArrowUp, Trash2 } from 'lucide-react'
+import { useId, useMemo } from 'react'
 import type { FieldErrors } from 'react-hook-form'
 import { Link } from 'react-router'
 import {
@@ -41,16 +41,6 @@ type ProjectSummary = Pick<
   ProjectResponse,
   'id' | 'name' | 'slug' | 'service_template_image_url'
 >
-
-/** The project's logo, as on its project card, for a dropdown trigger. */
-function ProjectLogo({ project }: { project?: ProjectSummary }) {
-  if (!project) return null
-  return (
-    <span aria-hidden="true" className="mr-2 flex shrink-0">
-      <ServiceIcon service={project} size="xs" />
-    </span>
-  )
-}
 
 /** A project's monitors as dropdown choices. Cached per project. */
 function useMonitorChoices(projectId: number | undefined) {
@@ -114,9 +104,10 @@ function NoMonitorsHint({ project }: { project?: ProjectSummary }) {
 }
 
 /**
- * The ordered components of a status page, from any number of projects.
- * Each one is a project, one of its environments, and the public name and
- * group it is shown under. Controlled: the caller owns the rows.
+ * The ordered components of a status page, from any number of services.
+ * Picking a service adds it straight away, on its production environment, with
+ * a public name to edit. Most services have one environment, so the choice only
+ * appears on a row that has several. Controlled: the caller owns the rows.
  */
 export function StatusPageComponentsEditor({
   value,
@@ -127,7 +118,7 @@ export function StatusPageComponentsEditor({
   value: ComponentRow[]
   onChange: (rows: ComponentRow[]) => void
   errors?: RowErrors
-  /** Project the add row starts on, e.g. the one the user came from. */
+  /** Listed first in the picker, e.g. the service the user came from. */
   initialProjectId?: number
 }) {
   const groupListId = useId()
@@ -142,7 +133,10 @@ export function StatusPageComponentsEditor({
       ),
     [projectsQuery.data]
   )
-  const projectOptions: SearchableSelectOption[] = projects.map((p) => ({
+  const projectOptions: SearchableSelectOption[] = [
+    ...projects.filter((p) => p.id === initialProjectId),
+    ...projects.filter((p) => p.id !== initialProjectId),
+  ].map((p) => ({
     value: String(p.id),
     label: p.name,
     keywords: p.slug,
@@ -175,18 +169,13 @@ export function StatusPageComponentsEditor({
   }
 
   return (
-    <div className="space-y-4">
+    <div className="@container space-y-4">
       <datalist id={groupListId}>
         {groups.map((g) => (
           <option key={g} value={g} />
         ))}
       </datalist>
-      {value.length === 0 ? (
-        <p className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
-          No components yet. Choose a project and an environment below — add as
-          many as you like, from any of your projects.
-        </p>
-      ) : (
+      {value.length > 0 && (
         <Card>
           <CardContent className="divide-y p-0">
             {value.map((row, index) => (
@@ -197,9 +186,7 @@ export function StatusPageComponentsEditor({
                 count={value.length}
                 errors={errors?.[index]}
                 groupListId={groupListId}
-                projects={projects}
-                projectOptions={projectOptions}
-                projectsLoading={projectsQuery.isLoading}
+                project={projects.find((p) => p.id === row.project_id)}
                 taken={taken}
                 onChange={(next) => replace(index, next)}
                 onMove={(by) => move(index, by)}
@@ -215,7 +202,7 @@ export function StatusPageComponentsEditor({
         projectsLoading={projectsQuery.isLoading}
         taken={taken}
         full={value.length >= MAX_MONITORS_PER_PAGE}
-        initialProjectId={initialProjectId}
+        hasComponents={value.length > 0}
         onAdd={(row) => onChange([...value, row])}
       />
     </div>
@@ -228,9 +215,7 @@ function ComponentRowEditor({
   count,
   errors,
   groupListId,
-  projects,
-  projectOptions,
-  projectsLoading,
+  project,
   taken,
   onChange,
   onMove,
@@ -241,9 +226,7 @@ function ComponentRowEditor({
   count: number
   errors?: FieldErrors<ComponentRow>
   groupListId: string
-  projects: ProjectSummary[]
-  projectOptions: SearchableSelectOption[]
-  projectsLoading: boolean
+  project?: ProjectSummary
   taken: ReadonlySet<number>
   onChange: (row: ComponentRow) => void
   onMove: (by: -1 | 1) => void
@@ -251,15 +234,9 @@ function ComponentRowEditor({
 }) {
   const nameId = useId()
   const groupId = useId()
-  // Switching project needs that project's environments first, so the new
-  // project is held here until an environment is picked; the row itself
-  // keeps pointing at its current monitor until then.
-  const [pendingProjectId, setPendingProjectId] = useState<number>()
-  const projectId = pendingProjectId ?? row.project_id
-  const project = projects.find((p) => p.id === projectId)
-  const { choices, isLoading, error, refetch } = useMonitorChoices(projectId)
-  const pending = pendingProjectId !== undefined
+  const { choices, error, refetch } = useMonitorChoices(row.project_id)
   const label = row.display_name || row.monitor_name
+  const chooseEnvironment = Boolean(error) || choices.length > 1
 
   const pick = (monitorId: string) => {
     const choice = choices.find((c) => String(c.monitor.id) === monitorId)
@@ -267,100 +244,74 @@ function ComponentRowEditor({
     onChange(
       switchComponent(
         row,
-        project ?? { id: row.project_id, name: row.project_name },
+        { id: row.project_id, name: row.project_name },
         choice
       )
     )
-    setPendingProjectId(undefined)
   }
 
   return (
-    <div className="flex flex-col gap-3 p-4 lg:flex-row lg:items-start">
-      <div className="flex gap-1 lg:pt-5">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-8"
-          disabled={index === 0}
-          onClick={() => onMove(-1)}
-          aria-label={`Move ${label} up`}
-        >
-          <ArrowUp className="size-4" />
-        </Button>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-8"
-          disabled={index === count - 1}
-          onClick={() => onMove(1)}
-          aria-label={`Move ${label} down`}
-        >
-          <ArrowDown className="size-4" />
-        </Button>
+    <div className="space-y-3 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <ServiceIcon
+            service={project ?? { id: row.project_id, name: row.project_name }}
+            size="sm"
+          />
+          <div className="min-w-0 truncate text-sm font-medium">
+            {row.project_name}
+            {row.environment_name && (
+              <span className="font-normal text-muted-foreground">
+                {' '}
+                · {row.environment_name}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8"
+            disabled={index === 0}
+            onClick={() => onMove(-1)}
+            aria-label={`Move ${label} up`}
+          >
+            <ArrowUp className="size-4" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8"
+            disabled={index === count - 1}
+            onClick={() => onMove(1)}
+            aria-label={`Move ${label} down`}
+          >
+            <ArrowDown className="size-4" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="text-muted-foreground"
+            onClick={onRemove}
+            aria-label={`Remove ${label}`}
+          >
+            <Trash2 className="size-4 sm:mr-2" />
+            <span className="max-sm:sr-only">Remove</span>
+          </Button>
+        </div>
       </div>
-      <div className="grid min-w-0 flex-1 grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <div className="min-w-0 space-y-1">
-          <div className="text-xs font-medium">Project</div>
-          {projectsLoading ? (
-            <Skeleton className="h-9 w-full" />
-          ) : (
-            <SearchableSelect
-              className="w-full"
-              value={String(projectId)}
-              onValueChange={(v) => {
-                const id = Number(v)
-                setPendingProjectId(id === row.project_id ? undefined : id)
-              }}
-              options={projectOptions}
-              placeholder={row.project_name}
-              icon={<ProjectLogo project={project} />}
-              searchPlaceholder="Search projects…"
-              emptyText="No project matches"
-              label={`Project of ${label}`}
-            />
-          )}
-        </div>
-        <div className="min-w-0 space-y-1">
-          <div className="text-xs font-medium">Environment</div>
-          {error ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="w-full"
-              onClick={refetch}
-            >
-              Couldn&apos;t load environments — retry
-            </Button>
-          ) : isLoading ? (
-            <Skeleton className="h-9 w-full" />
-          ) : pending && choices.length === 0 ? (
-            <NoMonitorsHint project={project} />
-          ) : (
-            <SearchableSelect
-              className="w-full"
-              value={pending ? undefined : String(row.monitor_id)}
-              onValueChange={pick}
-              options={environmentOptions(choices, taken, row.monitor_id)}
-              placeholder={
-                pending
-                  ? 'Choose an environment'
-                  : (row.environment_name ?? row.monitor_name)
-              }
-              searchPlaceholder="Search environments…"
-              emptyText="No environment matches"
-              label={`Environment of ${label}`}
-            />
-          )}
-          {pending && choices.length > 0 && (
-            <p className="text-xs text-muted-foreground">
-              Pick an environment to switch this component to{' '}
-              {project?.name ?? 'that project'}.
-            </p>
-          )}
-        </div>
+      {/* Sized by the room it has, not the screen, so it fits a form column. */}
+      <div
+        className={
+          chooseEnvironment
+            ? 'grid min-w-0 grid-cols-1 gap-3 @lg:grid-cols-3'
+            : 'grid min-w-0 grid-cols-1 gap-3 @lg:grid-cols-2'
+        }
+      >
         <div className="min-w-0 space-y-1">
           <label htmlFor={nameId} className="block text-xs font-medium">
             Public name
@@ -396,29 +347,50 @@ function ComponentRowEditor({
             </p>
           )}
         </div>
+        {chooseEnvironment && (
+          <div className="min-w-0 space-y-1">
+            <div className="text-xs font-medium">Environment</div>
+            {error ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="w-full"
+                onClick={refetch}
+              >
+                Couldn&apos;t load environments — retry
+              </Button>
+            ) : (
+              <SearchableSelect
+                className="w-full"
+                value={String(row.monitor_id)}
+                onValueChange={pick}
+                options={environmentOptions(choices, taken, row.monitor_id)}
+                placeholder={row.environment_name ?? row.monitor_name}
+                searchPlaceholder="Search environments…"
+                emptyText="No environment matches"
+                label={`Environment of ${label}`}
+              />
+            )}
+          </div>
+        )}
       </div>
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="self-start text-muted-foreground lg:mt-5"
-        onClick={onRemove}
-      >
-        <Trash2 className="size-4 sm:mr-2" />
-        <span className="max-sm:sr-only">Remove</span>
-      </Button>
     </div>
   )
 }
 
-/** Project → environment → Add, for one more component. */
+/**
+ * One picker for the next component: choosing a service adds it. Its first
+ * environment not yet on the page comes first (production, then previews), so
+ * choosing the same service again adds the next one.
+ */
 function AddComponentRow({
   projects,
   projectOptions,
   projectsLoading,
   taken,
   full,
-  initialProjectId,
+  hasComponents,
   onAdd,
 }: {
   projects: ProjectSummary[]
@@ -426,113 +398,77 @@ function AddComponentRow({
   projectsLoading: boolean
   taken: ReadonlySet<number>
   full: boolean
-  initialProjectId?: number
+  hasComponents: boolean
   onAdd: (row: ComponentRow) => void
 }) {
-  const [projectId, setProjectId] = useState<number | undefined>(
-    initialProjectId
-  )
-  const [monitorId, setMonitorId] = useState<number>()
-  const project = projects.find((p) => p.id === projectId)
-  const { choices, isLoading, error, refetch } = useMonitorChoices(projectId)
-  // Until the operator picks one, offer the first environment not yet on
-  // the page (production first).
-  const chosen =
-    choices.find(
-      (c) => c.monitor.id === monitorId && !taken.has(c.monitor.id)
-    ) ?? firstAvailableChoice(choices, taken)
-  const allTaken = choices.length > 0 && chosen === undefined
+  const queryClient = useQueryClient()
+  const add = useMutation({
+    mutationFn: async (project: ProjectSummary) => {
+      const request = { path: { project_id: project.id } }
+      const [environments, monitors] = await Promise.all([
+        queryClient.fetchQuery(getEnvironmentsOptions(request)),
+        queryClient.fetchQuery(listMonitorsOptions(request)),
+      ])
+      const choices = buildMonitorChoices(environments, monitors)
+      return {
+        hasMonitors: choices.length > 0,
+        choice: firstAvailableChoice(choices, taken),
+      }
+    },
+    onSuccess: ({ choice }, project) => {
+      if (choice) onAdd(componentRow(project, choice))
+    },
+  })
+  const heading = hasComponents ? 'Add another service' : 'Add a service'
+  const picked = add.variables
 
   return (
-    <div className="space-y-3 rounded-lg border p-4">
+    <div className="space-y-2">
       <div>
-        <div className="text-sm font-medium">Add a component</div>
+        <div className="text-sm font-medium">{heading}</div>
         <p className="text-xs text-muted-foreground">
-          Choose a project and one of its environments. Repeat for every service
-          the page should show.
+          {full
+            ? `A status page can show at most ${MAX_MONITORS_PER_PAGE} components.`
+            : 'It is added on its production environment. Any service, from any project.'}
         </p>
       </div>
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_1fr_auto] md:items-start">
-        <div className="min-w-0 space-y-1">
-          <div className="text-xs font-medium">Project</div>
-          {projectsLoading ? (
-            <Skeleton className="h-9 w-full" />
-          ) : (
-            <SearchableSelect
-              className="w-full"
-              value={projectId === undefined ? undefined : String(projectId)}
-              onValueChange={(v) => {
-                setProjectId(Number(v))
-                setMonitorId(undefined)
-              }}
-              options={projectOptions}
-              placeholder="Choose a project"
-              icon={<ProjectLogo project={project} />}
-              searchPlaceholder="Search projects…"
-              emptyText="No project matches"
-              label="Project of the new component"
-            />
-          )}
-        </div>
-        <div className="min-w-0 space-y-1">
-          <div className="text-xs font-medium">Environment</div>
-          {projectId === undefined ? (
-            <SearchableSelect
-              className="w-full"
-              value={undefined}
-              onValueChange={() => undefined}
-              options={[]}
-              placeholder="Choose a project first"
-              disabled
-              label="Environment of the new component"
-            />
-          ) : error ? (
-            <ErrorAlert
-              title="Failed to load environments"
-              description={
-                error instanceof Error
-                  ? error.message
-                  : 'An unexpected error occurred'
-              }
-              retry={refetch}
-            />
-          ) : isLoading ? (
-            <Skeleton className="h-9 w-full" />
-          ) : choices.length === 0 ? (
-            <NoMonitorsHint project={project} />
-          ) : (
-            <SearchableSelect
-              className="w-full"
-              value={chosen ? String(chosen.monitor.id) : undefined}
-              onValueChange={(v) => setMonitorId(Number(v))}
-              options={environmentOptions(choices, taken)}
-              placeholder={
-                allTaken ? 'All environments are on the page' : 'Choose one'
-              }
-              searchPlaceholder="Search environments…"
-              emptyText="No environment matches"
-              label="Environment of the new component"
-            />
-          )}
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          className="md:mt-5"
-          disabled={!project || !chosen || full}
-          onClick={() => {
-            if (!project || !chosen) return
-            onAdd(componentRow(project, chosen))
-            setMonitorId(undefined)
+      {projectsLoading ? (
+        <Skeleton className="h-10 w-full" />
+      ) : (
+        <SearchableSelect
+          className="w-full"
+          value={undefined}
+          onValueChange={(v) => {
+            const project = projects.find((p) => String(p.id) === v)
+            if (project) add.mutate(project)
           }}
-        >
-          <Plus className="size-4 sm:mr-2" />
-          Add
-        </Button>
-      </div>
-      {full && (
+          options={projectOptions}
+          placeholder={
+            add.isPending ? `Adding ${picked?.name}…` : 'Choose a service'
+          }
+          disabled={full || add.isPending}
+          searchPlaceholder="Search services…"
+          emptyText="No service matches"
+          label={heading}
+        />
+      )}
+      {add.isError && (
+        <ErrorAlert
+          title={`Failed to add ${picked?.name ?? 'this service'}`}
+          description={
+            add.error instanceof Error
+              ? add.error.message
+              : 'An unexpected error occurred'
+          }
+          retry={() => picked && add.mutate(picked)}
+        />
+      )}
+      {add.isSuccess && !add.data.hasMonitors && (
+        <NoMonitorsHint project={picked} />
+      )}
+      {add.isSuccess && add.data.hasMonitors && !add.data.choice && (
         <p className="text-xs text-muted-foreground">
-          A status page can show at most {MAX_MONITORS_PER_PAGE} components.
+          Every environment of {picked?.name} is already on this page.
         </p>
       )}
     </div>

@@ -31,7 +31,9 @@ import {
   initialIncidentStatus,
   MAX_GROUP_NAME_CHARS,
   MAX_INCIDENT_UPDATE_CHARS,
+  newStatusPageUrl,
   operationQueries,
+  parseInitialProjectId,
   statusPageFormSchema,
   switchComponent,
   toSelection,
@@ -566,5 +568,27 @@ describe('customIncidentSchema / customIncidentBody', () => {
     expect(
       customIncidentBody({ ...values, target: 'project:99' }, page)
     ).toBeNull()
+  })
+})
+
+describe('create page links', () => {
+  it('carries the project the user came from', () => {
+    expect(newStatusPageUrl()).toBe('/status-pages/new')
+    expect(newStatusPageUrl(4)).toBe('/status-pages/new?project=4')
+  })
+
+  it('ignores a project that is not a real id', () => {
+    expect(parseInitialProjectId('4')).toBe(4)
+    for (const value of [
+      null,
+      '',
+      '0',
+      '-1',
+      '1.5',
+      'abc',
+      '99999999999999999',
+    ]) {
+      expect(parseInitialProjectId(value)).toBeUndefined()
+    }
   })
 })
