@@ -34,10 +34,10 @@ use utoipa::OpenApi;
 
 use crate::handlers::failure_report::*;
 use crate::handlers::types::{
-    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerHistoryEntry,
-    ContainerHistoryListResponse, ContainerHistoryQuery, ContainerInfoResponse,
-    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
+    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, AssetCachePurgeResponse,
+    ContainerActionResponse, ContainerDetailResponse, ContainerEnvironmentVariableValueResponse,
+    ContainerHistoryEntry, ContainerHistoryListResponse, ContainerHistoryQuery,
+    ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
@@ -226,9 +226,12 @@ async fn deployment_response_with_service_urls(
         get_container_metrics_history,
         stream_container_metrics,
         get_activity_graph,
-        list_managed_environment_variables
+        list_managed_environment_variables,
+        purge_asset_cache,
+        purge_environment_asset_cache
     ),
     components(schemas(
+        AssetCachePurgeResponse,
         DeploymentListResponse,
         DeploymentResponse,
         crate::services::DeploymentFailureInfo,
@@ -3029,9 +3032,10 @@ pub async fn get_activity_graph(
     path = "/projects/{project_id}/asset-cache",
     tag = "Deployments",
     responses(
-        (status = 200, description = "Asset cache purged"),
+        (status = 200, description = "Asset cache purged", body = AssetCachePurgeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID")
@@ -3052,7 +3056,7 @@ pub async fn purge_asset_cache(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted })))
+    Ok(Json(AssetCachePurgeResponse { deleted }))
 }
 
 /// Purge cached static assets for a specific environment.
@@ -3061,9 +3065,10 @@ pub async fn purge_asset_cache(
     path = "/projects/{project_id}/environments/{environment_id}/asset-cache",
     tag = "Deployments",
     responses(
-        (status = 200, description = "Environment asset cache purged"),
+        (status = 200, description = "Environment asset cache purged", body = AssetCachePurgeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -3085,11 +3090,32 @@ pub async fn purge_environment_asset_cache(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted })))
+    Ok(Json(AssetCachePurgeResponse { deleted }))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// #1795: the purge endpoints are in the OpenAPI document, so the console
+    /// calls them through the generated client and sees a refusal.
+    #[test]
+    fn asset_cache_purge_endpoints_are_documented() {
+        use utoipa::OpenApi;
+        let doc = super::DeploymentsApiDoc::openapi();
+        for path in [
+            "/projects/{project_id}/asset-cache",
+            "/projects/{project_id}/environments/{environment_id}/asset-cache",
+        ] {
+            let item = doc
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} is documented"));
+            assert!(item.delete.is_some(), "{path} documents DELETE");
+        }
+        let schemas = doc.components.expect("components").schemas;
+        assert!(schemas.contains_key("AssetCachePurgeResponse"));
+    }
 
     mod lifecycle_conflict_tests {
         use crate::services::services::DeploymentError;
