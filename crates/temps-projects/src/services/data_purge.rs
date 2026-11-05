@@ -45,10 +45,10 @@ use tracing::{debug, error, info, warn};
 
 /// Telemetry tables purged by `project_id` once their project is deleted.
 ///
-/// Must match the tables whose foreign keys the
-/// `m20261105_000001_project_data_purges` migration drops: a table with its
-/// foreign key still in place is cleaned by the cascade, and a table missing
-/// from here would keep a deleted project's rows forever.
+/// Must match the tables whose foreign keys are dropped after the
+/// `m20261105_000001_project_data_purges` migration: a table with its foreign
+/// key still in place is cleaned by the cascade, and a table missing from here
+/// would keep a deleted project's rows forever.
 pub const PURGED_TABLES: [&str; 5] = [
     "proxy_logs",
     "events",
@@ -56,6 +56,12 @@ pub const PURGED_TABLES: [&str; 5] = [
     "request_logs",
     "performance_metrics",
 ];
+
+/// Parents [`PURGED_TABLES`] hold no foreign keys to once post-migration
+/// maintenance has dropped them. Until then a project delete would cascade
+/// through every chunk of those tables, so it is refused
+/// (see `ProjectService::ensure_telemetry_detached`).
+pub const DETACHED_PARENTS: [&str; 4] = ["projects", "environments", "deployments", "error_groups"];
 
 /// Longest `last_error` stored on a purge row.
 const MAX_ERROR_LEN: usize = 2_000;
@@ -734,6 +740,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detached_parents_match_the_migration() {
+        assert_eq!(
+            DETACHED_PARENTS,
+            temps_migrations::PROJECT_DATA_DETACHED_PARENTS,
+            "project deletes must wait for exactly the foreign keys maintenance drops"
+        );
+    }
+
     async fn exec(db: &DatabaseConnection, sql: &str) {
         db.execute_unprepared(sql)
             .await
@@ -790,6 +805,45 @@ mod tests {
                 println!("Docker/Postgres not available, skipping: {e}");
                 None
             }
+        }
+    }
+
+    /// Before post-migration maintenance has dropped them, some telemetry
+    /// tables still hold their foreign keys. A purge queued then (an instance
+    /// mid-upgrade) still runs to completion: deleting child rows never trips
+    /// a foreign key.
+    #[tokio::test]
+    async fn purges_while_a_telemetry_foreign_key_is_still_in_place() {
+        let Some(test_db) = test_db().await else {
+            return;
+        };
+        let db = test_db.db.clone();
+        seed_telemetry(&db, 9_101, 5).await;
+        // NOT VALID: the seeded rows reference no project, as a deleted
+        // project's rows do.
+        exec(
+            &db,
+            "ALTER TABLE request_logs ADD CONSTRAINT fk_request_logs_project_id \
+             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE NOT VALID",
+        )
+        .await;
+        ProjectDataPurger::enqueue(db.as_ref(), 9_101, "deleted-app")
+            .await
+            .unwrap();
+
+        let purger = ProjectDataPurger::new(db.clone(), fast_config());
+        assert_eq!(purger.run_once().await.unwrap(), PassOutcome::Removed(10));
+        assert_eq!(purger.run_once().await.unwrap(), PassOutcome::Completed);
+        for table in ["proxy_logs", "request_logs"] {
+            assert_eq!(
+                count(
+                    &db,
+                    &format!("SELECT count(*) AS n FROM {table} WHERE project_id = 9101")
+                )
+                .await,
+                0,
+                "{table} still holds the deleted project's rows"
+            );
         }
     }
 

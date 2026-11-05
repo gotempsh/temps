@@ -15,10 +15,10 @@
 //! outright. `proxy_logs.project_id` was `SET NULL`, so the project's request
 //! log was rewritten rather than removed.
 //!
-//! After this migration:
+//! This migration and the post-migration step after it:
 //!
-//! - those foreign keys are gone. A deleted project's telemetry rows keep its
-//!   id and are unreachable (every reader is scoped to a live project, and
+//! - remove those foreign keys. A deleted project's telemetry rows keep its id
+//!   and are unreachable (every reader is scoped to a live project, and
 //!   project ids are never reused) until the purger removes them;
 //! - `project_data_purges` records every deleted project whose telemetry is
 //!   still on disk. The project delete inserts its row in the same
@@ -28,17 +28,30 @@
 //!   control-plane part of the cascade is an index lookup per parent row
 //!   instead of a scan.
 //!
-//! Dropping a constraint on a hypertable is a catalog change propagated to
-//! its chunks: no rewrite, regardless of table size.
+//! Only the purge queue is created here. The foreign key drop and the indexes
+//! run after the server has bound, in `temps_schema::run_post_migration_indexes`.
 //!
-//! The indexes are **not built here**. SeaORM runs a migration inside a
+//! The foreign keys are **not dropped here**: TimescaleDB copies a
+//! hypertable's foreign key onto every chunk, and dropping it takes a lock on
+//! each chunk's relation, constraint and triggers (about six per chunk) until
+//! the transaction commits. SeaORM runs a migration in one transaction, and
+//! `events` and `proxy_logs` have a chunk per day and space partition, so a
+//! year of history needs more locks than PostgreSQL's lock table holds with
+//! the default `max_locks_per_transaction` and the migration failed with
+//! "out of shared memory". The post-migration step drops one constraint per
+//! transaction, and chunk by chunk where TimescaleDB allows it. Until it has
+//! run, a project delete is refused rather than cascading through every
+//! chunk. An instance that applied the earlier version of this migration,
+//! which dropped them here, has none left and the step does nothing.
+//!
+//! The indexes are not built here either. SeaORM runs a migration inside a
 //! transaction, where only a plain `CREATE INDEX` is legal, and that blocks
 //! writes for the whole build. Some of these tables take a steady stream of
 //! writes and grow with history (`performance_metrics`,
 //! `telemetry_client_outcomes`, `runtime_health_buckets`, `cron_monitor_runs`),
-//! so `temps_schema::run_post_migration_indexes` builds them after the
-//! server has bound, with `CREATE INDEX CONCURRENTLY`. Until then a project
-//! delete cascades the way it did before this migration.
+//! so they are built with `CREATE INDEX CONCURRENTLY`. Until then the
+//! control-plane part of a project delete scans those tables, as it did
+//! before this migration.
 //!
 //! Every name is resolved through `search_path`, never a fixed schema, so the
 //! migration also runs in the per-test schemas of `TestDatabase`.
@@ -57,8 +70,9 @@ pub const PURGED_TABLES: [&str; 5] = [
     "performance_metrics",
 ];
 
-/// Parents the telemetry tables no longer hold foreign keys to.
-const DETACHED_PARENTS: [&str; 4] = ["projects", "environments", "deployments", "error_groups"];
+/// Parents the telemetry tables no longer hold foreign keys to. Their
+/// foreign keys are dropped by `temps_schema`'s post-migration step.
+pub const DETACHED_PARENTS: [&str; 4] = ["projects", "environments", "deployments", "error_groups"];
 
 /// `(table, column)` foreign keys under `projects` that had no index leading
 /// with the column, plus the `project_id` lookups the purger needs on the two
@@ -128,34 +142,6 @@ pub fn fk_index_name(table: &str, column: &str) -> String {
     format!("idx_{table}_{column}_fk")
 }
 
-fn sql_array(items: impl IntoIterator<Item = String>) -> String {
-    let quoted: Vec<String> = items.into_iter().map(|item| format!("'{item}'")).collect();
-    format!("ARRAY[{}]::text[]", quoted.join(", "))
-}
-
-fn drop_telemetry_foreign_keys_sql() -> String {
-    let children = sql_array(PURGED_TABLES.iter().map(|t| String::from(*t)));
-    let parents = sql_array(DETACHED_PARENTS.iter().map(|t| String::from(*t)));
-    format!(
-        r#"
-DO $$
-DECLARE
-    fk record;
-BEGIN
-    FOR fk IN
-        SELECT c.conname, c.conrelid::regclass AS child
-        FROM pg_constraint c
-        WHERE c.contype = 'f'
-          AND c.conrelid IN (SELECT to_regclass(t) FROM unnest({children}) AS t)
-          AND c.confrelid IN (SELECT to_regclass(t) FROM unnest({parents}) AS t)
-    LOOP
-        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', fk.child, fk.conname);
-    END LOOP;
-END $$;
-"#
-    )
-}
-
 const CREATE_PURGES_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS project_data_purges (
     -- No foreign key: the project row is already gone.
@@ -187,18 +173,20 @@ DROP TABLE IF EXISTS project_data_purges;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        db.execute_unprepared(&drop_telemetry_foreign_keys_sql())
+        // Only the queue: see the module documentation for why the foreign
+        // keys are dropped after the migration instead.
+        manager
+            .get_connection()
+            .execute_unprepared(CREATE_PURGES_SQL)
             .await?;
-        db.execute_unprepared(CREATE_PURGES_SQL).await?;
         Ok(())
     }
 
     /// Drops the purge queue and the indexes built for [`FK_INDEXES`]. The telemetry
     /// foreign keys are deliberately not restored: rows of projects deleted
-    /// since `up` reference parents that no longer exist, so re-adding the
-    /// constraints would fail, or would need those rows deleted first, which a
-    /// rollback must not do silently.
+    /// since they were dropped reference parents that no longer exist, so
+    /// re-adding the constraints would fail, or would need those rows deleted
+    /// first, which a rollback must not do silently.
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
         db.execute_unprepared(DROP_PURGES_SQL).await?;
@@ -248,13 +236,10 @@ mod tests {
     }
 
     #[test]
-    fn foreign_key_drop_covers_every_purged_table_and_parent() {
-        let sql = drop_telemetry_foreign_keys_sql();
-        for table in PURGED_TABLES.iter().chain(DETACHED_PARENTS.iter()) {
-            assert!(
-                sql.contains(&format!("'{table}'")),
-                "{table} missing from FK drop"
-            );
-        }
+    fn up_creates_only_the_purge_queue() {
+        // Dropping the telemetry foreign keys here exhausted the lock table on
+        // instances with many chunks; it belongs to the post-migration step.
+        assert!(!CREATE_PURGES_SQL.contains("DROP CONSTRAINT"));
+        assert!(CREATE_PURGES_SQL.contains("CREATE TABLE IF NOT EXISTS project_data_purges"));
     }
 }

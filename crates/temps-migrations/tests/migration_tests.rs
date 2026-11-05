@@ -2815,10 +2815,11 @@ async fn verify_tables_dropped(db: &DatabaseConnection) -> anyhow::Result<()> {
 }
 
 async fn verify_foreign_keys(db: &DatabaseConnection) -> anyhow::Result<()> {
-    // Telemetry tables hold no foreign key into the project delete cascade
-    // (m20261105_000001_project_data_purges): a cascade into them scanned
-    // every request and analytics row per deployment, and the purger removes
-    // their rows instead. Re-adding one would bring that cost back.
+    // The telemetry tables' foreign keys into the project delete cascade are
+    // dropped after the migrations, by `temps_schema`'s post-migration step,
+    // never inside one: on a hypertable the drop locks every chunk, and in a
+    // migration's single transaction that ran PostgreSQL out of lock slots
+    // (m20261105_000001_project_data_purges). The migrations alone leave them.
     for (table, constraint) in [
         ("error_events", "fk_error_events_error_group_id"),
         ("error_events", "fk_error_events_project_id"),
@@ -2834,8 +2835,8 @@ async fn verify_foreign_keys(db: &DatabaseConnection) -> anyhow::Result<()> {
         if let Some(row) = row {
             let exists: bool = row.try_get("", "exists")?;
             assert!(
-                !exists,
-                "Foreign key constraint {} on {} must stay dropped: deleted projects' telemetry is purged in the background",
+                exists,
+                "Foreign key constraint {} on {} must be left to the post-migration step, not dropped inside a migration",
                 constraint, table
             );
         }

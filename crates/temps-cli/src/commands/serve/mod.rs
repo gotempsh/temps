@@ -878,6 +878,19 @@ impl ServeCommand {
                 loop {
                     match temps_schema::run_post_migration_indexes(index_db.as_ref()).await {
                         Ok(()) => break,
+                        // Retrying cannot fix this one on its own: the operator
+                        // has to raise a PostgreSQL setting and restart it. It is
+                        // still retried, so it completes once they have.
+                        Err(e @ temps_schema::SchemaError::LockSlotsExhausted(_)) => {
+                            tracing::error!(
+                                "Post-migration maintenance ran out of PostgreSQL lock slots; \
+                                 retrying in {:?}: {}",
+                                retry_delay,
+                                e
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "Post-migration index build failed; retrying in {:?}: {}",

@@ -1418,6 +1418,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            ProjectError::TelemetryDetachPending { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Database Maintenance Pending")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),

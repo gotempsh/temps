@@ -4,6 +4,8 @@
 //! Post-migration maintenance: concurrent index builds, trace-summary
 //! reconciliation and continuous-aggregate backfills.
 
+use crate::error::{SchemaError, SchemaResult};
+use crate::lock_capacity::{is_lock_exhaustion_sqlx, LockSlotsExhausted, SchemaStep};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use sqlx::Acquire;
 use std::time::Duration;
@@ -453,6 +455,390 @@ where
     }
 }
 
+/// Name of the post-migration step that drops the telemetry foreign keys.
+pub const DETACH_TELEMETRY_FOREIGN_KEYS_STEP: &str = "detach_telemetry_foreign_keys";
+
+/// Session-level advisory lock serializing [`detach_telemetry_foreign_keys`]
+/// across processes.
+const TELEMETRY_FK_DETACH_LOCK_KEY: &str = "temps:telemetry_fk_detach";
+
+/// `lock_timeout` for each foreign key drop. A drop locks the referenced table
+/// (`projects`, `environments`, ...) exclusively, and while that request
+/// waits every reader of the table queues behind it, so the wait is kept
+/// short and the drop retried instead.
+const DETACH_LOCK_TIMEOUT_SQL: &str = "SET lock_timeout = '1s'";
+
+/// SQLSTATE `feature_not_supported`: how TimescaleDB refuses to drop a
+/// foreign key from a single chunk ("operation not supported on chunk
+/// tables" up to 2.15, "cannot drop inherited constraint" from 2.18 until a
+/// later release lifted it again).
+const FEATURE_NOT_SUPPORTED: &str = "0A000";
+
+/// Foreign keys from the telemetry tables to the parents they are detached
+/// from, on the tables themselves: a hypertable's copies on its chunks go with
+/// it.
+const TELEMETRY_FOREIGN_KEYS_SQL: &str = "\
+    SELECT c.oid::bigint AS constraint_oid, \
+           c.conrelid::regclass::text AS child, \
+           quote_ident(c.conname) AS constraint_name, \
+           c.confrelid::regclass::text AS parent \
+    FROM pg_constraint c \
+    WHERE c.contype = 'f' \
+      AND c.conrelid = ANY (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
+      AND c.confrelid = ANY (SELECT to_regclass(t) FROM unnest($2::text[]) AS t) \
+    ORDER BY 2, 3";
+
+/// The copies of a hypertable's foreign key on its chunks: a foreign key of
+/// each child table to the same parent over the same columns. Matched by
+/// columns rather than name because TimescaleDB names the copies after the
+/// chunk in some releases (`1_1_events_project_id_fkey`) and not in others.
+/// A plain table has no children and returns nothing.
+const CHUNK_FOREIGN_KEYS_SQL: &str = "\
+    SELECT i.inhrelid::regclass::text AS chunk, quote_ident(cc.conname) AS constraint_name \
+    FROM pg_constraint hc \
+    JOIN pg_inherits i ON i.inhparent = hc.conrelid \
+    JOIN pg_constraint cc ON cc.conrelid = i.inhrelid AND cc.contype = 'f' \
+                         AND cc.confrelid = hc.confrelid \
+    WHERE hc.oid = $1::bigint::oid \
+      AND ARRAY(SELECT a.attname FROM unnest(cc.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                JOIN pg_attribute a ON a.attrelid = cc.conrelid AND a.attnum = k.attnum \
+                ORDER BY k.ord) \
+        = ARRAY(SELECT a.attname FROM unnest(hc.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                JOIN pg_attribute a ON a.attrelid = hc.conrelid AND a.attnum = k.attnum \
+                ORDER BY k.ord) \
+    ORDER BY i.inhrelid";
+
+/// A telemetry foreign key that still ties its table into the project delete
+/// cascade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryForeignKey {
+    pub table: String,
+    pub constraint: String,
+    pub parent: String,
+}
+
+fn telemetry_table_names() -> (Vec<String>, Vec<String>) {
+    (
+        temps_migrations::PROJECT_DATA_PURGED_TABLES
+            .iter()
+            .map(|table| table.to_string())
+            .collect(),
+        temps_migrations::PROJECT_DATA_DETACHED_PARENTS
+            .iter()
+            .map(|table| table.to_string())
+            .collect(),
+    )
+}
+
+async fn list_telemetry_foreign_keys(
+    connection: &mut sqlx::PgConnection,
+) -> Result<Vec<(i64, TelemetryForeignKey)>, sqlx::Error> {
+    let (children, parents) = telemetry_table_names();
+    let rows: Vec<(i64, String, String, String)> = sqlx::query_as(TELEMETRY_FOREIGN_KEYS_SQL)
+        .bind(children)
+        .bind(parents)
+        .fetch_all(&mut *connection)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(oid, table, constraint, parent)| {
+            (
+                oid,
+                TelemetryForeignKey {
+                    table,
+                    constraint,
+                    parent,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The telemetry foreign keys [`detach_telemetry_foreign_keys`] has not
+/// dropped yet. Empty once it has run, and on an instance that applied the
+/// earlier version of `m20261105_000001_project_data_purges`.
+pub async fn remaining_telemetry_foreign_keys(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<TelemetryForeignKey>, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    Ok(list_telemetry_foreign_keys(&mut connection)
+        .await?
+        .into_iter()
+        .map(|(_, foreign_key)| foreign_key)
+        .collect())
+}
+
+/// Run one DDL statement in its own transaction, retrying the lock failures
+/// an index build also retries ([`is_transient_index_build_sqlstate`]).
+async fn execute_ddl_with_retry(
+    connection: &mut sqlx::PgConnection,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
+    let mut failed_attempts: u32 = 0;
+    loop {
+        // Not kept in the statement cache: each chunk's drop is run once.
+        let error = match sqlx::query(sql)
+            .persistent(false)
+            .execute(&mut *connection)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        failed_attempts += 1;
+        let Some(delay) =
+            index_build_retry_delay(failed_attempts, is_transient_index_build_error(&error))
+        else {
+            return Err(error);
+        };
+        tracing::warn!(
+            attempt = failed_attempts,
+            max_attempts = INDEX_BUILD_ATTEMPTS,
+            retry_in_ms = delay.as_millis() as u64,
+            "'{sql}' hit a transient lock failure and will be retried: {error}"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .map(|code| code.into_owned())
+}
+
+/// Why one foreign key was not dropped.
+enum DetachFailure {
+    LockSlotsExhausted(Box<LockSlotsExhausted>),
+    Other(String),
+}
+
+/// Describe a lock exhaustion while dropping a foreign key from `table`.
+async fn detach_lock_exhaustion(
+    connection: &mut sqlx::PgConnection,
+    table: &str,
+    error: sqlx::Error,
+) -> LockSlotsExhausted {
+    LockSlotsExhausted::read(
+        &mut *connection,
+        SchemaStep::PostMigration(DETACH_TELEMETRY_FOREIGN_KEYS_STEP),
+        Some(table),
+        error.to_string(),
+    )
+    .await
+}
+
+/// Drop `foreign_key` (constraint `oid`): from each chunk in its own
+/// transaction first, then from the table, whose transaction then only locks
+/// the table, its parent and any chunk created in the meantime.
+///
+/// TimescaleDB refuses the per-chunk drop in some releases; the constraint is
+/// then dropped from the whole table in one transaction, which locks every
+/// chunk at once and can still run out of lock slots on a large table.
+/// [`MaintenanceProgress::ForeignKeyDetachFinished`] reports which way it went.
+async fn detach_foreign_key<F>(
+    connection: &mut sqlx::PgConnection,
+    oid: i64,
+    foreign_key: &TelemetryForeignKey,
+    on_progress: &F,
+) -> Result<(), DetachFailure>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    let TelemetryForeignKey {
+        table, constraint, ..
+    } = foreign_key;
+    let chunks: Vec<(String, String)> = sqlx::query_as(CHUNK_FOREIGN_KEYS_SQL)
+        .bind(oid)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| {
+            DetachFailure::Other(format!(
+                "{constraint} on {table} (listing its copies on the chunks): {error}"
+            ))
+        })?;
+    on_progress(MaintenanceProgress::ForeignKeyDetachStarted {
+        table,
+        constraint,
+        chunks: chunks.len(),
+    });
+    let started = std::time::Instant::now();
+
+    let mut per_chunk = !chunks.is_empty();
+    for (chunk, chunk_constraint) in &chunks {
+        let drop = format!("ALTER TABLE {chunk} DROP CONSTRAINT IF EXISTS {chunk_constraint}");
+        match execute_ddl_with_retry(&mut *connection, &drop).await {
+            Ok(()) => {}
+            Err(error) if sqlstate(&error).as_deref() == Some(FEATURE_NOT_SUPPORTED) => {
+                tracing::info!(
+                    table = %table,
+                    constraint = %constraint,
+                    chunk = %chunk,
+                    chunks = chunks.len(),
+                    "TimescaleDB does not allow dropping a foreign key from a single chunk \
+                     ({error}); dropping {constraint} from {table} and all its chunks in one \
+                     transaction"
+                );
+                per_chunk = false;
+                break;
+            }
+            Err(error) if is_lock_exhaustion_sqlx(&error) => {
+                return Err(DetachFailure::LockSlotsExhausted(Box::new(
+                    detach_lock_exhaustion(&mut *connection, table, error).await,
+                )));
+            }
+            Err(error) => {
+                return Err(DetachFailure::Other(format!(
+                    "{constraint} on {table} (dropping its copy {chunk_constraint} on chunk \
+                     {chunk}): {error}"
+                )));
+            }
+        }
+    }
+
+    let drop = format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}");
+    match execute_ddl_with_retry(&mut *connection, &drop).await {
+        Ok(()) => {}
+        Err(error) if is_lock_exhaustion_sqlx(&error) => {
+            return Err(DetachFailure::LockSlotsExhausted(Box::new(
+                detach_lock_exhaustion(&mut *connection, table, error).await,
+            )));
+        }
+        Err(error) => {
+            return Err(DetachFailure::Other(format!(
+                "{constraint} on {table}: {error}"
+            )));
+        }
+    }
+    on_progress(MaintenanceProgress::ForeignKeyDetachFinished {
+        table,
+        constraint,
+        chunks: chunks.len(),
+        per_chunk,
+        elapsed: started.elapsed(),
+    });
+    Ok(())
+}
+
+/// Drop every foreign key from the telemetry tables to the project delete
+/// cascade's parents, one constraint per transaction (see
+/// `m20261105_000001_project_data_purges` for why this is not in the
+/// migration).
+///
+/// Idempotent: it drops only what is still there, so an instance that already
+/// dropped them, or a run interrupted half-way, just finishes the rest. Each
+/// constraint is attempted even if an earlier one failed. A lock exhaustion is
+/// returned as [`SchemaError::LockSlotsExhausted`] once the others have been
+/// attempted.
+async fn detach_telemetry_foreign_keys_on<F>(
+    connection: &mut sqlx::PgConnection,
+    on_progress: &F,
+) -> SchemaResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    // Serialize across processes (several control planes, or `temps migrate`
+    // next to `temps serve`), as for the foreign key indexes. The wait is
+    // unbounded: the holder is finite work and the lock goes with its
+    // connection. The caller's lock timeout is restored afterwards.
+    let locked = async {
+        sqlx::query("SET lock_timeout = 0")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("SELECT pg_advisory_lock(hashtext($1)::BIGINT)")
+            .bind(TELEMETRY_FK_DETACH_LOCK_KEY)
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query(DETACH_LOCK_TIMEOUT_SQL)
+            .execute(&mut *connection)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if let Err(error) = locked {
+        let _ = sqlx::query("SET lock_timeout = '5s'")
+            .execute(&mut *connection)
+            .await;
+        return Err(ServiceError::Database(format!(
+            "Failed to take the telemetry foreign key lock for {DETACH_TELEMETRY_FOREIGN_KEYS_STEP}: {error}"
+        ))
+        .into());
+    }
+
+    let mut exhausted: Option<Box<LockSlotsExhausted>> = None;
+    let mut failures: Vec<String> = Vec::new();
+    match list_telemetry_foreign_keys(&mut *connection).await {
+        Ok(foreign_keys) => {
+            for (oid, foreign_key) in &foreign_keys {
+                match detach_foreign_key(&mut *connection, *oid, foreign_key, on_progress).await {
+                    Ok(()) => {}
+                    Err(DetachFailure::LockSlotsExhausted(error)) => {
+                        tracing::error!("{error}");
+                        if exhausted.is_none() {
+                            exhausted = Some(error);
+                        } else {
+                            failures.push(error.to_string());
+                        }
+                    }
+                    Err(DetachFailure::Other(message)) => failures.push(message),
+                }
+            }
+        }
+        Err(error) => failures.push(format!("listing the telemetry foreign keys: {error}")),
+    }
+
+    if let Err(error) = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::BIGINT)")
+        .bind(TELEMETRY_FK_DETACH_LOCK_KEY)
+        .execute(&mut *connection)
+        .await
+    {
+        tracing::warn!(
+            "Failed to release the telemetry foreign key lock early; \
+             it is released when the maintenance connection closes: {error}"
+        );
+    }
+    let restored = sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *connection)
+        .await;
+
+    if let Some(error) = exhausted {
+        return Err(SchemaError::LockSlotsExhausted(error));
+    }
+    if !failures.is_empty() {
+        return Err(ServiceError::Database(format!(
+            "{DETACH_TELEMETRY_FOREIGN_KEYS_STEP} failed to drop {} telemetry foreign key(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+        .into());
+    }
+    restored.map_err(|error| {
+        ServiceError::Database(format!(
+            "Dropped the telemetry foreign keys but failed to restore the lock timeout: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// [`detach_telemetry_foreign_keys_on`] on a connection of its own, for
+/// callers that run it outside [`run_post_migration_indexes`] (test
+/// databases, which migrate without the rest of maintenance).
+pub async fn detach_telemetry_foreign_keys(db: &DatabaseConnection) -> SchemaResult<()> {
+    let mut connection = db
+        .get_postgres_connection_pool()
+        .acquire()
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to acquire database connection for {DETACH_TELEMETRY_FOREIGN_KEYS_STEP}: {error}"
+            ))
+        })?;
+    // Session settings and the advisory lock must not outlive this call.
+    connection.close_on_drop();
+    detach_telemetry_foreign_keys_on(&mut connection, &|_| {}).await
+}
+
 /// Live progress events from post-migration maintenance (concurrent index
 /// builds and continuous-aggregate backfill).
 ///
@@ -478,6 +864,22 @@ pub enum MaintenanceProgress<'a> {
     IndexStarted { name: &'a str },
     /// The concurrent index build finished successfully.
     IndexFinished { name: &'a str, elapsed: Duration },
+    /// A telemetry foreign key is about to be dropped from `table` and its
+    /// `chunks` chunks (zero for a plain table).
+    ForeignKeyDetachStarted {
+        table: &'a str,
+        constraint: &'a str,
+        chunks: usize,
+    },
+    /// The foreign key was dropped. `per_chunk` is false when TimescaleDB
+    /// refused to drop it chunk by chunk and it went in one transaction.
+    ForeignKeyDetachFinished {
+        table: &'a str,
+        constraint: &'a str,
+        chunks: usize,
+        per_chunk: bool,
+        elapsed: Duration,
+    },
     /// A continuous aggregate is about to be refreshed over `windows` windows.
     AggregateStarted { view: &'a str, windows: usize },
     /// One refresh window finished. `error` is set when that window failed —
@@ -505,7 +907,12 @@ pub enum MaintenanceProgress<'a> {
 /// A single acquired pool connection is retained for the timeout settings and
 /// the concurrent index build. `CREATE INDEX CONCURRENTLY` allows audit writes
 /// to continue while PostgreSQL scans the existing history.
-pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResult<()> {
+///
+/// The telemetry foreign keys are dropped first
+/// ([`DETACH_TELEMETRY_FOREIGN_KEYS_STEP`]): project deletes are refused until
+/// they are gone. A failure there does not stop the index builds, and is
+/// returned after them.
+pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> SchemaResult<()> {
     run_post_migration_indexes_streaming(db, |_| {}).await
 }
 
@@ -517,7 +924,7 @@ pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResul
 pub async fn run_post_migration_indexes_streaming<F>(
     db: &DatabaseConnection,
     on_progress: F,
-) -> ServiceResult<()>
+) -> SchemaResult<()>
 where
     F: Fn(MaintenanceProgress<'_>),
 {
@@ -560,10 +967,13 @@ where
             .await;
         return Err(ServiceError::Database(format!(
             "Failed to set statement timeout for permission-denied retention index: {error}"
-        )));
+        ))
+        .into());
     }
 
-    let maintenance_result: ServiceResult<()> = async {
+    let maintenance_result: SchemaResult<()> = async {
+        let detached = detach_telemetry_foreign_keys_on(&mut connection, &on_progress).await;
+
         on_progress(MaintenanceProgress::IndexStarted {
             name: PERMISSION_DENIED_RETENTION_INDEX,
         });
@@ -609,6 +1019,7 @@ where
         // stuck index does not hold back the other set until the next retry.
         let reference = build_reference_indexes(&mut connection, &on_progress).await;
         let foreign_keys = build_project_foreign_key_indexes(&mut connection, &on_progress).await;
+        detached?;
         reference?;
         foreign_keys?;
 

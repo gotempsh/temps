@@ -193,6 +193,15 @@ pub struct UpgradeCommand {
     /// Defaults to `$TEMPS_DATA_DIR` or `~/.temps`.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Database URL, to warn before installing when PostgreSQL's lock table is
+    /// too small for the instance's TimescaleDB chunk count (a migration that
+    /// changes hypertable constraints would fail with "out of shared
+    /// memory"). Optional: without it the check is skipped. Prefer
+    /// TEMPS_DATABASE_URL: the flag form puts the password in the process
+    /// command line
+    #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
+    pub database_url: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -365,6 +374,7 @@ impl UpgradeCommand {
         println!("    Size:     {:.1} MB", size_mb);
         println!("    Release:  {}", release.html_url);
         println!();
+        print_lock_capacity_warning(self.database_url.as_deref()).await;
 
         if self.check {
             println!("Run `temps upgrade` to install this update.");
@@ -562,6 +572,7 @@ impl UpgradeCommand {
             api, version, asset
         );
         println!();
+        print_lock_capacity_warning(self.database_url.as_deref()).await;
 
         if self.check {
             println!("  Run without --check to install.");
@@ -741,6 +752,67 @@ pub fn current_version_tag() -> String {
     }
 
     version.to_string()
+}
+
+/// How long the pre-update lock capacity check may take. It is advisory and
+/// must never hold up an upgrade.
+const LOCK_CAPACITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The pre-update warning for an instance whose PostgreSQL lock table is too
+/// small for its TimescaleDB chunk count, `Ok(None)` when it fits. `Err` is
+/// why the check could not run.
+pub(crate) async fn lock_capacity_warning(database_url: &str) -> Result<Option<String>, String> {
+    let mut options = temps_database::connect_options(database_url);
+    options
+        .max_connections(1)
+        .min_connections(0)
+        .connect_timeout(LOCK_CAPACITY_CHECK_TIMEOUT);
+    let check = async {
+        let db = sea_orm::Database::connect(options)
+            .await
+            .map_err(|error| format!("could not connect to the database: {error}"))?;
+        let capacity = temps_schema::read_lock_capacity(db.get_postgres_connection_pool()).await;
+        let _ = db.close().await;
+        capacity.map_err(|error| format!("could not read the lock settings: {error}"))
+    };
+    let capacity = tokio::time::timeout(LOCK_CAPACITY_CHECK_TIMEOUT, check)
+        .await
+        .map_err(|_| format!("timed out after {}s", LOCK_CAPACITY_CHECK_TIMEOUT.as_secs()))??;
+    Ok(lock_capacity_warning_for(&capacity))
+}
+
+/// [`lock_capacity_warning`] for capacity already read.
+pub(crate) fn lock_capacity_warning_for(capacity: &temps_schema::LockCapacity) -> Option<String> {
+    capacity.at_risk().then(|| {
+        format!(
+            "PostgreSQL may run out of lock slots while the new release migrates: {}. {} Do it \
+             before upgrading: a migration that runs out is rolled back and the upgrade stops \
+             there until the setting is raised.",
+            capacity.describe(),
+            capacity.remedy()
+        )
+    })
+}
+
+/// Print the lock capacity warning under the upgrade plan, before anything
+/// is downloaded or replaced. Without a database URL there is nothing to
+/// check; a failed check is noted and does not stop the upgrade.
+async fn print_lock_capacity_warning(database_url: Option<&str>) {
+    let Some(database_url) = database_url else {
+        debug!("No database URL; skipping the pre-update lock capacity check");
+        return;
+    };
+    match lock_capacity_warning(database_url).await {
+        Ok(None) => debug!("PostgreSQL lock table fits this instance's chunk count"),
+        Ok(Some(warning)) => {
+            println!("  Warning: {warning}");
+            println!();
+        }
+        Err(reason) => {
+            println!("  Note: could not check PostgreSQL lock capacity ({reason}).");
+            println!();
+        }
+    }
 }
 
 /// How long a single background update check may take before it's abandoned.
@@ -4495,6 +4567,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
     }
@@ -4516,6 +4589,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Stable);
     }
@@ -4537,6 +4611,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
     }
@@ -4556,11 +4631,32 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         };
         assert_eq!(cmd.resolved_channel(), UpgradeChannel::Beta);
     }
 
     // ── EE tier + license logic ──────────────────────────────────────────
+
+    #[test]
+    fn lock_capacity_warning_only_when_the_lock_table_is_too_small() {
+        let capacity = |max_locks: i64, chunks: i64| temps_schema::LockCapacity {
+            max_locks_per_transaction: max_locks,
+            max_connections: 100,
+            max_prepared_transactions: 0,
+            timescaledb: true,
+            hypertables: vec![temps_schema::lock_capacity::HypertableChunks {
+                hypertable: "events".to_string(),
+                chunks,
+            }],
+        };
+        assert_eq!(lock_capacity_warning_for(&capacity(64, 200)), None);
+        let warning = lock_capacity_warning_for(&capacity(64, 2_000))
+            .expect("2 000 chunks need more than the default lock table");
+        assert!(warning.contains("at least 256"), "{warning}");
+        assert!(warning.contains("restart PostgreSQL"), "{warning}");
+        assert!(warning.contains("before upgrading"), "{warning}");
+    }
 
     fn cmd_with_tier(tier: Option<UpgradeTier>) -> UpgradeCommand {
         UpgradeCommand {
@@ -4575,6 +4671,7 @@ mod tests {
             license_path: None,
             ee_api: None,
             data_dir: None,
+            database_url: None,
         }
     }
 

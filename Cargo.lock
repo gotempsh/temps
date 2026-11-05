@@ -15708,6 +15708,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "sea-orm-migration 1.1.20",
  "temps-migrations",
+ "temps-schema",
  "testcontainers",
  "tokio",
  "uuid",
