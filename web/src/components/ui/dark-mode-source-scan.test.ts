@@ -80,8 +80,9 @@ function lightOnlyClasses(classes: string): string[] {
     if (!match) continue
     // The light classes above colour every side, so a one-side dark colour
     // (`dark:border-b-white/5`) leaves the other sides light: only an
-    // unsided counterpart counts.
-    const counterpart = new RegExp(`(?<![\\w-])dark:${property}-${COLOUR}`)
+    // unsided counterpart counts. `dark:` must also start the class: a
+    // conditional one (`hover:dark:bg-...`) leaves the base colour light.
+    const counterpart = new RegExp(`(?<![\\w:-])dark:${property}-${COLOUR}`)
     if (!counterpart.test(classes)) found.push(match[0])
   }
   return found
@@ -124,7 +125,15 @@ describe('lightOnlyClasses', () => {
     expect(lightOnlyClasses('text-green-700 dark:text-[22px]')).toEqual([
       'text-green-700',
     ])
-    expect(lightOnlyClasses('bg-green-50 dark:bg-[url(/x.png)]')).toEqual([
+    // Split so Tailwind, which scans this file, never emits a real
+    // `url(...)` rule the bundler would then try to resolve.
+    expect(lightOnlyClasses('bg-green-50 dark:bg-[' + 'url(/x.png)]')).toEqual([
+      'bg-green-50',
+    ])
+  })
+
+  test('rejects a dark colour that only applies under another variant', () => {
+    expect(lightOnlyClasses('bg-green-50 hover:dark:bg-green-900')).toEqual([
       'bg-green-50',
     ])
   })
