@@ -336,3 +336,92 @@ test('the list sends you to the create page, from its empty state too', async ()
   expect(link.getAttribute('href')).toBe('/status-pages/new')
   mock.restore()
 })
+
+/** A response held until the test releases it. */
+function gate() {
+  let release: () => void = () => {}
+  const opened = new Promise<void>((resolve) => (release = resolve))
+  return { opened, release }
+}
+
+test('nothing can be created while a chosen service is still being added', async () => {
+  const held = gate()
+  const mock = api({
+    'GET /projects/1/monitors': async () => {
+      await held.opened
+      return jsonResponse([
+        {
+          id: 11,
+          name: 'billing-production',
+          environment_id: 21,
+          is_managed: true,
+          is_active: true,
+        },
+      ])
+    },
+  })
+  setup()
+  typeTitle()
+  await pickService('Billing')
+  await screen.findByText('Wait for the service you chose to be added.')
+  expect(
+    (
+      screen.getByRole('button', {
+        name: 'Create and publish',
+      }) as HTMLButtonElement
+    ).disabled
+  ).toBe(true)
+  held.release()
+  await screen.findByRole('button', { name: 'Remove Billing' })
+  await waitFor(() =>
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'Create and publish',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(false)
+  )
+  mock.restore()
+})
+
+test('an addition that lands after a row changed environment adds what is free now', async () => {
+  const lookup: { held?: ReturnType<typeof gate> } = {}
+  const monitors = [
+    {
+      id: 11,
+      name: 'billing-production',
+      environment_id: 21,
+      is_managed: true,
+      is_active: true,
+    },
+    STAGING_MONITOR,
+  ]
+  const mock = api({
+    'GET /projects/1/monitors': async () => {
+      if (lookup.held) await lookup.held.opened
+      return jsonResponse(monitors)
+    },
+    'GET /projects/1/environments': () =>
+      jsonResponse([
+        { id: 22, name: 'staging', is_preview: true },
+        { id: 21, name: 'production', is_preview: false },
+      ]),
+  })
+  setup()
+  await addComponent()
+  lookup.held = gate()
+  await pickService('Billing')
+  // While that lookup runs, the first row moves to staging, the environment
+  // the addition would have picked.
+  fireEvent.click(
+    await screen.findByRole('combobox', { name: /^Environment of Billing/ })
+  )
+  fireEvent.click(await screen.findByRole('option', { name: /staging/ }))
+  await screen.findByText(/· staging/)
+  lookup.held.release()
+  await screen.findByText(/· production/)
+  expect(screen.getAllByLabelText('Public name').length).toBe(2)
+  expect(screen.getAllByText(/· staging/).length).toBe(1)
+  mock.restore()
+})

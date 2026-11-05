@@ -19,9 +19,10 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowDown, ArrowUp, Trash2 } from 'lucide-react'
-import { useId, useMemo } from 'react'
+import { useEffect, useId, useMemo, useRef } from 'react'
 import type { FieldErrors } from 'react-hook-form'
 import { Link } from 'react-router'
+import { ADD_COMPONENT_KEY } from './use-adding-component'
 import {
   buildMonitorChoices,
   choiceLabel,
@@ -123,6 +124,12 @@ export function StatusPageComponentsEditor({
 }) {
   const groupListId = useId()
   const groups = groupNames(value)
+  // The rows as they are now, for an addition that finishes after the user
+  // changed them while it loaded (switched a row's environment, removed one).
+  const rowsRef = useRef(value)
+  useEffect(() => {
+    rowsRef.current = value
+  }, [value])
   const projectsQuery = useQuery(
     getProjectsOptions({ query: { page: 1, per_page: 100 } })
   )
@@ -200,10 +207,14 @@ export function StatusPageComponentsEditor({
         projects={projects}
         projectOptions={projectOptions}
         projectsLoading={projectsQuery.isLoading}
-        taken={taken}
         full={value.length >= MAX_MONITORS_PER_PAGE}
         hasComponents={value.length > 0}
-        onAdd={(row) => onChange([...value, row])}
+        currentTaken={() => new Set(rowsRef.current.map((r) => r.monitor_id))}
+        onAdd={(row) => {
+          const rows = rowsRef.current
+          if (rows.some((r) => r.monitor_id === row.monitor_id)) return
+          onChange([...rows, row])
+        }}
       />
     </div>
   )
@@ -388,7 +399,7 @@ function AddComponentRow({
   projects,
   projectOptions,
   projectsLoading,
-  taken,
+  currentTaken,
   full,
   hasComponents,
   onAdd,
@@ -396,13 +407,15 @@ function AddComponentRow({
   projects: ProjectSummary[]
   projectOptions: SearchableSelectOption[]
   projectsLoading: boolean
-  taken: ReadonlySet<number>
+  /** Monitors on the page when the lookup returns, not when it started. */
+  currentTaken: () => ReadonlySet<number>
   full: boolean
   hasComponents: boolean
   onAdd: (row: ComponentRow) => void
 }) {
   const queryClient = useQueryClient()
   const add = useMutation({
+    mutationKey: ADD_COMPONENT_KEY,
     mutationFn: async (project: ProjectSummary) => {
       const request = { path: { project_id: project.id } }
       const [environments, monitors] = await Promise.all([
@@ -412,7 +425,7 @@ function AddComponentRow({
       const choices = buildMonitorChoices(environments, monitors)
       return {
         hasMonitors: choices.length > 0,
-        choice: firstAvailableChoice(choices, taken),
+        choice: firstAvailableChoice(choices, currentTaken()),
       }
     },
     onSuccess: ({ choice }, project) => {

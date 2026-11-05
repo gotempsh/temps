@@ -61,6 +61,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { StatusPageProjects, StatusPageStateBadge } from './ProjectStatusPages'
 import { StatusPageComponentsEditor } from './StatusPageComponentsEditor'
+import { useAddingComponent } from './use-adding-component'
 import { StatusPageDomains } from './StatusPageDomains'
 import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageAppearanceForm } from './StatusPageAppearanceForm'
@@ -260,7 +261,11 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
     },
   })
 
+  const adding = useAddingComponent()
+
   const onSubmit = (values: StatusPageFormValues) => {
+    // A service still being added is not in `values` yet.
+    if (adding) return
     update.mutate({
       path: { status_page_id: page.id },
       body: { monitors: toSelection(values.components) },
@@ -308,8 +313,12 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
           </section>
 
           <div className="flex justify-end">
-            <Button type="submit" disabled={update.isPending}>
-              {update.isPending ? 'Saving...' : 'Save changes'}
+            <Button type="submit" disabled={update.isPending || adding}>
+              {update.isPending
+                ? 'Saving...'
+                : adding
+                  ? 'Adding service…'
+                  : 'Save changes'}
             </Button>
           </div>
         </fieldset>
