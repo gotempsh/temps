@@ -20,6 +20,8 @@ import {
 } from '@/lib/cluster-network'
 import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { NodeAddressRanges } from '@/components/nodes/NodeAddressRanges'
+import { meshRangeToShow } from '@/lib/node-address-ranges'
 import { RotateClusterCaDialog } from '@/components/nodes/RotateClusterCaDialog'
 import { useClusterCaFingerprint } from '@/hooks/useClusterCaFingerprint'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
@@ -635,7 +637,7 @@ function NodeTable({
             <TableHead className="hidden sm:table-cell">Arch</TableHead>
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
-            <TableHead className="hidden md:table-cell">Address</TableHead>
+            <TableHead className="hidden md:table-cell">Node address</TableHead>
             <TableHead className="hidden sm:table-cell">Ingress</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
             {showOverlay && <TableHead>Cross-node</TableHead>}
@@ -1969,11 +1971,19 @@ export function NodesPage() {
                 </p>
               </div>
             ) : (
-              <NodeTable
-                nodes={nodes}
-                mesh={mesh}
-                overlay={clusterNetwork?.nodes}
-              />
+              <div className="space-y-3">
+                <NodeAddressRanges
+                  meshCidr={meshRangeToShow(mesh)?.cidr}
+                  meshReady={meshRangeToShow(mesh)?.ready}
+                  computeCidr={clusterNetwork?.compute_pool_cidr}
+                  subnetPrefixLen={clusterNetwork?.subnet_prefix_len}
+                />
+                <NodeTable
+                  nodes={nodes}
+                  mesh={mesh}
+                  overlay={clusterNetwork?.nodes}
+                />
+              </div>
             )}
           </CardContent>
         </Card>
