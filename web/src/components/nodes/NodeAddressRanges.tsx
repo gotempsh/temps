@@ -5,7 +5,8 @@ import { Info } from 'lucide-react'
 
 /**
  * What the two private ranges on the Worker Nodes page are for. A worker
- * that joined over the private network shows the same machine address under
+ * that joined outbound (it dials the control plane, with no address of its
+ * own) shows the same mesh address under
  * "Node address" and "Mesh", and its containers use a second range, which
  * users read as a collision. They cannot overlap: the cluster refuses a
  * container range that overlaps the mesh pool (`PoolOverlapsMesh`).
@@ -30,10 +31,13 @@ export function NodeAddressRanges({
         {meshCidr && (
           <p>
             <code className="font-mono">{meshCidr}</code>: machines on the
-            private network. Each node gets one address; it{' '}
-            {meshReady ? 'shows' : 'will show'} under{' '}
-            <strong>Node address</strong> and <strong>Mesh</strong>, which are
-            the same for a worker that joined over the private network.
+            private network. Each node gets one address from it, shown under{' '}
+            <strong>Mesh</strong>
+            {meshReady ? '' : ' once the network is up'}. A worker that joined
+            without an address of its own (it dials this server) is reached at
+            that address, so <strong>Node address</strong> shows the same one; a
+            worker joined at its own address (<code>--private-address</code>)
+            shows that one instead.
           </p>
         )}
         {computeCidr && (

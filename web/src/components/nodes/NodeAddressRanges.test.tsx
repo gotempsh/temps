@@ -21,7 +21,11 @@ describe('NodeAddressRanges', () => {
       )
     )
     expect(shown).toContain('10.201.0.0/16: machines on the private network')
-    expect(shown).toContain('Node address and Mesh')
+    expect(shown).toContain('one address from it, shown under Mesh.')
+    // The two columns match only for outbound joins; say which.
+    expect(shown).toContain('joined without an address of its own')
+    expect(shown).toContain('so Node address shows the same one')
+    expect(shown).toContain('--private-address')
     expect(shown).toContain(
       '10.205.0.0/16: container addresses, a /24 per node'
     )
@@ -39,7 +43,7 @@ describe('NodeAddressRanges', () => {
         />
       )
     )
-    expect(shown).toContain('it will show under Node address and Mesh')
+    expect(shown).toContain('shown under Mesh once the network is up')
   })
 
   test('uses the ranges this cluster is configured with', () => {
