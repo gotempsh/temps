@@ -123,3 +123,40 @@ export function emailSetupSteps(input: {
     sendStep(input.stats),
   ]
 }
+
+/** Which parts of the email overview to show below the setup checklist. */
+export interface EmailOverviewSections {
+  domains: boolean
+  providers: boolean
+  sent: boolean
+  events: boolean
+}
+
+const ALL_SECTIONS: EmailOverviewSections = {
+  domains: true,
+  providers: true,
+  sent: true,
+  events: true,
+}
+
+/**
+ * While setup is unfinished the checklist already asks for each missing piece,
+ * so a section that would only repeat it as an empty state stays out; a
+ * section with something in it (a provider, a domain, a captured email) still
+ * shows, since that is what the user needs to manage. Once every step is done
+ * the checklist leaves and every section shows, empty or not.
+ */
+export function emailOverviewSections(input: {
+  providers: EmailProviderResponse[]
+  domains: EmailDomainResponse[]
+  stats: EmailStatsResponse
+}): EmailOverviewSections {
+  if (emailSetupSteps(input).every((step) => step.done)) return ALL_SECTIONS
+  const anyEmail = input.stats.total > 0
+  return {
+    domains: input.domains.length > 0,
+    providers: input.providers.length > 0,
+    sent: anyEmail,
+    events: anyEmail,
+  }
+}
