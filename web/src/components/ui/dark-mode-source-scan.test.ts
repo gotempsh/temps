@@ -60,13 +60,28 @@ const LIGHT_ONLY: { pattern: RegExp; property: string }[] = [
 
 const STRING_LITERAL = /'[^'\n]*'|"[^"\n]*"|`[^`]*`/g
 
+/**
+ * A colour value, so `dark:text-xs` or `dark:border-0` (a size or a width)
+ * never passes for a dark colour: a palette shade, black/white, a theme token
+ * or an arbitrary value.
+ */
+const COLOUR =
+  `(?:(?:(?:${HUES}|gray|slate|zinc|neutral|stone)-\\d{2,3}|white|black|transparent|current|` +
+  '(?:primary|secondary|muted|accent|destructive|success|warning|foreground|' +
+  'background|card|popover|border|input|ring|sidebar|chart-\\d)(?:-[a-z]+)*)' +
+  '(?![\\w-])|\\[)'
+
 /** Light-only classes in `classes` that have no `dark:` counterpart. */
 function lightOnlyClasses(classes: string): string[] {
   const found: string[] = []
   for (const { pattern, property } of LIGHT_ONLY) {
     const match = classes.match(pattern)
     if (!match) continue
-    const counterpart = new RegExp(`(?<![\\w-])dark:${property}-`)
+    // `border` colours may be per side (`dark:border-b-white/5`).
+    const side = property === 'border' ? '(?:[xytrbse]-)?' : ''
+    const counterpart = new RegExp(
+      `(?<![\\w-])dark:${property}-${side}${COLOUR}`
+    )
     if (!counterpart.test(classes)) found.push(match[0])
   }
   return found
@@ -91,6 +106,32 @@ describe('lightOnlyClasses', () => {
     expect(lightOnlyClasses('border-gray-950/10 dark:border-white/10')).toEqual(
       []
     )
+  })
+
+  test('rejects a dark: utility that sets no colour', () => {
+    expect(lightOnlyClasses('text-green-700 dark:text-xs')).toEqual([
+      'text-green-700',
+    ])
+    expect(lightOnlyClasses('border-green-200 dark:border-0')).toEqual([
+      'border-green-200',
+    ])
+    expect(lightOnlyClasses('border-green-200 dark:border-t')).toEqual([
+      'border-green-200',
+    ])
+    expect(lightOnlyClasses('bg-green-50 dark:bg-none')).toEqual([
+      'bg-green-50',
+    ])
+  })
+
+  test('accepts per-side, token and arbitrary dark colours', () => {
+    expect(lightOnlyClasses('border-gray-950/5 dark:border-b-white/5')).toEqual(
+      []
+    )
+    expect(lightOnlyClasses('bg-green-50 dark:bg-muted')).toEqual([])
+    expect(
+      lightOnlyClasses('text-green-700 dark:text-muted-foreground')
+    ).toEqual([])
+    expect(lightOnlyClasses('text-red-700 dark:text-[#f87171]')).toEqual([])
   })
 
   test('ignores translucent fills and hover-only shades', () => {
