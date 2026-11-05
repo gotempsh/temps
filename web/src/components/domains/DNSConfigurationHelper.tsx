@@ -94,7 +94,7 @@ export function DNSConfigurationHelper() {
               href="https://dash.cloudflare.com"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-purple-600 hover:text-purple-700 dark:hover:text-purple-300 underline"
+              className="text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 underline"
             >
               Cloudflare Dashboard
             </a>
