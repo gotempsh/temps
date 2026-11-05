@@ -105,6 +105,29 @@ export function isSameDockerfile(
 }
 
 /**
+ * The Dockerfile that tells apart the detected cards of a selection, for
+ * `FrameworkSelector` beside an editable path. A path no card has gives none:
+ * the selector would otherwise add a card for it on every keystroke, and the
+ * framework and directory are still what is selected.
+ */
+export function selectedDetectedDockerfile(
+  presets: readonly ProjectPresetResponse[] | undefined,
+  selection: string,
+  dockerfilePath: string | undefined
+): string | undefined {
+  const { preset, directory } = splitPresetSelection(selection)
+  const path = normalizePresetPath(directory)
+  const detected = presets?.some(
+    (card) =>
+      card.preset === preset &&
+      card.preset === 'dockerfile' &&
+      normalizePresetPath(card.path) === path &&
+      isSameDockerfile(card.dockerfilePath, dockerfilePath)
+  )
+  return detected ? dockerfilePath : undefined
+}
+
+/**
  * The public detection endpoint's snake_case presets in the camelCase shape
  * `FrameworkSelector` reads. Dropping `dockerfile_path` here makes a card for
  * `docker/Dockerfile` build the root `Dockerfile` instead.

@@ -7,6 +7,7 @@ import {
   applyFrameworkSelection,
   buildConfigurationPatch,
   buildConfigurationValues,
+  withoutLegacySandboxGrants,
 } from './build-configuration-form'
 
 const project = (overrides: Partial<ProjectResponse> = {}) =>
@@ -240,6 +241,29 @@ describe('applyFrameworkSelection', () => {
     })
   })
 
+  test('another detected Dockerfile beside the current one drops the build context', () => {
+    // Detection names the file from the repository root, so keeping a
+    // subdirectory context would make the build look for apps/docker/Dockerfile.
+    const values = {
+      ...buildConfigurationValues(project()),
+      directory: './',
+      buildContext: './apps',
+    }
+    expect(
+      applyFrameworkSelection(
+        values,
+        'dockerfile::root',
+        card({ preset: 'dockerfile', dockerfilePath: 'docker/Dockerfile' })
+      )
+    ).toEqual({
+      ...values,
+      preset: 'dockerfile',
+      directory: './',
+      dockerfilePath: 'docker/Dockerfile',
+      buildContext: '',
+    })
+  })
+
   test('a detected Dockerfile with no named file falls back to the default', () => {
     const values = { ...current, dockerfilePath: 'stale.Dockerfile' }
     expect(
@@ -249,5 +273,31 @@ describe('applyFrameworkSelection', () => {
         card({ preset: 'dockerfile' })
       ).dockerfilePath
     ).toBe('Dockerfile')
+  })
+})
+
+describe('withoutLegacySandboxGrants', () => {
+  test('leaving Compose clears grants the server would refuse', () => {
+    const stored = { composePath: 'compose.yml', unsandboxedServices: ['db'] }
+    expect(withoutLegacySandboxGrants('dockerfile', stored)).toEqual({
+      composePath: 'compose.yml',
+      unsandboxedServices: [],
+    })
+    expect(
+      withoutLegacySandboxGrants('nextjs', stored).unsandboxedServices
+    ).toEqual([])
+  })
+
+  test('Compose always sends the empty list, since an omitted key is kept', () => {
+    expect(withoutLegacySandboxGrants('docker-compose', {})).toEqual({
+      unsandboxedServices: [],
+    })
+  })
+
+  test('another framework with no grants is sent as it is', () => {
+    const stored = { dockerfilePath: 'Dockerfile' }
+    expect(withoutLegacySandboxGrants('dockerfile', stored)).toBe(stored)
+    const empty = { unsandboxedServices: [] }
+    expect(withoutLegacySandboxGrants('dockerfile', empty)).toBe(empty)
   })
 })

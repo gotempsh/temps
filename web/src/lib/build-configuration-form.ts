@@ -132,6 +132,23 @@ export function buildConfigurationPatch(
 }
 
 /**
+ * The config to send for a save. The server refuses any request that still
+ * carries legacy per-service sandbox grants, whichever preset it is for, so a
+ * Compose project holding them could not otherwise move to another framework.
+ * Compose always sends the empty list because the server keeps an omitted key.
+ */
+export function withoutLegacySandboxGrants<T extends Record<string, unknown>>(
+  preset: string | null | undefined,
+  config: T
+): T {
+  const grants = config.unsandboxedServices
+  const hasGrants = Array.isArray(grants) && grants.length > 0
+  return isComposePreset(preset ?? '') || hasGrants
+    ? { ...config, unsandboxedServices: [] }
+    : config
+}
+
+/**
  * The Compose file a detected card brings. Detection lists paths from the
  * repository root, but a project stores them relative to its root directory,
  * and a card lists every Compose file in the repository, not only its own.
@@ -187,7 +204,8 @@ export function applyFrameworkSelection(
     preset,
     directory,
     dockerfilePath,
-    // A context chosen for the previous location would not contain this file.
+    // A detected file is relative to the card's directory, even beside the
+    // current file, so it only resolves when no other context is set.
     buildContext: '',
     composePath: isComposePreset(preset)
       ? detectedComposePath(card, directory)

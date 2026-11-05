@@ -96,6 +96,7 @@ import {
 import { composeValidationWarning } from '@/lib/compose-check'
 import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
+import { withoutLegacySandboxGrants } from '@/lib/build-configuration-form'
 import {
   detectedPresetsFromPublic,
   normalizePresetPath,
@@ -366,11 +367,11 @@ function GitSettingsInline({
       overrides.preset === 'nixpacks' && overrides.preset_config === undefined
         ? presetConfigForSelection('nixpacks', presetCfg)
         : (overrides.preset_config ?? presetCfg ?? undefined)
-    if (selectedPreset === 'docker-compose' && selectedPresetConfig) {
-      selectedPresetConfig = {
-        ...selectedPresetConfig,
-        unsandboxedServices: [],
-      }
+    if (selectedPresetConfig) {
+      selectedPresetConfig = withoutLegacySandboxGrants(
+        selectedPreset,
+        selectedPresetConfig
+      )
     }
     if (isLocalSource) {
       await updateProjectSettings.mutateAsync({
