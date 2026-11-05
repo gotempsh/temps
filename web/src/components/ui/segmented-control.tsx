@@ -16,7 +16,8 @@ export interface SegmentedOption<T extends string> {
  * A compact choice of one value for what is on screen (which chart metric,
  * which device), per DESIGN.md: tabs are for sections with their own content.
  * A radio group, so arrow keys move the choice and only the chosen option is
- * in the tab order. It sizes to its options and never scrolls.
+ * in the tab order. It sizes to its options and never scrolls: when they do not
+ * fit the width it has (seven breakdowns on a phone), they wrap onto more rows.
  */
 export function SegmentedControl<T extends string>({
   value,
@@ -56,7 +57,7 @@ export function SegmentedControl<T extends string>({
       aria-label={label}
       onKeyDown={onKeyDown}
       className={cn(
-        'inline-flex w-fit shrink-0 items-center rounded-md border bg-background p-0.5',
+        'inline-flex w-fit min-w-0 max-w-full flex-wrap items-center gap-0.5 rounded-md border bg-background p-0.5',
         className
       )}
     >

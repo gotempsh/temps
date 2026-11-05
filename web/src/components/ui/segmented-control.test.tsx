@@ -51,8 +51,11 @@ test('clicking and arrow keys change the choice', () => {
   ).toBe('true')
 })
 
-test('it sizes to its options instead of scrolling', () => {
+test('it sizes to its options, and wraps them instead of scrolling or overflowing', () => {
   render(<Harness />)
-  const group = screen.getByRole('radiogroup')
-  expect(group.className).not.toMatch(/overflow|(^|\s)h-\d/)
+  const classes = screen.getByRole('radiogroup').className.split(' ')
+  expect(classes).toContain('flex-wrap')
+  expect(classes).toContain('max-w-full')
+  expect(classes).not.toContain('shrink-0')
+  expect(classes.some((c) => /^(overflow|h-\d)/.test(c))).toBe(false)
 })
