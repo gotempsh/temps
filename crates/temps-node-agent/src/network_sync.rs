@@ -736,6 +736,14 @@ async fn run(
                             // than freezing it behind a mesh problem.
                             warn!(error = %e, "WireGuard mesh sync failed; will retry");
                         }
+                        Err(e) if !OVERLAY_SUPPORTED => {
+                            // A Mac worker runs no overlay: a mesh failure is
+                            // not an overlay state to report, and nothing on
+                            // this path would ever clear one reported here.
+                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                            continue;
+                        }
                         Err(e) => {
                             // The overlay runs on the mesh, so it is down too.
                             let wait = overlay_failed(
@@ -2527,6 +2535,12 @@ impl SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_mac_worker_runs_without_the_overlay() {
+        // A Mac worker never reports overlay state, failed or otherwise.
+        assert_eq!(OVERLAY_SUPPORTED, !cfg!(target_os = "macos"));
+    }
 
     #[test]
     fn underlay_is_probed_at_the_registered_private_address() {
