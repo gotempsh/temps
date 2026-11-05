@@ -49,6 +49,36 @@ describe('buildConfigurationPatch', () => {
     ).toEqual({})
   })
 
+  test('reads a directory the way the server stores it', () => {
+    // The server stores `/apps/web` and `apps\\web` as `apps/web`, and the
+    // root as `.`; retyping either must not offer a save again.
+    const saved = project({ directory: 'apps/web' })
+    for (const directory of ['/apps/web', 'apps\\web', ' apps/web ']) {
+      expect(
+        buildConfigurationPatch(saved, {
+          ...buildConfigurationValues(saved),
+          directory,
+        })
+      ).toEqual({})
+    }
+    const root = project({ directory: '.', pull_only_root_directory: false })
+    for (const directory of ['./', '', '/']) {
+      expect(
+        buildConfigurationPatch(root, {
+          ...buildConfigurationValues(root),
+          directory,
+        })
+      ).toEqual({})
+    }
+    // A leading `./` on a subdirectory is kept, as the server keeps it.
+    expect(
+      buildConfigurationPatch(saved, {
+        ...buildConfigurationValues(saved),
+        directory: './apps/web',
+      })
+    ).toEqual({ directory: './apps/web' })
+  })
+
   test('sends only what changed and keeps the rest of the preset config', () => {
     const saved = project()
     expect(

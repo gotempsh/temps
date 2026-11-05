@@ -12,23 +12,26 @@ import { toast } from 'sonner'
  * Detects a public repository's presets again, past the server's cache, and
  * puts the result in the query that `options` reads. A plain refetch would be
  * answered from that cache, so a Dockerfile added since would stay missing.
+ *
+ * The request travels as the mutation's variables, so the result is cached
+ * for the repository that asked even if `options` changes while it is pending.
  */
 export function useRefreshPublicPresets(
   options: Options<DetectPublicPresetsData>
 ) {
   const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: async () => {
+  const mutation = useMutation({
+    mutationFn: async (request: Options<DetectPublicPresetsData>) => {
       const { data } = await detectPublicPresets({
-        ...options,
-        query: { ...options.query, fresh: true },
+        ...request,
+        query: { ...request.query, fresh: true },
         throwOnError: true,
       })
       return data
     },
-    onSuccess: (data) => {
+    onSuccess: (data, request) => {
       queryClient.setQueryData(
-        detectPublicPresetsOptions(options).queryKey,
+        detectPublicPresetsOptions(request).queryKey,
         data
       )
     },
@@ -38,4 +41,10 @@ export function useRefreshPublicPresets(
       )
     },
   })
+  // Bound when the refresh starts: the request is read now, not on success.
+  return {
+    ...mutation,
+    mutate: () => mutation.mutate(options),
+    mutateAsync: () => mutation.mutateAsync(options),
+  }
 }

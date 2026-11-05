@@ -57,3 +57,35 @@ test('a failed refresh keeps what the page already shows', async () => {
   await waitFor(() => expect(result.current.isError).toBe(true))
   expect(cached()).toEqual(shown)
 })
+
+test('a refresh is cached for the repository that started it', async () => {
+  let answer: (response: Response) => void = () => {}
+  mockApi({
+    [ROUTE]: () => new Promise<Response>((resolve) => (answer = resolve)),
+  })
+  const client = new QueryClient()
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  )
+  const other = {
+    ...OPTIONS,
+    path: { provider: 'github', owner: 'acme', repo: 'other' },
+  } as typeof OPTIONS
+  const { result, rerender } = renderHook(
+    ({ options }) => useRefreshPublicPresets(options),
+    { wrapper, initialProps: { options: OPTIONS } }
+  )
+  act(() => result.current.mutate())
+  await waitFor(() => expect(result.current.isPending).toBe(true))
+  // The page moves to another repository before the answer arrives.
+  rerender({ options: other })
+  const fresh = { branch: 'main', presets: [] }
+  answer(jsonResponse(fresh))
+  await waitFor(() => expect(result.current.isSuccess).toBe(true))
+  expect(
+    client.getQueryData(detectPublicPresetsOptions(OPTIONS).queryKey)
+  ).toEqual(fresh)
+  expect(
+    client.getQueryData(detectPublicPresetsOptions(other).queryKey)
+  ).toBeUndefined()
+})

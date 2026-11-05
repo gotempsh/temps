@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ProjectPresetResponse, ProjectResponse } from '@/api/client'
-import { isRepositoryRootDirectory } from '@/lib/project-directory'
+import {
+  canonicalProjectDirectory,
+  isRepositoryRootDirectory,
+} from '@/lib/project-directory'
 import {
   isSameDockerfile,
   normalizePresetPath,
@@ -71,7 +74,7 @@ export function buildConfigurationValues(
 export function normalizeBuildConfiguration(
   values: BuildConfigurationValues
 ): BuildConfigurationValues {
-  const directory = values.directory.trim() || DEFAULT_DIRECTORY
+  const directory = canonicalProjectDirectory(values.directory)
   return {
     preset: values.preset,
     directory,
@@ -100,7 +103,9 @@ export function buildConfigurationPatch(
   const patch: BuildConfigurationPatch = {}
 
   if (next.preset !== saved.preset) patch.preset = next.preset
-  if (next.directory !== saved.directory) patch.directory = next.directory
+  if (next.directory !== canonicalProjectDirectory(saved.directory)) {
+    patch.directory = next.directory
+  }
   if (next.pullOnlyRootDirectory !== saved.pullOnlyRootDirectory) {
     patch.pull_only_root_directory = next.pullOnlyRootDirectory
   }
