@@ -360,7 +360,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools lld
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
@@ -395,6 +395,12 @@ jobs:
       # module, so memory is the likely limit, though the runner reports no
       # cause. Two parallel crates trade build time for a lower peak; the
       # samples show the headroom if this ever needs tuning or fails again.
+      #
+      # It links with lld. The `.text` section is well over the 128 MB an
+      # AArch64 direct call (`R_AARCH64_CALL26`) can reach, so the linker must
+      # insert range-extension stubs; on 2026-11-05 GNU ld stopped managing it
+      # ("relocation truncated to fit" against `memcpy`), and lld places its
+      # thunks reliably. The `.comment` check fails the step if lld was not used.
       - name: Build release binary
         run: |
           while :; do
@@ -407,8 +413,11 @@ jobs:
           sampler_pid=$!
           trap 'kill "$sampler_pid"' EXIT
           cargo build --release --bin temps
+          readelf -p .comment target/release/temps | grep -q 'LLD' \
+            || { echo "::error::target/release/temps was not linked with lld"; exit 1; }
         env:
           CARGO_BUILD_JOBS: 2
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=lld
           TEMPS_RELEASE_IMAGE_MANIFEST: ${{ github.workspace }}/release-inputs/runtime-images.json
           SKIP_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
