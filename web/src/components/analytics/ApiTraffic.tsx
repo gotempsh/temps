@@ -43,7 +43,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { SegmentedControl } from '@/components/ui/segmented-control'
 import {
   Table,
   TableBody,
@@ -923,22 +923,12 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
                   : 'Requests and errors per interval. Drag across the chart to select a timeframe.'}
               </CardDescription>
             </div>
-            <Tabs
+            <SegmentedControl
+              label="Chart metric"
               value={mainChartMetric}
-              onValueChange={(v) => setMainChartMetric(v as MainChartMetric)}
-            >
-              <TabsList className="h-8">
-                {MAIN_CHART_METRICS.map((m) => (
-                  <TabsTrigger
-                    key={m.value}
-                    value={m.value}
-                    className="h-6 px-2.5 text-xs"
-                  >
-                    {m.label}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
+              onValueChange={setMainChartMetric}
+              options={MAIN_CHART_METRICS}
+            />
           </div>
         </CardHeader>
         <CardContent>
