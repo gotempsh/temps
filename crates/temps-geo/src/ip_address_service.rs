@@ -429,13 +429,14 @@ impl IpAddressService {
             && stored.hosting_classifier_version != Some(HOSTING_CLASSIFIER_VERSION);
         // A row stored while no city database was loaded holds nothing, and with
         // no ASN database either, nothing above would look at it again until the
-        // staleness window expired. One that truly has no location only costs a
-        // local lookup on each cache miss, and stops once an ASN database is there
-        // to stamp it.
+        // staleness window expired. `updated_at` is the verification clock, so a row
+        // still at its creation time has never been checked against a database. This
+        // survives a restart, and a row that truly has no location is checked once.
         let needs_location = self.geoip_service.build_epoch().is_some()
             && stored.hosting_classifier_version.is_none()
             && stored.country.is_empty()
-            && stored.city.is_none();
+            && stored.city.is_none()
+            && stored.updated_at == stored.created_at;
         if age_days < self.stale_lookup_days().await && !needs_reclassification && !needs_location {
             return stored.into();
         }
@@ -460,6 +461,11 @@ impl IpAddressService {
             // re-resolved on every cache miss for as long as it exists.
             Err(e) if needs_reclassification && e.is_expected_miss() => {
                 return self.stamp_not_hosting(stored, &e).await;
+            }
+            // The city database has no record of it either: remember that it was
+            // checked, or this lookup would repeat on every cache miss.
+            Err(e) if needs_location && e.is_expected_miss() => {
+                return self.record_verified(stored, now).await;
             }
             Err(e) => {
                 debug!(
@@ -510,6 +516,39 @@ impl IpAddressService {
                     "failed to persist a re-resolved IP geolocation; serving the stored row"
                 );
                 stored_info
+            }
+        }
+    }
+
+    /// Advance a row's verification time without changing what it holds.
+    async fn record_verified(
+        &self,
+        stored: ip_geolocations::Model,
+        now: UtcDateTime,
+    ) -> IpAddressInfo {
+        let result = ip_geolocations::Entity::update_many()
+            .col_expr(
+                ip_geolocations::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(ip_geolocations::Column::Id.eq(stored.id))
+            .exec(self.db.as_ref())
+            .await;
+        match result {
+            Ok(_) => {
+                let mut info: IpAddressInfo = stored.into();
+                info.updated_at = now;
+                info
+            }
+            Err(e) => {
+                warn!(
+                    ip_address = stored.ip_address,
+                    ip_geolocation_id = stored.id,
+                    error = %e,
+                    "failed to record that an address has no known location; it is checked \
+                     again on the next cache miss"
+                );
+                stored.into()
             }
         }
     }
@@ -1204,6 +1243,55 @@ mod tests {
             panic!("the service was dropped, so this is the last handle");
         };
         assert_eq!(db.into_transaction_log().len(), 1, "one write");
+    }
+
+    /// An address the city database has no record of must be checked once, not on
+    /// every cache expiry for as long as it stays active.
+    #[tokio::test]
+    async fn an_address_with_no_known_location_is_checked_once() {
+        let Some((geo, _dir)) = service_without_asn() else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+        let now = Utc::now();
+        let created = now - chrono::Duration::hours(7);
+        // A private address, which no database can locate.
+        let stored = ip_geolocations::Model {
+            ip_address: "10.1.2.3".to_string(),
+            created_at: created,
+            updated_at: created,
+            ..unlocated_row(now)
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(db.clone(), geo);
+
+        let first = service.refresh_if_stale(stored.clone(), now).await;
+        assert_eq!(first.updated_at, now, "the check is recorded");
+
+        // What the next cache miss reads back: no further write.
+        let checked = ip_geolocations::Model {
+            updated_at: now,
+            ..stored
+        };
+        let second = service.refresh_if_stale(checked, now).await;
+        assert_eq!(second.updated_at, now);
+
+        drop(service);
+        let Ok(db) = Arc::try_unwrap(db) else {
+            panic!("the service was dropped, so this is the last handle");
+        };
+        let log = db.into_transaction_log();
+        assert_eq!(log.len(), 1, "exactly one write: {log:?}");
+        let sql = format!("{log:?}");
+        assert!(sql.contains("updated_at"), "{sql}");
+        assert!(!sql.contains("is_hosting_provider"), "{sql}");
     }
 
     /// Replacing a loaded database is routine and its cached answers stay good;
