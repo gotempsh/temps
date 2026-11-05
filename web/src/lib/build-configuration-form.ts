@@ -170,6 +170,54 @@ function detectedComposePath(
   return file ? file.slice(prefix.length) : DEFAULT_COMPOSE_PATH
 }
 
+/** A repository path with no `./`, leading or trailing slash; the root is ''. */
+function repoPath(path: string): string {
+  return path
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^(\.\/|\/)+/, '')
+    .replace(/\/+$/, '')
+    .replace(/^\.$/, '')
+}
+
+/**
+ * Where `directory` sits inside the build context: '' when they are the same
+ * (or no context is set, so the context is the directory), the path between
+ * them when the context contains it, and `undefined` when it does not.
+ */
+function directoryWithinContext(
+  directory: string,
+  buildContext: string
+): string | undefined {
+  if (!buildContext.trim()) return ''
+  const context = repoPath(buildContext)
+  const dir = repoPath(directory)
+  if (context === dir) return ''
+  if (context === '') return dir
+  if (dir.startsWith(`${context}/`)) return dir.slice(context.length + 1)
+  return undefined
+}
+
+/**
+ * The Dockerfile path as detection names it, relative to the root directory.
+ * The stored path is relative to the build context, so with a context above
+ * the root directory it carries the path between them, which this removes.
+ * Used to tell which detected card is the current file.
+ */
+export function dockerfileWithinDirectory(
+  values: Pick<
+    BuildConfigurationValues,
+    'directory' | 'buildContext' | 'dockerfilePath'
+  >
+): string {
+  const prefix = directoryWithinContext(values.directory, values.buildContext)
+  const path = repoPath(values.dockerfilePath)
+  if (prefix && path.startsWith(`${prefix}/`)) {
+    return path.slice(prefix.length + 1)
+  }
+  return values.dockerfilePath
+}
+
 /**
  * The values after choosing a card in `FrameworkSelector`.
  *
@@ -195,23 +243,32 @@ export function applyFrameworkSelection(
     preset === current.preset &&
     normalizePresetPath(directory) === normalizePresetPath(current.directory)
   const dockerfile = isDockerfilePreset(preset)
-  const dockerfilePath = dockerfile
-    ? card?.dockerfilePath || DEFAULT_DOCKERFILE_PATH
-    : current.dockerfilePath
+  const detectedFile = card?.dockerfilePath || DEFAULT_DOCKERFILE_PATH
   if (
     samePlace &&
-    (!dockerfile || isSameDockerfile(dockerfilePath, current.dockerfilePath))
+    (!dockerfile ||
+      isSameDockerfile(detectedFile, dockerfileWithinDirectory(current)))
   ) {
     return current
   }
+  // Detection names the file from its own directory, but the build reads the
+  // Dockerfile path from the build context. A context that contains the
+  // directory is kept, with the path rewritten to start from it; any other
+  // context would point the build at the wrong file, so it is cleared.
+  const within = dockerfile
+    ? directoryWithinContext(directory, current.buildContext)
+    : undefined
+  const dockerfilePath = !dockerfile
+    ? current.dockerfilePath
+    : within
+      ? `${within}/${repoPath(detectedFile)}`
+      : detectedFile
   return {
     ...current,
     preset,
     directory,
     dockerfilePath,
-    // A detected file is relative to the card's directory, even beside the
-    // current file, so it only resolves when no other context is set.
-    buildContext: '',
+    buildContext: within !== undefined ? current.buildContext : '',
     composePath: isComposePreset(preset)
       ? detectedComposePath(card, directory)
       : current.composePath,

@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import type { ProjectPresetResponse, ProjectResponse } from '@/api/client'
 import {
   applyFrameworkSelection,
+  dockerfileWithinDirectory,
   buildConfigurationPatch,
   buildConfigurationValues,
   withoutLegacySandboxGrants,
@@ -292,6 +293,77 @@ describe('applyFrameworkSelection', () => {
       dockerfilePath: 'docker/Dockerfile',
       buildContext: '',
     })
+  })
+
+  test('another Dockerfile in the same folder keeps a context above it', () => {
+    // The Dockerfile needs files from the repository root, so the context is
+    // the root; the new file is rewritten to be found from there.
+    const values = {
+      ...buildConfigurationValues(project()),
+      directory: './apps/web',
+      buildContext: '.',
+      dockerfilePath: 'apps/web/Dockerfile',
+    }
+    expect(
+      applyFrameworkSelection(
+        values,
+        'dockerfile::apps/web',
+        card({ preset: 'dockerfile', dockerfilePath: 'Dockerfile.worker' })
+      )
+    ).toEqual({
+      ...values,
+      dockerfilePath: 'apps/web/Dockerfile.worker',
+      buildContext: '.',
+    })
+  })
+
+  test('a Dockerfile in a folder inside the context keeps it, from any depth', () => {
+    const values = buildConfigurationValues(project()) // context ./apps
+    expect(
+      applyFrameworkSelection(
+        values,
+        'dockerfile::apps/worker',
+        card({ preset: 'dockerfile', dockerfilePath: 'docker/Dockerfile' })
+      )
+    ).toEqual({
+      ...values,
+      directory: './apps/worker',
+      dockerfilePath: 'worker/docker/Dockerfile',
+      buildContext: './apps',
+    })
+  })
+
+  test('a context equal to the folder is kept, and the file is used as named', () => {
+    const values = {
+      ...buildConfigurationValues(project()),
+      directory: './apps/api',
+      buildContext: 'apps/api/',
+      dockerfilePath: 'Dockerfile',
+    }
+    const next = applyFrameworkSelection(
+      values,
+      'dockerfile::apps/api',
+      card({ preset: 'dockerfile', dockerfilePath: 'Dockerfile.worker' })
+    )
+    expect(next.dockerfilePath).toBe('Dockerfile.worker')
+    expect(next.buildContext).toBe('apps/api/')
+  })
+
+  test('choosing the current file again under a root context changes nothing', () => {
+    const values = {
+      ...buildConfigurationValues(project()),
+      directory: './apps/web',
+      buildContext: '.',
+      dockerfilePath: 'apps/web/Dockerfile',
+    }
+    expect(dockerfileWithinDirectory(values)).toBe('Dockerfile')
+    expect(
+      applyFrameworkSelection(
+        values,
+        'dockerfile::apps/web',
+        card({ preset: 'dockerfile', dockerfilePath: 'Dockerfile' })
+      )
+    ).toBe(values)
   })
 
   test('a detected Dockerfile with no named file falls back to the default', () => {

@@ -38,6 +38,7 @@ import {
   buildConfigurationValues,
   DEFAULT_COMPOSE_PATH,
   DEFAULT_DOCKERFILE_PATH,
+  dockerfileWithinDirectory,
   isComposePreset,
   isDockerfilePreset,
   normalizeBuildConfiguration,
@@ -365,7 +366,7 @@ function BuildConfigurationForm({
             selectedPreset={presetSelectionKey(values.preset, values.directory)}
             selectedDockerfilePath={
               isDockerfilePreset(values.preset)
-                ? values.dockerfilePath
+                ? dockerfileWithinDirectory(values)
                 : undefined
             }
             onSelectPreset={handleFrameworkSelection}
