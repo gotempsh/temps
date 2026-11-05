@@ -32,4 +32,6 @@ export function useInsightsOpen(): [boolean, (open: boolean) => void] {
 export interface InsightsToggleButtonProps {
   open: boolean
   onToggle: (open: boolean) => void
+  /** Show the label beside the icon rather than only to screen readers. */
+  showLabel?: boolean
 }
