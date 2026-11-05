@@ -138,6 +138,15 @@ export function IngressSetupPage() {
   const workers = (nodesQuery.data?.nodes ?? []).filter(
     (n) => n.role === 'worker'
   )
+  // Once the page has shown workers it keeps the wizard mounted, even if a
+  // later poll finds none: unmounting it would lose a run in progress, its
+  // result and the undo it offers.
+  const [hadWorkers, setHadWorkers] = useState(false)
+  if (workers.length > 0 && !hadWorkers) setHadWorkers(true)
+  const showWizard =
+    !nodesQuery.isLoading &&
+    !(nodesQuery.isError && !nodesQuery.data) &&
+    (workers.length > 0 || hadWorkers)
   const anyPublic = workers.some((w) => addressScope(w.address) === 'public')
 
   const choose = (next: IngressWay) => {
@@ -203,9 +212,15 @@ export function IngressSetupPage() {
             </Button>
           </AlertDescription>
         </Alert>
-      ) : workers.length === 0 ? (
+      ) : workers.length === 0 && !hadWorkers ? (
         <NoWorkers />
       ) : null}
+      {showWizard && workers.length === 0 && (
+        <p className="text-xs text-amber-700 dark:text-amber-300">
+          This cluster has no worker nodes any more, so nothing new can be set
+          up here. What this page reported is kept below.
+        </p>
+      )}
       {/* A failed poll keeps the last list: replacing the wizard here would
           abort a run in progress and lose what it reported. */}
       {nodesQuery.isError && nodesQuery.data && workers.length > 0 && (
@@ -215,9 +230,7 @@ export function IngressSetupPage() {
           workers again first.
         </p>
       )}
-      {nodesQuery.isLoading ||
-      (nodesQuery.isError && !nodesQuery.data) ||
-      workers.length === 0 ? null : via === 'ports' ? (
+      {!showWizard ? null : via === 'ports' ? (
         <OpenPortsPanel workers={workers} />
       ) : (
         <TunnelSetup workers={workers} preferredWorker={preferredWorker} />

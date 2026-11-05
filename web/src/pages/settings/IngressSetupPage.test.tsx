@@ -334,3 +334,26 @@ test('a failed refresh of the worker list keeps the wizard and says the list may
   expect(screen.getByRole('button', { name: 'Create tunnel' })).toBeTruthy()
   expect(screen.queryByText('Could not load the worker nodes')).toBeNull()
 })
+
+test('a run\u2019s result stays when a later poll finds no workers', async () => {
+  let gone = false
+  const { client } = setup({
+    nodes: () => (gone ? [] : [worker(1, 'worker-a')]),
+  })
+  await screen.findByText('example.com')
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+
+  gone = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText(/This cluster has no worker nodes any more/)
+  // The result, not the empty-cluster onboarding that would replace it.
+  expect(
+    screen.getByText('Visitors can reach apps under example.com')
+  ).toBeTruthy()
+  expect(screen.queryByText('No worker node yet')).toBeNull()
+})

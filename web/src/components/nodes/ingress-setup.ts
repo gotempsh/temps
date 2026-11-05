@@ -168,7 +168,7 @@ export const START_AGENT_COMMAND = 'sudo systemctl start temps-agent'
 /** Why a worker that is not active cannot run a tunnel, and how to fix it. */
 export function offlineWorkerReason(status: string): string {
   return status === 'offline'
-    ? 'It is offline, so it cannot run a tunnel. Start its agent on that machine, then it shows as active here within a minute.'
+    ? 'It is offline, so it cannot run a tunnel. Start its agent on that machine: with the systemd service run the command below, otherwise start `temps agent` under its supervisor again. It shows as active here within a minute.'
     : `It is ${status}, so it cannot run a tunnel. Bring it back from its page under Worker nodes.`
 }
 
@@ -394,7 +394,7 @@ export function unavailableWorker(
     if (node.status !== 'active') {
       const fix =
         node.status === 'offline'
-          ? `Start its agent on that machine (${START_AGENT_COMMAND})`
+          ? `Start its agent on that machine (${START_AGENT_COMMAND} with the systemd service, otherwise \`temps agent\` under its supervisor)`
           : 'Bring it back from its page under Worker nodes'
       return `Worker '${node.name}' is ${node.status}, so it cannot run a tunnel. ${fix} or untick it under Workers, then try again.`
     }

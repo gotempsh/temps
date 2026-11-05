@@ -206,7 +206,7 @@ describe('runTunnelSetup', () => {
     expect(outcome.kind).toBe('failed')
     if (outcome.kind !== 'failed') return
     expect(outcome.error).toBe(
-      "Worker 'worker-a' is offline, so it cannot run a tunnel. Start its agent on that machine (sudo systemctl start temps-agent) or untick it under Workers, then try again."
+      "Worker 'worker-a' is offline, so it cannot run a tunnel. Start its agent on that machine (sudo systemctl start temps-agent with the systemd service, otherwise `temps agent` under its supervisor) or untick it under Workers, then try again."
     )
     // No domain, no tunnel: nothing to roll back.
     expect(calls).toEqual(['nodes'])
