@@ -1077,7 +1077,10 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           Every node must accept UDP <code>{mesh.listen_port}</code> from the
           other nodes.
         </li>
-        <li>Nodes run Linux with kernel WireGuard (5.6 or newer).</li>
+        <li>
+          Nodes run Linux with kernel WireGuard (5.6 or newer), or macOS with a
+          Docker app whose VM holds the node&apos;s end of the mesh.
+        </li>
         <li>
           Workers already on your private network keep using it. Once on, the
           mesh stays on.

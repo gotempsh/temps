@@ -46,12 +46,12 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
 import { type JoinIngressChoice, joinIngressFlag } from '@/lib/worker-ingress'
-import { workerJoinScript } from '@/lib/worker-join-script'
+import { type WorkerOs, workerJoinScript } from '@/lib/worker-join-script'
 import { usePlaneRelease } from '@/hooks/usePlaneRelease'
 import {
   ForceJoinOption,
   WorkerJoinScript,
-  WorkerRequirements,
+  WorkerOsChoice,
 } from '@/components/nodes/WorkerJoinScript'
 import {
   controlPlaneMeshPort,
@@ -94,8 +94,9 @@ export function AddWorkerNode({ otherWays }: { otherWays: ReactNode }) {
       <div>
         <p className="text-sm font-medium">Add a worker node</p>
         <p className="text-sm text-muted-foreground">
-          Any Linux machine, on any provider or at home. It connects to this
-          server over an encrypted private network and needs no public IP.
+          Any Linux machine, on any provider or at home, or a Mac for
+          development. It connects to this server over an encrypted private
+          network and needs no public IP.
         </p>
       </div>
 
@@ -478,12 +479,13 @@ function JoinCommandStep({ url }: { url: string }) {
   const [created, setCreated] = useState(0)
   const [ingress, setIngress] = useState<JoinIngressChoice>('delegated')
   const [force, setForce] = useState(false)
+  const [os, setOs] = useState<WorkerOs>('linux')
   // The install step pins the release this server runs; a worker on another
   // version may not speak its protocol.
   const release = usePlaneRelease()
   const choices = (
     <>
-      <WorkerRequirements />
+      <WorkerOsChoice value={os} onChange={setOs} />
       <IngressQuestion value={ingress} onChange={setIngress} />
       <ForceJoinOption checked={force} onChange={setForce} />
     </>
@@ -529,6 +531,7 @@ function JoinCommandStep({ url }: { url: string }) {
     version: release.tag,
     joinFlags: joinIngressFlag(ingress),
     force,
+    os,
   })
 
   return (
@@ -538,6 +541,7 @@ function JoinCommandStep({ url }: { url: string }) {
         command={script.command}
         pinnedTo={script.pinnedTo}
         pending={release.pending}
+        os={os}
       />
       <p className="text-xs text-muted-foreground">
         Shown once. It adds one machine and expires{' '}

@@ -142,6 +142,11 @@ pub enum NetworkError {
         device: String,
     },
 
+    /// A macOS worker's operation in the Docker app's VM, run through the
+    /// mesh sidecar (ADR 090), failed or could not run.
+    #[error("'{operation}' in the Docker app's VM (mesh sidecar) failed: {reason}")]
+    VmExec { operation: String, reason: String },
+
     // ----- config / validation -----
     /// The provided config was internally inconsistent (e.g. peer CIDR
     /// overlaps the node's own CIDR).

@@ -117,7 +117,7 @@ test('the first command is pinned to the release this server runs and uses sudo'
     'sudo -H /root/.temps/bin/temps agent service install'
   )
   expect(screen.getByText(/the version this server runs/)).toBeTruthy()
-  expect(screen.getByText('The new machine must run Linux')).toBeTruthy()
+  expect(screen.getByText('What does the new machine run?')).toBeTruthy()
 })
 
 test('"Create another" is for another machine, so it drops a --force chosen for the last one', async () => {

@@ -176,7 +176,7 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// import (clears the low 3 bits and the top bit, sets bit 254), so a key
 /// generated without clamping reads back as different base64 while being the
 /// same key.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn clamped_private_key(encoded: &str) -> Option<String> {
     let mut bytes: [u8; 32] = BASE64.decode(encoded).ok()?.try_into().ok()?;
     bytes[0] &= 248;
@@ -283,7 +283,7 @@ impl PeerChanges {
 pub const LIVE_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// A peer as the interface currently holds it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct CurrentPeer {
     endpoint: Option<SocketAddr>,
@@ -293,7 +293,7 @@ struct CurrentPeer {
 }
 
 /// The desired peer set diffed against what the interface holds.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn plan_peer_changes<'a>(
     current: &HashMap<String, CurrentPeer>,
     desired: &'a [MeshPeer],
@@ -558,7 +558,195 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the interface lives in the Docker app's VM and is driven through
+/// the mesh sidecar (see [`crate::vm`], ADR 090).
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::*;
+    use crate::vm;
+
+    fn dump() -> Result<Option<vm::Dump>, WireGuardError> {
+        let exists = vm::run(
+            &format!("look for {MESH_INTERFACE}"),
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "ip link show dev {MESH_INTERFACE} >/dev/null 2>&1 && echo yes || echo no"
+                ),
+            ],
+            None,
+        )?;
+        if exists.trim() != "yes" {
+            return Ok(None);
+        }
+        let text = vm::run(
+            &format!("read {MESH_INTERFACE}"),
+            &["wg", "show", MESH_INTERFACE, "dump"],
+            None,
+        )?;
+        vm::parse_dump(&text).map(Some)
+    }
+
+    fn addresses() -> Result<Vec<String>, WireGuardError> {
+        let text = vm::run(
+            &format!("read addresses of {MESH_INTERFACE}"),
+            &["ip", "-4", "-o", "addr", "show", "dev", MESH_INTERFACE],
+            None,
+        )?;
+        Ok(vm::parse_addresses(&text))
+    }
+
+    fn mtu() -> Result<u32, WireGuardError> {
+        let path = format!("/sys/class/net/{MESH_INTERFACE}/mtu");
+        let text = vm::run(&format!("read {path}"), &["cat", &path], None)?;
+        text.trim().parse().map_err(|error| {
+            WireGuardError::InterfaceError(format!("unreadable MTU in {path}: {error}"))
+        })
+    }
+
+    fn up() -> Result<bool, WireGuardError> {
+        let text = vm::run(
+            &format!("read {MESH_INTERFACE} state"),
+            &["ip", "-o", "link", "show", "dev", MESH_INTERFACE],
+            None,
+        )?;
+        Ok(vm::parse_link_up(&text))
+    }
+
+    pub fn ensure_interface(
+        interface: &MeshInterface,
+        key: &MeshKey,
+    ) -> Result<bool, WireGuardError> {
+        let address = format!("{}/{}", interface.address, interface.prefix_len);
+        if let Some(held) = dump()? {
+            // As on Linux: a restart (or a VM that kept running while the
+            // agent restarted) must not drop tunnels that are already right.
+            let settled = held.private_key == clamped_private_key(&key.private_key)
+                && held.listen_port == interface.listen_port
+                && addresses()? == vec![address.clone()];
+            if settled {
+                let mtu_changed = mtu()? != interface.mtu;
+                vm::run(
+                    &format!("bring {MESH_INTERFACE} up"),
+                    &[
+                        "ip",
+                        "link",
+                        "set",
+                        "dev",
+                        MESH_INTERFACE,
+                        "mtu",
+                        &interface.mtu.to_string(),
+                        "up",
+                    ],
+                    None,
+                )?;
+                return Ok(mtu_changed);
+            }
+        }
+        let script = vm::configure_script(
+            interface.address,
+            interface.prefix_len,
+            interface.listen_port,
+            interface.mtu,
+        );
+        vm::run(
+            &format!("configure WireGuard interface {MESH_INTERFACE}"),
+            &["sh", "-c", &script],
+            Some(format!("{}\n", key.private_key).as_bytes()),
+        )
+        .map_err(|error| {
+            WireGuardError::InterfaceError(format!(
+                "{error}. The Docker app's VM kernel needs WireGuard support (Linux 5.6+ or the \
+                 wireguard module); `temps join` checks it"
+            ))
+        })?;
+        Ok(true)
+    }
+
+    pub fn reconcile_peers(desired: &[MeshPeer]) -> Result<PeerChanges, WireGuardError> {
+        let held = dump()?.ok_or_else(|| {
+            WireGuardError::InterfaceError(format!(
+                "{MESH_INTERFACE} does not exist in the Docker app's VM (the VM restarted?)"
+            ))
+        })?;
+        let now = SystemTime::now();
+        let current: HashMap<String, CurrentPeer> = held
+            .peers
+            .iter()
+            .map(|peer| {
+                let live = peer
+                    .latest_handshake
+                    .and_then(|at| now.duration_since(at).ok())
+                    .is_some_and(|age| age < LIVE_HANDSHAKE);
+                (
+                    peer.public_key.clone(),
+                    CurrentPeer {
+                        endpoint: peer.endpoint,
+                        allowed_ips: peer.allowed_ips.clone(),
+                        live,
+                    },
+                )
+            })
+            .collect();
+        let (to_set, to_remove, changes) = plan_peer_changes(&current, desired);
+        for public_key in to_remove {
+            if !is_valid_public_key(&public_key) {
+                continue;
+            }
+            vm::run(
+                &format!("remove WireGuard peer {public_key}"),
+                &["wg", "set", MESH_INTERFACE, "peer", &public_key, "remove"],
+                None,
+            )?;
+        }
+        for peer in to_set {
+            if !is_valid_public_key(&peer.public_key) {
+                return Err(WireGuardError::InvalidConfig(format!(
+                    "invalid WireGuard key for peer {}",
+                    peer.address
+                )));
+            }
+            let args = vm::set_peer_args(
+                &peer.public_key,
+                peer.endpoint,
+                &peer.allowed_ips(),
+                PERSISTENT_KEEPALIVE_SECS,
+            );
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            vm::run(
+                &format!("configure WireGuard peer {}", peer.public_key),
+                &argv,
+                None,
+            )?;
+        }
+        Ok(changes)
+    }
+
+    pub fn interface_state() -> Result<Option<MeshInterfaceState>, WireGuardError> {
+        let Some(held) = dump()? else {
+            return Ok(None);
+        };
+        Ok(Some(MeshInterfaceState {
+            public_key: held
+                .private_key
+                .as_deref()
+                .and_then(|key| MeshKey::from_private_key(key).ok())
+                .map(|key| key.public_key),
+            listen_port: held.listen_port,
+            addresses: addresses()?,
+            mtu: mtu()?,
+            up: up()?,
+            peers: held.peer_status(),
+        }))
+    }
+
+    pub fn peer_status() -> Result<Vec<MeshPeerStatus>, WireGuardError> {
+        Ok(dump()?.map(|held| held.peer_status()).unwrap_or_default())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod imp {
     use super::*;
 

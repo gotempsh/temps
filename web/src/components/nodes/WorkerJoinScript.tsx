@@ -2,43 +2,78 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Link } from 'react-router'
-import { AlertTriangle, Info } from 'lucide-react'
+import { AlertTriangle } from 'lucide-react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Checkbox } from '@/components/ui/checkbox'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
+import type { WorkerOs } from '@/lib/worker-join-script'
+
+const OS_CHOICES: { value: WorkerOs; label: string; description: string }[] = [
+  {
+    value: 'linux',
+    label: 'Linux',
+    description:
+      'A server, VM or home machine. It dials this server over a WireGuard tunnel it sets up with the Linux kernel, and the agent runs as a systemd service. Installing and joining need sudo.',
+  },
+  {
+    value: 'macos',
+    label: 'Mac',
+    description:
+      'A Mac with Docker Desktop, OrbStack, colima or Rancher Desktop running. Its containers and its end of the tunnel run in that app\u2019s VM, and nothing on the Mac is opened to the network. Runs as you, without sudo, and starts at login. Suited to development and personal use: it goes offline while the Mac sleeps and reconnects when it wakes.',
+  },
+]
 
 /**
- * What the new machine must be, said before anyone creates a command: the
- * outbound join has the worker dial this server over a WireGuard tunnel it
- * brings up itself, which needs the Linux kernel's WireGuard. The other
- * operating systems only join with `--private-address`, which needs this
- * server to reach them.
+ * Which machine is being added, asked before anyone creates a command: a
+ * Linux worker installs and runs as root, a Mac (ADR 090) as the user whose
+ * Docker app holds its containers. Both dial this server, so neither needs
+ * an address this server can reach.
  */
-export function WorkerRequirements() {
+export function WorkerOsChoice({
+  value,
+  onChange,
+}: {
+  value: WorkerOs
+  onChange: (value: WorkerOs) => void
+}) {
   return (
-    <Alert>
-      <Info className="h-4 w-4" />
-      <AlertTitle>The new machine must run Linux</AlertTitle>
-      <AlertDescription className="space-y-1 text-xs">
-        <p>
-          It dials this server over a WireGuard tunnel it sets up itself, which
-          needs the Linux kernel&apos;s WireGuard, and the agent runs as a
-          systemd service. A Mac or Windows machine cannot join this way.
-        </p>
-        <p>
-          <code>temps join --private-address &lt;ip&gt;</code> is for a machine
-          this server can reach at that address, such as one on the same private
-          network or with a public IP (see{' '}
-          <strong>Other ways to add a node</strong> below). A server on the
-          internet cannot reach a machine behind a home router, so use a Linux
-          machine for this one. A non-Linux machine joined that way also runs
-          without the network policy boot guard (it needs <code>nft</code>) and
-          without the systemd service. The commands on this page are for Linux.
-        </p>
-      </AlertDescription>
-    </Alert>
+    <fieldset className="space-y-2">
+      <legend className="text-sm font-medium">
+        What does the new machine run?
+      </legend>
+      <RadioGroup
+        value={value}
+        onValueChange={(next) => onChange(next as WorkerOs)}
+        className="gap-2"
+      >
+        {OS_CHOICES.map((choice) => (
+          <div key={choice.value} className="flex items-start gap-2">
+            <RadioGroupItem
+              id={`join-os-${choice.value}`}
+              value={choice.value}
+              className="mt-0.5"
+            />
+            <Label
+              htmlFor={`join-os-${choice.value}`}
+              className="grid gap-0.5 font-normal"
+            >
+              <span className="text-sm">{choice.label}</span>
+              <span className="text-xs text-muted-foreground">
+                {choice.description}
+              </span>
+            </Label>
+          </div>
+        ))}
+      </RadioGroup>
+      <p className="text-xs text-muted-foreground">
+        Windows cannot join this way. <code>temps join --private-address
+        &lt;ip&gt;</code> is for a machine this server can reach at that
+        address (see <strong>Other ways to add a node</strong> below).
+      </p>
+    </fieldset>
   )
 }
 
@@ -96,11 +131,13 @@ export function WorkerJoinScript({
   command,
   pinnedTo,
   pending = false,
+  os = 'linux',
 }: {
   command: string
   pinnedTo: string | null
   /** Still reading the server's release, so the pin is not known yet. */
   pending?: boolean
+  os?: WorkerOs
 }) {
   if (pending) {
     return (
@@ -114,12 +151,21 @@ export function WorkerJoinScript({
   }
   return (
     <div className="space-y-2">
-      <p className="text-sm text-muted-foreground">
-        Paste this on the new machine as a user who can use <code>sudo</code>:
-        installing, joining and starting the agent need root. Each step runs
-        only if the one before it worked. In a root shell without sudo, leave
-        out <code>sudo -H</code>.
-      </p>
+      {os === 'macos' ? (
+        <p className="text-sm text-muted-foreground">
+          Paste this in Terminal on the Mac, as yourself (no <code>sudo</code>
+          ), with your Docker app running. Each step runs only if the one
+          before it worked. Keep the Docker app starting at login so the worker
+          comes back after a restart.
+        </p>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          Paste this on the new machine as a user who can use{' '}
+          <code>sudo</code>: installing, joining and starting the agent need
+          root. Each step runs only if the one before it worked. In a root
+          shell without sudo, leave out <code>sudo -H</code>.
+        </p>
+      )}
       <div className="flex items-start gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
         <pre
           tabIndex={0}

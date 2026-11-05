@@ -142,6 +142,11 @@ pub struct JoinCommand {
     /// mesh enrollment showed neither (ADR 060).
     #[arg(skip)]
     withhold_prior_token: bool,
+
+    /// On a Mac: the Docker app whose VM holds this worker's containers and
+    /// its end of the mesh (ADR 090), found before anything else runs.
+    #[arg(skip)]
+    mac: Option<super::mac_worker::MacJoinContext>,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -707,9 +712,9 @@ fn apply_saved_public_ingress_settings(
 /// How to start the worker once it has joined.
 fn print_start_agent_hint() {
     println!();
-    println!("Start the worker:");
-    println!("  temps agent service install   as a systemd service, restarted on failure and at boot (root)");
-    println!("  temps agent                   in the foreground, or under your own supervisor");
+    for line in super::agent_service::start_agent_hint(cfg!(target_os = "macos")) {
+        println!("{line}");
+    }
 }
 
 /// Extract the port `temps agent` will listen on from `--agent-address`.
@@ -898,7 +903,14 @@ async fn detect_local_platform() -> Option<String> {
 }
 
 impl JoinCommand {
-    pub fn execute(self) -> anyhow::Result<()> {
+    pub fn execute(mut self) -> anyhow::Result<()> {
+        if cfg!(target_os = "macos") {
+            let context = super::mac_worker::detect()?;
+            // Everything in this process (the platform check, preflight)
+            // talks to that app's daemon, while still single-threaded.
+            std::env::set_var("DOCKER_HOST", &context.endpoint.host);
+            self.mac = Some(context);
+        }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -1571,14 +1583,26 @@ impl JoinCommand {
     ) -> anyhow::Result<()> {
         use temps_deployments::handlers::nodes::MeshEnrollResponse;
 
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             anyhow::bail!(
                 "With no --private-address, this machine joins over a WireGuard tunnel it \
-                 dials itself, which needs kernel WireGuard: run `temps join` on Linux. On \
-                 another OS, pass --private-address <ip> with an address the control plane can \
-                 reach."
+                 dials itself, which needs Linux kernel WireGuard (or, on a Mac, a Docker \
+                 app's VM): run `temps join` on Linux or macOS. On another OS, pass \
+                 --private-address <ip> with an address the control plane can reach."
             );
         }
+        // A Mac checks its Docker app's VM before the token is spent.
+        let mac = self.mac.clone();
+        let mac_agent_port = match &mac {
+            Some(context) => {
+                let port = super::mac_worker::agent_port(&self.agent_address)?;
+                let checked = context.clone();
+                tokio::task::spawn_blocking(move || super::mac_worker::preflight(&checked))
+                    .await??;
+                Some(port)
+            }
+            None => None,
+        };
         println!(
             "Joining outbound only: this machine dials the control plane and needs no inbound \
              port. (Pass --private-address <ip> to register at an address instead.)"
@@ -1725,6 +1749,25 @@ impl JoinCommand {
             );
         }
 
+        // On a Mac the mesh lives in the Docker app's VM, held by the mesh
+        // sidecar, which also carries the agent's calls to the control plane.
+        let mac_worker = match (&mac, mac_agent_port) {
+            (Some(context), Some(agent_port)) => {
+                temps_wireguard::vm::set_docker_endpoint(context.endpoint.clone())?;
+                Some(
+                    super::mac_worker::start_sidecar(
+                        context,
+                        node_address,
+                        control_plane_address,
+                        answer.node_api_port,
+                        agent_port,
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
+
         // 2. The mesh, with the control plane as the only peer. No endpoint
         // of our own: the control plane learns it from our handshakes.
         let private_address = node_address.to_string();
@@ -1787,13 +1830,22 @@ impl JoinCommand {
             ),
         })?;
 
-        // 3. Register over the mesh, under our own mesh address.
+        // 3. Register over the mesh, under our own mesh address. A Mac
+        // reaches the node API through the sidecar's egress forwarder; TLS
+        // still pins the cluster CA and the control plane's reserved name.
+        let node_api = match &mac_worker {
+            Some(worker) => {
+                super::mac_worker::wait_for_egress(worker).await?;
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, worker.egress_port))
+            }
+            None => std::net::SocketAddr::new(
+                std::net::IpAddr::V4(control_plane_address),
+                answer.node_api_port,
+            ),
+        };
         self.register_over_mesh(
             MeshRegistration {
-                node_api: std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(control_plane_address),
-                    answer.node_api_port,
-                ),
+                node_api,
                 ca_fingerprint: &answer.ca_fingerprint,
                 join_token: &answer.join_token,
                 node_name: &answer.name,
@@ -1803,7 +1855,16 @@ impl JoinCommand {
             labels,
             platform,
         )
-        .await
+        .await?;
+        if let Some(worker) = mac_worker {
+            worker.save(&crate::commands::agent::agent_data_dir())?;
+            println!(
+                "This Mac is a worker. Its containers and its end of the mesh run in {}'s VM; \
+                 it suits development and personal use (it goes offline while the Mac sleeps).",
+                worker.docker_app.display_name()
+            );
+        }
+        Ok(())
     }
 
     /// Relay mode: use an operator-run relay for WireGuard key exchange.

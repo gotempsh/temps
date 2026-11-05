@@ -8,7 +8,7 @@ import { MemoryRouter } from 'react-router'
 import {
   ForceJoinOption,
   WorkerJoinScript,
-  WorkerRequirements,
+  WorkerOsChoice,
 } from './WorkerJoinScript'
 import { workerJoinScript } from '@/lib/worker-join-script'
 
@@ -27,16 +27,32 @@ function text(html: string): string {
     .replace(/&quot;/g, '"')
 }
 
-describe('WorkerRequirements', () => {
-  test('says up front that the worker must run Linux and when --private-address applies', () => {
-    const shown = text(render(<WorkerRequirements />))
-    expect(shown).toContain('The new machine must run Linux')
-    expect(shown).toContain('A Mac or Windows machine cannot join this way')
-    expect(shown).toContain('temps join --private-address <ip>')
-    expect(shown).toContain('this server can reach at that address')
-    expect(shown).toContain('cannot reach a machine behind a home router')
-    expect(shown).toContain('network policy boot guard')
-    expect(shown).toContain('The commands on this page are for Linux')
+describe('WorkerOsChoice', () => {
+  test('offers Linux and Mac, and says what a Mac worker is for', () => {
+    const shown = text(
+      render(<WorkerOsChoice value="macos" onChange={() => {}} />)
+    )
+    expect(shown).toContain('What does the new machine run?')
+    expect(shown).toContain('Linux')
+    expect(shown).toContain('Docker Desktop, OrbStack, colima or Rancher Desktop')
+    expect(shown).toContain('Runs as you, without sudo')
+    expect(shown).toContain('development and personal use')
+    expect(shown).toContain('offline while the Mac sleeps')
+    expect(shown).not.toContain('must run Linux')
+    expect(shown).toContain('temps join --private-address')
+  })
+})
+
+describe('WorkerJoinScript for a Mac', () => {
+  test('tells the user to paste it as themselves with the Docker app running', () => {
+    const shown = text(
+      render(
+        <WorkerJoinScript command="x" pinnedTo="v0.1.0" os="macos" />
+      )
+    )
+    expect(shown).toContain('Paste this in Terminal on the Mac, as yourself')
+    expect(shown).toContain('Docker app running')
+    expect(shown).not.toContain('leave out sudo -H')
   })
 })
 

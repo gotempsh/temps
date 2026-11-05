@@ -750,6 +750,30 @@ async fn run(
                         }
                     }
                 }
+                if !OVERLAY_SUPPORTED {
+                    // ADR 090: a Mac worker's containers are reached through
+                    // ports published on its mesh address, in the Docker
+                    // app's VM; it runs no VXLAN overlay. Keep the snapshot
+                    // current so a restart without the control plane brings
+                    // the mesh back with today's peers.
+                    applied_once = true;
+                    if !offline && saved.as_ref() != Some(&payload) {
+                        let (path, written) = (snapshot_path.clone(), payload.clone());
+                        match tokio::task::spawn_blocking(move || save_snapshot(&path, &written))
+                            .await
+                            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+                        {
+                            Ok(()) => saved = Some(payload),
+                            Err(e) => warn!(
+                                error = %e,
+                                snapshot = %snapshot_path.display(),
+                                "could not save the network snapshot"
+                            ),
+                        }
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
                 if payload.alloc.is_none() {
                     debug!("network sync: no compute_cidr allocated yet");
                     tokio::time::sleep(POLL_INTERVAL).await;
@@ -1125,6 +1149,11 @@ async fn poll_once(
 /// Pause before re-polling after the control plane changed our mesh
 /// registration, so the new underlay is picked up at once.
 const MESH_REGISTERED_REPOLL: Duration = Duration::from_secs(1);
+
+/// Whether this agent runs the cross-node VXLAN overlay. A Mac worker (ADR
+/// 090) does not: its kernel networking is the Docker app's VM, reached only
+/// through the mesh sidecar.
+const OVERLAY_SUPPORTED: bool = !cfg!(target_os = "macos");
 
 /// Local mesh state kept across ticks.
 #[derive(Default)]

@@ -64,6 +64,8 @@ import {
   nodeRemovalBlocker,
   shouldPromptForFirstWorkerNode,
   WORKER_NODES_URL,
+  macWorkerHost,
+  nodeStatusLabel,
   nodesAdvancedSection,
 } from '@/lib/worker-nodes'
 import {
@@ -172,13 +174,44 @@ const nodeStatusVariant: Record<
   pending: 'warning-subtle',
 }
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({
+  status,
+  capacity,
+}: {
+  status: string
+  /** The node's last heartbeat capacity: says whether it is a Mac. */
+  capacity?: unknown
+}) {
+  const shown = nodeStatusLabel(status, macWorkerHost(capacity))
   return (
     <Badge
-      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      variant={
+        shown.hint
+          ? 'neutral-subtle'
+          : (nodeStatusVariant[status] ?? 'neutral-subtle')
+      }
       className="text-xs capitalize"
+      title={shown.hint ?? undefined}
     >
-      {status}
+      {shown.label}
+    </Badge>
+  )
+}
+
+/**
+ * Marks a Mac worker (ADR 090): fine for development and personal use, and
+ * offline whenever the Mac sleeps.
+ */
+function MacWorkerBadge({ capacity }: { capacity: unknown }) {
+  const mac = macWorkerHost(capacity)
+  if (!mac) return null
+  return (
+    <Badge
+      variant="outline"
+      className="text-[10px]"
+      title={`Containers run in ${mac.dockerApp ?? 'a Docker app'} on a Mac. Suited to development and personal use: it goes offline while the Mac sleeps.`}
+    >
+      Mac · development
     </Badge>
   )
 }
@@ -671,12 +704,16 @@ function NodeTable({
                           {node.role}
                         </Badge>
                         <NodeRoleBadge labels={node.labels} />
+                        <MacWorkerBadge capacity={node.capacity} />
                       </div>
                     </div>
                   </div>
                 </TableCell>
                 <TableCell>
-                  <StatusBadge status={node.status} />
+                  <StatusBadge
+                    status={node.status}
+                    capacity={node.capacity}
+                  />
                 </TableCell>
                 <TableCell className="hidden sm:table-cell">
                   <NodeArchitecture architecture={node.architecture} />
@@ -1271,7 +1308,8 @@ function NodeDetail({
             <h3 className="max-w-full min-w-0 text-lg font-semibold truncate">
               {node.name}
             </h3>
-            <StatusBadge status={node.status} />
+            <StatusBadge status={node.status} capacity={node.capacity} />
+            <MacWorkerBadge capacity={node.capacity} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />
             <WorkerIngressBadge node={node} />

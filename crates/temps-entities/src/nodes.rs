@@ -281,6 +281,12 @@ impl Model {
         )
     }
 
+    /// A Mac worker (ADR 090): it reports so in its heartbeat. It goes
+    /// offline while the Mac sleeps and reconnects on its own.
+    pub fn is_mac_worker(&self) -> bool {
+        temps_core::node_address::capacity_is_mac_worker(&self.capacity)
+    }
+
     /// Deployment ids this node last reported running without its cluster
     /// resolver; empty when it has not reported or the value is malformed.
     pub fn deployments_without_resolver(&self) -> Vec<i64> {

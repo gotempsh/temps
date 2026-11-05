@@ -40,6 +40,7 @@ pub mod mesh_doctor;
 pub mod occupied;
 pub mod overlay_name;
 pub mod overlay_routes;
+pub mod vm;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

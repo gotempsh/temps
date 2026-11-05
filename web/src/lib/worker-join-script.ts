@@ -69,6 +69,27 @@ export function asRootTemps(args: string): string {
 
 export const AGENT_SERVICE_COMMAND = asRootTemps('agent service install')
 
+/**
+ * The operating system of the machine being added.
+ *
+ * A Mac (ADR 090) runs everything as the user, not root: its containers run
+ * in that user's Docker app (Docker Desktop, OrbStack, colima, Rancher
+ * Desktop), whose socket is in their home, and the agent is a LaunchAgent in
+ * their login session. So the Mac command installs into `~/.temps` without
+ * sudo and calls that binary by path (the installer's PATH change only
+ * applies to shells started afterwards).
+ */
+export type WorkerOs = 'linux' | 'macos'
+
+/** Where the installer puts Temps for the user running it on a Mac. */
+export const USER_TEMPS_BIN = '~/.temps/bin/temps'
+
+/** Install Temps for the current user (a Mac). */
+export function userInstallCommand(tag: string | null): string {
+  const pin = tag ? ` -s -- ${tag}` : ''
+  return `(set -o pipefail; curl -fsSL ${INSTALLER_URL} | bash${pin})`
+}
+
 export interface WorkerJoinScriptOptions {
   /** The URL the worker dials, as `temps join` takes it. */
   url: string
@@ -83,6 +104,8 @@ export interface WorkerJoinScriptOptions {
    * old cluster loses it, so this is only ever set by an explicit choice.
    */
   force?: boolean
+  /** The new machine's OS; Linux unless said otherwise. */
+  os?: WorkerOs
 }
 
 /**
@@ -97,9 +120,20 @@ export function workerJoinScript({
   version,
   joinFlags = '',
   force = false,
+  os = 'linux',
 }: WorkerJoinScriptOptions): { command: string; pinnedTo: string | null } {
   const tag = releaseTag(version)
   const join = `join ${shellWord(url)} ${shellWord(token)}${joinFlags}${force ? ' --force' : ''}`
+  if (os === 'macos') {
+    return {
+      pinnedTo: tag,
+      command: [
+        userInstallCommand(tag),
+        `${USER_TEMPS_BIN} ${join}`,
+        `${USER_TEMPS_BIN} agent service install`,
+      ].join(' && \\\n'),
+    }
+  }
   return {
     pinnedTo: tag,
     command: [

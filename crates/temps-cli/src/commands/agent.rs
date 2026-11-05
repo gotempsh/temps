@@ -162,6 +162,11 @@ impl AgentCommand {
             Some(AgentSubcommand::Ingress(command)) => return command.execute(),
             None => {}
         }
+        // A Mac worker (ADR 090): pin the Docker app `temps join` recorded
+        // before anything connects to Docker, while this process is still
+        // single-threaded.
+        #[cfg(target_os = "macos")]
+        let mac_worker = prepare_mac_worker()?;
         let available_parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -177,6 +182,11 @@ impl AgentCommand {
         rt.block_on(async move {
             let disable_state_stream = self.disable_state_stream;
             let config = self.resolve_config()?;
+
+            #[cfg(target_os = "macos")]
+            if let Some(worker) = mac_worker.clone() {
+                wait_for_mac_sidecar(worker).await;
+            }
 
             let docker = bollard::Docker::connect_with_defaults()
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
@@ -825,6 +835,62 @@ impl AgentCommand {
 /// kernel still has the bridge from the previous run. Returns None if
 /// the interface doesn't exist, has no v4 address, or `ip` isn't on
 /// PATH (single-host dev mode).
+/// Load this Mac's worker record, pin its Docker app for every component
+/// of the agent, and refuse a Mac that never joined as a Mac worker.
+#[cfg(target_os = "macos")]
+fn prepare_mac_worker() -> anyhow::Result<Option<temps_node_agent::mac_worker::MacWorker>> {
+    use temps_node_agent::mac_worker::MacWorker;
+
+    let data_dir = agent_data_dir();
+    let Some(worker) = MacWorker::load(&data_dir)? else {
+        return Ok(None);
+    };
+    temps_wireguard::vm::set_docker_endpoint(worker.endpoint())?;
+    temps_node_agent::mac_worker::set_running(&worker);
+    // bollard and the deployer read DOCKER_HOST. This is the endpoint `temps
+    // join` recorded in the agent's own data directory, not configuration
+    // taken from the environment: a later `docker context use` must not move
+    // a running worker to another VM.
+    std::env::set_var("DOCKER_HOST", &worker.docker_host);
+    tracing::info!(
+        docker_app = worker.docker_app.display_name(),
+        docker_host = %worker.docker_host,
+        mesh_address = %worker.mesh_address,
+        "macOS worker: containers and the mesh run in the Docker app's VM"
+    );
+    Ok(Some(worker))
+}
+
+/// Keep trying until the mesh sidecar runs in the Docker app's VM. At login
+/// the agent can start before the Docker app does, and the app can be
+/// restarted under it: neither is an error worth exiting on.
+#[cfg(target_os = "macos")]
+async fn wait_for_mac_sidecar(worker: temps_node_agent::mac_worker::MacWorker) {
+    let mut delay = std::time::Duration::from_secs(2);
+    loop {
+        let attempt = worker.clone();
+        match tokio::task::spawn_blocking(move || {
+            temps_node_agent::mac_worker::ensure_sidecar(&attempt)
+        })
+        .await
+        {
+            Ok(Ok(action)) => {
+                tracing::info!(?action, "mesh sidecar is running in the Docker app's VM");
+                return;
+            }
+            Ok(Err(error)) => tracing::warn!(
+                %error,
+                retry_in_secs = delay.as_secs(),
+                hint = %worker.docker_app.start_hint(worker.colima_profile.as_deref()),
+                "the mesh sidecar is not running yet; is the Docker app running?"
+            ),
+            Err(error) => tracing::warn!(%error, "mesh sidecar check panicked; retrying"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_secs(60));
+    }
+}
+
 async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
     use tokio::process::Command;
     let out = Command::new("ip")
