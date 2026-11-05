@@ -149,7 +149,7 @@ export function FrameworkSelector({
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <label className="text-sm font-medium">Framework Preset</label>
+        <label className="text-sm font-medium">Framework preset</label>
         <div className="flex items-center gap-2">
           {/* Refresh button */}
           {onRefresh && (
@@ -291,6 +291,28 @@ function TypeBadge({ children }: { children: React.ReactNode }) {
   )
 }
 
+/** Makes a whole card a toggle button, for the keyboard as well as the pointer. */
+function selectableCardProps(
+  isSelected: boolean,
+  disabled: boolean,
+  onSelect: () => void
+) {
+  return {
+    role: 'button',
+    tabIndex: disabled ? -1 : 0,
+    'aria-pressed': isSelected,
+    'aria-disabled': disabled || undefined,
+    onClick: () => {
+      if (!disabled) onSelect()
+    },
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (disabled || (event.key !== 'Enter' && event.key !== ' ')) return
+      event.preventDefault()
+      onSelect()
+    },
+  }
+}
+
 // Component for showing a preset from the full catalog
 function PresetCard({
   preset,
@@ -305,13 +327,12 @@ function PresetCard({
 }) {
   return (
     <Card
-      className={`relative cursor-pointer transition-shadow hover:shadow-sm dark:hover:shadow-none ${
+      className={`relative cursor-pointer transition-shadow hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:shadow-none ${
         isSelected
           ? 'ring-2 ring-primary ring-offset-1 ring-offset-background'
           : ''
       } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
-      onClick={() => !disabled && onSelect()}
-      aria-pressed={isSelected}
+      {...selectableCardProps(isSelected, disabled, onSelect)}
     >
       <CardContent className="p-4">
         {isSelected && (
@@ -391,17 +412,16 @@ function DetectedPresetCard({
   const projectType = presetInfo?.project_type || 'Server'
   const description = presetInfo?.description || 'Custom configuration'
   const pathLabel = project.path && project.path !== '.' ? project.path : './'
-  const onPick = () => !disabled && onSelectPreset(presetKey)
+  const onPick = () => onSelectPreset(presetKey)
 
   return (
     <Card
-      className={`relative cursor-pointer transition-shadow hover:shadow-sm dark:hover:shadow-none ${
+      className={`relative cursor-pointer transition-shadow hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:shadow-none ${
         isSelected
           ? 'ring-2 ring-primary ring-offset-1 ring-offset-background'
           : ''
       } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
-      onClick={onPick}
-      aria-pressed={isSelected}
+      {...selectableCardProps(isSelected, disabled, onPick)}
     >
       <CardContent className="p-4">
         {isSelected && (
