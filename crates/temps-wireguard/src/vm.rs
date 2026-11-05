@@ -23,9 +23,9 @@
 //! every platform; only [`run`] touches a Docker daemon.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -89,6 +89,73 @@ pub fn exec_args(host: &str, argv: &[&str], stdin: bool) -> Vec<String> {
     args
 }
 
+/// Run `command` to completion, feeding `stdin` when given, within
+/// `timeout`. Both output pipes are drained while it runs, so a command that
+/// prints more than a pipe holds (a `wg show dump` of a large mesh, a build)
+/// cannot block on a full pipe. `Ok(None)` when it was killed at the deadline.
+pub fn output_within(
+    mut command: Command,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // Dropped at the end of this block: closes stdin so the command sees
+        // the end of its input.
+        if let Err(error) = pipe.write_all(input) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Some(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    }))
+}
+
 /// Run `argv` in the sidecar, feeding `stdin` when given, and return its
 /// standard output. `operation` names what was attempted, for the error.
 pub fn run(operation: &str, argv: &[&str], stdin: Option<&[u8]>) -> Result<String, WireGuardError> {
@@ -97,42 +164,17 @@ pub fn run(operation: &str, argv: &[&str], stdin: Option<&[u8]>) -> Result<Strin
         operation: format!("{operation} (in the {SIDECAR_CONTAINER} container)"),
         reason,
     };
-    let mut child = Command::new(&endpoint.cli)
-        .args(exec_args(&endpoint.host, argv, stdin.is_some()))
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| failed(format!("cannot run {}: {error}", endpoint.cli)))?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input)
-            .map_err(|error| failed(format!("cannot write to docker exec: {error}")))?;
-        // Dropped here: closes stdin so the command sees end of input.
-    }
-    let deadline = std::time::Instant::now() + EXEC_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(failed(format!(
-                    "no answer within {}s: the Docker app's VM may be paused (the Mac is \
-                     asleep) or restarting",
-                    EXEC_TIMEOUT.as_secs()
-                )));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(failed(format!("cannot wait for docker exec: {error}"))),
-        }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| failed(format!("cannot read docker exec output: {error}")))?;
+    let mut command = Command::new(&endpoint.cli);
+    command.args(exec_args(&endpoint.host, argv, stdin.is_some()));
+    let output = output_within(command, stdin, EXEC_TIMEOUT)
+        .map_err(|error| failed(format!("cannot run {}: {error}", endpoint.cli)))?
+        .ok_or_else(|| {
+            failed(format!(
+                "no answer within {}s: the Docker app's VM may be paused (the Mac is asleep) or \
+                 restarting",
+                EXEC_TIMEOUT.as_secs()
+            ))
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let reason = if stderr.contains("No such container") || stderr.contains("is not running") {
@@ -316,6 +358,41 @@ pub fn peers_by_key(dump: &Dump) -> HashMap<String, &DumpPeer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_drains_more_than_a_pipe_holds() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "head -c 300000 /dev/zero"]);
+        let output = output_within(command, None, Duration::from_secs(20))
+            .unwrap()
+            .expect("finishes well before the deadline");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 300_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_kills_a_command_at_the_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        assert!(output_within(command, None, Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_feeds_stdin() {
+        let mut command = Command::new("cat");
+        command.arg("-");
+        let output = output_within(command, Some(b"key material"), Duration::from_secs(20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.stdout, b"key material");
+    }
 
     const DUMP: &str = "cHJpdmF0ZQ==\tcHVibGlj\t51820\toff
 QUFBQQ==\t(none)\t192.168.5.2:51820\t10.210.0.1/32\t1730800000\t1024\t2048\t25

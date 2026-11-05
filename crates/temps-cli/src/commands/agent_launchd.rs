@@ -136,25 +136,49 @@ pub fn render_plist(
 }
 
 /// Whether someone other than this user (or root) could change `path`: an
-/// ancestor owned by another user, or world-writable without the sticky bit.
-/// Group-writable is allowed: on macOS that is the `admin` group, whose
-/// members can already act as root.
+/// ancestor owned by another user, group-writable by a group other than
+/// `wheel` or `admin` (whose members can already act as root on macOS), or
+/// world-writable without the sticky bit.
 fn unsafe_component(path: &Path) -> anyhow::Result<Option<String>> {
     use std::os::unix::fs::MetadataExt;
     for component in path.ancestors() {
         let meta = std::fs::metadata(component)
             .map_err(|error| anyhow::anyhow!("could not check {}: {error}", component.display()))?;
-        if !path_is_safe(meta.uid(), meta.mode(), uid()) {
+        if !path_is_safe(meta.uid(), meta.gid(), meta.mode(), uid()) {
             return Ok(Some(component.display().to_string()));
         }
     }
     Ok(None)
 }
 
-fn path_is_safe(owner: u32, mode: u32, me: u32) -> bool {
+/// macOS's `wheel` and `admin` groups: their members can act as root.
+const ROOT_EQUIVALENT_GROUPS: [u32; 2] = [0, 80];
+
+fn path_is_safe(owner: u32, group: u32, mode: u32, me: u32) -> bool {
+    let sticky = mode & 0o1000 != 0;
     let owner_ok = owner == me || owner == 0;
-    let world_writable = mode & 0o002 != 0 && mode & 0o1000 == 0;
-    owner_ok && !world_writable
+    let group_writable = mode & 0o020 != 0 && !sticky && !ROOT_EQUIVALENT_GROUPS.contains(&group);
+    let world_writable = mode & 0o002 != 0 && !sticky;
+    owner_ok && !group_writable && !world_writable
+}
+
+/// The data directory an installed plist runs the agent with, so uninstall
+/// and status act on the worker that was installed, not on the current
+/// shell's default.
+fn installed_data_dir(plist: &str) -> Option<PathBuf> {
+    let after_key = plist.split("<key>TEMPS_DATA_DIR</key>").nth(1)?;
+    let value = after_key
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()?;
+    let value = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    Some(PathBuf::from(value))
 }
 
 fn launchctl(args: &[&str]) -> anyhow::Result<std::process::Output> {
@@ -285,8 +309,12 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
 fn uninstall(remove_mesh: bool) -> anyhow::Result<()> {
     let home = home()?;
     let path = plist_path(&home);
+    let mut data_dir = super::agent::agent_data_dir();
     if path.exists() {
         let existing = std::fs::read_to_string(&path)?;
+        if let Some(installed) = installed_data_dir(&existing) {
+            data_dir = installed;
+        }
         if !existing.contains(MANAGED_MARKER) {
             anyhow::bail!(
                 "{} was not written by Temps; leaving it alone",
@@ -300,7 +328,6 @@ fn uninstall(remove_mesh: bool) -> anyhow::Result<()> {
         println!("The {LABEL} LaunchAgent is not installed.");
     }
     if remove_mesh {
-        let data_dir = super::agent::agent_data_dir();
         match temps_node_agent::mac_worker::MacWorker::load(&data_dir)? {
             Some(worker) => {
                 let endpoint = worker.endpoint();
@@ -311,7 +338,10 @@ fn uninstall(remove_mesh: bool) -> anyhow::Result<()> {
                     worker.docker_app.display_name()
                 );
             }
-            None => println!("No mac-worker.json: no mesh sidecar to remove."),
+            None => println!(
+                "No {}: no mesh sidecar to remove.",
+                temps_node_agent::mac_worker::MacWorker::path(&data_dir).display()
+            ),
         }
     } else {
         println!(
@@ -338,7 +368,10 @@ fn status() -> anyhow::Result<()> {
             }
         }
     }
-    let data_dir = super::agent::agent_data_dir();
+    let data_dir = std::fs::read_to_string(plist_path(&home()?))
+        .ok()
+        .and_then(|plist| installed_data_dir(&plist))
+        .unwrap_or_else(super::agent::agent_data_dir);
     if let Some(worker) = temps_node_agent::mac_worker::MacWorker::load(&data_dir)? {
         let endpoint = worker.endpoint();
         let output = temps_node_agent::mac_worker::docker(
@@ -398,11 +431,19 @@ mod tests {
 
     #[test]
     fn only_paths_this_user_or_root_controls_are_trusted() {
-        assert!(path_is_safe(501, 0o755, 501));
-        assert!(path_is_safe(0, 0o775, 501));
-        assert!(path_is_safe(0, 0o1777, 501), "a sticky /tmp-like ancestor");
-        assert!(!path_is_safe(502, 0o755, 501), "another user's file");
-        assert!(!path_is_safe(501, 0o777, 501), "world-writable");
+        assert!(path_is_safe(501, 20, 0o755, 501));
+        assert!(path_is_safe(0, 80, 0o775, 501), "group-writable by admin");
+        assert!(path_is_safe(501, 0, 0o775, 501), "group-writable by wheel");
+        assert!(
+            path_is_safe(0, 0, 0o1777, 501),
+            "a sticky /tmp-like ancestor"
+        );
+        assert!(!path_is_safe(502, 20, 0o755, 501), "another user's file");
+        assert!(!path_is_safe(501, 20, 0o777, 501), "world-writable");
+        assert!(
+            !path_is_safe(501, 20, 0o775, 501),
+            "group-writable by a shared group (staff): another member could swap the binary"
+        );
     }
 
     #[test]
@@ -416,6 +457,12 @@ mod tests {
         .unwrap();
         assert!(plist.contains("/Users/a&amp;b/&lt;temps&gt;"));
         assert!(!plist.contains("a&b"));
+        // Uninstall reads the data directory back from the installed plist.
+        assert_eq!(
+            installed_data_dir(&plist),
+            Some(PathBuf::from("/Users/a&b/.temps"))
+        );
+        assert_eq!(installed_data_dir("<plist></plist>"), None);
     }
 
     #[test]

@@ -1834,9 +1834,10 @@ impl JoinCommand {
         // reaches the node API through the sidecar's egress forwarder; TLS
         // still pins the cluster CA and the control plane's reserved name.
         let node_api = match &mac_worker {
-            Some(worker) => {
-                super::mac_worker::wait_for_egress(worker).await?;
-                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, worker.egress_port))
+            Some(sidecar) => {
+                super::mac_worker::wait_for_egress(&sidecar.worker).await?;
+                let port = sidecar.worker.egress_port;
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
             }
             None => std::net::SocketAddr::new(
                 std::net::IpAddr::V4(control_plane_address),
@@ -1856,8 +1857,11 @@ impl JoinCommand {
             platform,
         )
         .await?;
-        if let Some(worker) = mac_worker {
-            worker.save(&crate::commands::agent::agent_data_dir())?;
+        if let Some(sidecar) = mac_worker {
+            sidecar
+                .worker
+                .save(&crate::commands::agent::agent_data_dir())?;
+            let worker = sidecar.keep();
             println!(
                 "This Mac is a worker. Its containers and its end of the mesh run in {}'s VM; \
                  it suits development and personal use (it goes offline while the Mac sleeps).",

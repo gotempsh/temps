@@ -29,7 +29,7 @@
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -390,42 +390,11 @@ pub fn docker(
         host: endpoint.host.clone(),
         reason,
     };
-    let mut child = Command::new(&endpoint.cli)
-        .arg("--host")
-        .arg(&endpoint.host)
-        .args(args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| failed(format!("cannot run {}: {error}", endpoint.cli)))?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input)
-            .map_err(|error| failed(format!("cannot write to docker: {error}")))?;
-    }
-    let deadline = std::time::Instant::now() + DOCKER_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(failed(format!(
-                    "no answer within {}s",
-                    DOCKER_TIMEOUT.as_secs()
-                )));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => return Err(failed(error.to_string())),
-        }
-    }
-    child
-        .wait_with_output()
-        .map_err(|error| failed(error.to_string()))
+    let mut command = Command::new(&endpoint.cli);
+    command.arg("--host").arg(&endpoint.host).args(args);
+    temps_wireguard::vm::output_within(command, stdin, DOCKER_TIMEOUT)
+        .map_err(|error| failed(format!("cannot run {}: {error}", endpoint.cli)))?
+        .ok_or_else(|| failed(format!("no answer within {}s", DOCKER_TIMEOUT.as_secs())))
 }
 
 fn docker_ok(
@@ -632,6 +601,58 @@ pub fn probe_vm(endpoint: &DockerEndpoint) -> Result<VmCapabilities, MacWorkerEr
     })
 }
 
+/// What the forwarding probe answers, so the join knows it reached the probe
+/// and not something else listening on the Mac.
+pub const FORWARDING_PROBE_REPLY: &str = "temps-forwarding-probe";
+
+/// The forwarding probe's container name for `port`.
+pub fn forwarding_probe_name(port: u16) -> String {
+    format!("temps-mac-probe-{port}")
+}
+
+/// `docker run` arguments for the forwarding probe: an unprivileged
+/// host-network container answering on the VM's loopback at `port`, which is
+/// where the sidecar's egress forwarder will listen.
+pub fn forwarding_probe_args(tag: &str, port: u16) -> Vec<String> {
+    let listen = format!("TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr");
+    let reply = format!("SYSTEM:echo {FORWARDING_PROBE_REPLY}");
+    strings(&[
+        "run",
+        "--detach",
+        "--rm",
+        "--name",
+        &forwarding_probe_name(port),
+        "--network",
+        "host",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--label",
+        &format!("{ROLE_LABEL}=probe"),
+        tag,
+        "socat",
+        &listen,
+        &reply,
+    ])
+}
+
+/// Start the forwarding probe; stop it with [`stop_forwarding_probe`].
+pub fn start_forwarding_probe(endpoint: &DockerEndpoint, port: u16) -> Result<(), MacWorkerError> {
+    let tag = ensure_image(endpoint)?;
+    docker_ok(endpoint, &forwarding_probe_args(&tag, port), None).map(|_| ())
+}
+
+/// Remove the forwarding probe for `port`, if it is still there.
+pub fn stop_forwarding_probe(endpoint: &DockerEndpoint, port: u16) {
+    let _ = docker(
+        endpoint,
+        &strings(&["rm", "--force", &forwarding_probe_name(port)]),
+        None,
+    );
+}
+
 /// Whether the sidecar reaches `port` on the Mac's loopback through
 /// `host-gateway` (the path the control plane's calls to the agent take).
 pub fn sidecar_reaches_mac(endpoint: &DockerEndpoint, port: u16) -> Result<bool, MacWorkerError> {
@@ -654,6 +675,20 @@ pub fn sidecar_reaches_mac(endpoint: &DockerEndpoint, port: u16) -> Result<bool,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_forwarding_probe_is_unprivileged_and_answers_on_vm_loopback_only() {
+        let args = forwarding_probe_args("temps-mac-mesh:abc", 41234);
+        let text = args.join(" ");
+        assert!(text.contains("--network host"), "{text}");
+        assert!(text.contains("--cap-drop ALL"), "{text}");
+        assert!(!text.contains("--cap-add"), "{text}");
+        assert!(!text.contains("--privileged"), "{text}");
+        assert!(text.contains("--rm"), "{text}");
+        assert!(text.contains("TCP-LISTEN:41234,bind=127.0.0.1,"), "{text}");
+        assert!(text.contains(FORWARDING_PROBE_REPLY), "{text}");
+        assert_eq!(forwarding_probe_name(41234), "temps-mac-probe-41234");
+    }
 
     fn worker() -> MacWorker {
         MacWorker {

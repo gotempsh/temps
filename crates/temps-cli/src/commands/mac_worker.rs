@@ -51,8 +51,14 @@ fn find_docker_cli() -> Option<PathBuf> {
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
+/// How long a Docker CLI call at join may take: a Docker app whose socket
+/// is still there but which no longer answers must fail with a hint, not hang.
+const DETECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn run(cli: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(cli).args(args).output().ok()?;
+    let mut command = std::process::Command::new(cli);
+    command.args(args);
+    let output = temps_wireguard::vm::output_within(command, None, DETECT_TIMEOUT).ok()??;
     output
         .status
         .success()
@@ -211,7 +217,59 @@ pub fn preflight(context: &MacJoinContext) -> anyhow::Result<()> {
         );
     }
     println!("{app}'s VM supports WireGuard and nftables.");
+    check_loopback_forwarding(context)?;
     Ok(())
+}
+
+/// Check that the Docker app forwards a listener on its VM's loopback to
+/// this Mac's loopback, which is how the agent reaches the control plane
+/// (Docker Desktop only does it with host networking on). Checked before
+/// the join token is spent.
+fn check_loopback_forwarding(context: &MacJoinContext) -> anyhow::Result<()> {
+    let app = context.app.display_name();
+    println!("Checking that {app} forwards its VM's loopback to this Mac...");
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map_err(|error| anyhow::anyhow!("could not pick a free port on this Mac: {error}"))?
+        .port();
+    mac_worker::start_forwarding_probe(&context.endpoint, port).map_err(|error| {
+        anyhow::anyhow!("could not start the forwarding check in {app}'s VM: {error}")
+    })?;
+    let reached = probe_answers(port, Duration::from_secs(30));
+    mac_worker::stop_forwarding_probe(&context.endpoint, port);
+    if !reached {
+        anyhow::bail!(
+            "{app} does not forward its VM's loopback to this Mac (nothing answered on \
+             127.0.0.1:{port}), which is how the agent reaches the control plane. {} Nothing \
+             was set up and the join token was not used.",
+            context.app.host_network_hint()
+        );
+    }
+    Ok(())
+}
+
+/// Whether the forwarding probe answers on this Mac's `port` within `limit`.
+fn probe_answers(port: u16, limit: Duration) -> bool {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + limit;
+    let address = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut stream) =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+        {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+            let mut reply = [0u8; 64];
+            if let Ok(read) = stream.read(&mut reply) {
+                if String::from_utf8_lossy(&reply[..read])
+                    .contains(mac_worker::FORWARDING_PROBE_REPLY)
+                {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
 }
 
 /// The agent port of `--agent-address` (127.0.0.1:3100 by default).
@@ -219,13 +277,57 @@ pub fn agent_port(agent_address: &str) -> anyhow::Result<u16> {
     let address: std::net::SocketAddr = agent_address.parse().map_err(|error| {
         anyhow::anyhow!("--agent-address {agent_address:?} is not ip:port: {error}")
     })?;
-    if !address.ip().is_loopback() {
+    // The sidecar reaches the Mac through the Docker app's IPv4 host
+    // gateway, so the agent must listen on IPv4 loopback, not `::1`.
+    if address.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) {
         anyhow::bail!(
-            "On a Mac, the agent listens on this Mac's loopback only (the mesh sidecar forwards \
-             the control plane to it); pass --agent-address 127.0.0.1:<port>, not {address}."
+            "On a Mac, the agent listens on this Mac's IPv4 loopback only (the mesh sidecar \
+             forwards the control plane to it); pass --agent-address 127.0.0.1:<port>, not \
+             {address}."
         );
     }
     Ok(address.port())
+}
+
+/// The sidecar a join started. Until [`JoinedSidecar::keep`], dropping it
+/// (the join failed after the sidecar started) removes the sidecar and the
+/// mesh interface when this join created them; a sidecar that was already
+/// there belongs to a worker joined before, whose saved record
+/// `temps agent service uninstall --remove-mesh` uses.
+pub struct JoinedSidecar {
+    pub worker: MacWorker,
+    created: bool,
+    kept: bool,
+}
+
+impl JoinedSidecar {
+    /// The join succeeded: leave the sidecar running.
+    pub fn keep(mut self) -> MacWorker {
+        self.kept = true;
+        self.worker.clone()
+    }
+}
+
+impl Drop for JoinedSidecar {
+    fn drop(&mut self) {
+        if self.kept || !self.created {
+            return;
+        }
+        let app = self.worker.docker_app.display_name();
+        let endpoint = self.worker.endpoint();
+        let removed = mac_worker::remove_sidecar(&endpoint)
+            .and_then(|_| mac_worker::remove_mesh_interface(&endpoint));
+        match removed {
+            Ok(()) => println!(
+                "The join failed: removed the mesh sidecar and interface it created in {app}'s VM."
+            ),
+            Err(error) => println!(
+                "The join failed, and removing the mesh sidecar it created in {app}'s VM failed \
+                 too ({error}): remove it with `docker rm -f {}`.",
+                mac_worker::SIDECAR_CONTAINER
+            ),
+        }
+    }
 }
 
 /// Start the mesh sidecar for this node and check it reaches the agent's
@@ -236,7 +338,7 @@ pub async fn start_sidecar(
     control_plane_address: Ipv4Addr,
     node_api_port: u16,
     agent_port: u16,
-) -> anyhow::Result<MacWorker> {
+) -> anyhow::Result<JoinedSidecar> {
     let worker = MacWorker {
         docker_app: context.app,
         colima_profile: context.colima_profile.clone(),
@@ -266,6 +368,11 @@ pub async fn start_sidecar(
             mac_worker::SidecarAction::Replaced => "re-created",
         }
     );
+    let sidecar = JoinedSidecar {
+        worker,
+        created: action == mac_worker::SidecarAction::Created,
+        kept: false,
+    };
     // The control plane's calls to the agent come in through the sidecar to
     // this Mac's loopback. Prove that path with a short-lived listener on the
     // agent port (an agent already running there answers just as well).
@@ -282,7 +389,7 @@ pub async fn start_sidecar(
              agent. Update {app}; nothing was registered."
         );
     }
-    Ok(worker)
+    Ok(sidecar)
 }
 
 /// Wait until the Docker app forwards the sidecar's egress port to this
@@ -325,6 +432,9 @@ mod tests {
         assert_eq!(agent_port("127.0.0.1:3100").unwrap(), 3100);
         let error = agent_port("0.0.0.0:3100").unwrap_err().to_string();
         assert!(error.contains("loopback"), "{error}");
+        // The sidecar's path to the Mac is IPv4: `::1` would never be reached.
+        assert!(agent_port("[::1]:3100").is_err());
+        assert!(agent_port("127.0.0.2:3100").is_err());
         assert!(agent_port("nonsense").is_err());
     }
 }
