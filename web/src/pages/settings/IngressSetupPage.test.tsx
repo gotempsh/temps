@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { adminListNodesQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { IngressSetupPage } from './IngressSetupPage'
 
 afterEach(cleanup)
@@ -72,7 +73,13 @@ const cloudflareAccount = (id: number, name: string) => ({
   updated_at: '2026-01-01T00:00:00Z',
 })
 
-function setup() {
+function setup({
+  nodes = () => [
+    worker(1, 'worker-a'),
+    worker(2, 'worker-b'),
+    worker(3, 'worker-c', 'offline'),
+  ],
+}: { nodes?: () => ReturnType<typeof worker>[] | Response } = {}) {
   const posted: { path: string; body: unknown }[] = []
   // A pasted token adds account 2 next to the existing account 1.
   const accounts = [cloudflareAccount(1, 'Cloudflare')]
@@ -94,14 +101,12 @@ function setup() {
   const api = mockApi({
     ...perAccount(1),
     ...perAccount(2),
-    'GET /internal/nodes': () =>
-      jsonResponse({
-        nodes: [
-          worker(1, 'worker-a'),
-          worker(2, 'worker-b'),
-          worker(3, 'worker-c', 'offline'),
-        ],
-      }),
+    'GET /internal/nodes': () => {
+      const answer = nodes()
+      return answer instanceof Response
+        ? answer
+        : jsonResponse({ nodes: answer })
+    },
     'GET /internal/nodes/1/public-ingress/settings': () =>
       jsonResponse(settings(1, 'delegated')),
     'GET /internal/nodes/2/public-ingress/settings': () =>
@@ -149,7 +154,7 @@ function setup() {
       </MemoryRouter>
     </QueryClientProvider>
   )
-  return { api, posted }
+  return { api, posted, client }
 }
 
 function managedDomain(verified: boolean) {
@@ -181,6 +186,11 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   await waitFor(() => expect(b.hasAttribute('disabled')).toBe(true))
   expect(c.hasAttribute('disabled')).toBe(true)
   expect(screen.getByText('temps agent ingress delegated')).toBeTruthy()
+  // The offline worker says why, and how to start it.
+  expect(
+    screen.getByText(/It is offline, so it cannot run a tunnel/)
+  ).toBeTruthy()
+  expect(screen.getByText('sudo systemctl start temps-agent')).toBeTruthy()
 
   fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
   // The subdomain scheme warns about Universal SSL before it can be used.
@@ -188,7 +198,11 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   expect(
     screen.getByText('HTTPS fails without Advanced Certificate Manager')
   ).toBeTruthy()
-  fireEvent.click(screen.getByRole('radio', { name: /app\.example\.com/ }))
+  // Hostnames read as a pattern, with a concrete example.
+  fireEvent.click(
+    screen.getByRole('radio', { name: /<app-name>\.example\.com/ })
+  )
+  expect(screen.getByText('shop.example.com')).toBeTruthy()
 
   const create = screen.getByRole('button', { name: 'Create tunnel' })
   await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
@@ -275,4 +289,115 @@ test('after a run, the account its tunnel uses is no longer offered for removal'
     screen.queryByRole('button', { name: 'Use a different token' })
   ).toBeNull()
   expect(api.called('DELETE', '/dns-providers/2')).toBe(false)
+})
+
+test('a worker that went offline after the page loaded stops the run before anything is created', async () => {
+  let reads = 0
+  const { posted } = setup({
+    // Active when the page loads, offline when Create re-checks it.
+    nodes: () => [worker(1, 'worker-a', reads++ === 0 ? 'active' : 'offline')],
+  })
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+
+  await screen.findByText(/Setup failed: Worker 'worker-a' is offline/)
+  expect(screen.getByText('Nothing was created.')).toBeTruthy()
+  // No domain, no tunnel.
+  expect(posted).toEqual([])
+})
+
+test('a failed refresh of the worker list keeps the wizard and says the list may be stale', async () => {
+  let fail = false
+  const { client } = setup({
+    nodes: () =>
+      fail
+        ? jsonResponse(
+            { title: 'Service Unavailable', status: 503, detail: 'down' },
+            503
+          )
+        : [worker(1, 'worker-a')],
+  })
+  await screen.findByText('example.com')
+  expect(screen.getByRole('button', { name: 'Create tunnel' })).toBeTruthy()
+
+  fail = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText(/The worker list may be out of date/)
+  // Still the wizard, not the full-page error that would abort a run.
+  expect(screen.getByRole('button', { name: 'Create tunnel' })).toBeTruthy()
+  expect(screen.queryByText('Could not load the worker nodes')).toBeNull()
+})
+
+test('a run\u2019s result stays when a later poll finds no workers', async () => {
+  let gone = false
+  const { client } = setup({
+    nodes: () => (gone ? [] : [worker(1, 'worker-a')]),
+  })
+  await screen.findByText('example.com')
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+
+  gone = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText(/This cluster has no worker nodes any more/)
+  // The result, not the empty-cluster onboarding that would replace it.
+  expect(
+    screen.getByText('Visitors can reach apps under example.com')
+  ).toBeTruthy()
+  expect(screen.queryByText('No worker node yet')).toBeNull()
+})
+
+test('a picked worker that goes offline holds Create until the operator decides', async () => {
+  let cOffline = false
+  const { client, posted } = setup({
+    nodes: () => [
+      worker(1, 'worker-a'),
+      worker(3, 'worker-c', cOffline ? 'offline' : 'active'),
+    ],
+  })
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  const c = screen.getByRole('checkbox', { name: 'worker-c' })
+  await waitFor(() => expect(c.getAttribute('data-state')).toBe('checked'))
+  // An explicit selection of both.
+  fireEvent.click(a)
+  fireEvent.click(a)
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+
+  cOffline = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText('worker-c is no longer available')
+  expect(create.hasAttribute('disabled')).toBe(true)
+  // Changing another box does not quietly drop the unavailable pick.
+  fireEvent.click(a)
+  fireEvent.click(a)
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  expect(screen.getByText('worker-c is no longer available')).toBeTruthy()
+  expect(create.hasAttribute('disabled')).toBe(true)
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue with worker-a' })
+  )
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  expect(screen.queryByText('worker-c is no longer available')).toBeNull()
+
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
+    node_ids: [1],
+  })
 })
