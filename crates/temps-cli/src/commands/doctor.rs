@@ -1532,6 +1532,9 @@ fn migration_check_result(status: Result<&temps_schema::SchemaStatus, &String>) 
     }
 }
 
+/// The "Lock capacity" check: warn when the lock table cannot hold the locks a
+/// migration changing every hypertable's constraints at once would take, with
+/// the `max_locks_per_transaction` to set. Informational without TimescaleDB.
 fn lock_capacity_result(capacity: Result<&temps_schema::LockCapacity, &String>) -> CheckResult {
     match capacity {
         Err(error) => CheckResult::Warn(format!(
@@ -1553,6 +1556,9 @@ fn lock_capacity_result(capacity: Result<&temps_schema::LockCapacity, &String>) 
     }
 }
 
+/// The "Telemetry foreign keys" check: warn, naming them, while foreign keys
+/// the post-migration step has not dropped yet still make project deletes
+/// refuse.
 fn telemetry_foreign_keys_result(
     remaining: Result<&Vec<temps_schema::TelemetryForeignKey>, &String>,
 ) -> CheckResult {

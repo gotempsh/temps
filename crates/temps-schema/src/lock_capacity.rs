@@ -145,6 +145,7 @@ impl LockCapacity {
     }
 }
 
+/// `value / divisor` rounded up, and 0 for a value that is not positive.
 fn ceil_div(value: i64, divisor: i64) -> i64 {
     if value <= 0 {
         0
@@ -153,10 +154,13 @@ fn ceil_div(value: i64, divisor: i64) -> i64 {
     }
 }
 
+/// `value` rounded up to a multiple of `step`.
 fn round_up(value: i64, step: i64) -> i64 {
     ceil_div(value, step).saturating_mul(step)
 }
 
+/// How to raise `max_locks_per_transaction` to `suggested`, including the
+/// restart it needs.
 fn raise_instructions(suggested: i64) -> String {
     format!(
         "Raise max_locks_per_transaction to at least {suggested} (in postgresql.conf, or \
@@ -259,6 +263,8 @@ pub enum SchemaStep {
 }
 
 impl std::fmt::Display for SchemaStep {
+    /// The step as it starts the error message: "Migration <name>" or
+    /// "Post-migration step <name>".
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Migration(name) => write!(f, "Migration {name}"),
@@ -312,6 +318,9 @@ impl LockSlotsExhausted {
         Self::new(step, changed_table, capacity, capacity_error, reason)
     }
 
+    /// Describe a lock exhaustion of `step` from an already-read `capacity`.
+    /// Without `changed_table` the table is taken to be the hypertable with the
+    /// most chunks, or [`LockedTable::Unknown`] when there is none.
     pub fn new(
         step: SchemaStep,
         changed_table: Option<&str>,
@@ -346,6 +355,9 @@ impl LockSlotsExhausted {
 }
 
 impl std::fmt::Display for LockSlotsExhausted {
+    /// The operator message: the step and table, the chunk count against the
+    /// lock slots, the setting to raise and the restart it needs, then the
+    /// PostgreSQL error.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

@@ -47,7 +47,8 @@ impl ProjectService {
     /// every chunk of `events`, `proxy_logs` and `error_events`, locking each
     /// one in a single transaction (about four locks per chunk), which on a
     /// large history fails with "out of shared memory" and is slow regardless.
-    /// A catalog lookup on a handful of rows.
+    /// A catalog lookup on a handful of rows, with the names resolved in
+    /// `current_schema()` as the maintenance step resolves them.
     pub async fn ensure_telemetry_detached(&self, project_id: i32) -> Result<(), ProjectError> {
         let to_array = |tables: &[&str]| -> Vec<String> {
             tables.iter().map(|table| table.to_string()).collect()
@@ -59,8 +60,10 @@ impl ProjectService {
                 "SELECT c.conrelid::regclass::text || '.' || c.conname AS foreign_key \
                  FROM pg_constraint c \
                  WHERE c.contype = 'f' \
-                   AND c.conrelid = ANY (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
-                   AND c.confrelid = ANY (SELECT to_regclass(t) FROM unnest($2::text[]) AS t) \
+                   AND c.conrelid = ANY (SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(t)) \
+                                         FROM unnest($1::text[]) AS t) \
+                   AND c.confrelid = ANY (SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(t)) \
+                                          FROM unnest($2::text[]) AS t) \
                  ORDER BY 1",
                 [
                     to_array(&super::data_purge::PURGED_TABLES).into(),

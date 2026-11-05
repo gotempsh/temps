@@ -477,6 +477,11 @@ const FEATURE_NOT_SUPPORTED: &str = "0A000";
 /// Foreign keys from the telemetry tables to the parents they are detached
 /// from, on the tables themselves: a hypertable's copies on its chunks go with
 /// it.
+///
+/// Both names are resolved in `current_schema()`, where the migrations created
+/// them, rather than through the whole `search_path`: a schema missing one of
+/// these tables must not pick up, and drop the foreign key of, a same-named
+/// table in a later schema such as `public`.
 const TELEMETRY_FOREIGN_KEYS_SQL: &str = "\
     SELECT c.oid::bigint AS constraint_oid, \
            c.conrelid::regclass::text AS child, \
@@ -484,8 +489,10 @@ const TELEMETRY_FOREIGN_KEYS_SQL: &str = "\
            c.confrelid::regclass::text AS parent \
     FROM pg_constraint c \
     WHERE c.contype = 'f' \
-      AND c.conrelid = ANY (SELECT to_regclass(t) FROM unnest($1::text[]) AS t) \
-      AND c.confrelid = ANY (SELECT to_regclass(t) FROM unnest($2::text[]) AS t) \
+      AND c.conrelid = ANY (SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(t)) \
+                            FROM unnest($1::text[]) AS t) \
+      AND c.confrelid = ANY (SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(t)) \
+                             FROM unnest($2::text[]) AS t) \
     ORDER BY 2, 3";
 
 /// The copies of a hypertable's foreign key on its chunks: a foreign key of
@@ -493,7 +500,7 @@ const TELEMETRY_FOREIGN_KEYS_SQL: &str = "\
 /// columns rather than name because TimescaleDB names the copies after the
 /// chunk in some releases (`1_1_events_project_id_fkey`) and not in others.
 /// A plain table has no children and returns nothing.
-const CHUNK_FOREIGN_KEYS_SQL: &str = "\
+pub(crate) const CHUNK_FOREIGN_KEYS_SQL: &str = "\
     SELECT i.inhrelid::regclass::text AS chunk, quote_ident(cc.conname) AS constraint_name \
     FROM pg_constraint hc \
     JOIN pg_inherits i ON i.inhparent = hc.conrelid \
@@ -517,6 +524,8 @@ pub struct TelemetryForeignKey {
     pub parent: String,
 }
 
+/// The telemetry tables and the parents they are detached from, as the
+/// `text[]` parameters of [`TELEMETRY_FOREIGN_KEYS_SQL`].
 fn telemetry_table_names() -> (Vec<String>, Vec<String>) {
     (
         temps_migrations::PROJECT_DATA_PURGED_TABLES
@@ -530,7 +539,9 @@ fn telemetry_table_names() -> (Vec<String>, Vec<String>) {
     )
 }
 
-async fn list_telemetry_foreign_keys(
+/// The telemetry foreign keys still in place, with each constraint's oid for
+/// [`CHUNK_FOREIGN_KEYS_SQL`].
+pub(crate) async fn list_telemetry_foreign_keys(
     connection: &mut sqlx::PgConnection,
 ) -> Result<Vec<(i64, TelemetryForeignKey)>, sqlx::Error> {
     let (children, parents) = telemetry_table_names();
@@ -601,6 +612,7 @@ async fn execute_ddl_with_retry(
     }
 }
 
+/// The SQLSTATE of a database error, if `error` is one.
 fn sqlstate(error: &sqlx::Error) -> Option<String> {
     error
         .as_database_error()
@@ -609,7 +621,7 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
 }
 
 /// Why one foreign key was not dropped.
-enum DetachFailure {
+pub(crate) enum DetachFailure {
     LockSlotsExhausted(Box<LockSlotsExhausted>),
     Other(String),
 }
@@ -627,6 +639,55 @@ async fn detach_lock_exhaustion(
         error.to_string(),
     )
     .await
+}
+
+/// Drop the copies of `foreign_key` on `chunks` (`(chunk, constraint)` pairs
+/// listed by [`CHUNK_FOREIGN_KEYS_SQL`]), each in its own transaction.
+///
+/// Returns whether every copy was dropped chunk by chunk, and `false` once
+/// TimescaleDB refuses the per-chunk drop: the caller's table-level drop then
+/// takes the remaining copies with it. A chunk that no longer exists, removed
+/// by retention (`drop_chunks`) after it was listed, has no copy left to drop
+/// and is skipped.
+pub(crate) async fn drop_chunk_copies(
+    connection: &mut sqlx::PgConnection,
+    foreign_key: &TelemetryForeignKey,
+    chunks: &[(String, String)],
+) -> Result<bool, DetachFailure> {
+    let TelemetryForeignKey {
+        table, constraint, ..
+    } = foreign_key;
+    for (chunk, chunk_constraint) in chunks {
+        let drop =
+            format!("ALTER TABLE IF EXISTS {chunk} DROP CONSTRAINT IF EXISTS {chunk_constraint}");
+        match execute_ddl_with_retry(&mut *connection, &drop).await {
+            Ok(()) => {}
+            Err(error) if sqlstate(&error).as_deref() == Some(FEATURE_NOT_SUPPORTED) => {
+                tracing::info!(
+                    table = %table,
+                    constraint = %constraint,
+                    chunk = %chunk,
+                    chunks = chunks.len(),
+                    "TimescaleDB does not allow dropping a foreign key from a single chunk \
+                     ({error}); dropping {constraint} from {table} and all its chunks in one \
+                     transaction"
+                );
+                return Ok(false);
+            }
+            Err(error) if is_lock_exhaustion_sqlx(&error) => {
+                return Err(DetachFailure::LockSlotsExhausted(Box::new(
+                    detach_lock_exhaustion(&mut *connection, table, error).await,
+                )));
+            }
+            Err(error) => {
+                return Err(DetachFailure::Other(format!(
+                    "{constraint} on {table} (dropping its copy {chunk_constraint} on chunk \
+                     {chunk}): {error}"
+                )));
+            }
+        }
+    }
+    Ok(!chunks.is_empty())
 }
 
 /// Drop `foreign_key` (constraint `oid`): from each chunk in its own
@@ -665,37 +726,7 @@ where
     });
     let started = std::time::Instant::now();
 
-    let mut per_chunk = !chunks.is_empty();
-    for (chunk, chunk_constraint) in &chunks {
-        let drop = format!("ALTER TABLE {chunk} DROP CONSTRAINT IF EXISTS {chunk_constraint}");
-        match execute_ddl_with_retry(&mut *connection, &drop).await {
-            Ok(()) => {}
-            Err(error) if sqlstate(&error).as_deref() == Some(FEATURE_NOT_SUPPORTED) => {
-                tracing::info!(
-                    table = %table,
-                    constraint = %constraint,
-                    chunk = %chunk,
-                    chunks = chunks.len(),
-                    "TimescaleDB does not allow dropping a foreign key from a single chunk \
-                     ({error}); dropping {constraint} from {table} and all its chunks in one \
-                     transaction"
-                );
-                per_chunk = false;
-                break;
-            }
-            Err(error) if is_lock_exhaustion_sqlx(&error) => {
-                return Err(DetachFailure::LockSlotsExhausted(Box::new(
-                    detach_lock_exhaustion(&mut *connection, table, error).await,
-                )));
-            }
-            Err(error) => {
-                return Err(DetachFailure::Other(format!(
-                    "{constraint} on {table} (dropping its copy {chunk_constraint} on chunk \
-                     {chunk}): {error}"
-                )));
-            }
-        }
-    }
+    let per_chunk = drop_chunk_copies(&mut *connection, foreign_key, &chunks).await?;
 
     let drop = format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}");
     match execute_ddl_with_retry(&mut *connection, &drop).await {
@@ -971,61 +1002,12 @@ where
         .into());
     }
 
-    let maintenance_result: SchemaResult<()> = async {
-        let detached = detach_telemetry_foreign_keys_on(&mut connection, &on_progress).await;
-
-        on_progress(MaintenanceProgress::IndexStarted {
-            name: PERMISSION_DENIED_RETENTION_INDEX,
-        });
-        let started = std::time::Instant::now();
-
-        build_index_with_retry(
-            &mut connection,
-            PERMISSION_DENIED_RETENTION_INDEX,
-            "audit_logs (audit_date, id)",
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
-                 idx_audit_logs_permission_denied_retention \
-             ON audit_logs (audit_date ASC, id ASC) \
-             WHERE operation_type = 'PERMISSION_DENIED'",
-            "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
-        )
-        .await
-        .map_err(|reason| {
-            ServiceError::Database(format!(
-                "Failed to build concurrent permission-denied retention index \
-                 '{PERMISSION_DENIED_RETENTION_INDEX}': {reason}"
-            ))
-        })?;
-
-        on_progress(MaintenanceProgress::IndexFinished {
-            name: PERMISSION_DENIED_RETENTION_INDEX,
-            elapsed: started.elapsed(),
-        });
-
-        // The reference indexes scan whole tables and run without a
-        // statement timeout: a build that is cut off at a fixed limit would
-        // be restarted from nothing on every retry and never finish on a
-        // large history. They do not block writes (see `ReferenceIndex`), and
-        // the lock timeout above still bounds waiting for a lock.
-        sqlx::query("SET statement_timeout = 0")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| {
-                ServiceError::Database(format!(
-                    "Failed to lift the statement timeout for reference index builds: {error}"
-                ))
-            })?;
-        // Both sets are attempted before either failure is returned, so one
-        // stuck index does not hold back the other set until the next retry.
-        let reference = build_reference_indexes(&mut connection, &on_progress).await;
-        let foreign_keys = build_project_foreign_key_indexes(&mut connection, &on_progress).await;
-        detached?;
-        reference?;
-        foreign_keys?;
-
-        Ok(())
-    }
-    .await;
+    let detached = detach_telemetry_foreign_keys_on(&mut connection, &on_progress).await;
+    // The index builds run whatever the detach returned, and the detach error
+    // comes first: a lock exhaustion carries the setting to raise, which an
+    // index failure reported in its place would hide.
+    let indexes = build_post_migration_indexes(&mut connection, &on_progress).await;
+    let maintenance_result = detached.and(indexes);
 
     // Do not leak maintenance-specific session settings back into the pool.
     let reset_lock_result = sqlx::query("RESET lock_timeout")
@@ -1046,6 +1028,67 @@ where
             "Built permission-denied retention index but failed to reset statement timeout: {error}"
         ))
     })?;
+
+    Ok(())
+}
+
+/// The index builds of [`run_post_migration_indexes_streaming`], on its
+/// maintenance connection: the permission-denied retention index, then the
+/// reference and project foreign key indexes.
+async fn build_post_migration_indexes<F>(
+    connection: &mut sqlx::PgConnection,
+    on_progress: &F,
+) -> SchemaResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    on_progress(MaintenanceProgress::IndexStarted {
+        name: PERMISSION_DENIED_RETENTION_INDEX,
+    });
+    let started = std::time::Instant::now();
+
+    build_index_with_retry(
+        &mut *connection,
+        PERMISSION_DENIED_RETENTION_INDEX,
+        "audit_logs (audit_date, id)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+             idx_audit_logs_permission_denied_retention \
+         ON audit_logs (audit_date ASC, id ASC) \
+         WHERE operation_type = 'PERMISSION_DENIED'",
+        "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
+    )
+    .await
+    .map_err(|reason| {
+        ServiceError::Database(format!(
+            "Failed to build concurrent permission-denied retention index \
+             '{PERMISSION_DENIED_RETENTION_INDEX}': {reason}"
+        ))
+    })?;
+
+    on_progress(MaintenanceProgress::IndexFinished {
+        name: PERMISSION_DENIED_RETENTION_INDEX,
+        elapsed: started.elapsed(),
+    });
+
+    // The reference indexes scan whole tables and run without a statement
+    // timeout: a build that is cut off at a fixed limit would be restarted
+    // from nothing on every retry and never finish on a large history. They do
+    // not block writes (see `ReferenceIndex`), and the lock timeout set by the
+    // caller still bounds waiting for a lock.
+    sqlx::query("SET statement_timeout = 0")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::Database(format!(
+                "Failed to lift the statement timeout for reference index builds: {error}"
+            ))
+        })?;
+    // Both sets are attempted before either failure is returned, so one stuck
+    // index does not hold back the other set until the next retry.
+    let reference = build_reference_indexes(&mut *connection, on_progress).await;
+    let foreign_keys = build_project_foreign_key_indexes(&mut *connection, on_progress).await;
+    reference?;
+    foreign_keys?;
 
     Ok(())
 }

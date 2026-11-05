@@ -1119,6 +1119,127 @@ mod tests {
         Ok(())
     }
 
+    /// Retention (`drop_chunks`) can remove a chunk after the step listed the
+    /// copies of a foreign key on the chunks and before it drops them: the
+    /// chunk that is gone is skipped, and the step still finishes.
+    #[tokio::test]
+    async fn test_detach_skips_a_chunk_dropped_by_retention() -> anyhow::Result<()> {
+        let Some((_container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+        fill_chunks(db.as_ref(), "events", 6, 1).await?;
+
+        let mut connection = db.get_postgres_connection_pool().acquire().await?;
+        let (oid, foreign_key) = maintenance::list_telemetry_foreign_keys(&mut connection)
+            .await?
+            .into_iter()
+            .find(|(_, foreign_key)| foreign_key.table == "events")
+            .ok_or_else(|| anyhow::anyhow!("events has no telemetry foreign key"))?;
+        let chunks: Vec<(String, String)> = sqlx::query_as(maintenance::CHUNK_FOREIGN_KEYS_SQL)
+            .bind(oid)
+            .fetch_all(&mut *connection)
+            .await?;
+        assert!(chunks.len() >= 6, "events has {} chunk(s)", chunks.len());
+
+        // Retention runs between the listing and the drops.
+        let dropped = count(
+            db.as_ref(),
+            "SELECT count(*) AS n FROM drop_chunks('events', older_than => now() - interval '3 days')",
+        )
+        .await?;
+        assert!(dropped > 0, "retention dropped no chunk of events");
+        let mut gone = Vec::new();
+        for (chunk, chunk_constraint) in &chunks {
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(chunk)
+                .fetch_one(&mut *connection)
+                .await?;
+            if !exists {
+                gone.push((chunk, chunk_constraint));
+            }
+        }
+        let (gone_chunk, gone_constraint) = gone
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("every listed chunk of events still exists"))?;
+        let unguarded = sqlx::query(&format!(
+            "ALTER TABLE {gone_chunk} DROP CONSTRAINT IF EXISTS {gone_constraint}"
+        ))
+        .execute(&mut *connection)
+        .await;
+        assert!(
+            unguarded.is_err(),
+            "dropping a constraint from the removed chunk {gone_chunk} without IF EXISTS \
+             on the table must fail"
+        );
+
+        match maintenance::drop_chunk_copies(&mut connection, &foreign_key, &chunks).await {
+            Ok(_) => {}
+            Err(maintenance::DetachFailure::LockSlotsExhausted(error)) => {
+                anyhow::bail!("{error}")
+            }
+            Err(maintenance::DetachFailure::Other(message)) => anyhow::bail!("{message}"),
+        }
+        drop(connection);
+        detach_telemetry_foreign_keys(db.as_ref()).await?;
+        assert_eq!(telemetry_foreign_keys_anywhere(db.as_ref()).await?, 0);
+        Ok(())
+    }
+
+    /// The telemetry tables are looked up in the current schema only. A
+    /// session whose schema has none of them, with a migrated `public` after
+    /// it on the `search_path`, finds no foreign key to drop and leaves
+    /// `public` alone.
+    #[tokio::test]
+    async fn test_detach_ignores_telemetry_tables_outside_the_current_schema() -> anyhow::Result<()>
+    {
+        let Some((container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+        let in_public = remaining_telemetry_foreign_keys(db.get_postgres_connection_pool())
+            .await?
+            .len();
+        assert!(
+            in_public > 0,
+            "the migrations leave the foreign keys in place"
+        );
+
+        db.execute_unprepared("CREATE SCHEMA scratch").await?;
+        let port = container.get_host_port_ipv4(5432).await?;
+        let scratch_url = format!(
+            "postgresql://postgres:postgres@localhost:{port}/postgres\
+             ?options=-c%20search_path%3Dscratch%2Cpublic"
+        );
+        let scratch = retry_db_connect(|| connect_without_migrations(&scratch_url)).await?;
+        assert_eq!(
+            count(
+                scratch.as_ref(),
+                "SELECT count(*) AS n FROM (SELECT 1 WHERE current_schema() = 'scratch') s"
+            )
+            .await?,
+            1,
+            "the session must resolve names in scratch first"
+        );
+
+        assert!(
+            remaining_telemetry_foreign_keys(scratch.get_postgres_connection_pool())
+                .await?
+                .is_empty()
+        );
+        detach_telemetry_foreign_keys(scratch.as_ref()).await?;
+        assert_eq!(
+            remaining_telemetry_foreign_keys(db.get_postgres_connection_pool())
+                .await?
+                .len(),
+            in_public,
+            "public keeps its foreign keys"
+        );
+        Ok(())
+    }
+
     async fn start_db(
         args: &[&str],
     ) -> anyhow::Result<

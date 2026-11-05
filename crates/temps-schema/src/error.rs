@@ -21,12 +21,15 @@ pub enum SchemaError {
 }
 
 impl From<LockSlotsExhausted> for SchemaError {
+    /// Box the lock exhaustion, which is large next to the other variant.
     fn from(error: LockSlotsExhausted) -> Self {
         Self::LockSlotsExhausted(Box::new(error))
     }
 }
 
 impl From<SchemaError> for ServiceError {
+    /// For callers that report a [`ServiceError`]: a lock exhaustion becomes
+    /// [`ServiceError::Configuration`] with the full advice as its message.
     fn from(error: SchemaError) -> Self {
         match error {
             // A server setting the operator has to change.
