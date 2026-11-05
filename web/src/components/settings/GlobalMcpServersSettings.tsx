@@ -37,6 +37,8 @@ import {
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { blankRequiredField } from '@/lib/blank-required-field'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   createGlobalMcp,
   revealGlobalMcpConfig,
@@ -71,7 +73,10 @@ export function GlobalMcpServersSettings() {
       refetch()
       setMcpToDelete(null)
     },
-    onError: () => toast.error('Failed to delete MCP server'),
+    onError: (error) =>
+      toast.error('Failed to delete MCP server', {
+        description: getErrorMessage(error),
+      }),
   })
 
   const openCreate = () => {
@@ -387,7 +392,14 @@ function GlobalMcpDialog({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!name.trim() || !slug.trim()) return
+    const blank = blankRequiredField([
+      ['Name', name],
+      ['Slug', slug],
+    ])
+    if (blank) {
+      toast.error(blank)
+      return
+    }
 
     let config: Record<string, unknown>
     try {
@@ -424,9 +436,10 @@ function GlobalMcpDialog({
       }
       setConfigText('')
       onSuccess()
-    } catch {
+    } catch (error) {
       toast.error(
-        isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server'
+        isEdit ? 'Failed to update MCP server' : 'Failed to create MCP server',
+        { description: getErrorMessage(error) }
       )
     } finally {
       setIsPending(false)

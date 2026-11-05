@@ -8,9 +8,13 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import * as React from 'react'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { useNavigate } from 'react-router'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+
+/** How long the saved message shows before the funnel opens. */
+const FUNNEL_SAVED_REDIRECT_DELAY_MS = 1500
 
 interface CreateFunnelProps {
   project: ProjectResponse
@@ -41,22 +45,31 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
     meta: {
       errorTitle: 'Failed to create funnel',
     },
-    onSuccess: (data) => {
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
       setFeedback({ type: 'success', message: 'Funnel created successfully!' })
-      setTimeout(() => {
-        navigate(
-          `/projects/${project.slug}/analytics/funnels/${data.funnel_id}`
-        )
-      }, 1500)
     },
-    onError: (error: any) => {
+    onError: (error) => {
       setFeedback({
         type: 'error',
-        message: error?.message || 'Failed to create funnel. Please try again.',
+        message: getErrorMessage(
+          error,
+          'Failed to create funnel. Please try again.'
+        ),
       })
     },
   })
+
+  // The success message stays up briefly before opening the new funnel. The
+  // form stays disabled until then: a second click used to create a duplicate.
+  const createdFunnelId = createFunnel.data?.funnel_id
+  React.useEffect(() => {
+    if (createdFunnelId === undefined) return
+    const timer = setTimeout(() => {
+      navigate(`/projects/${project.slug}/analytics/funnels/${createdFunnelId}`)
+    }, FUNNEL_SAVED_REDIRECT_DELAY_MS)
+    return () => clearTimeout(timer)
+  }, [createdFunnelId, navigate, project.slug])
 
   const handleSubmit = (formData: FunnelFormData) => {
     if (
@@ -104,7 +117,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
       </div>
       <FunnelForm
         project={project}
-        isSubmitting={createFunnel.isPending}
+        isSubmitting={createFunnel.isPending || createFunnel.isSuccess}
         feedback={feedback}
         onSubmit={handleSubmit}
         onCancel={handleCancel}
