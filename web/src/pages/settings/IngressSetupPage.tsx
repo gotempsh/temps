@@ -223,7 +223,7 @@ export function IngressSetupPage() {
       )}
       {/* A failed poll keeps the last list: replacing the wizard here would
           abort a run in progress and lose what it reported. */}
-      {nodesQuery.isError && nodesQuery.data && workers.length > 0 && (
+      {nodesQuery.isError && nodesQuery.data && (
         <p className="text-xs text-amber-700 dark:text-amber-300">
           The worker list may be out of date: the last refresh failed (
           {deliveryError(nodesQuery.error)}). Creating a tunnel checks the

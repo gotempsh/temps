@@ -217,6 +217,21 @@ describe('runTunnelSetup', () => {
     expect(last.find((s) => s.key === 'domain')?.status).toBe('pending')
   })
 
+  test('a run whose page went away creates nothing after the workers check', async () => {
+    const controller = new AbortController()
+    const { api, calls } = fakeApi({
+      listNodes: async () => {
+        calls.push('nodes')
+        // The page unmounts while the check is in flight.
+        controller.abort()
+        return [{ id: 1, name: 'worker-a', role: 'worker', status: 'active' }]
+      },
+    })
+    const outcome = await runTunnelSetup(plan, api, () => {}, controller.signal)
+    expect(outcome.kind).toBe('aborted')
+    expect(calls).toEqual(['nodes'])
+  })
+
   test('a worker the run cannot read the nodes for creates nothing either', async () => {
     const { api, calls } = fakeApi({
       listNodes: async () => {
