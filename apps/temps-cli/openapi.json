@@ -5595,6 +5595,21 @@
         ],
         "type": "object"
       },
+      "AssetCachePurgeResponse": {
+        "description": "Result of purging cached static assets.",
+        "properties": {
+          "deleted": {
+            "description": "How many cached asset entries were removed (0 when the cache was empty).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "type": "object"
+      },
       "AssignRoleRequest": {
         "properties": {
           "role_type": {
@@ -20455,6 +20470,14 @@
           },
           "sseIdleTimeoutSeconds": {
             "description": "Override for the proxy's idle timeout on Server-Sent Events streams to\nthis project/environment, in seconds. `None` = inherit the global\n`request_timeouts.default_sse_idle_timeout_seconds`. `Some(0)`\nexplicitly forces \"no timeout\". `Some(n)` for `n > 0` is clamped to\nthe global hard ceiling at resolution time.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stopTimeoutSeconds": {
+            "description": "How long, in seconds, a superseded deployment's containers get to\nfinish in-flight work after SIGTERM before they are killed, once a new\ndeployment has gone live. Raise it for long requests (uploads,\nexports, streaming responses, WebSockets). `None` = the platform\ndefault ([`DEFAULT_STOP_TIMEOUT_SECONDS`]); valid overrides are\n[`MIN_STOP_TIMEOUT_SECONDS`]..=[`MAX_STOP_TIMEOUT_SECONDS`].\nEnvironments inherit the project value and may override it.",
             "format": "int32",
             "type": [
               "integer",
@@ -74171,6 +74194,14 @@
               "null"
             ]
           },
+          "stopTimeoutSeconds": {
+            "description": "How long, in seconds (1-3600), the previous deployment's containers get\nto finish in-flight requests after SIGTERM, once a new deployment is\nlive, before they are killed. Absent leaves the current value\nunchanged; the platform default is 10 seconds.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "websocketIdleTimeoutSeconds": {
             "description": "Project-level default idle timeout for WebSocket connections, in\nseconds (0 = no timeout, or 1-86400). Environments may override this;\nalways clamped to the operator's global hard ceiling. Absent leaves\nthe current value unchanged.",
             "format": "int32",
@@ -74603,6 +74634,14 @@
           },
           "sse_idle_timeout_seconds": {
             "description": "Override the proxy's idle timeout for Server-Sent Events streams to\nthis environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the\noperator's global hard ceiling. Absent leaves the current value\nunchanged. Send JSON `null` to clear the override.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stop_timeout_seconds": {
+            "description": "Override how long, in seconds (1-3600), this environment's previous\ndeployment gets to finish in-flight requests after SIGTERM, once a new\ndeployment is live, before it is killed. Absent leaves the current\nvalue unchanged. Send JSON `null` to clear the override (inherit the\nproject value, else 10 seconds).",
             "format": "int32",
             "type": [
               "integer",
@@ -94466,7 +94505,7 @@
           "API Keys"
         ]
       },
-      "put": {
+      "patch": {
         "operationId": "update_api_key",
         "parameters": [
           {
@@ -136248,6 +136287,53 @@
         "x-maturity": "beta"
       }
     },
+    "/projects/{project_id}/asset-cache": {
+      "delete": {
+        "operationId": "purge_asset_cache",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetCachePurgeResponse"
+                }
+              }
+            },
+            "description": "Asset cache purged"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Purge all cached static assets for a project.\nOrphaned CAS blobs are cleaned up by the nightly garbage collector.",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
     "/projects/{project_id}/autofix": {
       "get": {
         "operationId": "get_autofix_capability",
@@ -143462,6 +143548,63 @@
         "summary": "Wake a sleeping on-demand environment",
         "tags": [
           "Environments"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/asset-cache": {
+      "delete": {
+        "operationId": "purge_environment_asset_cache",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetCachePurgeResponse"
+                }
+              }
+            },
+            "description": "Environment asset cache purged"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Purge cached static assets for a specific environment.",
+        "tags": [
+          "Deployments"
         ]
       }
     },
