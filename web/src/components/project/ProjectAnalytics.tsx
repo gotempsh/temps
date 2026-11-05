@@ -136,6 +136,7 @@ import {
   type QuickFilter,
   type AnalyticsDateFilter,
 } from '@/hooks/useAnalyticsDateRange'
+import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
 import {
   ArrowLeft,
   ArrowRight,
@@ -1294,10 +1295,8 @@ export function ProjectAnalyticsOverview({
   // /setup — the empty-state banner below already covers "no data yet".
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
-  )
+  // No refresh button: a relative range moves forward on its own.
+  const { startDate, endDate } = useAdvancingDateRange(dateFilter)
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
