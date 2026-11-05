@@ -3,6 +3,7 @@
 
 import { useEffect } from 'react'
 import { Link, useNavigate } from 'react-router'
+import { toast } from 'sonner'
 import {
   ArrowRight,
   Bell,
@@ -136,8 +137,14 @@ function buildRecommendations(
 export function Setup() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { items, completedCount, totalCount, allDone, isLoaded } =
-    useGettingStarted()
+  const {
+    items,
+    completedCount,
+    totalCount,
+    allDone,
+    isLoaded,
+    markHarnessCompleted,
+  } = useGettingStarted()
   const signals = useActivationSignals()
 
   useEffect(() => {
@@ -197,6 +204,24 @@ export function Setup() {
               totalCount={totalCount}
               pct={pct}
               onContinue={() => goToStep(nextStep)}
+              onMarkCompleted={
+                nextStep.key === 'ai'
+                  ? () => {
+                      try {
+                        markHarnessCompleted()
+                        toast.success(
+                          'Harness setup marked as completed in this browser.'
+                        )
+                      } catch (error) {
+                        toast.error(
+                          error instanceof Error
+                            ? error.message
+                            : 'Could not save checklist progress.'
+                        )
+                      }
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -357,12 +382,15 @@ function NextStepHero({
   totalCount,
   pct,
   onContinue,
+  onMarkCompleted,
 }: {
   step: GettingStartedItem
   completedCount: number
   totalCount: number
   pct: number
   onContinue: () => void
+  /** Only for a step Temps cannot check itself (the AI harness). */
+  onMarkCompleted?: () => void
 }) {
   const Icon = STEP_ICONS[step.key] ?? Sparkles
   return (
@@ -392,10 +420,21 @@ function NextStepHero({
                 </p>
               </div>
             </div>
-            <Button size="lg" className="shrink-0" onClick={onContinue}>
-              {step.cta}
-              <ArrowRight className="h-4 w-4 ml-1.5" />
-            </Button>
+            <div className="flex shrink-0 flex-col-reverse gap-2 sm:flex-row sm:items-center">
+              {onMarkCompleted && (
+                <Button
+                  variant="ghost"
+                  title="Save this checklist acknowledgment for your account in this browser"
+                  onClick={onMarkCompleted}
+                >
+                  Mark as completed
+                </Button>
+              )}
+              <Button size="lg" onClick={onContinue}>
+                {step.cta}
+                <ArrowRight className="h-4 w-4 ml-1.5" />
+              </Button>
+            </div>
           </div>
 
           <div className="mt-5 flex items-center gap-3">

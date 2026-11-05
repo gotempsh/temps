@@ -49,7 +49,7 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { SegmentedControl } from '@/components/ui/segmented-control'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
@@ -256,6 +256,11 @@ type BreakdownDimension =
   | 'browser'
   | 'operating_system'
 
+const DEVICE_OPTIONS = [
+  { value: 'desktop', label: 'Desktop', icon: Monitor },
+  { value: 'mobile', label: 'Mobile', icon: Smartphone },
+] as const
+
 const BREAKDOWN_DIMENSIONS: {
   value: BreakdownDimension
   label: string
@@ -429,26 +434,16 @@ function SpeedBreakdownCard({
               Average per group · sorted by samples · click a value to filter
             </CardDescription>
           </div>
-          <Tabs
+          <SegmentedControl
+            label="Break down by"
             value={dimension}
-            onValueChange={(v) => {
-              setDimension(v as BreakdownDimension)
+            onValueChange={(next) => {
+              setDimension(next)
               setSortKey('events')
               setSortDirection('desc')
             }}
-          >
-            <TabsList className="h-8">
-              {BREAKDOWN_DIMENSIONS.map((d) => (
-                <TabsTrigger
-                  key={d.value}
-                  value={d.value}
-                  className="h-6 px-2.5 text-xs"
-                >
-                  {d.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+            options={BREAKDOWN_DIMENSIONS}
+          />
         </div>
       </CardHeader>
       <CardContent>
@@ -828,27 +823,12 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               </SelectContent>
             </Select>
 
-            <Tabs
+            <SegmentedControl
+              label="Device"
               value={device}
-              onValueChange={(v) => setDevice(v as 'desktop' | 'mobile')}
-            >
-              <TabsList className="h-8">
-                <TabsTrigger
-                  value="desktop"
-                  icon={Monitor}
-                  className="h-6 px-2 text-xs"
-                >
-                  Desktop
-                </TabsTrigger>
-                <TabsTrigger
-                  value="mobile"
-                  icon={Smartphone}
-                  className="h-6 px-2 text-xs"
-                >
-                  Mobile
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
+              onValueChange={setDevice}
+              options={DEVICE_OPTIONS}
+            />
 
             <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
 
@@ -976,22 +956,15 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                     thresholds
                   </CardDescription>
                 </div>
-                <Tabs
+                <SegmentedControl
+                  label="Chart metric"
                   value={activeMetric}
-                  onValueChange={(v) => setActiveMetric(v as MetricKey)}
-                >
-                  <TabsList className="h-8">
-                    {tileMetrics.map((m) => (
-                      <TabsTrigger
-                        key={m}
-                        value={m}
-                        className="h-6 px-2.5 text-xs"
-                      >
-                        {METRIC_THRESHOLDS[m].short}
-                      </TabsTrigger>
-                    ))}
-                  </TabsList>
-                </Tabs>
+                  onValueChange={setActiveMetric}
+                  options={tileMetrics.map((m) => ({
+                    value: m,
+                    label: METRIC_THRESHOLDS[m].short,
+                  }))}
+                />
               </div>
             </CardHeader>
             <CardContent>

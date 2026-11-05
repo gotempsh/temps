@@ -15,6 +15,8 @@ interface ProjectCardMediaProps {
   logoClassName?: string
   /** Overrides the initial shown when there is no image. */
   fallbackClassName?: string
+  /** The name is already written beside the image, so do not announce it twice. */
+  decorative?: boolean
 }
 
 export function ProjectCardMedia({
@@ -25,6 +27,7 @@ export function ProjectCardMedia({
   className,
   logoClassName,
   fallbackClassName,
+  decorative,
 }: ProjectCardMediaProps) {
   return (
     <ProjectCardMediaContent
@@ -36,6 +39,7 @@ export function ProjectCardMedia({
       className={className}
       logoClassName={logoClassName}
       fallbackClassName={fallbackClassName}
+      decorative={decorative}
     />
   )
 }
@@ -48,6 +52,7 @@ function ProjectCardMediaContent({
   className,
   logoClassName,
   fallbackClassName,
+  decorative = false,
 }: ProjectCardMediaProps) {
   const sources = projectCardMediaSources(
     deploymentUrl,
@@ -59,12 +64,13 @@ function ProjectCardMediaContent({
 
   return (
     <span
-      role="img"
+      {...(decorative
+        ? { 'aria-hidden': true }
+        : { role: 'img', 'aria-label': `${name} service image` })}
       className={cn(
         'relative flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-md border bg-muted/55',
         className
       )}
-      aria-label={`${name} service image`}
     >
       {source ? (
         <img
@@ -81,7 +87,12 @@ function ProjectCardMediaContent({
           onError={() => setSourceIndex((current) => current + 1)}
         />
       ) : (
-        <span className={cn('text-sm font-medium text-muted-foreground', fallbackClassName)}>
+        <span
+          className={cn(
+            'text-sm font-medium text-muted-foreground',
+            fallbackClassName
+          )}
+        >
           {name.slice(0, 1).toUpperCase()}
         </span>
       )}

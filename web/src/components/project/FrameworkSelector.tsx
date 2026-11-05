@@ -14,6 +14,7 @@ import {
 } from '@/components/git-providers/GitConnectionExpiredAlert'
 import type { ProjectPresetResponse, PresetResponse } from '@/api/client'
 import { usePresets } from '@/contexts/PresetContext'
+import { isSameDockerfile } from '@/lib/preset-selection'
 
 // Helper function to normalize path for consistent comparison
 // Normalizes '.', './', and empty strings to 'root'
@@ -37,7 +38,18 @@ interface FrameworkSelectorProps {
   isRefreshing?: boolean
   error?: Error | null
   selectedPreset: string
-  onSelectPreset: (value: string) => void
+  /**
+   * The Dockerfile in use. Several Dockerfiles can share one path, so the key
+   * alone cannot tell which card is selected; without this they all are.
+   */
+  selectedDockerfilePath?: string
+  /**
+   * The path is typed beside the selector, so one no card has selects no card,
+   * rather than adding one for it on every keystroke.
+   */
+  editableDockerfilePath?: boolean
+  /** `detected` is the card chosen, when it came from detection. */
+  onSelectPreset: (value: string, detected?: ProjectPresetResponse) => void
   onRefresh?: () => void
   disabled?: boolean
 }
@@ -48,6 +60,8 @@ export function FrameworkSelector({
   isRefreshing = false,
   error,
   selectedPreset,
+  selectedDockerfilePath,
+  editableDockerfilePath = false,
   onSelectPreset,
   onRefresh,
   disabled = false,
@@ -81,7 +95,10 @@ export function FrameworkSelector({
     const alreadyExists = rawDetectedProjects.some((p) => {
       return (
         p.preset === selectedSlug &&
-        normalizePath(p.path) === normalizedSelectedPath
+        normalizePath(p.path) === normalizedSelectedPath &&
+        (editableDockerfilePath ||
+          selectedDockerfilePath === undefined ||
+          isSameDockerfile(p.dockerfilePath, selectedDockerfilePath))
       )
     })
 
@@ -96,9 +113,16 @@ export function FrameworkSelector({
       iconUrl: presetInfo?.icon_url || '',
       projectType: presetInfo?.project_type || 'server',
       path: selectedPath === 'root' ? './' : selectedPath,
+      dockerfilePath: selectedDockerfilePath,
     }
     return [injected, ...rawDetectedProjects]
-  }, [rawDetectedProjects, selectedPreset, getPresetBySlug])
+  }, [
+    rawDetectedProjects,
+    selectedPreset,
+    selectedDockerfilePath,
+    editableDockerfilePath,
+    getPresetBySlug,
+  ])
 
   const hasDetectedPresets = detectedProjects.length > 0 && !error
 
@@ -149,7 +173,7 @@ export function FrameworkSelector({
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <label className="text-sm font-medium">Framework Preset</label>
+        <label className="text-sm font-medium">Framework preset</label>
         <div className="flex items-center gap-2">
           {/* Refresh button */}
           {onRefresh && (
@@ -259,9 +283,10 @@ export function FrameworkSelector({
           <>
             {(presetsToDisplay as ProjectPresetResponse[]).map((project) => (
               <DetectedPresetCard
-                key={`${project.preset}::${project.path || 'root'}`}
+                key={`${project.preset}::${project.path || 'root'}::${project.dockerfilePath ?? ''}`}
                 project={project}
                 selectedPreset={selectedPreset}
+                selectedDockerfilePath={selectedDockerfilePath}
                 onSelectPreset={onSelectPreset}
                 disabled={disabled}
                 getPresetBySlug={getPresetBySlug}
@@ -291,6 +316,31 @@ function TypeBadge({ children }: { children: React.ReactNode }) {
   )
 }
 
+/** Makes a whole card a toggle button, for the keyboard as well as the pointer. */
+function selectableCardProps(
+  isSelected: boolean,
+  disabled: boolean,
+  onSelect: () => void
+) {
+  return {
+    role: 'button',
+    tabIndex: disabled ? -1 : 0,
+    'aria-pressed': isSelected,
+    'aria-disabled': disabled || undefined,
+    onClick: () => {
+      if (!disabled) onSelect()
+    },
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (disabled || (event.key !== 'Enter' && event.key !== ' ')) return
+      event.preventDefault()
+      // The key is spent choosing this card. A form around it may treat Enter
+      // as "continue", which would leave the step as the choice is made.
+      event.stopPropagation()
+      onSelect()
+    },
+  }
+}
+
 // Component for showing a preset from the full catalog
 function PresetCard({
   preset,
@@ -305,13 +355,12 @@ function PresetCard({
 }) {
   return (
     <Card
-      className={`relative cursor-pointer transition-shadow hover:shadow-sm dark:hover:shadow-none ${
+      className={`relative cursor-pointer transition-shadow hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:shadow-none ${
         isSelected
           ? 'ring-2 ring-primary ring-offset-1 ring-offset-background'
           : ''
       } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
-      onClick={() => !disabled && onSelect()}
-      aria-pressed={isSelected}
+      {...selectableCardProps(isSelected, disabled, onSelect)}
     >
       <CardContent className="p-4">
         {isSelected && (
@@ -353,13 +402,15 @@ function PresetCard({
 function DetectedPresetCard({
   project,
   selectedPreset,
+  selectedDockerfilePath,
   onSelectPreset,
   disabled,
   getPresetBySlug,
 }: {
   project: ProjectPresetResponse
   selectedPreset: string
-  onSelectPreset: (value: string) => void
+  selectedDockerfilePath?: string
+  onSelectPreset: (value: string, detected?: ProjectPresetResponse) => void
   disabled: boolean
   getPresetBySlug: (slug: string) => PresetResponse | undefined
 }) {
@@ -379,9 +430,17 @@ function DetectedPresetCard({
     const normalizedSelectedPath = normalizePath(selectedPath)
     return (
       project.preset === selectedSlug &&
-      normalizedPath === normalizedSelectedPath
+      normalizedPath === normalizedSelectedPath &&
+      (selectedDockerfilePath === undefined ||
+        isSameDockerfile(project.dockerfilePath, selectedDockerfilePath))
     )
-  }, [selectedPreset, project.preset, normalizedPath])
+  }, [
+    selectedPreset,
+    selectedDockerfilePath,
+    project.preset,
+    project.dockerfilePath,
+    normalizedPath,
+  ])
 
   const presetInfo = getPresetBySlug(project.preset)
   const fallbackPreset = getPresetBySlug('nixpacks')
@@ -391,17 +450,16 @@ function DetectedPresetCard({
   const projectType = presetInfo?.project_type || 'Server'
   const description = presetInfo?.description || 'Custom configuration'
   const pathLabel = project.path && project.path !== '.' ? project.path : './'
-  const onPick = () => !disabled && onSelectPreset(presetKey)
+  const onPick = () => onSelectPreset(presetKey, project)
 
   return (
     <Card
-      className={`relative cursor-pointer transition-shadow hover:shadow-sm dark:hover:shadow-none ${
+      className={`relative cursor-pointer transition-shadow hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:hover:shadow-none ${
         isSelected
           ? 'ring-2 ring-primary ring-offset-1 ring-offset-background'
           : ''
       } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
-      onClick={onPick}
-      aria-pressed={isSelected}
+      {...selectableCardProps(isSelected, disabled, onPick)}
     >
       <CardContent className="p-4">
         {isSelected && (
@@ -443,7 +501,7 @@ function DetectedPresetCard({
                 className="mt-1 truncate text-xs text-muted-foreground"
                 title={project.dockerfilePath}
               >
-                Dockerfile detected in{' '}
+                Builds with{' '}
                 <span className="font-mono">{project.dockerfilePath}</span>
               </p>
             )}

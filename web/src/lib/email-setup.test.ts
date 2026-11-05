@@ -7,7 +7,7 @@ import type {
   EmailProviderResponse,
   EmailStatsResponse,
 } from '@/api/client'
-import { emailSetupSteps } from './email-setup'
+import { emailOverviewSections, emailSetupSteps } from './email-setup'
 
 const provider = {
   id: 1,
@@ -114,4 +114,37 @@ test('only delivered email completes sending, not captured or failed', () => {
   expect(failed.done).toBe(false)
   expect(failed.detail).toContain('2 failed')
   expect(step('send', { stats: stats({ total: 1, sent: 1 }) }).done).toBe(true)
+})
+
+test('with nothing set up, only the checklist shows', () => {
+  expect(
+    emailOverviewSections({ providers: [], domains: [], stats: stats() })
+  ).toEqual({ domains: false, providers: false, sent: false, events: false })
+})
+
+test('during setup, a section shows once it has something to manage', () => {
+  expect(
+    emailOverviewSections({
+      providers: [provider],
+      domains: [],
+      stats: stats({ total: 2, captured: 2 }),
+    })
+  ).toEqual({ domains: false, providers: true, sent: true, events: true })
+  expect(
+    emailOverviewSections({
+      providers: [provider],
+      domains: [domain('pending')],
+      stats: stats(),
+    })
+  ).toEqual({ domains: true, providers: true, sent: false, events: false })
+})
+
+test('once setup is done every section shows, even an empty one', () => {
+  expect(
+    emailOverviewSections({
+      providers: [provider],
+      domains: [domain('verified')],
+      stats: stats({ total: 1, sent: 1 }),
+    })
+  ).toEqual({ domains: true, providers: true, sent: true, events: true })
 })

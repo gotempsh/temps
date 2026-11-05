@@ -136,6 +136,7 @@ import {
   type QuickFilter,
   type AnalyticsDateFilter,
 } from '@/hooks/useAnalyticsDateRange'
+import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
 import {
   ArrowLeft,
   ArrowRight,
@@ -233,8 +234,9 @@ export interface AnalyticsFiltersProps {
   onFilterChange: (filter: QuickFilter) => void
   onDateRangeChange: (range: DateRange | undefined) => void
   onEnvironmentChange: (environment: number | undefined) => void
-  onRefresh: () => void
-  isRefreshing: boolean
+  /** Leave out on a page that should offer only the filters. */
+  onRefresh?: () => void
+  isRefreshing?: boolean
   /** Extra page-level actions rendered before the refresh button. */
   actions?: React.ReactNode
   /** Extra controls rendered next to the environment selector, on the left side. */
@@ -250,7 +252,7 @@ export function AnalyticsFilters({
   onDateRangeChange,
   onEnvironmentChange,
   onRefresh,
-  isRefreshing,
+  isRefreshing = false,
   actions,
   leftActions,
 }: AnalyticsFiltersProps) {
@@ -294,17 +296,19 @@ export function AnalyticsFilters({
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex flex-wrap items-center gap-2">
           {actions}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onRefresh}
-            disabled={isRefreshing}
-          >
-            <RefreshCw
-              className={cn('h-4 w-4', isRefreshing && 'animate-spin')}
-            />
-            Refresh
-          </Button>
+          {onRefresh && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onRefresh}
+              disabled={isRefreshing}
+            >
+              <RefreshCw
+                className={cn('h-4 w-4', isRefreshing && 'animate-spin')}
+              />
+              Refresh
+            </Button>
+          )}
           <DateTimeRange
             value={(() => {
               const { startDate, endDate } = getDateRangeFromFilter({
@@ -1244,7 +1248,9 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
 interface ProjectAnalyticsOverviewProps {
   project: ProjectResponse
 }
-function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
+export function ProjectAnalyticsOverview({
+  project,
+}: ProjectAnalyticsOverviewProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const { patch: patchUrl } = useUrlState<'filter' | 'from' | 'to'>()
@@ -1285,17 +1291,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   )
 
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const [dateRangeRefreshKey, setDateRangeRefreshKey] = React.useState(0)
   // While the guided tour is showing off this page, don't yank the user to
   // /setup — the empty-state banner below already covers "no data yet".
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
-  const queryClient = useQueryClient()
-  const { startDate, endDate } = React.useMemo(() => {
-    void dateRangeRefreshKey
-    return getDateRangeFromFilter(dateFilter)
-  }, [dateFilter, dateRangeRefreshKey])
+  // No refresh button: a relative range moves forward on its own.
+  const { startDate, endDate } = useAdvancingDateRange(dateFilter)
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
@@ -1332,52 +1333,34 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     }
   }, [hasNoData, showSetupOverride, project.slug, navigate])
 
-  const handleRefresh = React.useCallback(async () => {
-    setDateRangeRefreshKey((current) => current + 1)
-    setIsRefreshing(true)
-    try {
-      // Invalidate all analytics queries for this project
-      await queryClient.invalidateQueries({
-        predicate: (query) => {
-          const queryKey = query.queryKey
-          return (
-            Array.isArray(queryKey) &&
-            queryKey.some(
-              (key) =>
-                typeof key === 'object' &&
-                key &&
-                'query' in key &&
-                typeof key.query === 'object' &&
-                key.query &&
-                'project_id_or_slug' in key.query &&
-                key.query.project_id_or_slug === project.slug
-            )
-          )
-        },
-      })
-      // Also invalidate the hasAnalyticsEvents query specifically
-      await hasAnalyticsEventsQuery.refetch()
-    } finally {
-      setIsRefreshing(false)
-    }
-  }, [queryClient, project.slug, hasAnalyticsEventsQuery])
-
   return (
     <>
       <div className="space-y-6">
         <PageHeader
           title="Analytics"
           description={`Traffic, audience, and engagement for ${project.name}.`}
+          className="sm:items-center"
           actions={
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                navigate(`/projects/${project.slug}/analytics/globe`)
+            <AnalyticsFilters
+              project={project}
+              activeFilter={dateFilter.quickFilter}
+              dateRange={dateFilter.dateRange}
+              selectedEnvironment={selectedEnvironment}
+              onFilterChange={(filter) =>
+                updateDateFilter({
+                  ...dateFilter,
+                  quickFilter: filter,
+                  dateRange: undefined,
+                })
               }
-            >
-              <Globe className="mr-2 size-4" /> Visitor globe
-            </Button>
+              onDateRangeChange={(range) =>
+                updateDateFilter({
+                  quickFilter: range ? 'custom' : dateFilter.quickFilter,
+                  dateRange: range,
+                })
+              }
+              onEnvironmentChange={setSelectedEnvironment}
+            />
           }
         />
 
@@ -1407,35 +1390,6 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
         )}
 
         <div className="flex flex-col gap-6">
-          <AnalyticsFilters
-            project={project}
-            activeFilter={dateFilter.quickFilter}
-            dateRange={dateFilter.dateRange}
-            selectedEnvironment={selectedEnvironment}
-            onFilterChange={(filter) =>
-              updateDateFilter({
-                ...dateFilter,
-                quickFilter: filter,
-                dateRange: undefined,
-              })
-            }
-            onDateRangeChange={(range) =>
-              updateDateFilter({
-                quickFilter: range ? 'custom' : dateFilter.quickFilter,
-                dateRange: range,
-              })
-            }
-            onEnvironmentChange={setSelectedEnvironment}
-            onRefresh={handleRefresh}
-            isRefreshing={isRefreshing}
-            actions={
-              <InsightsToggleButton
-                open={insightsOpen}
-                onToggle={setInsightsOpen}
-              />
-            }
-          />
-
           {/* Analytics Metrics */}
           <AnalyticsMetrics
             project={project}
@@ -1443,6 +1397,13 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
             endDate={endDate}
             environment={selectedEnvironment}
           />
+          <div className="flex justify-end">
+            <InsightsToggleButton
+              open={insightsOpen}
+              onToggle={setInsightsOpen}
+              showLabel
+            />
+          </div>
           {insightsOpen && (
             <OverviewInsights
               project={project}

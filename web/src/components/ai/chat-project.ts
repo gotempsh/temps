@@ -6,6 +6,8 @@ export interface ProjectChoice {
   id: number
   name: string
   slug?: string | null
+  service_template_image_url?: string | null
+  source_type?: string | null
 }
 
 /** Most projects the picker fetches; the search covers only these. */

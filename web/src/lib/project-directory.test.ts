@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  canonicalProjectDirectory,
   isRepositoryRootDirectory,
   rootDirectoryHelp,
 } from './project-directory'
@@ -44,4 +45,14 @@ describe('isRepositoryRootDirectory', () => {
       expect(isRepositoryRootDirectory(directory)).toBe(false)
     }
   )
+})
+
+describe('canonicalProjectDirectory', () => {
+  test('matches the server: slashes, no leading slash, one root spelling', () => {
+    expect(canonicalProjectDirectory(' /apps/web ')).toBe('apps/web')
+    expect(canonicalProjectDirectory('apps\\web')).toBe('apps/web')
+    expect(canonicalProjectDirectory('.')).toBe('./')
+    expect(canonicalProjectDirectory('')).toBe('./')
+    expect(canonicalProjectDirectory('./apps')).toBe('./apps')
+  })
 })

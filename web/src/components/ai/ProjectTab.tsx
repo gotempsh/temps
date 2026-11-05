@@ -5,7 +5,7 @@ import {
   getLastDeploymentOptions,
   getProjectOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -62,11 +62,7 @@ export function ProjectTab({ projectId }: { projectId: number }) {
   return (
     <div className="flex min-h-0 flex-col">
       <div className="flex items-center gap-3 px-4 py-3">
-        <ProjectAvatar
-          name={data.name}
-          className="size-10 rounded-md"
-          fallbackClassName="rounded-md bg-primary/10 text-primary"
-        />
+        <ServiceIcon service={data} size="lg" />
         <div className="min-w-0">
           <h3 className="truncate text-sm font-semibold">{data.name}</h3>
           <p className="flex items-center gap-1 text-xs text-muted-foreground">

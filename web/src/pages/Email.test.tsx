@@ -68,8 +68,15 @@ function renderEmail(
   return { api, view }
 }
 
+/** Provider, verified domain and a delivered email: the checklist is done. */
+const SET_UP = {
+  providers: [PROVIDER],
+  domains: [DOMAIN],
+  stats: { ...noEmails, total: 1, sent: 1 },
+}
+
 test('one page shows domains before providers, then sent emails, with only the SDK apart', async () => {
-  const { view } = renderEmail('/email')
+  const { view } = renderEmail('/email', SET_UP)
   expect(
     view.getAllByRole('tab').map((tab) => tab.textContent?.trim())
   ).toEqual(['Overview', 'SDK'])
@@ -82,12 +89,12 @@ test('one page shows domains before providers, then sent emails, with only the S
 })
 
 for (const old of ['providers', 'domains', 'emails', 'analytics']) {
-  test(`an old ?tab=${old} link lands on the overview`, () => {
-    const { view } = renderEmail(`/email?tab=${old}`)
+  test(`an old ?tab=${old} link lands on the overview`, async () => {
+    const { view } = renderEmail(`/email?tab=${old}`, SET_UP)
     expect(
       view.getByRole('tab', { name: 'Overview' }).getAttribute('data-state')
     ).toBe('active')
-    expect(view.getByRole('heading', { name: 'Domains' })).toBeTruthy()
+    expect(await view.findByRole('heading', { name: 'Domains' })).toBeTruthy()
   })
 }
 
@@ -108,6 +115,46 @@ test('a new install is asked for one thing at a time, starting with a provider',
       .getAllByRole('link')
       .map((link) => link.getAttribute('href'))
   ).toEqual(['/email/providers/new'])
+})
+
+test('a new install shows only the checklist, not empty sections repeating it', async () => {
+  const { view } = renderEmail('/email')
+  await view.findByRole('region', { name: 'Set up sending' })
+  for (const name of ['Domains', 'Providers', 'Sent emails', 'Event log']) {
+    expect(view.queryByRole('heading', { name })).toBeNull()
+  }
+})
+
+test('a hidden section stays mounted, so an open dialog survives it hiding', async () => {
+  const { view } = renderEmail('/email')
+  await view.findByRole('region', { name: 'Set up sending' })
+  for (const id of ['email-domains', 'email-providers', 'email-sent']) {
+    const section = document.getElementById(id)
+    expect(section).not.toBeNull()
+    expect(section?.closest('[hidden]')).not.toBeNull()
+  }
+})
+
+test('an old ?tab= link scrolls to its section once the page knows it shows', async () => {
+  const scrolled: string[] = []
+  const original = Element.prototype.scrollIntoView
+  // A hidden section has no box to scroll to, as in a browser.
+  Element.prototype.scrollIntoView = function (this: Element) {
+    if (!this.closest('[hidden]')) scrolled.push(this.id)
+  }
+  try {
+    renderEmail('/email?tab=providers', SET_UP)
+    await waitFor(() => expect(scrolled).toContain('email-providers'))
+  } finally {
+    Element.prototype.scrollIntoView = original
+  }
+})
+
+test('during setup, a connected provider shows but the empty domains do not', async () => {
+  const { view } = renderEmail('/email', { providers: [PROVIDER] })
+  expect(await view.findByRole('heading', { name: 'Providers' })).toBeTruthy()
+  expect(view.queryByRole('heading', { name: 'Domains' })).toBeNull()
+  expect(view.queryByRole('heading', { name: 'Sent emails' })).toBeNull()
 })
 
 test('the checklist moves on to the domain once a provider exists', async () => {

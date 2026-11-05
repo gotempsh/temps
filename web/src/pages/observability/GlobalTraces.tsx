@@ -4,8 +4,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { traceDetailPath } from '@/lib/traces-time-window'
 import { ChartGantt, Layers } from 'lucide-react'
-import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
-import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   durationBarClass,
   durationShare,
@@ -122,19 +121,8 @@ export default function GlobalTraces() {
     }),
     retry: false,
   })
-  const projectIds = [
-    ...new Set(query.data?.data.map((trace) => trace.project_id) ?? []),
-  ].sort((a, b) => a - b)
-  const media = useLatestDeploymentMedia(projectIds)
   const projectImage = (id: number, name: string) => (
-    <ProjectCardMedia
-      name={name}
-      className="size-6 [&_img]:p-0.5"
-      deploymentUrl={media.data?.projects?.[String(id)]?.url}
-      screenshotLocation={
-        media.data?.projects?.[String(id)]?.screenshot_location
-      }
-    />
+    <ServiceIcon service={{ id, name }} size="sm" />
   )
   const traces = query.data?.data ?? []
   // Bars compare traces on this page, so the slowest one fills its track.

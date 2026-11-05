@@ -134,6 +134,7 @@ import {
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
 import { detectedPortForSelection } from '@/lib/dockerfile-port'
+import { selectedDockerfileFor } from '@/lib/preset-selection'
 import { getRepositoryUrl } from '@/lib/repository-url'
 
 // Best-effort provider detection from the repo URL's hostname, for the brand
@@ -1517,8 +1518,13 @@ export function ProjectConfigurator({
                   isRefreshing={presetFetching || isManuallyRefreshingPresets}
                   error={presetError}
                   selectedPreset={selectValue}
+                  selectedDockerfilePath={selectedDockerfileFor(
+                    selectValue,
+                    selectedDockerfilePath
+                  )}
+                  editableDockerfilePath
                   onRefresh={handleRefreshPresets}
-                  onSelectPreset={(value) => {
+                  onSelectPreset={(value, detected) => {
                     if (value === 'custom') {
                       field.onChange('custom')
                       form.setValue('rootDirectory', './')
@@ -1559,11 +1565,14 @@ export function ProjectConfigurator({
                       // and resets to the plain default otherwise, so a
                       // stale value from a previous selection never lingers.
                       if (presetName === 'dockerfile') {
-                        const matchedCandidate = presetData?.presets?.find(
-                          (p: ProjectPresetResponse) =>
-                            p.preset === presetName &&
-                            normalizePath(p.path) === normalizePath(presetPath)
-                        )
+                        const matchedCandidate =
+                          detected ??
+                          presetData?.presets?.find(
+                            (p: ProjectPresetResponse) =>
+                              p.preset === presetName &&
+                              normalizePath(p.path) ===
+                                normalizePath(presetPath)
+                          )
                         form.setValue(
                           'dockerfilePath',
                           matchedCandidate?.dockerfilePath || 'Dockerfile'
