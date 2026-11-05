@@ -11,6 +11,180 @@ use crate::compose::{
 };
 use bollard::Docker;
 
+/// Removes everything a test's Compose project created when the test ends, however
+/// it ends. A `restart: always` container left behind by a panic would keep running.
+struct ComposeStackCleanup {
+    project_name: String,
+    project_dir: std::path::PathBuf,
+}
+
+impl ComposeStackCleanup {
+    fn new(project_name: &str, project_dir: &std::path::Path) -> Self {
+        Self {
+            project_name: project_name.to_string(),
+            project_dir: project_dir.to_path_buf(),
+        }
+    }
+}
+
+/// Longest a test's cleanup may take. `Drop` is synchronous, so no async timeout
+/// around the test could interrupt it if Docker stopped answering.
+const COMPOSE_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `command` until `deadline`, killing it if it is still running then.
+/// `None` when it could not be started or ran out of time.
+fn output_until(
+    mut command: std::process::Command,
+    deadline: std::time::Instant,
+) -> Option<std::process::Output> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+impl Drop for ComposeStackCleanup {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + COMPOSE_CLEANUP_DEADLINE;
+
+        // By label first: this also catches one-off `run` containers.
+        let mut list = std::process::Command::new("docker");
+        list.args(["ps", "--all", "--quiet", "--filter"])
+            .arg(format!(
+                "label={COMPOSE_PROJECT_LABEL}={}",
+                self.project_name
+            ));
+        if let Some(listed) = output_until(list, deadline) {
+            let stdout = String::from_utf8_lossy(&listed.stdout);
+            let containers: Vec<&str> = stdout.split_whitespace().collect();
+            if !containers.is_empty() {
+                let mut remove = std::process::Command::new("docker");
+                remove
+                    .args(["rm", "--force", "--volumes"])
+                    .args(&containers);
+                let _ = output_until(remove, deadline);
+            }
+        }
+
+        // Then the project's networks and volumes.
+        let mut down = std::process::Command::new("docker");
+        down.args(["compose", "-p", &self.project_name])
+            .args(["down", "--volumes", "--remove-orphans"])
+            .current_dir(&self.project_dir);
+        let _ = output_until(down, deadline);
+    }
+}
+
+#[test]
+fn a_cleanup_command_that_stalls_is_killed_at_the_deadline() {
+    let mut stalled = std::process::Command::new("sleep");
+    stalled.arg("30");
+    let started = std::time::Instant::now();
+
+    let output = output_until(stalled, started + std::time::Duration::from_millis(100));
+
+    assert!(output.is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the command ran for {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_cleanup_command_that_finishes_returns_its_output() {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "echo listed"]);
+
+    let output = output_until(
+        command,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .expect("the command finishes well before the deadline");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "listed");
+}
+
+#[tokio::test]
+async fn a_test_that_panics_still_removes_its_compose_stack() {
+    let Some(executor) = test_executor() else {
+        return;
+    };
+    let docker = executor
+        .docker
+        .require()
+        .expect("test_executor only builds an available handle")
+        .clone();
+    let compose_available = tokio::process::Command::new("docker")
+        .args(["compose", "version"])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success());
+    if !compose_available || docker.inspect_image("alpine:latest").await.is_err() {
+        println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+        return;
+    }
+
+    let project_dir = tempfile::tempdir().unwrap();
+    let project_name = format!(
+        "temps-stop-cleanup-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::write(
+        project_dir.path().join("docker-compose.yml"),
+        "services:\n  web:\n    image: alpine:latest\n    restart: always\n    command: [\"sleep\", \"300\"]\n",
+    )
+    .unwrap();
+    let cleanup = ComposeStackCleanup::new(&project_name, project_dir.path());
+    let up = tokio::process::Command::new("docker")
+        .args(["compose", "-p", &project_name, "up", "-d"])
+        .current_dir(project_dir.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+
+    let panicked = tokio::spawn(async move {
+        let _cleanup = cleanup;
+        panic!("a failure partway through a test");
+    })
+    .await;
+    assert!(panicked.is_err());
+
+    let remaining = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{COMPOSE_PROJECT_LABEL}={project_name}")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert!(remaining.is_empty(), "{remaining:?}");
+}
+
 #[tokio::test]
 async fn a_stopped_stack_will_not_be_restarted_by_docker() {
     let Some(executor) = test_executor() else {
@@ -50,21 +224,23 @@ async fn a_stopped_stack_will_not_be_restarted_by_docker() {
             .current_dir(project_dir.path());
         command
     };
+    let _cleanup = ComposeStackCleanup::new(&project_name, project_dir.path());
     let up = compose(&["up", "-d"]).output().await.unwrap();
-    if !up.status.success() {
-        // Compose can leave containers behind when startup fails.
-        let _ = compose(&["down", "-v"]).output().await;
-        panic!("{}", String::from_utf8_lossy(&up.stderr));
-    }
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
     // An operator's one-off container is not part of the stack.
     let one_off = compose(&["run", "-d", "--rm", "web"])
         .output()
         .await
         .unwrap();
-    if !one_off.status.success() {
-        let _ = compose(&["down", "-v"]).output().await;
-        panic!("{}", String::from_utf8_lossy(&one_off.stderr));
-    }
+    assert!(
+        one_off.status.success(),
+        "{}",
+        String::from_utf8_lossy(&one_off.stderr)
+    );
 
     let stopped = executor
         .stop_at(
@@ -93,15 +269,6 @@ async fn a_stopped_stack_will_not_be_restarted_by_docker() {
             .and_then(|labels| labels.get("com.docker.compose.oneoff"))
             .is_some_and(|value| value == "True");
         if one_off_container {
-            let _ = docker
-                .remove_container(
-                    container.id.as_deref().unwrap(),
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
             continue;
         }
         let inspected = docker
@@ -119,7 +286,6 @@ async fn a_stopped_stack_will_not_be_restarted_by_docker() {
                 .and_then(|policy| policy.name),
         ));
     }
-    let _ = compose(&["down", "-v"]).output().await;
 
     stopped.expect("stop should succeed");
     assert_eq!(
@@ -170,12 +336,13 @@ async fn a_failed_stop_leaves_running_containers_their_restart_policy() {
             .current_dir(project_dir.path());
         command
     };
+    let _cleanup = ComposeStackCleanup::new(&project_name, project_dir.path());
     let up = compose(&["up", "-d"]).output().await.unwrap();
-    if !up.status.success() {
-        // Compose can leave containers behind when startup fails.
-        let _ = compose(&["down", "-v"]).output().await;
-        panic!("{}", String::from_utf8_lossy(&up.stderr));
-    }
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
 
     let stopped = executor
         .stop_at(
@@ -203,7 +370,6 @@ async fn a_failed_stop_leaves_running_containers_their_restart_policy() {
         )
         .await
         .unwrap();
-    let _ = compose(&["down", "-v"]).output().await;
 
     stopped.expect_err("the Compose file does not exist");
     assert_eq!(inspected.state.and_then(|state| state.running), Some(true));
@@ -266,12 +432,13 @@ async fn a_running_service_outside_the_compose_file_keeps_its_restart_policy() {
             .current_dir(project_dir.path());
         command
     };
+    let _cleanup = ComposeStackCleanup::new(&project_name, project_dir.path());
     let up = compose(&["up", "-d"]).output().await.unwrap();
-    if !up.status.success() {
-        // Compose can leave containers behind when startup fails.
-        let _ = compose(&["down", "-v"]).output().await;
-        panic!("{}", String::from_utf8_lossy(&up.stderr));
-    }
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
 
     let stopped = executor
         .stop_at(&project_name, Some(project_dir.path()), Some("next.yml"))
@@ -312,7 +479,6 @@ async fn a_running_service_outside_the_compose_file_keeps_its_restart_policy() {
         ));
     }
     services.sort_by(|a, b| a.0.cmp(&b.0));
-    let _ = compose(&["down", "-v"]).output().await;
 
     stopped.expect("stop should succeed");
     assert_eq!(
