@@ -40,8 +40,16 @@ export const GITLAB_AUTHORIZATION_REJECTED =
   "GitLab no longer accepts this connection's authorization"
 
 /**
- * The message for a GitLab OAuth connection whose refresh token was rejected,
- * or `null` for anything else. `is_expired` is the block itself. The
+ * Where a connection whose provider has no Reauthorize action gets a working
+ * authorization: this flow adds a GitLab OAuth provider.
+ */
+export const GITLAB_OAUTH_SETUP_PATH = '/git-providers/add'
+
+/**
+ * The message for a GitLab connection whose refresh token was rejected, or
+ * `null` for anything else. Check `providerSupportsReauthorization` before
+ * offering Reauthorize with it, because a GitLab App connection reaches this
+ * too and has no such action. `is_expired` is the block itself. The
  * `invalid_grant` check covers a health message recorded before the server
  * stopped storing raw provider responses, until the next check replaces it.
  */

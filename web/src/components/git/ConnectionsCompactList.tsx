@@ -13,7 +13,9 @@ import {
 import {
   authorizationRejectedMessage,
   canReauthorizeConnection,
+  GITLAB_OAUTH_SETUP_PATH,
   needsReauthorization,
+  providerSupportsReauthorization,
 } from './reauthorization'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
@@ -180,8 +182,11 @@ export function ConnectionsCompactList({
       </Button>
     ) : null
 
+  const hasReauthorize = providerSupportsReauthorization(provider)
+
   // The message sits beside the action that resolves it, in every variant. A
   // provider's response never reaches this list for a rejected authorization.
+  // A provider with no Reauthorize action links to the way out it does have.
   const renderReauthorizeAction = (c: ConnectionResponse) => {
     const message = authorizationRejectedMessage(c, provider)
     const button = renderReauthorizeButton(c)
@@ -192,6 +197,14 @@ export function ConnectionsCompactList({
           <span className="text-xs font-medium text-destructive">
             {message}
           </span>
+        )}
+        {message && !hasReauthorize && (
+          <Link
+            to={GITLAB_OAUTH_SETUP_PATH}
+            className="text-xs font-medium underline"
+          >
+            Add a GitLab OAuth provider
+          </Link>
         )}
         {button}
       </div>
@@ -443,7 +456,9 @@ export function ConnectionsCompactList({
               }
             >
               {authorizationRejectedMessage(c, provider)
-                ? 'Reauthorization required'
+                ? hasReauthorize
+                  ? 'Reauthorization required'
+                  : 'Reconnection required'
                 : unhealthy && c.health_message
                   ? c.health_message
                   : healthy

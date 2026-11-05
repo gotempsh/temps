@@ -52,6 +52,7 @@ import type {
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   authorizationRejectedMessage,
+  GITLAB_OAUTH_SETUP_PATH,
   providerSupportsReauthorization,
 } from '@/components/git/reauthorization'
 import { Badge } from '@/components/ui/badge'
@@ -829,7 +830,7 @@ function ConnectionProblems({
             Syncing and deployments fail until the account is connected again.
             This provider&apos;s authentication method has no Reauthorize
             action, so{' '}
-            <Link to="/git-providers/add" className="underline">
+            <Link to={GITLAB_OAUTH_SETUP_PATH} className="underline">
               add a GitLab OAuth provider
             </Link>{' '}
             and connect the account through it.

@@ -150,6 +150,41 @@ for (const variant of ['single-line', 'two-line', 'avatar'] as const) {
   })
 }
 
+const SETUP_LINK = 'Add a GitLab OAuth provider'
+
+for (const variant of ['single-line', 'two-line', 'avatar'] as const) {
+  test(`a rejected GitLab App connection links to a recovery it can use (${variant})`, () => {
+    const view = list('gitlab_app', true, false, variant, 4, 'gitlab')
+    const message = view.getByText(REJECTED)
+    const link = view.getByRole('link', { name: SETUP_LINK })
+    expect(link.getAttribute('href')).toBe('/git-providers/add')
+    expect(
+      message.parentElement?.contains(link),
+      'the message must sit next to the way out'
+    ).toBe(true)
+    expect(view.queryByRole('button', { name: 'Reauthorize' })).toBeNull()
+    expect(view.queryByText('Reauthorization required')).toBeNull()
+  })
+
+  test(`a rejected GitLab OAuth connection offers no other provider (${variant})`, () => {
+    const view = list('oauth', true, false, variant, 4, 'gitlab')
+    expect(view.queryByRole('link', { name: SETUP_LINK })).toBeNull()
+  })
+}
+
+test('a GitLab App connection that was not rejected shows no recovery link', () => {
+  const view = list('gitlab_app', false, false, 'single-line', 4, 'gitlab')
+  expect(view.queryByRole('link', { name: SETUP_LINK })).toBeNull()
+})
+
+test('the status line names what each rejected connection needs', () => {
+  const app = list('gitlab_app', true, false, 'single-line', 4, 'gitlab')
+  expect(app.getByText('Reconnection required')).toBeTruthy()
+  cleanup()
+  const oauth = list('oauth', true, false, 'single-line', 4, 'gitlab')
+  expect(oauth.getByText('Reauthorization required')).toBeTruthy()
+})
+
 test('another unhealthy reason keeps its own message and no rejection copy', () => {
   const view = list(
     'oauth',
