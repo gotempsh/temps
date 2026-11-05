@@ -1294,6 +1294,47 @@ mod tests {
         assert!(!sql.contains("is_hosting_provider"), "{sql}");
     }
 
+    /// A check that could not be recorded must not look recorded, or the address
+    /// would be served as checked by a row that still says otherwise.
+    #[tokio::test]
+    async fn a_failed_verification_write_keeps_the_row_and_is_retried() {
+        let Some((geo, _dir)) = service_without_asn() else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+        let now = Utc::now();
+        let created = now - chrono::Duration::hours(7);
+        let stored = ip_geolocations::Model {
+            ip_address: "10.1.2.3".to_string(),
+            created_at: created,
+            updated_at: created,
+            ..unlocated_row(now)
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_errors([DbErr::Custom("connection lost".to_string())])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(db.clone(), geo);
+
+        let failed = service.refresh_if_stale(stored.clone(), now).await;
+        assert_eq!(failed.updated_at, created, "nothing was recorded");
+
+        // The row did not change, so the next cache miss tries again.
+        let retried = service.refresh_if_stale(stored, now).await;
+        assert_eq!(retried.updated_at, now);
+
+        drop(service);
+        let Ok(db) = Arc::try_unwrap(db) else {
+            panic!("the service was dropped, so this is the last handle");
+        };
+        assert_eq!(db.into_transaction_log().len(), 2, "one failure, one retry");
+    }
+
     /// Replacing a loaded database is routine and its cached answers stay good;
     /// only an arrival makes the whole cache miss.
     #[tokio::test]
