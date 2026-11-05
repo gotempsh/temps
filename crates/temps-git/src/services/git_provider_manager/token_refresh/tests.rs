@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use temps_test_utils::TestDatabase;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, Notify, Semaphore};
 
 const CONNECTION_ID: i32 = 7001;
 const STORED_ACCESS: &str = "stored-access";
@@ -50,6 +50,9 @@ struct Endpoint {
     user_calls: AtomicUsize,
     refresh_response: Mutex<(u16, String)>,
     user_status: Mutex<u16>,
+    /// When set, a token check waits here after being counted, so a test can
+    /// order what happens between the caller's read and its write.
+    user_gate: Mutex<Option<Arc<Semaphore>>>,
     hold: Mutex<Option<oneshot::Receiver<()>>>,
     refresh_reached: Notify,
     request_bodies: Mutex<Vec<String>>,
@@ -77,6 +80,10 @@ async fn refresh_route(
 
 async fn user_route(State(endpoint): State<Arc<Endpoint>>) -> axum::response::Response {
     endpoint.user_calls.fetch_add(1, Ordering::SeqCst);
+    let gate = endpoint.user_gate.lock().unwrap().clone();
+    if let Some(gate) = gate {
+        gate.acquire().await.unwrap().forget();
+    }
     let status = *endpoint.user_status.lock().unwrap();
     (StatusCode::from_u16(status).unwrap(), r#"{"id":1}"#).into_response()
 }
@@ -128,6 +135,7 @@ impl Harness {
             user_calls: AtomicUsize::new(0),
             refresh_response: Mutex::new((200, issued_body())),
             user_status: Mutex::new(200),
+            user_gate: Mutex::new(None),
             hold: Mutex::new(None),
             refresh_reached: Notify::new(),
             request_bodies: Mutex::new(Vec::new()),
@@ -228,6 +236,22 @@ impl Harness {
         let (release, held) = oneshot::channel();
         *self.endpoint.hold.lock().unwrap() = Some(held);
         release
+    }
+
+    fn gate_user_route(&self) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        *self.endpoint.user_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    async fn wait_for_user_calls(&self, calls: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while self.user_calls() < calls {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     fn refresh_calls(&self) -> usize {
@@ -974,6 +998,102 @@ async fn a_missing_lifetime_is_recorded_as_unknown_rather_than_guessed() {
     );
 }
 
+/// Leaves the connection as a provider that reports no `expires_in` does.
+async fn forget_expiry(h: &Harness) {
+    let mut row = h.row().await.into_active_model();
+    row.token_expires_at = Set(None);
+    row.update(h.db.as_ref()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_token_of_unknown_lifetime_is_refreshed_once_the_provider_rejects_it() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    forget_expiry(&h).await;
+    *h.endpoint.user_status.lock().unwrap() = 401;
+    h.respond(200, issued_body());
+
+    let token = h
+        .manager
+        .validate_and_refresh_connection_token(CONNECTION_ID)
+        .await
+        .unwrap();
+
+    assert_eq!(token, "issued-access");
+    assert_eq!(h.refresh_calls(), 1);
+    assert_eq!(h.user_calls(), 1);
+    let row = h.row().await;
+    assert_eq!(h.decrypt(row.refresh_token.as_deref()), "issued-refresh");
+    assert!(row.token_expires_at.is_some());
+}
+
+#[tokio::test]
+async fn a_token_of_unknown_lifetime_the_provider_accepts_spends_no_refresh_token() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    forget_expiry(&h).await;
+
+    let token = h
+        .manager
+        .validate_and_refresh_connection_token(CONNECTION_ID)
+        .await
+        .unwrap();
+
+    assert_eq!(token, STORED_ACCESS);
+    assert_eq!(h.user_calls(), 1);
+    assert_eq!(h.refresh_calls(), 0);
+    assert_eq!(h.row().await.token_expires_at, None);
+}
+
+#[tokio::test]
+async fn an_outage_does_not_spend_the_refresh_token_of_an_unknown_lifetime() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    forget_expiry(&h).await;
+    *h.endpoint.user_status.lock().unwrap() = 503;
+
+    let token = h
+        .manager
+        .validate_and_refresh_connection_token(CONNECTION_ID)
+        .await
+        .unwrap();
+
+    assert_eq!(token, STORED_ACCESS);
+    assert_eq!(h.refresh_calls(), 0);
+    let row = h.row().await;
+    assert!(!row.is_expired);
+    assert_eq!(h.decrypt(row.refresh_token.as_deref()), STORED_REFRESH);
+}
+
+#[tokio::test]
+async fn a_token_of_unknown_lifetime_without_a_refresh_token_is_not_checked() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    let mut row = h.row().await.into_active_model();
+    row.token_expires_at = Set(None);
+    row.refresh_token = Set(None);
+    row.update(h.db.as_ref()).await.unwrap();
+    *h.endpoint.user_status.lock().unwrap() = 401;
+
+    let token = h
+        .manager
+        .validate_and_refresh_connection_token(CONNECTION_ID)
+        .await
+        .unwrap();
+
+    assert_eq!(token, STORED_ACCESS);
+    assert_eq!(
+        h.user_calls(),
+        0,
+        "without a refresh token there is no way out"
+    );
+    assert_eq!(h.refresh_calls(), 0);
+}
+
 #[tokio::test]
 async fn the_refresh_request_carries_the_stored_token_and_no_second_attempt() {
     let Some(h) = Harness::start().await else {
@@ -1030,4 +1150,78 @@ async fn replacing_the_token_through_update_token_bumps_the_generation() {
         h.decrypt(h.row().await.access_token.as_deref()),
         "replacement-access"
     );
+}
+
+/// Both updates read the row before their validation request, so they start from
+/// the same generation. The second must still move it past the one a refresh
+/// picked up after the first, or that refresh would overwrite the second token.
+#[tokio::test]
+async fn token_updates_from_the_same_read_each_move_the_generation() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    let before = h.row().await.credential_generation;
+    let gate = h.gate_user_route();
+
+    let update = |token: &'static str| {
+        h.manager
+            .update_connection_token(CONNECTION_ID, token.to_string(), None)
+    };
+    let (first, second, refresh_started_from) =
+        tokio::join!(update("first-access"), update("second-access"), async {
+            h.wait_for_user_calls(2).await;
+            gate.add_permits(1);
+            let row = loop {
+                let row = h.row().await;
+                if row.credential_generation != before {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            gate.add_permits(1);
+            row
+        });
+    first.unwrap();
+    second.unwrap();
+
+    assert_eq!(h.row().await.credential_generation, before + 2);
+    let token_after_first = h.decrypt(refresh_started_from.access_token.as_deref());
+    assert!(matches!(
+        h.manager
+            .update_connection_tokens(&refresh_started_from, "late-access".to_string(), None, None)
+            .await,
+        Err(GitProviderManagerError::ConnectionGrantReplaced {
+            connection_id: CONNECTION_ID
+        })
+    ));
+    let stored = h.decrypt(h.row().await.access_token.as_deref());
+    assert_ne!(stored, "late-access");
+    assert_ne!(stored, token_after_first, "the later update must be kept");
+}
+
+#[tokio::test]
+async fn a_connection_deleted_during_validation_is_named_in_the_error() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    let gate = h.gate_user_route();
+
+    let (result, ()) = tokio::join!(
+        h.manager
+            .update_connection_token(CONNECTION_ID, "orphan-access".to_string(), None),
+        async {
+            h.wait_for_user_calls(1).await;
+            git_provider_connections::Entity::delete_by_id(CONNECTION_ID)
+                .exec(h.db.as_ref())
+                .await
+                .unwrap();
+            gate.add_permits(1);
+        }
+    );
+
+    assert!(matches!(
+        &result,
+        Err(GitProviderManagerError::ConnectionNotFound(message))
+            if message.contains(&CONNECTION_ID.to_string())
+    ));
 }

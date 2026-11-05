@@ -6,6 +6,7 @@
 
 use super::token_refresh::BlockedConnection;
 use super::*;
+use sea_orm::sea_query::Expr;
 
 impl GitProviderManager {
     fn url_has_origin(url: &str, expected_host: &str) -> bool {
@@ -452,12 +453,24 @@ impl GitProviderManager {
                 // freshly-validated-but-just-expired token. Five minutes makes
                 // that window much harder to hit while still letting us reuse
                 // tokens for nearly their entire lifetime.
-                let should_refresh = if let Some(expires_at) = connection.token_expires_at {
-                    let now = Utc::now();
-                    let buffer = chrono::Duration::minutes(5);
-                    expires_at < now + buffer
-                } else {
-                    false
+                let should_refresh = match connection.token_expires_at {
+                    Some(expires_at) => {
+                        let now = Utc::now();
+                        let buffer = chrono::Duration::minutes(5);
+                        expires_at < now + buffer
+                    }
+                    // The provider reported no lifetime, so nothing here says
+                    // when this token dies. Ask it: many callers have no
+                    // retry-on-401 of their own, and without this they would
+                    // keep sending a dead token. Only a definite rejection uses
+                    // up the refresh token; an outage carries on with this one.
+                    None if connection.refresh_token.is_some() => {
+                        self.get_provider_service(connection.provider_id)
+                            .await?
+                            .token_needs_refresh(&access_token)
+                            .await
+                    }
+                    None => false,
                 };
 
                 if !should_refresh {
@@ -811,7 +824,6 @@ impl GitProviderManager {
                         // Continue to save the token
                         return self
                             .save_updated_connection_token(
-                                connection,
                                 new_access_token,
                                 new_refresh_token,
                                 connection_id,
@@ -912,7 +924,6 @@ impl GitProviderManager {
         }
 
         self.save_updated_connection_token(
-            connection,
             new_access_token,
             new_refresh_token,
             connection_id,
@@ -924,7 +935,6 @@ impl GitProviderManager {
     /// Helper method to save updated connection token
     async fn save_updated_connection_token(
         &self,
-        connection: git_provider_connections::Model,
         new_access_token: String,
         new_refresh_token: Option<String>,
         connection_id: i32,
@@ -938,26 +948,42 @@ impl GitProviderManager {
             None
         };
 
-        let generation = connection.credential_generation.wrapping_add(1);
-        let mut active_model: git_provider_connections::ActiveModel = connection.into();
-        // A token entered by the user replaces the grant, so a refresh still in
-        // flight must not overwrite it.
-        active_model.credential_generation = Set(generation);
-        active_model.access_token = Set(Some(encrypted_access));
+        let mut update = git_provider_connections::ActiveModel {
+            access_token: Set(Some(encrypted_access)),
+            token_expires_at: Set(None), // Reset expiration since we have a new token
+            updated_at: Set(chrono::Utc::now()),
+            is_active: Set(true), // Reactivate if it was deactivated due to expired token
+            is_expired: Set(false), // Reset expired flag since we have a validated token
+            ..Default::default()
+        };
         if encrypted_refresh.is_some() {
-            active_model.refresh_token = Set(encrypted_refresh);
+            update.refresh_token = Set(encrypted_refresh);
         }
-        active_model.token_expires_at = Set(None); // Reset expiration since we have a new token
-        active_model.updated_at = Set(chrono::Utc::now());
-        active_model.is_active = Set(true); // Reactivate if it was deactivated due to expired token
-        active_model.is_expired = Set(false); // Reset expired flag since we have a validated token
 
         // Clear installation_id if switching from GitHub App to PAT
         if clear_installation_id {
-            active_model.installation_id = Set(None);
+            update.installation_id = Set(None);
         }
 
-        active_model.update(self.db.as_ref()).await?;
+        // A token entered by the user replaces the grant, so a refresh still in
+        // flight must not overwrite it. The increment happens in the write: the
+        // caller's read is older than the validation request made since, and a
+        // value computed from it could repeat a generation that a refresh has
+        // already started from.
+        let result = git_provider_connections::Entity::update_many()
+            .set(update)
+            .col_expr(
+                git_provider_connections::Column::CredentialGeneration,
+                Expr::col(git_provider_connections::Column::CredentialGeneration).add(1),
+            )
+            .filter(git_provider_connections::Column::Id.eq(connection_id))
+            .exec(self.db.as_ref())
+            .await?;
+        if result.rows_affected == 0 {
+            return Err(GitProviderManagerError::ConnectionNotFound(format!(
+                "no git connection with id {connection_id} to store its new token on"
+            )));
+        }
 
         tracing::info!(
             "Successfully updated and validated access token for connection {}",
