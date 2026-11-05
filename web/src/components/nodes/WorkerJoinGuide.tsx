@@ -88,12 +88,9 @@ import {
   type InternetJoinMethod,
   type JoinPath,
 } from '@/lib/wireguard-mesh'
-import {
-  AGENT_SERVICE_COMMAND,
-  installCommand,
-  releaseTag,
-} from '@/lib/worker-join-script'
-import { useSelfUpdateCapability } from '@/hooks/useSelfUpdate'
+import { AGENT_SERVICE_COMMAND, installCommand } from '@/lib/worker-join-script'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
+import { UnpinnedInstallNote } from '@/components/nodes/WorkerJoinScript'
 
 // A pairing's join command comes from the server and calls `temps` from
 // PATH, so its install step stays the plain installer.
@@ -108,12 +105,17 @@ const WITHOUT_SYSTEMD = (
 
 /**
  * Install Temps as root, pinned to the release this server runs so the worker
- * matches it. Without a readable release it installs the newest stable one.
+ * matches it. It waits (a bounded time) for that release before offering a
+ * command, and says so when it installs the newest stable one instead.
  */
 function InstallCommandLine() {
-  const { data } = useSelfUpdateCapability()
+  const release = usePlaneRelease()
+  if (release.pending) return <Skeleton className="mt-1 h-8 w-full" />
   return (
-    <CommandLine command={installCommand(releaseTag(data?.current_version))} />
+    <>
+      <CommandLine command={installCommand(release.tag)} />
+      {!release.tag && <UnpinnedInstallNote />}
+    </>
   )
 }
 

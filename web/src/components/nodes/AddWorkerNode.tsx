@@ -5,7 +5,7 @@ import {
   clusterNetworkGetOptions,
   clusterNetworkUpdateMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -47,7 +47,7 @@ import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
 import { type JoinIngressChoice, joinIngressFlag } from '@/lib/worker-ingress'
 import { workerJoinScript } from '@/lib/worker-join-script'
-import { useSelfUpdateCapability } from '@/hooks/useSelfUpdate'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
 import {
   ForceJoinOption,
   WorkerJoinScript,
@@ -64,8 +64,6 @@ import {
 const ENROLLMENT_TOKEN_TTL_SECS = 3600
 /** How often the node list is read while a worker is expected. */
 const WAITING_POLL_MS = 5_000
-/** How long the join command waits for this server's version. */
-const VERSION_WAIT_MS = 10_000
 
 /**
  * The quickest way to add a worker: turn on the private network, then run
@@ -481,17 +479,8 @@ function JoinCommandStep({ url }: { url: string }) {
   const [ingress, setIngress] = useState<JoinIngressChoice>('delegated')
   const [force, setForce] = useState(false)
   // The install step pins the release this server runs; a worker on another
-  // version may not speak its protocol. The command waits for that read so
-  // the first one shown is already pinned, but not for ever: past
-  // VERSION_WAIT_MS it is shown unpinned, and says so.
-  const { data: capability, isLoading: versionLoading } =
-    useSelfUpdateCapability()
-  const [versionWaitOver, setVersionWaitOver] = useState(false)
-  useEffect(() => {
-    if (!versionLoading) return
-    const timer = setTimeout(() => setVersionWaitOver(true), VERSION_WAIT_MS)
-    return () => clearTimeout(timer)
-  }, [versionLoading])
+  // version may not speak its protocol.
+  const release = usePlaneRelease()
   const choices = (
     <>
       <WorkerRequirements />
@@ -500,11 +489,12 @@ function JoinCommandStep({ url }: { url: string }) {
     </>
   )
 
-  const create = () => {
+  const create = ({ another }: { another: boolean }) => {
     setKnownNodes(new Set((nodeList?.nodes ?? []).map((n) => n.id)))
     setCreated((n) => n + 1)
-    // Each command is for another machine: moving one is not a standing choice.
-    setForce(false)
+    // Another command is for another machine: moving one is not a standing
+    // choice. The first command keeps what was ticked before creating it.
+    if (another) setForce(false)
     mint.mutate({ body: { max_uses: 1, ttl_secs: ENROLLMENT_TOKEN_TTL_SECS } })
   }
 
@@ -516,7 +506,11 @@ function JoinCommandStep({ url }: { url: string }) {
           Creates the commands to run on the new machine. They install the Temps
           version this server runs, join this cluster and start the agent.
         </p>
-        <Button size="sm" onClick={create} disabled={mint.isPending}>
+        <Button
+          size="sm"
+          onClick={() => create({ another: false })}
+          disabled={mint.isPending}
+        >
           {mint.isPending ? (
             <Loader2 className="mr-1 h-4 w-4 animate-spin" />
           ) : (
@@ -532,7 +526,7 @@ function JoinCommandStep({ url }: { url: string }) {
   const script = workerJoinScript({
     url,
     token: mint.data.token,
-    version: capability?.current_version,
+    version: release.tag,
     joinFlags: joinIngressFlag(ingress),
     force,
   })
@@ -543,7 +537,7 @@ function JoinCommandStep({ url }: { url: string }) {
       <WorkerJoinScript
         command={script.command}
         pinnedTo={script.pinnedTo}
-        pending={versionLoading && !versionWaitOver}
+        pending={release.pending}
       />
       <p className="text-xs text-muted-foreground">
         Shown once. It adds one machine and expires{' '}
@@ -551,7 +545,7 @@ function JoinCommandStep({ url }: { url: string }) {
         <button
           type="button"
           className="font-medium underline"
-          onClick={create}
+          onClick={() => create({ another: true })}
           disabled={mint.isPending}
         >
           Create another

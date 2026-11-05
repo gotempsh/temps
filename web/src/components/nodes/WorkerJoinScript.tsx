@@ -135,16 +135,23 @@ export function WorkerJoinScript({
           worker and the control plane match.
         </p>
       ) : (
-        <p className="text-xs text-amber-700 dark:text-amber-300">
-          This server&apos;s release could not be read, so the first step
-          installs the newest stable release, which may not match it. To pin it,
-          add the version shown on the{' '}
-          <Link to="/settings/version" className="font-medium underline">
-            Version page
-          </Link>
-          : <code>bash -s -- &lt;version&gt;</code>.
-        </p>
+        <UnpinnedInstallNote />
       )}
     </div>
+  )
+}
+
+/** Said wherever an install could not be pinned to this server's release. */
+export function UnpinnedInstallNote() {
+  return (
+    <p className="text-xs text-amber-700 dark:text-amber-300">
+      This server&apos;s release could not be read, so the install takes the
+      newest stable release, which may not match it. To pin it, add the version
+      shown on the{' '}
+      <Link to="/settings/version" className="font-medium underline">
+        Version page
+      </Link>
+      : <code>bash -s -- &lt;version&gt;</code>.
+    </p>
   )
 }
