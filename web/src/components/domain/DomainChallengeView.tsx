@@ -499,7 +499,7 @@ export function DomainChallengeView({
 
           {/* Active Certificate */}
           {domain.status === 'active' && (
-            <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/10">
+            <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/10">
               <CheckCircle2 className="h-4 w-4 text-green-600" />
               <AlertDescription>
                 Your SSL certificate is active and your domain is secured with

@@ -107,6 +107,16 @@ describe('HTML shell', () => {
     expect(template).toMatch(/<html[^>]*\slang="en"/)
   })
 
+  it('declares both colour schemes so the browser never recolours a theme', () => {
+    expect(template).toContain(
+      '<meta name="color-scheme" content="light dark" />'
+    )
+  })
+
+  it('opts out of Dark Reader-style extensions that invert the dark theme', () => {
+    expect(template).toContain('<meta name="darkreader-lock" />')
+  })
+
   it('keeps the mount point Rsbuild renders the app into', () => {
     expect(template).toContain('<div id="<%= mountId %>"></div>')
   })

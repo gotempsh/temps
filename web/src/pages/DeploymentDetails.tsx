@@ -862,12 +862,12 @@ function BrowserFrameScreenshot({
                 <button
                   type="button"
                   aria-label={`Deployment URL: ${display}. ${entries.length} URLs available`}
-                  className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
+                  className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-background px-2.5 py-1 text-left text-xs text-muted-foreground transition-colors hover:text-foreground"
                 >
                   <Globe className="h-3.5 w-3.5 shrink-0" />
                   <span className="truncate">{display}</span>
                   {selected && (
-                    <span className="shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4 max-sm:hidden">
+                    <span className="shrink-0 rounded border border-gray-950/10 dark:border-white/10 px-1.5 font-mono text-[10px] leading-4 max-sm:hidden">
                       {urlEntryLabel(selected)}
                     </span>
                   )}
@@ -894,7 +894,7 @@ function BrowserFrameScreenshot({
                       )}
                     />
                     <span className="truncate">{entry.display}</span>
-                    <span className="ml-auto shrink-0 rounded border border-gray-950/10 px-1.5 font-mono text-[10px] leading-4 text-muted-foreground">
+                    <span className="ml-auto shrink-0 rounded border border-gray-950/10 dark:border-white/10 px-1.5 font-mono text-[10px] leading-4 text-muted-foreground">
                       {urlEntryLabel(entry)}
                     </span>
                   </DropdownMenuItem>
@@ -917,14 +917,14 @@ function BrowserFrameScreenshot({
             href={activeUrl}
             target="_blank"
             rel="noreferrer"
-            className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+            className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-background px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
             <Globe className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">{display}</span>
             <ExternalLink className="ml-auto h-3 w-3 shrink-0" />
           </a>
         ) : (
-          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 bg-background px-2.5 py-1 text-xs text-muted-foreground">
+          <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-background px-2.5 py-1 text-xs text-muted-foreground">
             <Globe className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">{display}</span>
           </div>
@@ -943,7 +943,7 @@ function BrowserFrameScreenshot({
             href={url}
             target="_blank"
             rel="noreferrer"
-            className="group relative block border-t border-gray-950/5"
+            className="group relative block border-t border-gray-950/5 dark:border-white/5"
           >
             {body}
             {showsOtherUrl && url && (
@@ -954,7 +954,9 @@ function BrowserFrameScreenshot({
             <span className="pointer-events-none absolute inset-0 bg-foreground/0 transition-colors group-hover:bg-foreground/5" />
           </a>
         ) : (
-          <div className="border-t border-gray-950/5">{body}</div>
+          <div className="border-t border-gray-950/5 dark:border-white/5">
+            {body}
+          </div>
         ))}
     </Card>
   )
@@ -988,7 +990,7 @@ function DeploymentHeader({
   const firstLine = deployment.commit_message?.split('\n')[0]
   const hasCommit = Boolean(shortHash || firstLine || deployment.branch)
   return (
-    <div className="flex flex-col gap-3 border-b border-gray-950/10 pb-5 sm:flex-row sm:items-center sm:justify-between">
+    <div className="flex flex-col gap-3 border-b border-gray-950/10 dark:border-white/10 pb-5 sm:flex-row sm:items-center sm:justify-between">
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2 sm:flex-nowrap">
         <Button
           variant="ghost"
@@ -1002,7 +1004,7 @@ function DeploymentHeader({
           </Link>
         </Button>
         <span
-          className="hidden h-5 w-px shrink-0 bg-gray-950/10 sm:block"
+          className="hidden h-5 w-px shrink-0 bg-gray-950/10 dark:bg-white/10 sm:block"
           aria-hidden="true"
         />
         <div className="min-w-0 sm:shrink-0">
@@ -1011,7 +1013,7 @@ function DeploymentHeader({
         {hasCommit && (
           <>
             <span
-              className="hidden h-5 w-px shrink-0 bg-gray-950/10 sm:block"
+              className="hidden h-5 w-px shrink-0 bg-gray-950/10 dark:bg-white/10 sm:block"
               aria-hidden="true"
             />
             <GitCommitHorizontal className="hidden h-4 w-4 shrink-0 text-muted-foreground sm:block" />
@@ -1608,7 +1610,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         )}
 
         {md?.isRollback && (
-          <div className="flex items-center gap-2 rounded-md border border-gray-950/5 bg-muted/40 px-3 py-2 text-sm">
+          <div className="flex items-center gap-2 rounded-md border border-gray-950/5 dark:border-white/5 bg-muted/40 px-3 py-2 text-sm">
             <RotateCcw className="h-4 w-4 shrink-0 text-muted-foreground" />
             <span className="text-muted-foreground">
               This is a rollback deployment

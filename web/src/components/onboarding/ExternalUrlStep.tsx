@@ -77,7 +77,7 @@ export function ExternalUrlStep({
       </div>
 
       {domain && domain.status === 'valid' && (
-        <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+        <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
           <CheckCircle2 className="h-4 w-4 text-green-600" />
           <AlertDescription>
             <strong>Domain verified!</strong> Your SSL certificate has been

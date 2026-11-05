@@ -778,7 +778,7 @@ export function DomainDetail() {
                     successful read before changing it.
                   </p>
                 ) : !activeOrder ? (
-                  <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
+                  <div className="space-y-3 rounded-lg border border-gray-950/10 dark:border-white/10 p-4">
                     <p className="text-sm text-muted-foreground">
                       {isOrderTerminal
                         ? `Previous order ended with status "${order?.status}". Create a new ACME order to continue.`
@@ -804,7 +804,7 @@ export function DomainDetail() {
                     </Button>
                   </div>
                 ) : hasDnsValues ? (
-                  <div className="overflow-hidden rounded-lg border border-gray-950/10">
+                  <div className="overflow-hidden rounded-lg border border-gray-950/10 dark:border-white/10">
                     <InlineStepStrip
                       steps={[
                         {
@@ -815,7 +815,7 @@ export function DomainDetail() {
                         { label: 'Verify & finalize', state: 'upcoming' },
                       ]}
                     />
-                    <div className="space-y-4 border-t border-gray-950/5 p-4">
+                    <div className="space-y-4 border-t border-gray-950/5 dark:border-white/5 p-4">
                       <div>
                         <p className="text-sm font-medium">
                           Add TXT record{dnsTxtRecords.length > 1 ? 's' : ''} to
@@ -927,7 +927,7 @@ export function DomainDetail() {
                         {domain.status}
                       </Badge>
                     </div>
-                    <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
+                    <div className="space-y-3 rounded-lg border border-gray-950/10 dark:border-white/10 p-4">
                       <p className="text-sm text-muted-foreground">
                         {isOrderTerminal
                           ? `Previous order ended with status "${order?.status}". Create a new ACME order to continue.`
@@ -982,7 +982,7 @@ export function DomainDetail() {
                     {domain.status}
                   </Badge>
                 </div>
-                <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
+                <div className="space-y-3 rounded-lg border border-gray-950/10 dark:border-white/10 p-4">
                   <p className="text-sm text-muted-foreground">
                     {!orderKnown || orderReadFailed
                       ? 'Certificate order status is unavailable. Retry before changing it.'
@@ -1552,7 +1552,7 @@ export function DomainDetail() {
 
         {/* Alerts (shared across variants) */}
         {isUsingCloudflare() && (
-          <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
+          <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
             <Info className="size-4 text-purple-600" />
             <AlertDescription>
               Domain and certificate management is handled automatically by
@@ -1612,7 +1612,7 @@ function DnsRecordsList({
   if (records.length === 0) return null
 
   return (
-    <div className="divide-y divide-gray-950/5 overflow-hidden rounded-lg border border-gray-950/10">
+    <div className="divide-y divide-gray-950/5 dark:divide-white/5 overflow-hidden rounded-lg border border-gray-950/10 dark:border-white/10">
       {records.map((record, index) => (
         <div
           key={`${keyPrefix}-${index}`}
@@ -1634,14 +1634,14 @@ function DnsRecordsList({
             <CopyButton
               value={record.name}
               minimal
-              className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
+              className="h-7 rounded-md border border-gray-950/10 dark:border-white/10 px-2 py-1 text-xs"
             >
               <span className="max-sm:sr-only">Name</span>
             </CopyButton>
             <CopyButton
               value={record.value}
               minimal
-              className="h-7 rounded-md border border-gray-950/10 px-2 py-1 text-xs"
+              className="h-7 rounded-md border border-gray-950/10 dark:border-white/10 px-2 py-1 text-xs"
             >
               <span className="max-sm:sr-only">Value</span>
             </CopyButton>
@@ -1812,7 +1812,7 @@ function RenewalAttemptsTimeline({ domainName }: { domainName: string }) {
             No renewal attempts recorded yet.
           </p>
         ) : (
-          <div className="divide-y divide-border rounded-lg border border-gray-950/10">
+          <div className="divide-y divide-border rounded-lg border border-gray-950/10 dark:border-white/10">
             {attempts.map((attempt) => (
               <div
                 key={attempt.id}
@@ -1998,7 +1998,7 @@ type InlineStep = {
 
 function InlineStepStrip({ steps }: { steps: InlineStep[] }) {
   return (
-    <ol className="flex items-stretch divide-x divide-gray-950/5 bg-muted/40">
+    <ol className="flex items-stretch divide-x divide-gray-950/5 dark:divide-white/5 bg-muted/40">
       {steps.map((step, idx) => {
         const stateClasses =
           step.state === 'current'
@@ -2067,7 +2067,7 @@ function ActiveCertificateInner({
           )}
         </div>
       )}
-      <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/10">
+      <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/10">
         <CheckCircle className="size-4 text-green-600" />
         <AlertDescription>
           Your TLS certificate is active and your domain is secured with HTTPS.
@@ -2181,8 +2181,8 @@ function HttpChallengePanel({
       )}
 
       {ip && (
-        <div className="rounded-lg border border-gray-950/10 bg-muted/40">
-          <div className="flex items-center justify-between border-b border-gray-950/5 px-4 py-2.5">
+        <div className="rounded-lg border border-gray-950/10 dark:border-white/10 bg-muted/40">
+          <div className="flex items-center justify-between border-b border-gray-950/5 dark:border-white/5 px-4 py-2.5">
             <div className="flex items-center gap-2">
               <Info className="size-4 text-blue-600" />
               <span className="text-sm font-medium">DNS A record required</span>
@@ -2197,7 +2197,7 @@ function HttpChallengePanel({
               <ExternalLink className="size-3" />
             </a>
           </div>
-          <dl className="divide-y divide-gray-950/5 text-sm">
+          <dl className="divide-y divide-gray-950/5 dark:divide-white/5 text-sm">
             <DnsKvRow label="Name" value={dnsName} />
             <DnsKvRow label="Type" value="A" copyable={false} />
             <DnsKvRow label="Value" value={ip} />
@@ -2205,7 +2205,7 @@ function HttpChallengePanel({
         </div>
       )}
 
-      <div className="space-y-3 rounded-lg border border-gray-950/10 p-4">
+      <div className="space-y-3 rounded-lg border border-gray-950/10 dark:border-white/10 p-4">
         <div className="flex items-center justify-between">
           <span className="text-sm font-medium">Challenge URL</span>
           <a
@@ -2273,7 +2273,7 @@ function HttpChallengePanel({
         httpDebugInfo &&
         httpDebugInfo.dns_a_records.length > 0 &&
         httpDebugInfo.challenge_exists && (
-          <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/10">
+          <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/10">
             <CheckCircle className="size-4 text-green-600" />
             <AlertTitle>Ready for validation</AlertTitle>
             <AlertDescription>
@@ -2418,7 +2418,7 @@ function FailedPanel({
               : 'this record exists'}{' '}
             in DNS:
           </p>
-          <div className="divide-y divide-gray-950/5 rounded-lg border border-gray-950/10 overflow-hidden">
+          <div className="divide-y divide-gray-950/5 dark:divide-white/5 rounded-lg border border-gray-950/10 dark:border-white/10 overflow-hidden">
             {dnsTxtRecords.map((record, index) => (
               <div
                 key={`${keyPrefix}-${index}`}
