@@ -88,15 +88,36 @@ import {
   type InternetJoinMethod,
   type JoinPath,
 } from '@/lib/wireguard-mesh'
+import { AGENT_SERVICE_COMMAND, installCommand } from '@/lib/worker-join-script'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
+import { UnpinnedInstallNote } from '@/components/nodes/WorkerJoinScript'
 
-const INSTALL_COMMAND = 'curl -fsSL https://temps.sh/install.sh | bash'
-const AGENT_SERVICE_COMMAND = 'temps agent service install'
+// A pairing's join command comes from the server and calls `temps` from
+// PATH, so its install step stays the plain installer.
+const PAIRING_INSTALL_COMMAND = 'curl -fsSL https://temps.sh/install.sh | bash'
+const PAIRING_AGENT_SERVICE_COMMAND = 'temps agent service install'
 const WITHOUT_SYSTEMD = (
   <>
     Without systemd, run <code>temps agent</code> under your own supervisor
     instead.
   </>
 )
+
+/**
+ * Install Temps as root, pinned to the release this server runs so the worker
+ * matches it. It waits (a bounded time) for that release before offering a
+ * command, and says so when it installs the newest stable one instead.
+ */
+function InstallCommandLine() {
+  const release = usePlaneRelease()
+  if (release.pending) return <Skeleton className="mt-1 h-8 w-full" />
+  return (
+    <>
+      <CommandLine command={installCommand(release.tag)} />
+      {!release.tag && <UnpinnedInstallNote />}
+    </>
+  )
+}
 
 /** Mesh state for the Worker Nodes page; polls faster while it comes up. */
 export function useWireguardMesh() {
@@ -262,7 +283,7 @@ export function WorkerJoinGuide({
             server — for example a Hetzner vSwitch or an AWS VPC.
           </p>
           <Step number={1} title="Install Temps on the worker">
-            <CommandLine command={INSTALL_COMMAND} />
+            <InstallCommandLine />
           </Step>
           <Step number={2} title="Join the cluster">
             {missingToken ? (
@@ -278,7 +299,7 @@ export function WorkerJoinGuide({
               </>
             )}
           </Step>
-          <Step number={3} title="Start the agent, as root">
+          <Step number={3} title="Start the agent">
             <CommandLine command={AGENT_SERVICE_COMMAND} />
             <p className="mt-1 text-xs">
               Runs the worker as a systemd service that restarts on failure and
@@ -518,7 +539,7 @@ function UrlJoin({
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
+        <InstallCommandLine />
       </Step>
       <Step number={3} title="Join the cluster">
         {missingToken ? (
@@ -534,7 +555,7 @@ function UrlJoin({
           </>
         )}
       </Step>
-      <Step number={4} title="Start the agent, as root">
+      <Step number={4} title="Start the agent">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
           The worker registers on the mesh and shows as Connected below within a
@@ -648,9 +669,9 @@ function OutboundJoin({
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
+        <InstallCommandLine />
       </Step>
-      <Step number={3} title="Join the cluster, as root">
+      <Step number={3} title="Join the cluster">
         <OutboundJoinCommand url={url} />
         <p className="mt-1 text-xs">
           The worker sends its WireGuard key to this server over HTTPS, brings
@@ -658,7 +679,7 @@ function OutboundJoin({
           registers under its mesh address. It needs no public IP.
         </p>
       </Step>
-      <Step number={4} title="Start the agent, as root">
+      <Step number={4} title="Start the agent">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
           The worker shows as Connected below within a minute. {WITHOUT_SYSTEMD}
@@ -751,7 +772,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
+        <CommandLine command={PAIRING_INSTALL_COMMAND} />
       </Step>
       <Step number={3} title="Create the pairing">
         <form
@@ -887,7 +908,7 @@ function CreatedPairing({
           <span>{pairing.name} is on the mesh.</span>
           {badge}
         </div>
-        <CommandLine command={AGENT_SERVICE_COMMAND} />
+        <CommandLine command={PAIRING_AGENT_SERVICE_COMMAND} />
       </Step>
     )
   }
@@ -910,7 +931,7 @@ function CreatedPairing({
         It holds a one-time secret and is shown only now. It waits until this
         server reaches it at <code>{pairing.node_endpoint}</code>, brings the
         mesh up and registers. Then start the worker with{' '}
-        <code>{AGENT_SERVICE_COMMAND}</code>.
+        <code>{PAIRING_AGENT_SERVICE_COMMAND}</code>.
       </p>
       <p className="mt-1 text-xs">
         The code is piped to <code>temps join --pair -</code> so it never shows

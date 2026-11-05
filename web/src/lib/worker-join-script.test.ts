@@ -1,0 +1,143 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { describe, expect, test } from 'bun:test'
+import {
+  AGENT_SERVICE_COMMAND,
+  asRootTemps,
+  installCommand,
+  releaseTag,
+  shellWord,
+  workerJoinScript,
+} from './worker-join-script'
+
+describe('releaseTag', () => {
+  test('keeps the release tags the installer can download', () => {
+    expect(releaseTag('v0.0.8')).toBe('v0.0.8')
+    expect(releaseTag('v0.2.0-beta.1')).toBe('v0.2.0-beta.1')
+    expect(releaseTag('v0.1.0-nightly.20261104.0123abcde')).toBe(
+      'v0.1.0-nightly.20261104.0123abcde'
+    )
+    expect(releaseTag('  v1.2.3\n')).toBe('v1.2.3')
+    // Hyphens inside a prerelease, as the installer's own tag check allows.
+    expect(releaseTag('v1.2.3-rc-1')).toBe('v1.2.3-rc-1')
+  })
+
+  test('does not pin what is not a release', () => {
+    expect(releaseTag(undefined)).toBeNull()
+    expect(releaseTag(null)).toBeNull()
+    expect(releaseTag('')).toBeNull()
+    expect(releaseTag('dev')).toBeNull()
+    expect(releaseTag('0.1.0')).toBeNull()
+    expect(releaseTag('v0.1.0-')).toBeNull()
+    expect(releaseTag('v0.1.0 (abc1234)')).toBeNull()
+  })
+
+  test('never lets shell syntax through into the pasted command', () => {
+    for (const hostile of [
+      'v1.0.0; rm -rf /',
+      'v1.0.0$(id)',
+      'v1.0.0`id`',
+      'v1.0.0-a|b',
+      "v1.0.0-'x'",
+      'v1.0.0-a\nb',
+    ]) {
+      expect(releaseTag(hostile)).toBeNull()
+    }
+  })
+})
+
+describe('installCommand', () => {
+  test('pins the control plane release and installs as root', () => {
+    expect(installCommand('v0.1.0-nightly.20261104.0123abcde')).toBe(
+      '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-nightly.20261104.0123abcde)'
+    )
+  })
+
+  test('falls back to the installer default without a release', () => {
+    expect(installCommand(null)).toBe(
+      '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash)'
+    )
+  })
+})
+
+describe('root commands', () => {
+  test('call the root install by absolute path, so PATH does not matter', () => {
+    expect(asRootTemps('join https://cp.example.com tok')).toBe(
+      'sudo -H /root/.temps/bin/temps join https://cp.example.com tok'
+    )
+    expect(AGENT_SERVICE_COMMAND).toBe(
+      'sudo -H /root/.temps/bin/temps agent service install'
+    )
+  })
+})
+
+describe('shellWord', () => {
+  test('leaves plain URLs and tokens as they are', () => {
+    expect(shellWord('https://cp.example.com:8443/base')).toBe(
+      'https://cp.example.com:8443/base'
+    )
+    expect(shellWord('tk_abc-DEF.123')).toBe('tk_abc-DEF.123')
+  })
+
+  test('single-quotes anything with shell syntax, quotes included', () => {
+    expect(shellWord('https://cp.example.com/$(id)')).toBe(
+      "'https://cp.example.com/$(id)'"
+    )
+    expect(shellWord('https://cp.example.com/a;b|c`d`')).toBe(
+      "'https://cp.example.com/a;b|c`d`'"
+    )
+    expect(shellWord("it's")).toBe("'it'\\''s'")
+    expect(shellWord('a b')).toBe("'a b'")
+  })
+})
+
+describe('workerJoinScript', () => {
+  const base = {
+    url: 'https://cp.example.com',
+    token: 'tk_enroll',
+    version: 'v0.1.0-nightly.20261104.0123abcde',
+    joinFlags: ' --ingress delegated',
+  }
+
+  test('installs the control plane version, joins and starts the agent with sudo, each step only after the last worked', () => {
+    const script = workerJoinScript(base)
+    expect(script.pinnedTo).toBe('v0.1.0-nightly.20261104.0123abcde')
+    expect(script.command).toBe(
+      [
+        '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-nightly.20261104.0123abcde) && \\',
+        'sudo -H /root/.temps/bin/temps join https://cp.example.com tk_enroll --ingress delegated && \\',
+        'sudo -H /root/.temps/bin/temps agent service install',
+      ].join('\n')
+    )
+    // Every step that needs root gets it.
+    for (const line of script.command.split('\n')) {
+      expect(line).toContain('sudo -H')
+    }
+  })
+
+  test('adds --force only when the user chose to move the machine', () => {
+    expect(workerJoinScript(base).command).not.toContain('--force')
+    expect(workerJoinScript({ ...base, force: true }).command).toContain(
+      'sudo -H /root/.temps/bin/temps join https://cp.example.com tk_enroll --ingress delegated --force && \\'
+    )
+  })
+
+  test('quotes a join URL with shell syntax instead of running it as root', () => {
+    const script = workerJoinScript({
+      ...base,
+      url: 'https://cp.example.com/$(touch /tmp/x)',
+    })
+    expect(script.command).toContain(
+      "temps join 'https://cp.example.com/$(touch /tmp/x)' tk_enroll"
+    )
+  })
+
+  test('says so when the version cannot be pinned', () => {
+    const script = workerJoinScript({ ...base, version: undefined })
+    expect(script.pinnedTo).toBeNull()
+    expect(script.command.split('\n')[0]).toBe(
+      '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash) && \\'
+    )
+  })
+})

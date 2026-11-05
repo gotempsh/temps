@@ -12,6 +12,7 @@ import type {
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
+import { asRootTemps, shellWord } from '@/lib/worker-join-script'
 
 /** How a worker reaches this control plane when it joins. */
 export type JoinPath = 'private' | 'internet'
@@ -38,7 +39,9 @@ export function joinCommand(
 ): string {
   const address =
     path === 'internet' ? '<worker-public-ip>' : '<worker-private-ip>'
-  return `temps join ${url} ${token ?? '<join-token>'} --private-address ${address}`
+  return asRootTemps(
+    `join ${shellWord(url)} ${token ? shellWord(token) : '<join-token>'} --private-address ${address}`
+  )
 }
 
 /**
@@ -46,7 +49,9 @@ export function joinCommand(
  * WireGuard key over HTTPS and dials this server, so it needs no address.
  */
 export function outboundJoinCommand(url: string, token: string | null): string {
-  return `temps join ${url} ${token ?? '<join-token>'}`
+  return asRootTemps(
+    `join ${shellWord(url)} ${token ? shellWord(token) : '<join-token>'}`
+  )
 }
 
 /**

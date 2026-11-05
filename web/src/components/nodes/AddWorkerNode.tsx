@@ -25,7 +25,6 @@ import {
 import type { WireguardMeshStatusResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Collapsible,
   CollapsibleContent,
@@ -47,11 +46,17 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
 import { type JoinIngressChoice, joinIngressFlag } from '@/lib/worker-ingress'
+import { workerJoinScript } from '@/lib/worker-join-script'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
+import {
+  ForceJoinOption,
+  WorkerJoinScript,
+  WorkerRequirements,
+} from '@/components/nodes/WorkerJoinScript'
 import {
   controlPlaneMeshPort,
   joinUrl,
   offersOutboundJoin,
-  outboundJoinCommand,
   outboundPeerReach,
 } from '@/lib/wireguard-mesh'
 
@@ -472,25 +477,40 @@ function JoinCommandStep({ url }: { url: string }) {
     : []
   const [created, setCreated] = useState(0)
   const [ingress, setIngress] = useState<JoinIngressChoice>('delegated')
-  const ingressQuestion = (
-    <IngressQuestion value={ingress} onChange={setIngress} />
+  const [force, setForce] = useState(false)
+  // The install step pins the release this server runs; a worker on another
+  // version may not speak its protocol.
+  const release = usePlaneRelease()
+  const choices = (
+    <>
+      <WorkerRequirements />
+      <IngressQuestion value={ingress} onChange={setIngress} />
+      <ForceJoinOption checked={force} onChange={setForce} />
+    </>
   )
 
-  const create = () => {
+  const create = ({ another }: { another: boolean }) => {
     setKnownNodes(new Set((nodeList?.nodes ?? []).map((n) => n.id)))
     setCreated((n) => n + 1)
+    // Another command is for another machine: moving one is not a standing
+    // choice. The first command keeps what was ticked before creating it.
+    if (another) setForce(false)
     mint.mutate({ body: { max_uses: 1, ttl_secs: ENROLLMENT_TOKEN_TTL_SECS } })
   }
 
   if (!mint.data) {
     return (
-      <div className="space-y-2">
-        {ingressQuestion}
+      <div className="space-y-3">
+        {choices}
         <p className="text-sm text-muted-foreground">
-          Creates a command to run as root on the new machine. It installs
-          Temps, joins this cluster and starts the agent.
+          Creates the commands to run on the new machine. They install the Temps
+          version this server runs, join this cluster and start the agent.
         </p>
-        <Button size="sm" onClick={create} disabled={mint.isPending}>
+        <Button
+          size="sm"
+          onClick={() => create({ another: false })}
+          disabled={mint.isPending}
+        >
           {mint.isPending ? (
             <Loader2 className="mr-1 h-4 w-4 animate-spin" />
           ) : (
@@ -503,34 +523,29 @@ function JoinCommandStep({ url }: { url: string }) {
     )
   }
 
-  const command = [
-    'curl -fsSL https://temps.sh/install.sh | bash',
-    outboundJoinCommand(url, mint.data.token) + joinIngressFlag(ingress),
-    'temps agent service install',
-  ].join('\n')
+  const script = workerJoinScript({
+    url,
+    token: mint.data.token,
+    version: release.tag,
+    joinFlags: joinIngressFlag(ingress),
+    force,
+  })
 
   return (
-    <div className="space-y-2" key={created}>
-      {ingressQuestion}
-      <p className="text-sm text-muted-foreground">
-        Run this as root on the new machine:
-      </p>
-      <div className="flex items-start gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-        <pre
-          tabIndex={0}
-          className="min-w-0 flex-1 overflow-x-auto whitespace-pre"
-        >
-          {command}
-        </pre>
-        <CopyButton minimal className="h-6 w-6 shrink-0" value={command} />
-      </div>
+    <div className="space-y-3" key={created}>
+      {choices}
+      <WorkerJoinScript
+        command={script.command}
+        pinnedTo={script.pinnedTo}
+        pending={release.pending}
+      />
       <p className="text-xs text-muted-foreground">
         Shown once. It adds one machine and expires{' '}
         <TimeAgo date={mint.data.expires_at} />.{' '}
         <button
           type="button"
           className="font-medium underline"
-          onClick={create}
+          onClick={() => create({ another: true })}
           disabled={mint.isPending}
         >
           Create another

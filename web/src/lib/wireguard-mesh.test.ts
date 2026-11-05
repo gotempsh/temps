@@ -102,10 +102,10 @@ describe('join URL', () => {
 describe('join command', () => {
   test('asks for the address that matches the join path', () => {
     expect(joinCommand('https://t.example.com', 'tok', 'internet')).toBe(
-      'temps join https://t.example.com tok --private-address <worker-public-ip>'
+      'sudo -H /root/.temps/bin/temps join https://t.example.com tok --private-address <worker-public-ip>'
     )
     expect(joinCommand('https://t.example.com', null, 'private')).toBe(
-      'temps join https://t.example.com <join-token> --private-address <worker-private-ip>'
+      'sudo -H /root/.temps/bin/temps join https://t.example.com <join-token> --private-address <worker-private-ip>'
     )
   })
 })
@@ -119,10 +119,10 @@ describe('outbound join', () => {
 
   test('needs no worker address', () => {
     expect(outboundJoinCommand('https://t.example.com', 'tok')).toBe(
-      'temps join https://t.example.com tok'
+      'sudo -H /root/.temps/bin/temps join https://t.example.com tok'
     )
     expect(outboundJoinCommand('https://t.example.com', null)).toBe(
-      'temps join https://t.example.com <join-token>'
+      'sudo -H /root/.temps/bin/temps join https://t.example.com <join-token>'
     )
   })
 
