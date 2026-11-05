@@ -643,7 +643,18 @@ function TunnelSetup({
               workers={workers}
               eligibility={eligibility}
               selected={nodeIds}
-              onChange={setPicked}
+              onChange={(ids) =>
+                // The picker only knows the selectable workers; a pick that
+                // became unavailable stays until the operator decides on it
+                // (Continue, or the worker coming back), so changing another
+                // box cannot quietly drop it.
+                setPicked((current) => [
+                  ...(current ?? []).filter(
+                    (id) => !eligibility.get(id)?.selectable
+                  ),
+                  ...ids,
+                ])
+              }
             />
           </CardContent>
         </Card>

@@ -383,6 +383,12 @@ test('a picked worker that goes offline holds Create until the operator decides'
 
   await screen.findByText('worker-c is no longer available')
   expect(create.hasAttribute('disabled')).toBe(true)
+  // Changing another box does not quietly drop the unavailable pick.
+  fireEvent.click(a)
+  fireEvent.click(a)
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  expect(screen.getByText('worker-c is no longer available')).toBeTruthy()
+  expect(create.hasAttribute('disabled')).toBe(true)
   fireEvent.click(
     screen.getByRole('button', { name: 'Continue with worker-a' })
   )
