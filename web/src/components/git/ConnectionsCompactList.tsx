@@ -13,6 +13,7 @@ import {
 import {
   authorizationRejectedMessage,
   canReauthorizeConnection,
+  displayedHealthStatus,
   GITLAB_OAUTH_SETUP_PATH,
   needsReauthorization,
   providerSupportsReauthorization,
@@ -55,6 +56,8 @@ import { toast } from 'sonner'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 type Variant = 'single-line' | 'two-line' | 'avatar'
+
+const EXPIRED_STATUS = 'The access token has expired'
 
 interface ConnectionsCompactListProps {
   connections: ConnectionResponse[]
@@ -364,7 +367,7 @@ export function ConnectionsCompactList({
   const HealthBadge = ({ c }: { c: ConnectionResponse }) => {
     const checkedAt = c.last_health_check_at
     const label = (() => {
-      switch (c.health_status) {
+      switch (displayedHealthStatus(c)) {
         case 'healthy':
           return {
             variant: 'secondary' as const,
@@ -389,9 +392,10 @@ export function ConnectionsCompactList({
     const tooltip = (() => {
       const rejected = authorizationRejectedMessage(c, provider)
       if (rejected) return rejected
-      if (c.health_status === 'unhealthy' && c.health_message) {
+      if (displayedHealthStatus(c) === 'unhealthy' && c.health_message) {
         return c.health_message
       }
+      if (c.is_expired) return EXPIRED_STATUS
       if (!checkedAt) return 'No health check has run yet'
       return `Last checked: ${new Date(checkedAt).toLocaleString()}`
     })()
@@ -418,8 +422,9 @@ export function ConnectionsCompactList({
 
   const renderRow = (c: ConnectionResponse) => {
     if (variant === 'single-line') {
-      const unhealthy = c.health_status === 'unhealthy'
-      const healthy = c.health_status === 'healthy'
+      const status = displayedHealthStatus(c)
+      const unhealthy = status === 'unhealthy'
+      const healthy = status === 'healthy'
       const railColor = unhealthy
         ? 'bg-destructive'
         : healthy
@@ -459,8 +464,9 @@ export function ConnectionsCompactList({
                 ? hasReauthorize
                   ? 'Reauthorization required'
                   : 'Reconnection required'
-                : unhealthy && c.health_message
-                  ? c.health_message
+                : unhealthy
+                  ? (c.health_message ??
+                    (c.is_expired ? EXPIRED_STATUS : 'Unhealthy'))
                   : healthy
                     ? 'Healthy'
                     : 'Not checked yet'}

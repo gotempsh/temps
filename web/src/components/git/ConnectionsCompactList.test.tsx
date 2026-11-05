@@ -185,6 +185,35 @@ test('the status line names what each rejected connection needs', () => {
   expect(oauth.getByText('Reauthorization required')).toBeTruthy()
 })
 
+test('a blocked connection with a stale healthy check is not shown as healthy', () => {
+  const view = list('oauth', true, false, 'single-line', 4, 'gitlab')
+  expect(view.queryByText('Healthy')).toBeNull()
+  const status = view.getByText('Reauthorization required')
+  expect(status.className).toContain('text-destructive')
+  expect(view.container.querySelector('.bg-destructive')).toBeTruthy()
+  expect(view.container.querySelector('.bg-emerald-500')).toBeNull()
+})
+
+for (const variant of ['two-line', 'avatar'] as const) {
+  test(`a blocked connection with a stale healthy check has an unhealthy badge (${variant})`, () => {
+    const view = list('oauth', true, false, variant, 4, 'gitlab')
+    expect(view.getByText('Unhealthy')).toBeTruthy()
+    expect(view.queryByText('Healthy')).toBeNull()
+  })
+}
+
+test('a connection that is not blocked keeps its healthy indicators', () => {
+  const view = list('oauth', false, false, 'single-line', 4, 'gitlab')
+  expect(view.getByText('Healthy')).toBeTruthy()
+  expect(view.container.querySelector('.bg-emerald-500')).toBeTruthy()
+})
+
+test('an expired token with no health message says so, not that it was never checked', () => {
+  const view = list('pat', true, false, 'single-line', 4, 'gitlab')
+  expect(view.getByText('The access token has expired')).toBeTruthy()
+  expect(view.queryByText('Not checked yet')).toBeNull()
+})
+
 test('another unhealthy reason keeps its own message and no rejection copy', () => {
   const view = list(
     'oauth',

@@ -52,6 +52,7 @@ import type {
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   authorizationRejectedMessage,
+  displayedHealthStatus,
   GITLAB_OAUTH_SETUP_PATH,
   providerSupportsReauthorization,
 } from '@/components/git/reauthorization'
@@ -756,10 +757,11 @@ function LastSyncedValue({ connection }: { connection: ConnectionResponse }) {
 }
 
 function HealthValue({ connection }: { connection: ConnectionResponse }) {
+  const status = displayedHealthStatus(connection)
   const label =
-    connection.health_status === 'healthy'
+    status === 'healthy'
       ? 'Healthy'
-      : connection.health_status === 'unhealthy'
+      : status === 'unhealthy'
         ? 'Unhealthy'
         : 'Not checked'
   return (
@@ -770,9 +772,9 @@ function HealthValue({ connection }: { connection: ConnectionResponse }) {
           : 'No health check has run yet'
       }
       className={
-        connection.health_status === 'unhealthy'
+        status === 'unhealthy'
           ? 'text-destructive'
-          : connection.health_status === 'healthy'
+          : status === 'healthy'
             ? 'text-emerald-700 dark:text-emerald-400'
             : undefined
       }

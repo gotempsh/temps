@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   authorizationRejectedMessage,
   canReauthorizeConnection,
+  displayedHealthStatus,
   needsReauthorization,
   providerSupportsReauthorization,
   readReauthorizationCallback,
@@ -141,6 +142,24 @@ describe('providerSupportsReauthorization', () => {
       undefined,
     ]) {
       expect(providerSupportsReauthorization(provider)).toBe(false)
+    }
+  })
+})
+
+describe('displayedHealthStatus', () => {
+  test('an expired connection is unhealthy whatever the last check said', () => {
+    for (const health_status of ['healthy', 'unhealthy', 'unknown']) {
+      expect(displayedHealthStatus({ is_expired: true, health_status })).toBe(
+        'unhealthy'
+      )
+    }
+  })
+
+  test('otherwise the last check stands', () => {
+    for (const health_status of ['healthy', 'unhealthy', 'unknown']) {
+      expect(displayedHealthStatus({ is_expired: false, health_status })).toBe(
+        health_status
+      )
     }
   })
 })

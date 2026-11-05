@@ -35,6 +35,17 @@ export function needsReauthorization(
   return connection.is_expired || connection.health_status === 'unhealthy'
 }
 
+/**
+ * The health to show for a connection. A rejected refresh sets `is_expired`
+ * during a sync or deploy and `health_status` only moves at the next health
+ * check, so an expired connection counts as unhealthy whatever the last one said.
+ */
+export function displayedHealthStatus(
+  connection: Pick<ConnectionResponse, 'is_expired' | 'health_status'>
+) {
+  return connection.is_expired ? 'unhealthy' : connection.health_status
+}
+
 /** Shown instead of whatever the provider answered, which is not for operators. */
 export const GITLAB_AUTHORIZATION_REJECTED =
   "GitLab no longer accepts this connection's authorization"

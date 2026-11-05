@@ -154,6 +154,26 @@ test('a verified 404 for the provider shows the connection as not found', () => 
 
 const rejected = { ...connection, is_expired: true }
 
+test('a blocked connection with a stale healthy check is not shown as healthy', () => {
+  const client = createClient()
+  client.setQueryData(providerKey, { ...provider, auth_method: 'oauth' })
+  client.setQueryData(connectionKey, rejected)
+  const html = render(client)
+  expect(html).toContain('Unhealthy')
+  expect(html).not.toContain('Healthy')
+  client.clear()
+})
+
+test('a connection that is not blocked still shows its healthy check', () => {
+  const client = createClient()
+  client.setQueryData(providerKey, { ...provider, auth_method: 'oauth' })
+  client.setQueryData(connectionKey, connection)
+  const html = render(client)
+  expect(html).toContain('Healthy')
+  expect(html).not.toContain('Unhealthy')
+  client.clear()
+})
+
 test('a rejected GitLab OAuth connection points at Reauthorize', () => {
   const client = createClient()
   client.setQueryData(providerKey, { ...provider, auth_method: 'oauth' })
