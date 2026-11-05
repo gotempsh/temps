@@ -5,26 +5,367 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0-beta.59] - 2026-11-03
-
-### Added
-
-- **git:** Reauthorize existing OAuth connections
+## [0.1.0-beta.60] - 2026-11-05
 
 ### CI
 
-- **release:** Stop the Linux ARM64 build from losing its runner
-- **release:** Log ARM64 runner resources before the first sleep
-- **release:** Check every ARM64 resource probe runs before the first sleep
+- **release:** Link the Linux ARM64 binary with lld so it stops overflowing call range
 
 ### Fixed
 
+- **git:** Block connections whose refresh token is rejected and stop losing rotated tokens
+- **web:** Explain a rejected GitLab authorization beside Reauthorize
+- **git:** Keep a stale refresh from overwriting a new token and refresh tokens of unknown lifetime
+- **web:** Stop sending GitLab App connections to a Reauthorize action they lack
+- **web:** Show GitLab App connections their recovery in the connections list
+- **web:** Stop showing a connection with a rejected token as healthy
+- **web:** Explain the machine and container address ranges on the Worker Nodes page ([#1821](https://github.com/gotempsh/temps/issues/1821))
+- **web:** Simplify build configuration, status pages, analytics, email and projects screens ([#1816](https://github.com/gotempsh/temps/issues/1816))
+- **web:** Give new workers a join command that installs the plane's version with sudo ([#1819](https://github.com/gotempsh/temps/issues/1819))
+- **web:** Check tunnel workers are online before creating anything, and show hostnames as a pattern ([#1820](https://github.com/gotempsh/temps/issues/1820))
+- **migrations:** Drop telemetry foreign keys after boot, not in one migration transaction
+- **test-utils:** Return the typed schema error from the post-migration helper
+- **schema:** Harden the telemetry foreign key detach against review findings
+
+### Testing
+
+- **release:** Fail the workflow contract when the ARM64 lld check is weakened
+
+## [0.1.0-beta.59] - 2026-11-05
+
+### Added
+
+- **nodes:** Encrypt values sent to workers with the node's public key
+- **git:** Reauthorize existing OAuth connections
+- **docker-util:** Add a crate for capped exec capture, image pull, ensure-network and tar upload
+
+### Build
+
+- **deps:** Bump bollard to 0.21.1 and testcontainers to 0.28
+- **status-page:** Remove the unused futures dependency
+- **deps:** Drop anyhow from crates that no longer use it
+
+### CI
+
+- **rust-tests:** Report what fills the disk in unit test jobs
+- **rust-tests:** Keep the disk report going after a failed command
+- **release:** Stop the Linux ARM64 build from losing its runner
+- **release:** Log ARM64 runner resources before the first sleep
+- **release:** Check every ARM64 resource probe runs before the first sleep
+- **rust-tests:** Run the temps-ai-agents unit tests
+- **rust-tests:** Stop a cache restore before it fills the disk
+- **rust-tests:** Keep the disk guard honest through the whole restore
+- **rust-tests:** Keep stopping a restore while the disk guard scans
+- **otel:** Run the Cloud-primary write-mode and outbox load tests
+- **tests:** Add a tool that compares the CI test filters with the workspace
+- **tests:** Run every test binary in CI and fail when one is left out
+- **rust-tests:** Keep the moved protocol and actor token tests running
+- **tests:** Report a missing cargo as a coverage tool error
+- **tests:** Exclude the rotated-out cursor test by name instead of ignoring it
+- **tests:** Correct the allow-list reason for the mesh lockdown tests
+- **tests:** Run the starters discovery tests in unit-integration
+- **tests:** Run Rust Tests on pull requests into the refactor branches
+- **tests:** Run the temps-docker-util tests in the Docker group
+- **nextest:** Run the tests sharing the sandbox image one at a time
+- **tests:** Run Rust Tests on pull requests into main only
+- **e2e:** Deploy fork pull requests from the fork
+
+### Documentation
+
+- **deployments:** Qualify secret mounts and list every TLS-only sandbox channel
+- **nodes:** Say which way each TLS-only response travels
+- **skills:** Adding a migration is adding a file
+- **crates:** Regenerate the crate map and lower the rule-drift baseline
+- **alarms:** Add temps-alarms to the crate map
+- **alarms:** Point release testing at the moved rule catalog tests
+- **deployments:** Fix the get_exposed_ports example
+- **core,plugin-sdk,query-mongodb:** Fix doc examples that no longer compile
+- **crates:** Regenerate the crate map for temps-plugin-protocol
+- **ci:** State the coverage guard's measured runtime
+- **crates:** Regenerate the crate map after merging the integration branch
+- **deployments:** Correct the comment on unsupported job types
+- **deployments:** Document what each job reads from its row
+- **config:** Point the environment hostname template at its default's new home
+- **deployments:** Add crate rules for the deployment pipeline
+- **nodes:** Add crate rules for node lifecycle and placement
+- **providers:** Add crate rules for the service manager and the engine contract
+- **proxy:** Add crate rules for the request path
+- **backup:** Add crate rules for backups and restores
+- **ai:** Add crate rules for chats and unattended agent runs
+- **core:** Add crate rules for plugins and shared contracts
+- **migrations:** Add crate rules for migrations and entities
+- **core:** Correct the documented middleware priority order
+
+### Fixed
+
+- **deployments:** Keep secrets out of final image metadata on custom builds
+- **deployer:** Treat a truncated exec stream as a failed probe on bollard 0.21
+- **deployments:** Keep the running Compose stack when a deploy fails before replacing it
 - Resolve the 20 open automated-qa issues across API, workers, proxy, AI gateway and backup ([#1779](https://github.com/gotempsh/temps/issues/1779))
 - Image transfer timeouts, Dragonfly startup and false deployment reverts ([#1787](https://github.com/gotempsh/temps/issues/1787))
 - **web:** Report refused console actions accurately and with the reason ([#1794](https://github.com/gotempsh/temps/issues/1794))
 - **git:** Preserve reauthorized grants during concurrent refreshes
 - **api:** Regenerate OAuth reauthorization client routes
 - **git:** Keep token refresh independent of sync status
+- **deployer:** Stop following build status when a secret-mount build is cancelled
+- **deployments:** Pass public values when a build falls back to the control plane
+- **deployer:** End the BuildKit session with every secret-mount build
+- **deployments:** Serve a secret mount however BuildKit names it
+- **deployments:** Withhold secrets from ARGs hidden by Dockerfile line syntax
+- **cli:** Make rollback -y skip the confirmation prompt
+- **deployments:** Run the default health check on rollback and promotion
+- **cli:** Fail a targetless rollback without a terminal before fetching history
+- **ai-agents:** Install the microsandbox runtime the SDK requires
+- **entities:** Keep health-check timeout bounds with the config type
+- **deps:** Update pulldown-cmark to 0.13.6 for RUSTSEC-2026-0433
+- **otel:** Update projects when disconnecting from Cloud or falling back on quota
+- **deployer:** Let the release binary compile again
+- **ai-agents:** Install the microsandbox runtime the SDK accepts
+- **core:** Redact the master key from EncryptionService Debug output
+- **core:** Keep key characters out of cookie and ECIES key parse errors
+- **providers:** Answer engine validation, not-found and conflict errors with their own status
+- **docker-util:** Restore feature-gated test import and drop a needless borrow
+- **providers:** Return the daemon's own error when the Temps network cannot be created
+- **ai-chat:** Discard a stale harness runtime before the salvage reply
+- **ai-chat:** Give each attachment conflict its own explicit error title
+- **git:** Name every provider failure behind a repository creation error
+- **monitoring:** Decide the message of every cron monitor error explicitly
+- **funnels:** Document the funnel update and delete responses in the API
+- **providers:** Document the 400 that start, stop, env var and credential endpoints can return
+- **providers:** Answer a start on a missing imported container with a 404
+- **sandbox:** Stop a kill by pattern from restarting the whole sandbox
+- **backup:** Keep a cancelled backup failed when its engine finishes late
+- **backup:** Stop one bad cron expression from ending all scheduled backups
+- **backup:** Start only one run when a schedule is triggered concurrently
+- **backup:** Fail the backup when its engine panics instead of leaving it running
+- **backup:** Fail child rows when a backup is cancelled or orphaned by a restart
+- **backup:** Keep handling backup requests and cancels while every slot is busy
+- **deployments:** Mark jobs interrupted by a restart as failed, not successful
+- **deployments:** Withhold failure report logs when secrets cannot be decrypted
+- **deployments:** Remove deployment containers even when log storage is broken
+- **deployments:** Point the missing Docker socket error at ADR 079
+- **ai-agents:** Leave a preview gateway owned by another instance running on startup
+- **ai-agents:** Make cancelling an agent run stop its sandbox and stick
+- **cli:** Exit 0 from temps projects delete after deleting the default project
+- **docker-housekeeping:** Keep the Docker socket address out of disk usage errors
+- **schema:** Stop temps migrate --dry-run creating the migration ledger
+- **entities:** Keep stored secrets out of entity JSON and debug output
+- **nodes:** Log why a worker's remote deployer could not be created
+- **cli:** Serve the node state and instance env routes on the mesh listener
+- **geo:** Keep temps serve running when the GeoLite2 database is missing
+- **cli:** Accept 64-bit instance ids on the node mesh env route
+- **providers:** Refuse to upgrade an imported service instead of creating a second container
+- **providers:** Derive the data explorer's database password with HMAC-SHA256
+- **providers:** Delete an imported service without touching the operator's container
+- **providers:** Answer cluster routes by error type, not by words in the message
+- **providers:** Stop leaving anonymous volumes behind after restores and upgrades
+- **providers:** Stop repeating the input in the invalid service type error
+- **git:** Validate the GitHub App manifest response and never match an empty webhook secret
+- **git:** Report manifest setup failures with the shared error builder
+- **git:** Require a name in the GitHub App manifest reply
+- **console:** Hold the random console ports until they are served
+- **serve:** Size the server's database pool from TEMPS_DB_* again
+- **deployments:** Stop and start paused deployments on the node that runs them
+- **deployments:** Keep pause, resume and deploy from racing over a paused deployment
+- **deployments:** Give a restarted replica the full failure threshold before alarming
+- **serve:** Stop startup hanging on geo downloads and dead pool connections ([#1812](https://github.com/gotempsh/temps/issues/1812))
+- **deployments:** Remove a resumed deployment's containers when a newer deploy replaces it
+- **deployments:** Keep a deploy's teardown from removing a deployment being paused
+- **deployments:** Limit how long an unreachable worker can block pause and resume
+- **geo:** Resolve cached addresses again when a late database arrives ([#1815](https://github.com/gotempsh/temps/issues/1815))
+
+### Miscellaneous
+
+- **migrations:** Lower the rule-drift baseline for the shorter migration module
+- **refactor:** Regenerate the crate map and lock in the lower rule-drift count
+- **core:** Lower the anyhow_in_library rule baseline
+- **tools:** Remove the unreferenced Keycloak dev harness
+- **tools:** Remove the unreferenced backup stress benchmark
+- Remove the unreferenced acceptance-tests runner
+- **api:** Generate @temps-sdk/api from the canonical spec and drop its copy
+- **api:** Regenerate @temps-sdk/api from the canonical spec
+- **docker-util:** Format the node agent pull and regenerate the crate map
+- **rules:** Lower the temps-deployments rule-drift baseline
+- **deployments:** Lower the long-function baseline after the replica phase split
+- **rule-drift:** Lower the baseline after the catch-all and funnel fixes
+- **nodes:** Record the temps-nodes crate in the docs and rule baseline
+- **rule-drift:** Lower the baseline after the typed notification errors
+- **rule-drift:** Lower the baseline after the typed git errors
+- **rule-drift:** Lower the baseline after naming error fields
+- **api:** Regenerate the OpenAPI spec and both clients
+- **openapi:** Refresh the spec and generated clients
+
+### Refactor
+
+- **migrations:** Generate the migration list from the migration files
+- **backup:** Merge temps-backup-core into temps-backup as `execution`
+- **embeddings:** Keep only the hash tokenizer error tracking uses
+- **error-tracking:** Merge temps-embeddings into temps-error-tracking as `tokenizer`
+- **cli:** Merge temps-static-files into temps-cli
+- **authz:** Split the authorization primitives into temps-authz
+- **ai,analytics,audit:** Depend on temps-authz instead of temps-auth
+- **blob,dns,email,flags,geo,import,infra:** Depend on temps-authz
+- **kv,logs,mcp,monitoring,netpol,notifications:** Depend on temps-authz
+- **otel,proxy,webhooks,error-tracking:** Depend on temps-authz
+- **core:** Share one constant-time comparison for secrets and token hashes
+- **import:** Share the importers' sanitize_slug through temps-import-types
+- **clickhouse:** Build the real-ClickHouse test clients with temps-clickhouse
+- **core:** Run status-page and log-aggregator retries through RetryConfig
+- **environments:** Give temps-projects' env var service the shared EnvVarError
+- **core:** Hash stored tokens with one shared sha256_hex
+- **core:** Share HTML and LIKE-pattern escaping through temps-core
+- **session-replay,project-groups:** Depend on temps-authz
+- **config:** Move settings handlers and ConfigPlugin into temps-config-handlers
+- **entities:** Delete the unused tokenizer copy
+- **presets:** Move the Compose security catalog out of temps-entities
+- **presets:** Move stored preset behaviour out of temps-entities
+- **config:** Move deployment config logic out of temps-entities
+- **alarms:** Move the alarm service into a new temps-alarms crate
+- **alarms:** Move default alert rule seeding into temps-alarms
+- **alarms:** Depend on temps-alarms from providers, git, backup and otel
+- **test-utils:** Move TestDatabase into a dev-only temps-test-utils crate
+- **schema:** Move the migrator out of temps-database into temps-schema
+- **core:** Stop re-exporting temps-memory from temps-core
+- **deployments:** Move the workflow engine out of temps-core
+- **core:** Move the external plugin protocol to temps-plugin-protocol
+- **core:** Move project templates to temps-presets
+- **core:** Move AppSettings and public ingress to temps-config
+- **core:** Return a typed EncryptionError from EncryptionService
+- **core:** Return a typed AuditError from the audit traits
+- **core:** Remove ServiceError::Internal
+- **providers:** Move the MariaDB data browser into temps-query-mariadb
+- **config:** Move the control plane's node agent TLS clients into temps-config
+- **ai-agents:** Move AgentError and the shared sandbox constants into temps-agent-core
+- **backup:** Use temps-docker-util for WAL-G and binlog execs and image pulls
+- **providers:** Use temps-docker-util for exec capture, pulls and uploads
+- **ai-agents:** Use temps-docker-util for sandbox step execs and image pulls
+- **docker:** Use temps-docker-util for container exec and plain image pulls
+- **core:** Move ensure_bridge_network to temps-docker-util
+- **ai-cli:** Make the AI CLI providers a standalone temps-ai-cli crate
+- **providers:** Move the engine contract into temps-providers-core
+- **sandbox:** Make the sandbox backends a standalone temps-sandbox-providers crate
+- **ai-chat:** Move the tool loop into its own module
+- **ai-chat:** Give the tool loop an explicit budget
+- **ai-chat:** Build the tool loop's executors outside the loop
+- **ai-chat:** Hold the tool loop's progress in state structs
+- **ai-chat:** Extract how a chat turn finishes
+- **ai-chat:** Extract the tool loop's salvage call
+- **ai-chat:** Extract tool dispatch from the tool loop
+- **ai-chat:** Extract one provider round from the tool loop
+- **ai-chat:** Extract a chat turn's claim check and monitor
+- **ai-chat:** Extract how a chat turn is assembled
+- **deployments:** Add a job registry and move the configure jobs
+- **deployments:** Move the mark, screenshot and scan jobs to the registry
+- **deployments:** Move the capture and persist jobs to the registry
+- **deployments:** Move the pull, verify and source bundle jobs to the registry
+- **deployments:** Move the static site jobs to the registry
+- **deployments:** Move the repository download job to the registry
+- **deployments:** Move the compose job to the registry
+- **deployments:** Move the image build job to the registry
+- **deployments:** Move the image deploy job to the registry
+- **deployments:** Make the job registry the only dispatcher
+- **proxy:** Move request_filter's body behind a stage result
+- **proxy:** Take reading and stripping the request out of request_filter
+- **proxy:** Take the status-page hostname stage out of request_filter
+- **proxy:** Take the sandbox preview stage out of request_filter
+- **proxy:** Make the signed-in gate a request_filter stage
+- **proxy:** Take the host wake stage out of request_filter
+- **proxy:** Take matching the path route out of request_filter
+- **proxy:** Take the path target wake stage out of request_filter
+- **proxy:** Take the unavailable path target stage out of request_filter
+- **proxy:** Take a project's checks out of request_filter
+- **proxy:** Take the connection cap stage out of a project's checks
+- **proxy:** Take the request policy stage out of a project's checks
+- **proxy:** Take the access decision's responses out of a project's checks
+- **proxy:** Take the Shield stage out of a project's checks
+- **proxy:** Take the password wall stage out of a project's checks
+- **proxy:** Take the solver files stage out of request_filter
+- **proxy:** Make the ACME challenge one request_filter stage
+- **proxy:** Take the on-demand TLS stage out of request_filter
+- **proxy:** Take the HTTPS redirect stage out of request_filter
+- **proxy:** Take the domain redirect stage out of request_filter
+- **proxy:** Take preparing the upstream request out of request_filter
+- **proxy:** Take the second domain redirect check out of request_filter
+- **proxy:** Take the static files stage out of request_filter
+- **proxy:** Take the persisted asset stage out of request_filter
+- **proxy:** Take the stale chunk stage out of request_filter
+- **proxy:** Take the admin gate stage out of request_filter
+- **proxy:** Answer every wake refusal from one place
+- **proxy:** Split the sign-in and password verify answers out of their stages
+- **proxy:** Lock in the shorter request filter in the rule baseline
+- **cli:** Register plugins from tables that read in startup order
+- **providers:** Move the Redis engine into temps-providers-redis
+- **node-agent:** Call database engines and the plugin compiler through injected interfaces
+- **node-agent:** Pass the injected engines in the agent server options
+- **deployments:** Split replica deployment into named phases with a test per failure path
+- **providers:** Move the MongoDB engine into temps-providers-mongodb
+- **deployments:** Load deployment projects and environments through the remote deployment service
+- **deployments:** Serve the edge route table and node lookups from services
+- **providers:** Move the MariaDB engine into temps-providers-mariadb
+- **providers:** Move the object storage engines into temps-providers-s3
+- **providers:** Move the PostgreSQL engines into temps-providers-postgres
+- **nodes:** Move worker node code into temps-nodes
+- **notifications:** Report provider failures with typed errors that hide webhook secrets
+- **traefik-discovery:** Move Traefik route discovery into its own crate
+- **providers:** Fold the data browser drivers into their engines
+- **ci-tokens:** Move deployment tokens and CI dispatch into their own crate
+- **git:** Tell missing files, refused tokens and rate limits apart when reading repositories
+- **git:** Report local git failures with typed errors that drop URL credentials
+- **docker-housekeeping:** Move Docker cleanup and disk usage into their own crate
+- **monitoring:** Name the monitor, operation and path in cron, disk and outage errors
+- **ai-chat:** Give identity error variants named fields, keeping status and detail
+- **git:** Give public repository error variants named fields, keeping status and detail
+- **deployments:** Remove the unused environment-wide container operations
+
+### Styling
+
+- **migrations:** Apply rustfmt to the generated migration list
+- **providers:** Format the test-support attributes
+- **ai-chat:** Format the tool loop tests
+- **deployments:** Format the rollback tests after the helper path change
+
+### Testing
+
+- **deployments:** Skip the rollback probe tests when Docker is unavailable
+- **ai-agents:** Make the Docker sandbox tests hold up under nextest
+- **ai-agents:** Stop the kill test matching its own helper shell
+- **migrations:** Pin shipped migration order in a checked-in fixture
+- **backup:** Cover the cancel helpers, job processor and orphan reconcile
+- **authz:** Cover the role mapping, guard 403 shape and RequireAuth
+- **config-handlers:** Cover the settings router's 401 and the plugin's OpenAPI document
+- **alarms:** Cover moved entry points that had no direct test
+- **alarms:** Cover seed_default_rules capacity and insert paths on a mock
+- **test-utils:** Share the identical docker_available helper
+- **test-utils:** Share the error-tracking setup_test_db helper
+- **otel:** Stop Cloud-primary tests depending on two clocks agreeing
+- **monitoring:** Add the column the HTTP check tests' env_vars table was missing
+- **cloud:** Align console-access tests with email and ingress-grant changes
+- **clickhouse:** Drop a premise the clickhouse crate no longer meets
+- **providers,ai-agents:** Update golden container fixtures to what the engines send
+- **sandbox:** List the egress-policy route in the Vercel surface guard
+- **core:** Pin the external plugin wire format byte for byte
+- **sandbox:** List every route the Vercel surface guard was missing
+- **vm-agent:** Mark the rotated-out cursor test as known broken on ext4
+- **cli:** Stop the OTLP leak test failing on a random span id
+- Pin the client-visible body of fail-closed audit paths
+- **dns,providers,migrations:** Run the database suites CI was skipping
+- **ci:** Check which pull requests run Rust Tests and how tests guard on the database URL
+- **docker:** Remove a test container that would not start
+- **ai-chat:** Pin what a chat turn shows and persists for each way it ends
+- **ai-chat:** Use expect_err in the tool loop tests
+- **deployments:** Pin what every job type string builds
+- **proxy:** Add a benchmark of the request path
+- **proxy:** Stop the request path benchmark waiting for a first route load
+- **proxy:** Pin the order of the checks in request_filter
+- **proxy:** Pin the status page host and preview ahead of the signed-in gate
+- **proxy:** Keep the request path bench out of the test coverage check
+- **proxy:** Stop changing the environment in the request path fixtures
+- **ai-chat:** Read the Redis engine from its own crate
+- **e2e:** Wait for the outage incident in the monitoring scenario
+- **providers:** Assert the typed error when MariaDB refuses an upgrade
+- **cli:** Fail if a serve profile's local-workload setting stops reaching environments
+- **authz:** Record temps-nodes and temps-ci-tokens in the guard snapshots
+- **migrations:** Name the latest shipped migration in the order failure message
 
 ## [0.1.0-beta.58] - 2026-11-03
 
