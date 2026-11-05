@@ -5,10 +5,7 @@ import { expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
-const css = readFileSync(
-  path.resolve(import.meta.dir, '../globals.css'),
-  'utf8'
-)
+const css = readFileSync(path.resolve(import.meta.dir, 'globals.css'), 'utf8')
 
 const ruleBody = (selector: string) =>
   css.match(new RegExp(`(?:^|\\n)${selector} \\{([^}]*)\\}`))?.[1] ?? ''
