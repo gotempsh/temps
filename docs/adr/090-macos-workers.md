@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-05
-- **Builds on:** ADR-088 (workers join with no public address), ADR-048 (WireGuard mesh), ADR-020 (agent mTLS), ADR-059 (join preflight)
+- **Builds on:** ADR-088 (workers join with no public address), ADR-080 (WireGuard mesh), ADR-020 (agent mTLS), ADR-059 (join preflight)
 
 ## Context
 
@@ -137,13 +137,20 @@ Before the join token is spent:
    kernel WireGuard and nftables. Either missing stops the join with what to
    update; nothing is set up. A refusal to run the probe names Docker Desktop's
    Enhanced Container Isolation, which forbids it.
+3. Check that the app forwards a listener on its VM's loopback to the Mac's
+   loopback, the path the agent's calls to the control plane take: an
+   unprivileged throwaway container answers on the VM's loopback and the join
+   reads its reply on the Mac. If nothing answers, Docker Desktop needs
+   *Settings > Resources > Network > Enable host networking*, the error says
+   so, and the token is not spent.
 
 Then, after mesh enrollment (ADR-088 §1): start the sidecar, prove it reaches
 the Mac's loopback through `host-gateway`, bring the mesh up through it, wait
 until the egress port is forwarded to the Mac, and register over it (ADR-088
-§2). If the egress port never appears, Docker Desktop needs *Settings >
-Resources > Network > Enable host networking*, and the error says so.
-`--agent-address` must stay on loopback.
+§2). If any of that fails, the join removes the sidecar and the mesh interface
+it created (a sidecar that was already there belongs to a worker joined
+before, and stays). `--agent-address` must be `127.0.0.1:<port>`: the sidecar
+reaches the Mac over IPv4.
 
 ### 4. The service: a LaunchAgent
 
@@ -218,10 +225,15 @@ is nothing to load it), and the docs and the install output say so.
   visitor address) is reachable from workloads on a Mac worker, so a Mac worker
   should not also run a tunnel connector for untrusted workloads.
 - **Calls to the control plane.** The egress forwarder listens on the VM's
-  loopback, which containers cannot reach (they have their own namespaces), so
-  it gives workloads no path to the control plane's node API. The mesh lockdown
-  keeps dropping forwarded traffic from containers into the tunnel, as on Linux.
-  The agent verifies the control plane by the cluster CA and reserved name.
+  loopback, which containers cannot reach directly, and the mesh lockdown keeps
+  dropping forwarded traffic from containers into the tunnel, as on Linux. But
+  the Docker app forwards that loopback port to the Mac's loopback, and
+  workloads reach the Mac's loopback through `host-gateway`: **unlike on Linux,
+  a workload on a Mac worker has a network path to the control plane's node
+  API** (through the Mac, the forwarder and the mesh). The barrier is the node
+  API's own authentication (the agent token, and TLS to the cluster CA), not
+  the network. The agent verifies the control plane by the cluster CA and
+  reserved name, so a workload cannot stand in for it either.
 - **Nothing on the LAN.** No listener binds a Mac interface other than
   loopback; the Docker apps forward VM loopback ports to the Mac's loopback
   only. Published workload ports bind the mesh address, inside the VM. The
@@ -229,6 +241,11 @@ is nothing to load it), and the docs and the install output say so.
   give the VM a LAN address (colima `--network-address` in bridged mode) still
   exposes nothing: the sidecar binds the mesh address and the VM's loopback,
   never `0.0.0.0`.
+- **Policy window.** After the Docker app's VM restarts, a restricted workload
+  runs without network policy until the agent's first policy pass (within 15 s
+  of the agent reaching the VM): a Mac has no boot guard to close that window
+  (see Network policy). Keeping restricted workloads stopped until the policy
+  is in place would need a start-control mechanism this ADR does not add.
 - **The private key** stays in `~/.temps/wireguard/private.key` (0600) and in
   the VM's kernel; it crosses `docker exec` on standard input and is written to
   a 0600 temporary file in the sidecar's tmpfs only for `wg set`, removed on
@@ -262,7 +279,8 @@ Unit tests cover everything that parses, plans or renders (the `wg` dump and
 classification, sidecar arguments and spec, the LaunchAgent plist, the console
 command and labels). CI has no macOS runner with a Docker VM, so the sidecar,
 the VM probes, launchd and the end-to-end join are not covered there;
-`scripts/macos-worker-e2e.sh` is the manual test for a real Mac.
+`scripts/macos-worker-e2e.sh`, added with the implementation (#1824), is the
+manual test for a real Mac.
 
 It was run on an Apple silicon Mac with colima: a control plane built from this
 change in one colima VM (as a Linux host, its listeners and WireGuard port
