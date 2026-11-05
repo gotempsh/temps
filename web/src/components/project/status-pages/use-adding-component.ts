@@ -1,16 +1,28 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useIsMutating } from '@tanstack/react-query'
+import { useIsMutating, type MutationKey } from '@tanstack/react-query'
+import { useId, useMemo } from 'react'
 
-/** Identifies the lookup that adds a component to a status page. */
-export const ADD_COMPONENT_KEY = ['status-page-add-component']
+/** What a form shares with its `StatusPageComponentsEditor`. */
+export interface ComponentAddition {
+  /** Tags the editor's lookups, so only this form counts them. */
+  mutationKey: MutationKey
+  /**
+   * Whether a service chosen in this form is still being added. Its
+   * environments are loading and the row is not in the form yet, so a save
+   * now would leave it out: the form holds its save until it lands.
+   */
+  adding: boolean
+}
 
 /**
- * Whether a component is being added. Its environments are still loading and
- * the row is not in the form yet, so a save now would leave it out: the forms
- * that host the editor hold their save until it lands.
+ * The pending addition of one form, scoped to it: a lookup left running by
+ * another status page's editor never holds this form's save.
  */
-export function useAddingComponent(): boolean {
-  return useIsMutating({ mutationKey: ADD_COMPONENT_KEY }) > 0
+export function useComponentAddition(): ComponentAddition {
+  const id = useId()
+  const mutationKey = useMemo(() => ['status-page-add-component', id], [id])
+  const adding = useIsMutating({ mutationKey, exact: true }) > 0
+  return { mutationKey, adding }
 }

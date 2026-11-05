@@ -61,7 +61,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { StatusPageProjects, StatusPageStateBadge } from './ProjectStatusPages'
 import { StatusPageComponentsEditor } from './StatusPageComponentsEditor'
-import { useAddingComponent } from './use-adding-component'
+import { useComponentAddition } from './use-adding-component'
 import { StatusPageDomains } from './StatusPageDomains'
 import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageAppearanceForm } from './StatusPageAppearanceForm'
@@ -261,7 +261,8 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
     },
   })
 
-  const adding = useAddingComponent()
+  const addition = useComponentAddition()
+  const adding = addition.adding
 
   const onSubmit = (values: StatusPageFormValues) => {
     // A service still being added is not in `values` yet.
@@ -298,6 +299,7 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
                 <FormItem>
                   <StatusPageComponentsEditor
                     value={field.value}
+                    addition={addition}
                     onChange={field.onChange}
                     errors={form.formState.errors.components}
                     initialProjectId={page.projects[0]?.id}

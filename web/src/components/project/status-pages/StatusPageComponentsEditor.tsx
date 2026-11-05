@@ -22,7 +22,7 @@ import { ArrowDown, ArrowUp, Trash2 } from 'lucide-react'
 import { useEffect, useId, useMemo, useRef } from 'react'
 import type { FieldErrors } from 'react-hook-form'
 import { Link } from 'react-router'
-import { ADD_COMPONENT_KEY } from './use-adding-component'
+import type { ComponentAddition } from './use-adding-component'
 import {
   buildMonitorChoices,
   choiceLabel,
@@ -115,12 +115,15 @@ export function StatusPageComponentsEditor({
   onChange,
   errors,
   initialProjectId,
+  addition,
 }: {
   value: ComponentRow[]
   onChange: (rows: ComponentRow[]) => void
   errors?: RowErrors
   /** Listed first in the picker, e.g. the service the user came from. */
   initialProjectId?: number
+  /** The host form's `useComponentAddition()`, so it can hold its save. */
+  addition: ComponentAddition
 }) {
   const groupListId = useId()
   const groups = groupNames(value)
@@ -209,6 +212,7 @@ export function StatusPageComponentsEditor({
         projectsLoading={projectsQuery.isLoading}
         full={value.length >= MAX_MONITORS_PER_PAGE}
         hasComponents={value.length > 0}
+        mutationKey={addition.mutationKey}
         currentTaken={() => new Set(rowsRef.current.map((r) => r.monitor_id))}
         onAdd={(row) => {
           const rows = rowsRef.current
@@ -399,6 +403,7 @@ function AddComponentRow({
   projects,
   projectOptions,
   projectsLoading,
+  mutationKey,
   currentTaken,
   full,
   hasComponents,
@@ -407,6 +412,7 @@ function AddComponentRow({
   projects: ProjectSummary[]
   projectOptions: SearchableSelectOption[]
   projectsLoading: boolean
+  mutationKey: ComponentAddition['mutationKey']
   /** Monitors on the page when the lookup returns, not when it started. */
   currentTaken: () => ReadonlySet<number>
   full: boolean
@@ -415,7 +421,7 @@ function AddComponentRow({
 }) {
   const queryClient = useQueryClient()
   const add = useMutation({
-    mutationKey: ADD_COMPONENT_KEY,
+    mutationKey,
     mutationFn: async (project: ProjectSummary) => {
       const request = { path: { project_id: project.id } }
       const [environments, monitors] = await Promise.all([

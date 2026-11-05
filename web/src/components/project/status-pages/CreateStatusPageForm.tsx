@@ -22,7 +22,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { StatusPageComponentsEditor } from './StatusPageComponentsEditor'
-import { useAddingComponent } from './use-adding-component'
+import { useComponentAddition } from './use-adding-component'
 import {
   createDefaults,
   createStatusPageSchema,
@@ -75,7 +75,8 @@ export function CreateStatusPageForm({
   })
   const busy =
     create.isPending || publish.isPending || form.formState.isSubmitting
-  const adding = useAddingComponent()
+  const addition = useComponentAddition()
+  const adding = addition.adding
 
   const handleCreate = async (values: CreateStatusPageValues) => {
     // A service still being added is not in `values` yet.
@@ -148,6 +149,7 @@ export function CreateStatusPageForm({
                 <FormItem>
                   <StatusPageComponentsEditor
                     value={field.value}
+                    addition={addition}
                     onChange={field.onChange}
                     errors={form.formState.errors.components}
                     initialProjectId={initialProjectId}
