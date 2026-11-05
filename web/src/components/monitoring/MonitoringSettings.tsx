@@ -3,7 +3,8 @@
 
 'use client'
 
-import { getPreferences, updatePreferences } from '@/api/client/sdk.gen'
+import { getPreferences } from '@/api/client/sdk.gen'
+import { savePreferences } from './save-preferences'
 import { NotificationPreferencesResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { SettingsGroup } from '@temps-sdk/ds'
@@ -31,7 +32,6 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
-import { toast } from 'sonner'
 import {
   backupAlertsSchema,
   domainAlertsSchema,
@@ -879,16 +879,14 @@ export function MonitoringSettings() {
       error_time_window: data.runtimeErrors.windowMinutes,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    await savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving service alert settings...',
         success: 'Service alert settings saved successfully',
-        error: 'Failed to save service alert settings',
+        subject: 'service alert settings',
       }
     )
   }
@@ -905,16 +903,14 @@ export function MonitoringSettings() {
       dns_changes_enabled: data.dnsConfigurationChanges,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    await savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving domain alert settings...',
         success: 'Domain alert settings saved successfully',
-        error: 'Failed to save domain alert settings',
+        subject: 'domain alert settings',
       }
     )
   }
@@ -930,16 +926,14 @@ export function MonitoringSettings() {
       backup_successes_enabled: data.backupSuccess,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    await savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving backup alert settings...',
         success: 'Backup alert settings saved successfully',
-        error: 'Failed to save backup alert settings',
+        subject: 'backup alert settings',
       }
     )
   }
@@ -953,16 +947,14 @@ export function MonitoringSettings() {
       load_balancer_issues_enabled: data.loadBalancerIssues,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    await savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving route alert settings...',
         success: 'Route alert settings saved successfully',
-        error: 'Failed to save route alert settings',
+        subject: 'route alert settings',
       }
     )
   }
@@ -970,16 +962,11 @@ export function MonitoringSettings() {
   const handleNotificationSave = async (data: NotificationSettingsFormData) => {
     if (!preferences) return
 
-    await toast.promise(
-      updatePreferences({
-        body: notificationPreferencesUpdate(preferences, data),
-      }),
-      {
-        loading: 'Saving delivery preferences...',
-        success: 'Delivery preferences saved',
-        error: 'Failed to save delivery preferences',
-      }
-    )
+    await savePreferences(notificationPreferencesUpdate(preferences, data), {
+      loading: 'Saving delivery preferences...',
+      success: 'Delivery preferences saved',
+      subject: 'delivery preferences',
+    })
   }
 
   const handleDigestSave = async (data: WeeklyDigestFormData) => {
@@ -999,16 +986,14 @@ export function MonitoringSettings() {
       },
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    await savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving weekly digest settings...',
         success: 'Weekly digest settings saved successfully',
-        error: 'Failed to save weekly digest settings',
+        subject: 'weekly digest settings',
       }
     )
   }
