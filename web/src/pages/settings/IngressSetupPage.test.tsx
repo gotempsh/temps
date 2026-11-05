@@ -357,3 +357,41 @@ test('a run\u2019s result stays when a later poll finds no workers', async () =>
   ).toBeTruthy()
   expect(screen.queryByText('No worker node yet')).toBeNull()
 })
+
+test('a picked worker that goes offline holds Create until the operator decides', async () => {
+  let cOffline = false
+  const { client, posted } = setup({
+    nodes: () => [
+      worker(1, 'worker-a'),
+      worker(3, 'worker-c', cOffline ? 'offline' : 'active'),
+    ],
+  })
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  const c = screen.getByRole('checkbox', { name: 'worker-c' })
+  await waitFor(() => expect(c.getAttribute('data-state')).toBe('checked'))
+  // An explicit selection of both.
+  fireEvent.click(a)
+  fireEvent.click(a)
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+
+  cOffline = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText('worker-c is no longer available')
+  expect(create.hasAttribute('disabled')).toBe(true)
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue with worker-a' })
+  )
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  expect(screen.queryByText('worker-c is no longer available')).toBeNull()
+
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
+    node_ids: [1],
+  })
+})

@@ -482,7 +482,9 @@ export async function runTunnelSetup(
   set('workers', 'done', 'Connected.')
 
   // A page that went away (or a new run) stops this one before it creates
-  // anything more, so nothing is made without a page to show it and undo it.
+  // anything, so nothing is made without a page to show it and undo it.
+  // Past this point the run finishes what it started rather than stopping
+  // halfway with a domain and no tunnel.
   if (signal?.aborted) return { kind: 'aborted', created }
 
   // 1. The domain, managed and verified: a tunnel only takes one.
@@ -524,8 +526,6 @@ export async function runTunnelSetup(
   } catch (error) {
     return fail('domain', message(error))
   }
-
-  if (signal?.aborted) return { kind: 'aborted', created }
 
   // 2. The tunnel. A save that fails afterwards still leaves a row, found
   // by its name: the name was free when the run started.

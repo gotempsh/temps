@@ -408,6 +408,11 @@ function TunnelSetup({
     (id) => eligibility.get(id)?.selectable
   )
   const chosenNodes = workers.filter((n) => nodeIds.includes(n.id))
+  // Workers the operator picked that a later poll made unavailable (offline,
+  // removed): the run would quietly use fewer, so it waits for a decision.
+  const droppedPicks = (picked ?? [])
+    .filter((id) => !eligibility.get(id)?.selectable)
+    .map((id) => workers.find((n) => n.id === id)?.name ?? `node ${id}`)
 
   const managedQuery = useQuery({
     ...listManagedDomainsOptions({ path: { id: account?.id ?? 0 } }),
@@ -506,6 +511,7 @@ function TunnelSetup({
     !!zone &&
     !labelError &&
     nodeIds.length > 0 &&
+    droppedPicks.length === 0 &&
     !conflict &&
     tunnelsQuery.isSuccess &&
     !managedQuery.isLoading
@@ -653,6 +659,33 @@ function TunnelSetup({
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {droppedPicks.length > 0 && !run.data && !run.isPending && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                {droppedPicks.join(', ')}{' '}
+                {droppedPicks.length === 1 ? 'is' : 'are'} no longer available
+              </AlertTitle>
+              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                <p>
+                  You picked {droppedPicks.length === 1 ? 'it' : 'them'} under
+                  Workers, but {droppedPicks.length === 1 ? 'it' : 'they'} can
+                  no longer run a tunnel (see why there). Bring{' '}
+                  {droppedPicks.length === 1 ? 'it' : 'them'} back, or go on
+                  without.
+                </p>
+                {nodeIds.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setPicked(nodeIds)}
+                  >
+                    Continue with {chosenNodes.map((n) => n.name).join(', ')}
+                  </Button>
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
           {steps && <StepList steps={steps} />}
           {outcome && (
             <OutcomePanel
