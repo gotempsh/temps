@@ -61,6 +61,7 @@ mesh_address=$(field mesh_address)
 control_plane=$(field control_plane_address)
 agent_port=$(field agent_port)
 egress_port=$(field egress_port)
+node_api_port=$(field node_api_port)
 d() { "$docker_cli" --host "$docker_host" "$@"; }
 in_sidecar() { d exec "$SIDECAR" "$@"; }
 
@@ -72,14 +73,22 @@ handshake_age() {
   [[ -n "$latest" && "$latest" != 0 ]] && echo $((now - latest)) || echo 999999
 }
 
-# Wait up to $1 seconds for the control plane to answer over the mesh. A
-# reply means it accepted this worker's packets and sends back to where they
+# Whether the control plane's node API accepts a TCP connection over the
+# mesh, from the sidecar (the path the agent's calls take). TCP, not ping:
+# the sidecar has no CAP_NET_RAW, and unprivileged ICMP depends on the VM's
+# net.ipv4.ping_group_range.
+control_plane_answers() {
+  in_sidecar socat -T 3 /dev/null "TCP:$control_plane:$node_api_port,connect-timeout=3" >/dev/null 2>&1
+}
+
+# Wait up to $1 seconds for the control plane to answer over the mesh. An
+# answer means it accepted this worker's packets and sends back to where they
 # came from; WireGuard roams on any authenticated packet, so this does not
 # need (or wait for) a fresh handshake.
 wait_for_control_plane() {
   local limit="$1"
   for _ in $(seq 1 "$limit"); do
-    in_sidecar ping -c 1 -W 1 "$control_plane" >/dev/null 2>&1 && return 0
+    control_plane_answers && return 0
     sleep 1
   done
   return 1
@@ -99,8 +108,8 @@ check "the mesh lockdown is installed in the VM" \
   in_sidecar nft list table inet temps_mesh
 age=$(handshake_age)
 if [[ "$age" -lt 180 ]]; then pass "handshake with the control plane ${age}s ago"; else fail "no handshake in the last 180s"; fi
-check "the control plane answers over the mesh (ping $control_plane)" \
-  in_sidecar ping -c 1 -W 3 "$control_plane"
+check "the control plane's node API answers over the mesh ($control_plane:$node_api_port)" \
+  control_plane_answers
 check "the agent listens on the Mac's loopback" \
   sh -c "lsof -nP -iTCP:$agent_port -sTCP:LISTEN | grep -q '127.0.0.1:$agent_port'"
 check "the egress forwarder is reachable on the Mac's loopback" \
@@ -135,7 +144,7 @@ if [[ "$restart" -eq 1 ]]; then
   if [[ -n "$new_pid" && "$new_pid" != "$old_pid" ]]; then pass "the LaunchAgent restarted (pid $old_pid -> $new_pid)"; else fail "the LaunchAgent did not restart"; fi
   check "the agent listens again after the restart" \
     sh -c "lsof -nP -iTCP:$agent_port -sTCP:LISTEN | grep -q '127.0.0.1:$agent_port'"
-  check "the control plane answers over the mesh after the restart" in_sidecar ping -c 1 -W 3 "$control_plane"
+  check "the control plane answers over the mesh after the restart" wait_for_control_plane 30
   if [[ -n "$app_url" ]]; then
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$app_url")
     if [[ "$code" =~ ^(2|3) ]]; then pass "app answers after the restart ($code)"; else fail "app answered $code after the restart"; fi
@@ -155,10 +164,14 @@ if [[ "$network_change" -eq 1 ]]; then
     fail "could not move the WireGuard port to $new_port"
   elif [[ "$(in_sidecar wg show temps-wg0 listen-port)" != "$new_port" ]]; then
     fail "the WireGuard port did not change to $new_port"
-  elif wait_for_control_plane 90; then
-    pass "the control plane answers the worker on its new port"
-  else
+  elif ! wait_for_control_plane 90; then
     fail "the control plane did not answer within 90s of the port change"
+  elif [[ "$(in_sidecar wg show temps-wg0 listen-port)" != "$new_port" ]]; then
+    # Something (a restarting agent's first sync) moved the port back: the
+    # answer may have come over the old port, so it proves nothing.
+    fail "the WireGuard port moved off $new_port while waiting for the control plane"
+  else
+    pass "the control plane answers the worker on its new port"
   fi
   if [[ -n "$app_url" ]]; then
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$app_url")
