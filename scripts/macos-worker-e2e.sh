@@ -18,7 +18,7 @@
 #   --restart         restart the LaunchAgent and wait for the mesh to recover
 #   --network-change  move the worker's WireGuard source port (what a NAT or
 #                     Wi-Fi change looks like to the control plane) and wait
-#                     for a fresh handshake
+#                     for the control plane to answer on the new port
 #   --app-url <url>   an app deployed to this worker, fetched through the
 #                     control plane's proxy (e.g. https://app.example.com)
 #
@@ -72,12 +72,14 @@ handshake_age() {
   [[ -n "$latest" && "$latest" != 0 ]] && echo $((now - latest)) || echo 999999
 }
 
-wait_for_handshake() {
-  local limit="$1" since="$2"
+# Wait up to $1 seconds for the control plane to answer over the mesh. A
+# reply means it accepted this worker's packets and sends back to where they
+# came from; WireGuard roams on any authenticated packet, so this does not
+# need (or wait for) a fresh handshake.
+wait_for_control_plane() {
+  local limit="$1"
   for _ in $(seq 1 "$limit"); do
-    local latest
-    latest=$(in_sidecar wg show temps-wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | sort -n | tail -1)
-    [[ -n "$latest" && "$latest" -gt "$since" ]] && return 0
+    in_sidecar ping -c 1 -W 1 "$control_plane" >/dev/null 2>&1 && return 0
     sleep 1
   done
   return 1
@@ -149,17 +151,15 @@ if [[ "$network_change" -eq 1 ]]; then
   # Put the original port back however the script ends, so a failed run does
   # not leave the worker on a port the agent did not choose.
   trap 'in_sidecar wg set temps-wg0 listen-port "$old_port" >/dev/null 2>&1 || echo "WARNING: could not restore WireGuard port $old_port" >&2' EXIT
-  before=$(date +%s)
   if ! in_sidecar wg set temps-wg0 listen-port "$new_port"; then
     fail "could not move the WireGuard port to $new_port"
   elif [[ "$(in_sidecar wg show temps-wg0 listen-port)" != "$new_port" ]]; then
     fail "the WireGuard port did not change to $new_port"
-  elif wait_for_handshake 90 "$before"; then
-    pass "a fresh handshake from the new port"
+  elif wait_for_control_plane 90; then
+    pass "the control plane answers the worker on its new port"
   else
-    fail "no handshake from the new port"
+    fail "the control plane did not answer within 90s of the port change"
   fi
-  check "the control plane answers after the change" in_sidecar ping -c 1 -W 3 "$control_plane"
   if [[ -n "$app_url" ]]; then
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$app_url")
     if [[ "$code" =~ ^(2|3) ]]; then pass "app answers after the change ($code)"; else fail "app answered $code after the change"; fi
