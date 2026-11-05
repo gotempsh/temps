@@ -669,6 +669,7 @@ impl GeoIpService {
         Ok(Self::MaxMind(Arc::new(MaxMindGeoIpService {
             reader: ArcSwapOption::from_pointee(reader),
             asn_reader: ArcSwapOption::empty(),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         })))
     }
 
@@ -778,6 +779,15 @@ impl GeoIpService {
         }
     }
 
+    /// How many databases have become available since this service started. One
+    /// atomic read, for the lookup path. Always 0 in mock mode.
+    pub fn databases_arrived(&self) -> u64 {
+        match self {
+            Self::MaxMind(service) => service.databases_arrived(),
+            Self::Mock(_) => 0,
+        }
+    }
+
     /// Whether an ASN database is loaded, i.e. whether hosting/datacenter
     /// classification is active. Always `false` in mock mode.
     pub fn has_asn_database(&self) -> bool {
@@ -807,6 +817,11 @@ pub struct MaxMindGeoIpService {
     /// Swapped by the file watcher, so a database that arrives after startup
     /// turns hosting classification on without a restart.
     asn_reader: ArcSwapOption<maxminddb::Reader<MmdbSource>>,
+    /// How many times a database that was not loaded has become available. Lets
+    /// a cache tell, with one atomic read, whether what it holds was resolved
+    /// with less data than there is now. Replacing a loaded database does not
+    /// count: its answers were complete and stay valid until they expire.
+    databases_arrived: std::sync::atomic::AtomicU64,
 }
 
 impl MaxMindGeoIpService {
@@ -866,6 +881,7 @@ impl MaxMindGeoIpService {
         Ok(Self {
             reader: ArcSwapOption::new(reader.map(Arc::new)),
             asn_reader: ArcSwapOption::new(asn_reader.map(Arc::new)),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -880,6 +896,7 @@ impl MaxMindGeoIpService {
         Some(Self {
             reader: ArcSwapOption::from_pointee(city),
             asn_reader: ArcSwapOption::from_pointee(asn),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -929,7 +946,8 @@ impl MaxMindGeoIpService {
     pub fn refresh(&self, new_reader: maxminddb::Reader<MmdbSource>) {
         let previous_epoch = self.build_epoch();
         let new_epoch = new_reader.metadata().build_epoch;
-        self.reader.store(Some(Arc::new(new_reader)));
+        let previous = self.reader.swap(Some(Arc::new(new_reader)));
+        self.note_arrival_if(previous.is_none());
         info!(
             previous_build_epoch = previous_epoch,
             new_build_epoch = new_epoch,
@@ -937,11 +955,27 @@ impl MaxMindGeoIpService {
         );
     }
 
+    /// Counted after the reader is published, so anyone who sees the new count
+    /// also sees the database.
+    fn note_arrival_if(&self, arrived: bool) {
+        if arrived {
+            self.databases_arrived
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// See [`GeoIpService::databases_arrived`].
+    pub fn databases_arrived(&self) -> u64 {
+        self.databases_arrived
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Publish `new_reader` as the ASN database for all subsequent lookups.
     pub fn refresh_asn(&self, new_reader: maxminddb::Reader<MmdbSource>) {
         let previous_epoch = self.asn_build_epoch();
         let new_epoch = new_reader.metadata().build_epoch;
-        self.asn_reader.store(Some(Arc::new(new_reader)));
+        let previous = self.asn_reader.swap(Some(Arc::new(new_reader)));
+        self.note_arrival_if(previous.is_none());
         info!(
             previous_build_epoch = previous_epoch,
             new_build_epoch = new_epoch,
@@ -1278,6 +1312,7 @@ mod tests {
                 open_mmdb(&path).expect("open GeoLite2 city database"),
             ),
             asn_reader: ArcSwapOption::empty(),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         };
 
         let private: IpAddr = "172.17.0.2".parse().unwrap();
@@ -1493,6 +1528,7 @@ mod tests {
             asn_reader: ArcSwapOption::from_pointee(
                 open_mmdb(&asn_path).expect("open bundled ASN db"),
             ),
+            databases_arrived: std::sync::atomic::AtomicU64::new(0),
         };
         assert!(service.has_asn_database());
 

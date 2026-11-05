@@ -149,13 +149,24 @@ impl From<ip_geolocations::Model> for IpAddressInfo {
     }
 }
 
+/// A cached lookup, and how many databases had arrived when it was resolved.
+#[derive(Clone)]
+struct CachedIp {
+    info: IpAddressInfo,
+    databases_arrived: u64,
+}
+
 pub struct IpAddressService {
     db: Arc<DatabaseConnection>,
     geoip_service: Arc<GeoIpService>,
     /// In-memory cache keyed by IP string. Lets the proxy hot path (batch log
     /// enrichment, visitor tracking) resolve repeat IPs without a Postgres query,
     /// which is the dominant per-request DB load at high request rates.
-    cache: Cache<String, IpAddressInfo>,
+    ///
+    /// An entry resolved before a late database arrived is not served: startup
+    /// stops waiting for slow downloads, so an address seen in that gap would
+    /// otherwise stay unlocated and count as human until the entry expired.
+    cache: Cache<String, CachedIp>,
     /// Supplies the admin-configured staleness threshold for stored rows.
     ///
     /// Optional because the threshold is a data-freshness policy, not a
@@ -228,8 +239,13 @@ impl IpAddressService {
 
     pub async fn get_or_create_ip(&self, ip_address_str: &str) -> anyhow::Result<IpAddressInfo> {
         // Fast path: serve repeat IPs straight from memory, no DB connection used.
+        // Read before resolving: a database arriving during this lookup leaves
+        // the entry marked as older, which costs one extra lookup and no stale data.
+        let databases_arrived = self.geoip_service.databases_arrived();
         if let Some(cached) = self.cache.get(ip_address_str).await {
-            return Ok(cached);
+            if cached.databases_arrived == databases_arrived {
+                return Ok(cached.info);
+            }
         }
 
         let now = Utc::now();
@@ -280,7 +296,13 @@ impl IpAddressService {
                 LastUsedWrite::Recorded | LastUsedWrite::NotNeeded => {
                     let info = self.refresh_if_stale(existing_ip, now).await;
                     self.cache
-                        .insert(ip_address_str.to_string(), info.clone())
+                        .insert(
+                            ip_address_str.to_string(),
+                            CachedIp {
+                                info: info.clone(),
+                                databases_arrived,
+                            },
+                        )
                         .await;
                     return Ok(info);
                 }
@@ -352,7 +374,13 @@ impl IpAddressService {
         info!("Created new IP address record for {}", ip_address_str);
         let info: IpAddressInfo = result.into();
         self.cache
-            .insert(ip_address_str.to_string(), info.clone())
+            .insert(
+                ip_address_str.to_string(),
+                CachedIp {
+                    info: info.clone(),
+                    databases_arrived,
+                },
+            )
             .await;
         Ok(info)
     }
@@ -399,7 +427,16 @@ impl IpAddressService {
         // generic staleness window (default 30 days) expired.
         let needs_reclassification = self.geoip_service.has_asn_database()
             && stored.hosting_classifier_version != Some(HOSTING_CLASSIFIER_VERSION);
-        if age_days < self.stale_lookup_days().await && !needs_reclassification {
+        // A row stored while no city database was loaded holds nothing, and with
+        // no ASN database either, nothing above would look at it again until the
+        // staleness window expired. One that truly has no location only costs a
+        // local lookup on each cache miss, and stops once an ASN database is there
+        // to stamp it.
+        let needs_location = self.geoip_service.build_epoch().is_some()
+            && stored.hosting_classifier_version.is_none()
+            && stored.country.is_empty()
+            && stored.city.is_none();
+        if age_days < self.stale_lookup_days().await && !needs_reclassification && !needs_location {
             return stored.into();
         }
 
@@ -991,6 +1028,145 @@ mod tests {
         assert!(!sql.contains("updated_at"), "{sql}");
     }
 
+    fn unlocated_row(now: UtcDateTime) -> ip_geolocations::Model {
+        ip_geolocations::Model {
+            id: 11,
+            ip_address: "8.8.8.8".to_string(),
+            country: String::new(),
+            country_code: None,
+            region: None,
+            city: None,
+            latitude: None,
+            longitude: None,
+            timezone: None,
+            is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
+            asn_number: None,
+            hosting_classifier_version: None,
+            created_at: now,
+            updated_at: now,
+            last_used_at: Some(now),
+        }
+    }
+
+    /// The databases bundled with `temps-cli`, as a server that has the city
+    /// database and has not received the ASN one yet.
+    fn service_without_asn() -> Option<(Arc<GeoIpService>, tempfile::TempDir)> {
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        let city = bundled.join(crate::refresh::CITY_DB_FILENAME);
+        if !city.exists() || !bundled.join(crate::refresh::ASN_DB_FILENAME).exists() {
+            return None;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let maxmind = crate::MaxMindGeoIpService::load(
+            &city,
+            &dir.path().join(crate::refresh::ASN_DB_FILENAME),
+        )
+        .expect("a missing ASN database must not fail startup");
+        Some((Arc::new(GeoIpService::MaxMind(Arc::new(maxmind))), dir))
+    }
+
+    /// Startup stops waiting for a slow download. An address seen before the
+    /// database arrives must not keep counting as human for the six hours its
+    /// cache entry lasts.
+    #[tokio::test]
+    async fn a_cached_address_is_resolved_again_when_a_database_arrives() {
+        let Some((geo, _dir)) = service_without_asn() else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+        let now = Utc::now();
+        let unclassified = unlocated_row(now);
+        let classified = ip_geolocations::Model {
+            is_hosting_provider: Some(true),
+            hosting_classifier_version: Some(HOSTING_CLASSIFIER_VERSION),
+            ..unclassified.clone()
+        };
+        // Exactly: the first lookup's read, then the one after the database
+        // arrives, then its write. Any other query would run out of results.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([
+                    vec![unclassified.clone()],
+                    vec![unclassified.clone()],
+                    vec![classified.clone()],
+                ])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(db, geo.clone());
+
+        let before = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(before.is_hosting_provider, None);
+        let repeated = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(
+            repeated.is_hosting_provider, None,
+            "still served from memory"
+        );
+
+        let bundled_asn = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../temps-cli")
+            .join(crate::refresh::ASN_DB_FILENAME);
+        geo.refresh_asn_from_path_if_changed(&bundled_asn)
+            .expect("load the ASN database");
+
+        let after = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(after.is_hosting_provider, Some(true));
+        let cached = service.get_or_create_ip("8.8.8.8").await.unwrap();
+        assert_eq!(cached.is_hosting_provider, Some(true), "cached again");
+    }
+
+    /// With no ASN database at all, the classifier check never fires, so nothing
+    /// else would locate this row until the staleness window expired.
+    #[tokio::test]
+    async fn a_row_stored_without_a_city_database_is_located_when_one_is_loaded() {
+        let Some((geo, _dir)) = service_without_asn() else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+        let now = Utc::now();
+        let stored = unlocated_row(now);
+        let located = ip_geolocations::Model {
+            country: "United States".to_string(),
+            ..stored.clone()
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![located.clone()]])
+                .into_connection(),
+        );
+        let service = IpAddressService::new(db.clone(), geo);
+
+        let info = service.refresh_if_stale(stored, now).await;
+
+        assert_eq!(info.country.as_deref(), Some("United States"));
+        drop(service);
+        let Ok(db) = Arc::try_unwrap(db) else {
+            panic!("the service was dropped, so this is the last handle");
+        };
+        assert_eq!(db.into_transaction_log().len(), 1, "one write");
+    }
+
+    /// Replacing a loaded database is routine and its cached answers stay good;
+    /// only an arrival makes the whole cache miss.
+    #[tokio::test]
+    async fn replacing_a_loaded_database_is_not_an_arrival() {
+        let Some((geo, _dir)) = service_without_asn() else {
+            println!("Bundled GeoLite2 databases not present, skipping");
+            return;
+        };
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../temps-cli");
+        assert_eq!(geo.databases_arrived(), 0);
+
+        geo.refresh_from_path(&bundled.join(crate::refresh::CITY_DB_FILENAME))
+            .expect("replace the city database");
+        assert_eq!(geo.databases_arrived(), 0);
+
+        geo.refresh_asn_from_path_if_changed(&bundled.join(crate::refresh::ASN_DB_FILENAME))
+            .expect("load the ASN database");
+        assert_eq!(geo.databases_arrived(), 1);
+    }
+
     /// Without a settings source the service must still apply a sane window
     /// rather than treating every stored row as fresh forever (or as stale on
     /// every lookup, which would re-resolve the whole table).
@@ -1045,7 +1221,7 @@ mod tests {
 
         assert_eq!(info.id, 42, "the deleted row's id must not be handed out");
         let cached = service.cache.get("203.0.113.20").await.unwrap();
-        assert_eq!(cached.id, 42);
+        assert_eq!(cached.info.id, 42);
     }
 
     /// If the protecting write fails, the id must not be handed out: the
