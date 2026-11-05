@@ -72,11 +72,10 @@ fn validate_trigger_config(
     trigger_type: &str,
     trigger_config: &serde_json::Value,
 ) -> Result<(), ErrorTrackingError> {
-    if !matches!(
-        AlertTriggerType::from_str(trigger_type),
-        Some(AlertTriggerType::Frequency)
-    ) {
-        return Ok(());
+    match AlertTriggerType::from_str(trigger_type) {
+        Some(AlertTriggerType::Frequency) => {}
+        Some(AlertTriggerType::UserCount) => return validate_user_count_config(trigger_config),
+        _ => return Ok(()),
     }
     let config: FrequencyConfig =
         serde_json::from_value(trigger_config.clone()).map_err(|error| {
@@ -96,6 +95,26 @@ fn validate_trigger_config(
             "Frequency rule window_minutes must be between 1 and \
              {MAX_FREQUENCY_WINDOW_MINUTES}, got {}",
             config.window_minutes
+        )));
+    }
+    Ok(())
+}
+
+/// A user count rule without a count of at least 1 could never fire, and
+/// nothing would say so.
+fn validate_user_count_config(
+    trigger_config: &serde_json::Value,
+) -> Result<(), ErrorTrackingError> {
+    let config: UserCountConfig =
+        serde_json::from_value(trigger_config.clone()).map_err(|error| {
+            ErrorTrackingError::Validation(format!(
+                "Invalid trigger config for 'user_count': expected count: {error}"
+            ))
+        })?;
+    if config.count < 1 {
+        return Err(ErrorTrackingError::Validation(format!(
+            "User count rule count must be at least 1, got {}",
+            config.count
         )));
     }
     Ok(())
@@ -121,6 +140,9 @@ pub struct FrequencyConfig {
 /// Configuration for user count triggers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserCountConfig {
+    /// Consoles before #1749 saved this as `threshold`; those rules are read
+    /// the same way, so they fire as their authors configured them.
+    #[serde(alias = "threshold")]
     pub count: i64,
 }
 
@@ -894,6 +916,40 @@ mod tests {
         let json = serde_json::json!({"count": 10});
         let config: UserCountConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.count, 10);
+    }
+
+    /// #1749: rules the console saved under `threshold` never fired, because
+    /// the server only read `count`. They now read the same.
+    #[test]
+    fn user_count_rule_saved_as_threshold_reads_its_count() {
+        let config: UserCountConfig =
+            serde_json::from_value(serde_json::json!({"threshold": 3})).unwrap();
+        assert_eq!(config.count, 3);
+        assert!(
+            validate_trigger_config("user_count", &serde_json::json!({"threshold": 3})).is_ok()
+        );
+    }
+
+    /// #1749: a user count rule saved with no count never fired, silently.
+    #[test]
+    fn user_count_rule_config_is_refused_without_a_positive_count() {
+        assert!(validate_trigger_config("user_count", &serde_json::json!({"count": 1})).is_ok());
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"count": 0}),
+            serde_json::json!({"count": -2}),
+            serde_json::json!({"count": "ten"}),
+        ] {
+            match validate_trigger_config("user_count", &bad) {
+                Err(ErrorTrackingError::Validation(message)) => {
+                    assert!(
+                        message.contains("user_count") || message.contains("User count"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{bad} must be refused, got {other:?}"),
+            }
+        }
     }
 
     #[test]
