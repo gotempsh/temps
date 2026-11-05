@@ -541,19 +541,23 @@ fn set_mode(_path: &Path, _mode: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The start hint's lines: a Mac (ADR 090) runs the agent as a LaunchAgent,
-/// as the user, not as a systemd service.
-pub fn start_agent_hint(mac: bool) -> [&'static str; 3] {
-    let service = if mac {
-        "  temps agent service install   as a LaunchAgent, as you (no sudo), restarted on exit and at login"
-    } else {
-        "  temps agent service install   as a systemd service, restarted on failure and at boot (root)"
-    };
-    [
-        "Start the worker:",
-        service,
-        "  temps agent                   in the foreground, or under your own supervisor",
-    ]
+/// The start hint's lines. A Mac joined with its Docker app (ADR 090) runs
+/// the agent as a LaunchAgent, as the user; any other Mac join has no
+/// service to install (the LaunchAgent needs the Docker app's sidecar), so
+/// it only gets the foreground command; Linux gets the systemd service.
+pub fn start_agent_hint(mac: bool, mac_worker: bool) -> Vec<&'static str> {
+    let mut lines = vec!["Start the worker:"];
+    if !mac {
+        lines.push(
+            "  temps agent service install   as a systemd service, restarted on failure and at boot (root)",
+        );
+    } else if mac_worker {
+        lines.push(
+            "  temps agent service install   as a LaunchAgent, as you (no sudo), restarted on exit and at login",
+        );
+    }
+    lines.push("  temps agent                   in the foreground, or under your own supervisor");
+    lines
 }
 
 #[cfg(test)]
@@ -562,17 +566,28 @@ mod tests {
 
     #[test]
     fn the_start_hint_names_the_platform_service() {
-        let linux = start_agent_hint(false);
+        let linux = start_agent_hint(false, false);
         assert!(
             linux[1].contains("systemd") && linux[1].contains("(root)"),
             "{linux:?}"
         );
-        let mac = start_agent_hint(true);
+        let mac = start_agent_hint(true, true);
         assert!(
             mac[1].contains("LaunchAgent") && mac[1].contains("no sudo"),
             "{mac:?}"
         );
         assert!(!mac.iter().any(|line| line.contains("systemd")), "{mac:?}");
+
+        // A direct Mac join has no Docker app sidecar for the LaunchAgent.
+        let direct = start_agent_hint(true, false);
+        assert!(
+            !direct.iter().any(|line| line.contains("service install")),
+            "{direct:?}"
+        );
+        assert!(
+            direct.iter().any(|line| line.contains("foreground")),
+            "{direct:?}"
+        );
     }
 
     #[test]

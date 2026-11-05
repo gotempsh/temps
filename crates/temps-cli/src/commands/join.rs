@@ -709,10 +709,11 @@ fn apply_saved_public_ingress_settings(
     config.public_ingress_https_port = https_port;
 }
 
-/// How to start the worker once it has joined.
-fn print_start_agent_hint() {
+/// How to start the worker once it has joined; `mac_worker` when this Mac
+/// joined with its Docker app (ADR 090).
+fn print_start_agent_hint(mac_worker: bool) {
     println!();
-    for line in super::agent_service::start_agent_hint(cfg!(target_os = "macos")) {
+    for line in super::agent_service::start_agent_hint(cfg!(target_os = "macos"), mac_worker) {
         println!("{line}");
     }
 }
@@ -1356,7 +1357,7 @@ impl JoinCommand {
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
-        print_start_agent_hint();
+        print_start_agent_hint(self.mac.is_some());
 
         Ok(())
     }
@@ -2114,7 +2115,7 @@ impl JoinCommand {
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
-        print_start_agent_hint();
+        print_start_agent_hint(self.mac.is_some());
 
         Ok(())
     }
