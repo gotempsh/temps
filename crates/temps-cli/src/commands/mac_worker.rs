@@ -232,9 +232,12 @@ fn check_loopback_forwarding(context: &MacJoinContext) -> anyhow::Result<()> {
         .and_then(|listener| listener.local_addr())
         .map_err(|error| anyhow::anyhow!("could not pick a free port on this Mac: {error}"))?
         .port();
-    mac_worker::start_forwarding_probe(&context.endpoint, port).map_err(|error| {
-        anyhow::anyhow!("could not start the forwarding check in {app}'s VM: {error}")
-    })?;
+    if let Err(error) = mac_worker::start_forwarding_probe(&context.endpoint, port) {
+        // `docker run --detach` may have started the probe before it failed
+        // or timed out: remove it either way.
+        mac_worker::stop_forwarding_probe(&context.endpoint, port);
+        anyhow::bail!("could not start the forwarding check in {app}'s VM: {error}");
+    }
     let reached = probe_answers(port, Duration::from_secs(30));
     mac_worker::stop_forwarding_probe(&context.endpoint, port);
     if !reached {
