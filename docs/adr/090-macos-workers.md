@@ -202,9 +202,10 @@ existing `DockerVmNft` helper; the eBPF datapath is Linux only. **What is
 missing on a Mac: the boot guard.** On Linux a systemd unit loads the last
 policy before Docker starts. A Docker app's VM restarts containers before
 anything of ours runs, so after a VM restart a restricted workload runs
-unguarded until the agent's first policy pass (within 15 s of the agent
-reaching the VM). The agent on a Mac neither writes nor lifts a boot guard (there
-is nothing to load it), and the docs and the install output say so.
+unguarded until the agent completes a successful policy pass. Passes run every
+15 s, but that is a polling interval, not a deadline: a control-plane outage
+extends the window. The agent on a Mac neither writes nor lifts a boot guard
+(there is nothing to load it).
 
 ## Security
 
@@ -242,9 +243,9 @@ is nothing to load it), and the docs and the install output say so.
   exposes nothing: the sidecar binds the mesh address and the VM's loopback,
   never `0.0.0.0`.
 - **Policy window.** After the Docker app's VM restarts, a restricted workload
-  runs without network policy until the agent's first policy pass (within 15 s
-  of the agent reaching the VM): a Mac has no boot guard to close that window
-  (see Network policy). Keeping restricted workloads stopped until the policy
+  runs without network policy until the agent completes a successful policy
+  pass, which a control-plane outage can delay: a Mac has no boot guard to
+  close that window (see Network policy). Keeping restricted workloads stopped until the policy
   is in place would need a start-control mechanism this ADR does not add.
 - **The private key** stays in `~/.temps/wireguard/private.key` (0600) and in
   the VM's kernel; it crosses `docker exec` on standard input and is written to
