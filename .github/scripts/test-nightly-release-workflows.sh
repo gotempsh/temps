@@ -459,7 +459,7 @@ abort "the Linux ARM64 release build must log resources before its first sleep" 
   arm64_first_sleep && arm64_probes.all? { |probe| arm64_run.index(probe) < arm64_first_sleep }
 abort "the Linux ARM64 release build must link with lld (GNU ld overflows AArch64 call range)" unless
   arm64_build.fetch("env", {})["CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS"].to_s.include?("-fuse-ld=lld") &&
-  arm64_run.include?("readelf -p .comment target/release/temps") &&
+  arm64_run.match?(/readelf -p \.comment target\/release\/temps \| grep -q 'LLD' \\\n\s*\|\| \{ echo "::error::target\/release\/temps was not linked with lld"; exit 1; \}/) &&
   release.fetch("jobs").fetch("build-linux-arm64").fetch("steps").any? { |step|
     step["name"] == "Install build dependencies" && step.fetch("run", "").split.include?("lld")
   }
