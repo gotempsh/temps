@@ -50,7 +50,10 @@ import type {
   RepositoryResponse,
 } from '@/api/client/types.gen'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
-import { authorizationRejectedMessage } from '@/components/git/reauthorization'
+import {
+  authorizationRejectedMessage,
+  providerSupportsReauthorization,
+} from '@/components/git/reauthorization'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
@@ -812,12 +815,26 @@ function ConnectionProblems({
   if (authorizationRejected)
     return (
       <Callout tone="error" title={authorizationRejected}>
-        Syncing and deployments fail until the connection is reauthorized. Use
-        Reauthorize on the{' '}
-        <Link to={`/git-providers/${providerId}`} className="underline">
-          provider&apos;s connections
-        </Link>
-        .
+        {providerSupportsReauthorization(provider) ? (
+          <>
+            Syncing and deployments fail until the connection is reauthorized.
+            The user who connected it can use Reauthorize on the{' '}
+            <Link to={`/git-providers/${providerId}`} className="underline">
+              provider&apos;s connections
+            </Link>
+            .
+          </>
+        ) : (
+          <>
+            Syncing and deployments fail until the account is connected again.
+            This provider&apos;s authentication method has no Reauthorize
+            action, so{' '}
+            <Link to="/git-providers/add" className="underline">
+              add a GitLab OAuth provider
+            </Link>{' '}
+            and connect the account through it.
+          </>
+        )}
       </Callout>
     )
   if (connection.is_expired)

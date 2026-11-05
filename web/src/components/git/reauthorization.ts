@@ -6,6 +6,16 @@ import type {
   ProviderResponse,
 } from '@/api/client/types.gen'
 
+/** Whether this provider's authentication method has a Reauthorize action at all. */
+export function providerSupportsReauthorization(
+  provider?: Pick<ProviderResponse, 'auth_method' | 'provider_type'>
+) {
+  return (
+    provider?.auth_method === 'oauth' &&
+    ['github', 'gitlab'].includes(provider.provider_type)
+  )
+}
+
 export function canReauthorizeConnection(
   connection: Pick<ConnectionResponse, 'installation_id' | 'user_id'>,
   provider?: Pick<ProviderResponse, 'auth_method' | 'provider_type'>,
@@ -14,8 +24,7 @@ export function canReauthorizeConnection(
   return (
     currentUserId !== undefined &&
     connection.user_id === currentUserId &&
-    provider?.auth_method === 'oauth' &&
-    ['github', 'gitlab'].includes(provider.provider_type) &&
+    providerSupportsReauthorization(provider) &&
     !connection.installation_id
   )
 }

@@ -6,6 +6,7 @@ import {
   authorizationRejectedMessage,
   canReauthorizeConnection,
   needsReauthorization,
+  providerSupportsReauthorization,
   readReauthorizationCallback,
 } from './reauthorization'
 
@@ -123,5 +124,23 @@ describe('Rejected authorization message', () => {
     expect(
       authorizationRejectedMessage({ is_expired: true, health_message: null })
     ).toBeNull()
+  })
+})
+
+describe('providerSupportsReauthorization', () => {
+  test('only OAuth GitHub and GitLab providers have the action', () => {
+    for (const provider_type of ['github', 'gitlab']) {
+      expect(
+        providerSupportsReauthorization({ auth_method: 'oauth', provider_type })
+      ).toBe(true)
+    }
+    for (const provider of [
+      { auth_method: 'gitlab_app', provider_type: 'gitlab' },
+      { auth_method: 'gitlab_pat', provider_type: 'gitlab' },
+      { auth_method: 'oauth', provider_type: 'gitea' },
+      undefined,
+    ]) {
+      expect(providerSupportsReauthorization(provider)).toBe(false)
+    }
   })
 })
