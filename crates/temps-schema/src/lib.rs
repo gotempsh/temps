@@ -15,14 +15,20 @@
         reason = "tests read fixture configuration (database/service URLs) from the environment"
     )
 )]
+mod error;
+pub mod lock_capacity;
 mod maintenance;
 mod migrations;
 pub mod schema_guard;
 
+pub use error::{SchemaError, SchemaResult};
+pub use lock_capacity::{read_lock_capacity, LockCapacity, LockSlotsExhausted};
 pub use maintenance::{
-    reconcile_otel_trace_summaries, run_post_migration_backfill,
+    detach_telemetry_foreign_keys, reconcile_otel_trace_summaries,
+    remaining_telemetry_foreign_keys, run_post_migration_backfill,
     run_post_migration_backfill_streaming, run_post_migration_indexes,
-    run_post_migration_indexes_streaming, MaintenanceProgress,
+    run_post_migration_indexes_streaming, MaintenanceProgress, TelemetryForeignKey,
+    DETACH_TELEMETRY_FOREIGN_KEYS_STEP,
 };
 pub use migrations::{
     defined_migration_count, ensure_no_unprotected_upgrade, establish_connection,
@@ -812,6 +818,463 @@ mod tests {
         outcome?;
         assert!(index_present(db.clone()).await?);
         Ok(())
+    }
+
+    /// The foreign key drop `m20261105_000001_project_data_purges` used to run
+    /// in `up()`: every telemetry foreign key in one statement, inside the
+    /// migration's transaction.
+    fn old_project_data_purges_drop_sql() -> String {
+        let array = |tables: &[&str]| {
+            let quoted: Vec<String> = tables.iter().map(|t| format!("'{t}'")).collect();
+            format!("ARRAY[{}]::text[]", quoted.join(", "))
+        };
+        format!(
+            "DO $$ DECLARE fk record; BEGIN \
+             FOR fk IN SELECT c.conname, c.conrelid::regclass AS child FROM pg_constraint c \
+                 WHERE c.contype = 'f' \
+                   AND c.conrelid IN (SELECT to_regclass(t) FROM unnest({children}) AS t) \
+                   AND c.confrelid IN (SELECT to_regclass(t) FROM unnest({parents}) AS t) \
+             LOOP EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', fk.child, fk.conname); \
+             END LOOP; END $$",
+            children = array(&temps_migrations::PROJECT_DATA_PURGED_TABLES),
+            parents = array(&temps_migrations::PROJECT_DATA_DETACHED_PARENTS),
+        )
+    }
+
+    const PROJECT_DATA_PURGES: &str = "m20261105_000001_project_data_purges";
+
+    /// Apply every migration before `PROJECT_DATA_PURGES`, as on an instance
+    /// still running the release before it.
+    async fn migrate_up_to_project_data_purges(db: &DbConnection) -> anyhow::Result<()> {
+        let position = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == PROJECT_DATA_PURGES)
+            .ok_or_else(|| anyhow::anyhow!("{PROJECT_DATA_PURGES} is not defined"))?;
+        Migrator::up(db, Some(position as u32)).await?;
+        Ok(())
+    }
+
+    /// Insert one row per day and space partition into `table`, `days` days
+    /// back, so it has `days x partitions` chunks. Every NOT NULL column
+    /// without a default gets a placeholder of its type, and foreign keys are
+    /// not checked (`session_replication_role = replica`): only the chunks
+    /// matter. A few days per transaction, so creating them fits the lock
+    /// table the test then exhausts.
+    async fn fill_chunks(
+        db: &DbConnection,
+        table: &str,
+        days: u32,
+        partitions: u32,
+    ) -> anyhow::Result<()> {
+        const DAYS_PER_BATCH: u32 = 5;
+        let mut first = 0;
+        while first < days {
+            let last = (first + DAYS_PER_BATCH).min(days) - 1;
+            db.execute_unprepared(&format!(
+                "DO $$ DECLARE cols text; vals text; BEGIN \
+                 PERFORM set_config('session_replication_role', 'replica', true); \
+                 SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum), \
+                        string_agg('(' || CASE \
+                            WHEN a.attname = 'timestamp' THEN 'now() - make_interval(days => d)' \
+                            WHEN a.attname = 'id' THEN '(d * {partitions} + p + 1)' \
+                            WHEN t.typcategory = 'N' THEN '1' \
+                            WHEN t.typcategory = 'B' THEN 'false' \
+                            WHEN t.typcategory = 'D' THEN 'now()' \
+                            WHEN t.typname IN ('json', 'jsonb') THEN '''{{}}''' \
+                            WHEN t.typname = 'uuid' THEN 'gen_random_uuid()' \
+                            WHEN t.typcategory = 'A' THEN '''{{}}''' \
+                            ELSE '''x''' END || ')::' || format_type(a.atttypid, a.atttypmod), \
+                            ', ' ORDER BY a.attnum) \
+                   INTO cols, vals \
+                 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+                 WHERE a.attrelid = '{table}'::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+                   AND (a.attname IN ('timestamp', 'id') OR (a.attnotnull AND NOT a.atthasdef)); \
+                 EXECUTE format('INSERT INTO {table} (%s) SELECT %s \
+                     FROM generate_series({first}, {last}) AS d, \
+                          generate_series(0, {partitions} - 1) AS p', cols, vals); \
+                 END $$"
+            ))
+            .await
+            .map_err(|error| anyhow::anyhow!("filling chunks of {table}: {error}"))?;
+            first = last + 1;
+        }
+        Ok(())
+    }
+
+    async fn count(db: &DbConnection, sql: &str) -> anyhow::Result<i64> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql.to_owned(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("{sql}: no row"))?;
+        Ok(row.try_get::<i64>("", "n")?)
+    }
+
+    /// Foreign keys from the telemetry tables, or any of their chunks, to the
+    /// detached parents.
+    async fn telemetry_foreign_keys_anywhere(db: &DbConnection) -> anyhow::Result<i64> {
+        count(
+            db,
+            "SELECT count(*) AS n FROM pg_constraint c \
+             WHERE c.contype = 'f' \
+               AND c.confrelid IN (to_regclass('projects'), to_regclass('environments'), \
+                                   to_regclass('deployments'), to_regclass('error_groups')) \
+               AND (c.conrelid IN (to_regclass('proxy_logs'), to_regclass('events'), \
+                                   to_regclass('error_events'), to_regclass('request_logs'), \
+                                   to_regclass('performance_metrics')) \
+                    OR c.conrelid IN (SELECT inhrelid FROM pg_inherits \
+                        WHERE inhparent IN (to_regclass('proxy_logs'), to_regclass('events'), \
+                                            to_regclass('error_events'))))",
+        )
+        .await
+    }
+
+    /// The reported failure, reproduced: with enough chunks for the lock
+    /// table, the old migration runs out of lock slots in its one transaction,
+    /// while the new migration plus the post-migration step, one constraint
+    /// and one chunk per transaction, drop every telemetry foreign key. Both
+    /// are no-ops when run again.
+    #[tokio::test]
+    async fn test_project_data_purges_fits_a_small_lock_table() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+
+        let Some((container, db)) = start_db(&[
+            "-c",
+            "max_locks_per_transaction=32",
+            "-c",
+            "max_connections=20",
+        ])
+        .await?
+        else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        migrate_up_to_project_data_purges(db.as_ref()).await?;
+        // A chunk per day and space partition on the two big hypertables.
+        fill_chunks(db.as_ref(), "events", 60, 4).await?;
+        fill_chunks(db.as_ref(), "proxy_logs", 60, 4).await?;
+        let total_chunks = count(
+            db.as_ref(),
+            "SELECT count(*) AS n FROM timescaledb_information.chunks",
+        )
+        .await?;
+        let events_chunks = count(
+            db.as_ref(),
+            "SELECT count(*) AS n FROM timescaledb_information.chunks \
+             WHERE hypertable_name = 'events'",
+        )
+        .await?;
+        assert!(
+            total_chunks >= 300,
+            "only {total_chunks} chunks were created"
+        );
+
+        // The old migration, in the transaction SeaORM gives a migration.
+        let txn = db.begin().await?;
+        let old = txn
+            .execute_unprepared(&old_project_data_purges_drop_sql())
+            .await;
+        txn.rollback().await?;
+        let old_error = match old {
+            Ok(_) => anyhow::bail!(
+                "the old migration was expected to run out of lock slots with {total_chunks} chunks"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            lock_capacity::is_lock_exhaustion(&old_error),
+            "expected SQLSTATE 53200 from the lock table, got: {old_error}"
+        );
+
+        // That real error, as the migration runners report it.
+        let exhausted = migrations::lock_exhaustion(
+            db.as_ref(),
+            lock_capacity::SchemaStep::Migration(PROJECT_DATA_PURGES.to_string()),
+            &old_error,
+        )
+        .await;
+        let message = exhausted.to_string();
+        assert!(message.contains(PROJECT_DATA_PURGES), "{message}");
+        assert!(
+            matches!(
+                &exhausted.table,
+                lock_capacity::LockedTable::LargestHypertable(table)
+                    if table == "events" || table == "proxy_logs"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{total_chunks} TimescaleDB chunk(s)")),
+            "{message}"
+        );
+        let suggested = exhausted
+            .suggested_max_locks_per_transaction()
+            .ok_or_else(|| anyhow::anyhow!("no suggestion: {message}"))?;
+        assert!(suggested > 16, "{message}");
+        assert!(
+            message.contains(&format!(
+                "max_locks_per_transaction to at least {suggested}"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("restart PostgreSQL"), "{message}");
+        let as_service = temps_core::ServiceError::from(SchemaError::from(exhausted));
+        assert!(matches!(
+            as_service,
+            temps_core::ServiceError::Configuration { .. }
+        ));
+
+        // The new migration, then the post-migration step.
+        run_migrations(db.as_ref()).await?;
+        assert!(
+            !remaining_telemetry_foreign_keys(db.get_postgres_connection_pool())
+                .await?
+                .is_empty(),
+            "the migration must leave the foreign keys to the post-migration step"
+        );
+        let events = std::sync::Mutex::new(Vec::new());
+        let outcome = run_post_migration_indexes_streaming(db.as_ref(), |progress| {
+            if let MaintenanceProgress::ForeignKeyDetachFinished {
+                table,
+                chunks,
+                per_chunk,
+                ..
+            } = progress
+            {
+                if let Ok(mut events) = events.lock() {
+                    events.push((table.to_string(), chunks, per_chunk));
+                }
+            }
+        })
+        .await;
+        if outcome.is_err() {
+            print_server_log(&container).await;
+        }
+        outcome?;
+        assert_eq!(telemetry_foreign_keys_anywhere(db.as_ref()).await?, 0);
+        let events = events
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("progress lock poisoned"))?;
+        assert!(
+            events
+                .iter()
+                .any(|(table, chunks, per_chunk)| table == "events"
+                    && *chunks as i64 == events_chunks
+                    && *per_chunk),
+            "events must be detached chunk by chunk ({events_chunks} chunks): {events:?}"
+        );
+
+        // Running both again changes nothing.
+        run_migrations(db.as_ref()).await?;
+        run_post_migration_indexes(db.as_ref()).await?;
+        detach_telemetry_foreign_keys(db.as_ref()).await?;
+        assert_eq!(telemetry_foreign_keys_anywhere(db.as_ref()).await?, 0);
+        assert!(get_pending_migration_names(db.as_ref()).await?.is_empty());
+        Ok(())
+    }
+
+    /// An instance that applied the earlier `m20261105_000001_project_data_purges`,
+    /// which dropped the foreign keys itself, has none left: the
+    /// post-migration step does nothing there and does not fail.
+    #[tokio::test]
+    async fn test_detach_after_the_old_migration_is_a_no_op() -> anyhow::Result<()> {
+        use sea_orm::TransactionTrait;
+
+        let Some((_container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        migrate_up_to_project_data_purges(db.as_ref()).await?;
+        fill_chunks(db.as_ref(), "events", 3, 4).await?;
+
+        // The old migration on a small history: it fit, and it is recorded.
+        let txn = db.begin().await?;
+        txn.execute_unprepared(&old_project_data_purges_drop_sql())
+            .await?;
+        txn.commit().await?;
+        Migrator::up(db.as_ref(), Some(1)).await?;
+        assert_eq!(telemetry_foreign_keys_anywhere(db.as_ref()).await?, 0);
+
+        // The new binary: the rest of the migrations and maintenance, twice.
+        for _ in 0..2 {
+            run_migrations(db.as_ref()).await?;
+            let detached = std::sync::atomic::AtomicUsize::new(0);
+            run_post_migration_indexes_streaming(db.as_ref(), |progress| {
+                if matches!(
+                    progress,
+                    MaintenanceProgress::ForeignKeyDetachStarted { .. }
+                ) {
+                    detached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+            .await?;
+            assert_eq!(detached.into_inner(), 0, "nothing was left to drop");
+        }
+        assert_eq!(
+            count(db.as_ref(), "SELECT count(*) AS n FROM project_data_purges").await?,
+            0
+        );
+        Ok(())
+    }
+
+    /// Retention (`drop_chunks`) can remove a chunk after the step listed the
+    /// copies of a foreign key on the chunks and before it drops them: the
+    /// chunk that is gone is skipped, and the step still finishes.
+    #[tokio::test]
+    async fn test_detach_skips_a_chunk_dropped_by_retention() -> anyhow::Result<()> {
+        let Some((_container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+        fill_chunks(db.as_ref(), "events", 6, 1).await?;
+
+        let mut connection = db.get_postgres_connection_pool().acquire().await?;
+        let (oid, foreign_key) = maintenance::list_telemetry_foreign_keys(&mut connection)
+            .await?
+            .into_iter()
+            .find(|(_, foreign_key)| foreign_key.table == "events")
+            .ok_or_else(|| anyhow::anyhow!("events has no telemetry foreign key"))?;
+        let chunks: Vec<(String, String)> = sqlx::query_as(maintenance::CHUNK_FOREIGN_KEYS_SQL)
+            .bind(oid)
+            .fetch_all(&mut *connection)
+            .await?;
+        assert!(chunks.len() >= 6, "events has {} chunk(s)", chunks.len());
+
+        // Retention runs between the listing and the drops.
+        let dropped = count(
+            db.as_ref(),
+            "SELECT count(*) AS n FROM drop_chunks('events', older_than => now() - interval '3 days')",
+        )
+        .await?;
+        assert!(dropped > 0, "retention dropped no chunk of events");
+        let mut gone = Vec::new();
+        for (chunk, chunk_constraint) in &chunks {
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(chunk)
+                .fetch_one(&mut *connection)
+                .await?;
+            if !exists {
+                gone.push((chunk, chunk_constraint));
+            }
+        }
+        let (gone_chunk, gone_constraint) = gone
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("every listed chunk of events still exists"))?;
+        let unguarded = sqlx::query(&format!(
+            "ALTER TABLE {gone_chunk} DROP CONSTRAINT IF EXISTS {gone_constraint}"
+        ))
+        .execute(&mut *connection)
+        .await;
+        assert!(
+            unguarded.is_err(),
+            "dropping a constraint from the removed chunk {gone_chunk} without IF EXISTS \
+             on the table must fail"
+        );
+
+        match maintenance::drop_chunk_copies(&mut connection, &foreign_key, &chunks).await {
+            Ok(_) => {}
+            Err(maintenance::DetachFailure::LockSlotsExhausted(error)) => {
+                anyhow::bail!("{error}")
+            }
+            Err(maintenance::DetachFailure::Other(message)) => anyhow::bail!("{message}"),
+        }
+        drop(connection);
+        detach_telemetry_foreign_keys(db.as_ref()).await?;
+        assert_eq!(telemetry_foreign_keys_anywhere(db.as_ref()).await?, 0);
+        Ok(())
+    }
+
+    /// The telemetry tables are looked up in the current schema only. A
+    /// session whose schema has none of them, with a migrated `public` after
+    /// it on the `search_path`, finds no foreign key to drop and leaves
+    /// `public` alone.
+    #[tokio::test]
+    async fn test_detach_ignores_telemetry_tables_outside_the_current_schema() -> anyhow::Result<()>
+    {
+        let Some((container, db)) = start_fresh_db().await? else {
+            println!("Docker not available, skipping");
+            return Ok(());
+        };
+        run_migrations(db.as_ref()).await?;
+        let in_public = remaining_telemetry_foreign_keys(db.get_postgres_connection_pool())
+            .await?
+            .len();
+        assert!(
+            in_public > 0,
+            "the migrations leave the foreign keys in place"
+        );
+
+        db.execute_unprepared("CREATE SCHEMA scratch").await?;
+        let port = container.get_host_port_ipv4(5432).await?;
+        let scratch_url = format!(
+            "postgresql://postgres:postgres@localhost:{port}/postgres\
+             ?options=-c%20search_path%3Dscratch%2Cpublic"
+        );
+        let scratch = retry_db_connect(|| connect_without_migrations(&scratch_url)).await?;
+        assert_eq!(
+            count(
+                scratch.as_ref(),
+                "SELECT count(*) AS n FROM (SELECT 1 WHERE current_schema() = 'scratch') s"
+            )
+            .await?,
+            1,
+            "the session must resolve names in scratch first"
+        );
+
+        assert!(
+            remaining_telemetry_foreign_keys(scratch.get_postgres_connection_pool())
+                .await?
+                .is_empty()
+        );
+        detach_telemetry_foreign_keys(scratch.as_ref()).await?;
+        assert_eq!(
+            remaining_telemetry_foreign_keys(db.get_postgres_connection_pool())
+                .await?
+                .len(),
+            in_public,
+            "public keeps its foreign keys"
+        );
+        Ok(())
+    }
+
+    async fn start_db(
+        args: &[&str],
+    ) -> anyhow::Result<
+        Option<(
+            testcontainers::ContainerAsync<GenericImage>,
+            std::sync::Arc<DbConnection>,
+        )>,
+    > {
+        let mut cmd = vec!["postgres".to_string()];
+        cmd.extend(args.iter().map(|arg| arg.to_string()));
+        let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_PASSWORD", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_cmd(cmd)
+            .with_startup_timeout(std::time::Duration::from_secs(120))
+            .start()
+            .await
+        {
+            Ok(c) => c,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let port = container.get_host_port_ipv4(5432).await?;
+        let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
+
+        let db = retry_db_connect(|| connect_without_migrations(&database_url)).await?;
+
+        Ok(Some((container, db)))
     }
 
     async fn start_fresh_db() -> anyhow::Result<

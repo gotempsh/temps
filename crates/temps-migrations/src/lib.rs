@@ -83,6 +83,10 @@ pub use migration::m20261024_000001_drop_sandbox_driver_mode::{
 /// crate's purger must cover exactly these.
 pub use migration::m20261105_000001_project_data_purges::PURGED_TABLES as PROJECT_DATA_PURGED_TABLES;
 
+/// Parents the telemetry tables hold no foreign keys to once
+/// `temps_schema`'s post-migration step has dropped them.
+pub use migration::m20261105_000001_project_data_purges::DETACHED_PARENTS as PROJECT_DATA_DETACHED_PARENTS;
+
 /// Foreign key columns under `projects` without a leading index, and the name
 /// of the index built for each. Built concurrently after boot by
 /// `temps_schema::run_post_migration_indexes`, not inside the migration.

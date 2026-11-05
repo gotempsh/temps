@@ -178,6 +178,14 @@ where
     unreachable!("loop always returns Ok or Err before exhausting MAX_ATTEMPTS")
 }
 
+/// The post-migration step a server runs after its migrations and that tests
+/// depend on: dropping the telemetry tables' foreign keys into the project
+/// delete cascade. Without it a test database would still have them, which no
+/// running instance does once it has started.
+async fn finish_migrations(db: &DbConnection) -> temps_schema::SchemaResult<()> {
+    temps_schema::detach_telemetry_foreign_keys(db).await
+}
+
 fn is_transient_migration_error(message: &str) -> bool {
     message.contains("deadlock detected")
         || message.contains("40P01")
@@ -566,11 +574,12 @@ async fn ensure_template_database<M: MigratorTrait>(
             .execute_unprepared("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE")
             .await
             .ok();
-        run_migrations_with_retry(|| M::up(&template_db, None))
-            .await
-            .map_err(|error| anyhow::anyhow!("Template database {}: {}", template, error))
+        run_migrations_with_retry(|| M::up(&template_db, None)).await?;
+        finish_migrations(&template_db).await?;
+        Ok(())
     }
-    .await;
+    .await
+    .map_err(|error: anyhow::Error| anyhow::anyhow!("Template database {}: {}", template, error));
     // Every connection to a template must be gone before it can be cloned.
     let _ = template_db.close().await;
     migrated?;
@@ -1082,6 +1091,7 @@ impl TestDatabase {
         // Run migrations after creating the isolated test database
         use sea_orm_migration::MigratorTrait;
         run_migrations_with_retry(|| temps_migrations::Migrator::up(&*test_db.db, None)).await?;
+        finish_migrations(&test_db.db).await?;
         Ok(test_db)
     }
 
@@ -1310,6 +1320,7 @@ impl TestDatabase {
 
         // Run migrations in this test's unique schema
         run_migrations_with_retry(|| M::up(&*test_db.db, None)).await?;
+        finish_migrations(&test_db.db).await?;
 
         Ok(test_db)
     }

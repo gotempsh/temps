@@ -752,6 +752,34 @@ impl DoctorCommand {
             .map_err(|error| error.to_string());
         report.add("Migrations", migration_check_result(schema_status.as_ref()));
 
+        // A migration that changes hypertable constraints locks every chunk in
+        // one transaction; warn while the lock table can still be resized,
+        // before a binary with such a migration is installed.
+        let lock_capacity = temps_schema::read_lock_capacity(db.get_postgres_connection_pool())
+            .await
+            .map_err(|error| error.to_string());
+        report.add(
+            "Lock capacity",
+            lock_capacity_result(lock_capacity.as_ref()),
+        );
+
+        // Only this binary's schema refuses project deletes while the keys
+        // remain; with its migrations still pending, the running server is an
+        // older one that still cascades.
+        if schema_status
+            .as_ref()
+            .is_ok_and(|status| status.pending().is_empty())
+        {
+            let remaining =
+                temps_schema::remaining_telemetry_foreign_keys(db.get_postgres_connection_pool())
+                    .await
+                    .map_err(|error| error.to_string());
+            report.add(
+                "Telemetry foreign keys",
+                telemetry_foreign_keys_result(remaining.as_ref()),
+            );
+        }
+
         Some(db)
     }
 
@@ -1504,6 +1532,57 @@ fn migration_check_result(status: Result<&temps_schema::SchemaStatus, &String>) 
     }
 }
 
+/// The "Lock capacity" check: warn when the lock table cannot hold the locks a
+/// migration changing every hypertable's constraints at once would take, with
+/// the `max_locks_per_transaction` to set. Informational without TimescaleDB.
+fn lock_capacity_result(capacity: Result<&temps_schema::LockCapacity, &String>) -> CheckResult {
+    match capacity {
+        Err(error) => CheckResult::Warn(format!(
+            "Could not read max_locks_per_transaction or the TimescaleDB chunk count: {error}"
+        )),
+        Ok(capacity) if !capacity.timescaledb => CheckResult::Info(format!(
+            "TimescaleDB is not installed, so there are no chunks to lock; the lock table holds \
+             about {} locks",
+            capacity.lock_slots()
+        )),
+        Ok(capacity) if capacity.at_risk() => CheckResult::Warn(format!(
+            "{}. A migration that changes the constraints of every hypertable at once would fail \
+             with \"out of shared memory\" (SQLSTATE 53200). {} Do this before installing a new \
+             release.",
+            capacity.describe(),
+            capacity.remedy()
+        )),
+        Ok(capacity) => CheckResult::Pass(capacity.describe()),
+    }
+}
+
+/// The "Telemetry foreign keys" check: warn, naming them, while foreign keys
+/// the post-migration step has not dropped yet still make project deletes
+/// refuse.
+fn telemetry_foreign_keys_result(
+    remaining: Result<&Vec<temps_schema::TelemetryForeignKey>, &String>,
+) -> CheckResult {
+    match remaining {
+        Err(error) => CheckResult::Warn(format!(
+            "Could not list the telemetry foreign keys: {error}"
+        )),
+        Ok(remaining) if remaining.is_empty() => {
+            CheckResult::Pass("telemetry tables are out of the project delete cascade".to_string())
+        }
+        Ok(remaining) => CheckResult::Warn(format!(
+            "{} foreign key(s) still tie telemetry tables to the project delete cascade ({}), so \
+             project deletes are refused. Post-migration maintenance drops them after `temps \
+             serve` starts; run `temps migrate` to do it now and see what stops it",
+            remaining.len(),
+            remaining
+                .iter()
+                .map(|foreign_key| format!("{}.{}", foreign_key.table, foreign_key.constraint))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 fn update_check_result(
     current: &str,
     channel: upgrade::UpgradeChannel,
@@ -1576,6 +1655,80 @@ mod tests {
         };
         assert!(message.contains("n1.temps.local") && !message.contains("n2.temps.local"));
         assert!(message.contains("and more"), "{message}");
+    }
+
+    fn lock_capacity(max_locks: i64, chunks: &[(&str, i64)]) -> temps_schema::LockCapacity {
+        temps_schema::LockCapacity {
+            max_locks_per_transaction: max_locks,
+            max_connections: 100,
+            max_prepared_transactions: 0,
+            timescaledb: true,
+            hypertables: chunks
+                .iter()
+                .map(
+                    |(hypertable, chunks)| temps_schema::lock_capacity::HypertableChunks {
+                        hypertable: hypertable.to_string(),
+                        chunks: *chunks,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn lock_capacity_passes_with_room_to_spare() {
+        let result = lock_capacity_result(Ok(&lock_capacity(64, &[("events", 120)])));
+        assert!(
+            matches!(&result, CheckResult::Pass(message) if message.contains("6400")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn lock_capacity_warns_with_the_value_to_set_and_the_restart() {
+        let result = lock_capacity_result(Ok(&lock_capacity(
+            64,
+            &[("proxy_logs", 1_460), ("events", 1_460)],
+        )));
+        let CheckResult::Warn(message) = result else {
+            panic!("expected a warning, got {result:?}");
+        };
+        assert!(message.contains("2920 TimescaleDB chunk(s)"), "{message}");
+        assert!(message.contains("at least 384"), "{message}");
+        assert!(message.contains("restart PostgreSQL"), "{message}");
+        assert!(message.contains("before installing"), "{message}");
+    }
+
+    #[test]
+    fn lock_capacity_without_timescaledb_is_informational() {
+        let mut capacity = lock_capacity(64, &[]);
+        capacity.timescaledb = false;
+        assert!(matches!(
+            lock_capacity_result(Ok(&capacity)),
+            CheckResult::Info(_)
+        ));
+        assert!(matches!(
+            lock_capacity_result(Err(&"permission denied".to_string())),
+            CheckResult::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn telemetry_foreign_keys_warn_until_dropped() {
+        assert!(matches!(
+            telemetry_foreign_keys_result(Ok(&Vec::new())),
+            CheckResult::Pass(_)
+        ));
+        let remaining = vec![temps_schema::TelemetryForeignKey {
+            table: "events".to_string(),
+            constraint: "fk_events_project_id".to_string(),
+            parent: "projects".to_string(),
+        }];
+        let CheckResult::Warn(message) = telemetry_foreign_keys_result(Ok(&remaining)) else {
+            panic!("expected a warning");
+        };
+        assert!(message.contains("events.fk_events_project_id"), "{message}");
+        assert!(message.contains("project deletes are refused"), "{message}");
     }
 
     #[test]

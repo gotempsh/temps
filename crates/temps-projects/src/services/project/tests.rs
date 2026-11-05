@@ -7904,3 +7904,79 @@ fn group_filter_ungrouped_and_in_group_are_distinct_variants() {
         "InGroup(42) must match InGroup(42)"
     );
 }
+
+/// Until post-migration maintenance has dropped the telemetry foreign keys, a
+/// project delete is refused before anything is fenced or torn down: the
+/// cascade would lock every chunk of the telemetry tables in one transaction.
+/// Once they are gone the same delete goes through.
+#[tokio::test]
+async fn project_deletion_waits_for_the_telemetry_foreign_keys_to_be_dropped() {
+    let Ok(test_db) = TestDatabase::with_migrations().await else {
+        eprintln!("Test database unavailable, skipping");
+        return;
+    };
+    let db = test_db.db.clone();
+    let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+    let project = temps_entities::projects::ActiveModel {
+        name: Set("Detach Pending".to_string()),
+        slug: Set("detach-pending".to_string()),
+        repo_name: Set("repo".to_string()),
+        repo_owner: Set("owner".to_string()),
+        preset: Set(temps_entities::preset::Preset::NextJs),
+        main_branch: Set("main".to_string()),
+        directory: Set("/".to_string()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .unwrap();
+
+    // The state between the migration and the post-migration step.
+    db.execute_unprepared(
+        "ALTER TABLE request_logs ADD CONSTRAINT fk_request_logs_project_id \
+         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE NOT VALID",
+    )
+    .await
+    .unwrap();
+
+    let refused = service.begin_project_deletion(project.id).await;
+    match &refused {
+        Err(ProjectError::TelemetryDetachPending {
+            project_id,
+            foreign_keys,
+        }) => {
+            assert_eq!(*project_id, project.id);
+            assert_eq!(
+                foreign_keys,
+                &vec!["request_logs.fk_request_logs_project_id".to_string()]
+            );
+        }
+        other => panic!("expected TelemetryDetachPending, got {other:?}"),
+    }
+    let message = refused.unwrap_err().to_string();
+    assert!(message.contains("temps migrate"), "{message}");
+    let untouched = temps_entities::projects::Entity::find_by_id(project.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .expect("a refused delete leaves the project in place");
+    assert!(!untouched.is_deleted, "a refused delete must not fence");
+    assert!(matches!(
+        service.delete_project(project.id, &project.name).await,
+        Err(ProjectError::TelemetryDetachPending { .. })
+    ));
+
+    db.execute_unprepared("ALTER TABLE request_logs DROP CONSTRAINT fk_request_logs_project_id")
+        .await
+        .unwrap();
+    service.begin_project_deletion(project.id).await.unwrap();
+    service
+        .delete_project(project.id, &project.name)
+        .await
+        .unwrap();
+    assert!(temps_entities::projects::Entity::find_by_id(project.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .is_none());
+}

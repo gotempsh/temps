@@ -39,6 +39,59 @@ impl ProjectService {
         })
     }
 
+    /// Fail with [`ProjectError::TelemetryDetachPending`] while any telemetry
+    /// table still holds a foreign key into the project delete cascade.
+    ///
+    /// The foreign keys are dropped by post-migration maintenance after the
+    /// server starts. Until then `DELETE FROM projects` would fire them on
+    /// every chunk of `events`, `proxy_logs` and `error_events`, locking each
+    /// one in a single transaction (about four locks per chunk), which on a
+    /// large history fails with "out of shared memory" and is slow regardless.
+    /// A catalog lookup on a handful of rows, with the names resolved in
+    /// `current_schema()` as the maintenance step resolves them.
+    pub async fn ensure_telemetry_detached(&self, project_id: i32) -> Result<(), ProjectError> {
+        let to_array = |tables: &[&str]| -> Vec<String> {
+            tables.iter().map(|table| table.to_string()).collect()
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT c.conrelid::regclass::text || '.' || c.conname AS foreign_key \
+                 FROM pg_constraint c \
+                 WHERE c.contype = 'f' \
+                   AND c.conrelid = ANY (SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(t)) \
+                                         FROM unnest($1::text[]) AS t) \
+                   AND c.confrelid = ANY (SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(t)) \
+                                          FROM unnest($2::text[]) AS t) \
+                 ORDER BY 1",
+                [
+                    to_array(&super::data_purge::PURGED_TABLES).into(),
+                    to_array(&super::data_purge::DETACHED_PARENTS).into(),
+                ],
+            ))
+            .await?;
+        let foreign_keys = rows
+            .iter()
+            .map(|row| row.try_get::<String>("", "foreign_key"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if foreign_keys.is_empty() {
+            return Ok(());
+        }
+        warn!(
+            project_id,
+            remaining = foreign_keys.len(),
+            "Refusing to delete project {} until post-migration maintenance drops the telemetry \
+             foreign keys: {}",
+            project_id,
+            foreign_keys.join(", ")
+        );
+        Err(ProjectError::TelemetryDetachPending {
+            project_id,
+            foreign_keys,
+        })
+    }
+
     /// Persist deletion intent before cancelling workflows or touching Docker.
     /// Deployment workers reject projects with this fence, closing the window
     /// where a new container could appear after the cleanup snapshot.
@@ -50,7 +103,12 @@ impl ProjectService {
     /// this fence and refuses. A binding can therefore never appear behind the
     /// fence, where it would block the final delete while its cleanup refuses
     /// the deleted project. Retrying an already-fenced project is a no-op.
+    ///
+    /// Refused first while the telemetry tables are still in the delete
+    /// cascade ([`Self::ensure_telemetry_detached`]), so nothing is fenced or
+    /// torn down for a delete that cannot finish.
     pub async fn begin_project_deletion(&self, project_id: i32) -> Result<(), ProjectError> {
+        self.ensure_telemetry_detached(project_id).await?;
         let txn = self.db.begin().await?;
         let outcome = Self::fence_locked_project(&txn, project_id).await;
         // End the transaction before returning, refusal included, so the row
@@ -110,6 +168,7 @@ impl ProjectService {
         project_name: &str,
     ) -> Result<(), ProjectError> {
         self.ensure_no_delivery_bindings(project_id).await?;
+        self.ensure_telemetry_detached(project_id).await?;
 
         // Fetch environments before deletion to emit cleanup jobs.
         // We only need id, name, and project_id — use select_only to avoid loading full models.

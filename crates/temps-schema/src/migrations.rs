@@ -3,6 +3,8 @@
 
 //! Applying this binary's migrations, behind the schema guard.
 
+use crate::error::SchemaResult;
+use crate::lock_capacity::{is_lock_exhaustion, LockSlotsExhausted, SchemaStep};
 use crate::schema_guard::{known_migration_names, SchemaStatus};
 use sea_orm::sea_query::Query;
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
@@ -155,7 +157,10 @@ async fn apply_migration_on_newer_schema(
 /// A short session `lock_timeout` is set first so a migration blocked on a
 /// contended lock fails fast (and the operator retries) rather than burning the
 /// entire `MIGRATION_TIMEOUT` budget waiting behind live traffic.
-pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
+///
+/// A migration that runs out of PostgreSQL lock slots returns
+/// [`SchemaError::LockSlotsExhausted`] naming it.
+pub async fn run_migrations(db: &DbConnection) -> SchemaResult<()> {
     let status = ensure_schema_compatible(db).await?;
 
     // Fail fast on contended locks rather than hanging the whole budget.
@@ -180,29 +185,68 @@ pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
         let report = run_migrations_streaming(db, |_| {}).await?;
         return match report.failed() {
             None => Ok(()),
-            Some(failed) => Err(ServiceError::Database(format!(
-                "Failed to apply migration {} on a database migrated by a newer Temps \
-                 release: {}",
-                failed.name,
-                failed
-                    .error
-                    .as_deref()
-                    .unwrap_or("no error detail reported")
-            ))),
+            Some(failed) => match &failed.lock_exhaustion {
+                Some(exhausted) => Err(exhausted.clone().into()),
+                None => Err(ServiceError::Database(format!(
+                    "Failed to apply migration {} on a database migrated by a newer Temps \
+                     release: {}",
+                    failed.name,
+                    failed
+                        .error
+                        .as_deref()
+                        .unwrap_or("no error detail reported")
+                ))
+                .into()),
+            },
         };
     }
 
     match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(ServiceError::Database(format!(
-            "Failed to run migrations: {}",
-            e
-        ))),
+        Ok(Err(e)) if is_lock_exhaustion(&e) => {
+            // `Migrator::up` applies every pending migration and stops at the
+            // failed one, whose transaction rolled back: it is the first one
+            // still pending.
+            let failed = match Migrator::get_pending_migrations(db).await {
+                Ok(pending) => pending
+                    .first()
+                    .map(|migration| migration.name().to_string())
+                    .unwrap_or_else(|| "(unknown: none is pending any more)".to_string()),
+                Err(error) => format!("(unknown: pending migrations could not be read: {error})"),
+            };
+            Err(lock_exhaustion(db, SchemaStep::Migration(failed), &e)
+                .await
+                .into())
+        }
+        Ok(Err(e)) => {
+            Err(ServiceError::Database(format!("Failed to run migrations: {}", e)).into())
+        }
         Err(_) => Err(ServiceError::Database(format!(
             "Database migrations timed out after {} seconds. For large databases, \
              run `temps migrate` manually with the new binary before restarting the server.",
             MIGRATION_TIMEOUT.as_secs()
-        ))),
+        ))
+        .into()),
+    }
+}
+
+/// Describe a migration that ran out of lock slots, with the instance's lock
+/// settings and chunk count read after its rollback.
+pub(crate) async fn lock_exhaustion(
+    db: &DbConnection,
+    step: SchemaStep,
+    error: &DbErr,
+) -> LockSlotsExhausted {
+    let reason = error.to_string();
+    match db.get_postgres_connection_pool().acquire().await {
+        Ok(mut connection) => LockSlotsExhausted::read(&mut connection, step, None, reason).await,
+        Err(acquire_error) => LockSlotsExhausted::new(
+            step,
+            None,
+            None,
+            Some(format!("no connection to read them on: {acquire_error}")),
+            reason,
+        ),
     }
 }
 
@@ -217,6 +261,9 @@ pub struct MigrationStepResult {
     pub elapsed: Duration,
     /// The error message when `success` is false.
     pub error: Option<String>,
+    /// Set when the migration ran out of PostgreSQL lock slots; `error` then
+    /// holds its message.
+    pub lock_exhaustion: Option<LockSlotsExhausted>,
 }
 
 /// Report returned by [`run_migrations_reported`]: the plan (pending names
@@ -363,22 +410,29 @@ where
                 ))),
             }
         };
-        let outcome = match timeout(MIGRATION_TIMEOUT, apply).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(format!("{}", e)),
-            Err(_) => Err(format!("timed out after {}s", MIGRATION_TIMEOUT.as_secs())),
-        };
+        let outcome = timeout(MIGRATION_TIMEOUT, apply).await;
         let elapsed = started.elapsed();
 
-        let (success, error) = match outcome {
-            Ok(()) => (true, None),
-            Err(err) => (false, Some(err)),
+        let (success, error, lock_exhaustion) = match outcome {
+            Ok(Ok(())) => (true, None, None),
+            Ok(Err(err)) if is_lock_exhaustion(&err) => {
+                let exhausted =
+                    self::lock_exhaustion(db, SchemaStep::Migration(name.clone()), &err).await;
+                (false, Some(exhausted.to_string()), Some(exhausted))
+            }
+            Ok(Err(err)) => (false, Some(err.to_string()), None),
+            Err(_) => (
+                false,
+                Some(format!("timed out after {}s", MIGRATION_TIMEOUT.as_secs())),
+                None,
+            ),
         };
         let result = MigrationStepResult {
             name,
             success,
             elapsed,
             error,
+            lock_exhaustion,
         };
         // Emit the finished result, then record it in the report.
         on_progress(MigrationProgress::Finished {

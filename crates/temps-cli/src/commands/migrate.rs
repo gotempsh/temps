@@ -699,6 +699,48 @@ fn print_maintenance(progress: temps_schema::MaintenanceProgress<'_>, interactiv
                 format!("({})", format_elapsed(elapsed)).dimmed()
             );
         }
+        MaintenanceProgress::ForeignKeyDetachStarted {
+            table,
+            constraint,
+            chunks,
+        } => {
+            let line = format!(
+                "  {} drop foreign key {} from {} ({} chunk(s)) …",
+                "→".cyan(),
+                constraint,
+                table,
+                chunks
+            );
+            if interactive {
+                print!("{line}");
+                let _ = std::io::stdout().flush();
+            } else {
+                println!("{line}");
+            }
+        }
+        MaintenanceProgress::ForeignKeyDetachFinished {
+            table,
+            constraint,
+            chunks,
+            per_chunk,
+            elapsed,
+        } => {
+            let how = if per_chunk {
+                format!("{chunks} chunk(s), one per transaction")
+            } else if chunks > 0 {
+                format!("{chunks} chunk(s) in one transaction")
+            } else {
+                "plain table".to_string()
+            };
+            println!(
+                "{}  {} dropped foreign key {} from {} {}",
+                if interactive { "\r" } else { "" },
+                "✓".green(),
+                constraint,
+                table,
+                format!("({how}, {})", format_elapsed(elapsed)).dimmed()
+            );
+        }
         MaintenanceProgress::AggregateStarted { view, windows } => {
             if interactive {
                 print!("  {} {} refresh [0/{}] …", "→".cyan(), view, windows);
@@ -814,6 +856,30 @@ fn maintenance_json(progress: temps_schema::MaintenanceProgress<'_>) -> serde_js
         MaintenanceProgress::IndexFinished { name, elapsed } => serde_json::json!({
             "event": "maintenance_index_finished",
             "name": name,
+            "elapsed_ms": elapsed.as_millis() as u64,
+        }),
+        MaintenanceProgress::ForeignKeyDetachStarted {
+            table,
+            constraint,
+            chunks,
+        } => serde_json::json!({
+            "event": "maintenance_foreign_key_detach_started",
+            "table": table,
+            "constraint": constraint,
+            "chunks": chunks,
+        }),
+        MaintenanceProgress::ForeignKeyDetachFinished {
+            table,
+            constraint,
+            chunks,
+            per_chunk,
+            elapsed,
+        } => serde_json::json!({
+            "event": "maintenance_foreign_key_detach_finished",
+            "table": table,
+            "constraint": constraint,
+            "chunks": chunks,
+            "per_chunk": per_chunk,
             "elapsed_ms": elapsed.as_millis() as u64,
         }),
         MaintenanceProgress::AggregateStarted { view, windows } => serde_json::json!({
@@ -975,6 +1041,31 @@ mod tests {
         });
         assert_eq!(finished["event"], "maintenance_index_finished");
         assert_eq!(finished["elapsed_ms"], 3_000);
+    }
+
+    #[test]
+    fn maintenance_foreign_key_detach_json_events_report_how_it_went() {
+        use temps_schema::MaintenanceProgress;
+
+        let started = super::maintenance_json(MaintenanceProgress::ForeignKeyDetachStarted {
+            table: "events",
+            constraint: "fk_events_project_id",
+            chunks: 1_460,
+        });
+        assert_eq!(started["event"], "maintenance_foreign_key_detach_started");
+        assert_eq!(started["chunks"], 1_460);
+
+        let finished = super::maintenance_json(MaintenanceProgress::ForeignKeyDetachFinished {
+            table: "events",
+            constraint: "fk_events_project_id",
+            chunks: 1_460,
+            per_chunk: true,
+            elapsed: std::time::Duration::from_secs(2),
+        });
+        assert_eq!(finished["event"], "maintenance_foreign_key_detach_finished");
+        assert_eq!(finished["table"], "events");
+        assert_eq!(finished["per_chunk"], true);
+        assert_eq!(finished["elapsed_ms"], 2_000);
     }
 
     #[tokio::test]

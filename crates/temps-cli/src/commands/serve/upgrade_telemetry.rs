@@ -136,7 +136,7 @@ pub async fn run_migrations_reporting_upgrade(
             if let Some(probe) = probe {
                 send_before_exit(db, data_dir, probe.failed_event(&error.to_string())).await;
             }
-            Err(error)
+            Err(error.into())
         }
     }
 }
