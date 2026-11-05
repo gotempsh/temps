@@ -10,8 +10,9 @@
 
 use temps_entities::deployment_config::{
     BuildLocation, DeploymentConfig, DeploymentConfigSnapshot, RateLimitConfig, SecurityConfig,
-    SecurityHeadersConfig, DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS, MAX_HEALTH_CHECK_TIMEOUT_SECONDS,
-    MAX_REPLICAS, MIN_HEALTH_CHECK_TIMEOUT_SECONDS,
+    SecurityHeadersConfig, DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS, DEFAULT_STOP_TIMEOUT_SECONDS,
+    MAX_HEALTH_CHECK_TIMEOUT_SECONDS, MAX_REPLICAS, MAX_STOP_TIMEOUT_SECONDS,
+    MIN_HEALTH_CHECK_TIMEOUT_SECONDS, MIN_STOP_TIMEOUT_SECONDS,
 };
 use temps_entities::environments;
 
@@ -32,6 +33,29 @@ pub fn resolve_health_check_timeout_seconds(configured: Option<i32>) -> u64 {
         })
         .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS);
     u64::from(seconds.unsigned_abs())
+}
+
+/// Effective stop grace period in seconds for a resolved override: clamped to
+/// the accepted range, or the platform default (10 s) when unset. Stored
+/// values are validated on write; the clamp keeps a hand-edited row from
+/// killing containers with no grace at all (0) or holding a teardown for days.
+pub fn resolve_stop_timeout_seconds(configured: Option<i32>) -> u64 {
+    let seconds = configured
+        .map(|s| s.clamp(MIN_STOP_TIMEOUT_SECONDS, MAX_STOP_TIMEOUT_SECONDS))
+        .unwrap_or(DEFAULT_STOP_TIMEOUT_SECONDS);
+    u64::from(seconds.unsigned_abs())
+}
+
+/// Refuse a stop grace period outside the accepted range, wherever one is saved.
+pub fn validate_stop_timeout_seconds(seconds: i32) -> Result<(), String> {
+    if (MIN_STOP_TIMEOUT_SECONDS..=MAX_STOP_TIMEOUT_SECONDS).contains(&seconds) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Stop timeout {seconds} is not in valid range \
+             ({MIN_STOP_TIMEOUT_SECONDS}-{MAX_STOP_TIMEOUT_SECONDS} seconds)"
+        ))
+    }
 }
 
 /// Refuse a replica count no deployment could run, wherever one is saved.
@@ -293,6 +317,7 @@ impl DeploymentConfigExt for DeploymentConfig {
             health_check_timeout_seconds: other
                 .health_check_timeout_seconds
                 .or(self.health_check_timeout_seconds),
+            stop_timeout_seconds: other.stop_timeout_seconds.or(self.stop_timeout_seconds),
         }
     }
 
@@ -416,6 +441,10 @@ impl DeploymentConfigExt for DeploymentConfig {
                      ({MIN_HEALTH_CHECK_TIMEOUT_SECONDS}-{MAX_HEALTH_CHECK_TIMEOUT_SECONDS} seconds)"
                 ));
             }
+        }
+
+        if let Some(seconds) = self.stop_timeout_seconds {
+            validate_stop_timeout_seconds(seconds)?;
         }
 
         Ok(())
@@ -856,6 +885,56 @@ mod tests {
             merged.target_labels,
             Some(serde_json::json!({"region": "eu"}))
         );
+    }
+
+    #[test]
+    fn stop_timeout_defaults_validates_merges_and_clamps() {
+        // Unset keeps today's 10 s grace, so existing projects are unchanged.
+        assert_eq!(resolve_stop_timeout_seconds(None), 10);
+        assert_eq!(resolve_stop_timeout_seconds(Some(120)), 120);
+        // A hand-edited row can neither remove the grace nor hold for days.
+        assert_eq!(resolve_stop_timeout_seconds(Some(0)), 1);
+        assert_eq!(resolve_stop_timeout_seconds(Some(-5)), 1);
+        assert_eq!(resolve_stop_timeout_seconds(Some(i32::MAX)), 3600);
+
+        for ok in [1, 10, 3600] {
+            let config = DeploymentConfig {
+                stop_timeout_seconds: Some(ok),
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok(), "{ok} is in range");
+        }
+        for bad in [0, -1, 3601] {
+            let config = DeploymentConfig {
+                stop_timeout_seconds: Some(bad),
+                ..Default::default()
+            };
+            let error = config.validate().expect_err("out of range");
+            assert!(error.contains(&format!("Stop timeout {bad}")), "{error}");
+            assert!(error.contains("1-3600 seconds"), "{error}");
+        }
+
+        let project = DeploymentConfig {
+            stop_timeout_seconds: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(
+            project
+                .merge(&DeploymentConfig::default())
+                .stop_timeout_seconds,
+            Some(120),
+            "an environment without an override inherits the project value"
+        );
+        let env = DeploymentConfig {
+            stop_timeout_seconds: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(project.merge(&env).stop_timeout_seconds, Some(30));
+
+        // Stored configs written before the field existed still parse.
+        let legacy: DeploymentConfig =
+            serde_json::from_value(serde_json::json!({"replicas": 1})).expect("legacy config");
+        assert_eq!(legacy.stop_timeout_seconds, None);
     }
 
     #[test]

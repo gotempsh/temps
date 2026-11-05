@@ -697,6 +697,10 @@ impl ProjectResponse {
                     .deployment_config
                     .clone()
                     .and_then(|c| c.health_check_timeout_seconds),
+                stop_timeout_seconds: project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.stop_timeout_seconds),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
@@ -898,6 +902,12 @@ pub struct UpdateDeploymentConfigRequest {
     /// 300 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// How long, in seconds (1-3600), the previous deployment's containers get
+    /// to finish in-flight requests after SIGTERM, once a new deployment is
+    /// live, before they are killed. Absent leaves the current value
+    /// unchanged; the platform default is 10 seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_seconds: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
 }

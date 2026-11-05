@@ -28,6 +28,33 @@ use temps_workload_docker::secrets::{
 };
 use tracing::{debug, info, warn};
 
+/// Grace period between SIGTERM and SIGKILL for a stop that names none: the
+/// platform default a project's stop timeout falls back to.
+const DEFAULT_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// bollard's own client timeout, which also bounds `POST /containers/{id}/stop`.
+const DEFAULT_DOCKER_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Margin past the grace period for the daemon to kill the container and answer.
+const STOP_REQUEST_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Docker takes the grace period as whole seconds in an `i32`.
+fn stop_grace_seconds(grace: std::time::Duration) -> i32 {
+    i32::try_from(grace.as_secs()).unwrap_or(i32::MAX)
+}
+
+/// The client for one stop request. The daemon answers a stop only once the
+/// container has exited, which with a long grace period is well past bollard's
+/// two-minute default: without a longer timeout the request would fail while
+/// the container is still draining. Only this request gets it, so a hung daemon
+/// still fails every other call in two minutes.
+fn stop_request_client(docker: &bollard::Docker, grace: std::time::Duration) -> bollard::Docker {
+    let needed = grace.saturating_add(STOP_REQUEST_MARGIN);
+    docker
+        .clone()
+        .with_timeout(needed.max(DEFAULT_DOCKER_CLIENT_TIMEOUT))
+}
+
 /// A failed stop as a deployer error. Only Docker's 404 means the container is
 /// gone, and so not running; any other failure may have left it running.
 fn stop_error(container_id: &str, error: bollard::errors::Error) -> DeployerError {
@@ -935,11 +962,21 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.require_docker()?
+        self.stop_container_with_grace(container_id, DEFAULT_STOP_GRACE)
+            .await
+    }
+
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        let docker = self.require_docker()?;
+        stop_request_client(&docker, grace)
             .stop_container(
                 container_id,
                 Some(StopContainerOptions {
-                    t: Some(10),
+                    t: Some(stop_grace_seconds(grace)),
                     signal: None,
                 }),
             )

@@ -4436,6 +4436,79 @@ async fn health_probe_updates_require_admin_on_socket_granted_projects() {
     }
 }
 
+/// #1806: the stop timeout is saved through the deployment-config API like
+/// the startup timeout, and refused outside 1-3600 seconds.
+#[tokio::test]
+async fn stop_timeout_is_saved_and_validated() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let project = project_for_hosting_lock_test("drains-slowly");
+    let mut updated = project.clone();
+    updated.deployment_config = Some(temps_entities::deployment_config::DeploymentConfig {
+        stop_timeout_seconds: Some(120),
+        ..Default::default()
+    });
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![project.clone()], vec![updated]])
+            .into_connection(),
+    );
+    let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+    let request = serde_json::from_value(serde_json::json!({"stopTimeoutSeconds": 120})).unwrap();
+    let saved = service
+        .update_project_deployment_config(
+            10,
+            request,
+            temps_config::CeilingEnforcement::Bypass,
+            DeployCaller::ProjectWriter,
+        )
+        .await
+        .expect("an in-range stop timeout is saved");
+    assert_eq!(
+        saved.deployment_config.unwrap().stop_timeout_seconds,
+        Some(120)
+    );
+    // The UPDATE itself carries the value, not only the mock's canned reply.
+    drop(service);
+    let log = format!(
+        "{:?}",
+        Arc::try_unwrap(db)
+            .expect("the service was dropped")
+            .into_transaction_log()
+    );
+    assert!(log.contains(r#"stopTimeoutSeconds": Number(120)"#), "{log}");
+
+    for bad in [0, 3601] {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // Read, then re-read under the row lock, before validating.
+                .append_query_results([vec![project.clone()], vec![project.clone()]])
+                .into_connection(),
+        );
+        let service = create_test_services(db, Arc::new(MockJobQueue::new())).await;
+        let request =
+            serde_json::from_value(serde_json::json!({"stopTimeoutSeconds": bad})).unwrap();
+        let result = service
+            .update_project_deployment_config(
+                10,
+                request,
+                temps_config::CeilingEnforcement::Bypass,
+                DeployCaller::ProjectWriter,
+            )
+            .await;
+        match result {
+            Err(ProjectError::InvalidInput(message)) => {
+                assert!(
+                    message.contains(&format!("Stop timeout {bad}")),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("an out-of-range stop timeout {bad} was saved"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn git_settings_merge_startup_overrides_from_locked_row() {
     use sea_orm::{DatabaseBackend, MockDatabase};

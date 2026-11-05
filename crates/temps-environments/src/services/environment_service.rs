@@ -1227,6 +1227,9 @@ impl EnvironmentService {
         if let Some(timeout) = settings.health_check_timeout_seconds {
             deployment_config.health_check_timeout_seconds = Some(timeout);
         }
+        if let Some(stop_timeout_seconds) = settings.stop_timeout_seconds {
+            deployment_config.stop_timeout_seconds = stop_timeout_seconds;
+        }
         // Validate the deployment config
         deployment_config.validate().map_err(|e| {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
@@ -2394,6 +2397,7 @@ mod tests {
                 crate::handlers::UpdateEnvironmentSettingsRequest {
                     health: None,
                     health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     branch: Some("main".to_string()),
                     cpu_request: None,
                     cpu_limit: None,
@@ -2509,6 +2513,7 @@ mod tests {
                 crate::handlers::UpdateEnvironmentSettingsRequest {
                     health: None,
                     health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     branch: None,
                     cpu_request: None,
                     cpu_limit: None,
@@ -2570,6 +2575,7 @@ mod tests {
         crate::handlers::UpdateEnvironmentSettingsRequest {
             health: None,
             health_check_timeout_seconds: None,
+            stop_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,
@@ -2671,6 +2677,90 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// #1806: an environment sets, keeps or clears (back to the project's
+    /// value) its stop timeout, and an out-of-range one is refused.
+    #[tokio::test]
+    async fn stop_timeout_override_is_set_kept_cleared_and_validated() {
+        use temps_entities::deployment_config::DeploymentConfig;
+        for (change, expected) in [
+            (None, Some(60)),
+            (Some(Some(45)), Some(45)),
+            (Some(None), None),
+        ] {
+            let current = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    stop_timeout_seconds: Some(60),
+                    ..Default::default()
+                }),
+                ..env_for_ceiling_test()
+            };
+            let updated = environments::Model {
+                deployment_config: Some(DeploymentConfig {
+                    stop_timeout_seconds: expected,
+                    ..Default::default()
+                }),
+                ..current.clone()
+            };
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![current]])
+                    .append_query_results([vec![updated]])
+                    .append_exec_results([MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = service_with_ceilings(db.clone(), Default::default());
+            service
+                .update_environment_settings(
+                    10,
+                    1,
+                    crate::handlers::UpdateEnvironmentSettingsRequest {
+                        stop_timeout_seconds: change,
+                        ..empty_settings_request()
+                    },
+                    temps_config::CeilingEnforcement::Bypass,
+                )
+                .await
+                .unwrap();
+            drop(service);
+            let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+            // Check the UPDATE payload rather than only the canned mock reply.
+            match expected {
+                Some(seconds) => assert!(
+                    log.contains("stopTimeoutSeconds") && log.contains(&seconds.to_string()),
+                    "{log}"
+                ),
+                None => assert!(!log.contains("stopTimeoutSeconds"), "{log}"),
+            }
+        }
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![env_for_ceiling_test()]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with_ceilings(db, Default::default());
+        let error = service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    stop_timeout_seconds: Some(Some(0)),
+                    ..empty_settings_request()
+                },
+                temps_config::CeilingEnforcement::Bypass,
+            )
+            .await
+            .expect_err("a zero stop timeout is refused");
+        assert!(error.to_string().contains("Stop timeout 0"), "{error}");
     }
 
     /// ADR 066 I10: a Shield mode is stored with the attack-mode column the
@@ -2956,6 +3046,7 @@ mod tests {
                 crate::handlers::UpdateEnvironmentSettingsRequest {
                     health: None,
                     health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
@@ -3007,6 +3098,7 @@ mod tests {
                 crate::handlers::UpdateEnvironmentSettingsRequest {
                     health: None,
                     health_check_timeout_seconds: None,
+                    stop_timeout_seconds: None,
                     memory_limit: Some(Some(0)),
                     ..empty_settings_request()
                 },
@@ -3544,6 +3636,7 @@ mod tests {
         crate::handlers::UpdateEnvironmentSettingsRequest {
             health: None,
             health_check_timeout_seconds: None,
+            stop_timeout_seconds: None,
             branch: None,
             cpu_request: None,
             cpu_limit: None,

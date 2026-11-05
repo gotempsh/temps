@@ -1239,6 +1239,9 @@ impl ProjectService {
         if let Some(health_check_timeout_seconds) = config.health_check_timeout_seconds {
             deployment_config.health_check_timeout_seconds = Some(health_check_timeout_seconds);
         }
+        if let Some(stop_timeout_seconds) = config.stop_timeout_seconds {
+            deployment_config.stop_timeout_seconds = Some(stop_timeout_seconds);
+        }
 
         if let Some(health) = config.health {
             deployment_config.health = Some(health);

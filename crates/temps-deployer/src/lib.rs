@@ -489,6 +489,15 @@ fn bounded_strings(items: &[String], max_entries: usize, max_bytes: usize) -> Ve
     kept
 }
 
+/// Body of a worker agent's `POST /agent/containers/{id}/stop`. Every field is
+/// optional so an empty body (older control planes) keeps the default stop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StopContainerRequest {
+    /// Seconds between SIGTERM and SIGKILL; the agent's default (10) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeployRequest {
     pub image_name: String,
@@ -1257,6 +1266,22 @@ pub trait ContainerDeployer: Send + Sync {
 
     /// Stop a running container
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError>;
+
+    /// Stop a running container, giving it `grace` between SIGTERM and
+    /// SIGKILL to finish in-flight work. Used when a superseded deployment is
+    /// torn down, where the project's stop timeout applies.
+    ///
+    /// Every deployer that stops real containers overrides this. The default
+    /// is for test doubles and deployers without a grace period to honour; it
+    /// stops the container the way [`Self::stop_container`] does.
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        let _ = grace;
+        self.stop_container(container_id).await
+    }
 
     /// Pause a running container
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError>;

@@ -114,6 +114,63 @@ const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
 /// log and move on — the container row is left for the next sweep to retry.
 pub(crate) const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
+/// The grace period a superseded deployment's containers get between SIGTERM
+/// and SIGKILL: the environment's stop timeout, else the project's, else the
+/// platform default (10 s). A failed lookup falls back to the default, with a
+/// warning: the teardown must still happen.
+pub(crate) async fn superseded_stop_grace(
+    db: &sea_orm::DatabaseConnection,
+    environment_id: i32,
+) -> std::time::Duration {
+    let configured = async {
+        let environment = environments::Entity::find_by_id(environment_id)
+            .one(db)
+            .await?;
+        let Some(environment) = environment else {
+            return Ok::<_, sea_orm::DbErr>(None);
+        };
+        if let Some(seconds) = environment
+            .deployment_config
+            .as_ref()
+            .and_then(|config| config.stop_timeout_seconds)
+        {
+            return Ok(Some(seconds));
+        }
+        let project = projects::Entity::find_by_id(environment.project_id)
+            .one(db)
+            .await?;
+        Ok(project
+            .and_then(|project| project.deployment_config)
+            .and_then(|config| config.stop_timeout_seconds))
+    }
+    .await
+    .unwrap_or_else(|error| {
+        warn!(
+            environment_id,
+            %error,
+            "Could not read the stop timeout; stopping superseded containers with the default grace period"
+        );
+        None
+    });
+    std::time::Duration::from_secs(
+        temps_config::deployment_config::resolve_stop_timeout_seconds(configured),
+    )
+}
+
+/// How long one container's stop-and-remove may take before the sweep gives
+/// up on it: `base`, which already covers the default 10 s grace, plus any
+/// grace beyond that. A long stop timeout must not be cut short by the
+/// teardown's own ceiling.
+pub(crate) fn teardown_budget(
+    base: std::time::Duration,
+    grace: std::time::Duration,
+) -> std::time::Duration {
+    let default_grace = std::time::Duration::from_secs(
+        temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+    );
+    base.saturating_add(grace.saturating_sub(default_grace))
+}
+
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkCompleteOutput {
@@ -2301,6 +2358,7 @@ WHERE project.id = $2
         container: deployment_containers::Model,
         project_id: i32,
         environment_id: i32,
+        stop_grace: std::time::Duration,
     ) -> Result<(), String> {
         let container_id = container.container_id.clone();
         let plane_workload = crate::services::plane_deployer::deployment_replica_workload(
@@ -2379,7 +2437,7 @@ WHERE project.id = $2
                 .ok();
             }
             (None, Some(deployer)) => {
-                self.stop_and_remove_container(deployer.as_ref(), &container_id)
+                self.stop_and_remove_container(deployer.as_ref(), &container_id, stop_grace)
                     .await?;
             }
             (None, None) => {
@@ -2407,9 +2465,13 @@ WHERE project.id = $2
         &self,
         deployer: &dyn temps_deployer::ContainerDeployer,
         container_id: &str,
+        stop_grace: std::time::Duration,
     ) -> Result<(), String> {
-        // Stop container first
-        match deployer.stop_container(container_id).await {
+        // Stop container first, giving in-flight requests the stop timeout.
+        match deployer
+            .stop_container_with_grace(container_id, stop_grace)
+            .await
+        {
             Ok(_) => {
                 self.log(format!("Stopped container {}", container_id))
                     .await
@@ -2518,12 +2580,17 @@ WHERE project.id = $2
         let teardowns = containers.into_iter().map(|container| {
             let container_id = container.container_id.clone();
             async move {
+                // A rejected deployment never went live, so it has no
+                // traffic to drain: the default grace period.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
                     self.teardown_container(
                         container,
                         deployment.project_id,
                         deployment.environment_id,
+                        std::time::Duration::from_secs(
+                            temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+                        ),
                     ),
                 )
                 .await
@@ -2638,6 +2705,22 @@ WHERE project.id = $2
         .await
         .ok();
 
+        // The previous deployment drains its in-flight requests for the
+        // project's stop timeout before it is killed (#1806).
+        let stop_grace = superseded_stop_grace(self.db.as_ref(), environment_id).await;
+        let teardown_timeout = teardown_budget(
+            std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
+            stop_grace,
+        );
+        if !previous_deployments.is_empty() {
+            self.log(format!(
+                "Stopping previous containers with a {}s grace period",
+                stop_grace.as_secs()
+            ))
+            .await
+            .ok();
+        }
+
         let mut incomplete_teardowns = 0usize;
         for deployment in previous_deployments {
             let deployment_id = deployment.id;
@@ -2732,8 +2815,8 @@ WHERE project.id = $2
                 async move {
                     let container_id = container.container_id.clone();
                     let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
-                        self.teardown_container(container, project_id, env_id),
+                        teardown_timeout,
+                        self.teardown_container(container, project_id, env_id, stop_grace),
                     )
                     .await;
                     match result {
@@ -2747,7 +2830,8 @@ WHERE project.id = $2
                         Err(_) => {
                             self.log(format!(
                                 "Timed out tearing down container {} after {}s — will retry on next sweep",
-                                container_id, CONTAINER_TEARDOWN_TIMEOUT_SECS
+                                container_id,
+                                teardown_timeout.as_secs()
                             ))
                             .await
                             .ok();
@@ -3498,6 +3582,8 @@ mod teardown_tests {
         stop_delay: StdMutex<Option<std::time::Duration>>,
         stops_in_flight: std::sync::atomic::AtomicUsize,
         most_stops_in_flight: std::sync::atomic::AtomicUsize,
+        /// The grace period of every graceful stop, by container.
+        stop_graces: Arc<StdMutex<Vec<(String, std::time::Duration)>>>,
     }
 
     /// Holds a deployer operation open so a test can run something against it.
@@ -3522,6 +3608,7 @@ mod teardown_tests {
                 stop_delay: StdMutex::new(None),
                 stops_in_flight: std::sync::atomic::AtomicUsize::new(0),
                 most_stops_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                stop_graces: Arc::new(StdMutex::new(Vec::new())),
             }
         }
 
@@ -3604,6 +3691,17 @@ mod teardown_tests {
             self.stopped.lock().unwrap().push(id.to_string());
             self.operations.lock().unwrap().push(format!("stop {id}"));
             Ok(())
+        }
+        async fn stop_container_with_grace(
+            &self,
+            id: &str,
+            grace: std::time::Duration,
+        ) -> Result<(), DeployerError> {
+            self.stop_graces
+                .lock()
+                .unwrap()
+                .push((id.to_string(), grace));
+            self.stop_container(id).await
         }
         async fn pause_container(&self, _id: &str) -> Result<(), DeployerError> {
             Ok(())
@@ -4478,6 +4576,119 @@ mod teardown_tests {
             deployer.stopped.lock().unwrap().len(),
             1,
             "stopped deployment must not be re-torn-down on the next pass"
+        );
+    }
+
+    /// #1806: a superseded deployment's containers drain for the stop timeout
+    /// the environment sets, else the project's, else the default 10 s.
+    #[tokio::test]
+    async fn test_teardown_stops_previous_containers_with_the_configured_grace() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+
+        async fn graces_after_a_deploy(
+            db: &Arc<DbConnection>,
+            project_id: i32,
+            environment_id: i32,
+            round: &str,
+        ) -> Vec<(String, std::time::Duration)> {
+            let prev = insert_deployment(
+                db,
+                project_id,
+                environment_id,
+                &format!("prev-{round}"),
+                "completed",
+            )
+            .await;
+            insert_container(db, prev.id, &format!("prev-container-{round}")).await;
+            let new = insert_deployment(
+                db,
+                project_id,
+                environment_id,
+                &format!("new-{round}"),
+                "completed",
+            )
+            .await;
+            let deployer = Arc::new(RecordingDeployer::new());
+            let job = make_job(db.clone(), new.id, deployer.clone());
+            job.cancel_previous_deployments(environment_id, new.created_at)
+                .await;
+            let graces = deployer.stop_graces.lock().unwrap().clone();
+            // Leave only `new` live, so the next round starts clean.
+            deployments::Entity::update_many()
+                .col_expr(
+                    deployments::Column::State,
+                    sea_orm::sea_query::Expr::value("stopped"),
+                )
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+            graces
+        }
+
+        // Nothing configured: the 10 s Temps has always used.
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "default").await,
+            [(
+                "prev-container-default".to_string(),
+                std::time::Duration::from_secs(10)
+            )]
+        );
+
+        // The project's stop timeout.
+        let mut active: projects::ActiveModel = project.clone().into();
+        active.deployment_config = Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            stop_timeout_seconds: Some(120),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "project").await,
+            [(
+                "prev-container-project".to_string(),
+                std::time::Duration::from_secs(120)
+            )]
+        );
+
+        // An environment override wins over the project.
+        let mut active: environments::ActiveModel = env.clone().into();
+        active.deployment_config = Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            stop_timeout_seconds: Some(30),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "environment").await,
+            [(
+                "prev-container-environment".to_string(),
+                std::time::Duration::from_secs(30)
+            )]
+        );
+    }
+
+    #[test]
+    fn teardown_budget_grows_with_a_grace_period_longer_than_the_default() {
+        let base = std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS);
+        assert_eq!(
+            teardown_budget(base, std::time::Duration::from_secs(10)),
+            base,
+            "the default grace keeps today's ceiling"
+        );
+        assert_eq!(
+            teardown_budget(base, std::time::Duration::from_secs(1)),
+            base
+        );
+        assert_eq!(
+            teardown_budget(base, std::time::Duration::from_secs(600)),
+            base + std::time::Duration::from_secs(590)
         );
     }
 

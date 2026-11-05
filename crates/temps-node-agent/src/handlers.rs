@@ -659,6 +659,10 @@ pub async fn deploy_container(
     }
 }
 
+/// Longest grace period a stop request may ask for (1 hour), matching the
+/// largest stop timeout a project can be configured with.
+const MAX_STOP_GRACE_SECONDS: u64 = 3600;
+
 /// Stop a running container
 #[utoipa::path(
     tag = "Containers",
@@ -667,6 +671,7 @@ pub async fn deploy_container(
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
+    request_body(content = Option<temps_deployer::StopContainerRequest>, description = "Optional grace period; an empty body stops with the default 10 s"),
     responses(
         (status = 200, description = "Container stopped", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
@@ -678,9 +683,25 @@ pub async fn deploy_container(
 pub async fn stop_container(
     State(state): State<Arc<AgentState>>,
     Path(container_id): Path<String>,
+    body: Option<Json<temps_deployer::StopContainerRequest>>,
 ) -> impl IntoResponse {
-    tracing::info!(container_id = %container_id, "Stopping container");
-    match state.container_deployer.stop_container(&container_id).await {
+    let grace_seconds = body.and_then(|Json(request)| request.grace_seconds);
+    tracing::info!(container_id = %container_id, ?grace_seconds, "Stopping container");
+    let stopped = match grace_seconds {
+        // The control plane validated the project's stop timeout; bound it
+        // again so a hand-made request cannot hold the agent for days.
+        Some(seconds) => {
+            state
+                .container_deployer
+                .stop_container_with_grace(
+                    &container_id,
+                    std::time::Duration::from_secs(seconds.clamp(1, MAX_STOP_GRACE_SECONDS)),
+                )
+                .await
+        }
+        None => state.container_deployer.stop_container(&container_id).await,
+    };
+    match stopped {
         Ok(()) => {
             tracing::info!(container_id = %container_id, "Container stopped");
             AgentResponse::ok("stopped".to_string()).into_response()
@@ -847,11 +868,118 @@ mod container_error_tests {
             host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
         });
 
-        let response = stop_container(State(state), Path("some-container".to_string()))
+        let response = stop_container(State(state), Path("some-container".to_string()), None)
             .await
             .into_response();
         server.await.expect("mock runtime task");
         response.status()
+    }
+
+    /// The stop request this agent forwards to its runtime for `body`.
+    async fn forwarded_stop(body: Option<temps_deployer::StopContainerRequest>) -> String {
+        use axum::extract::{Path, State};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock runtime");
+        let address = listener.local_addr().expect("mock runtime address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            // Read the head, then the (small, fixed-length) JSON body.
+            loop {
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= length {
+                        break;
+                    }
+                }
+                let read = stream.read(&mut buffer).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"success":true,"data":"stopped","error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                format!("http://{address}"),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .expect("create deployer"),
+        );
+        let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
+            container_deployer: runtime.clone(),
+            image_builder: runtime,
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+
+        let response = stop_container(
+            State(state),
+            Path("old-replica".to_string()),
+            body.map(Json),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.await.expect("mock runtime task")
+    }
+
+    /// #1806: the control plane's grace period is the one the container gets.
+    #[tokio::test]
+    async fn a_stop_with_a_grace_period_applies_it() {
+        let forwarded = forwarded_stop(Some(temps_deployer::StopContainerRequest {
+            grace_seconds: Some(90),
+        }))
+        .await;
+        assert!(forwarded.contains(r#"{"grace_seconds":90}"#), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_grace_period_is_bounded_to_an_hour() {
+        let forwarded = forwarded_stop(Some(temps_deployer::StopContainerRequest {
+            grace_seconds: Some(u64::MAX),
+        }))
+        .await;
+        assert!(
+            forwarded.contains(r#"{"grace_seconds":3600}"#),
+            "{forwarded}"
+        );
+    }
+
+    /// An older control plane sends no grace period: the default stop.
+    #[tokio::test]
+    async fn a_stop_without_a_grace_period_uses_the_default_stop() {
+        let forwarded = forwarded_stop(None).await;
+        assert!(!forwarded.contains("grace_seconds"), "{forwarded}");
     }
 
     #[tokio::test]

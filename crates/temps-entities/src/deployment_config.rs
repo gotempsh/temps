@@ -394,6 +394,15 @@ pub struct DeploymentConfig {
     /// value and may override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// How long, in seconds, a superseded deployment's containers get to
+    /// finish in-flight work after SIGTERM before they are killed, once a new
+    /// deployment has gone live. Raise it for long requests (uploads,
+    /// exports, streaming responses, WebSockets). `None` = the platform
+    /// default ([`DEFAULT_STOP_TIMEOUT_SECONDS`]); valid overrides are
+    /// [`MIN_STOP_TIMEOUT_SECONDS`]..=[`MAX_STOP_TIMEOUT_SECONDS`].
+    /// Environments inherit the project value and may override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_seconds: Option<i32>,
     /// Deploy-time probe; environment overrides project, repository config overrides both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
@@ -405,6 +414,14 @@ pub const DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 300;
 pub const MIN_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 30;
 /// Largest accepted readiness-budget override, in seconds (1 hour).
 pub const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 3600;
+
+/// Default grace period between SIGTERM and SIGKILL when a superseded
+/// deployment's containers are stopped, in seconds.
+pub const DEFAULT_STOP_TIMEOUT_SECONDS: i32 = 10;
+/// Smallest accepted stop grace period override, in seconds.
+pub const MIN_STOP_TIMEOUT_SECONDS: i32 = 1;
+/// Largest accepted stop grace period override, in seconds (1 hour).
+pub const MAX_STOP_TIMEOUT_SECONDS: i32 = 3600;
 
 /// Deployment configuration snapshot for deployments
 ///
@@ -506,6 +523,7 @@ impl Default for DeploymentConfig {
             websocket_idle_timeout_seconds: None,
             max_concurrent_connections: None,
             health_check_timeout_seconds: None,
+            stop_timeout_seconds: None,
             health: None,
         }
     }

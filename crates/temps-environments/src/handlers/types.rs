@@ -458,6 +458,13 @@ pub struct UpdateEnvironmentSettingsRequest {
     pub health: Option<Option<temps_core::repo_config::HealthCheckConfig>>,
     #[serde(default)]
     pub health_check_timeout_seconds: Option<i32>,
+    /// Override how long, in seconds (1-3600), this environment's previous
+    /// deployment gets to finish in-flight requests after SIGTERM, once a new
+    /// deployment is live, before it is killed. Absent leaves the current
+    /// value unchanged. Send JSON `null` to clear the override (inherit the
+    /// project value, else 10 seconds).
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub stop_timeout_seconds: Option<Option<i32>>,
     /// Minimum (request) CPU in microcores. Send JSON `null` to clear (no request).
     /// Absent leaves the current value unchanged.
     #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]

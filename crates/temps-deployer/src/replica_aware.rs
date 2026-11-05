@@ -103,6 +103,16 @@ impl ContainerDeployer for ReplicaAwareDeployer {
         self.local.stop_container(container_id).await
     }
 
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        self.local
+            .stop_container_with_grace(container_id, grace)
+            .await
+    }
+
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError> {
         self.local.pause_container(container_id).await
     }

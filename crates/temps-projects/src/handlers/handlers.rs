@@ -2576,6 +2576,9 @@ pub async fn update_project_deployment_config(
             "updated".to_string(),
         );
     }
+    if config.stop_timeout_seconds.is_some() {
+        updated_fields.insert("stop_timeout_seconds".to_string(), "updated".to_string());
+    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,

@@ -239,7 +239,16 @@ impl MarkDeploymentCompleteJob {
         let deployment_id = container.deployment_id;
         if is_micro_vm {
             return self
-                .teardown_container(container, project_id, environment_id)
+                // A paused deployment serves nothing, so there is nothing to
+                // drain: the default grace period.
+                .teardown_container(
+                    container,
+                    project_id,
+                    environment_id,
+                    std::time::Duration::from_secs(
+                        temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+                    ),
+                )
                 .await
                 .map_err(|reason| PausedSweepError::RetireMicroVm {
                     container_id,

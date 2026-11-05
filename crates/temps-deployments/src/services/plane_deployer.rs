@@ -1102,6 +1102,19 @@ impl ContainerDeployer for PlaneContainerDeployer {
         self.local.stop_container(container_id).await
     }
 
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        if let Some(workload_id) = self.plane_only_workload(container_id).await? {
+            return self.retire(workload_id, container_id).await;
+        }
+        self.local
+            .stop_container_with_grace(container_id, grace)
+            .await
+    }
+
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError> {
         if self.plane_only_workload(container_id).await?.is_some() {
             return Err(self.unsupported_for_micro_vm("pause", container_id));

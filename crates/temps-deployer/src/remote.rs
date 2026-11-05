@@ -560,6 +560,10 @@ pub struct RemoteNodeDeployer {
     sealing: temps_core::sealed_request::NodeSealing,
 }
 
+/// Margin past a stop's grace period for the worker to kill the container and
+/// answer.
+const STOP_REQUEST_MARGIN: Duration = Duration::from_secs(60);
+
 impl RemoteNodeDeployer {
     pub fn new(agent_url: String, token: String, node_name: String) -> Result<Self, DeployerError> {
         // Strict TLS by default; operators with self-signed agent certs
@@ -1012,7 +1016,7 @@ impl RemoteNodeDeployer {
         body: &B,
         carries_values: bool,
     ) -> Result<T, DeployerError> {
-        self.agent_post_inner(path, body, carries_values, None)
+        self.agent_post_inner(path, body, carries_values, None, None)
             .await
     }
 
@@ -1024,7 +1028,7 @@ impl RemoteNodeDeployer {
         body: &B,
         container_id: &str,
     ) -> Result<T, DeployerError> {
-        self.agent_post_inner(path, body, false, Some(container_id))
+        self.agent_post_inner(path, body, false, Some(container_id), None)
             .await
     }
 
@@ -1034,15 +1038,15 @@ impl RemoteNodeDeployer {
         body: &B,
         carries_values: bool,
         missing_container_id: Option<&str>,
+        request_timeout: Option<Duration>,
     ) -> Result<T, DeployerError> {
         let url = format!("{}{}", self.agent_url, path);
+        let mut post = self.client.post(&url).bearer_auth(&self.token);
+        if let Some(request_timeout) = request_timeout {
+            post = post.timeout(request_timeout);
+        }
         let request = self
-            .with_body(
-                self.client.post(&url).bearer_auth(&self.token),
-                path,
-                body,
-                carries_values,
-            )
+            .with_body(post, path, body, carries_values)
             .map_err(|error| DeployerError::DeploymentFailed(error.to_string()))?;
         let response = request.send().await.map_err(|e| {
             DeployerError::NetworkError(format!(
@@ -1407,6 +1411,32 @@ impl ContainerDeployer for RemoteNodeDeployer {
                 &format!("/agent/containers/{}/stop", container_id),
                 &serde_json::json!({}),
                 container_id,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The worker applies the grace period itself. An agent older than this
+    /// field ignores it and stops with its default 10 s.
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        // The agent answers once the container has exited, so the request
+        // must outlast the grace period, not the client's 300 s default.
+        let request_timeout = grace
+            .saturating_add(STOP_REQUEST_MARGIN)
+            .max(Duration::from_secs(300));
+        let _: String = self
+            .agent_post_inner(
+                &format!("/agent/containers/{}/stop", container_id),
+                &crate::StopContainerRequest {
+                    grace_seconds: Some(grace.as_secs()),
+                },
+                false,
+                Some(container_id),
+                Some(request_timeout),
             )
             .await?;
         Ok(())
@@ -3490,6 +3520,66 @@ mod tests {
                 .expect("write response");
         });
         (address, server)
+    }
+
+    /// #1806: a superseded replica on a worker gets the project's stop
+    /// timeout, carried in the stop request's body.
+    #[tokio::test]
+    async fn graceful_stop_sends_the_grace_period_to_the_worker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !String::from_utf8_lossy(&request).contains("grace_seconds") {
+                let read = stream.read(&mut buffer).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"success":true,"data":"stopped","error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer");
+
+        deployer
+            .stop_container_with_grace("old-replica", Duration::from_secs(90))
+            .await
+            .expect("stop succeeds");
+
+        let request = server.await.expect("mock agent task");
+        assert!(
+            request.starts_with("POST /agent/containers/old-replica/stop"),
+            "{request}"
+        );
+        assert!(request.contains(r#"{"grace_seconds":90}"#), "{request}");
+    }
+
+    #[test]
+    fn an_empty_stop_body_from_an_older_control_plane_still_parses() {
+        let request: crate::StopContainerRequest =
+            serde_json::from_str("{}").expect("empty body parses");
+        assert_eq!(request.grace_seconds, None);
     }
 
     #[tokio::test]
