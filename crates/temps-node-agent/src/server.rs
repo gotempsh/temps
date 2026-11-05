@@ -595,6 +595,14 @@ fn spawn_heartbeat_loop(
                     value,
                 );
             }
+            // A Mac worker says so (ADR 090): the console labels it and shows
+            // it asleep rather than broken while the Mac sleeps.
+            if let (Some(host), Some(fields)) = (
+                crate::mac_worker::heartbeat_host(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(temps_core::node_address::AGENT_HOST_KEY.to_string(), host);
+            }
             // The node runtime's reports: only those that changed since the
             // last accepted beat.
             let instance_reports = match &node_runtime {

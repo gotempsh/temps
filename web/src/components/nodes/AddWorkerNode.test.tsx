@@ -117,7 +117,7 @@ test('the first command is pinned to the release this server runs and uses sudo'
     'sudo -H /root/.temps/bin/temps agent service install'
   )
   expect(screen.getByText(/the version this server runs/)).toBeTruthy()
-  expect(screen.getByText('The new machine must run Linux')).toBeTruthy()
+  expect(screen.getByText('What does the new machine run?')).toBeTruthy()
 })
 
 test('"Create another" is for another machine, so it drops a --force chosen for the last one', async () => {
@@ -149,4 +149,40 @@ test('a version that is not a release tag is not pinned, and the panel says so',
   expect(
     screen.getByText(/newest stable release, which may not match it/)
   ).toBeTruthy()
+})
+
+test('a Mac cannot take ingress on its main address or Tailscale, and the command falls back to delegated', async () => {
+  setup()
+  const fixed = await screen.findByRole('radio', {
+    name: /Yes, on its main address/,
+  })
+  fireEvent.click(fixed)
+  expect(fixed.getAttribute('aria-checked')).toBe('true')
+
+  fireEvent.click(screen.getByRole('radio', { name: /^Mac/ }))
+  await waitFor(() =>
+    expect(
+      screen
+        .getByRole('radio', { name: /Yes, on its main address/ })
+        .hasAttribute('disabled')
+    ).toBe(true)
+  )
+  expect(
+    screen
+      .getByRole('radio', { name: /Only my private network/ })
+      .hasAttribute('disabled')
+  ).toBe(true)
+  expect(screen.getByText(/cannot open ports 80 and 443/)).toBeTruthy()
+  expect(
+    screen
+      .getByRole('radio', { name: /^Yes, managed from this console/ })
+      .getAttribute('aria-checked')
+  ).toBe('true')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Create join command' }))
+  const block = await screen.findByText(/~\/\.temps\/bin\/temps join/)
+  expect(block.textContent).toContain(
+    '~/.temps/bin/temps join https://cp.example.com tk_enroll_1 --ingress delegated && \\'
+  )
+  expect(block.textContent).not.toContain('sudo')
 })

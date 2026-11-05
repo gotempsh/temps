@@ -45,13 +45,17 @@ import { MeshCaRotationRequired } from '@/components/nodes/RotateClusterCaDialog
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
-import { type JoinIngressChoice, joinIngressFlag } from '@/lib/worker-ingress'
-import { workerJoinScript } from '@/lib/worker-join-script'
+import {
+  type JoinIngressChoice,
+  joinIngressFlag,
+  joinIngressUnavailable,
+} from '@/lib/worker-ingress'
+import { type WorkerOs, workerJoinScript } from '@/lib/worker-join-script'
 import { usePlaneRelease } from '@/hooks/usePlaneRelease'
 import {
   ForceJoinOption,
   WorkerJoinScript,
-  WorkerRequirements,
+  WorkerOsChoice,
 } from '@/components/nodes/WorkerJoinScript'
 import {
   controlPlaneMeshPort,
@@ -94,8 +98,9 @@ export function AddWorkerNode({ otherWays }: { otherWays: ReactNode }) {
       <div>
         <p className="text-sm font-medium">Add a worker node</p>
         <p className="text-sm text-muted-foreground">
-          Any Linux machine, on any provider or at home. It connects to this
-          server over an encrypted private network and needs no public IP.
+          Any Linux machine, on any provider or at home, or a Mac for
+          development. It connects to this server over an encrypted private
+          network and needs no public IP.
         </p>
       </div>
 
@@ -478,13 +483,19 @@ function JoinCommandStep({ url }: { url: string }) {
   const [created, setCreated] = useState(0)
   const [ingress, setIngress] = useState<JoinIngressChoice>('delegated')
   const [force, setForce] = useState(false)
+  const [os, setOs] = useState<WorkerOs>('linux')
   // The install step pins the release this server runs; a worker on another
   // version may not speak its protocol.
   const release = usePlaneRelease()
+  const selectOs = (next: WorkerOs) => {
+    setOs(next)
+    // A Mac cannot take every ingress choice: fall back to the default one.
+    if (joinIngressUnavailable(next, ingress)) setIngress('delegated')
+  }
   const choices = (
     <>
-      <WorkerRequirements />
-      <IngressQuestion value={ingress} onChange={setIngress} />
+      <WorkerOsChoice value={os} onChange={selectOs} />
+      <IngressQuestion value={ingress} onChange={setIngress} os={os} />
       <ForceJoinOption checked={force} onChange={setForce} />
     </>
   )
@@ -529,6 +540,7 @@ function JoinCommandStep({ url }: { url: string }) {
     version: release.tag,
     joinFlags: joinIngressFlag(ingress),
     force,
+    os,
   })
 
   return (
@@ -538,6 +550,7 @@ function JoinCommandStep({ url }: { url: string }) {
         command={script.command}
         pinnedTo={script.pinnedTo}
         pending={release.pending}
+        os={os}
       />
       <p className="text-xs text-muted-foreground">
         Shown once. It adds one machine and expires{' '}
@@ -604,9 +617,11 @@ const INGRESS_CHOICES: {
 function IngressQuestion({
   value,
   onChange,
+  os,
 }: {
   value: JoinIngressChoice
   onChange: (value: JoinIngressChoice) => void
+  os: WorkerOs
 }) {
   return (
     <fieldset className="space-y-2">
@@ -618,24 +633,34 @@ function IngressQuestion({
         onValueChange={(next) => onChange(next as JoinIngressChoice)}
         className="gap-2"
       >
-        {INGRESS_CHOICES.map((choice) => (
-          <div key={choice.value} className="flex items-start gap-2">
-            <RadioGroupItem
-              id={`join-ingress-${choice.value}`}
-              value={choice.value}
-              className="mt-0.5"
-            />
-            <Label
-              htmlFor={`join-ingress-${choice.value}`}
-              className="grid gap-0.5 font-normal"
-            >
-              <span className="text-sm">{choice.label}</span>
-              <span className="text-xs text-muted-foreground">
-                {choice.description}
-              </span>
-            </Label>
-          </div>
-        ))}
+        {INGRESS_CHOICES.map((choice) => {
+          const unavailable = joinIngressUnavailable(os, choice.value)
+          return (
+            <div key={choice.value} className="flex items-start gap-2">
+              <RadioGroupItem
+                id={`join-ingress-${choice.value}`}
+                value={choice.value}
+                disabled={unavailable !== null}
+                className="mt-0.5"
+              />
+              <Label
+                htmlFor={`join-ingress-${choice.value}`}
+                className="grid gap-0.5 font-normal"
+              >
+                <span
+                  className={
+                    unavailable ? 'text-sm text-muted-foreground' : 'text-sm'
+                  }
+                >
+                  {choice.label}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {unavailable ?? choice.description}
+                </span>
+              </Label>
+            </div>
+          )
+        })}
       </RadioGroup>
       <p className="text-xs text-muted-foreground">
         Change it later on the worker with <code>temps agent ingress</code>.

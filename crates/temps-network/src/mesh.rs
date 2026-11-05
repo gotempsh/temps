@@ -64,7 +64,14 @@ pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkErr
     crate::linux::firewall::ensure_mesh_lockdown(lockdown).await
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the same ruleset, installed in the Docker app's VM, where the mesh
+/// interface and every published port live (ADR 090).
+#[cfg(target_os = "macos")]
+pub async fn ensure_lockdown(lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
+    crate::vm::ensure_lockdown(lockdown).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn ensure_lockdown(_lockdown: &MeshLockdown) -> Result<bool, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -115,7 +122,12 @@ pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, Ne
     crate::linux::firewall::mesh_lockdown_state(lockdown).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn lockdown_state(lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
+    crate::vm::lockdown_state(lockdown).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn lockdown_state(_lockdown: &MeshLockdown) -> Result<LockdownState, NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -129,7 +141,12 @@ pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
     crate::linux::preflight_mesh_routes(pool).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn preflight_routes(pool: Ipv4Net) -> Result<(), NetworkError> {
+    crate::vm::preflight_mesh_routes(pool).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
@@ -140,11 +157,91 @@ pub async fn preflight_routes(_pool: Ipv4Net) -> Result<(), NetworkError> {
 /// to the operator's `configured` underlay MTU if smaller, minus WireGuard's
 /// overhead (see [`mesh_mtu_for`]).
 pub async fn detect_mtu(configured: Option<u32>) -> Result<u32, NetworkError> {
-    let device = crate::detect_underlay_device().await?;
-    let detected = crate::detect_underlay_mtu(&device).await?;
+    #[cfg(target_os = "macos")]
+    let detected = crate::vm::default_route_mtu().await?;
+    #[cfg(not(target_os = "macos"))]
+    let detected = {
+        let device = crate::detect_underlay_device().await?;
+        crate::detect_underlay_mtu(&device).await?
+    };
     Ok(mesh_mtu_for(
         configured.map_or(detected, |configured| configured.min(detected)),
     ))
+}
+
+/// The nftables table owning the mesh lockdown (see [`render_lockdown`]).
+pub const MESH_TABLE: &str = "temps_mesh";
+
+/// The mesh carries VXLAN between nodes, plus (on workers) the control
+/// plane's connections to published container ports. Without this table it
+/// would also be a path from every peer to anything the host binds on
+/// 0.0.0.0 (the control plane's database, agent APIs) and, since Docker
+/// enables forwarding, a route through the node into its own LAN — reachable
+/// even where a cloud firewall guards the public addresses. The icmp rule is
+/// IPv4-only on purpose: the mesh carries no IPv6.
+pub(crate) fn render_lockdown(lockdown: &MeshLockdown) -> String {
+    let wg = MESH_INTERFACE;
+    let vxlan_port = lockdown.vxlan_port;
+    let mesh = lockdown.mesh;
+    let marker = lockdown_marker(lockdown);
+    let node_api = lockdown
+        .node_api_port
+        .map(|port| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {mesh} tcp dport {port} accept\n"
+            )
+        })
+        .unwrap_or_default();
+    // A worker's agent API, for the control plane only (mutual TLS on top).
+    let agent_api = lockdown
+        .agent_api
+        .map(|api| {
+            format!(
+                "add rule inet {MESH_TABLE} input iifname \"{wg}\" ip saddr {} tcp dport {} accept\n",
+                api.from, api.port
+            )
+        })
+        .unwrap_or_default();
+    // A hub forwards between members (ADR 048 D4): in from the tunnel and
+    // straight back into it, mesh address to mesh address. Each member's own
+    // input rules still decide what it accepts.
+    let relay = if lockdown.relay {
+        format!(
+            "add rule inet {MESH_TABLE} forward iifname \"{wg}\" oifname \"{wg}\" ip saddr {mesh} ip daddr {mesh} accept\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "
+add table inet {MESH_TABLE}
+delete table inet {MESH_TABLE}
+add table inet {MESH_TABLE}
+
+# Ahead of temps_network (-100) and Docker's chains.
+add chain inet {MESH_TABLE} input {{ type filter hook input priority -110; policy accept; }}
+add rule inet {MESH_TABLE} input counter comment \"{marker}\"
+add rule inet {MESH_TABLE} input iifname \"{wg}\" ct state established,related accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" udp dport {vxlan_port} accept
+add rule inet {MESH_TABLE} input iifname \"{wg}\" icmp type echo-request accept
+{node_api}{agent_api}add rule inet {MESH_TABLE} input iifname \"{wg}\" counter drop
+
+add chain inet {MESH_TABLE} forward {{ type filter hook forward priority -110; policy accept; }}
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" ct state established,related accept
+{relay}add rule inet {MESH_TABLE} forward iifname \"{wg}\" ip saddr {mesh} ct status dnat accept
+add rule inet {MESH_TABLE} forward iifname \"{wg}\" counter drop
+add rule inet {MESH_TABLE} forward oifname \"{wg}\" counter drop
+"
+    )
+}
+
+pub(crate) fn lockdown_marker(lockdown: &MeshLockdown) -> String {
+    const MESH_LOCKDOWN_VERSION: &str = "v1";
+    let signature = format!("{MESH_LOCKDOWN_VERSION}|{lockdown:?}");
+    format!(
+        "temps-mesh-{MESH_LOCKDOWN_VERSION}-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, signature.as_bytes())
+    )
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

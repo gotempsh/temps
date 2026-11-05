@@ -736,6 +736,14 @@ async fn run(
                             // than freezing it behind a mesh problem.
                             warn!(error = %e, "WireGuard mesh sync failed; will retry");
                         }
+                        Err(e) if !OVERLAY_SUPPORTED => {
+                            // A Mac worker runs no overlay: a mesh failure is
+                            // not an overlay state to report, and nothing on
+                            // this path would ever clear one reported here.
+                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                            continue;
+                        }
                         Err(e) => {
                             // The overlay runs on the mesh, so it is down too.
                             let wait = overlay_failed(
@@ -749,6 +757,30 @@ async fn run(
                             continue;
                         }
                     }
+                }
+                if !OVERLAY_SUPPORTED {
+                    // ADR 090: a Mac worker's containers are reached through
+                    // ports published on its mesh address, in the Docker
+                    // app's VM; it runs no VXLAN overlay. Keep the snapshot
+                    // current so a restart without the control plane brings
+                    // the mesh back with today's peers.
+                    applied_once = true;
+                    if !offline && saved.as_ref() != Some(&payload) {
+                        let (path, written) = (snapshot_path.clone(), payload.clone());
+                        match tokio::task::spawn_blocking(move || save_snapshot(&path, &written))
+                            .await
+                            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+                        {
+                            Ok(()) => saved = Some(payload),
+                            Err(e) => warn!(
+                                error = %e,
+                                snapshot = %snapshot_path.display(),
+                                "could not save the network snapshot"
+                            ),
+                        }
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
                 }
                 if payload.alloc.is_none() {
                     debug!("network sync: no compute_cidr allocated yet");
@@ -1125,6 +1157,11 @@ async fn poll_once(
 /// Pause before re-polling after the control plane changed our mesh
 /// registration, so the new underlay is picked up at once.
 const MESH_REGISTERED_REPOLL: Duration = Duration::from_secs(1);
+
+/// Whether this agent runs the cross-node VXLAN overlay. A Mac worker (ADR
+/// 090) does not: its kernel networking is the Docker app's VM, reached only
+/// through the mesh sidecar.
+const OVERLAY_SUPPORTED: bool = !cfg!(target_os = "macos");
 
 /// Local mesh state kept across ticks.
 #[derive(Default)]
@@ -2498,6 +2535,12 @@ impl SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_mac_worker_runs_without_the_overlay() {
+        // A Mac worker never reports overlay state, failed or otherwise.
+        assert_eq!(OVERLAY_SUPPORTED, !cfg!(target_os = "macos"));
+    }
 
     #[test]
     fn underlay_is_probed_at_the_registered_private_address() {

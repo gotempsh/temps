@@ -140,4 +140,25 @@ describe('workerJoinScript', () => {
       '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash) && \\'
     )
   })
+
+  test('a Mac installs and joins as the user, without sudo, and starts a LaunchAgent', () => {
+    const script = workerJoinScript({
+      ...base,
+      version: 'v0.1.0-beta.58',
+      os: 'macos',
+    })
+    expect(script.pinnedTo).toBe('v0.1.0-beta.58')
+    expect(script.command).not.toContain('sudo')
+    expect(script.command).not.toContain('/root/')
+    expect(script.command.split('\n')).toEqual([
+      '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- v0.1.0-beta.58) && \\',
+      '~/.temps/bin/temps join https://cp.example.com tk_enroll --ingress delegated && \\',
+      '~/.temps/bin/temps agent service install',
+    ])
+  })
+
+  test('a Mac join never passes --private-address: it dials out', () => {
+    const script = workerJoinScript({ ...base, os: 'macos' })
+    expect(script.command).not.toContain('--private-address')
+  })
 })

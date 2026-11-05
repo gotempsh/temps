@@ -187,11 +187,16 @@ pub async fn notify_nodes_offline(
     failover_after_secs: Option<u64>,
 ) {
     for &node_id in offline_node_ids {
-        let name = node_service
+        let (name, mac_worker) = node_service
             .get_by_id(node_id)
             .await
-            .map(|n| n.name)
-            .unwrap_or_else(|_| format!("node-{}", node_id));
+            .map(|n| {
+                let mac = n.is_mac_worker();
+                (n.name, mac)
+            })
+            .unwrap_or_else(|_| (format!("node-{}", node_id), false));
+        let (severity, title, message) =
+            offline_alarm_text(&name, node_id, mac_worker, failover_after_secs);
 
         // Nodes are host-wide, not project-scoped: the alarm's node is its
         // `metadata.node_id`, which scopes its cooldown and its resolution, so
@@ -203,15 +208,9 @@ pub async fn notify_nodes_offline(
             container_id: None,
             service_id: None,
             alarm_type: AlarmType::NodeOffline,
-            severity: AlarmSeverity::Critical,
-            title: format!("Worker node '{}' is offline", name),
-            message: format!(
-                "Node '{}' (id {}) stopped sending heartbeats for over {}s and was marked offline. {}",
-                name,
-                node_id,
-                HEARTBEAT_STALE_THRESHOLD_SECS,
-                offline_next_step(failover_after_secs)
-            ),
+            severity,
+            title,
+            message,
             metadata: Some(serde_json::json!({
                 "node_id": node_id,
                 "node_name": name,
@@ -431,6 +430,41 @@ pub async fn check_drain_completion(node_service: &NodeService) -> Vec<i32> {
 }
 
 /// What happens to an offline node's workloads next, for the offline alert.
+/// Severity, title and message of a node-offline alarm. A Mac worker (ADR
+/// 090) goes offline whenever the Mac sleeps or leaves the network and comes
+/// back on its own, so its alarm is a warning that says so rather than a
+/// critical "something broke".
+fn offline_alarm_text(
+    name: &str,
+    node_id: i32,
+    mac_worker: bool,
+    failover_after_secs: Option<u64>,
+) -> (AlarmSeverity, String, String) {
+    if mac_worker {
+        return (
+            AlarmSeverity::Warning,
+            format!("Mac worker '{name}' is asleep or offline"),
+            format!(
+                "Mac worker '{name}' (id {node_id}) stopped sending heartbeats for over {}s: \
+                 the Mac is probably asleep, shut down or off the network. It reconnects on its \
+                 own when the Mac wakes. {}",
+                HEARTBEAT_STALE_THRESHOLD_SECS,
+                offline_next_step(failover_after_secs)
+            ),
+        );
+    }
+    (
+        AlarmSeverity::Critical,
+        format!("Worker node '{name}' is offline"),
+        format!(
+            "Node '{name}' (id {node_id}) stopped sending heartbeats for over {}s and was marked \
+             offline. {}",
+            HEARTBEAT_STALE_THRESHOLD_SECS,
+            offline_next_step(failover_after_secs)
+        ),
+    )
+}
+
 fn offline_next_step(failover_after_secs: Option<u64>) -> String {
     match failover_after_secs {
         Some(secs) => format!(
@@ -914,6 +948,23 @@ fn group_by_deployment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mac_worker_offline_alarm_is_a_warning_that_says_it_is_asleep() {
+        let (severity, title, message) = offline_alarm_text("laptop", 7, true, Some(300));
+        assert_eq!(severity, AlarmSeverity::Warning);
+        assert_eq!(title, "Mac worker 'laptop' is asleep or offline");
+        assert!(message.contains("(id 7)"), "{message}");
+        assert!(message.contains("reconnects on its own"), "{message}");
+    }
+
+    #[test]
+    fn a_linux_worker_offline_alarm_stays_critical() {
+        let (severity, title, message) = offline_alarm_text("worker-1", 3, false, None);
+        assert_eq!(severity, AlarmSeverity::Critical);
+        assert_eq!(title, "Worker node 'worker-1' is offline");
+        assert!(message.contains("Node 'worker-1' (id 3)"), "{message}");
+    }
     use sea_orm::{DatabaseBackend, MockDatabase};
 
     fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> nodes::Model {

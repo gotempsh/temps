@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod agent_ingress;
+pub mod agent_launchd;
 pub mod agent_service;
 pub mod api_key;
 mod api_url;
@@ -20,6 +21,7 @@ pub mod edge;
 pub mod firecracker;
 pub mod host_preflight;
 pub mod join;
+pub mod mac_worker;
 pub mod microsandbox;
 pub mod migrate;
 pub mod network;
