@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import type { ProjectPresetResponse } from '@/api/client'
 import {
   normalizePresetPath,
   presetConfigForSelection,
   presetSelectionKey,
   detectedPresetsFromPublic,
   isSameDockerfile,
-  selectedDetectedDockerfile,
+  selectedDockerfileFor,
   splitPresetSelection,
 } from './preset-selection'
 
@@ -181,46 +180,17 @@ describe('detectedPresetsFromPublic', () => {
   })
 })
 
-describe('selectedDetectedDockerfile', () => {
-  const cards = [
-    { preset: 'dockerfile', path: './', dockerfilePath: 'docker/Dockerfile' },
-    { preset: 'dockerfile', path: './', dockerfilePath: 'ci/Dockerfile' },
-    { preset: 'dockerfile', path: 'services/api' },
-    { preset: 'nextjs', path: 'web' },
-  ] as ProjectPresetResponse[]
-
-  test('names the file a detected card has, to tell cards at one path apart', () => {
-    expect(
-      selectedDetectedDockerfile(cards, 'dockerfile::root', 'ci/Dockerfile')
-    ).toBe('ci/Dockerfile')
-    expect(
-      selectedDetectedDockerfile(
-        cards,
-        'dockerfile::services/api',
-        './Dockerfile'
-      )
-    ).toBe('./Dockerfile')
+describe('selectedDockerfileFor', () => {
+  test('a Dockerfile selection keeps its path, whatever it is', () => {
+    expect(selectedDockerfileFor('dockerfile::root', 'ci/Dockerfile')).toBe(
+      'ci/Dockerfile'
+    )
+    expect(selectedDockerfileFor('dockerfile', 'typed/Dock')).toBe('typed/Dock')
   })
 
-  test('a path no card has names nothing, so typing adds no cards', () => {
+  test('another framework ignores a path left over from an earlier choice', () => {
     expect(
-      selectedDetectedDockerfile(cards, 'dockerfile::root', 'docker/Dock')
-    ).toBeUndefined()
-    expect(
-      selectedDetectedDockerfile(
-        cards,
-        'dockerfile::services/api',
-        'ci/Dockerfile'
-      )
-    ).toBeUndefined()
-  })
-
-  test('other frameworks and missing detection name nothing', () => {
-    expect(
-      selectedDetectedDockerfile(cards, 'nextjs::web', 'Dockerfile')
-    ).toBeUndefined()
-    expect(
-      selectedDetectedDockerfile(undefined, 'dockerfile::root', 'Dockerfile')
+      selectedDockerfileFor('nextjs::web', 'ci/Dockerfile')
     ).toBeUndefined()
   })
 })

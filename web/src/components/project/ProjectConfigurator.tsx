@@ -134,7 +134,7 @@ import {
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
 import { detectedPortForSelection } from '@/lib/dockerfile-port'
-import { selectedDetectedDockerfile } from '@/lib/preset-selection'
+import { selectedDockerfileFor } from '@/lib/preset-selection'
 import { getRepositoryUrl } from '@/lib/repository-url'
 
 // Best-effort provider detection from the repo URL's hostname, for the brand
@@ -1518,11 +1518,11 @@ export function ProjectConfigurator({
                   isRefreshing={presetFetching || isManuallyRefreshingPresets}
                   error={presetError}
                   selectedPreset={selectValue}
-                  selectedDockerfilePath={selectedDetectedDockerfile(
-                    presetData?.presets,
+                  selectedDockerfilePath={selectedDockerfileFor(
                     selectValue,
                     selectedDockerfilePath
                   )}
+                  editableDockerfilePath
                   onRefresh={handleRefreshPresets}
                   onSelectPreset={(value, detected) => {
                     if (value === 'custom') {

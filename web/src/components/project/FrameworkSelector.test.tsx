@@ -21,7 +21,7 @@ const detected = [
   },
 ] as unknown as ProjectPresetResponse[]
 
-function setup(selectedDockerfilePath?: string) {
+function setup(selectedDockerfilePath?: string, editable = false) {
   const picks: { value: string; card?: ProjectPresetResponse }[] = []
   let parentKeys = 0
   render(
@@ -43,6 +43,7 @@ function setup(selectedDockerfilePath?: string) {
           isLoading={false}
           selectedPreset="dockerfile::root"
           selectedDockerfilePath={selectedDockerfilePath}
+          editableDockerfilePath={editable}
           onSelectPreset={(value, card) => {
             picks.push({ value, card })
           }}
@@ -54,7 +55,7 @@ function setup(selectedDockerfilePath?: string) {
 }
 
 const pressed = () =>
-  screen.getAllByRole('button', { pressed: true, name: /Dockerfile/ })
+  screen.queryAllByRole('button', { pressed: true, name: /Dockerfile/ })
 
 test('choosing a card with Enter stays inside the card', () => {
   const { picks, parentKeys } = setup()
@@ -82,6 +83,19 @@ test('keeps a hand-set Dockerfile on the list, selected', () => {
   setup('deploy/custom.Dockerfile')
   expect(pressed().length).toBe(1)
   expect(pressed()[0].textContent).toContain('deploy/custom.Dockerfile')
+})
+
+test('a path being typed that no card has selects none and adds none', () => {
+  setup('deploy/custom.Dockerfile', true)
+  expect(pressed().length).toBe(0)
+  expect(screen.queryByText(/deploy\/custom\.Dockerfile/)).toBeNull()
+  expect(screen.getByText(/docker\/Dockerfile/)).toBeTruthy()
+})
+
+test('a path being typed that a card has selects only that card', () => {
+  setup('docker/Dockerfile', true)
+  expect(pressed().length).toBe(1)
+  expect(pressed()[0].textContent).toContain('docker/Dockerfile')
 })
 
 test('without a known file every card at the path reads as selected', () => {

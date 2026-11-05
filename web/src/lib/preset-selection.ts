@@ -105,26 +105,17 @@ export function isSameDockerfile(
 }
 
 /**
- * The Dockerfile that tells apart the detected cards of a selection, for
- * `FrameworkSelector` beside an editable path. A path no card has gives none:
- * the selector would otherwise add a card for it on every keystroke, and the
- * framework and directory are still what is selected.
+ * The file that tells apart the Dockerfile cards of a selection. Any other
+ * framework's card names no file, so a path left over from an earlier choice
+ * must not stop that card reading as selected.
  */
-export function selectedDetectedDockerfile(
-  presets: readonly ProjectPresetResponse[] | undefined,
+export function selectedDockerfileFor(
   selection: string,
   dockerfilePath: string | undefined
 ): string | undefined {
-  const { preset, directory } = splitPresetSelection(selection)
-  const path = normalizePresetPath(directory)
-  const detected = presets?.some(
-    (card) =>
-      card.preset === preset &&
-      card.preset === 'dockerfile' &&
-      normalizePresetPath(card.path) === path &&
-      isSameDockerfile(card.dockerfilePath, dockerfilePath)
-  )
-  return detected ? dockerfilePath : undefined
+  return splitPresetSelection(selection).preset === 'dockerfile'
+    ? dockerfilePath
+    : undefined
 }
 
 /**

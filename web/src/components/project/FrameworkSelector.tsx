@@ -43,6 +43,11 @@ interface FrameworkSelectorProps {
    * alone cannot tell which card is selected; without this they all are.
    */
   selectedDockerfilePath?: string
+  /**
+   * The path is typed beside the selector, so one no card has selects no card,
+   * rather than adding one for it on every keystroke.
+   */
+  editableDockerfilePath?: boolean
   /** `detected` is the card chosen, when it came from detection. */
   onSelectPreset: (value: string, detected?: ProjectPresetResponse) => void
   onRefresh?: () => void
@@ -56,6 +61,7 @@ export function FrameworkSelector({
   error,
   selectedPreset,
   selectedDockerfilePath,
+  editableDockerfilePath = false,
   onSelectPreset,
   onRefresh,
   disabled = false,
@@ -90,7 +96,8 @@ export function FrameworkSelector({
       return (
         p.preset === selectedSlug &&
         normalizePath(p.path) === normalizedSelectedPath &&
-        (selectedDockerfilePath === undefined ||
+        (editableDockerfilePath ||
+          selectedDockerfilePath === undefined ||
           isSameDockerfile(p.dockerfilePath, selectedDockerfilePath))
       )
     })
@@ -113,6 +120,7 @@ export function FrameworkSelector({
     rawDetectedProjects,
     selectedPreset,
     selectedDockerfilePath,
+    editableDockerfilePath,
     getPresetBySlug,
   ])
 

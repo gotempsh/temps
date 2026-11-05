@@ -96,6 +96,7 @@ import {
 import { composeValidationWarning } from '@/lib/compose-check'
 import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
+import { useRefreshPublicPresets } from '@/hooks/useRefreshPublicPresets'
 import { withoutLegacySandboxGrants } from '@/lib/build-configuration-form'
 import {
   detectedPresetsFromPublic,
@@ -307,17 +308,19 @@ function GitSettingsInline({
     enabled: !!repositoryData?.id,
   })
   // Preset detection — public repos
+  const publicPresetRequest = {
+    path: {
+      provider: publicProvider,
+      owner: project?.repo_owner || '',
+      repo: project?.repo_name || '',
+    },
+    query: { base_url: publicRepository?.instanceUrl },
+  }
   const publicPresetQuery = useQuery({
-    ...detectPublicPresetsOptions({
-      path: {
-        provider: publicProvider,
-        owner: project?.repo_owner || '',
-        repo: project?.repo_name || '',
-      },
-      query: { base_url: publicRepository?.instanceUrl },
-    }),
+    ...detectPublicPresetsOptions(publicPresetRequest),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
   })
+  const refreshPublicPresets = useRefreshPublicPresets(publicPresetRequest)
   const publicRepositoryQuery = useQuery({
     ...getPublicRepositoryOptions({
       path: {
@@ -343,7 +346,9 @@ function GitSettingsInline({
   const isDetectingPresets =
     presetQuery.isLoading || publicPresetQuery.isLoading
   const isRefreshingPresets =
-    presetQuery.isFetching || publicPresetQuery.isFetching
+    presetQuery.isFetching ||
+    publicPresetQuery.isFetching ||
+    refreshPublicPresets.isPending
 
   // ---------------- Save helpers ----------------
   // The API expects a full update; build it from current project state plus overrides.
@@ -1041,10 +1046,9 @@ function GitSettingsInline({
           onRefreshDetection={
             isUploadedSource
               ? undefined
-              : () =>
-                  void (
-                    isPublicRepo ? publicPresetQuery : presetQuery
-                  ).refetch()
+              : isPublicRepo
+                ? () => refreshPublicPresets.mutate()
+                : () => void presetQuery.refetch()
           }
         />
       )}
