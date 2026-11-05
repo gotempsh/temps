@@ -19,12 +19,10 @@ pub fn parse_routes(text: &str) -> Vec<(Ipv4Net, String)> {
         .filter_map(|line| {
             let mut words = line.split_whitespace();
             let first = words.next()?;
-            let net = first.parse::<Ipv4Net>().ok().or_else(|| {
-                first
-                    .parse::<std::net::Ipv4Addr>()
-                    .ok()
-                    .map(Ipv4Net::from)
-            })?;
+            let net = first
+                .parse::<Ipv4Net>()
+                .ok()
+                .or_else(|| first.parse::<std::net::Ipv4Addr>().ok().map(Ipv4Net::from))?;
             let mut rest = line.split_whitespace();
             rest.find(|word| *word == "dev")?;
             Some((net, rest.next()?.to_string()))
