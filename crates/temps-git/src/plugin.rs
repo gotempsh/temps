@@ -71,6 +71,7 @@ impl TempsPlugin for GitPlugin {
                 encryption_service.clone(),
                 queue_service.clone(),
                 config_service.clone(),
+                audit_service.clone(),
             ));
             context.register_service(git_provider_manager.clone());
 

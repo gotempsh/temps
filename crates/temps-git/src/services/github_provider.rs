@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User,
-    WebhookConfig,
+    oauth_token_expiry, AuthMethod, Branch, Commit, FileContent, GitProviderError,
+    GitProviderService, GitProviderTag, GitProviderType, PullRequest, RefreshedOAuthToken,
+    RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User, WebhookConfig,
 };
 use super::github::create_github_app_jwt;
 use async_trait::async_trait;
@@ -337,10 +337,15 @@ struct OAuthTokenResponse {
 /// Token refresh response (for GitHub Apps with refresh tokens)
 #[derive(Deserialize)]
 struct RefreshTokenResponse {
-    access_token: String,
+    // GitHub answers a refused refresh with 200 and only `error` set.
+    #[serde(default)]
+    access_token: Option<String>,
     refresh_token: Option<String>,
+    /// Loosely typed on purpose: a malformed lifetime must not fail the parse
+    /// and lose tokens that GitHub has already issued.
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
     error: Option<String>,
-    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -578,7 +583,7 @@ impl GitHubProvider {
         client_id: &str,
         client_secret: &str,
         refresh_token: &str,
-    ) -> Result<(String, Option<String>), GitProviderError> {
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
         info!("Refreshing GitHub access token");
 
         let client = self.get_client()?;
@@ -589,25 +594,33 @@ impl GitHubProvider {
             ("grant_type", "refresh_token".to_string()),
         ];
 
-        let response = self
-            .send_with_retry(|| {
-                client
-                    .post("https://github.com/login/oauth/access_token")
-                    .header("Accept", "application/json")
-                    .form(&params)
-            })
-            .await?;
+        // Sent once, never through `send_with_retry`: GitHub refresh tokens are
+        // single-use, so a repeat could use up a token the first attempt rotated.
+        let requested_at = chrono::Utc::now();
+        let response = client
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .form(&params)
+            .send()
+            .await
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "GitHub token refresh request failed: {}",
+                    error.without_url()
+                ))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::AuthenticationFailed(format!(
-                "Failed to refresh token: {} - {}",
-                status, error_text
-            )));
+            return Err(if status.is_client_error() {
+                GitProviderError::AuthenticationFailed(format!(
+                    "GitHub refused the token refresh: HTTP {status}"
+                ))
+            } else {
+                GitProviderError::ApiError(format!(
+                    "GitHub refused the token refresh: HTTP {status}"
+                ))
+            });
         }
 
         let token_response: RefreshTokenResponse = response.json().await.map_err(|e| {
@@ -616,14 +629,21 @@ impl GitHubProvider {
 
         if let Some(error) = token_response.error {
             return Err(GitProviderError::AuthenticationFailed(format!(
-                "GitHub refresh error: {} - {}",
-                error,
-                token_response.error_description.unwrap_or_default()
+                "GitHub refused the token refresh: {error}"
             )));
         }
+        let access_token = token_response.access_token.ok_or_else(|| {
+            GitProviderError::ApiError(
+                "GitHub token refresh response had no access token".to_string(),
+            )
+        })?;
 
         debug!("Successfully refreshed GitHub access token");
-        Ok((token_response.access_token, token_response.refresh_token))
+        Ok(RefreshedOAuthToken {
+            access_token,
+            refresh_token: token_response.refresh_token,
+            expires_at: oauth_token_expiry(requested_at, token_response.expires_in.as_ref()),
+        })
     }
 
     /// Generate a GitHub App installation token
@@ -960,6 +980,26 @@ impl GitProviderService for GitHubProvider {
         GitHubProvider::validate_token(self, access_token).await
     }
 
+    async fn refresh_oauth_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
+        match &self.auth_method {
+            AuthMethod::OAuth {
+                client_id,
+                client_secret,
+                ..
+            } => {
+                self.refresh_access_token(client_id, client_secret, refresh_token)
+                    .await
+            }
+            AuthMethod::PersonalAccessToken { .. } => Err(GitProviderError::AuthenticationFailed(
+                "Personal Access Token is invalid and cannot be refreshed".to_string(),
+            )),
+            _ => Err(GitProviderError::NotImplemented),
+        }
+    }
+
     async fn validate_and_refresh_token(
         &self,
         access_token: &str,
@@ -987,10 +1027,10 @@ impl GitProviderService for GitHubProvider {
                         ..
                     } => {
                         if let Some(refresh_token) = refresh_token {
-                            let (new_access_token, new_refresh_token) = self
+                            let issued = self
                                 .refresh_access_token(client_id, client_secret, refresh_token)
                                 .await?;
-                            Ok((new_access_token, new_refresh_token))
+                            Ok((issued.access_token, issued.refresh_token))
                         } else {
                             Err(GitProviderError::AuthenticationFailed(
                                 "OAuth access token is invalid and no refresh token is available"

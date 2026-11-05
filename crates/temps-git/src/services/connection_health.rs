@@ -67,6 +67,17 @@ pub struct ConnectionHealthService {
     console_base_url: String,
 }
 
+/// What the UI and the alarm say when a provider rejects a refresh token. A fixed
+/// sentence, so the provider's response never reaches an operator's screen.
+fn authorization_rejected_message(provider: &git_providers::Model) -> String {
+    let name = match provider.provider_type.as_str() {
+        "gitlab" => "GitLab",
+        "github" => "GitHub",
+        _ => "The git provider",
+    };
+    format!("{name} no longer accepts this connection's authorization")
+}
+
 impl ConnectionHealthService {
     pub fn new(
         db: Arc<DatabaseConnection>,
@@ -306,14 +317,22 @@ impl ConnectionHealthService {
         connection: &git_provider_connections::Model,
         provider: &git_providers::Model,
     ) -> (String, Option<String>) {
-        // Try to resolve a usable access token. OAuth tokens may auto-refresh
-        // here; PATs return as-is.
+        // Try to resolve a usable access token. OAuth tokens that the provider
+        // no longer accepts get one refresh here, including on a connection that
+        // is blocked for reauthorization; success clears the block. PATs return
+        // as-is.
         let token = match self
             .git_provider_manager
-            .validate_and_refresh_connection_token(connection.id)
+            .token_for_health_check(connection.id)
             .await
         {
             Ok(t) => t,
+            Err(GitProviderManagerError::ConnectionReauthorizationRequired { .. }) => {
+                return (
+                    HEALTH_STATUS_UNHEALTHY.to_string(),
+                    Some(authorization_rejected_message(provider)),
+                );
+            }
             Err(e) => {
                 return (
                     HEALTH_STATUS_UNHEALTHY.to_string(),

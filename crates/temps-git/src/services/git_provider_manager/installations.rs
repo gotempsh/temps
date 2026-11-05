@@ -244,6 +244,7 @@ mod tests {
             encryption_service,
             queue_service,
             config_service,
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         // Test delete_installation
@@ -276,6 +277,7 @@ mod tests {
             encryption_service,
             queue_service,
             config_service,
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         // Should succeed even if installation not found (idempotent)

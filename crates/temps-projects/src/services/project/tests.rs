@@ -87,6 +87,7 @@ async fn create_test_services(
         encryption_service.clone(),
         mock_queue.clone() as Arc<dyn temps_core::JobQueue>,
         config_service.clone(),
+        Arc::new(temps_core::NoopAuditLogger),
     ));
 
     // Create EnvironmentService

@@ -1544,6 +1544,7 @@ pub(crate) mod tests {
             encryption.clone(),
             queue.clone(),
             config.clone(),
+            Arc::new(temps_core::NoopAuditLogger),
         ));
         let environments = Arc::new(temps_environments::EnvironmentService::new(
             db.clone(),

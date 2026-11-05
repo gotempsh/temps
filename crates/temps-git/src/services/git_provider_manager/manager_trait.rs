@@ -13,6 +13,20 @@ use async_trait::async_trait;
 
 use std::path::Path;
 
+/// A connection that needs reauthorization keeps its own error, so a deployment
+/// names the connection and the way out rather than reporting a decryption failure.
+fn token_error(
+    error: GitProviderManagerError,
+) -> crate::services::git_provider_manager_trait::GitProviderManagerError {
+    use crate::services::git_provider_manager_trait::GitProviderManagerError as TraitError;
+    match error {
+        GitProviderManagerError::ConnectionReauthorizationRequired { connection_id } => {
+            TraitError::ReauthorizationRequired { connection_id }
+        }
+        other => TraitError::DecryptionError(other.to_string()),
+    }
+}
+
 #[async_trait]
 impl GitProviderManagerTrait for GitProviderManager {
     async fn clone_repository(
@@ -57,7 +71,7 @@ impl GitProviderManagerTrait for GitProviderManager {
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
             .await
-            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+            .map_err(token_error)?;
 
         // Get repository info — also retry-on-auth, since the same stale
         // token would fail here before we ever reach the clone.
@@ -75,7 +89,7 @@ impl GitProviderManagerTrait for GitProviderManager {
                 let refreshed = self
                     .force_refresh_connection_token(connection_id)
                     .await
-                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                    .map_err(token_error)?;
                 provider_service
                     .get_repository(&refreshed, repo_owner, repo_name)
                     .await
@@ -178,7 +192,7 @@ impl GitProviderManagerTrait for GitProviderManager {
                 let refreshed = self
                     .force_refresh_connection_token(connection_id)
                     .await
-                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                    .map_err(token_error)?;
 
                 clone_with_token(refreshed).await.map_err(|err| {
                     TraitError::CloneError(format!("Failed to clone after refresh: {}", err))
@@ -263,7 +277,7 @@ impl GitProviderManagerTrait for GitProviderManager {
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
             .await
-            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+            .map_err(token_error)?;
 
         let repo = match provider_service
             .get_repository(&access_token, repo_owner, repo_name)
@@ -279,7 +293,7 @@ impl GitProviderManagerTrait for GitProviderManager {
                 let refreshed = self
                     .force_refresh_connection_token(connection_id)
                     .await
-                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                    .map_err(token_error)?;
                 provider_service
                     .get_repository(&refreshed, repo_owner, repo_name)
                     .await
@@ -363,7 +377,7 @@ impl GitProviderManagerTrait for GitProviderManager {
                 let refreshed = self
                     .force_refresh_connection_token(connection_id)
                     .await
-                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                    .map_err(token_error)?;
 
                 match tokio::time::timeout(CLONE_TIMEOUT, run_sparse_clone(refreshed)).await {
                     Ok(result) => {
@@ -414,7 +428,7 @@ impl GitProviderManagerTrait for GitProviderManager {
         let token = self
             .get_connection_token(connection_id)
             .await
-            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+            .map_err(token_error)?;
 
         Ok((token, provider.provider_type))
     }
@@ -441,7 +455,7 @@ impl GitProviderManagerTrait for GitProviderManager {
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
             .await
-            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+            .map_err(token_error)?;
 
         let repo = provider_service
             .get_repository(&access_token, repo_owner, repo_name)
@@ -480,7 +494,7 @@ impl GitProviderManagerTrait for GitProviderManager {
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
             .await
-            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+            .map_err(token_error)?;
 
         // Same retry-on-auth logic as clone_repository: the token we just
         // validated may have expired or been revoked between the check and
@@ -512,7 +526,7 @@ impl GitProviderManagerTrait for GitProviderManager {
                 let refreshed = self
                     .force_refresh_connection_token(connection_id)
                     .await
-                    .map_err(|err| TraitError::DecryptionError(err.to_string()))?;
+                    .map_err(token_error)?;
                 provider_service
                     .download_archive(
                         &refreshed,
@@ -568,7 +582,7 @@ impl GitProviderManagerTrait for GitProviderManager {
         let access_token = self
             .validate_and_refresh_connection_token(connection_id)
             .await
-            .map_err(|e| TraitError::DecryptionError(e.to_string()))?;
+            .map_err(token_error)?;
 
         // Push files to the branch (creates the branch + commit)
         provider_service

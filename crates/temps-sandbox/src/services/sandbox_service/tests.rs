@@ -565,6 +565,7 @@ pub(crate) fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> Sandb
         Arc::new(temps_core::EncryptionService::new_from_password("test")),
         Arc::new(NoopJobQueue),
         platform_config.clone(),
+        Arc::new(temps_core::NoopAuditLogger),
     ));
     let registry = Arc::new(StandaloneSandboxRegistry::local_only(Arc::new(
         temps_sandbox_providers::local::LocalSandboxProvider::new(),

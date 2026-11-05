@@ -405,6 +405,7 @@ fn build_service_shared(
         encryption,
         Arc::new(PanicOnSendJobQueue) as Arc<dyn temps_core::JobQueue>,
         config.clone(),
+        Arc::new(temps_core::NoopAuditLogger),
     ));
     let cookie_crypto = Arc::new(
         temps_core::CookieCrypto::new(
@@ -3646,6 +3647,7 @@ async fn destroy_sandbox_nullify_failure_does_not_fail_destroy() {
         encryption,
         Arc::new(PanicOnSendJobQueue) as Arc<dyn temps_core::JobQueue>,
         config.clone(),
+        Arc::new(temps_core::NoopAuditLogger),
     ));
     let cookie_crypto = Arc::new(
         temps_core::CookieCrypto::new(

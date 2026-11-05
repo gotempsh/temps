@@ -244,6 +244,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         )
     }
 

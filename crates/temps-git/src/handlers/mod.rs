@@ -141,6 +141,7 @@ mod public_route_tests {
                 ),
                 queue.clone(),
                 config_service.clone(),
+                Arc::new(temps_core::NoopAuditLogger),
             ),
         );
         let github_service = Arc::new(crate::services::github::GithubAppService::new(

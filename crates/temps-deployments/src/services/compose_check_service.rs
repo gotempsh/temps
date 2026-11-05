@@ -1345,6 +1345,7 @@ mod tests {
             encryption.clone(),
             Arc::new(NoopQueue),
             config,
+            Arc::new(temps_core::NoopAuditLogger),
         ));
         let executor = Arc::new(ComposeExecutor::new_with_handle(
             Arc::new(temps_core::DockerHandle::disabled(

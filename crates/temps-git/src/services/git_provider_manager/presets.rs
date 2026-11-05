@@ -776,6 +776,7 @@ mod tests {
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
         let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
             Some(server.url()),
@@ -971,6 +972,7 @@ services:
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
         let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
             Some(server.url()),

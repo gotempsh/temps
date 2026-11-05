@@ -148,7 +148,7 @@ impl GitProviderManager {
         self.replace_oauth_grant(connection, credentials).await
     }
 
-    async fn replace_oauth_grant(
+    pub(super) async fn replace_oauth_grant(
         &self,
         connection: git_provider_connections::Model,
         credentials: OAuthCredentials,
@@ -164,7 +164,10 @@ impl GitProviderManager {
         let user_id = connection.user_id;
         let provider_id = connection.provider_id;
         let version = connection.updated_at;
+        let generation = connection.credential_generation.wrapping_add(1);
         let mut update = git_provider_connections::ActiveModel {
+            // Makes a refresh still in flight unable to overwrite this grant.
+            credential_generation: Set(generation),
             access_token: Set(Some(access)),
             refresh_token: Set(refresh),
             token_expires_at: Set(credentials.expires_at),
@@ -270,6 +273,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue),
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         )
     }
 
@@ -343,6 +347,7 @@ mod tests {
         assert!(plaintexts.contains(&"replacement-access".to_string()));
         assert!(plaintexts.contains(&"replacement-refresh".to_string()));
         assert!(sql.contains("\"is_expired\" = FALSE"));
+        assert!(sql.contains("\"credential_generation\" = 1"));
         assert!(sql.contains("\"health_message\" = NULL"));
         assert!(sql.contains("\"consecutive_health_failures\" = 0"));
         assert!(sql.contains("UPDATE"));
@@ -543,7 +548,7 @@ mod tests {
             .contains("Connection 11 changed during token refresh"));
         let sql = format!("{:?}", transaction_log(manager));
         let predicate = sql.split("WHERE").nth(1).unwrap();
-        assert!(predicate.contains("access_token") && predicate.contains("refresh_token"));
+        assert!(predicate.contains("credential_generation"));
         assert!(!predicate.contains("updated_at"));
         assert!(!sql.contains("stale-access") && !sql.contains("stale-refresh"));
     }
@@ -576,6 +581,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue),
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
         assert!(manager
             .consume_reauthorization_state("reauthorize.bound-state", 7002)
