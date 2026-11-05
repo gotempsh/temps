@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { WorkerOs } from './worker-join-script'
+
 export interface WorkerIngressState {
   status: string
   last_heartbeat?: string | null
@@ -146,6 +148,25 @@ export function joinIngressFlag(choice: JoinIngressChoice): string {
   // is the worker's `tailscale0` one.
   if (choice === 'private') return ' --ingress private --listen tailscale'
   return ` --ingress ${choice}`
+}
+
+/**
+ * Why a Mac worker (ADR 090) cannot take `choice`, or null when it can. The
+ * agent runs as the user, so it cannot bind ports 80 and 443 on a specific
+ * address, and Tailscale on macOS has no `tailscale0` interface to listen on.
+ */
+export function joinIngressUnavailable(
+  os: WorkerOs,
+  choice: JoinIngressChoice
+): string | null {
+  if (os !== 'macos') return null
+  if (choice === 'fixed') {
+    return 'Not on a Mac: its agent runs as you and cannot open ports 80 and 443. Choose "managed from this console" and use a tunnel.'
+  }
+  if (choice === 'private') {
+    return 'Not on a Mac yet: Tailscale on macOS has no tailscale0 interface for the agent to listen on.'
+  }
+  return null
 }
 
 /** The command, run on the worker, that serves only its private network. */
