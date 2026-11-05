@@ -181,11 +181,37 @@ fn installed_data_dir(plist: &str) -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
+/// How long one `launchctl` call may take: bootstrapping or booting out a
+/// LaunchAgent takes well under a second, so a call still running after
+/// this is stuck.
+const LAUNCHCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn launchctl(args: &[&str]) -> anyhow::Result<std::process::Output> {
-    Command::new("/bin/launchctl")
-        .args(args)
-        .output()
-        .map_err(|error| anyhow::anyhow!("could not run launchctl: {error}"))
+    let mut command = Command::new("/bin/launchctl");
+    command.args(args);
+    output_within_deadline(command, LAUNCHCTL_TIMEOUT)
+}
+
+/// Run `command` to completion, killing it and failing if it takes longer
+/// than `timeout`, so a service command never waits forever.
+fn output_within_deadline(
+    command: Command,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    match temps_wireguard::vm::output_within(command, None, timeout) {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => anyhow::bail!(
+            "`{program} {}` did not finish within {}s and was stopped",
+            args.join(" "),
+            timeout.as_secs_f32()
+        ),
+        Err(error) => anyhow::bail!("could not run `{program} {}`: {error}", args.join(" ")),
+    }
 }
 
 fn install(args: &InstallArgs) -> anyhow::Result<()> {
@@ -406,6 +432,25 @@ fn status() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stuck_service_command_is_stopped_at_the_deadline() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+        let error = output_within_deadline(command, std::time::Duration::from_millis(200))
+            .expect_err("a command past its deadline fails");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let message = error.to_string();
+        assert!(message.contains("/bin/sleep 30"), "{message}");
+        assert!(message.contains("did not finish within"), "{message}");
+
+        let mut command = Command::new("/bin/echo");
+        command.arg("ok");
+        let output = output_within_deadline(command, std::time::Duration::from_secs(10))
+            .expect("a quick command finishes");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    }
 
     #[test]
     fn the_plist_runs_the_agent_with_its_data_dir_and_restarts_it() {
