@@ -232,14 +232,21 @@ fn check_loopback_forwarding(context: &MacJoinContext) -> anyhow::Result<()> {
         .and_then(|listener| listener.local_addr())
         .map_err(|error| anyhow::anyhow!("could not pick a free port on this Mac: {error}"))?
         .port();
-    if let Err(error) = mac_worker::start_forwarding_probe(&context.endpoint, port) {
+    // Unique to this attempt, so a cleanup never removes another join's probe.
+    let attempt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let name =
+        mac_worker::forwarding_probe_name(port, &format!("{}-{attempt}", std::process::id()));
+    if let Err(error) = mac_worker::start_forwarding_probe(&context.endpoint, &name, port) {
         // `docker run --detach` may have started the probe before it failed
         // or timed out: remove it either way.
-        mac_worker::stop_forwarding_probe(&context.endpoint, port);
+        mac_worker::stop_forwarding_probe(&context.endpoint, &name);
         anyhow::bail!("could not start the forwarding check in {app}'s VM: {error}");
     }
     let reached = probe_answers(port, Duration::from_secs(30));
-    mac_worker::stop_forwarding_probe(&context.endpoint, port);
+    mac_worker::stop_forwarding_probe(&context.endpoint, &name);
     if !reached {
         anyhow::bail!(
             "{app} does not forward its VM's loopback to this Mac (nothing answered on \

@@ -605,15 +605,17 @@ pub fn probe_vm(endpoint: &DockerEndpoint) -> Result<VmCapabilities, MacWorkerEr
 /// and not something else listening on the Mac.
 pub const FORWARDING_PROBE_REPLY: &str = "temps-forwarding-probe";
 
-/// The forwarding probe's container name for `port`.
-pub fn forwarding_probe_name(port: u16) -> String {
-    format!("temps-mac-probe-{port}")
+/// The forwarding probe's container name for `port` in one join attempt
+/// (`attempt` tells concurrent or leftover attempts on the same port apart),
+/// so an attempt only ever removes its own probe.
+pub fn forwarding_probe_name(port: u16, attempt: &str) -> String {
+    format!("temps-mac-probe-{port}-{attempt}")
 }
 
 /// `docker run` arguments for the forwarding probe: an unprivileged
 /// host-network container answering on the VM's loopback at `port`, which is
 /// where the sidecar's egress forwarder will listen.
-pub fn forwarding_probe_args(tag: &str, port: u16) -> Vec<String> {
+pub fn forwarding_probe_args(tag: &str, name: &str, port: u16) -> Vec<String> {
     let listen = format!("TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr");
     let reply = format!("SYSTEM:echo {FORWARDING_PROBE_REPLY}");
     strings(&[
@@ -621,7 +623,7 @@ pub fn forwarding_probe_args(tag: &str, port: u16) -> Vec<String> {
         "--detach",
         "--rm",
         "--name",
-        &forwarding_probe_name(port),
+        name,
         "--network",
         "host",
         "--cap-drop",
@@ -638,19 +640,20 @@ pub fn forwarding_probe_args(tag: &str, port: u16) -> Vec<String> {
     ])
 }
 
-/// Start the forwarding probe; stop it with [`stop_forwarding_probe`].
-pub fn start_forwarding_probe(endpoint: &DockerEndpoint, port: u16) -> Result<(), MacWorkerError> {
+/// Start the forwarding probe named `name` (see [`forwarding_probe_name`]);
+/// stop it with [`stop_forwarding_probe`].
+pub fn start_forwarding_probe(
+    endpoint: &DockerEndpoint,
+    name: &str,
+    port: u16,
+) -> Result<(), MacWorkerError> {
     let tag = ensure_image(endpoint)?;
-    docker_ok(endpoint, &forwarding_probe_args(&tag, port), None).map(|_| ())
+    docker_ok(endpoint, &forwarding_probe_args(&tag, name, port), None).map(|_| ())
 }
 
-/// Remove the forwarding probe for `port`, if it is still there.
-pub fn stop_forwarding_probe(endpoint: &DockerEndpoint, port: u16) {
-    let _ = docker(
-        endpoint,
-        &strings(&["rm", "--force", &forwarding_probe_name(port)]),
-        None,
-    );
+/// Remove the forwarding probe named `name`, if it is still there.
+pub fn stop_forwarding_probe(endpoint: &DockerEndpoint, name: &str) {
+    let _ = docker(endpoint, &strings(&["rm", "--force", name]), None);
 }
 
 /// Whether the sidecar reaches `port` on the Mac's loopback through
@@ -678,7 +681,8 @@ mod tests {
 
     #[test]
     fn the_forwarding_probe_is_unprivileged_and_answers_on_vm_loopback_only() {
-        let args = forwarding_probe_args("temps-mac-mesh:abc", 41234);
+        let name = forwarding_probe_name(41234, "7-1");
+        let args = forwarding_probe_args("temps-mac-mesh:abc", &name, 41234);
         let text = args.join(" ");
         assert!(text.contains("--network host"), "{text}");
         assert!(text.contains("--cap-drop ALL"), "{text}");
@@ -687,7 +691,16 @@ mod tests {
         assert!(text.contains("--rm"), "{text}");
         assert!(text.contains("TCP-LISTEN:41234,bind=127.0.0.1,"), "{text}");
         assert!(text.contains(FORWARDING_PROBE_REPLY), "{text}");
-        assert_eq!(forwarding_probe_name(41234), "temps-mac-probe-41234");
+        assert_eq!(name, "temps-mac-probe-41234-7-1");
+        assert!(
+            args.windows(2).any(|w| w[0] == "--name" && w[1] == name),
+            "{text}"
+        );
+        assert_ne!(
+            name,
+            forwarding_probe_name(41234, "7-2"),
+            "attempts get their own probe"
+        );
     }
 
     fn worker() -> MacWorker {

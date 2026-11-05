@@ -904,7 +904,7 @@ async fn detect_local_platform() -> Option<String> {
 
 impl JoinCommand {
     pub fn execute(mut self) -> anyhow::Result<()> {
-        if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") && self.uses_docker_app_vm() {
             let context = super::mac_worker::detect()?;
             // Everything in this process (the platform check, preflight)
             // talks to that app's daemon, while still single-threaded.
@@ -1057,6 +1057,12 @@ impl JoinCommand {
     /// How this machine joins, from the flags: `--pair`, then
     /// `--private-address`, then `--relay-url`; with none of them, outbound
     /// only (ADR 055).
+    /// Whether a Mac join puts its end of the mesh in the Docker app's VM
+    /// (ADR 090): only an outbound join does; a direct one needs no Docker app.
+    fn uses_docker_app_vm(&self) -> bool {
+        matches!(self.mode(), JoinMode::Outbound)
+    }
+
     fn mode(&self) -> JoinMode {
         if let Some(code) = self.pair.clone() {
             JoinMode::Paired(code)
@@ -2365,6 +2371,7 @@ mod tests {
         }
         let join = parse_join(&["https://cp.example.com", "token"]).unwrap();
         assert_eq!(join.mode(), JoinMode::Outbound);
+        assert!(join.uses_docker_app_vm());
         assert_eq!(join.target.as_deref(), Some("https://cp.example.com"));
 
         let join = parse_join(&[
@@ -2375,6 +2382,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(join.mode(), JoinMode::Direct("10.0.0.5".into()));
+        assert!(
+            !join.uses_docker_app_vm(),
+            "a direct Mac join needs no Docker app"
+        );
         let join = parse_join(&[
             "abc123",
             "token",
