@@ -45,6 +45,18 @@ describe('navigation search', () => {
     expect(first?.item.url).toBe(CLUSTER_DNS_URL)
   })
 
+  test('the setup checklist stays reachable after its sidebar card is hidden', () => {
+    const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
+    for (const query of [
+      'Finish setting up',
+      'platform setup',
+      'setup checklist',
+    ]) {
+      const [first] = fuse.search(query)
+      expect(first?.item.url).toBe('/setup')
+    }
+  })
+
   test('the card is also found by what it does', () => {
     const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
     const urls = fuse.search('temps.local').map((result) => result.item.url)

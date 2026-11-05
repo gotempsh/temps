@@ -39,7 +39,9 @@ import {
   Sparkles,
   Terminal,
   Wand2,
+  X,
 } from 'lucide-react'
+import { toast } from 'sonner'
 
 import {
   adminGetNodeOptions,
@@ -485,11 +487,13 @@ function NavSection({
 // as a bordered callout card (not a plain nav row) with a mini progress bar
 // so it reads as a distinct "you have setup left" prompt. Full checklist
 // detail lives on its own /setup page. Renders nothing once dismissed or
-// fully complete (same visibility rule as the /setup page).
+// fully complete (same visibility rule as the /setup page). Once a step is done
+// it can be dismissed; /setup stays reachable from the command palette.
 function GettingStartedNavItem() {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const { completedCount, totalCount, visible } = useGettingStarted()
+  const { completedCount, totalCount, visible, canDismiss, dismiss } =
+    useGettingStarted()
 
   if (!visible) return null
 
@@ -519,10 +523,13 @@ function GettingStartedNavItem() {
   }
 
   return (
-    <SidebarGroup className="pb-0">
+    <SidebarGroup className="relative pb-0">
       <Link
         to="/setup"
-        className="group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70"
+        className={cn(
+          'group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70',
+          canDismiss && 'pr-9'
+        )}
       >
         <div className="flex items-center gap-2">
           <BadgeCheck className="size-4 shrink-0 text-primary" />
@@ -538,6 +545,23 @@ function GettingStartedNavItem() {
           />
         </div>
       </Link>
+      {canDismiss && (
+        <button
+          type="button"
+          aria-label="Hide platform setup"
+          title="Hide platform setup"
+          className="absolute right-3.5 top-4 flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+          onClick={() => {
+            dismiss()
+            toast('Platform setup hidden', {
+              description:
+                'Open it again from ⌘K: search for "Finish setting up".',
+            })
+          }}
+        >
+          <X className="size-3.5" />
+        </button>
+      )}
     </SidebarGroup>
   )
 }

@@ -600,6 +600,19 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
+    // Always listed: the sidebar's setup card can be hidden, and this is the
+    // way back to the checklist.
+    title: 'Finish setting up',
+    url: '/setup',
+    icon: BadgeCheck,
+    keywords: [
+      'platform setup',
+      'setup checklist',
+      'onboarding checklist',
+      'setup steps',
+    ],
+  },
+  {
     title: 'Connect AI harness',
     url: '/setup/ai',
     icon: Wand2,
