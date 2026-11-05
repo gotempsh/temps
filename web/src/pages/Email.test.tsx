@@ -125,6 +125,31 @@ test('a new install shows only the checklist, not empty sections repeating it', 
   }
 })
 
+test('a hidden section stays mounted, so an open dialog survives it hiding', async () => {
+  const { view } = renderEmail('/email')
+  await view.findByRole('region', { name: 'Set up sending' })
+  for (const id of ['email-domains', 'email-providers', 'email-sent']) {
+    const section = document.getElementById(id)
+    expect(section).not.toBeNull()
+    expect(section?.closest('[hidden]')).not.toBeNull()
+  }
+})
+
+test('an old ?tab= link scrolls to its section once the page knows it shows', async () => {
+  const scrolled: string[] = []
+  const original = Element.prototype.scrollIntoView
+  // A hidden section has no box to scroll to, as in a browser.
+  Element.prototype.scrollIntoView = function (this: Element) {
+    if (!this.closest('[hidden]')) scrolled.push(this.id)
+  }
+  try {
+    renderEmail('/email?tab=providers', SET_UP)
+    await waitFor(() => expect(scrolled).toContain('email-providers'))
+  } finally {
+    Element.prototype.scrollIntoView = original
+  }
+})
+
 test('during setup, a connected provider shows but the empty domains do not', async () => {
   const { view } = renderEmail('/email', { providers: [PROVIDER] })
   expect(await view.findByRole('heading', { name: 'Providers' })).toBeTruthy()

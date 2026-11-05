@@ -42,10 +42,15 @@ export function Email() {
 
   usePageTitle('Email')
 
+  // Waits for the sections: until it is known which show, the one asked for
+  // is hidden and there is nothing to scroll to.
+  const sectionsKnown = sections !== undefined
   useEffect(() => {
     const section = tabParam ? SECTION_FOR_OLD_TAB[tabParam] : undefined
-    if (section) document.getElementById(section)?.scrollIntoView?.()
-  }, [tabParam])
+    if (section && sectionsKnown) {
+      document.getElementById(section)?.scrollIntoView?.()
+    }
+  }, [tabParam, sectionsKnown])
 
   return (
     <PageContainer>
@@ -76,57 +81,56 @@ export function Email() {
           <EmailStatsStrip />
 
           {/* While setup is unfinished the checklist above asks for each
-              missing piece, so sections that would only repeat it stay out
-              (emailOverviewSections). */}
-          {!sections ? (
-            <Skeleton className="h-48 w-full rounded-lg" />
-          ) : (
-            <>
-              {(sections.domains || sections.providers) && (
-                // Domains lead: they are what people send from. A provider
-                // is what a domain sends through, so it sits beside them while
-                // there is room, measured by the page's own width.
-                <div className="@container">
-                  <div
-                    className={
-                      sections.domains && sections.providers
-                        ? 'grid gap-10 @4xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]'
-                        : 'grid gap-10'
-                    }
-                  >
-                    {sections.domains && (
-                      <section
-                        id="email-domains"
-                        className="min-w-0 scroll-mt-4"
-                      >
-                        <EmailDomainsManagement />
-                      </section>
-                    )}
-                    {sections.providers && (
-                      <section
-                        id="email-providers"
-                        className="min-w-0 scroll-mt-4"
-                      >
-                        <EmailProvidersManagement />
-                      </section>
-                    )}
-                  </div>
-                </div>
-              )}
+              missing piece, so sections that would only repeat it are hidden
+              (emailOverviewSections). They stay mounted, so a dialog or form
+              open in one survives the section being hidden. */}
+          {!sections && <Skeleton className="h-48 w-full rounded-lg" />}
+          {/* Domains lead: they are what people send from. A provider is what
+              a domain sends through, so it sits beside them while there is
+              room, measured by the page's own width. */}
+          <div
+            className="@container"
+            hidden={!sections?.domains && !sections?.providers}
+          >
+            <div
+              className={
+                sections?.domains && sections.providers
+                  ? 'grid gap-10 @4xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]'
+                  : 'grid gap-10'
+              }
+            >
+              <section
+                id="email-domains"
+                className="min-w-0 scroll-mt-4"
+                hidden={!sections?.domains}
+              >
+                <EmailDomainsManagement />
+              </section>
+              <section
+                id="email-providers"
+                className="min-w-0 scroll-mt-4"
+                hidden={!sections?.providers}
+              >
+                <EmailProvidersManagement />
+              </section>
+            </div>
+          </div>
 
-              {sections.sent && (
-                <section id="email-sent" className="scroll-mt-4">
-                  <EmailsSentList />
-                </section>
-              )}
+          <section
+            id="email-sent"
+            className="scroll-mt-4"
+            hidden={!sections?.sent}
+          >
+            <EmailsSentList />
+          </section>
 
-              {sections.events && (
-                <section id="email-events" className="scroll-mt-4">
-                  <EmailEventLog />
-                </section>
-              )}
-            </>
-          )}
+          <section
+            id="email-events"
+            className="scroll-mt-4"
+            hidden={!sections?.events}
+          >
+            <EmailEventLog />
+          </section>
         </TabsContent>
 
         <TabsContent value="sdk" className="mt-6">
