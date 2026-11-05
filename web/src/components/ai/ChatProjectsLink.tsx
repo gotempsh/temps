@@ -5,7 +5,6 @@ import {
   getApplicationOptions,
   getLastDeploymentOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -18,6 +17,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ExternalLink, FolderGit2 } from 'lucide-react'
 import { Link } from 'react-router'
 import { useChatBlueprint } from './chat-blueprint'
+import { ChatProjectIcon } from './ChatProjectIcon'
 import { chatProjects, projectHref } from './chat-projects'
 import { useChatResources } from './chat-resources'
 import type { ProjectRef } from './project-refs'
@@ -69,10 +69,10 @@ function SingleProjectLink({ project }: { project: ProjectRef }) {
           title={`Open the project ${project.name}`}
           aria-label={`Open the project ${project.name}`}
         >
-          <ProjectAvatar
+          <ChatProjectIcon
+            projectId={project.id}
             name={project.name}
-            className="size-4 shrink-0 rounded-sm"
-            fallbackClassName="rounded-sm bg-primary/10 text-[10px] text-primary"
+            size="xxs"
           />
         </Link>
       </Button>
@@ -121,10 +121,10 @@ function ProjectsMenu({ projects }: { projects: readonly ProjectRef[] }) {
         {projects.map((project) => (
           <DropdownMenuItem key={project.id} asChild>
             <Link to={projectHref(project)} className="gap-2">
-              <ProjectAvatar
+              <ChatProjectIcon
+                projectId={project.id}
                 name={project.name}
-                className="size-4 shrink-0 rounded-sm"
-                fallbackClassName="rounded-sm bg-primary/10 text-[10px] text-primary"
+                size="xxs"
               />
               <span className="min-w-0 flex-1 truncate">{project.name}</span>
               <span className="shrink-0 font-mono text-xs text-muted-foreground">

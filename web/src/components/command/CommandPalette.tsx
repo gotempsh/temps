@@ -9,7 +9,7 @@ import {
   listServicesInfiniteOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { GROUP_PAGE_SIZE } from '@/components/project-groups/useProjectGroups'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   Command,
   CommandDialog,
@@ -1933,7 +1933,7 @@ export function CommandPalette() {
         key: `project:${project.id}`,
         title: project.slug,
         category: TERMS.service.singular,
-        icon: <ProjectAvatar name={project.name} className="size-5" />,
+        icon: <ServiceIcon service={project} size="xs" />,
         score: rank(`project:${project.id}`, project.name, result.score),
         run: () => navigate(`/projects/${project.slug}`),
       })
@@ -2155,7 +2155,7 @@ export function CommandPalette() {
         out.push({
           key,
           title: project.slug,
-          icon: <ProjectAvatar name={project.name} className="size-5" />,
+          icon: <ServiceIcon service={project} size="xs" />,
           run: () => navigate(`/projects/${project.slug}`),
         })
       } else if (key.startsWith('skill:')) {
@@ -2260,7 +2260,7 @@ export function CommandPalette() {
             }
             className="flex items-center gap-2"
           >
-            <ProjectAvatar name={project.name} className="size-6" />
+            <ServiceIcon service={project} size="sm" />
             <span>{project.slug}</span>
           </CommandItem>
         ))}

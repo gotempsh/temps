@@ -26,13 +26,10 @@ import {
 } from '@/components/ui/alert-dialog'
 import { listAllConversationsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useDebounce } from '@/hooks/useDebounce'
-import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { useQuery } from '@tanstack/react-query'
 import { AiSettingsMenu } from './AiSettingsMenu'
-import { ChatProjectMediaProvider } from './ChatProjectMedia'
-import { chatProjectQueryOptions } from './chat-project-media'
-import { useChatProjectMedia } from './chat-project-media-context'
+import { ChatProjectIcon } from './ChatProjectIcon'
 import { ConversationSandboxChip } from './ConversationSandboxChip'
 import { ChatRunBadge, ChatRunMark } from './ChatRunBadge'
 import {
@@ -248,35 +245,6 @@ function toSwitcherChat(c: ProjectConversation): SwitcherChat {
  * overlaid in the corner. Shared by the conversation list and the open-chat
  * header so a chat looks the same in both places.
  */
-/**
- * The project's logo as the project list shows it: the latest deployment's
- * screenshot or favicon, then the service template's image, then the initial.
- */
-function ProjectLogo({
-  projectId,
-  name,
-  className,
-}: {
-  projectId: number
-  name: string
-  className?: string
-}) {
-  const project = useQuery(chatProjectQueryOptions(projectId))
-  // The media is loaded once for the whole list (ChatProjectMediaProvider).
-  const media = useChatProjectMedia(projectId)
-  const hosted = project.data != null && project.data.source_type !== 'external'
-  const deployed = hosted ? media : undefined
-  return (
-    <ProjectCardMedia
-      name={project.data?.name ?? name}
-      className={className}
-      deploymentUrl={deployed?.url}
-      screenshotLocation={deployed?.screenshot_location}
-      templateImageUrl={project.data?.service_template_image_url}
-    />
-  )
-}
-
 function ContextAvatar({
   projectId,
   projectName,
@@ -312,16 +280,15 @@ function ContextAvatar({
   return (
     <div className="relative shrink-0">
       {projectId != null && projectName ? (
-        <ProjectLogo
+        <ChatProjectIcon
           projectId={projectId}
           name={projectName}
-          className={cn('size-8', className)}
+          className={className}
         />
       ) : (
-        <ProjectAvatar
-          name={projectName ?? label}
-          className={cn('size-8 rounded-md', className)}
-          fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
+        <ServiceIcon
+          service={{ name: projectName ?? label }}
+          className={className}
         />
       )}
       <span
@@ -596,16 +563,6 @@ export function DockBody({
         (switcherMatches.data ?? []).filter(isListedKind)
       ),
     [conversations, switcherMatches.data]
-  )
-  // Every project a logo in this view can show: the listed chats, the older
-  // matches of the switcher and the open chat.
-  const mediaProjectIds = useMemo(
-    () => [
-      ...conversations.map((c) => c.project_id),
-      ...olderMatches.map((c) => c.project_id),
-      active?.projectId,
-    ],
-    [conversations, olderMatches, active?.projectId]
   )
   // Whether the endpoint has older chats than the pages loaded so far.
   const [hasMoreChats, setHasMoreChats] = useState(false)
@@ -1734,15 +1691,11 @@ export function DockBody({
   )
 
   if (!isPage) {
-    return (
-      <ChatProjectMediaProvider projectIds={mediaProjectIds}>
-        <div className="flex h-full flex-col gap-3 p-4">{main}</div>
-      </ChatProjectMediaProvider>
-    )
+    return <div className="flex h-full flex-col gap-3 p-4">{main}</div>
   }
 
   return (
-    <ChatProjectMediaProvider projectIds={mediaProjectIds}>
+    <>
       <div className="flex h-full min-w-0">
         {/* Hidden, the list folds into a rail rather than disappearing (and the
           rail holds the way to show it again). */}
@@ -1801,7 +1754,7 @@ export function DockBody({
           </ResizablePanel>
         </ResizablePanelGroup>
       </div>
-    </ChatProjectMediaProvider>
+    </>
   )
 }
 
@@ -2277,11 +2230,7 @@ function ProjectPicker({
               onClick={() => pick(p)}
               className="group flex w-full items-center gap-3 rounded-md border border-transparent px-2 py-2.5 text-left transition-colors hover:border-border hover:bg-accent"
             >
-              <ProjectAvatar
-                name={p.name}
-                className="size-8 rounded-md"
-                fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
-              />
+              <ServiceIcon service={p} />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-medium">{p.name}</div>
                 {p.slug && (

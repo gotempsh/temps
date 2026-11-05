@@ -27,7 +27,8 @@ manager is `bun`.
   `CopyButton` for copy-to-clipboard; cards over dropdowns for selections where
   practical; `Skeleton` placeholders matching the real layout for content
   loading, never centred `Loader2` spinners (inline spinners on mutation buttons
-  are fine).
+  are fine); `ServiceIcon` for a project's icon anywhere one is listed, never a
+  hand-built initial or a media lookup of a page's own.
 - **Mobile**: tables use the shared overflow wrapper (hide a column only if a
   detail view still shows it); filter bars `flex flex-col gap-2 sm:flex-row
   sm:flex-wrap` with `w-full sm:w-[Npx]` selects; grids `grid-cols-1

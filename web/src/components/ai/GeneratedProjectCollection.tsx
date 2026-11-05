@@ -3,13 +3,12 @@
 
 import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
 import { BuildSourceIcon } from '@/components/dashboard/ProjectCard'
-import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   projectBuildSource,
   projectPresetLabel,
 } from '@/components/dashboard/project-card-data'
 import { PresetIcon } from '@/components/presets/PresetIcon'
-import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { cn } from '@/lib/utils'
 import { useQueries } from '@tanstack/react-query'
 import { ArrowUpRight, FolderGit2, GitBranch } from 'lucide-react'
@@ -50,14 +49,6 @@ export function GeneratedProjectCollection({
       retry: false,
     })),
   })
-
-  // The same image the project list shows: the latest deployment's
-  // screenshot or favicon, the service template's image, then the initial.
-  const hostedProjectIds = projectIds.filter((id) => {
-    const project = projectQueries[projectIds.indexOf(id)]?.data
-    return project != null && project.source_type !== 'external'
-  })
-  const deploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
 
   return (
     <section
@@ -109,18 +100,13 @@ export function GeneratedProjectCollection({
             const buildSource = trustedProject
               ? projectBuildSource(trustedProject)
               : null
-            const media =
-              project.id === null
-                ? undefined
-                : deploymentMedia.data?.projects?.[String(project.id)]
             const row = (
               <div className="group flex min-w-0 items-center gap-3 px-3 py-2.5 transition-colors hover:bg-muted/40 sm:px-4">
-                <ProjectCardMedia
-                  name={name}
+                {/* Only what the permission check returned: the artifact's own
+                    fields are not trusted to choose what the browser loads. */}
+                <ServiceIcon
+                  service={{ ...trustedProject, name }}
                   className="size-9"
-                  deploymentUrl={media?.url}
-                  screenshotLocation={media?.screenshot_location}
-                  templateImageUrl={trustedProject?.service_template_image_url}
                 />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-xs font-medium text-foreground">

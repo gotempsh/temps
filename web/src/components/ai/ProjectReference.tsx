@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { createContext, useContext, useMemo, type ReactNode } from 'react'
@@ -37,11 +37,7 @@ export function ProjectReferencesProvider({
   })
   const value = useMemo<ProjectReferences>(
     () => ({
-      projects: (list.data?.projects ?? []).map(({ id, slug, name }) => ({
-        id,
-        slug,
-        name,
-      })),
+      projects: list.data?.projects ?? [],
       open: onOpen,
     }),
     [list.data, onOpen]
@@ -86,11 +82,7 @@ export function ProjectChip({
         className
       )}
     >
-      <ProjectAvatar
-        name={project.name}
-        className="size-4 rounded-sm"
-        fallbackClassName="rounded-sm bg-primary/10 text-[10px] text-primary"
-      />
+      <ServiceIcon service={project} size="xxs" />
       <span className="truncate font-mono">{label}</span>
     </button>
   )

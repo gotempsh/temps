@@ -3,8 +3,7 @@
 
 import * as React from 'react'
 import { getProjects } from '@/api/client/sdk.gen'
-import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
-import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -112,26 +111,15 @@ export function ProjectSelect({
     [projects, value]
   )
 
-  const media = useLatestDeploymentMedia(
-    (projectsQuery.data?.projects ?? []).map((p) => p.id).sort((a, b) => a - b)
-  )
   const projectImage = (project: NonNullable<typeof selected>) => (
-    <ProjectCardMedia
-      name={project.name}
-      className="mr-2 size-5 [&_img]:p-0.5"
-      templateImageUrl={project.service_template_image_url}
-      deploymentUrl={media.data?.projects?.[String(project.id)]?.url}
-      screenshotLocation={
-        media.data?.projects?.[String(project.id)]?.screenshot_location
-      }
-    />
+    <ServiceIcon service={project} size="xs" className="mr-2" />
   )
   const handleRefresh = (e: React.MouseEvent) => {
     e.stopPropagation()
     void queryClient.invalidateQueries({
       queryKey: ['project-selector-catalog'],
     })
-    void media.refetch()
+    void queryClient.invalidateQueries({ queryKey: ['service-media'] })
   }
 
   const triggerLabel =
