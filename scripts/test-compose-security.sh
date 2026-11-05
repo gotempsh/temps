@@ -766,6 +766,7 @@ websocket_upgraded=false
 for _ in {1..10}; do
   websocket_status="$(curl --http1.1 --silent --output /dev/null --write-out '%{http_code}' \
     --max-time 5 --user "temps:${admin_ingress_password}" \
+    --header "Origin: http://${websocket_binding}" \
     --header 'Connection: Upgrade' --header 'Upgrade: websocket' \
     "http://${websocket_binding}/socket" || true)"
   if [[ "$websocket_status" == "101" ]]; then
@@ -802,6 +803,14 @@ if ! grep -Eiq '^Upgrade:[[:space:]]*websocket$' <<<"$websocket_request_clean" |
 fi
 if grep -Eiq '^Authorization:' <<<"$websocket_request_clean"; then
   echo "admin ingress forwarded its Basic Authorization credential upstream" >&2
+  exit 1
+fi
+# Temps accepts a browser WebSocket only when Origin and Host name the same
+# authority, port included. The published admin port is never 80/443, so a
+# proxy that forwards nginx's port-stripped $host breaks every console socket.
+if ! grep -Fxiq "Host: ${websocket_binding}" <<<"$websocket_request_clean"; then
+  printf '%s\n' "$websocket_request_clean" >&2
+  echo "admin ingress forwarded a Host without the port the client used (${websocket_binding}); WebSocket Origin validation would reject it" >&2
   exit 1
 fi
 
