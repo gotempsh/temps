@@ -1753,8 +1753,11 @@ impl DeployImageJob {
             return Vec::new();
         };
 
-        match image_builder.inspect_image(&image_output.image_tag).await {
-            Ok(info) => vec![info.platform],
+        // An image Temps did not build (`deploy:local-image`, an external
+        // image) can be a multi-platform image with several architectures
+        // present locally; every one of them is schedulable (#1789).
+        match image_builder.image_platforms(&image_output.image_tag).await {
+            Ok(platforms) => platforms,
             Err(e) => {
                 tracing::debug!(
                     image = %image_output.image_tag,
@@ -1842,8 +1845,8 @@ impl DeployImageJob {
             return Ok(());
         };
 
-        let image_platform = match image_builder.inspect_image(image_tag).await {
-            Ok(info) => info.platform,
+        let image_platforms = match image_builder.image_platforms(image_tag).await {
+            Ok(platforms) => platforms,
             Err(e) => {
                 tracing::debug!(
                     image = %image_tag,
@@ -1854,9 +1857,13 @@ impl DeployImageJob {
             }
         };
 
-        if temps_deployer::platform::platforms_match(&image_platform, local_platform) {
+        if image_platforms
+            .iter()
+            .any(|platform| temps_deployer::platform::platforms_match(platform, local_platform))
+        {
             return Ok(());
         }
+        let image_platform = image_platforms.join(", ");
 
         let msg = format!(
             "Image '{}' is built for {} but the control plane runs {}. \
@@ -1893,8 +1900,8 @@ impl DeployImageJob {
             return Ok(());
         };
 
-        let image_platform = match image_builder.inspect_image(image_tag).await {
-            Ok(info) => info.platform,
+        let image_platforms = match image_builder.image_platforms(image_tag).await {
+            Ok(platforms) => platforms,
             Err(e) => {
                 tracing::debug!(
                     image = %image_tag,
@@ -1904,6 +1911,7 @@ impl DeployImageJob {
                 return Ok(());
             }
         };
+        let image_platform = image_platforms.join(", ");
 
         let node_platform = match remote.platform() {
             Some(platform) => platform,
@@ -1925,7 +1933,10 @@ impl DeployImageJob {
             },
         };
 
-        if temps_deployer::platform::platforms_match(&image_platform, &node_platform) {
+        if image_platforms
+            .iter()
+            .any(|platform| temps_deployer::platform::platforms_match(platform, &node_platform))
+        {
             return Ok(());
         }
 
@@ -2378,7 +2389,59 @@ impl DeployImageJob {
         }
 
         self.transfer_image_via_import(image_tag, None, remote, node_name, context)
+            .await?;
+        self.verify_imported_image_platform(image_tag, remote, node_name, context)
             .await
+    }
+
+    /// After a control-plane image is imported on a worker, the image the
+    /// worker resolves for the tag must be one it can run.
+    ///
+    /// The check before the transfer accepts a multi-platform image that has
+    /// the node's architecture; this one catches an archive that did not carry
+    /// it (a daemon that exported only its own platform, a worker on the
+    /// classic image store), which would otherwise only show as `exec format
+    /// error` when the container starts. A worker that cannot say is let
+    /// through, as before.
+    async fn verify_imported_image_platform(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let node_platform = match remote.platform() {
+            Some(platform) => platform,
+            None => match remote.refresh_platform().await {
+                Some(platform) => platform,
+                None => return Ok(()),
+            },
+        };
+        let imported = match remote.inspect_image(image_tag).await {
+            Ok(imported) => imported,
+            Err(error) => {
+                tracing::debug!(
+                    image = %image_tag,
+                    node = %node_name,
+                    %error,
+                    "Could not inspect the imported image to verify its platform"
+                );
+                return Ok(());
+            }
+        };
+        if temps_deployer::platform::platforms_match(&imported.platform, &node_platform) {
+            return Ok(());
+        }
+        let msg = format!(
+            "Image '{image_tag}' was transferred to node '{node_name}', which runs \
+             {node_platform}, but the node resolves it as {}. The image's {node_platform} \
+             variant did not arrive with it; push the image to a registry the node can pull \
+             from, or restrict this environment to {} nodes with target nodes/labels.",
+            imported.platform, imported.platform
+        );
+        self.log_at(context, LogLevel::Error, format!("ERROR: {msg}"))
+            .await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
     }
 
     /// Save `image_tag` from the control plane's Docker (`docker save`) and
@@ -5180,6 +5243,7 @@ mod tests {
             discovered: None,
             image_platform: None,
             discoverable: None,
+            local_platforms: Vec::new(),
         });
         let mut output = build_output_with_tags(&[
             ("linux/amd64", "myapp:latest"),
@@ -5189,6 +5253,34 @@ mod tests {
         let mut platforms = job.available_image_platforms(&output).await;
         platforms.sort();
         assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+    }
+
+    /// #1789: an image Temps did not build (`deploy:local-image`) that has
+    /// several architectures present locally is schedulable on each.
+    #[tokio::test]
+    async fn local_multi_platform_image_offers_every_architecture_to_the_scheduler() {
+        let job = job_with_image_builder(PlatformOnlyImageBuilder {
+            platform: "linux/amd64".into(),
+            discovered: Some("linux/amd64".into()),
+            image_platform: Some("linux/amd64".into()),
+            discoverable: None,
+            local_platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
+        });
+        let output = build_output_with_tags(&[]);
+        let mut platforms = job.available_image_platforms(&output).await;
+        platforms.sort();
+        assert_eq!(platforms, vec!["linux/amd64", "linux/arm64"]);
+
+        // The same image may run on a control plane of either architecture.
+        let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
+        assert!(job
+            .verify_image_platform_for_local("myapp:latest", Some("linux/arm64"), &context)
+            .await
+            .is_ok());
+        assert!(job
+            .verify_image_platform_for_local("myapp:latest", Some("linux/riscv64"), &context)
+            .await
+            .is_err());
     }
 
     fn build_output_with_tags(tags: &[(&str, &str)]) -> BuildImageOutput {
@@ -5385,6 +5477,9 @@ mod tests {
         /// What a discovery attempt would return. `None` models a daemon that
         /// still doesn't answer.
         discoverable: Option<String>,
+        /// Every platform a multi-platform image has locally; empty answers
+        /// with the inspected platform alone, as a single-platform image does.
+        local_platforms: Vec<String>,
     }
 
     impl PlatformOnlyImageBuilder {
@@ -5394,6 +5489,7 @@ mod tests {
                 discovered: Some(platform.to_string()),
                 image_platform: Some(image_platform.to_string()),
                 discoverable: None,
+                local_platforms: Vec::new(),
             }
         }
 
@@ -5406,6 +5502,7 @@ mod tests {
                 discovered: None,
                 image_platform: Some(image_platform.to_string()),
                 discoverable: Some(daemon.to_string()),
+                local_platforms: Vec::new(),
             }
         }
     }
@@ -5484,6 +5581,16 @@ mod tests {
             })
         }
 
+        async fn image_platforms(
+            &self,
+            image_name: &str,
+        ) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            if !self.local_platforms.is_empty() {
+                return Ok(self.local_platforms.clone());
+            }
+            Ok(vec![self.inspect_image(image_name).await?.platform])
+        }
+
         fn get_native_platform(&self) -> String {
             self.platform.clone()
         }
@@ -5525,6 +5632,7 @@ mod tests {
             discovered: Some(platform.to_string()),
             image_platform: None,
             discoverable: None,
+            local_platforms: Vec::new(),
         })
     }
 
@@ -5621,6 +5729,7 @@ mod tests {
             discovered: None,
             image_platform: Some("linux/arm64".to_string()),
             discoverable: None,
+            local_platforms: Vec::new(),
         });
         let context = crate::test_utils::create_test_context("wf".to_string(), 1, 1, 1);
 
@@ -8024,6 +8133,7 @@ mod tests {
             discovered: None,
             image_platform: None,
             discoverable: None,
+            local_platforms: Vec::new(),
         });
         let mut output = build_output_with_tags(&[("linux/arm64", "myapp:latest")]);
         output.builder_node_id = Some(7);
@@ -8111,6 +8221,8 @@ mod tests {
             "pull".to_string()
         } else if path.starts_with("/agent/images/import") {
             "import".to_string()
+        } else if path.starts_with("/agent/images/inspect") {
+            "inspect".to_string()
         } else {
             request_text.lines().next().unwrap_or_default().to_string()
         }
@@ -8122,6 +8234,18 @@ mod tests {
     /// so the test's sequence assertion reports them instead of a hang.
     async fn spawn_recording_agent(
         pull_response: (&'static str, &'static str),
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
+        spawn_recording_agent_resolving(pull_response, "linux/amd64").await
+    }
+
+    /// [`spawn_recording_agent`] whose node, after an import, resolves the
+    /// image as `imported_platform`.
+    async fn spawn_recording_agent_resolving(
+        pull_response: (&'static str, &'static str),
+        imported_platform: &'static str,
     ) -> (
         Arc<temps_deployer::remote::RemoteNodeDeployer>,
         AgentRequestLog,
@@ -8143,6 +8267,25 @@ mod tests {
                     "200 OK",
                     r#"{"success":true,"data":"sha256:imported"}"#.to_string(),
                 ),
+                "inspect" => {
+                    let (os, architecture) = imported_platform
+                        .split_once('/')
+                        .unwrap_or(("linux", "amd64"));
+                    (
+                        "200 OK",
+                        serde_json::json!({
+                            "id": "sha256:imported",
+                            "architecture": architecture,
+                            "os": os,
+                            "platform": imported_platform,
+                            "size_bytes": 1,
+                            "tags": [],
+                            "created": null,
+                            "working_dir": null,
+                        })
+                        .to_string(),
+                    )
+                }
                 _ => (
                     "404 Not Found",
                     r#"{"success":false,"data":null,"error":"unexpected request"}"#.to_string(),
@@ -8220,7 +8363,7 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "import"],
+            &["exists", "import", "inspect"],
             "an uploaded image must be imported, never pulled from a registry",
         );
         result.expect("an uploaded image must be transferred to the worker via import");
@@ -8228,6 +8371,39 @@ mod tests {
             save_image_called.load(Ordering::SeqCst),
             "expected the uploaded image to be exported from the control plane"
         );
+    }
+
+    /// #1789: a multi-platform image passes the pre-transfer check when it has
+    /// the node's architecture; if the archive the worker imported did not
+    /// carry it, the deploy fails here with the reason instead of at start
+    /// with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_an_import_the_node_cannot_run() {
+        let (remote, requests) = spawn_recording_agent_resolving(PULL_FAILS, "linux/arm64").await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-arch".to_string(), 1, 1, 1);
+
+        let error = job
+            .ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect_err("an image the node resolves for another architecture is refused");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "import", "inspect"],
+            "the imported image is inspected on the node",
+        );
+        let message = error.to_string();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("linux/amd64"), "{message}");
+        assert!(message.contains("linux/arm64"), "{message}");
     }
 
     /// Job configs planned before `image_source` existed carry only
@@ -8255,7 +8431,7 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "import"],
+            &["exists", "import", "inspect"],
             "a reserved temps.internal ref from a legacy config must be imported, never pulled",
         );
         result.expect("a reserved temps.internal ref must be transferred via import");

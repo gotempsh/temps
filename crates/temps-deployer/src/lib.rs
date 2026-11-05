@@ -1153,6 +1153,17 @@ pub trait ImageBuilder: Send + Sync {
     /// Inspect an image and return its metadata including architecture
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
+    /// Every platform `image_name` can run on from this builder's local store.
+    ///
+    /// A multi-platform image (a manifest list or OCI index) pulled for
+    /// several architectures holds a runnable image for each, while
+    /// [`Self::inspect_image`] only reports the one the daemon picks for its
+    /// own architecture. The default answers with that one platform; a
+    /// builder whose store can list an image's manifests overrides it.
+    async fn image_platforms(&self, image_name: &str) -> Result<Vec<String>, BuilderError> {
+        Ok(vec![self.inspect_image(image_name).await?.platform])
+    }
+
     /// The identity of the image `image_name` currently resolves to.
     ///
     /// `id` is whatever the daemon reports as the image ID: the config digest
