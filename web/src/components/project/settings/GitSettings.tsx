@@ -97,6 +97,7 @@ import { composeValidationWarning } from '@/lib/compose-check'
 import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
 import {
+  detectedPresetsFromPublic,
   normalizePresetPath,
   presetConfigForSelection,
   presetSelectionKey,
@@ -334,15 +335,7 @@ function GitSettingsInline({
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
-      presets: publicPresetQuery.data.presets.map((p: any) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: p.compose_files,
-      })),
+      presets: detectedPresetsFromPublic(publicPresetQuery.data.presets),
     }
   }, [publicPresetQuery.data])
   const effectivePresetData = presetQuery.data || publicPresetData
@@ -2523,15 +2516,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
-      presets: publicPresetQuery.data.presets.map((p: any) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: p.compose_files,
-      })),
+      presets: detectedPresetsFromPublic(publicPresetQuery.data.presets),
     }
   }, [publicPresetQuery.data])
   const detectedPresetData =

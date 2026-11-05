@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { PresetInfo, ProjectPresetResponse } from '@/api/client'
+
 /**
  * Helpers for the composite preset-selection key used by `FrameworkSelector`.
  *
@@ -88,4 +90,36 @@ export function presetConfigForSelection(
   }
 
   return { providers: [] }
+}
+
+const DEFAULT_DOCKERFILE = 'Dockerfile'
+
+/** Whether two Dockerfile paths name one file; blank means the default file. */
+export function isSameDockerfile(
+  a: string | null | undefined,
+  b: string | null | undefined
+): boolean {
+  const normalize = (value: string | null | undefined) =>
+    (value ?? '').trim().replace(/^\.\//, '') || DEFAULT_DOCKERFILE
+  return normalize(a) === normalize(b)
+}
+
+/**
+ * The public detection endpoint's snake_case presets in the camelCase shape
+ * `FrameworkSelector` reads. Dropping `dockerfile_path` here makes a card for
+ * `docker/Dockerfile` build the root `Dockerfile` instead.
+ */
+export function detectedPresetsFromPublic(
+  presets: readonly PresetInfo[]
+): ProjectPresetResponse[] {
+  return presets.map((preset) => ({
+    preset: preset.preset,
+    presetLabel: preset.preset_label,
+    exposedPort: preset.exposed_port,
+    iconUrl: preset.icon_url,
+    projectType: preset.project_type,
+    path: preset.path,
+    composeFiles: preset.compose_files,
+    dockerfilePath: preset.dockerfile_path,
+  }))
 }

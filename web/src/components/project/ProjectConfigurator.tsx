@@ -1518,7 +1518,7 @@ export function ProjectConfigurator({
                   error={presetError}
                   selectedPreset={selectValue}
                   onRefresh={handleRefreshPresets}
-                  onSelectPreset={(value) => {
+                  onSelectPreset={(value, detected) => {
                     if (value === 'custom') {
                       field.onChange('custom')
                       form.setValue('rootDirectory', './')
@@ -1559,11 +1559,14 @@ export function ProjectConfigurator({
                       // and resets to the plain default otherwise, so a
                       // stale value from a previous selection never lingers.
                       if (presetName === 'dockerfile') {
-                        const matchedCandidate = presetData?.presets?.find(
-                          (p: ProjectPresetResponse) =>
-                            p.preset === presetName &&
-                            normalizePath(p.path) === normalizePath(presetPath)
-                        )
+                        const matchedCandidate =
+                          detected ??
+                          presetData?.presets?.find(
+                            (p: ProjectPresetResponse) =>
+                              p.preset === presetName &&
+                              normalizePath(p.path) ===
+                                normalizePath(presetPath)
+                          )
                         form.setValue(
                           'dockerfilePath',
                           matchedCandidate?.dockerfilePath || 'Dockerfile'

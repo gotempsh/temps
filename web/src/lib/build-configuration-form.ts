@@ -4,6 +4,7 @@
 import type { ProjectPresetResponse, ProjectResponse } from '@/api/client'
 import { isRepositoryRootDirectory } from '@/lib/project-directory'
 import {
+  isSameDockerfile,
   normalizePresetPath,
   splitPresetSelection,
 } from '@/lib/preset-selection'
@@ -131,46 +132,65 @@ export function buildConfigurationPatch(
 }
 
 /**
+ * The Compose file a detected card brings. Detection lists paths from the
+ * repository root, but a project stores them relative to its root directory,
+ * and a card lists every Compose file in the repository, not only its own.
+ */
+function detectedComposePath(
+  card: ProjectPresetResponse | undefined,
+  directory: string
+): string {
+  const files = card?.composeFiles ?? []
+  const path = normalizePresetPath(directory)
+  if (path === 'root') return files[0] || DEFAULT_COMPOSE_PATH
+  const prefix = `${path.replace(/\/+$/, '')}/`
+  const file = files.find((item) => item.startsWith(prefix))
+  return file ? file.slice(prefix.length) : DEFAULT_COMPOSE_PATH
+}
+
+/**
  * The values after choosing a card in `FrameworkSelector`.
  *
  * A detected card (`slug::path`) is the framework found at that path, so it
- * brings its directory and the file detection found there. A card from the full
- * catalog (a bare slug) says nothing about where the code is, so the root
- * directory and file paths stay as they are: changing the framework of a
- * monorepo service must not move it to the repository root.
+ * brings its directory and the file detection found there. Several Dockerfiles
+ * can share a path, so the file comes from the card itself, not the key. A card
+ * from the full catalog (a bare slug) says nothing about where the code is, so
+ * the root directory and file paths stay as they are: changing the framework of
+ * a monorepo service must not move it to the repository root.
  *
  * Choosing what is already selected changes nothing, so re-clicking the current
- * card cannot replace a Dockerfile path someone set by hand.
+ * card cannot replace a path someone set by hand.
  */
 export function applyFrameworkSelection(
   current: BuildConfigurationValues,
   selection: string,
-  detected: readonly ProjectPresetResponse[]
+  card?: ProjectPresetResponse
 ): BuildConfigurationValues {
   const { preset, directory } = splitPresetSelection(selection)
   if (!selection.includes('::')) return { ...current, preset }
 
-  const path = normalizePresetPath(directory)
-  if (
+  const samePlace =
     preset === current.preset &&
-    path === normalizePresetPath(current.directory)
+    normalizePresetPath(directory) === normalizePresetPath(current.directory)
+  const dockerfile = isDockerfilePreset(preset)
+  const dockerfilePath = dockerfile
+    ? card?.dockerfilePath || DEFAULT_DOCKERFILE_PATH
+    : current.dockerfilePath
+  if (
+    samePlace &&
+    (!dockerfile || isSameDockerfile(dockerfilePath, current.dockerfilePath))
   ) {
     return current
   }
-  const candidate = detected.find(
-    (item) => item.preset === preset && normalizePresetPath(item.path) === path
-  )
   return {
     ...current,
     preset,
     directory,
-    dockerfilePath: isDockerfilePreset(preset)
-      ? candidate?.dockerfilePath || DEFAULT_DOCKERFILE_PATH
-      : current.dockerfilePath,
+    dockerfilePath,
     // A context chosen for the previous location would not contain this file.
     buildContext: '',
     composePath: isComposePreset(preset)
-      ? candidate?.composeFiles?.[0] || DEFAULT_COMPOSE_PATH
+      ? detectedComposePath(card, directory)
       : current.composePath,
   }
 }

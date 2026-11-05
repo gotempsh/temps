@@ -14,6 +14,7 @@ import {
 } from '@/components/git-providers/GitConnectionExpiredAlert'
 import type { ProjectPresetResponse, PresetResponse } from '@/api/client'
 import { usePresets } from '@/contexts/PresetContext'
+import { isSameDockerfile } from '@/lib/preset-selection'
 
 // Helper function to normalize path for consistent comparison
 // Normalizes '.', './', and empty strings to 'root'
@@ -37,7 +38,13 @@ interface FrameworkSelectorProps {
   isRefreshing?: boolean
   error?: Error | null
   selectedPreset: string
-  onSelectPreset: (value: string) => void
+  /**
+   * The Dockerfile in use. Several Dockerfiles can share one path, so the key
+   * alone cannot tell which card is selected; without this they all are.
+   */
+  selectedDockerfilePath?: string
+  /** `detected` is the card chosen, when it came from detection. */
+  onSelectPreset: (value: string, detected?: ProjectPresetResponse) => void
   onRefresh?: () => void
   disabled?: boolean
 }
@@ -48,6 +55,7 @@ export function FrameworkSelector({
   isRefreshing = false,
   error,
   selectedPreset,
+  selectedDockerfilePath,
   onSelectPreset,
   onRefresh,
   disabled = false,
@@ -81,7 +89,9 @@ export function FrameworkSelector({
     const alreadyExists = rawDetectedProjects.some((p) => {
       return (
         p.preset === selectedSlug &&
-        normalizePath(p.path) === normalizedSelectedPath
+        normalizePath(p.path) === normalizedSelectedPath &&
+        (selectedDockerfilePath === undefined ||
+          isSameDockerfile(p.dockerfilePath, selectedDockerfilePath))
       )
     })
 
@@ -96,9 +106,15 @@ export function FrameworkSelector({
       iconUrl: presetInfo?.icon_url || '',
       projectType: presetInfo?.project_type || 'server',
       path: selectedPath === 'root' ? './' : selectedPath,
+      dockerfilePath: selectedDockerfilePath,
     }
     return [injected, ...rawDetectedProjects]
-  }, [rawDetectedProjects, selectedPreset, getPresetBySlug])
+  }, [
+    rawDetectedProjects,
+    selectedPreset,
+    selectedDockerfilePath,
+    getPresetBySlug,
+  ])
 
   const hasDetectedPresets = detectedProjects.length > 0 && !error
 
@@ -259,9 +275,10 @@ export function FrameworkSelector({
           <>
             {(presetsToDisplay as ProjectPresetResponse[]).map((project) => (
               <DetectedPresetCard
-                key={`${project.preset}::${project.path || 'root'}`}
+                key={`${project.preset}::${project.path || 'root'}::${project.dockerfilePath ?? ''}`}
                 project={project}
                 selectedPreset={selectedPreset}
+                selectedDockerfilePath={selectedDockerfilePath}
                 onSelectPreset={onSelectPreset}
                 disabled={disabled}
                 getPresetBySlug={getPresetBySlug}
@@ -308,6 +325,9 @@ function selectableCardProps(
     onKeyDown: (event: React.KeyboardEvent) => {
       if (disabled || (event.key !== 'Enter' && event.key !== ' ')) return
       event.preventDefault()
+      // The key is spent choosing this card. A form around it may treat Enter
+      // as "continue", which would leave the step as the choice is made.
+      event.stopPropagation()
       onSelect()
     },
   }
@@ -374,13 +394,15 @@ function PresetCard({
 function DetectedPresetCard({
   project,
   selectedPreset,
+  selectedDockerfilePath,
   onSelectPreset,
   disabled,
   getPresetBySlug,
 }: {
   project: ProjectPresetResponse
   selectedPreset: string
-  onSelectPreset: (value: string) => void
+  selectedDockerfilePath?: string
+  onSelectPreset: (value: string, detected?: ProjectPresetResponse) => void
   disabled: boolean
   getPresetBySlug: (slug: string) => PresetResponse | undefined
 }) {
@@ -400,9 +422,17 @@ function DetectedPresetCard({
     const normalizedSelectedPath = normalizePath(selectedPath)
     return (
       project.preset === selectedSlug &&
-      normalizedPath === normalizedSelectedPath
+      normalizedPath === normalizedSelectedPath &&
+      (selectedDockerfilePath === undefined ||
+        isSameDockerfile(project.dockerfilePath, selectedDockerfilePath))
     )
-  }, [selectedPreset, project.preset, normalizedPath])
+  }, [
+    selectedPreset,
+    selectedDockerfilePath,
+    project.preset,
+    project.dockerfilePath,
+    normalizedPath,
+  ])
 
   const presetInfo = getPresetBySlug(project.preset)
   const fallbackPreset = getPresetBySlug('nixpacks')
@@ -412,7 +442,7 @@ function DetectedPresetCard({
   const projectType = presetInfo?.project_type || 'Server'
   const description = presetInfo?.description || 'Custom configuration'
   const pathLabel = project.path && project.path !== '.' ? project.path : './'
-  const onPick = () => onSelectPreset(presetKey)
+  const onPick = () => onSelectPreset(presetKey, project)
 
   return (
     <Card
@@ -463,7 +493,7 @@ function DetectedPresetCard({
                 className="mt-1 truncate text-xs text-muted-foreground"
                 title={project.dockerfilePath}
               >
-                Dockerfile detected in{' '}
+                Builds with{' '}
                 <span className="font-mono">{project.dockerfilePath}</span>
               </p>
             )}

@@ -108,12 +108,11 @@ function BuildConfigurationForm({
   const frameworkLabel =
     getPresetBySlug(values.preset)?.label || values.preset || 'None selected'
 
-  const handleFrameworkSelection = (selection: string) => {
-    const next = applyFrameworkSelection(
-      values,
-      selection,
-      detectedPresets ?? []
-    )
+  const handleFrameworkSelection = (
+    selection: string,
+    detected?: ProjectPresetResponse
+  ) => {
+    const next = applyFrameworkSelection(values, selection, detected)
     for (const name of Object.keys(next) as (keyof typeof next)[]) {
       if (next[name] !== values[name]) {
         form.setValue(name, next[name] as never, { shouldDirty: true })
@@ -180,6 +179,7 @@ function BuildConfigurationForm({
                   size="sm"
                   className="shrink-0"
                   aria-describedby="build-configuration-framework"
+                  disabled={busy}
                   onClick={() => setFrameworkOpen(true)}
                 >
                   Change
@@ -200,6 +200,7 @@ function BuildConfigurationForm({
                         field.onChange(event)
                         form.clearErrors('directory')
                       }}
+                      readOnly={busy}
                       placeholder="./"
                       className="font-mono text-sm"
                     />
@@ -230,6 +231,7 @@ function BuildConfigurationForm({
                         <Checkbox
                           className="mt-1"
                           checked={field.value}
+                          disabled={busy}
                           onCheckedChange={(checked) =>
                             field.onChange(checked === true)
                           }
@@ -263,6 +265,7 @@ function BuildConfigurationForm({
                       <FormControl>
                         <Input
                           {...field}
+                          readOnly={busy}
                           placeholder={DEFAULT_DOCKERFILE_PATH}
                           className="font-mono text-sm"
                         />
@@ -287,6 +290,7 @@ function BuildConfigurationForm({
                       <FormControl>
                         <Input
                           {...field}
+                          readOnly={busy}
                           placeholder={values.directory || './'}
                           className="font-mono text-sm"
                         />
@@ -313,6 +317,7 @@ function BuildConfigurationForm({
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         placeholder={DEFAULT_COMPOSE_PATH}
                         className="font-mono text-sm"
                       />
@@ -358,6 +363,11 @@ function BuildConfigurationForm({
             isRefreshing={isRefreshingDetection}
             error={detectionError}
             selectedPreset={presetSelectionKey(values.preset, values.directory)}
+            selectedDockerfilePath={
+              isDockerfilePreset(values.preset)
+                ? values.dockerfilePath
+                : undefined
+            }
             onSelectPreset={handleFrameworkSelection}
             onRefresh={onRefreshDetection}
           />

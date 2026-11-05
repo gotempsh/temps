@@ -160,7 +160,11 @@ test('re-clicking the current Dockerfile card leaves a custom path and nothing t
     ] as unknown as ProjectPresetResponse[],
   })
   fireEvent.click(screen.getByRole('button', { name: 'Change' }))
-  fireEvent.click(await screen.findByRole('button', { name: /Dockerfile/ }))
+  const current = await screen.findByRole('button', {
+    name: /docker\/custom\.Dockerfile/,
+    pressed: true,
+  })
+  fireEvent.click(current)
   await waitFor(() =>
     expect(screen.queryByText('Choose a framework')).toBeNull()
   )
@@ -168,6 +172,78 @@ test('re-clicking the current Dockerfile card leaves a custom path and nothing t
   expect(path.value).toBe('docker/custom.Dockerfile')
   expect(saveButton().disabled).toBe(true)
   expect(saves.length).toBe(0)
+})
+
+test('choosing the other Dockerfile at the same path stages that file', async () => {
+  const { saves } = setup({
+    project: {
+      preset: 'dockerfile',
+      directory: './',
+      preset_config: {
+        preset: 'dockerfile',
+        dockerfilePath: 'docker/Dockerfile',
+      },
+    } as never,
+    detected: [
+      {
+        preset: 'dockerfile',
+        presetLabel: 'Dockerfile',
+        path: './',
+        dockerfilePath: 'docker/Dockerfile',
+      },
+      {
+        preset: 'dockerfile',
+        presetLabel: 'Dockerfile',
+        path: './',
+        dockerfilePath: '.devcontainer/Dockerfile',
+      },
+    ] as unknown as ProjectPresetResponse[],
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Change' }))
+  const other = await screen.findByRole('button', {
+    name: /\.devcontainer\/Dockerfile/,
+    pressed: false,
+  })
+  expect(
+    screen.getAllByRole('button', { name: /Dockerfile/, pressed: true }).length
+  ).toBe(1)
+  fireEvent.click(other)
+  const path = (await screen.findByLabelText(
+    'Dockerfile path'
+  )) as HTMLInputElement
+  await waitFor(() => expect(path.value).toBe('.devcontainer/Dockerfile'))
+  await waitFor(() => expect(saveButton().disabled).toBe(false))
+  fireEvent.click(saveButton())
+  await waitFor(() => expect(saves.length).toBe(1))
+  expect(saves[0].preset_config?.dockerfilePath).toBe(
+    '.devcontainer/Dockerfile'
+  )
+})
+
+test('the form cannot be edited while a save is in flight', async () => {
+  let finish = () => {}
+  setup({
+    onSave: () =>
+      new Promise<void>((resolve) => {
+        finish = resolve
+      }),
+  })
+  const directory = screen.getByLabelText('Root directory') as HTMLInputElement
+  fireEvent.change(directory, { target: { value: './apps/admin' } })
+  await waitFor(() => expect(saveButton().disabled).toBe(false))
+  fireEvent.click(saveButton())
+  await waitFor(() => expect(directory.readOnly).toBe(true))
+  expect(
+    (screen.getByRole('button', { name: 'Change' }) as HTMLButtonElement)
+      .disabled
+  ).toBe(true)
+  expect(
+    screen
+      .getByLabelText('Pull only the root directory')
+      .hasAttribute('disabled')
+  ).toBe(true)
+  finish()
+  await waitFor(() => expect(directory.readOnly).toBe(false))
 })
 
 test('offers no clone option for an uploaded source', () => {

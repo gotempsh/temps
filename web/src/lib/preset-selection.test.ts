@@ -6,6 +6,8 @@ import {
   normalizePresetPath,
   presetConfigForSelection,
   presetSelectionKey,
+  detectedPresetsFromPublic,
+  isSameDockerfile,
   splitPresetSelection,
 } from './preset-selection'
 
@@ -142,5 +144,37 @@ describe('round trip', () => {
     const key = presetSelectionKey('dockerfile', 'examples/foo')
     expect(key).toBe(presetSelectionKey('dockerfile', './examples/foo'))
     expect(splitPresetSelection(key).directory).toBe('./examples/foo')
+  })
+})
+
+describe('isSameDockerfile', () => {
+  test('treats blank as the default file and ignores a leading ./', () => {
+    expect(isSameDockerfile(undefined, 'Dockerfile')).toBe(true)
+    expect(isSameDockerfile(' ', null)).toBe(true)
+    expect(isSameDockerfile('./docker/Dockerfile', 'docker/Dockerfile')).toBe(
+      true
+    )
+    expect(isSameDockerfile('docker/api/Dockerfile', 'Dockerfile')).toBe(false)
+  })
+})
+
+describe('detectedPresetsFromPublic', () => {
+  test('keeps the detected file of a Dockerfile and of a Compose project', () => {
+    expect(
+      detectedPresetsFromPublic([
+        {
+          preset: 'dockerfile',
+          preset_label: 'Dockerfile',
+          path: './',
+          dockerfile_path: 'docker/Dockerfile',
+          compose_files: ['compose.yaml'],
+        } as never,
+      ])[0]
+    ).toMatchObject({
+      preset: 'dockerfile',
+      presetLabel: 'Dockerfile',
+      dockerfilePath: 'docker/Dockerfile',
+      composeFiles: ['compose.yaml'],
+    })
   })
 })
