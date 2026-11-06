@@ -58,10 +58,12 @@ export function WalHealthPanel({
   })
 
   const snapshot = data?.wal_health ?? null
+  const notChecked = data?.not_checked ?? null
   const incompatible = backupCapability.data?.cloud_backup_compatible === false
   const archivingDisabled = snapshot?.archive_mode === 'off' && !incompatible
   if (
     (!snapshot || snapshot.warnings.length === 0) &&
+    !notChecked &&
     !incompatible &&
     !archivingDisabled &&
     !backupCapability.isError
@@ -74,6 +76,28 @@ export function WalHealthPanel({
 
   return (
     <div className="space-y-3">
+      {notChecked ? (
+        <Alert>
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            <div className="flex items-baseline justify-between gap-3">
+              <p className="font-medium">WAL health is not being checked</p>
+              {notChecked.checked_at ? (
+                <p className="text-xs text-muted-foreground">
+                  Last tried <TimeAgo date={notChecked.checked_at} />
+                </p>
+              ) : null}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {notChecked.reason}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Until it is, this page cannot warn you when WAL fills the disk
+              or archiving stops.
+            </p>
+          </AlertDescription>
+        </Alert>
+      ) : null}
       {backupCapability.isError ? (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />

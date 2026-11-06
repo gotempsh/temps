@@ -89,3 +89,36 @@ describe('post-restore WAL archiving guidance', () => {
     expect(markup).not.toContain('discards WAL')
   })
 })
+
+describe('a database whose WAL health is not checked', () => {
+  test('the panel says so and why, instead of showing nothing', () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    })
+    client.setQueryData(['wal-health', 7], {
+      wal_health: null,
+      not_checked: {
+        reason:
+          'WAL health is not checked for this database: the agent on node worker-3 (id 3) does not support the WAL probe; update the agent on node worker-3 to this release',
+        checked_at: '2026-01-01T00:00:00Z',
+      },
+    })
+    client.setQueryData(
+      getExternalServiceBackupCapabilityQueryKey({ path: { id: 7 } }),
+      {
+        cloud_backup_compatible: true,
+        artifact: 'walg_repository',
+        engine: 'postgres_walg',
+        verified: true,
+        wal_g_installed: true,
+      } satisfies ExternalServiceBackupCapabilityResponse
+    )
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel serviceId={7} serviceType="postgres" />
+      </QueryClientProvider>
+    )
+    expect(markup).toContain('WAL health is not being checked')
+    expect(markup).toContain('update the agent on node worker-3')
+  })
+})

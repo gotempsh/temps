@@ -144,7 +144,11 @@ function MemberRow({
           <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
             {member.role}
           </Badge>
-          <StatusDot status={status} live={isLive} />
+          <StatusDot
+            status={status}
+            live={isLive}
+            unknown={Boolean(member.unavailable_reason)}
+          />
           <LimitsInline limits={member.resource_limits} />
         </div>
 
@@ -162,6 +166,11 @@ function MemberRow({
           </div>
         )}
       </div>
+
+      <UnavailableNote
+        runtimeReason={member.unavailable_reason}
+        statsReason={stats?.unavailable_reason}
+      />
 
       {/* Started + restart counter — third-tier metadata, only shown when
           there's a signal worth surfacing (started_at or non-zero restarts). */}
@@ -203,21 +212,61 @@ function MemberRow({
   )
 }
 
+/**
+ * Why the runtime state or the usage meters are empty, when the server could
+ * not read them: the container runs on a worker whose agent is unreachable or
+ * too old, or this server has no Docker daemon. Without it, an empty row
+ * reads as "container missing", which is wrong.
+ */
+export function UnavailableNote({
+  runtimeReason,
+  statsReason,
+}: {
+  runtimeReason?: string | null
+  statsReason?: string | null
+}) {
+  const reasons = [runtimeReason, statsReason].filter(
+    (reason, index, all): reason is string =>
+      Boolean(reason) && all.indexOf(reason) === index
+  )
+  if (reasons.length === 0) return null
+  return (
+    <Alert>
+      <AlertTriangle className="h-4 w-4" />
+      <AlertTitle>
+        {runtimeReason
+          ? 'Container state unavailable'
+          : 'Resource usage unavailable'}
+      </AlertTitle>
+      <AlertDescription>
+        {reasons.map((reason) => (
+          <p key={reason} className="text-xs">
+            {reason}
+          </p>
+        ))}
+      </AlertDescription>
+    </Alert>
+  )
+}
+
 // Tiny status pill — saves the horizontal space a full Badge eats. When
 // `live` is set on a running container the dot pulses, replacing the
 // separate "live" indicator the old card header used to show.
 function StatusDot({
   status,
   live = false,
+  unknown = false,
 }: {
   status: string | null
   live?: boolean
+  /** The state could not be read, so an empty status is not "missing". */
+  unknown?: boolean
 }) {
   if (!status) {
     return (
       <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
         <span className="size-1.5 rounded-full bg-muted-foreground/40" />
-        missing
+        {unknown ? 'unknown' : 'missing'}
       </span>
     )
   }
