@@ -249,6 +249,28 @@ async fn bitbucket_webhook_events(
         });
     }
 
+    // The first change is dispatched below; a push can delete more branches.
+    if is_push {
+        for branch in later_deleted_branches(&payload) {
+            if let Err(e) = state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(
+                    branch,
+                    temps_core::PreviewBranchCloseReason::BranchDeleted,
+                    authorized_projects.clone(),
+                )
+                .await
+            {
+                error!(
+                    hook_uuid = %hook_uuid,
+                    repo_owner = %repo_owner,
+                    repo_name = %repo_name,
+                    "Failed to queue preview teardown for a deleted Bitbucket branch: {:?}", e
+                );
+            }
+        }
+    }
+
     // Dispatch only to projects authenticated by the matched delivery token.
     let triggered = match state
         .git_provider_manager
@@ -364,6 +386,35 @@ fn closed_pull_request(
 
 /// The commit Git and the other providers report for a deleted ref.
 const DELETED_REF_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// Branches deleted by every change after the first in a Bitbucket push.
+fn later_deleted_branches(payload: &serde_json::Value) -> Vec<String> {
+    let Some(changes) = payload
+        .get("push")
+        .and_then(|p| p.get("changes"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut branches = Vec::new();
+    for change in changes.iter().skip(1) {
+        if change.get("new").is_some_and(|r| !r.is_null()) {
+            continue;
+        }
+        let Some(old) = change.get("old") else {
+            continue;
+        };
+
+        if old.get("type").and_then(|v| v.as_str()) == Some("tag") {
+            continue;
+        }
+        if let Some(name) = old.get("name").and_then(|v| v.as_str()) {
+            branches.push(name.to_string());
+        }
+    }
+    branches
+}
 
 /// Extract the git ref and commit SHA from a Bitbucket push payload.
 ///
@@ -810,5 +861,25 @@ mod tests {
             extract_push_ref_and_commit(&payload),
             ("refs/tags/v1.0.0".to_string(), DELETED_REF_SHA.to_string())
         );
+    }
+
+    /// The first change goes through the push path; every later deleted
+    /// branch is retired too, while later tags and updates are left alone.
+    #[test]
+    fn later_deleted_branches_skip_the_first_change_tags_and_updates() {
+        let payload = serde_json::json!({
+            "push": { "changes": [
+                { "new": null, "old": { "type": "branch", "name": "first" } },
+                { "new": { "type": "branch", "name": "updated", "target": { "hash": "abc" } },
+                  "old": { "type": "branch", "name": "updated" } },
+                { "new": null, "old": { "type": "tag", "name": "v1.0.0" } },
+                { "new": null, "old": { "type": "branch", "name": "feature/second" } }
+            ]}
+        });
+        assert_eq!(
+            later_deleted_branches(&payload),
+            vec!["feature/second".to_string()]
+        );
+        assert!(later_deleted_branches(&serde_json::json!({})).is_empty());
     }
 }
