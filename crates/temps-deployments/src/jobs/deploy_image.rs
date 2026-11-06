@@ -2383,16 +2383,14 @@ impl DeployImageJob {
                     ),
                 )
                 .await?;
-                self.transfer_image_via_import(
-                    image_tag,
-                    Some(&verified_image_id),
-                    remote,
-                    node_name,
-                    context,
-                )
-                .await?;
                 return self
-                    .verify_imported_image_platform(image_tag, remote, node_name, context)
+                    .transfer_image_via_import(
+                        image_tag,
+                        Some(&verified_image_id),
+                        remote,
+                        node_name,
+                        context,
+                    )
                     .await;
             }
             DeployImageSource::ControlPlaneLocal => {
@@ -2420,8 +2418,6 @@ impl DeployImageJob {
         }
 
         self.transfer_image_via_import(image_tag, None, remote, node_name, context)
-            .await?;
-        self.verify_imported_image_platform(image_tag, remote, node_name, context)
             .await
     }
 
@@ -2492,6 +2488,9 @@ impl DeployImageJob {
     /// With `expected_image_id`, the exported archive itself must contain that
     /// image: the tag is re-resolved by `docker save`, so a re-point between
     /// verification and export would otherwise ship a different image.
+    ///
+    /// Every import ends with [`Self::verify_imported_image_platform`], so no
+    /// caller can deliver an image the node cannot run.
     async fn transfer_image_via_import(
         &self,
         image_tag: &str,
@@ -2585,7 +2584,8 @@ impl DeployImageJob {
         )
         .await?;
 
-        Ok(())
+        self.verify_imported_image_platform(image_tag, remote, node_name, context)
+            .await
     }
 
     /// Write log message to both job-specific log file and context log writer
