@@ -14,6 +14,7 @@ import { Toaster, toast } from 'sonner'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { CancelRunButton } from './CancelRunButton'
+import { useCancelRun } from './useCancelRun'
 
 installBrowserWindow()
 afterEach(() => {
@@ -22,6 +23,17 @@ afterEach(() => {
 })
 
 const CANCEL = 'POST /projects/3/agents/runs/17/cancel'
+
+/** Wired the way the run page wires it: the page owns the mutation. */
+function RunPageCancel({ onCancelled }: { onCancelled: () => void }) {
+  const cancel = useCancelRun(3, 17, onCancelled)
+  return (
+    <CancelRunButton
+      pending={cancel.isPending}
+      onCancel={() => cancel.mutate()}
+    />
+  )
+}
 
 test('a pending cancel keeps the button focused and ignores further clicks', async () => {
   let release: (response: Response) => void = () => {}
@@ -37,11 +49,7 @@ test('a pending cancel keeps the button focused and ignores further clicks', asy
   })
   const view = render(
     <QueryClientProvider client={client}>
-      <CancelRunButton
-        projectId={3}
-        runId={17}
-        onCancelled={() => (reloads += 1)}
-      />
+      <RunPageCancel onCancelled={() => (reloads += 1)} />
       <Toaster />
     </QueryClientProvider>
   )
@@ -68,4 +76,16 @@ test('a pending cancel keeps the button focused and ignores further clicks', asy
   })
   await waitFor(() => expect(reloads).toBe(1))
   api.restore()
+})
+
+test('a pending cancel ignores clicks without the page having to guard them', () => {
+  let cancels = 0
+  const view = render(
+    <CancelRunButton pending onCancel={() => (cancels += 1)} />
+  )
+  const button = view.getByRole('button', { name: 'Cancel' })
+  fireEvent.click(button)
+  expect(cancels).toBe(0)
+  expect(button.getAttribute('aria-disabled')).toBe('true')
+  expect((button as HTMLButtonElement).disabled).toBe(false)
 })
