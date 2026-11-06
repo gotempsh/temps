@@ -1970,9 +1970,11 @@ pub struct UpdateCapabilityResponse {
     /// Version tag of the running binary. Always present — the version page
     /// needs it whether or not an update exists.
     pub current_version: String,
-    /// What a new worker installs so it never runs an older Temps than this
-    /// server: this release, or the newest nightly build for a build made
-    /// between releases.
+    /// What a new worker installs to match this server: this release, or,
+    /// for a build made between releases (which no release contains), the
+    /// newest nightly build. Nightly builds are cut daily from `main`, so a
+    /// server built from commits newer than the latest nightly, or from a
+    /// branch that never reached `main`, can get a worker without them.
     pub worker_install: temps_core::worker_install::WorkerInstall,
     /// Channel actually tracked, after applying the configured override or
     /// falling back to inference from the running version tag.

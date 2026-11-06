@@ -73865,7 +73865,7 @@
           },
           "worker_install": {
             "$ref": "#/components/schemas/WorkerInstall",
-            "description": "What a new worker installs so it never runs an older Temps than this\nserver: this release, or the newest nightly build for a build made\nbetween releases."
+            "description": "What a new worker installs to match this server: this release, or,\nfor a build made between releases (which no release contains), the\nnewest nightly build. Nightly builds are cut daily from `main`, so a\nserver built from commits newer than the latest nightly, or from a\nbranch that never reached `main`, can get a worker without them."
           }
         },
         "required": [
@@ -79837,7 +79837,7 @@
         "type": "object"
       },
       "WorkerInstall": {
-        "description": "What a new worker installs, so it never runs an older Temps than its\ncontrol plane.",
+        "description": "What a new worker installs to match its control plane, as closely as a\npublished build allows.",
         "oneOf": [
           {
             "description": "Exactly the release this control plane runs.",
@@ -79860,7 +79860,7 @@
             "type": "object"
           },
           {
-            "description": "The newest nightly build. This control plane runs a build made after\nrelease `after` and before the next one: no release contains it, and\n`after` is older. Nightly builds are cut every day from `main`, so\nthe newest one contains every change merged before it was cut.",
+            "description": "The newest nightly build. This control plane runs a build made after\nrelease `after` and before the next one: no release contains it, and\n`after` is older. Nightly builds are cut every day from `main`, so\nthe newest one contains every change merged before it was cut, but\nnot commits made since, nor a branch that never reached `main`.",
             "properties": {
               "after": {
                 "example": "v0.1.0-beta.61",

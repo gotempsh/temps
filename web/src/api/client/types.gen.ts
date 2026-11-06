@@ -34931,9 +34931,11 @@ export type UpdateCapabilityResponse = {
      */
     supervisor: SupervisorKind;
     /**
-     * What a new worker installs so it never runs an older Temps than this
-     * server: this release, or the newest nightly build for a build made
-     * between releases.
+     * What a new worker installs to match this server: this release, or,
+     * for a build made between releases (which no release contains), the
+     * newest nightly build. Nightly builds are cut daily from `main`, so a
+     * server built from commits newer than the latest nightly, or from a
+     * branch that never reached `main`, can get a worker without them.
      */
     worker_install: WorkerInstall;
 };
@@ -37427,8 +37429,8 @@ export type WireguardMeshStatusResponse = {
 };
 
 /**
- * What a new worker installs, so it never runs an older Temps than its
- * control plane.
+ * What a new worker installs to match its control plane, as closely as a
+ * published build allows.
  */
 export type WorkerInstall = {
     kind: 'release';
