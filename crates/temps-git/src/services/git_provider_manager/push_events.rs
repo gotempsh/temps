@@ -23,10 +23,11 @@ impl GitProviderManager {
         // "Failed to checkout ref 0000000...". Retiring the branch's preview
         // needs the projects that authenticated the delivery, which this
         // repository-wide lookup does not have, so receivers route deletions
-        // through `handle_push_event_for_projects` instead.
-        if Self::is_ref_deletion(&commit) {
+        // through `handle_push_event_for_projects` instead. A push with no
+        // commit at all has nothing to deploy either.
+        if commit.is_empty() || Self::is_ref_deletion(&commit) {
             tracing::info!(
-                "Ignoring push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                "Ignoring push event for {}/{} with a null or missing SHA, branch: {:?}, tag: {:?}",
                 owner,
                 repo,
                 branch,
@@ -146,6 +147,17 @@ impl GitProviderManager {
         commit: String,
         matching_projects: Vec<projects::Model>,
     ) -> Result<usize, GitProviderManagerError> {
+        // A payload with no commit names nothing to deploy and is not a
+        // deletion either: it must never retire a preview.
+        if commit.is_empty() {
+            tracing::info!(
+                "Ignoring push event with no commit SHA, branch: {:?}, tag: {:?}",
+                branch,
+                tag
+            );
+            return Ok(0);
+        }
+
         // Branch/tag deletions send the all-zeros "null SHA" in the `after`
         // field. There is no commit to deploy; a deleted branch retires its
         // preview instead.
@@ -263,10 +275,10 @@ impl GitProviderManager {
             .await?)
     }
 
-    /// Whether `commit` is the all-zeros (or missing) SHA providers send for
-    /// a deleted branch or tag.
+    /// Whether `commit` is the all-zeros SHA providers send for a deleted
+    /// branch or tag. A missing (empty) commit is not a deletion.
     pub fn is_ref_deletion(commit: &str) -> bool {
-        commit.chars().all(|c| c == '0')
+        !commit.is_empty() && commit.chars().all(|c| c == '0')
     }
 
     /// Retire the preview of `branch` on each of the authenticated `projects`.
@@ -415,14 +427,14 @@ mod tests {
             .collect()
     }
 
-    /// A deleted branch arrives as a push to the all-zeros SHA (or, from some
-    /// providers, an empty one). It deploys nothing and retires the branch's
+    /// A deleted branch arrives as a push to the all-zeros SHA. It deploys
+    /// nothing and retires the branch's
     /// preview on each Git-sourced project that authenticated the delivery.
     #[tokio::test]
     async fn deleting_a_branch_queues_preview_teardown_instead_of_a_deploy() {
         use sea_orm::{DatabaseBackend, MockDatabase};
 
-        for commit in ["0000000000000000000000000000000000000000", ""] {
+        for commit in ["0000000000000000000000000000000000000000", "0000000"] {
             let mut image_project = github_repo_project(2, None);
             image_project.source_type = SourceType::DockerImage;
             let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
@@ -493,6 +505,27 @@ mod tests {
             assert!(log.contains(clause), "missing {clause} in {log}");
         }
         assert!(log.contains("Int(Some(7))"), "{log}");
+    }
+
+    /// A payload that names a branch but no commit (a generic webhook with
+    /// the commit left out) is not a deletion: it deploys nothing and must
+    /// not retire the branch's preview.
+    #[tokio::test]
+    async fn a_push_without_a_commit_retires_nothing() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let queued = manager(db, Arc::new(PanicOnSendJobQueue))
+            .handle_push_event_for_projects(
+                Some("feature/login".into()),
+                None,
+                String::new(),
+                vec![github_repo_project(1, None)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
+        assert!(!GitProviderManager::is_ref_deletion(""));
     }
 
     #[tokio::test]

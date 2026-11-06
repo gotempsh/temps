@@ -373,6 +373,9 @@ fn closed_pull_request(
     Some((branch, reason))
 }
 
+/// The commit Git and the other providers report for a deleted ref.
+const DELETED_REF_SHA: &str = "0000000000000000000000000000000000000000";
+
 /// Extract the git ref and commit SHA from a Bitbucket push payload.
 ///
 /// Bitbucket push payload structure:
@@ -393,7 +396,7 @@ fn closed_pull_request(
 /// Returns `(ref_string, commit_sha)` where `ref_string` is in
 /// `refs/heads/{branch}` form for branches or `refs/tags/{tag}` for tags.
 /// A deleted ref has `"new": null`; its name then comes from `old` and the
-/// commit SHA is empty.
+/// commit is the all-zeros SHA other providers send for a deletion.
 fn extract_push_ref_and_commit(payload: &serde_json::Value) -> (String, String) {
     let changes = payload
         .get("push")
@@ -412,7 +415,7 @@ fn extract_push_ref_and_commit(payload: &serde_json::Value) -> (String, String) 
                 Some("tag") => format!("refs/tags/{}", name),
                 _ => format!("refs/heads/{}", name),
             };
-            return (git_ref, String::new());
+            return (git_ref, DELETED_REF_SHA.to_string());
         }
     }
 
@@ -776,7 +779,7 @@ mod tests {
     }
 
     /// A deleted branch has `"new": null`; its name comes from `old` and the
-    /// empty commit marks it as a deletion downstream.
+    /// all-zeros commit marks it as a deletion downstream.
     #[test]
     fn a_deleted_branch_push_names_the_old_ref_with_no_commit() {
         let payload = serde_json::json!({
@@ -787,7 +790,10 @@ mod tests {
         });
         assert_eq!(
             extract_push_ref_and_commit(&payload),
-            ("refs/heads/feature/login".to_string(), String::new())
+            (
+                "refs/heads/feature/login".to_string(),
+                DELETED_REF_SHA.to_string()
+            )
         );
 
         let payload = serde_json::json!({
@@ -795,7 +801,7 @@ mod tests {
         });
         assert_eq!(
             extract_push_ref_and_commit(&payload),
-            ("refs/tags/v1.0.0".to_string(), String::new())
+            ("refs/tags/v1.0.0".to_string(), DELETED_REF_SHA.to_string())
         );
     }
 }

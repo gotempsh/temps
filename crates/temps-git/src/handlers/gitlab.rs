@@ -268,19 +268,7 @@ async fn gitlab_webhook_events(
         None
     };
 
-    let commit = payload
-        .get("checkout_sha")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("commits")
-                .and_then(|cs| cs.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|c| c.get("id"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
+    let commit = pushed_commit(&payload);
 
     // Find all Temps projects matching this repo.
     let matching_projects = match projects::Entity::find()
@@ -480,6 +468,25 @@ async fn gitlab_oauth_callback(
     Ok(Redirect::to(&redirect_url))
 }
 
+/// The commit a push delivery names. A deleted branch or tag has a null
+/// `checkout_sha` and no commits; its `after` is then the all-zeros SHA,
+/// which marks the deletion downstream.
+fn pushed_commit(payload: &serde_json::Value) -> String {
+    let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
+    field("checkout_sha")
+        .or_else(|| {
+            payload
+                .get("commits")
+                .and_then(|cs| cs.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| field("after"))
+        .unwrap_or("")
+        .to_string()
+}
+
 /// The source branch of a merge request this delivery reports as closed or
 /// merged, and which of the two. `None` for any other event, and for a merge
 /// request from a fork: its branch lives in another project, so a same-named
@@ -662,5 +669,28 @@ mod tests {
             None
         );
         assert_eq!(super::closed_merge_request(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_deleted_branch_push_reports_the_null_sha() {
+        let deletion = serde_json::json!({
+            "ref": "refs/heads/feature/login",
+            "before": "abc123",
+            "after": "0000000000000000000000000000000000000000",
+            "checkout_sha": null,
+            "commits": []
+        });
+        assert_eq!(
+            super::pushed_commit(&deletion),
+            "0000000000000000000000000000000000000000"
+        );
+
+        let push = serde_json::json!({
+            "after": "def456",
+            "checkout_sha": "def456",
+            "commits": [{ "id": "def456" }]
+        });
+        assert_eq!(super::pushed_commit(&push), "def456");
+        assert_eq!(super::pushed_commit(&serde_json::json!({})), "");
     }
 }
