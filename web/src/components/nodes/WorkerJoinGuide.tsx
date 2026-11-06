@@ -90,12 +90,10 @@ import {
 } from '@/lib/wireguard-mesh'
 import { AGENT_SERVICE_COMMAND, installCommand } from '@/lib/worker-join-script'
 import { usePlaneRelease } from '@/hooks/usePlaneRelease'
-import { UnpinnedInstallNote } from '@/components/nodes/WorkerJoinScript'
-
-// A pairing's join command comes from the server and calls `temps` from
-// PATH, so its install step stays the plain installer.
-const PAIRING_INSTALL_COMMAND = 'curl -fsSL https://temps.sh/install.sh | bash'
-const PAIRING_AGENT_SERVICE_COMMAND = 'temps agent service install'
+import {
+  UnpinnedInstallNote,
+  WorkerJoinScript,
+} from '@/components/nodes/WorkerJoinScript'
 const WITHOUT_SYSTEMD = (
   <>
     Without systemd, run <code>temps agent</code> under your own supervisor
@@ -764,6 +762,12 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         server — for example this server runs on a laptop or behind NAT. This
         server dials the worker; no private key leaves either machine.
       </p>
+      <p className="text-xs">
+        For a Linux worker. A Mac cannot be paired: its end of the mesh runs
+        inside its Docker app, which nothing can dial. Add a Mac with{' '}
+        <strong>Add worker</strong> and choose <strong>Mac</strong>; it dials
+        this server instead.
+      </p>
       <Step number={1} title="Open the mesh port on the worker">
         <p className="mt-1">
           Allow UDP <code>{mesh.listen_port}</code> in on the worker (your
@@ -771,10 +775,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           needs to reach out.
         </p>
       </Step>
-      <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={PAIRING_INSTALL_COMMAND} />
-      </Step>
-      <Step number={3} title="Create the pairing">
+      <Step number={2} title="Create the pairing">
         <form
           className="mt-2 grid gap-2 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
           onSubmit={(event) => {
@@ -847,6 +848,9 @@ function CreatedPairing({
 }) {
   const { data } = usePairings()
   const now = useNow(15_000)
+  // The server pins the command to the release it runs; this reads the
+  // same version to say which one, as the Add worker panel does.
+  const release = usePlaneRelease()
   const listed = data?.pairings.find((pairing) => pairing.id === created.id)
   const pairing = pairingAsOf(listed ?? created, now)
   const { label, tone, hint } = pairingProgress(pairing)
@@ -858,7 +862,7 @@ function CreatedPairing({
 
   if (pairingEnded(pairing)) {
     return (
-      <Step number={4} title={`Run the pairing command on ${pairing.name}`}>
+      <Step number={3} title={`Run the pairing command on ${pairing.name}`}>
         <Alert className="mt-1 border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
           <AlertTitle className="text-amber-700 dark:text-amber-400">
@@ -902,20 +906,30 @@ function CreatedPairing({
 
   if (pairing.status === 'completed') {
     return (
-      <Step number={4} title={`Start the agent on ${pairing.name}, as root`}>
+      <Step number={3} title={`${pairing.name} joined`}>
         <div className="mt-1 flex items-center gap-2">
           <CheckCircle2 className="h-4 w-4 text-green-600" />
           <span>{pairing.name} is on the mesh.</span>
           {badge}
         </div>
-        <CommandLine command={PAIRING_AGENT_SERVICE_COMMAND} />
+        <p className="mt-1 text-xs">
+          The command starts the agent service once the worker has joined. If it
+          stopped before that, start it on the worker with:
+        </p>
+        <CommandLine command={AGENT_SERVICE_COMMAND} />
       </Step>
     )
   }
 
   return (
-    <Step number={4} title={`Run this on ${pairing.name}, as root`}>
-      <CommandLine command={command} />
+    <Step number={3} title={`Run this on ${pairing.name}`}>
+      <div className="mt-1">
+        <WorkerJoinScript
+          command={command}
+          pinnedTo={release.tag}
+          pending={release.pending}
+        />
+      </div>
       <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
         {badge}
         <span>
@@ -928,16 +942,15 @@ function CreatedPairing({
         </p>
       )}
       <p className="mt-1 text-xs">
-        It holds a one-time secret and is shown only now. It waits until this
-        server reaches it at <code>{pairing.node_endpoint}</code>, brings the
-        mesh up and registers. Then start the worker with{' '}
-        <code>{PAIRING_AGENT_SERVICE_COMMAND}</code>.
+        It holds a one-time secret and is shown only now. It installs Temps,
+        then waits until this server reaches it at{' '}
+        <code>{pairing.node_endpoint}</code>, brings the mesh up and registers,
+        then starts the agent service.
       </p>
       <p className="mt-1 text-xs">
-        The code is piped to <code>temps join --pair -</code> so it never shows
-        in the process list, and the leading space keeps the line out of the
-        shell history. Not in a root shell? Put <code>sudo</code> right before{' '}
-        <code>temps join</code>, after the <code>|</code>.
+        The code is piped to <code>temps join --pair -</code>, so it never shows
+        in the process list or in sudo&apos;s log, and the leading space keeps
+        the command out of the shell history.
       </p>
     </Step>
   )

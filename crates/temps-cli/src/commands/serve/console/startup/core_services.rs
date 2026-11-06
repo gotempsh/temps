@@ -127,6 +127,12 @@ pub(super) async fn register_core_services(
     // Registered behind the trait so temps-config depends only on the
     // temps-core contract, never on the CLI crate that implements it.
     service_context.register_service(self_updater.clone() as Arc<dyn temps_core::SelfUpdater>);
+    // The version this binary was built as, so the commands the server
+    // generates for a new worker (the pairing command) install the release
+    // it runs, as the console's Add worker panel does.
+    service_context.register_service(Arc::new(temps_core::worker_install::PlaneBuild::new(env!(
+        "TEMPS_VERSION"
+    ))));
     // Traefik label discovery status, resolved in serve/mod.rs. Pre-registered
     // before any plugin runs so DeploymentsPlugin's `/traefik-discovery/*`
     // handlers report this process's real state instead of falling back to a

@@ -2,14 +2,46 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import golden from './worker-install.golden.json'
 import {
   AGENT_SERVICE_COMMAND,
   asRootTemps,
+  INSTALLER_URL,
   installCommand,
   releaseTag,
+  ROOT_TEMPS_BIN,
   shellWord,
+  USER_TEMPS_BIN,
+  userInstallCommand,
   workerJoinScript,
 } from './worker-join-script'
+
+// The server's pairing command (crates/temps-core/src/worker_install.rs) is
+// tested against the same file, so the two renderers cannot drift.
+describe('the commands shared with the server', () => {
+  test('install exactly as the golden file says', () => {
+    expect(INSTALLER_URL).toBe(golden.installer_url)
+    expect(ROOT_TEMPS_BIN).toBe(golden.root_temps_bin)
+    expect(USER_TEMPS_BIN).toBe(golden.user_temps_bin)
+    expect(golden.installs.length).toBeGreaterThan(0)
+    for (const { tag, linux, mac } of golden.installs) {
+      expect(installCommand(tag)).toBe(linux)
+      expect(userInstallCommand(tag)).toBe(mac)
+    }
+    for (const { args, command } of golden.as_root_temps) {
+      expect(asRootTemps(args)).toBe(command)
+    }
+  })
+
+  test('pin the same release tags', () => {
+    for (const [version, tag] of golden.release_tags.pinned) {
+      expect(releaseTag(version)).toBe(tag)
+    }
+    for (const version of golden.release_tags.not_pinned) {
+      expect(releaseTag(version)).toBeNull()
+    }
+  })
+})
 
 describe('releaseTag', () => {
   test('keeps the release tags the installer can download', () => {

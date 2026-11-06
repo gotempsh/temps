@@ -26,6 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::worker_install::{linux_pairing_command, PlaneBuild};
 use temps_core::{
     AuditContext, AuditLogger, RequestMetadata, SensitiveAction, SensitiveActionAuthorizer,
 };
@@ -46,6 +47,8 @@ pub struct NodePairingAdminState {
     pub pairing_service: Arc<NodePairingAdminService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub sensitive_action_authorizer: Arc<dyn SensitiveActionAuthorizer>,
+    /// The version this server runs: the join command installs it.
+    pub plane_build: Arc<PlaneBuild>,
 }
 
 /// Start pairing a node.
@@ -107,7 +110,7 @@ impl From<node_pairings::Model> for NodePairingResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreateNodePairingResponse {
     pub pairing: NodePairingResponse,
-    /// Run this on the node, as root. It pipes the pairing code into `temps join --pair -`, so the code stays out of the process list and shell history.
+    /// Run this on the node (a Linux machine; it uses sudo where it needs root). It installs Temps pinned to the release this server runs, pipes the pairing code into `temps join --pair -` (so the code stays out of the process list, sudo's log and the shell history), then installs the agent service.
     pub join_command: String,
 }
 
@@ -316,30 +319,18 @@ pub async fn create_node_pairing(
         StatusCode::CREATED,
         [(header::CACHE_CONTROL, "no-store")],
         Json(CreateNodePairingResponse {
-            join_command: join_command(code.as_str()),
+            join_command: join_command(code.as_str(), &state.plane_build),
             pairing: pairing.into(),
         }),
     ))
 }
 
-/// The one command the operator pastes on the node for pairing `code`.
-///
-/// The code is a secret for up to the pairing's TTL, so it never goes in a
-/// process's argv: `temps join --pair <code>` would leave it readable by
-/// every local user in `/proc/<pid>/cmdline` for as long as the join waits.
-/// `printf` is a builtin in every POSIX shell, so the code reaches
-/// `temps join --pair -` through a pipe and no process is started with it.
-/// `printf` rather than a `<<<` here-string, which dash lacks.
-///
-/// The leading space keeps the line out of the shell history where the
-/// shell honours it (bash with `HISTCONTROL=ignorespace`/`ignoreboth`, the
-/// Debian/Ubuntu default, zsh with `HIST_IGNORE_SPACE`); the code is
-/// single-use and expires either way.
-fn join_command(code: &str) -> String {
-    // A code is `tpair1.` + base64url and never holds a quote; escape one
-    // anyway so the command can never break out of its quoting.
-    let quoted = code.replace('\'', r"'\''");
-    format!(r" printf '%s\n' '{quoted}' | temps join --pair -")
+/// The one command the operator pastes on the node for pairing `code`: the
+/// console's Add worker command for Linux (see
+/// [`temps_core::worker_install`]), pinned to the release this server runs,
+/// with the code piped to `temps join --pair -`.
+fn join_command(code: &str, plane_build: &PlaneBuild) -> String {
+    linux_pairing_command(code, plane_build.release_tag().as_deref())
 }
 
 /// Create a pairing for a node at `node_endpoint` and record it in the audit
@@ -583,6 +574,9 @@ mod tests {
         settings
     }
 
+    /// The `TEMPS_VERSION` of a release build of the test server.
+    const PLANE_VERSION: &str = "v0.1.0-beta.60 (abc1234) built 2026-11-06 08:00:00 UTC";
+
     fn app(
         db: DatabaseConnection,
         tokens_db: DatabaseConnection,
@@ -601,6 +595,7 @@ mod tests {
             )),
             audit_service: audit,
             sensitive_action_authorizer: authorizer,
+            plane_build: Arc::new(PlaneBuild::new(PLANE_VERSION)),
         };
         Router::new()
             .route(
@@ -769,11 +764,23 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-store")
         );
+        // The console's Add worker command for Linux, pinned to the
+        // release this server runs, with the code piped to the join.
         let command = body["join_command"].as_str().unwrap_or_default();
+        let lines: Vec<&str> = command.lines().collect();
+        assert_eq!(lines.len(), 3, "{command}");
+        assert_eq!(
+            lines[0],
+            " (set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-beta.60) && \\"
+        );
         assert!(
-            command.starts_with(r" printf '%s\n' 'tpair1.")
-                && command.ends_with("' | temps join --pair -"),
-            "{body}"
+            lines[1].starts_with(r"printf '%s\n' 'tpair1.")
+                && lines[1].ends_with("' | sudo -H /root/.temps/bin/temps join --pair - && \\"),
+            "{command}"
+        );
+        assert_eq!(
+            lines[2],
+            "sudo -H /root/.temps/bin/temps agent service install"
         );
         assert_eq!(body["pairing"]["id"], 5);
 
@@ -785,24 +792,21 @@ mod tests {
     }
 
     #[test]
-    fn the_join_command_keeps_the_code_out_of_argv_and_history() {
-        let command = join_command("tpair1.abc-_9");
+    fn the_join_command_pins_the_release_this_server_runs() {
+        let release = PlaneBuild::new(PLANE_VERSION);
         assert_eq!(
-            command,
-            r" printf '%s\n' 'tpair1.abc-_9' | temps join --pair -"
+            join_command("tpair1.abc-_9", &release),
+            linux_pairing_command("tpair1.abc-_9", Some("v0.1.0-beta.60"))
         );
-        // The only process started is `temps`, and the code is not among
-        // its arguments.
-        let joined = command.rsplit('|').next().unwrap_or_default();
-        assert!(!joined.contains("tpair1"), "{command}");
-        assert!(command.starts_with(' '), "{command}");
-    }
-
-    #[test]
-    fn a_quote_in_a_code_cannot_break_out_of_the_command() {
-        assert_eq!(
-            join_command("a'b"),
-            r" printf '%s\n' 'a'\''b' | temps join --pair -"
+        // A development build has no release to download: the newest
+        // stable one, as before the command was pinned.
+        let dev = PlaneBuild::new("dev");
+        assert!(
+            join_command("tpair1.abc", &dev).starts_with(
+                " (set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash) && "
+            ),
+            "{}",
+            join_command("tpair1.abc", &dev)
         );
     }
 
