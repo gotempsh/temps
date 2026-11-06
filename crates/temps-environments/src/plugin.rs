@@ -12,6 +12,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::environment_service::EnvironmentService;
+use crate::services::environment_teardown::EnvironmentTeardownService;
 use crate::services::ingress_service::IngressService;
 use crate::services::secret_service::SecretService;
 use crate::EnvVarService;
@@ -22,6 +23,14 @@ pub struct EnvironmentsPlugin {
 }
 
 impl EnvironmentsPlugin {
+    fn environment_teardown(context: &PluginContext) -> Arc<EnvironmentTeardownService> {
+        Arc::new(EnvironmentTeardownService::new(
+            context.require_service::<EnvironmentService>(),
+            context.require_service::<dyn temps_core::DeploymentCanceller>(),
+            context.require_service::<dyn temps_core::DeploymentContainerCleaner>(),
+        ))
+    }
+
     pub fn new() -> Self {
         Self {
             local_workloads_enabled: true,
@@ -81,9 +90,7 @@ impl TempsPlugin for EnvironmentsPlugin {
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let env_var_service = context.require_service::<EnvVarService>();
         let secret_service = context.require_service::<SecretService>();
-        let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
-        let deployment_container_cleaner =
-            context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
+        let environment_teardown = Self::environment_teardown(context);
         let on_demand_waker = context.get_service::<dyn temps_core::OnDemandWaker>();
         let integration_env_provider =
             context.get_service::<dyn temps_core::ProjectEnvVarsProvider>();
@@ -107,8 +114,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             env_var_service,
             secret_service,
             audit_service,
-            deployment_service,
-            deployment_container_cleaner,
+            environment_teardown,
             on_demand_waker,
             integration_env_provider,
             telemetry,

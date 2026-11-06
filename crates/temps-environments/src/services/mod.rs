@@ -3,12 +3,14 @@
 
 pub mod env_var_service;
 pub mod environment_service;
+pub mod environment_teardown;
 pub mod ingress_service;
 pub mod secret_service;
 pub mod secret_suggestion;
 pub mod shield_mode;
 pub use env_var_service::*;
 pub use environment_service::*;
+pub use environment_teardown::{EnvironmentTeardownError, EnvironmentTeardownService};
 pub use secret_service::*;
 pub use shield_mode::{environment_shield_write, project_shield_write};
 mod types;
