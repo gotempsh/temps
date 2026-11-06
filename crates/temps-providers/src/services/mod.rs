@@ -3,9 +3,9 @@
 
 use crate::externalsvc::error::{EngineError, Result};
 use crate::externalsvc::{
-    garage::GarageService, managed_instance_name, mariadb::MariaDbService, mongodb::MongodbService,
+    garage::GarageService, mariadb::MariaDbService, mongodb::MongodbService,
     postgres::PostgresService, redis::RedisService, rustfs::RustfsService, s3::S3Service,
-    ExternalService, ManagedS3BackendKind, ManagedS3BackendSelection, ServiceType,
+    ExternalService, ManagedS3BackendKind, ServiceType,
 };
 use bollard::Docker;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -18,6 +18,7 @@ use temps_core::EncryptionService;
 
 mod cluster_state;
 mod cluster_topology;
+mod engine_selection;
 mod manager;
 mod schema;
 #[cfg(test)]
@@ -27,6 +28,7 @@ mod types;
 
 pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
+use engine_selection::{EngineKind, EngineSelection};
 pub use schema::*;
 pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
@@ -43,15 +45,6 @@ pub use workload_ops::{
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
-
-/// The names a standalone service engine runs under, known without Docker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EngineIdentity {
-    /// What the engine's `get_name()` returns.
-    instance_name: String,
-    /// What the engine's `get_docker_container_name()` returns.
-    container_name: String,
-}
 
 /// The address the control plane dials to reach a cluster member's published
 /// port: the worker's data address for a member on a worker, the IPv4
@@ -295,50 +288,50 @@ impl ExternalServiceManager {
         Ok(candidates)
     }
 
-    #[allow(deprecated)]
     fn create_service_instance(
         &self,
         name: String,
         service_type: ServiceType,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        self.build_engine(EngineSelection::for_type(&name, service_type), service_type)
+    }
+
+    /// The engine `selection` names, for a service of `service_type`.
+    #[allow(
+        deprecated,
+        reason = "existing MinIO services keep running on the MinIO engine"
+    )]
+    fn build_engine(
+        &self,
+        selection: EngineSelection,
+        service_type: ServiceType,
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         let docker = self.require_docker()?;
-        Ok(match service_type {
-            ServiceType::Mariadb => Box::new(MariaDbService::new(name, docker)),
-            ServiceType::Mongodb => Box::new(MongodbService::new(name, docker)),
-            ServiceType::Postgres => Box::new(PostgresService::new(name, docker)),
-            // Note: PostgresCluster is handled via create_cluster_service_instance, not here
-            ServiceType::Redis => Box::new(RedisService::new(name, docker)),
-            // S3 now uses RustFS by default (high-performance S3-compatible storage)
-            ServiceType::S3 => Box::new(RustfsService::new(
+        let EngineSelection {
+            kind,
+            instance_name: name,
+        } = selection;
+        Ok(match kind {
+            EngineKind::Mariadb => Box::new(MariaDbService::new(name, docker)),
+            EngineKind::Mongodb => Box::new(MongodbService::new(name, docker)),
+            EngineKind::Postgres => Box::new(PostgresService::new(name, docker)),
+            EngineKind::Redis => Box::new(RedisService::new(name, docker)),
+            EngineKind::Rustfs => Box::new(RustfsService::new(
                 name,
                 docker,
                 self.encryption_service.clone(),
             )),
-            // Temps KV uses Redis backend. The instance name must come from
-            // `managed_instance_name` so this agrees with the kv plugin —
-            // see the module docs on `externalsvc::naming` and issue #495.
-            ServiceType::Kv => Box::new(RedisService::new(
-                managed_instance_name(&name, service_type),
-                docker,
-            )),
-            // Temps Blob uses RustfsService (high-performance S3-compatible
-            // storage). Same naming contract as `Kv` above.
-            ServiceType::Blob => Box::new(RustfsService::new(
-                managed_instance_name(&name, service_type),
-                docker,
-                self.encryption_service.clone(),
-            )),
-            // RustFS standalone S3-compatible storage
-            ServiceType::Rustfs => Box::new(RustfsService::new(
+            EngineKind::Minio => Box::new(S3Service::new(
                 name,
                 docker,
                 self.encryption_service.clone(),
             )),
-            // MinIO (deprecated) - kept for backward compatibility with existing services
-            ServiceType::Minio => Box::new(S3Service::new(
+            // Garage serves both S3 and Blob, and keeps which one it is.
+            EngineKind::Garage => Box::new(GarageService::new(
                 name,
                 docker,
                 self.encryption_service.clone(),
+                service_type,
             )),
         })
     }
@@ -378,122 +371,14 @@ impl ExternalServiceManager {
         self.create_service_instance_for_parameter_value(name, service_type, &parameter_value)
     }
 
-    #[allow(deprecated)]
     fn create_service_instance_for_parameter_value(
         &self,
         name: String,
         service_type: ServiceType,
         parameters: &serde_json::Value,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
-        if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
-            return self.create_service_instance(name, service_type);
-        }
-
-        let backend_selection =
-            ManagedS3BackendSelection::from_parameters(parameters).map_err(|e| {
-                ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
-                    reason: e.to_string(),
-                }
-            })?;
-        match backend_selection.backend {
-            ManagedS3BackendKind::Rustfs => self.create_service_instance(name, service_type),
-            ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
-                let docker = self.require_docker()?;
-                Ok(Box::new(S3Service::new(
-                    name,
-                    docker,
-                    self.encryption_service.clone(),
-                )))
-            }
-            ManagedS3BackendKind::Minio => Err(ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
-                reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
-                    .to_string(),
-            }),
-            ManagedS3BackendKind::Garage => {
-                let docker = self.require_docker()?;
-                Ok(Box::new(GarageService::new(
-                    name,
-                    docker,
-                    self.encryption_service.clone(),
-                    service_type,
-                )))
-            }
-        }
-    }
-
-    /// The names [`Self::create_service_instance`] would give a service,
-    /// worked out without building the engine.
-    ///
-    /// Engines need a Docker handle, which a server started with
-    /// `--profile control-plane` never has. A service on a worker node only
-    /// needs these names, so remote paths use this instead of an engine.
-    #[allow(deprecated)]
-    fn engine_identity(name: &str, service_type: ServiceType) -> EngineIdentity {
-        use crate::externalsvc::naming::{
-            mariadb_container_name, mongodb_container_name, postgres_container_name,
-            redis_container_name,
-        };
-        use crate::externalsvc::rustfs::rustfs_container_name;
-        use crate::externalsvc::s3::minio_container_name;
-
-        let instance_name = match service_type {
-            ServiceType::Kv | ServiceType::Blob => managed_instance_name(name, service_type),
-            _ => name.to_string(),
-        };
-        let container_name = match service_type {
-            ServiceType::Mariadb => mariadb_container_name(&instance_name),
-            ServiceType::Mongodb => mongodb_container_name(&instance_name),
-            ServiceType::Postgres => postgres_container_name(&instance_name),
-            ServiceType::Redis | ServiceType::Kv => redis_container_name(&instance_name),
-            ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs => {
-                rustfs_container_name(&instance_name)
-            }
-            ServiceType::Minio => minio_container_name(&instance_name),
-        };
-        EngineIdentity {
-            instance_name,
-            container_name,
-        }
-    }
-
-    /// The names [`Self::create_service_instance_for_parameters`] would give a
-    /// service: like [`Self::engine_identity`], but an S3 or Blob service
-    /// follows its stored backend.
-    #[allow(deprecated)]
-    fn engine_identity_for_parameters(
-        name: &str,
-        service_type: ServiceType,
-        parameters: &HashMap<String, serde_json::Value>,
-    ) -> Result<EngineIdentity, ExternalServiceError> {
-        if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
-            return Ok(Self::engine_identity(name, service_type));
-        }
-        let parameter_value =
-            serde_json::to_value(parameters).map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
-            })?;
-        let backend_selection = ManagedS3BackendSelection::from_parameters(&parameter_value)
-            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
-                reason: e.to_string(),
-            })?;
-        match backend_selection.backend {
-            ManagedS3BackendKind::Rustfs => Ok(Self::engine_identity(name, service_type)),
-            ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
-                Ok(Self::engine_identity(name, ServiceType::Minio))
-            }
-            ManagedS3BackendKind::Minio => Err(ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
-                reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
-                    .to_string(),
-            }),
-            ManagedS3BackendKind::Garage => Ok(EngineIdentity {
-                instance_name: name.to_string(),
-                container_name: crate::externalsvc::garage::garage_container_name(name),
-            }),
-        }
+        let selection = EngineSelection::for_parameters(0, &name, service_type, parameters)?;
+        self.build_engine(selection, service_type)
     }
 
     // -----------------------------------------------------------------------

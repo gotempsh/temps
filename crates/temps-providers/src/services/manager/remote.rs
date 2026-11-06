@@ -18,16 +18,15 @@ use std::collections::HashMap;
 use temps_entities::{nodes, settings};
 use tracing::warn;
 
+/// The container to address on a node that has no persisted name for it: the
+/// canonical name, unless only the legacy one (the bare instance name an
+/// earlier release used) exists there.
 fn select_remote_container_name(
-    persisted_name: Option<&str>,
     canonical_name: &str,
     canonical_exists: bool,
     legacy_name: &str,
     legacy_exists: bool,
 ) -> String {
-    if let Some(name) = persisted_name.filter(|name| !name.is_empty()) {
-        return name.to_string();
-    }
     if canonical_exists || canonical_name == legacy_name || !legacy_exists {
         canonical_name.to_string()
     } else {
@@ -152,6 +151,7 @@ impl ExternalServiceManager {
     pub(super) async fn resolve_remote_container_name(
         &self,
         client: &RemoteServiceClient,
+        service_id: i32,
         service_name: &str,
         service_type: ServiceType,
         parameters: &HashMap<String, serde_json::Value>,
@@ -166,16 +166,16 @@ impl ExternalServiceManager {
 
         // The container is on the node, so the names are all that's needed.
         // No engine is built: that would need a local Docker handle.
-        let identity =
-            Self::engine_identity_for_parameters(service_name, service_type, parameters)?;
-        let canonical_name = identity.container_name;
+        let selection =
+            EngineSelection::for_parameter_map(service_id, service_name, service_type, parameters)?;
+        let canonical_name = selection.container_name();
         let canonical_exists = client
             .service_status(&canonical_name)
             .await?
             .container_id
             .is_some();
 
-        let legacy_name = identity.instance_name;
+        let legacy_name = selection.instance_name;
         let legacy_exists = if legacy_name != canonical_name && !canonical_exists {
             client
                 .service_status(&legacy_name)
@@ -187,7 +187,6 @@ impl ExternalServiceManager {
         };
 
         Ok(select_remote_container_name(
-            persisted_name,
             &canonical_name,
             canonical_exists,
             &legacy_name,
@@ -478,7 +477,7 @@ impl ExternalServiceManager {
         // No engine is built here: that needs a local Docker handle, which a
         // control-plane-profile server does not have.
         let container_name =
-            Self::engine_identity(service_name, backend_service_type).container_name;
+            EngineSelection::for_type(service_name, backend_service_type).container_name();
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
@@ -581,7 +580,6 @@ mod tests {
     use super::*;
     use crate::externalsvc::{rustfs::DEFAULT_RUSTFS_IMAGE, ServiceType};
     use crate::services::test_support::*;
-    use crate::services::EngineIdentity;
     use std::collections::HashMap;
 
     #[test]
@@ -768,110 +766,160 @@ mod tests {
     }
 
     #[test]
-    fn remote_container_resolution_supports_persisted_canonical_and_legacy_names() {
+    fn remote_container_resolution_prefers_canonical_then_legacy_names() {
         assert_eq!(
-            select_remote_container_name(
-                Some("persisted-container"),
-                "postgres-orders",
-                true,
-                "orders",
-                true,
-            ),
-            "persisted-container"
-        );
-        assert_eq!(
-            select_remote_container_name(None, "postgres-orders", true, "orders", false),
+            select_remote_container_name("postgres-orders", true, "orders", false),
             "postgres-orders"
         );
         assert_eq!(
-            select_remote_container_name(None, "postgres-orders", false, "orders", true),
+            select_remote_container_name("postgres-orders", true, "orders", true),
+            "postgres-orders"
+        );
+        assert_eq!(
+            select_remote_container_name("postgres-orders", false, "orders", true),
             "orders"
         );
         assert_eq!(
-            select_remote_container_name(None, "postgres-orders", false, "orders", false),
+            select_remote_container_name("postgres-orders", false, "orders", false),
             "postgres-orders"
         );
     }
 
-    /// Remote paths name containers without building an engine, so the names
-    /// they compute must stay the ones the engines use.
-    #[test]
-    #[allow(deprecated)]
-    fn engine_identity_matches_the_engine_for_every_service_type() {
-        let manager = mock_service_manager(vec![]);
+    /// A fake worker agent whose `status` route reports a container for each
+    /// name in `existing` and none for any other.
+    async fn agent_with_containers(existing: &'static [&'static str]) -> RemoteServiceClient {
+        use axum::{extract::Path, routing::get, Json, Router};
 
-        for service_type in [
-            ServiceType::Mariadb,
-            ServiceType::Mongodb,
-            ServiceType::Postgres,
-            ServiceType::Redis,
-            ServiceType::S3,
-            ServiceType::Rustfs,
-            ServiceType::Kv,
-            ServiceType::Blob,
-            ServiceType::Minio,
-        ] {
-            let instance = manager
-                .create_service_instance("orders".to_string(), service_type)
-                .expect("mock manager always has an available Docker handle");
-            assert_eq!(
-                ExternalServiceManager::engine_identity("orders", service_type),
-                EngineIdentity {
-                    instance_name: instance.get_name(),
-                    container_name: instance.get_docker_container_name(),
-                },
-                "wrong identity for {service_type}"
-            );
-        }
+        let app = Router::new().route(
+            "/agent/services/{name}/status",
+            get(move |Path(name): Path<String>| async move {
+                let container_id = existing
+                    .contains(&name.as_str())
+                    .then(|| format!("id-{name}"));
+                Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "container_name": name,
+                        "container_id": container_id,
+                        "running": container_id.is_some(),
+                        "health": null,
+                    },
+                    "error": null,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+    }
 
-        for (service_type, backend) in [
-            (ServiceType::S3, None),
-            (ServiceType::S3, Some("rustfs")),
-            (ServiceType::S3, Some("minio")),
-            (ServiceType::S3, Some("garage")),
-            (ServiceType::Blob, None),
-            (ServiceType::Blob, Some("rustfs")),
-            (ServiceType::Blob, Some("garage")),
-        ] {
-            let parameters: HashMap<String, serde_json::Value> = backend
-                .map(|backend| HashMap::from([("backend".to_string(), backend.into())]))
-                .unwrap_or_default();
-            let instance = manager
-                .create_service_instance_for_parameters(
-                    "orders".to_string(),
-                    service_type,
-                    &parameters,
-                )
-                .expect("a valid backend builds an engine");
-            assert_eq!(
-                ExternalServiceManager::engine_identity_for_parameters(
+    /// Start, stop and delete on a worker address its container by name. A
+    /// `--profile control-plane` server has no Docker handle, so the name
+    /// must be found without building an engine.
+    #[tokio::test]
+    async fn remote_container_resolution_needs_no_local_docker() {
+        let manager = control_plane_manager();
+        assert!(
+            manager.require_docker().is_err(),
+            "the control-plane manager must have no Docker handle"
+        );
+        let no_parameters = HashMap::new();
+
+        let canonical = agent_with_containers(&["postgres-orders"]).await;
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(
+                    &canonical,
+                    7,
                     "orders",
-                    service_type,
-                    &parameters,
+                    ServiceType::Postgres,
+                    &no_parameters,
                 )
-                .expect("a valid backend has an identity"),
-                EngineIdentity {
-                    instance_name: instance.get_name(),
-                    container_name: instance.get_docker_container_name(),
-                },
-                "wrong identity for {service_type} on backend {backend:?}"
-            );
-        }
+                .await
+                .unwrap(),
+            "postgres-orders"
+        );
 
-        let minio_blob = HashMap::from([("backend".to_string(), serde_json::Value::from("minio"))]);
-        assert!(matches!(
-            ExternalServiceManager::engine_identity_for_parameters(
-                "orders",
+        // A container an earlier release created under the bare name.
+        let legacy = agent_with_containers(&["orders"]).await;
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(
+                    &legacy,
+                    7,
+                    "orders",
+                    ServiceType::Postgres,
+                    &no_parameters,
+                )
+                .await
+                .unwrap(),
+            "orders"
+        );
+
+        // The stored backend picks the engine, so its container name.
+        let minio = agent_with_containers(&["minio-orders"]).await;
+        let on_minio = HashMap::from([("backend".to_string(), serde_json::json!("minio"))]);
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(&minio, 7, "orders", ServiceType::S3, &on_minio)
+                .await
+                .unwrap(),
+            "minio-orders"
+        );
+
+        // The name the agent reported at create time wins, without asking it.
+        let persisted = HashMap::from([(
+            "container_name".to_string(),
+            serde_json::json!("orders-from-agent"),
+        )]);
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(
+                    &canonical,
+                    7,
+                    "orders",
+                    ServiceType::Postgres,
+                    &persisted,
+                )
+                .await
+                .unwrap(),
+            "orders-from-agent"
+        );
+
+        // A stored backend that cannot run the service is refused with the
+        // service's ID, not a Docker error.
+        let blob_on_minio = HashMap::from([("backend".to_string(), serde_json::json!("minio"))]);
+        let error = manager
+            .resolve_remote_container_name(
+                &canonical,
+                7,
+                "assets",
                 ServiceType::Blob,
-                &minio_blob,
+                &blob_on_minio,
+            )
+            .await
+            .expect_err("Blob cannot run on MinIO");
+        assert!(
+            matches!(
+                error,
+                ExternalServiceError::ParameterValidationFailed { service_id: 7, .. }
             ),
-            Err(ExternalServiceError::ParameterValidationFailed { .. })
-        ));
+            "{error:?}"
+        );
     }
 
     /// A `--profile control-plane` server has no Docker handle, but must
     /// still be able to create services on worker nodes.
     #[test]
+    #[allow(deprecated, reason = "existing MinIO services can still be recreated")]
     fn remote_create_params_need_no_local_docker() {
         let manager = control_plane_manager();
         assert!(
@@ -879,18 +927,26 @@ mod tests {
             "the control-plane manager must have no Docker handle"
         );
 
-        for (service_type, expected_name) in [
-            (ServiceType::Postgres, "postgres-orders"),
-            (ServiceType::Mongodb, "temps-mongodb-orders"),
-            (ServiceType::Redis, "redis-orders"),
-            (ServiceType::Kv, "redis-orders"),
-            (ServiceType::S3, "rustfs-orders"),
-            (ServiceType::Blob, "rustfs-orders"),
+        let on_minio = HashMap::from([("backend".to_string(), "minio".to_string())]);
+        for (service_type, parameters, expected_name) in [
+            (ServiceType::Postgres, HashMap::new(), "postgres-orders"),
+            (ServiceType::Mariadb, HashMap::new(), "mariadb-orders"),
+            (ServiceType::Mongodb, HashMap::new(), "temps-mongodb-orders"),
+            (ServiceType::Redis, HashMap::new(), "redis-orders"),
+            (ServiceType::Kv, HashMap::new(), "redis-orders"),
+            (ServiceType::S3, HashMap::new(), "rustfs-orders"),
+            (ServiceType::S3, on_minio, "minio-orders"),
+            (ServiceType::Rustfs, HashMap::new(), "rustfs-orders"),
+            (ServiceType::Blob, HashMap::new(), "rustfs-orders"),
+            (ServiceType::Minio, HashMap::new(), "minio-orders"),
         ] {
             let params = manager
-                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .build_remote_create_params("orders", &service_type, &parameters)
                 .unwrap_or_else(|e| panic!("{service_type} on a worker needs no Docker: {e}"));
-            assert_eq!(params.name, expected_name, "wrong name for {service_type}");
+            assert_eq!(
+                params.name, expected_name,
+                "wrong name for {service_type} with {parameters:?}"
+            );
         }
     }
 

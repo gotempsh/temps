@@ -1248,6 +1248,7 @@ impl ExternalServiceManager {
                 let container_name = self
                     .resolve_remote_container_name(
                         &client,
+                        service_id,
                         &service.name,
                         service_type_enum,
                         &parameters,

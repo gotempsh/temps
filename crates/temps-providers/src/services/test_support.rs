@@ -471,5 +471,19 @@ pub(super) fn control_plane_manager() -> ExternalServiceManager {
     ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
 }
 
+/// A control-plane-profile manager (no Docker handle) over `db`, holding the
+/// key [`encrypted_service_model`] encrypts parameters with.
+pub(super) fn control_plane_manager_with_db(db: Arc<DatabaseConnection>) -> ExternalServiceManager {
+    let enc = Arc::new(EncryptionService::new_from_password(
+        "service-parameter-reveal-test",
+    ));
+    let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+    let handle = Arc::new(DockerHandle::disabled(
+        temps_core::PROFILE_CONTROL_PLANE,
+        temps_core::CONTROL_PLANE_DOCKER_REASON,
+    ));
+    ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
+}
+
 #[cfg(feature = "docker-tests")]
 pub(super) use setup_test_manager_or_skip;
