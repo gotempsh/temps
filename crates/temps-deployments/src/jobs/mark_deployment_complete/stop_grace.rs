@@ -115,9 +115,7 @@ impl super::MarkDeploymentCompleteJob {
                 ))
                 .await
                 .ok();
-                return Err(format!(
-                    "Failed to remove rejected container {container_id}: {e}"
-                ));
+                return Err(format!("Failed to remove container {container_id}: {e}"));
             }
         }
 

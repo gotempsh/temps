@@ -4577,6 +4577,34 @@ mod teardown_tests {
     /// swept again, so the container row stayed live forever and the health
     /// monitor reported the leftover exited container as a crash on every
     /// poll. The deployment must stay sweepable until teardown succeeds.
+    /// The stop-and-remove helper tears down every superseded container, not
+    /// only a rejected deployment's, so its failure must not call the
+    /// container rejected: the sweep logs it as the teardown failure.
+    #[tokio::test]
+    async fn a_failed_container_removal_does_not_call_the_container_rejected() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db, 42, deployer.clone());
+
+        let error = job
+            .stop_and_remove_container(
+                deployer.as_ref(),
+                "prev-container",
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a refused removal is an error");
+
+        assert_eq!(
+            error,
+            "Failed to remove container prev-container: Other error: removal of container \
+             prev-container is already in progress"
+        );
+    }
+
     #[tokio::test]
     async fn test_failed_teardown_keeps_previous_deployment_sweepable() {
         let test_db = match TestDatabase::with_migrations().await {
