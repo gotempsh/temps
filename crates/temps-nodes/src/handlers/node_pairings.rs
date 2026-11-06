@@ -26,6 +26,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+#[cfg(test)]
+use temps_core::worker_install::WorkerInstall;
 use temps_core::worker_install::{linux_pairing_command, PlaneBuild};
 use temps_core::{
     AuditContext, AuditLogger, RequestMetadata, SensitiveAction, SensitiveActionAuthorizer,
@@ -327,10 +329,11 @@ pub async fn create_node_pairing(
 
 /// The one command the operator pastes on the node for pairing `code`: the
 /// console's Add worker command for Linux (see
-/// [`temps_core::worker_install`]), pinned to the release this server runs,
-/// with the code piped to `temps join --pair -`.
+/// [`temps_core::worker_install`]), installing the release this server runs
+/// (the newest nightly build when it runs a build between releases), with
+/// the code piped to `temps join --pair -`.
 fn join_command(code: &str, plane_build: &PlaneBuild) -> String {
-    linux_pairing_command(code, plane_build.release_tag().as_deref())
+    linux_pairing_command(code, &plane_build.worker_install())
 }
 
 /// Create a pairing for a node at `node_endpoint` and record it in the audit
@@ -796,8 +799,21 @@ mod tests {
         let release = PlaneBuild::new(PLANE_VERSION);
         assert_eq!(
             join_command("tpair1.abc-_9", &release),
-            linux_pairing_command("tpair1.abc-_9", Some("v0.1.0-beta.60"))
+            linux_pairing_command(
+                "tpair1.abc-_9",
+                &WorkerInstall::Release {
+                    tag: "v0.1.0-beta.60".into()
+                }
+            )
         );
+        // A build between releases never pins the older release it names.
+        let between = PlaneBuild::new("v0.1.0-beta.60-6af2f4949 built 2026-11-06 08:00:00 UTC");
+        let command = join_command("tpair1.abc", &between);
+        assert!(
+            command.contains("bash -s -- --channel nightly)"),
+            "{command}"
+        );
+        assert!(!command.contains("v0.1.0-beta.60"), "{command}");
         // A development build has no release to download: the newest
         // stable one, as before the command was pinned.
         let dev = PlaneBuild::new("dev");

@@ -484,8 +484,9 @@ function JoinCommandStep({ url }: { url: string }) {
   const [ingress, setIngress] = useState<JoinIngressChoice>('delegated')
   const [force, setForce] = useState(false)
   const [os, setOs] = useState<WorkerOs>('linux')
-  // The install step pins the release this server runs; a worker on another
-  // version may not speak its protocol.
+  // The install step takes the release this server runs (the newest nightly
+  // for a build between releases); a worker on an older version may not
+  // speak its protocol.
   const release = usePlaneRelease()
   const selectOs = (next: WorkerOs) => {
     setOs(next)
@@ -537,7 +538,7 @@ function JoinCommandStep({ url }: { url: string }) {
   const script = workerJoinScript({
     url,
     token: mint.data.token,
-    version: release.tag,
+    install: release.install,
     joinFlags: joinIngressFlag(ingress),
     force,
     os,
@@ -548,7 +549,7 @@ function JoinCommandStep({ url }: { url: string }) {
       {choices}
       <WorkerJoinScript
         command={script.command}
-        pinnedTo={script.pinnedTo}
+        install={script.install}
         pending={release.pending}
         os={os}
       />

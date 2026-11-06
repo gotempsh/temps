@@ -9,7 +9,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
-import type { WorkerOs } from '@/lib/worker-join-script'
+import type { WorkerInstall, WorkerOs } from '@/lib/worker-join-script'
 
 const OS_CHOICES: { value: WorkerOs; label: string; description: string }[] = [
   {
@@ -69,9 +69,10 @@ export function WorkerOsChoice({
         ))}
       </RadioGroup>
       <p className="text-xs text-muted-foreground">
-        Windows cannot join this way. <code>temps join --private-address
-        &lt;ip&gt;</code> is for a machine this server can reach at that
-        address (see <strong>Other ways to add a node</strong> below).
+        Windows cannot join this way.{' '}
+        <code>temps join --private-address &lt;ip&gt;</code> is for a machine
+        this server can reach at that address (see{' '}
+        <strong>Other ways to add a node</strong> below).
       </p>
     </fieldset>
   )
@@ -129,12 +130,12 @@ export function ForceJoinOption({
 /** The command to paste on the new machine, and which release it installs. */
 export function WorkerJoinScript({
   command,
-  pinnedTo,
+  install,
   pending = false,
   os = 'linux',
 }: {
   command: string
-  pinnedTo: string | null
+  install: WorkerInstall
   /** Still reading the server's release, so the pin is not known yet. */
   pending?: boolean
   os?: WorkerOs
@@ -154,16 +155,16 @@ export function WorkerJoinScript({
       {os === 'macos' ? (
         <p className="text-sm text-muted-foreground">
           Paste this in Terminal on the Mac, as yourself (no <code>sudo</code>
-          ), with your Docker app running. Each step runs only if the one
-          before it worked. Keep the Docker app starting at login so the worker
-          comes back after a restart.
+          ), with your Docker app running. Each step runs only if the one before
+          it worked. Keep the Docker app starting at login so the worker comes
+          back after a restart.
         </p>
       ) : (
         <p className="text-sm text-muted-foreground">
-          Paste this on the new machine as a user who can use{' '}
-          <code>sudo</code>: installing, joining and starting the agent need
-          root. Each step runs only if the one before it worked. In a root
-          shell without sudo, leave out <code>sudo -H</code>.
+          Paste this on the new machine as a user who can use <code>sudo</code>:
+          installing, joining and starting the agent need root. Each step runs
+          only if the one before it worked. In a root shell without sudo, leave
+          out <code>sudo -H</code>.
         </p>
       )}
       <div className="flex items-start gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
@@ -175,16 +176,34 @@ export function WorkerJoinScript({
         </pre>
         <CopyButton minimal className="h-6 w-6 shrink-0" value={command} />
       </div>
-      {pinnedTo ? (
-        <p className="text-xs text-muted-foreground">
-          Installs <code>{pinnedTo}</code>, the version this server runs, so the
-          worker and the control plane match.
-        </p>
-      ) : (
-        <UnpinnedInstallNote />
-      )}
+      <WorkerInstallNote install={install} />
     </div>
   )
+}
+
+/** Which release an install command takes, and why. */
+export function WorkerInstallNote({ install }: { install: WorkerInstall }) {
+  switch (install.kind) {
+    case 'release':
+      return (
+        <p className="text-xs text-muted-foreground">
+          Installs <code>{install.tag}</code>, the version this server runs, so
+          the worker and the control plane match.
+        </p>
+      )
+    case 'nightly':
+      return (
+        <p className="text-xs text-muted-foreground">
+          This server runs a build made after <code>{install.after}</code>,
+          which no release contains, so this installs the newest nightly build
+          rather than the older <code>{install.after}</code>. Nightly builds are
+          cut every day from the main branch: one has everything merged before
+          it was cut.
+        </p>
+      )
+    default:
+      return <UnpinnedInstallNote />
+  }
 }
 
 /** Said wherever an install could not be pinned to this server's release. */

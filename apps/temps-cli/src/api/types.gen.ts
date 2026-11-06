@@ -34550,6 +34550,12 @@ export type UpdateCapabilityResponse = {
      * What would restart the process: `systemd`, `launchd`, `container`, `none`.
      */
     supervisor: SupervisorKind;
+    /**
+     * What a new worker installs so it never runs an older Temps than this
+     * server: this release, or the newest nightly build for a build made
+     * between releases.
+     */
+    worker_install: WorkerInstall;
 };
 
 /**
@@ -37034,6 +37040,20 @@ export type WireguardMeshStatusResponse = {
      */
     reason?: string | null;
     state: WireguardMeshState;
+};
+
+/**
+ * What a new worker installs, so it never runs an older Temps than its
+ * control plane.
+ */
+export type WorkerInstall = {
+    kind: 'release';
+    tag: string;
+} | {
+    after: string;
+    kind: 'nightly';
+} | {
+    kind: 'latest';
 };
 
 export type WorkflowDryRunRequest = {

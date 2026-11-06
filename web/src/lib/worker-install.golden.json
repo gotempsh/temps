@@ -5,17 +5,33 @@
   "user_temps_bin": "~/.temps/bin/temps",
   "installs": [
     {
-      "tag": "v0.1.0-beta.60",
+      "install": {
+        "kind": "release",
+        "tag": "v0.1.0-beta.60"
+      },
       "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-beta.60)",
       "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- v0.1.0-beta.60)"
     },
     {
-      "tag": "v0.1.0-nightly.20261104.0123abcde",
+      "install": {
+        "kind": "release",
+        "tag": "v0.1.0-nightly.20261104.0123abcde"
+      },
       "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-nightly.20261104.0123abcde)",
       "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- v0.1.0-nightly.20261104.0123abcde)"
     },
     {
-      "tag": null,
+      "install": {
+        "kind": "nightly",
+        "after": "v0.1.0-beta.60"
+      },
+      "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- --channel nightly)",
+      "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- --channel nightly)"
+    },
+    {
+      "install": {
+        "kind": "latest"
+      },
       "linux": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash)",
       "mac": "(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash)"
     }

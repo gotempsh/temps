@@ -1419,6 +1419,7 @@ impl AppSettingsResponse {
         temps_core::SelfUpdateStatus,
         temps_core::ReleaseCheckResult,
         temps_core::SupervisorKind,
+        temps_core::worker_install::WorkerInstall,
         temps_core::feature_maturity::FeatureMaturity,
         temps_core::feature_maturity::Maturity,
     )),
@@ -1969,6 +1970,10 @@ pub struct UpdateCapabilityResponse {
     /// Version tag of the running binary. Always present — the version page
     /// needs it whether or not an update exists.
     pub current_version: String,
+    /// What a new worker installs so it never runs an older Temps than this
+    /// server: this release, or the newest nightly build for a build made
+    /// between releases.
+    pub worker_install: temps_core::worker_install::WorkerInstall,
     /// Channel actually tracked, after applying the configured override or
     /// falling back to inference from the running version tag.
     pub channel: String,
@@ -2062,6 +2067,7 @@ fn updater_unavailable_response(allowed: bool) -> UpdateCapabilityResponse {
         caveat: None,
         manual_command: "temps upgrade".to_string(),
         current_version: String::new(),
+        worker_install: temps_core::worker_install::WorkerInstall::Latest,
         channel: "unknown".to_string(),
         channel_is_pinned: false,
         supervisor: temps_core::SupervisorKind::None,
@@ -2159,6 +2165,7 @@ async fn get_update_capability(
         caveat: capability.caveat,
         manual_command: capability.manual_command,
         current_version: capability.current_version,
+        worker_install: capability.worker_install,
         channel: capability.channel,
         channel_is_pinned: capability.channel_is_pinned,
         supervisor: capability.supervisor,

@@ -486,6 +486,8 @@ impl SelfUpdater for BinarySelfUpdater {
             reason: blocker.as_ref().map(|(_, r)| r.clone()),
             manual_command: self.manual_command(blocker.as_ref().map(|(b, _)| *b)),
             current_version: current_version.clone(),
+            worker_install: temps_core::worker_install::PlaneBuild::new(env!("TEMPS_VERSION"))
+                .worker_install(),
             channel: channel.as_str().to_string(),
             channel_is_pinned: pinned,
             supervisor: self.supervisor,

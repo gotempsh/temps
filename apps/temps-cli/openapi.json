@@ -73862,6 +73862,10 @@
           "supervisor": {
             "$ref": "#/components/schemas/SupervisorKind",
             "description": "What would restart the process: `systemd`, `launchd`, `container`, `none`."
+          },
+          "worker_install": {
+            "$ref": "#/components/schemas/WorkerInstall",
+            "description": "What a new worker installs so it never runs an older Temps than this\nserver: this release, or the newest nightly build for a build made\nbetween releases."
           }
         },
         "required": [
@@ -73869,6 +73873,7 @@
           "allowed",
           "manual_command",
           "current_version",
+          "worker_install",
           "channel",
           "channel_is_pinned",
           "supervisor",
@@ -79830,6 +79835,66 @@
           "links"
         ],
         "type": "object"
+      },
+      "WorkerInstall": {
+        "description": "What a new worker installs, so it never runs an older Temps than its\ncontrol plane.",
+        "oneOf": [
+          {
+            "description": "Exactly the release this control plane runs.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "release"
+                ],
+                "type": "string"
+              },
+              "tag": {
+                "example": "v0.1.0-beta.61",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tag",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The newest nightly build. This control plane runs a build made after\nrelease `after` and before the next one: no release contains it, and\n`after` is older. Nightly builds are cut every day from `main`, so\nthe newest one contains every change merged before it was cut.",
+            "properties": {
+              "after": {
+                "example": "v0.1.0-beta.61",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "nightly"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "after",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The newest stable release, the installer's default: this control\nplane's version is not one the installer knows (a development\nbuild), so nothing better can be picked.",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "latest"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "WorkflowDryRunRequest": {
         "properties": {
