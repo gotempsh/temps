@@ -46,7 +46,7 @@ export function NodeLabelsCard({
               <Badge
                 key={key}
                 variant="secondary"
-                className="text-xs font-mono"
+                className="max-w-full whitespace-normal break-all text-xs font-mono"
               >
                 {key}={String(value)}
               </Badge>
@@ -59,8 +59,14 @@ export function NodeLabelsCard({
           <div className="space-y-1.5">
             <p className="text-xs text-muted-foreground">
               Change labels on the worker itself, as the user the agent runs as.
-              The node reports them within seconds; list them with{' '}
+              An agent of this release reports them within seconds; an older one
+              is restarted to pick them up. Check them with{' '}
               <code className="font-mono">temps agent labels list</code>.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              An agent started with <code className="font-mono">--labels</code>{' '}
+              or <code className="font-mono">TEMPS_NODE_LABELS</code> keeps
+              those labels: the command refuses and says where they are set.
             </p>
             <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1">
               <code className="min-w-0 flex-1 truncate font-mono text-xs">

@@ -1166,14 +1166,10 @@ impl JoinCommand {
 
         let config_path = temps_dir.join("agent.json");
         let json = serde_json::to_string_pretty(config)?;
-        std::fs::write(&config_path, &json)?;
-
-        // Set file permissions to 0600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        // Owner-only (0600), renamed into place under the lock `temps agent
+        // labels` and `temps agent ingress` take, so an edit overlapping
+        // this join cannot write the old enrollment back over the new one.
+        super::agent_labels::replace_agent_config(&config_path, &json)?;
 
         println!("Agent config saved to {}", config_path.display());
         Ok(())

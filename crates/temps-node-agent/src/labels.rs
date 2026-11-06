@@ -114,19 +114,78 @@ fn read_bounded(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelsStatus {
     pub node_id: i32,
+    /// The control plane that accepted them: node IDs are only unique
+    /// within one.
+    pub control_plane_url: String,
     pub labels: serde_json::Value,
     pub origin: LabelsOrigin,
     /// When the heartbeat carrying `labels` succeeded.
     pub accepted_at: DateTime<Utc>,
 }
 
+/// The node and control plane the running agent reports as. `agent.json`
+/// labels are applied only while the file still names the same ones: a
+/// `temps join` that re-enrolled this directory while the old agent still
+/// runs must not have its labels reported to the old control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrollment {
+    pub node_id: i32,
+    pub control_plane_url: String,
+}
+
+impl Enrollment {
+    /// Whether `config` (an `agent.json` object) is this enrollment's.
+    pub fn owns(&self, config: &serde_json::Value) -> bool {
+        let url = |url: &str| url.trim_end_matches('/').to_string();
+        config.get("node_id").and_then(serde_json::Value::as_i64) == Some(i64::from(self.node_id))
+            && config
+                .get("control_plane_url")
+                .and_then(serde_json::Value::as_str)
+                .map(url)
+                == Some(url(&self.control_plane_url))
+    }
+}
+
+/// Which version of a file was read: replaced (a new inode) or rewritten
+/// in place (a new size or modification time) shows as a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileVersion {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileVersion {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        Self {
+            dev,
+            ino,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        }
+    }
+}
+
 /// The `labels` object in the `agent.json` at `path`: `None` when the file
-/// cannot be read or parsed, or `labels` is not an object, so the caller
-/// keeps the labels it has. A file without `labels` has none.
-pub fn read_saved_labels(path: &Path) -> Option<serde_json::Value> {
+/// cannot be read or parsed, `labels` is not an object, or the file belongs
+/// to another enrollment than `enrollment`, so the caller keeps the labels
+/// it has. A file without `labels` has none.
+pub fn read_saved_labels(path: &Path, enrollment: &Enrollment) -> Option<serde_json::Value> {
+    read_saved(path, enrollment).map(|(labels, _)| labels)
+}
+
+fn read_saved(path: &Path, enrollment: &Enrollment) -> Option<(serde_json::Value, FileVersion)> {
     // The agent's own config: a symlinked agent.json is followed, as at
     // start, so its labels still reload.
-    let (text, _) = read_bounded(path, MAX_CONFIG_BYTES, true).ok()?;
+    let (text, meta) = read_bounded(path, MAX_CONFIG_BYTES, true).ok()?;
     let config: serde_json::Value = match serde_json::from_str(&text) {
         Ok(config) => config,
         Err(error) => {
@@ -140,14 +199,34 @@ pub fn read_saved_labels(path: &Path) -> Option<serde_json::Value> {
         warn!(path = %path.display(), "agent.json is not an object; keeping the current labels");
         return None;
     }
-    match config.get("labels") {
-        None | Some(serde_json::Value::Null) => Some(serde_json::json!({})),
-        Some(labels @ serde_json::Value::Object(_)) => Some(labels.clone()),
+    if !enrollment.owns(&config) {
+        debug!(
+            path = %path.display(),
+            node_id = enrollment.node_id,
+            "agent.json now names another node or control plane (re-joined); keeping the \
+             labels this agent reports until it is restarted"
+        );
+        return None;
+    }
+    let labels = match config.get("labels") {
+        None | Some(serde_json::Value::Null) => serde_json::json!({}),
+        Some(labels @ serde_json::Value::Object(_)) => labels.clone(),
         Some(_) => {
             warn!(path = %path.display(), "agent.json 'labels' is not an object; keeping the current labels");
-            None
+            return None;
         }
-    }
+    };
+    Some((labels, FileVersion::of(&meta)))
+}
+
+/// The labels the heartbeat sends. `revision` grows whenever `agent.json`
+/// is written, even with the same labels, so a heartbeat can tell a change
+/// it must confirm again (A, then B, then back to A before any heartbeat
+/// carried B) from the same labels beat after beat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CurrentLabels {
+    pub labels: serde_json::Value,
+    pub revision: u64,
 }
 
 /// The labels the heartbeat sends, starting from `initial`. With labels
@@ -156,14 +235,18 @@ pub fn read_saved_labels(path: &Path) -> Option<serde_json::Value> {
 pub fn watch_labels(
     settings: &LabelsSettings,
     initial: serde_json::Value,
+    enrollment: Enrollment,
 ) -> (
-    watch::Receiver<serde_json::Value>,
-    Option<watch::Sender<serde_json::Value>>,
+    watch::Receiver<CurrentLabels>,
+    Option<watch::Sender<CurrentLabels>>,
 ) {
-    let (sender, receiver) = watch::channel(initial);
+    let (sender, receiver) = watch::channel(CurrentLabels {
+        labels: initial,
+        revision: 0,
+    });
     match (settings.origin, &settings.data_dir) {
         (LabelsOrigin::AgentJson, Some(dir)) => {
-            tokio::spawn(reload_loop(dir.join("agent.json"), sender));
+            tokio::spawn(reload_loop(dir.join("agent.json"), enrollment, sender));
             (receiver, None)
         }
         // Nothing reloads: the caller keeps the sender so the channel stays
@@ -172,9 +255,10 @@ pub fn watch_labels(
     }
 }
 
-async fn reload_loop(path: PathBuf, sender: watch::Sender<serde_json::Value>) {
+async fn reload_loop(path: PathBuf, enrollment: Enrollment, sender: watch::Sender<CurrentLabels>) {
     let mut interval = tokio::time::interval(RELOAD_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut seen: Option<FileVersion> = None;
     loop {
         interval.tick().await;
         // The heartbeat loop is gone: nothing reads the labels any more.
@@ -182,20 +266,26 @@ async fn reload_loop(path: PathBuf, sender: watch::Sender<serde_json::Value>) {
             return;
         }
         let read_path = path.clone();
-        let Ok(Some(saved)) =
-            tokio::task::spawn_blocking(move || read_saved_labels(&read_path)).await
+        let read_enrollment = enrollment.clone();
+        let Ok(Some((saved, version))) =
+            tokio::task::spawn_blocking(move || read_saved(&read_path, &read_enrollment)).await
         else {
             continue;
         };
+        // Rewritten since the last read, possibly with labels that changed
+        // and changed back in between.
+        let rewritten = seen.is_some_and(|seen| seen != version);
+        seen = Some(version);
         let changed = sender.send_if_modified(|current| {
-            if *current == saved {
+            if current.labels == saved && !rewritten {
                 return false;
             }
-            *current = saved.clone();
+            current.labels = saved.clone();
+            current.revision += 1;
             true
         });
         if changed {
-            info!(labels = %saved, "labels changed in agent.json; reporting them now");
+            info!(labels = %saved, "agent.json labels written; reporting them now");
         }
     }
 }
@@ -244,32 +334,33 @@ pub fn read_status_file(data_dir: &Path) -> Option<(LabelsStatus, std::fs::Metad
 /// Records each newly accepted label set, once.
 pub(crate) struct AcceptedLabels {
     settings: LabelsSettings,
-    node_id: i32,
+    enrollment: Enrollment,
     recorded: Option<serde_json::Value>,
-    /// The labels the last heartbeat attempt carried, accepted or not.
-    sending: Option<serde_json::Value>,
+    /// The revision the last heartbeat attempt carried, accepted or not.
+    sending: Option<u64>,
 }
 
 impl AcceptedLabels {
-    pub(crate) fn new(settings: LabelsSettings, node_id: i32) -> Self {
+    pub(crate) fn new(settings: LabelsSettings, enrollment: Enrollment) -> Self {
         Self {
             settings,
-            node_id,
+            enrollment,
             recorded: None,
             sending: None,
         }
     }
 
-    /// Before each heartbeat: labels different from the last attempt's make
-    /// the next acceptance a new one, even if they equal what was recorded
-    /// earlier (A recorded, B never accepted, back to A: A is recorded
-    /// again with a new time, so `temps agent labels` can confirm it).
-    pub(crate) fn sending(&mut self, labels: &serde_json::Value) {
-        if self.sending.as_ref() != Some(labels) {
+    /// Before each heartbeat: a new revision (the file was written since
+    /// the last attempt) makes the next acceptance a new one, even with
+    /// labels equal to what was recorded earlier (A recorded, then B, then
+    /// back to A: A is recorded again with a new time, so `temps agent
+    /// labels` can confirm it).
+    pub(crate) fn sending(&mut self, labels: &CurrentLabels) {
+        if self.sending != Some(labels.revision) {
             if self.sending.is_some() {
                 self.recorded = None;
             }
-            self.sending = Some(labels.clone());
+            self.sending = Some(labels.revision);
         }
     }
 
@@ -283,25 +374,27 @@ impl AcceptedLabels {
         if self.recorded.as_ref() == Some(labels) {
             return;
         }
+        let node_id = self.enrollment.node_id;
         let status = LabelsStatus {
-            node_id: self.node_id,
+            node_id,
+            control_plane_url: self.enrollment.control_plane_url.clone(),
             labels: labels.clone(),
             origin: self.settings.origin,
             accepted_at: Utc::now(),
         };
         match tokio::task::spawn_blocking(move || record_accepted(&dir, &status)).await {
             Ok(Ok(())) => {
-                debug!(node_id = self.node_id, labels = %labels, "recorded the labels the control plane accepted");
+                debug!(node_id, labels = %labels, "recorded the labels the control plane accepted");
                 self.recorded = Some(labels.clone());
             }
             Ok(Err(error)) => warn!(
-                node_id = self.node_id,
+                node_id,
                 %error,
                 "could not record the labels the control plane accepted; `temps agent labels` \
                  cannot confirm them"
             ),
             Err(error) => {
-                warn!(node_id = self.node_id, %error, "recording accepted labels panicked")
+                warn!(node_id, %error, "recording accepted labels panicked")
             }
         }
     }
@@ -311,69 +404,130 @@ impl AcceptedLabels {
 mod tests {
     use super::*;
 
+    const PLANE: &str = "https://cp.example.test";
+
+    fn enrollment() -> Enrollment {
+        Enrollment {
+            node_id: 1,
+            control_plane_url: PLANE.to_string(),
+        }
+    }
+
     fn write(dir: &Path, text: &str) -> PathBuf {
         let path = dir.join("agent.json");
         std::fs::write(&path, text).unwrap();
         path
     }
 
+    /// An `agent.json` of [`enrollment`] with `labels` (raw JSON).
+    fn config(labels: &str) -> String {
+        format!(r#"{{"node_id":1,"control_plane_url":"{PLANE}","labels":{labels}}}"#)
+    }
+
     #[test]
     fn saved_labels_are_read_from_agent_json_or_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(dir.path(), r#"{"node_id":1,"labels":{"gpu":"true"}}"#);
+        let ours = enrollment();
+        let path = write(dir.path(), &config(r#"{"gpu":"true"}"#));
         assert_eq!(
-            read_saved_labels(&path),
+            read_saved_labels(&path, &ours),
             Some(serde_json::json!({"gpu":"true"}))
         );
-        write(dir.path(), r#"{"node_id":1}"#);
-        assert_eq!(read_saved_labels(&path), Some(serde_json::json!({})));
+        write(
+            dir.path(),
+            &format!(r#"{{"node_id":1,"control_plane_url":"{PLANE}/"}}"#),
+        );
+        assert_eq!(read_saved_labels(&path, &ours), Some(serde_json::json!({})));
         // Half-written or hand-broken: keep what is in force.
         write(dir.path(), r#"{"node_id":1,"labels":{"gp"#);
-        assert_eq!(read_saved_labels(&path), None);
-        write(dir.path(), r#"{"labels":"gpu=true"}"#);
-        assert_eq!(read_saved_labels(&path), None);
+        assert_eq!(read_saved_labels(&path, &ours), None);
+        write(dir.path(), &config(r#""gpu=true""#));
+        assert_eq!(read_saved_labels(&path, &ours), None);
         // Valid JSON but not a config object: keep, never clear, the labels
         // (a dedicated node must not turn ordinary on a broken edit).
         for broken in ["null", "[]", "\"x\"", "3"] {
             write(dir.path(), broken);
-            assert_eq!(read_saved_labels(&path), None, "{broken}");
+            assert_eq!(read_saved_labels(&path, &ours), None, "{broken}");
         }
-        assert_eq!(read_saved_labels(&dir.path().join("missing.json")), None);
+        assert_eq!(
+            read_saved_labels(&dir.path().join("missing.json"), &ours),
+            None
+        );
+    }
+
+    #[test]
+    fn a_config_from_another_enrollment_is_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = enrollment();
+        // Re-joined as another node, or to another control plane, while
+        // this agent still runs: its labels are not this agent's to report.
+        let path = write(
+            dir.path(),
+            &format!(r#"{{"node_id":2,"control_plane_url":"{PLANE}","labels":{{"gpu":"true"}}}}"#),
+        );
+        assert_eq!(read_saved_labels(&path, &ours), None);
+        write(
+            dir.path(),
+            r#"{"node_id":1,"control_plane_url":"https://other.example.test","labels":{}}"#,
+        );
+        assert_eq!(read_saved_labels(&path, &ours), None);
+        write(dir.path(), r#"{"node_id":1,"labels":{}}"#);
+        assert_eq!(read_saved_labels(&path, &ours), None);
     }
 
     #[tokio::test]
     async fn a_label_change_in_agent_json_is_published() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), r#"{"labels":{"zone":"a"}}"#);
+        write(dir.path(), &config(r#"{"zone":"a"}"#));
         let settings = LabelsSettings {
             origin: LabelsOrigin::AgentJson,
             data_dir: Some(dir.path().to_path_buf()),
         };
-        let (mut labels, kept) = watch_labels(&settings, serde_json::json!({"zone":"a"}));
+        let (mut labels, kept) =
+            watch_labels(&settings, serde_json::json!({"zone":"a"}), enrollment());
         assert!(kept.is_none());
+        // Let the first read see the file as the agent started with it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         write(
             dir.path(),
-            r#"{"labels":{"zone":"a","temps.sh/role":"dedicated"}}"#,
+            &config(r#"{"zone":"a","temps.sh/role":"dedicated"}"#),
         );
         tokio::time::timeout(RELOAD_INTERVAL * 3, labels.changed())
             .await
             .expect("the change is published within a few reloads")
             .unwrap();
+        let first = labels.borrow_and_update().clone();
         assert_eq!(
-            *labels.borrow(),
+            first.labels,
             serde_json::json!({"zone":"a","temps.sh/role":"dedicated"})
         );
+        // Written again with the same labels (changed and changed back
+        // between two reads): a new revision, so it is confirmed again.
+        write(
+            dir.path(),
+            // A different length, so the rewrite shows even where
+            // modification times are coarse.
+            &config(r#"{"temps.sh/role":"dedicated", "zone":"a"}"#),
+        );
+        tokio::time::timeout(RELOAD_INTERVAL * 3, labels.changed())
+            .await
+            .expect("a rewrite is published")
+            .unwrap();
+        let second = labels.borrow_and_update().clone();
+        assert_eq!(second.labels, first.labels);
+        assert!(second.revision > first.revision);
     }
 
     #[tokio::test]
     async fn pinned_labels_are_never_reloaded() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), r#"{"labels":{"zone":"b"}}"#);
+        write(dir.path(), &config(r#"{"zone":"b"}"#));
         let settings = LabelsSettings {
             origin: LabelsOrigin::Override,
             data_dir: Some(dir.path().to_path_buf()),
         };
-        let (mut labels, kept) = watch_labels(&settings, serde_json::json!({"zone":"a"}));
+        let (mut labels, kept) =
+            watch_labels(&settings, serde_json::json!({"zone":"a"}), enrollment());
         assert!(
             kept.is_some(),
             "the sender is kept so the channel stays open"
@@ -383,7 +537,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(*labels.borrow(), serde_json::json!({"zone":"a"}));
+        assert_eq!(labels.borrow().labels, serde_json::json!({"zone":"a"}));
     }
 
     #[tokio::test]
@@ -394,26 +548,30 @@ mod tests {
                 origin: LabelsOrigin::AgentJson,
                 data_dir: Some(dir.path().to_path_buf()),
             },
-            7,
+            enrollment(),
         );
         let a = serde_json::json!({"zone": "a"});
-        accepted.sending(&a);
+        let at = |revision| CurrentLabels {
+            labels: a.clone(),
+            revision,
+        };
+        accepted.sending(&at(0));
         accepted.accepted(&a).await;
         let first = read_status(dir.path()).unwrap().accepted_at;
-        // B is sent but never accepted (the control plane is down) ...
-        accepted.sending(&serde_json::json!({"zone": "b"}));
-        // ... and the operator goes back to A, which is then accepted.
-        accepted.sending(&a);
+        // agent.json is written (B, then back to A, or B never accepted
+        // because the control plane is down) and A is accepted again.
+        accepted.sending(&at(2));
         tokio::time::sleep(Duration::from_millis(5)).await;
         accepted.accepted(&a).await;
         let second = read_status(dir.path()).unwrap();
         assert_eq!(second.labels, a);
+        assert_eq!(second.control_plane_url, PLANE);
         assert!(
             second.accepted_at > first,
             "a new acceptance gets a new record"
         );
-        // The same labels beat after beat: no rewrite.
-        accepted.sending(&a);
+        // The same revision beat after beat: no rewrite.
+        accepted.sending(&at(2));
         std::fs::remove_file(dir.path().join(STATUS_FILE)).unwrap();
         accepted.accepted(&a).await;
         assert!(read_status(dir.path()).is_none());
@@ -424,7 +582,7 @@ mod tests {
     fn only_small_regular_files_are_read_and_symlinks_are_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("agent.json");
-        std::fs::write(&file, r#"{"labels":{}}"#).unwrap();
+        std::fs::write(&file, config("{}")).unwrap();
         assert!(read_regular_file(&file, 1024).is_ok());
         assert!(read_regular_file(&file, 4).is_err(), "over the limit");
         let link = dir.path().join("link.json");
@@ -434,7 +592,10 @@ mod tests {
             "a symlink is not followed"
         );
         // The agent's own config is followed, as it is at start.
-        assert_eq!(read_saved_labels(&link), Some(serde_json::json!({})));
+        assert_eq!(
+            read_saved_labels(&link, &enrollment()),
+            Some(serde_json::json!({}))
+        );
         assert!(read_regular_file(dir.path(), 1024).is_err(), "a directory");
         // A FIFO would block a plain read forever.
         let fifo = dir.path().join(STATUS_FILE);
@@ -452,7 +613,10 @@ mod tests {
                 origin: LabelsOrigin::Override,
                 data_dir: Some(dir.path().to_path_buf()),
             },
-            7,
+            Enrollment {
+                node_id: 7,
+                control_plane_url: PLANE.to_string(),
+            },
         );
         accepted.accepted(&serde_json::json!({"gpu":"true"})).await;
         let first = read_status(dir.path()).unwrap();

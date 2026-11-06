@@ -47,8 +47,12 @@ symlink; the temporary file has a name of the writing process's own and is
 created exclusively; the rename happens only if `agent.json` is still the
 file that was read; and an exclusive lock on `agent.json.lock` is held from
 the read to the rename, so two overlapping edits take turns instead of one
-losing the other's change. The agent keeps its labels when `agent.json` is
-not a JSON object at all. `--data-dir` picks
+losing the other's change. "Still the file that was read" means the same
+inode, size and modification time, so a write in place is caught too.
+`temps join` replaces `agent.json` under the same lock, through a temporary
+file, so an edit overlapping a join cannot write the old enrollment back.
+Temporary files a crashed run left behind are removed under the lock. The
+agent keeps its labels when `agent.json` is not a JSON object at all. `--data-dir` picks
 another agent directory, as for `temps agent ingress`, which uses the same
 reader and writer.
 
@@ -59,8 +63,9 @@ them too, before anything is registered:
 
 - a key is `name` or `prefix/name`: a name of 1-63 letters, digits, `-`, `_`
   or `.`, starting and ending with a letter or digit; a prefix of lowercase
-  letters, digits, `-` and `.` (a DNS name), at most 253 characters;
-- a value is at most 253 characters, without control characters, commas
+  letters, digits, `-` and `.` (a DNS name), at most 253 characters, each
+  part between dots at most 63;
+- a value is at most 253 characters (not bytes), without control characters, commas
   (which `--labels` uses to separate labels) or surrounding whitespace; it may
   be empty;
 - the `temps.sh/` prefix is reserved: only `temps.sh/role` exists, with the
@@ -78,7 +83,12 @@ before these rules can still be removed.
 The agent re-reads the `labels` object of `agent.json` every 5 seconds, as it
 already does for `ingress`, and a change sends a heartbeat at once. A file
 that does not parse, or whose `labels` is not an object, keeps the labels in
-force. Labels given with `--labels` or `TEMPS_NODE_LABELS` are pinned: the
+force, and so does a file that names another node ID or control plane URL
+than the running agent's: a `temps join` that re-enrolled the directory while
+the old agent still runs must not have its labels reported to the old
+control plane. A file rewritten with the same labels (changed and changed
+back between two reads) still counts as a change, so it is confirmed again.
+Labels given with `--labels` or `TEMPS_NODE_LABELS` are pinned: the
 agent never reloads them from the file.
 
 ### D4. The agent records the labels the control plane accepted
@@ -86,7 +96,9 @@ agent never reloads them from the file.
 After a heartbeat succeeds with labels different from the last ones
 recorded, the agent writes `labels-status.json` next to `agent.json`
 (`0600`): the labels, whether they came from `agent.json` or an override, the
-node ID and the time. One small write per change, not per heartbeat.
+node ID, the control plane URL and the time. The command trusts a record only
+for the node ID and control plane in `agent.json`, since node IDs repeat
+across control planes. One small write per change, not per heartbeat.
 
 This is how `set` and `unset` confirm the change locally: they wait (at most
 15 seconds) for a record of exactly the new labels written after their own
@@ -111,7 +123,10 @@ Before writing, the command looks for an override where the agent would get
 one: the installed systemd unit's effective environment and command line
 (drop-ins included), the LaunchAgent plist, and the record (D4) of the agent
 that last reported. Any of them fails the command, naming where the override
-is and how to remove it, without touching `agent.json`. `TEMPS_NODE_LABELS` in the
+is and how to remove it, without touching `agent.json`. When the unit cannot
+be checked (`systemctl show` fails, or an environment file it names cannot be
+read) the command refuses too: an override it cannot rule out is treated as
+one. `TEMPS_NODE_LABELS` in the
 caller's own shell is reported as a warning: it only affects a `temps agent`
 started from that shell.
 

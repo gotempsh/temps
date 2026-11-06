@@ -105,6 +105,7 @@ struct Worker {
     /// Held from the read to the write, by commands that change labels.
     _lock: Option<ConfigLock>,
     node_id: Option<i64>,
+    control_plane_url: Option<String>,
     node_name: Option<String>,
 }
 
@@ -130,6 +131,10 @@ impl Worker {
             .ok_or_else(|| anyhow::anyhow!("{} has no directory", path.display()))?;
         Ok(Self {
             node_id: config.get("node_id").and_then(serde_json::Value::as_i64),
+            control_plane_url: config
+                .get("control_plane_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             node_name: config
                 .get("node_name")
                 .and_then(serde_json::Value::as_str)
@@ -147,7 +152,8 @@ impl Worker {
     }
 
     /// The agent's record of what the control plane accepted, if it is about
-    /// this node (a re-join gets a new node ID).
+    /// this node on this control plane (a re-join gets a new node ID, and
+    /// node IDs repeat across control planes).
     fn status(&self) -> Option<LabelsStatus> {
         let (status, meta) = temps_node_agent::labels::read_status_file(&self.data_dir)?;
         // Run as root, only a record root wrote counts.
@@ -160,7 +166,12 @@ impl Worker {
         }
         #[cfg(not(unix))]
         let _ = meta;
-        Some(status).filter(|status| Some(i64::from(status.node_id)) == self.node_id)
+        let url = |url: &str| url.trim_end_matches('/').to_string();
+        Some(status).filter(|status| {
+            Some(i64::from(status.node_id)) == self.node_id
+                && self.control_plane_url.as_deref().map(url)
+                    == Some(url(&status.control_plane_url))
+        })
     }
 
     fn display_name(&self) -> String {
@@ -254,8 +265,13 @@ fn list(target: &Target) -> anyhow::Result<()> {
              Labels in the console under Settings > Nodes."
         ),
     }
-    for found in service_overrides() {
-        println!("Warning: {found}");
+    match service_overrides() {
+        Ok(found) => {
+            for found in found {
+                println!("Warning: {found}");
+            }
+        }
+        Err(error) => println!("Warning: {error}."),
     }
     if let Some(note) = shell_override_note() {
         println!("Note: {note}");
@@ -270,7 +286,13 @@ fn change(
     edit: impl FnOnce(&mut Labels) -> anyhow::Result<Vec<String>>,
 ) -> anyhow::Result<()> {
     let mut worker = Worker::load(&args.target, true)?;
-    if let Some(found) = service_overrides().into_iter().next() {
+    let overrides = service_overrides().map_err(|error| {
+        anyhow::anyhow!(
+            "{error}, so it is not known whether the agent would use labels saved in \
+             agent.json; nothing was changed. Fix that, then run this again."
+        )
+    })?;
+    if let Some(found) = overrides.into_iter().next() {
         anyhow::bail!(
             "{found}. The agent would ignore labels saved in agent.json, so nothing was changed. \
              Remove the override, restart the agent, then run this again."
@@ -398,8 +420,9 @@ fn apply(
         println!(
             "Not reported yet. The agent applies agent.json by itself and reports it on its \
              next successful heartbeat: if the control plane is unreachable, that is when it \
-             reconnects. If the agent is not running, start it (`temps agent service status`). \
-             Check with `temps agent labels list`."
+             reconnects. If the agent is not running, start it (`temps agent service status`); \
+             if it was downgraded to a release older than this command, restart it, since such \
+             an agent reads agent.json only at start. Check with `temps agent labels list`."
         );
         console_hint(worker, wanted);
         return Ok(());
@@ -501,26 +524,32 @@ fn console_hint(worker: &Worker, wanted: &serde_json::Value) {
     }
 }
 
-/// Which file was read: a write replaces only that file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which file was read, and its size and modification time then: a write
+/// replaces only that file, and only if nobody wrote to it in place since
+/// (`temps join`, an editor saving in place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct FileIdentity {
     dev: u64,
     ino: u64,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
 }
 
 impl FileIdentity {
-    #[cfg(unix)]
     fn of(meta: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
         Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
+            dev,
+            ino,
+            len: meta.len(),
+            modified: meta.modified().ok(),
         }
-    }
-
-    #[cfg(not(unix))]
-    fn of(_meta: &std::fs::Metadata) -> Self {
-        Self { dev: 0, ino: 0 }
     }
 }
 
@@ -617,6 +646,10 @@ pub(super) fn lock_agent_config(path: &Path) -> anyhow::Result<ConfigLock> {
 
 fn lock_agent_config_within(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
     refuse_shared_dir_as_root(path)?;
+    open_config_lock(path, wait)
+}
+
+fn open_config_lock(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
     let lock_path = path.with_extension("json.lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -667,6 +700,27 @@ pub(super) fn write_config_atomically(
 ) -> anyhow::Result<()> {
     let text = serde_json::to_string_pretty(config)
         .map_err(|e| anyhow::anyhow!("Could not serialize the agent config: {e}"))?;
+    remove_stale_temp_files(path);
+    let tmp = write_temp_file(path, &text)?;
+    let unchanged = std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_file() && FileIdentity::of(&meta) == read);
+    if !unchanged {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!(
+            "{} changed while it was being edited, so nothing was written. Run this again.",
+            path.display()
+        );
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("Could not replace {}: {e}", path.display())
+    })
+}
+
+/// Write `text` to a new temporary file beside `path`: a name of this
+/// process's own, created exclusively (`O_EXCL` never follows a symlink
+/// planted in its place), owner-only and synced. Removed again on failure.
+fn write_temp_file(path: &Path, text: &str) -> anyhow::Result<PathBuf> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -698,15 +752,61 @@ pub(super) fn write_config_atomically(
             wrong_user_hint()
         );
     }
-    let unchanged = std::fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.file_type().is_file() && FileIdentity::of(&meta) == read);
-    if !unchanged {
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::bail!(
-            "{} changed while it was being edited, so nothing was written. Run this again.",
-            path.display()
-        );
+    Ok(tmp)
+}
+
+/// Whether `name` is a temporary file [`write_temp_file`] makes for
+/// `agent.json`: `agent.json.<pid>.<nanos>.tmp`.
+fn is_config_temp_name(name: &str) -> bool {
+    name.strip_prefix("agent.json.")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|middle| middle.split_once('.'))
+        .is_some_and(|(pid, nanos)| {
+            [pid, nanos]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
+/// Remove temporary files a crashed earlier run left beside `path`. Only
+/// called under the config lock, so no other writer's file is in flight;
+/// only regular files are removed, never what a symlink points at.
+fn remove_stale_temp_files(path: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let stale = name.to_str().is_some_and(is_config_temp_name)
+            && entry.file_type().is_ok_and(|kind| kind.is_file());
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
+}
+
+/// For `temps join`, which replaces `agent.json` with a new enrollment's
+/// config (or writes the first one): under the same lock as `temps agent
+/// labels` and `temps agent ingress`, through a temporary file renamed over
+/// it. An overlapping edit then either finishes first or reads the new
+/// file; it can never write the old enrollment back over this one.
+pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()> {
+    // Join has registered the node by now: a lock held by a hung edit must
+    // not lose the new enrollment, so it is written anyway.
+    let lock = match open_config_lock(path, LOCK_WAIT) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            println!("Warning: {error} Writing the new config anyway.");
+            None
+        }
+    };
+    if lock.is_some() {
+        remove_stale_temp_files(path);
+    }
+    let tmp = write_temp_file(path, text)?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         anyhow::anyhow!("Could not replace {}: {e}", path.display())
@@ -761,8 +861,10 @@ fn shell_override_note() -> Option<String> {
     ))
 }
 
-/// Overrides of `agent.json` labels in the installed agent service.
-fn service_overrides() -> Vec<String> {
+/// Overrides of `agent.json` labels in the installed agent service. `Err`
+/// when the service could not be checked: a change is then refused rather
+/// than written blind.
+fn service_overrides() -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     if cfg!(target_os = "macos") {
         if let Some(home) = dirs::home_dir() {
@@ -776,9 +878,9 @@ fn service_overrides() -> Vec<String> {
     } else if cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir() {
         found.extend(systemd_override(|args| {
             super::agent_service::systemctl_query(args)
-        }));
+        })?);
     }
-    found
+    Ok(found)
 }
 
 /// What in a LaunchAgent plist overrides `agent.json` labels.
@@ -793,8 +895,12 @@ fn plist_override(plist: &str) -> Option<&'static str> {
 }
 
 /// What in the loaded systemd unit (drop-ins and environment files
-/// included) overrides `agent.json` labels. `query` runs `systemctl`.
-fn systemd_override(query: impl Fn(&[&str]) -> Result<String, String>) -> Option<String> {
+/// included) overrides `agent.json` labels. `query` runs `systemctl`; a
+/// failed query, or an environment file that exists but cannot be read, is
+/// an `Err`: the override cannot be ruled out.
+fn systemd_override(
+    query: impl Fn(&[&str]) -> Result<String, String>,
+) -> Result<Option<String>, String> {
     let service = "temps-agent.service";
     let show = query(&[
         "show",
@@ -806,7 +912,16 @@ fn systemd_override(query: impl Fn(&[&str]) -> Result<String, String>) -> Option
         "-p",
         "EnvironmentFiles",
     ])
-    .ok()?;
+    .map_err(|error| {
+        format!(
+            "Could not check {service} for a {LABELS_ENV} or --labels override \
+             (`systemctl show {service}` failed: {error})"
+        )
+    })?;
+    // `systemctl show` quotes a word holding whitespace as a whole
+    // (`"TEMPS_NODE_LABELS=zone=west coast"`), so a word may start with a
+    // quote.
+    let word = |part: &str| part.trim_matches(['"', '\'']).to_string();
     for line in show.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -815,48 +930,62 @@ fn systemd_override(query: impl Fn(&[&str]) -> Result<String, String>) -> Option
             "Environment"
                 if value
                     .split_whitespace()
-                    .any(|v| v.starts_with("TEMPS_NODE_LABELS=")) =>
+                    .any(|part| word(part).starts_with("TEMPS_NODE_LABELS=")) =>
             {
-                return Some(format!(
+                return Ok(Some(format!(
                     "{service} sets {LABELS_ENV} (see `systemctl cat {service}`), which \
                      overrides agent.json"
-                ));
+                )));
             }
             "ExecStart"
                 if value
                     .split_whitespace()
+                    .map(word)
                     .any(|arg| arg == "--labels" || arg.starts_with("--labels=")) =>
             {
-                return Some(format!(
+                return Ok(Some(format!(
                     "{service} starts the agent with --labels (see `systemctl cat {service}`), \
                      which overrides agent.json"
-                ));
+                )));
             }
+            // One `EnvironmentFiles=/path (ignore_errors=no)` line per file;
+            // the path may hold spaces.
             "EnvironmentFiles" => {
-                // `/path (ignore_errors=no)` entries.
-                for file in value
-                    .split_whitespace()
-                    .filter(|part| part.starts_with('/'))
-                {
-                    let sets = std::fs::read_to_string(file).is_ok_and(|text| {
-                        text.lines().any(|line| {
-                            line.trim_start()
-                                .trim_start_matches("export ")
-                                .starts_with("TEMPS_NODE_LABELS=")
-                        })
-                    });
-                    if sets {
-                        return Some(format!(
-                            "{file}, an environment file of {service}, sets {LABELS_ENV}, which \
-                             overrides agent.json"
-                        ));
+                let file = value
+                    .rsplit_once(" (ignore_errors=")
+                    .map_or(value, |(path, _)| path);
+                if !file.starts_with('/') {
+                    continue;
+                }
+                let text = match std::fs::read_to_string(file) {
+                    Ok(text) => text,
+                    // A missing optional file sets nothing.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not read {file}, an environment file of {service}, to check \
+                             it for {LABELS_ENV}: {error}.{}",
+                            wrong_user_hint()
+                        ))
                     }
+                };
+                let sets = text.lines().any(|line| {
+                    line.trim_start()
+                        .trim_start_matches("export ")
+                        .trim_start()
+                        .starts_with("TEMPS_NODE_LABELS=")
+                });
+                if sets {
+                    return Ok(Some(format!(
+                        "{file}, an environment file of {service}, sets {LABELS_ENV}, which \
+                         overrides agent.json"
+                    )));
                 }
             }
             _ => {}
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -864,9 +993,12 @@ mod tests {
     use super::*;
     use chrono::{Duration as ChronoDuration, Utc};
 
+    const PLANE: &str = "https://cp.example.test";
+
     fn status(labels: serde_json::Value, origin: LabelsOrigin, age_secs: i64) -> LabelsStatus {
         LabelsStatus {
             node_id: 3,
+            control_plane_url: PLANE.to_string(),
             labels,
             origin,
             accepted_at: Utc::now() - ChronoDuration::seconds(age_secs),
@@ -909,9 +1041,10 @@ mod tests {
             path: PathBuf::from("/x/agent.json"),
             data_dir: PathBuf::from("/x"),
             config: serde_json::json!({}),
-            identity: FileIdentity { dev: 0, ino: 0 },
+            identity: FileIdentity::default(),
             _lock: None,
             node_id: Some(3),
+            control_plane_url: Some(PLANE.to_string()),
             node_name: None,
         };
         let error = settled(&worker, Confirmation::Overridden(serde_json::json!({})))
@@ -929,8 +1062,23 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.json");
-        let original = r#"{"node_id":3,"labels":{"zone":"a"}}"#;
-        std::fs::write(&path, original).unwrap();
+        let original =
+            format!(r#"{{"node_id":3,"control_plane_url":"{PLANE}","labels":{{"zone":"a"}}}}"#);
+        std::fs::write(&path, &original).unwrap();
+        // A record from the same node ID on another control plane is not
+        // this worker's.
+        let mut elsewhere = status(serde_json::json!({"zone": "b"}), LabelsOrigin::AgentJson, 1);
+        elsewhere.control_plane_url = "https://other.example.test".to_string();
+        temps_node_agent::labels::record_accepted(dir.path(), &elsewhere).unwrap();
+        assert!(Worker::load(
+            &Target {
+                data_dir: Some(dir.path().to_path_buf())
+            },
+            false
+        )
+        .unwrap()
+        .status()
+        .is_none());
         temps_node_agent::labels::record_accepted(
             dir.path(),
             &status(serde_json::json!({"zone": "a"}), LabelsOrigin::Override, 60),
@@ -960,26 +1108,60 @@ mod tests {
             systemd_override(show(
                 "LoadState=loaded\nEnvironment=TEMPS_DATA_DIR=/root/.temps\nExecStart={ path=/usr/local/bin/temps ; argv[]=/usr/local/bin/temps agent ; }\nEnvironmentFiles=\n"
             )),
-            None
+            Ok(None)
         );
         let env = systemd_override(show(
             "Environment=TEMPS_DATA_DIR=/root/.temps TEMPS_NODE_LABELS=zone=a\n",
         ))
+        .unwrap()
         .unwrap();
         assert!(env.contains("sets TEMPS_NODE_LABELS"), "{env}");
+        // systemd quotes an assignment whose value holds a space.
+        let quoted = systemd_override(show(
+            "Environment=\"TEMPS_DATA_DIR=/srv/my temps\" \"TEMPS_NODE_LABELS=zone=west coast\"\n",
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(quoted.contains("sets TEMPS_NODE_LABELS"), "{quoted}");
+        assert_eq!(
+            systemd_override(show("Environment=\"TEMPS_DATA_DIR=/srv/my temps\"\n")),
+            Ok(None)
+        );
         let flag = systemd_override(show(
             "ExecStart={ path=/usr/local/bin/temps ; argv[]=/usr/local/bin/temps agent --labels zone=a ; }\n",
         ))
+        .unwrap()
         .unwrap();
         assert!(flag.contains("--labels"), "{flag}");
+        let quoted_flag = systemd_override(show(
+            "ExecStart={ path=/usr/local/bin/temps ; argv[]=/usr/local/bin/temps agent \"--labels=zone=west coast\" ; }\n",
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(quoted_flag.contains("--labels"), "{quoted_flag}");
+        // An environment file, in a directory whose name holds a space.
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("agent.env");
+        let spaced = dir.path().join("unit env");
+        std::fs::create_dir(&spaced).unwrap();
+        let file = spaced.join("agent.env");
         std::fs::write(&file, "RUST_LOG=info\nexport TEMPS_NODE_LABELS=zone=a\n").unwrap();
         let text = format!("EnvironmentFiles={} (ignore_errors=no)\n", file.display());
-        let from_file = systemd_override(move |_: &[&str]| Ok(text.clone())).unwrap();
+        let from_file = systemd_override(move |_: &[&str]| Ok(text.clone()))
+            .unwrap()
+            .unwrap();
         assert!(from_file.contains("environment file"), "{from_file}");
-        // systemctl unavailable or the unit absent: nothing to report.
-        assert_eq!(systemd_override(|_: &[&str]| Err("no".to_string())), None);
+        // An optional file that does not exist sets nothing.
+        let missing = format!(
+            "EnvironmentFiles={} (ignore_errors=yes)\n",
+            spaced.join("absent.env").display()
+        );
+        assert_eq!(
+            systemd_override(move |_: &[&str]| Ok(missing.clone())),
+            Ok(None)
+        );
+        // systemctl failing is not "no override": the change is refused.
+        let error = systemd_override(|_: &[&str]| Err("timed out".to_string())).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[test]
@@ -1126,6 +1308,81 @@ mod tests {
         assert_eq!(own_temp_files(dir.path()), 0);
     }
 
+    #[test]
+    fn a_config_written_in_place_after_it_was_read_is_not_replaced() {
+        if skip_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        std::fs::write(&path, r#"{"labels":{}}"#).unwrap();
+        let file = read_agent_config(&path).unwrap();
+        // Rewritten in place (same inode), as `std::fs::write` does.
+        std::fs::write(&path, r#"{"labels":{},"token":"new"}"#).unwrap();
+        let error = write_config_atomically(&path, &file.value, file.identity)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed while it was being edited"),
+            "{error}"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("new"));
+    }
+
+    #[test]
+    fn leftover_temp_files_are_removed_and_a_join_replaces_the_config_under_the_lock() {
+        if skip_as_root() {
+            return;
+        }
+        assert!(is_config_temp_name("agent.json.42.1700000000000000000.tmp"));
+        for name in [
+            "agent.json.tmp",
+            "agent.json.x.1.tmp",
+            "agent.json.1.2",
+            "other.1.2.tmp",
+        ] {
+            assert!(!is_config_temp_name(name), "{name}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        std::fs::write(&path, r#"{"labels":{},"token":"old"}"#).unwrap();
+        let stale = dir.path().join("agent.json.42.17.tmp");
+        std::fs::write(&stale, "{").unwrap();
+        let unrelated = dir.path().join("agent.json.notes.tmp");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let file = read_agent_config(&path).unwrap();
+        write_config_atomically(&path, &file.value, file.identity).unwrap();
+        assert!(!stale.exists(), "a crashed run's temp file is removed");
+        assert!(
+            unrelated.exists(),
+            "only this command's temp files are removed"
+        );
+
+        // An edit that read the old enrollment, then a join: the edit can no
+        // longer write the old config back.
+        let edit = read_agent_config(&path).unwrap();
+        replace_agent_config(&path, r#"{"labels":{},"token":"new"}"#).unwrap();
+        assert!(write_config_atomically(&path, &edit.value, edit.identity).is_err());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("new"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // A join waits for an edit holding the lock, then writes.
+        let held = lock_agent_config(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || replace_agent_config(&path, r#"{"token":"third"}"#))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("new"));
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
+    }
+
     /// A root run refuses the world-writable temporary directory these tests
     /// use, by design (see `read_agent_config`).
     fn skip_as_root() -> bool {
@@ -1175,7 +1432,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The parent of the temp file does not exist: open fails.
         let path = dir.path().join("missing").join("agent.json");
-        let identity = FileIdentity { dev: 0, ino: 0 };
+        let identity = FileIdentity::default();
         let error = write_config_atomically(&path, &serde_json::json!({}), identity)
             .unwrap_err()
             .to_string();

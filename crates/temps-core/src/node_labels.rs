@@ -23,8 +23,11 @@ pub const NODE_ROLES: [&str; 2] = [BUILDER_NODE_ROLE, DEDICATED_NODE_ROLE];
 pub const RESERVED_PREFIX: &str = "temps.sh/";
 /// Longest key name (the part after any `prefix/`).
 pub const MAX_NAME_LEN: usize = 63;
-/// Longest key prefix, and longest value.
+/// Longest key prefix.
 pub const MAX_PREFIX_LEN: usize = 253;
+/// Longest part of a key prefix between dots, as in a DNS name.
+pub const MAX_DNS_LABEL_LEN: usize = 63;
+/// Longest value, in characters.
 pub const MAX_VALUE_LEN: usize = 253;
 /// Most labels one node may carry: they travel in every heartbeat.
 pub const MAX_LABELS: usize = 64;
@@ -104,6 +107,7 @@ fn check_prefix(key: &str, prefix: &str) -> Result<(), LabelError> {
     }
     let ok = prefix.split('.').all(|part| {
         !part.is_empty()
+            && part.len() <= MAX_DNS_LABEL_LEN
             && part
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -112,7 +116,8 @@ fn check_prefix(key: &str, prefix: &str) -> Result<(), LabelError> {
     });
     if !ok {
         return Err(invalid(format!(
-            "the prefix '{prefix}' must be a lowercase DNS name such as example.com"
+            "the prefix '{prefix}' must be a lowercase DNS name such as example.com, each \
+             part between dots 1 to {MAX_DNS_LABEL_LEN} characters"
         )));
     }
     Ok(())
@@ -148,7 +153,7 @@ pub fn validate_value(key: &str, value: &str) -> Result<(), LabelError> {
         value: value.escape_default().to_string(),
         reason: reason.to_string(),
     };
-    if value.len() > MAX_VALUE_LEN {
+    if value.chars().count() > MAX_VALUE_LEN {
         return Err(invalid("values are at most 253 characters"));
     }
     if value.chars().any(char::is_control) {
@@ -305,6 +310,13 @@ mod tests {
             .to_string()
             .contains("most is 63"));
         assert!(parse_label(&format!("{}=1", "a".repeat(MAX_NAME_LEN))).is_ok());
+        // Each part of a prefix is a DNS label: at most 63 characters.
+        let part = "p".repeat(MAX_DNS_LABEL_LEN);
+        assert!(parse_label(&format!("{part}.example.com/x=1")).is_ok());
+        let error = parse_label(&format!("{part}p.example.com/x=1"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 to 63"), "{error}");
     }
 
     #[test]
@@ -324,6 +336,9 @@ mod tests {
         assert!(validate_value("k", " a").is_err());
         assert!(validate_value("k", &"v".repeat(MAX_VALUE_LEN)).is_ok());
         assert!(validate_value("k", &"v".repeat(MAX_VALUE_LEN + 1)).is_err());
+        // The limit counts characters, not bytes.
+        assert!(validate_value("k", &"é".repeat(MAX_VALUE_LEN)).is_ok());
+        assert!(validate_value("k", &"é".repeat(MAX_VALUE_LEN + 1)).is_err());
         // A value may hold '=' after the first one.
         assert_eq!(parse_label("k=a=b").unwrap().1, "a=b");
     }

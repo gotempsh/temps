@@ -508,9 +508,13 @@ fn spawn_heartbeat_loop(
     // ADR-091: labels saved in agent.json are reloaded while the agent runs
     // (`temps agent labels set`); a change wakes the heartbeat. `kept_sender`
     // holds the channel open when nothing reloads.
+    let enrollment = crate::labels::Enrollment {
+        node_id: config.node_id,
+        control_plane_url: config.control_plane_url.clone(),
+    };
     let (mut labels_rx, kept_sender) =
-        crate::labels::watch_labels(&labels_settings, config.labels.clone());
-    let mut accepted_labels = crate::labels::AcceptedLabels::new(labels_settings, config.node_id);
+        crate::labels::watch_labels(&labels_settings, config.labels.clone(), enrollment.clone());
+    let mut accepted_labels = crate::labels::AcceptedLabels::new(labels_settings, enrollment);
     // ADR 045: advertise this host's own grant so the control plane can gate
     // placement up front instead of discovering mid-deploy that the node would
     // have deployed the project without the socket. Snapshotted once at
@@ -679,8 +683,9 @@ fn spawn_heartbeat_loop(
                 known_platform
             };
 
-            let labels = labels_rx.borrow_and_update().clone();
-            accepted_labels.sending(&labels);
+            let current = labels_rx.borrow_and_update().clone();
+            accepted_labels.sending(&current);
+            let labels = current.labels;
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,
@@ -1595,9 +1600,13 @@ pub(crate) mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let agent_json = dir.path().join("agent.json");
-        std::fs::write(&agent_json, r#"{"node_id":1,"labels":{"zone":"a"}}"#).unwrap();
+        let saved = |labels: &str| {
+            format!(r#"{{"node_id":1,"control_plane_url":"{url}","labels":{labels}}}"#)
+        };
+        std::fs::write(&agent_json, saved(r#"{"zone":"a"}"#)).unwrap();
         let mut config = test_agent_config(false);
-        config.control_plane_url = url;
+        config.node_id = 1;
+        config.control_plane_url = url.clone();
         config.labels = serde_json::json!({"zone": "a"});
         // Nothing answers here: the inventory listing fails and is skipped.
         let deployer = Arc::new(
@@ -1648,7 +1657,7 @@ pub(crate) mod tests {
 
         std::fs::write(
             &agent_json,
-            r#"{"node_id":1,"labels":{"zone":"a","temps.sh/role":"dedicated"}}"#,
+            saved(r#"{"zone":"a","temps.sh/role":"dedicated"}"#),
         )
         .unwrap();
         let wanted = serde_json::json!({"zone": "a", "temps.sh/role": "dedicated"});
@@ -1660,6 +1669,7 @@ pub(crate) mod tests {
         let status = crate::labels::read_status(dir.path()).unwrap();
         assert_eq!(status.origin, crate::labels::LabelsOrigin::AgentJson);
         assert_eq!(status.node_id, 1);
+        assert_eq!(status.control_plane_url, url);
     }
 
     #[test]
