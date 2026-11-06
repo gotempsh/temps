@@ -256,17 +256,9 @@ async fn gitlab_webhook_events(
 
     let git_ref = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
 
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else {
-        None
-    };
+    let branch = super::branch_from_ref(git_ref, false);
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
 
     let commit = pushed_commit(&payload);
 
@@ -519,8 +511,30 @@ fn closed_merge_request(
 
 #[cfg(test)]
 mod tests {
-    //! Smoke-tests for the helpers from the handler perspective. Detailed
-    //! crypto edge-cases live in `services::gitlab_webhook::tests`.
+    #[test]
+    fn branch_refs_preserve_embedded_prefixes() {
+        for (input, expected) in [
+            (
+                "refs/heads/feat/refs/heads/victim",
+                Some("feat/refs/heads/victim"),
+            ),
+            ("refs/heads/x", Some("x")),
+            ("refs/heads/feat/topic", Some("feat/topic")),
+            ("refs/tags/release", None),
+        ] {
+            assert_eq!(
+                super::super::branch_from_ref(input, false).as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::branch_from_ref("feat/topic", false).as_deref(),
+            None
+        );
+    }
+
+    // Smoke-tests for the helpers from the handler perspective. Detailed
+    // crypto edge-cases live in `services::gitlab_webhook::tests`.
 
     use super::{project_has_signing_token, stored_signing_token};
 

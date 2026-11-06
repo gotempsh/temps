@@ -207,20 +207,9 @@ async fn bitbucket_webhook_events(
     }
 
     // Determine branch and tag from the git ref.
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else if !git_ref.starts_with("refs/") && !git_ref.is_empty() {
-        // Bitbucket PR events send the branch name directly (no refs/ prefix).
-        Some(git_ref.clone())
-    } else {
-        None
-    };
+    let branch = super::branch_from_ref(&git_ref, !git_ref.is_empty());
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
 
     let authorized_projects =
         matched_projects_for_repository(matched_projects, repo_owner.as_str(), repo_name.as_str());
@@ -460,6 +449,28 @@ fn matched_projects_for_repository(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn branch_refs_preserve_embedded_prefixes() {
+        for (input, expected) in [
+            (
+                "refs/heads/feat/refs/heads/victim",
+                Some("feat/refs/heads/victim"),
+            ),
+            ("refs/heads/x", Some("x")),
+            ("refs/heads/feat/topic", Some("feat/topic")),
+            ("refs/tags/release", None),
+        ] {
+            assert_eq!(
+                super::super::branch_from_ref(input, true).as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::branch_from_ref("feat/topic", true).as_deref(),
+            Some("feat/topic")
+        );
+    }
+
     use super::*;
 
     fn test_project(id: i32, repo_owner: &str, repo_name: &str) -> temps_entities::projects::Model {
@@ -616,11 +627,7 @@ mod tests {
     #[test]
     fn test_refs_tags_prefix_stripped_to_tag() {
         let git_ref = "refs/tags/v2.0.0".to_string();
-        let tag = if git_ref.starts_with("refs/tags/") {
-            Some(git_ref.replace("refs/tags/", ""))
-        } else {
-            None
-        };
+        let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
         assert_eq!(tag, Some("v2.0.0".to_string()));
     }
 

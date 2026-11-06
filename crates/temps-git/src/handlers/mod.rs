@@ -29,6 +29,14 @@ pub use public::PublicRepositoriesApiDoc;
 /// so no delivery that worked is refused; the other providers set their own.
 pub(crate) const PROVIDER_EVENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Extract a branch without changing occurrences of the prefix inside its name.
+fn branch_from_ref(git_ref: &str, allow_bare: bool) -> Option<String> {
+    git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| (allow_bare && !git_ref.starts_with("refs/")).then_some(git_ref))
+        .map(str::to_owned)
+}
+
 /// Configure the session-authenticated routes for git providers: provider and
 /// connection management, repository browsing, and the OAuth/installation
 /// callbacks a provider redirects the operator's browser to.
