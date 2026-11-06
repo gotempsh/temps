@@ -295,6 +295,32 @@ async fn gitea_webhook_events(
         });
     }
 
+    // Gitea reports a deleted branch as a `delete` event, never as a push.
+    if event_type == "delete" {
+        if let Some(branch) = deleted_branch(&payload) {
+            if let Err(e) = state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(
+                    branch,
+                    temps_core::PreviewBranchCloseReason::BranchDeleted,
+                    authorized_projects,
+                )
+                .await
+            {
+                error!(
+                    delivery_id = delivery_id,
+                    repo_owner = repo_owner,
+                    repo_name = repo_name,
+                    "Failed to queue preview teardown for deleted Gitea branch: {:?}",
+                    e
+                );
+            }
+        }
+        return axum::Json(GiteaWebhookResponse {
+            message: "processed".to_string(),
+        });
+    }
+
     // Other non-push events are accepted (200) and logged but not dispatched.
     if event_type != "push" {
         info!(
@@ -365,8 +391,35 @@ async fn gitea_webhook_events(
     })
 }
 
+/// The branch a Gitea `delete` event removed; `None` for a deleted tag.
+fn deleted_branch(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("ref_type").and_then(|v| v.as_str()) != Some("branch") {
+        return None;
+    }
+
+    let name = payload.get("ref").and_then(|v| v.as_str())?;
+    let branch = name.strip_prefix("refs/heads/").unwrap_or(name);
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delete_events_name_the_deleted_branch_but_never_a_tag() {
+        let event =
+            |ref_type: &str, name: &str| serde_json::json!({ "ref": name, "ref_type": ref_type });
+        assert_eq!(
+            super::deleted_branch(&event("branch", "feat/topic")).as_deref(),
+            Some("feat/topic")
+        );
+        assert_eq!(
+            super::deleted_branch(&event("branch", "refs/heads/feat/topic")).as_deref(),
+            Some("feat/topic")
+        );
+        assert_eq!(super::deleted_branch(&event("tag", "v1.0.0")), None);
+        assert_eq!(super::deleted_branch(&event("branch", "")), None);
+    }
+
     #[test]
     fn branch_refs_preserve_embedded_prefixes() {
         for (input, expected) in [
