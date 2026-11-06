@@ -97,3 +97,45 @@ fn the_error_names_fields_but_never_their_values() {
     assert!(!message.contains("client-secret"));
     assert!(!message.contains("test-private-key-value"));
 }
+
+#[test]
+fn shared_secret_warning_is_rate_limited_and_recovers_at_the_boundary() {
+    let warning = SharedSecretWarning::new();
+    assert!(warning.should_warn(2, 0));
+    assert!(!warning.should_warn(2, 0));
+    assert!(!warning.should_warn(3, 299));
+    assert!(warning.should_warn(3, 300));
+    assert!(!warning.should_warn(2, 599));
+    assert!(warning.should_warn(2, 600));
+}
+
+#[test]
+fn distinct_secrets_do_not_consume_the_warning_interval() {
+    let warning = SharedSecretWarning::new();
+    assert!(!warning.should_warn(0, 0));
+    assert!(!warning.should_warn(1, 0));
+    assert!(warning.should_warn(2, 0));
+    assert!(!warning.should_warn(1, 300));
+    assert!(warning.should_warn(2, 300));
+}
+
+#[test]
+fn concurrent_shared_secret_deliveries_emit_only_one_warning() {
+    let warning = Arc::new(SharedSecretWarning::new());
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let warning = warning.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                warning.should_warn(2, 0)
+            })
+        })
+        .collect();
+    let warnings = threads
+        .into_iter()
+        .filter_map(|thread| thread.join().expect("warning task completes").then_some(()))
+        .count();
+    assert_eq!(warnings, 1);
+}

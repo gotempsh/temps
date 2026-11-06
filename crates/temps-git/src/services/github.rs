@@ -7,7 +7,9 @@ use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{self, repositories};
@@ -267,6 +269,43 @@ pub struct GithubAppService {
     db: Arc<DbConnection>,
     queue_service: Arc<dyn temps_core::jobs::JobQueue>,
     git_provider_manager: Arc<crate::services::git_provider_manager::GitProviderManager>,
+    shared_secret_warning: Arc<SharedSecretWarning>,
+}
+
+/// One warning per five minutes across all matching App groups and service
+/// clones. Constant memory; concurrent webhook deliveries cannot flood logs.
+struct SharedSecretWarning {
+    started_at: Instant,
+    next_warning_second: AtomicU64,
+}
+
+impl SharedSecretWarning {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            next_warning_second: AtomicU64::new(0),
+        }
+    }
+
+    fn should_warn(&self, matching_apps: usize, elapsed_seconds: u64) -> bool {
+        matching_apps > 1
+            && self
+                .next_warning_second
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    (elapsed_seconds >= next).then(|| elapsed_seconds.saturating_add(300))
+                })
+                .is_ok()
+    }
+
+    fn warn_if_shared(&self, signing: &[WebhookSigningApp]) {
+        if self.should_warn(signing.len(), self.started_at.elapsed().as_secs()) {
+            let app_ids: Vec<i32> = signing.iter().map(|app| app.app_id).collect();
+            warn!(
+                app_ids = ?app_ids,
+                "GitHub Apps share a webhook secret; configure distinct secrets for App isolation. Installation ownership checks and delivery processing continue. This warning is limited to once every five minutes."
+            );
+        }
+    }
 }
 
 /// Identity authenticated by a GitHub App webhook secret.
@@ -355,6 +394,7 @@ impl GithubAppService {
             db,
             queue_service,
             git_provider_manager,
+            shared_secret_warning: Arc::new(SharedSecretWarning::new()),
         }
     }
     // Helper method to extract GitHub App data from a git_provider
@@ -1582,6 +1622,7 @@ impl GithubAppService {
             debug!("No GitHub App webhook secret matched the signature");
             return Err(GithubAppServiceError::InvalidWebhookSignature);
         }
+        self.shared_secret_warning.warn_if_shared(&signing);
         Ok(signing)
     }
 
