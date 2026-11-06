@@ -2134,6 +2134,46 @@ impl WorkflowExecutionService {
 
         let removal: Result<(), String> = match teardown {
             TeardownPath::Plane(workload) => {
+                // The plane removes a retired replica without a graceful stop,
+                // so give a container replica its stop grace first, bounded
+                // like the deployer path below. An unreachable node only loses
+                // the grace period; the replica is still retired.
+                if workload.container && !workload.retired {
+                    match self.teardown_deployer_for_node(container.node_id).await {
+                        Ok(deployer) => {
+                            let budget = crate::jobs::mark_deployment_complete::teardown_budget(
+                                self.container_teardown_timeout,
+                                stop_grace,
+                            );
+                            if tokio::time::timeout(
+                                budget,
+                                crate::services::plane_deployer::stop_replica_before_retiring(
+                                    deployer.as_ref(),
+                                    &container_id,
+                                    workload,
+                                    stop_grace,
+                                ),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!(
+                                    container_id = %container_id,
+                                    budget_seconds = budget.as_secs(),
+                                    "Graceful stop of the replica did not answer in time; retiring it \
+                                     through the workload plane"
+                                );
+                            }
+                        }
+                        Err(error) => warn!(
+                            container_id = %container_id,
+                            node_id = ?container.node_id,
+                            %error,
+                            "Cannot reach the replica's node to stop it gracefully; retiring it \
+                             through the workload plane without the stop grace period"
+                        ),
+                    }
+                }
                 crate::services::plane_deployer::retire_replica_workload(
                     self.workload_plane.get().map(Arc::as_ref),
                     container.deployment_id,

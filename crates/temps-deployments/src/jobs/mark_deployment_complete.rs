@@ -2360,7 +2360,19 @@ WHERE project.id = $2
         }
 
         match (plane_workload, deployer) {
-            (Some(workload), _) => {
+            (Some(workload), deployer) => {
+                // The plane removes a retired replica without a graceful stop,
+                // so give it the configured grace first. Without a reachable
+                // deployer the replica is still retired, only without it.
+                if let Some(deployer) = deployer.as_ref() {
+                    crate::services::plane_deployer::stop_replica_before_retiring(
+                        deployer.as_ref(),
+                        &container_id,
+                        workload,
+                        stop_grace,
+                    )
+                    .await;
+                }
                 if let Err(e) = crate::services::plane_deployer::retire_replica_workload(
                     self.workload_plane.as_deref(),
                     container.deployment_id,
@@ -2400,65 +2412,6 @@ WHERE project.id = $2
             .update(self.db.as_ref())
             .await
             .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
-
-        Ok(())
-    }
-
-    /// Stop (best effort) and remove a legacy container through its node's
-    /// deployer. An already-removed container counts as removed.
-    async fn stop_and_remove_container(
-        &self,
-        deployer: &dyn temps_deployer::ContainerDeployer,
-        container_id: &str,
-        stop_grace: std::time::Duration,
-    ) -> Result<(), String> {
-        // Stop container first, giving in-flight requests the stop timeout.
-        match deployer
-            .stop_container_with_grace(container_id, stop_grace)
-            .await
-        {
-            Ok(_) => {
-                self.log(format!("Stopped container {}", container_id))
-                    .await
-                    .ok();
-            }
-            Err(e) => {
-                self.log(format!("Failed to stop container {}: {}", container_id, e))
-                    .await
-                    .ok();
-            }
-        }
-
-        // Remove container from Docker. A container that is already gone
-        // (pruned, removed by hand, lost with its node's disk) is torn down:
-        // retrying could never succeed and would keep the deployment in the
-        // sweep forever.
-        match deployer.remove_container(container_id).await {
-            Ok(_) => {
-                self.log(format!("Removed container {}", container_id))
-                    .await
-                    .ok();
-            }
-            Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
-                self.log(format!(
-                    "Container {} was already removed from Docker",
-                    container_id
-                ))
-                .await
-                .ok();
-            }
-            Err(e) => {
-                self.log(format!(
-                    "Failed to remove container {}: {}",
-                    container_id, e
-                ))
-                .await
-                .ok();
-                return Err(format!(
-                    "Failed to remove rejected container {container_id}: {e}"
-                ));
-            }
-        }
 
         Ok(())
     }

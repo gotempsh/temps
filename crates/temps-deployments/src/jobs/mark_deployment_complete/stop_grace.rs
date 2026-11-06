@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The stop grace period a superseded deployment's containers get, and the
-//! teardown budget that has to cover it.
+//! The stop grace period a superseded deployment's containers get, the
+//! teardown budget that has to cover it, and the graceful stop and removal
+//! of a legacy container.
 
 use sea_orm::EntityTrait;
 
@@ -61,6 +62,67 @@ pub(crate) fn teardown_budget(
         temps_config::deployment_config::resolve_stop_timeout_seconds(None),
     );
     base.saturating_add(grace.saturating_sub(default_grace))
+}
+
+impl super::MarkDeploymentCompleteJob {
+    /// Stop (best effort) and remove a legacy container through its node's
+    /// deployer. An already-removed container counts as removed.
+    pub(super) async fn stop_and_remove_container(
+        &self,
+        deployer: &dyn temps_deployer::ContainerDeployer,
+        container_id: &str,
+        stop_grace: std::time::Duration,
+    ) -> Result<(), String> {
+        // Stop container first, giving in-flight requests the stop timeout.
+        match deployer
+            .stop_container_with_grace(container_id, stop_grace)
+            .await
+        {
+            Ok(_) => {
+                self.log(format!("Stopped container {}", container_id))
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                self.log(format!("Failed to stop container {}: {}", container_id, e))
+                    .await
+                    .ok();
+            }
+        }
+
+        // Remove container from Docker. A container that is already gone
+        // (pruned, removed by hand, lost with its node's disk) is torn down:
+        // retrying could never succeed and would keep the deployment in the
+        // sweep forever.
+        match deployer.remove_container(container_id).await {
+            Ok(_) => {
+                self.log(format!("Removed container {}", container_id))
+                    .await
+                    .ok();
+            }
+            Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
+                self.log(format!(
+                    "Container {} was already removed from Docker",
+                    container_id
+                ))
+                .await
+                .ok();
+            }
+            Err(e) => {
+                self.log(format!(
+                    "Failed to remove container {}: {}",
+                    container_id, e
+                ))
+                .await
+                .ok();
+                return Err(format!(
+                    "Failed to remove rejected container {container_id}: {e}"
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
