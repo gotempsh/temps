@@ -248,16 +248,16 @@ async fn github_webhook_events(
         .get("X-Hub-Signature-256")
         .and_then(|v| v.to_str().ok());
 
-    if let Err(e) = state
+    let signing_app = state
         .github_service
         .validate_webhook_signature(signature, &body)
         .await
-    {
-        error!("Invalid webhook signature: {:?}", e);
-        return Err(problem_new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Webhook Signature")
-            .with_detail("The webhook signature validation failed"));
-    }
+        .map_err(|e| {
+            warn!(error = %e, "Invalid GitHub App webhook signature");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Invalid Webhook Signature")
+                .with_detail("The webhook signature validation failed")
+        })?;
 
     // Get the X-Github-Event header
     let event_type = headers
@@ -330,21 +330,37 @@ async fn github_webhook_events(
         }
     };
 
-    // Process the webhook event based on type
-    let installation_res = webhook_event.installation.clone();
-    let mut installation_id: i32 = 0;
+    let installation_id = match &webhook_event.installation {
+        Some(EventInstallation::Full(installation)) => Some(installation.id.into_inner()),
+        Some(EventInstallation::Minimal(installation)) => Some(installation.id.into_inner()),
+        None => None,
+    }
+    .map(i32::try_from)
+    .transpose()
+    .map_err(|_| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Webhook Installation")
+            .with_detail("GitHub installation ID is out of range")
+    })?
+    .unwrap_or(0);
 
-    match installation_res {
-        Some(EventInstallation::Full(install)) => {
-            installation_id = install.id.into_inner() as i32;
-        }
-        Some(EventInstallation::Minimal(installation_)) => {
-            installation_id = installation_.id.into_inner() as i32;
-        }
-        None => {
-            warn!("No installation information in webhook event");
-        }
-    };
+    if installation_id != 0 {
+        state
+            .github_service
+            .authorize_webhook_installation(signing_app, installation_id)
+            .await
+            .map_err(|e| {
+                warn!(app_id = signing_app.app_id, installation_id, error = %e,
+                    "Ignoring GitHub App webhook: installation ownership not confirmed");
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Webhook Installation Not Authorized")
+                    .with_detail("The installation could not be bound to the signing App")
+            })?;
+    } else if !matches!(webhook_event.specific, WebhookEventPayload::Ping(_)) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Webhook Installation")
+            .with_detail("GitHub App webhook requires an installation"));
+    }
 
     // Handle specific webhook events
     let webhook_event_clone = webhook_event.clone();
@@ -362,10 +378,20 @@ async fn github_webhook_events(
         }
         WebhookEventPayload::Installation(installation_event) => {
             info!("Installation event received");
-            handle_installation_event(&state, installation_event, installation_id).await;
+            handle_installation_event(
+                &state,
+                installation_event,
+                installation_id,
+                signing_app.app_id,
+            )
+            .await;
         }
         WebhookEventPayload::Ping(ping_event) => {
-            if let Some(app_id) = ping_event.hook.and_then(|h| h.app_id) {
+            if let Some(app_id) = ping_event
+                .hook
+                .and_then(|h| h.app_id)
+                .filter(|id| id.into_inner() == signing_app.app_id as u64)
+            {
                 info!("Ping event app_id: {:?}", app_id);
                 let _ = state
                     .github_service
@@ -768,6 +794,7 @@ async fn handle_installation_event(
     state: &Arc<AppState>,
     event: Box<octocrab::models::webhook_events::payload::InstallationWebhookEventPayload>,
     installation_id: i32,
+    signing_app_id: i32,
 ) {
     use octocrab::models::webhook_events::payload::InstallationWebhookEventAction;
 
@@ -793,7 +820,7 @@ async fn handle_installation_event(
 
             match state
                 .github_service
-                .process_installation(installation_id, None)
+                .process_installation(installation_id, Some(signing_app_id))
                 .await
             {
                 Ok(result) => {
@@ -1245,6 +1272,102 @@ async fn github_app_installation_callback(
 
 #[cfg(test)]
 mod tests {
+    async fn signed_installation_delivery(provider_id: i32) -> (bool, usize) {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::{git_provider_connections, git_providers, projects};
+        let now = chrono::Utc::now();
+        let app = git_providers::Model {
+            id: 10,
+            name: "example-app".into(),
+            provider_type: "github".into(),
+            base_url: None,
+            api_url: None,
+            auth_method: "app".into(),
+            auth_config: serde_json::json!({
+                "app_id": 100, "client_id": "example", "client_secret": "example",
+                "private_key": "unused", "webhook_secret": "test-signing-secret"
+            }),
+            webhook_secret: None,
+            is_active: true,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut other_app = app.clone();
+        other_app.id = 20;
+        other_app.auth_config["app_id"] = serde_json::json!(101);
+        other_app.auth_config["webhook_secret"] = serde_json::json!("other-test-secret");
+        let connection: git_provider_connections::Model =
+            serde_json::from_value(serde_json::json!({
+                "id": 30, "provider_id": provider_id, "account_name": "example",
+                "account_type": "Organization", "installation_id": "200",
+                "is_active": true, "is_expired": false, "syncing": false,
+                "synced_repository_count": 0, "health_status": "unknown",
+                "consecutive_health_failures": 0, "created_at": now, "updated_at": now
+            }))
+            .unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![other_app, app]])
+                .append_query_results([vec![connection.clone()], vec![connection]])
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let state = super::super::public_route_tests::state_with_db(db.clone());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "installation": {"id": 200, "node_id": "example-installation"},
+            "repository": {"id": 1, "name": "demo", "owner": {
+                "login": "example", "id": 1, "node_id": "example",
+                "avatar_url": "https://example.com/avatar", "gravatar_id": "",
+                "url": "https://example.com/user", "html_url": "https://example.com/user",
+                "followers_url": "https://example.com/followers",
+                "following_url": "https://example.com/following",
+                "gists_url": "https://example.com/gists", "starred_url": "https://example.com/starred",
+                "subscriptions_url": "https://example.com/subscriptions",
+                "organizations_url": "https://example.com/orgs",
+                "repos_url": "https://example.com/repos", "events_url": "https://example.com/events",
+                "received_events_url": "https://example.com/received", "type": "Organization",
+                "site_admin": false
+            }, "url": "https://example.com/repo"},
+            "ref": "refs/heads/topic", "after": "0000000000000000000000000000000000000000",
+            "before": "1111111111111111111111111111111111111111",
+            "commits": [], "compare": "https://example.com/compare",
+            "created": false, "deleted": true, "forced": false,
+            "pusher": {"name": "example", "email": "example@example.com"}
+        })).unwrap();
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"test-signing-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Hub-Signature-256", signature.parse().unwrap());
+        headers.insert("X-GitHub-Event", "push".parse().unwrap());
+        let result = github_webhook_events(headers, State(state.clone()), Bytes::from(body)).await;
+        if provider_id != 10 {
+            assert_eq!(
+                result.as_ref().err().unwrap().status_code,
+                StatusCode::UNAUTHORIZED
+            );
+        } else {
+            assert!(result.is_ok(), "{:?}", result.as_ref().err());
+        }
+        drop(state);
+        let queries = Arc::try_unwrap(db).unwrap().into_transaction_log().len();
+        (result.is_ok(), queries)
+    }
+
+    #[tokio::test]
+    async fn signing_app_mismatch_dispatches_nothing() {
+        // Only signature and ownership queries run; no dispatch queries or jobs.
+        assert_eq!(signed_installation_delivery(20).await, (false, 2));
+    }
+
+    #[tokio::test]
+    async fn signing_app_pairing_dispatches_branch_deletion() {
+        // The matching App reaches the installation and project dispatch queries.
+        assert_eq!(signed_installation_delivery(10).await, (true, 4));
+    }
+
     use super::*;
 
     #[test]

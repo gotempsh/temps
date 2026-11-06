@@ -125,7 +125,12 @@ mod public_route_tests {
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
     pub(super) fn state() -> Arc<AppState> {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        state_with_db(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ))
+    }
+
+    pub(super) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(
                 temps_config::ServerConfig::new(
