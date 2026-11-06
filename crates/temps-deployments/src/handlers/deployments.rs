@@ -896,9 +896,11 @@ where
             );
             Err(temps_core::error_builder::internal_server_error()
                 .title("Deployment operation failed")
+                // The panic payload is internal; it is in the log above, not
+                // in the response.
                 .detail(format!(
                     "The {operation} of deployment {deployment_id} in project {project_id} \
-                     stopped unexpectedly: {join_error}"
+                     stopped unexpectedly; the server log has the cause"
                 ))
                 .build())
         }
@@ -6976,5 +6978,9 @@ pub(crate) mod tests {
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
         let body = serde_json::to_string(&problem.body).expect("problem serializes");
         assert!(body.contains("deployment 42 in project 7"), "{body}");
+        assert!(
+            !body.contains("boom") && !body.contains("panicked"),
+            "the panic payload must stay out of the response: {body}"
+        );
     }
 }
