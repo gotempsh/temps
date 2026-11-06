@@ -820,7 +820,9 @@ function EnvironmentVariableRow({
     isVisible &&
     !isSecret &&
     credentialValueForScope(revealedValue, revealScope) !== undefined ? (
-      <div className="flex min-w-0 items-center gap-1">
+      // A revealed value is for selecting and copying: a click on it
+      // (the first half of a double-click, say) must not open the row.
+      <div data-row-ignore="" className="flex min-w-0 items-center gap-1">
         <EnvironmentVariableValue name={variable.key} value={dataValue} />
         <Button
           variant="ghost"

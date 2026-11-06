@@ -118,6 +118,14 @@ describe('followsRecordLink', () => {
     ).toBe(false)
   })
 
+  test('custom widgets are controls too, whatever element carries the role', () => {
+    for (const role of ['tab', 'combobox', 'radio', 'option', 'slider']) {
+      expect(
+        followsRecordLink(el(row), el({ tag: 'div', role, parent: cell }))
+      ).toBe(false)
+    }
+  })
+
   test('clicks from a portal the row opened never navigate', () => {
     expect(
       followsRecordLink(el(row), el({ tag: 'div', role: 'menuitem' }))
@@ -181,6 +189,33 @@ describe('RecordRow', () => {
     )
     fireEvent.click(view.getByRole('button', { name: 'Edit' }))
     expect(pressed).toBe(1)
+    expect(view.queryByText('Opened record')).toBeNull()
+  })
+
+  test('custom widgets and marked values keep their own click', () => {
+    let selected = 0
+    const view = renderRecords(
+      table(
+        <>
+          <TableCell>
+            <RecordLink to="/records/1">first</RecordLink>
+          </TableCell>
+          <TableCell>
+            <div role="tab" onClick={() => selected++}>
+              Logs
+            </div>
+          </TableCell>
+          <TableCell>
+            <span data-row-ignore="">
+              <span>revealed-value</span>
+            </span>
+          </TableCell>
+        </>
+      )
+    )
+    fireEvent.click(view.getByRole('tab', { name: 'Logs' }))
+    expect(selected).toBe(1)
+    fireEvent.click(view.getByText('revealed-value'))
     expect(view.queryByText('Opened record')).toBeNull()
   })
 

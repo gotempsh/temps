@@ -1,9 +1,40 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/** Elements inside a row that keep their own click. */
-const ROW_CONTROLS =
-  'a,button,input,select,textarea,label,summary,[role=button],[role=checkbox],[role=menuitem],[role=switch],[data-row-ignore]'
+/**
+ * Elements inside a row that keep their own click: native controls, custom
+ * widgets by their ARIA role, editable text, and anything marked
+ * `data-row-ignore` (a value meant to be selected or copied, for one).
+ */
+const ROW_CONTROLS = [
+  'a',
+  'button',
+  'input',
+  'select',
+  'textarea',
+  'label',
+  'summary',
+  '[contenteditable]:not([contenteditable=false])',
+  ...[
+    'button',
+    'checkbox',
+    'combobox',
+    'link',
+    'menuitem',
+    'menuitemcheckbox',
+    'menuitemradio',
+    'option',
+    'radio',
+    'searchbox',
+    'slider',
+    'spinbutton',
+    'switch',
+    'tab',
+    'textbox',
+    'treeitem',
+  ].map((role) => `[role=${role}]`),
+  '[data-row-ignore]',
+].join(',')
 
 /**
  * Whether a click on `target` should follow the row's record link: not when
