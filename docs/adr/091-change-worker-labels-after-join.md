@@ -112,7 +112,8 @@ is visible.
 ### D5. Restart only an agent that cannot reload
 
 An agent that has left a record (D4) reloads by itself, so it is never
-restarted: when its confirmation is late (the control plane is unreachable,
+restarted, even when the record cannot be read (larger than the 256 KiB the
+command reads, say): when its confirmation is late (the control plane is unreachable,
 say), the command says the change is pending and how to check it later. With
 no record at all (an agent older than D3), `set` and `unset` restart the
 Temps-managed service running from that data directory (the systemd unit or the `sh.temps.agent` LaunchAgent), with the
@@ -128,7 +129,10 @@ one: the installed systemd unit's effective environment, environment files
 (wildcard patterns expanded) and command line (drop-ins included), the
 LaunchAgent plist, and the record (D4) of the agent that last reported. A
 unit or plist that runs the agent from another data directory than the one
-being edited is not this worker's, and is skipped. Any of them fails the command, naming where the override
+being edited is not this worker's, and is skipped. The unit's directory is
+its effective `TEMPS_DATA_DIR`: as in systemd, environment files override
+`Environment=` and the last assignment wins; with none, the unit is
+checked. Any of them fails the command, naming where the override
 is and how to remove it, without touching `agent.json`. When the unit cannot
 be checked (`systemctl show` fails, or an environment file it names cannot be
 read) the command refuses too: an override it cannot rule out is treated as

@@ -177,6 +177,33 @@ impl Worker {
         })
     }
 
+    /// Whether `labels-status.json` is here but could not be read (larger
+    /// than the agent's limit, or not a record): only an agent of this
+    /// release writes one, so it is one that reloads by itself. Run as root,
+    /// only a file root owns counts.
+    fn unreadable_status(&self) -> bool {
+        let path = self.data_dir.join(temps_node_agent::labels::STATUS_FILE);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        #[cfg(unix)]
+        let by_root = {
+            use std::os::unix::fs::MetadataExt;
+            !running_as_root() || meta.uid() == 0
+        };
+        #[cfg(not(unix))]
+        let by_root = true;
+        meta.is_file()
+            && by_root
+            && temps_node_agent::labels::read_status_file(&self.data_dir).is_none()
+    }
+
+    /// Whether the agent reloads `agent.json` by itself (ADR-091 D5): it
+    /// left a record, readable or not.
+    fn reloads(&self) -> bool {
+        self.status().is_some() || self.unreadable_status()
+    }
+
     fn display_name(&self) -> String {
         self.node_name
             .clone()
@@ -261,6 +288,16 @@ fn list(target: &Target) -> anyhow::Result<()> {
             status
                 .accepted_at
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        None if worker.unreadable_status() => println!(
+            "{} could not be read (it may be larger than {} bytes): an agent of this release \
+             runs here, but what the control plane accepted cannot be shown. Check the node's \
+             Labels in the console under Settings > Nodes.",
+            worker
+                .data_dir
+                .join(temps_node_agent::labels::STATUS_FILE)
+                .display(),
+            temps_node_agent::labels::MAX_STATUS_BYTES
         ),
         None => println!(
             "No record of what the control plane accepted: the agent is not running, has not \
@@ -415,7 +452,7 @@ fn apply(
     // a restart drops the traffic it serves, and when its report is late
     // (the control plane is unreachable, say) it reports the change as soon
     // as it can on its own.
-    if worker.status().is_some() {
+    if worker.reloads() {
         println!("Waiting for the running agent to report them...");
         if let Some(done) = settled(worker, wait_for(worker, wanted, since, RELOAD_WAIT))? {
             return Ok(done);
@@ -590,13 +627,10 @@ pub(super) fn read_agent_config(path: &Path) -> anyhow::Result<AgentConfigFile> 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if running_as_root() && meta.uid() != 0 {
-            anyhow::bail!(
-                "Refusing to edit {} as root: it is owned by uid {}. Run this as that user, \
-                 without sudo.",
-                path.display(),
-                meta.uid()
-            );
+        if running_as_root() {
+            if let Some(why) = root_edit_problem(meta.uid(), meta.mode()) {
+                anyhow::bail!("Refusing to edit {} as root: {why}", path.display());
+            }
         }
     }
     let value: serde_json::Value = serde_json::from_str(&text)
@@ -608,6 +642,24 @@ pub(super) fn read_agent_config(path: &Path) -> anyhow::Result<AgentConfigFile> 
         value,
         identity: FileIdentity::of(&meta),
     })
+}
+
+/// Why a root run must not edit an `agent.json` with owner `uid` and mode
+/// `mode` (ADR-091 D7): it must be root's and writable by root alone.
+fn root_edit_problem(uid: u32, mode: u32) -> Option<String> {
+    if uid != 0 {
+        Some(format!(
+            "it is owned by uid {uid}. Run this as that user, without sudo."
+        ))
+    } else if mode & 0o022 != 0 {
+        Some(format!(
+            "it is writable by its group or by everyone (mode {:04o}), so another user could \
+             change it under this command. Make it owner-only (`chmod 600`), then run this again.",
+            mode & 0o7777
+        ))
+    } else {
+        None
+    }
 }
 
 /// Run as root, refuse unless the directory holding `path` and every one
@@ -1114,21 +1166,54 @@ fn systemd_override(
              (`systemctl show {service}` failed: {error})"
         )
     })?;
-    // A unit running the agent from another directory does not read this
-    // agent.json, so its labels do not override it. The last assignment
-    // wins, as in systemd. When an environment file could set it too, or
-    // nothing does, the directory is not known, and the unit is checked.
-    let env_files = show.lines().any(|line| {
-        line.strip_prefix("EnvironmentFiles=")
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    let unit_dir = show
+    // The environment files, in order, each read once: one that exists but
+    // cannot be read is an error, since it could set either variable.
+    let mut env_files: Vec<(PathBuf, String)> = Vec::new();
+    for value in show
         .lines()
-        .filter_map(|line| line.strip_prefix("Environment="))
-        .flat_map(show_words)
-        .filter_map(|part| part.strip_prefix("TEMPS_DATA_DIR=").map(PathBuf::from))
+        .filter_map(|line| line.strip_prefix("EnvironmentFiles="))
+    {
+        // One `EnvironmentFiles=/path (ignore_errors=no)` line per entry;
+        // the path may hold spaces.
+        let pattern = value
+            .rsplit_once(" (ignore_errors=")
+            .map_or(value, |(path, _)| path);
+        if !pattern.starts_with('/') {
+            continue;
+        }
+        for file in environment_files(pattern)? {
+            match read_environment_file(&file) {
+                Ok(text) => env_files.push((file, text)),
+                // A missing optional file sets nothing.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Could not read {}, an environment file of {service}, to check it for \
+                         {LABELS_ENV}: {error}.{}",
+                        file.display(),
+                        wrong_user_hint()
+                    ))
+                }
+            }
+        }
+    }
+    // A unit running the agent from another directory does not read this
+    // agent.json, so its labels do not override it. As in systemd, the
+    // environment files override `Environment=`, and a later assignment
+    // wins. With no TEMPS_DATA_DIR at all the directory is not known, and
+    // the unit is checked.
+    let unit_dir = env_files
+        .iter()
+        .filter_map(|(_, text)| env_file_value(text, "TEMPS_DATA_DIR"))
         .next_back()
-        .filter(|_| !env_files);
+        .or_else(|| {
+            show.lines()
+                .filter_map(|line| line.strip_prefix("Environment="))
+                .flat_map(show_words)
+                .filter_map(|part| part.strip_prefix("TEMPS_DATA_DIR=").map(str::to_string))
+                .next_back()
+        })
+        .map(PathBuf::from);
     if unit_dir.is_some_and(|dir| !same_dir(&dir, data_dir)) {
         return Ok(None);
     }
@@ -1157,48 +1242,37 @@ fn systemd_override(
                      which overrides agent.json"
                 )));
             }
-            // One `EnvironmentFiles=/path (ignore_errors=no)` line per file;
-            // the path may hold spaces.
-            "EnvironmentFiles" => {
-                let file = value
-                    .rsplit_once(" (ignore_errors=")
-                    .map_or(value, |(path, _)| path);
-                if !file.starts_with('/') {
-                    continue;
-                }
-                for file in environment_files(file)? {
-                    let text = match read_environment_file(&file) {
-                        Ok(text) => text,
-                        // A missing optional file sets nothing.
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(error) => {
-                            return Err(format!(
-                                "Could not read {}, an environment file of {service}, to check \
-                                 it for {LABELS_ENV}: {error}.{}",
-                                file.display(),
-                                wrong_user_hint()
-                            ))
-                        }
-                    };
-                    let sets = text.lines().any(|line| {
-                        line.trim_start()
-                            .trim_start_matches("export ")
-                            .trim_start()
-                            .starts_with("TEMPS_NODE_LABELS=")
-                    });
-                    if sets {
-                        return Ok(Some(format!(
-                            "{}, an environment file of {service}, sets {LABELS_ENV}, which \
-                             overrides agent.json",
-                            file.display()
-                        )));
-                    }
-                }
-            }
             _ => {}
         }
     }
+    if let Some((file, _)) = env_files
+        .iter()
+        .find(|(_, text)| env_file_value(text, LABELS_ENV).is_some())
+    {
+        return Ok(Some(format!(
+            "{}, an environment file of {service}, sets {LABELS_ENV}, which overrides agent.json",
+            file.display()
+        )));
+    }
     Ok(None)
+}
+
+/// The value the last assignment of `name` in an environment file gives
+/// it (`NAME=value`, `export NAME=value`, quotes removed).
+fn env_file_value(text: &str, name: &str) -> Option<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+            let value = line.strip_prefix(name)?.strip_prefix('=')?.trim();
+            let unquoted = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            Some(unquoted.to_string())
+        })
+        .next_back()
 }
 
 #[cfg(test)]
@@ -1349,13 +1423,40 @@ mod tests {
         )
         .unwrap();
         assert!(redirected.is_some());
-        // An environment file could set it as well: the unit is checked.
-        let unknown = systemd_override(
-            show("Environment=TEMPS_DATA_DIR=/srv/other TEMPS_NODE_LABELS=zone=a\nEnvironmentFiles=/nonexistent/temps.env (ignore_errors=yes)\n"),
-            root,
-        )
-        .unwrap();
-        assert!(unknown.is_some());
+        // An environment file overrides Environment=, as in systemd: one
+        // pointing the unit at this worker makes its override this worker's.
+        let files = tempfile::tempdir().unwrap();
+        let redirect = files.path().join("redirect.env");
+        std::fs::write(&redirect, "TEMPS_DATA_DIR=\"/root/.temps\"\n").unwrap();
+        let text = format!(
+            "Environment=TEMPS_DATA_DIR=/srv/other TEMPS_NODE_LABELS=zone=a\nEnvironmentFiles={} (ignore_errors=no)\n",
+            redirect.display()
+        );
+        assert!(systemd_override(move |_: &[&str]| Ok(text.clone()), root)
+            .unwrap()
+            .is_some());
+        // An unrelated environment file does not hide which worker the unit
+        // runs: a pinned worker A does not block editing worker B.
+        let logging = files.path().join("logging.env");
+        std::fs::write(&logging, "RUST_LOG=info\n").unwrap();
+        let text = format!(
+            "Environment=TEMPS_DATA_DIR=/srv/worker-a TEMPS_NODE_LABELS=zone=a\nEnvironmentFiles={} (ignore_errors=no)\n",
+            logging.display()
+        );
+        assert_eq!(
+            systemd_override(
+                move |_: &[&str]| Ok(text.clone()),
+                Path::new("/srv/worker-b")
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            env_file_value(
+                "A=1\nexport TEMPS_DATA_DIR='/x'\nTEMPS_DATA_DIR=/y\n",
+                "TEMPS_DATA_DIR"
+            ),
+            Some("/y".to_string())
+        );
         // A unit running the agent from another directory does not read
         // this agent.json: its override is not this worker's.
         assert_eq!(
@@ -1655,6 +1756,51 @@ mod tests {
         drop(held);
         writer.join().unwrap().unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
+    }
+
+    #[test]
+    fn a_root_edit_takes_only_an_owner_only_root_config() {
+        assert_eq!(root_edit_problem(0, 0o100600), None);
+        assert_eq!(root_edit_problem(0, 0o100644), None);
+        assert!(root_edit_problem(1000, 0o100600)
+            .unwrap()
+            .contains("uid 1000"));
+        for mode in [0o100660, 0o100606, 0o100666] {
+            let why = root_edit_problem(0, mode).unwrap();
+            assert!(why.contains("chmod 600"), "{mode:o}: {why}");
+        }
+    }
+
+    /// A record the agent wrote but the CLI cannot read (larger than its
+    /// limit) still means the agent reloads by itself: `set` waits for it
+    /// rather than restart it.
+    #[test]
+    fn an_unreadable_record_still_means_the_agent_reloads() {
+        if skip_as_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("agent.json"),
+            format!(r#"{{"node_id":3,"control_plane_url":"{PLANE}","labels":{{}}}}"#),
+        )
+        .unwrap();
+        let target = Target {
+            data_dir: Some(dir.path().to_path_buf()),
+        };
+        let worker = Worker::load(&target, false).unwrap();
+        assert!(!worker.reloads(), "no record: an older agent");
+        let status_path = dir.path().join(temps_node_agent::labels::STATUS_FILE);
+        let huge = "x".repeat(temps_node_agent::labels::MAX_STATUS_BYTES as usize + 1);
+        std::fs::write(&status_path, format!(r#"{{"node_id":3,"pad":"{huge}"}}"#)).unwrap();
+        assert!(worker.status().is_none());
+        assert!(worker.unreadable_status());
+        assert!(worker.reloads());
+        // A readable record of another node is not this agent's.
+        let mut other = status(serde_json::json!({}), LabelsOrigin::AgentJson, 1);
+        other.node_id = 9;
+        temps_node_agent::labels::record_accepted(dir.path(), &other).unwrap();
+        assert!(!worker.reloads());
     }
 
     #[cfg(unix)]
