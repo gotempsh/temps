@@ -707,7 +707,7 @@ fn lock_agent_config_within(path: &Path, wait: Duration) -> anyhow::Result<Confi
 /// Lock `path`, giving up after `wait`. A wait longer than [`LOCK_WAIT`]
 /// says, once, what it is waiting for.
 fn open_config_lock(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
-    let lock_path = path.with_extension("json.lock");
+    let lock_path = sibling(path, ".lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -791,7 +791,7 @@ fn write_temp_file(path: &Path, text: &str) -> anyhow::Result<PathBuf> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let tmp = path.with_extension(format!("json.{}.{unique}.tmp", std::process::id()));
+    let tmp = sibling(path, &format!(".{}.{unique}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -822,10 +822,24 @@ fn write_temp_file(path: &Path, text: &str) -> anyhow::Result<PathBuf> {
     Ok(tmp)
 }
 
-/// Whether `name` is a temporary file [`write_temp_file`] makes for
-/// `agent.json`: `agent.json.<pid>.<nanos>.tmp`.
-fn is_config_temp_name(name: &str) -> bool {
-    name.strip_prefix("agent.json.")
+/// `path` with `suffix` appended to its file name: `agent.json` gives
+/// `agent.json.lock`, and a symlink target `worker.json` gives
+/// `worker.json.lock`, so two different files never share a lock or a
+/// temporary-file name.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| "agent.json".into());
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Whether `name` is a temporary file [`write_temp_file`] makes for the
+/// file named `file`: `<file>.<pid>.<nanos>.tmp`.
+fn is_config_temp_name(name: &str, file: &str) -> bool {
+    name.strip_prefix(file)
+        .and_then(|rest| rest.strip_prefix('.'))
         .and_then(|rest| rest.strip_suffix(".tmp"))
         .and_then(|middle| middle.split_once('.'))
         .is_some_and(|(pid, nanos)| {
@@ -835,11 +849,12 @@ fn is_config_temp_name(name: &str) -> bool {
         })
 }
 
-/// Remove temporary files a crashed earlier run left beside `path`. Only
-/// called under the config lock, so no other writer's file is in flight;
-/// only regular files are removed, never what a symlink points at.
+/// Remove temporary files a crashed earlier run left for `path`. Only
+/// called under `path`'s lock, so no writer of that file has one in flight;
+/// another file's temporary files, and anything but a regular file, are
+/// left alone.
 fn remove_stale_temp_files(path: &Path) {
-    let Some(dir) = path.parent() else {
+    let (Some(dir), Some(file)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -847,7 +862,9 @@ fn remove_stale_temp_files(path: &Path) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let stale = name.to_str().is_some_and(is_config_temp_name)
+        let stale = name
+            .to_str()
+            .is_some_and(|name| is_config_temp_name(name, file))
             && entry.file_type().is_ok_and(|kind| kind.is_file());
         if stale {
             let _ = std::fs::remove_file(entry.path());
@@ -979,7 +996,7 @@ pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()
         })
     };
     let _lock = lock(&canonical)?;
-    let _target_lock = if target == canonical {
+    let _target_lock = if sibling(&target, ".lock") == sibling(&canonical, ".lock") {
         None
     } else {
         Some(lock(&target)?)
@@ -1274,21 +1291,70 @@ fn systemd_override(
 }
 
 /// The value the last assignment of `name` in an environment file gives
-/// it (`NAME=value`, `export NAME=value`, quotes removed).
+/// it, parsed as systemd parses the file (see [`env_file_assignments`]).
 fn env_file_value(text: &str, name: &str) -> Option<String> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            let line = line.strip_prefix("export ").map_or(line, str::trim_start);
-            let value = line.strip_prefix(name)?.strip_prefix('=')?.trim();
-            let unquoted = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-                .unwrap_or(value);
-            Some(unquoted.to_string())
-        })
+    env_file_assignments(text)
+        .into_iter()
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| value)
         .next_back()
+}
+
+/// The assignments in an environment file, as systemd reads them: lines
+/// starting with `#` or `;` are comments; `export ` before a name is
+/// ignored; a value may be in double quotes (with `\` escapes), in single
+/// quotes, or bare (`\` escapes the next character); a `\` at the end of a
+/// line continues it on the next; whitespace around a bare value is dropped.
+fn env_file_assignments(text: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&first) = chars.peek() else {
+            break;
+        };
+        if first == '#' || first == ';' {
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let mut key = String::new();
+        while let Some(c) = chars.next_if(|c| *c != '=' && *c != '\n') {
+            key.push(c);
+        }
+        if chars.next() != Some('=') {
+            continue;
+        }
+        let key = key.trim();
+        let key = key.strip_prefix("export ").map_or(key, str::trim_start);
+        let mut value = String::new();
+        let mut quote: Option<char> = None;
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (None, '\n') => break,
+                (Some(q), c) if c == q => quote = None,
+                (Some('"') | None, '\\') => match chars.next() {
+                    // A continued line.
+                    Some('\n') | None => {}
+                    Some(escaped) => value.push(escaped),
+                },
+                (Some(_), c) => value.push(c),
+                (None, '"' | '\'') => quote = Some(c),
+                (None, c) => value.push(c),
+            }
+        }
+        let value = if quote.is_none() {
+            value.trim_end().to_string()
+        } else {
+            value
+        };
+        found.push((key.to_string(), value));
+    }
+    found
 }
 
 #[cfg(test)]
@@ -1489,6 +1555,43 @@ mod tests {
             ),
             Some("/y".to_string())
         );
+        // systemd's syntax: escapes, quotes, continued lines, comments.
+        for (text, want) in [
+            ("TEMPS_DATA_DIR=/srv/my\\ temps\n", "/srv/my temps"),
+            ("TEMPS_DATA_DIR=\"/srv/my temps\"\n", "/srv/my temps"),
+            ("TEMPS_DATA_DIR='/srv/a\\b'\n", "/srv/a\\b"),
+            ("TEMPS_DATA_DIR=\"/srv/\\\"q\\\"\"\n", "/srv/\"q\""),
+            ("TEMPS_DATA_DIR=/srv/\\\nworker\n", "/srv/worker"),
+            ("TEMPS_DATA_DIR = /srv/x   \n", "/srv/x"),
+            (
+                "# TEMPS_DATA_DIR=/no\n; TEMPS_DATA_DIR=/no\nTEMPS_DATA_DIR=/yes",
+                "/yes",
+            ),
+        ] {
+            assert_eq!(
+                env_file_value(text, "TEMPS_DATA_DIR").as_deref(),
+                Some(want),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            env_file_value("# TEMPS_DATA_DIR=/no\n", "TEMPS_DATA_DIR"),
+            None
+        );
+        // An escaped space in the unit's directory: the override is this
+        // worker's, not skipped as another directory's.
+        let escaped = files.path().join("escaped.env");
+        std::fs::write(&escaped, "TEMPS_DATA_DIR=/srv/my\\ temps\n").unwrap();
+        let text = format!(
+            "Environment=TEMPS_NODE_LABELS=zone=a\nEnvironmentFiles={} (ignore_errors=no)\n",
+            escaped.display()
+        );
+        assert!(
+            systemd_override(move |_: &[&str]| Ok(text.clone()), spaced_dir)
+                .unwrap()
+                .is_some()
+        );
+
         // A unit running the agent from another directory does not read
         // this agent.json: its override is not this worker's.
         assert_eq!(
@@ -1739,14 +1842,24 @@ mod tests {
         if skip_as_root() {
             return;
         }
-        assert!(is_config_temp_name("agent.json.42.1700000000000000000.tmp"));
+        assert!(is_config_temp_name(
+            "agent.json.42.1700000000000000000.tmp",
+            "agent.json"
+        ));
+        // Another file's temporary file is not this one's.
+        assert!(!is_config_temp_name("worker.json.42.17.tmp", "agent.json"));
+        assert!(is_config_temp_name("worker.json.42.17.tmp", "worker.json"));
+        assert_eq!(
+            sibling(Path::new("/d/agent.conf"), ".lock"),
+            Path::new("/d/agent.conf.lock")
+        );
         for name in [
             "agent.json.tmp",
             "agent.json.x.1.tmp",
             "agent.json.1.2",
             "other.1.2.tmp",
         ] {
-            assert!(!is_config_temp_name(name), "{name}");
+            assert!(!is_config_temp_name(name, "agent.json"), "{name}");
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.json");
@@ -1889,6 +2002,18 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(std::fs::read_to_string(&real).unwrap().contains("new"));
+        // A link to another file in the same directory: two locks, not the
+        // same one twice (which would wait on itself).
+        let conf = worker.join("agent.conf");
+        std::fs::write(&conf, r#"{"token":"old"}"#).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&conf, &link).unwrap();
+        let started = std::time::Instant::now();
+        replace_agent_config(&link, r#"{"token":"same-dir"}"#).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(std::fs::read_to_string(&conf).unwrap().contains("same-dir"));
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
         // A dangling link is an error naming it, not a silent new file.
         std::fs::remove_file(&real).unwrap();
         let error = replace_agent_config(&link, "{}").unwrap_err().to_string();
