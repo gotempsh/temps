@@ -470,7 +470,9 @@ async fn gitlab_oauth_callback(
 
 /// The commit a push delivery names. A deleted branch or tag has a null
 /// `checkout_sha` and no commits; its `after` is then the all-zeros SHA,
-/// which marks the deletion downstream.
+/// which marks the deletion downstream. Any other `after` is not used: a tag
+/// whose target is not a commit also has a null `checkout_sha`, and its
+/// non-zero `after` names nothing to deploy.
 fn pushed_commit(payload: &serde_json::Value) -> String {
     let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
     field("checkout_sha")
@@ -482,7 +484,11 @@ fn pushed_commit(payload: &serde_json::Value) -> String {
                 .and_then(|c| c.get("id"))
                 .and_then(|v| v.as_str())
         })
-        .or_else(|| field("after"))
+        .or_else(|| {
+            field("after").filter(|sha| {
+                crate::services::git_provider_manager::GitProviderManager::is_ref_deletion(sha)
+            })
+        })
         .unwrap_or("")
         .to_string()
 }
@@ -691,6 +697,15 @@ mod tests {
             "commits": [{ "id": "def456" }]
         });
         assert_eq!(super::pushed_commit(&push), "def456");
+
+        // A tag on a non-commit object: no checkout_sha, a non-zero `after`.
+        let annotated = serde_json::json!({
+            "ref": "refs/tags/v1.0.0",
+            "after": "abc999",
+            "checkout_sha": null,
+            "commits": []
+        });
+        assert_eq!(super::pushed_commit(&annotated), "");
         assert_eq!(super::pushed_commit(&serde_json::json!({})), "");
     }
 }
