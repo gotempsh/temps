@@ -6354,11 +6354,16 @@ export type ConnectorView = {
     domain: string;
     edge_port: number;
     /**
-     * Publishes every environment as `<label>.<domain>` (ADR 068 D3).
-     * At most one tunnel does.
+     * Publishes every environment as `<label>.<domain>` (ADR 068 D3), or
+     * `<label>-<host_suffix>.<domain>` with a host suffix. At most one
+     * tunnel does.
      */
     environment_hosts: boolean;
     external_id?: string | null;
+    /**
+     * Suffix of its environment hosts' first label; `null` for none.
+     */
+    host_suffix?: string | null;
     id: number;
     last_error?: string | null;
     name: string;
@@ -7584,6 +7589,15 @@ export type CreateConnectorRequest = {
      * or only the hostnames chosen for this tunnel.
      */
     auto_publish?: boolean | null;
+    /**
+     * Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`
+     * (ADR 068 D3), e.g. `lab` with domain `example.com` gives
+     * `shop-production-lab.example.com`: one level under the zone, which
+     * Cloudflare's free certificate covers. Without it they are
+     * `<label>.<domain>`. 1-20 lowercase letters, digits or hyphens; only
+     * for a provider set up with a domain.
+     */
+    host_suffix?: string | null;
     /**
      * Lowercase letters, digits and hyphens; names the tunnel `temps-<name>`.
      */
@@ -12917,6 +12931,11 @@ export type EnvironmentHostsResponse = {
      * at most one may.
      */
     enabled_elsewhere?: string | null;
+    /**
+     * The tunnel's hostname suffix: environments are published as
+     * `<label>-<suffix>.<domain>` with one, `<label>.<domain>` without.
+     */
+    host_suffix?: string | null;
     /**
      * The hosts it publishes, or would publish once turned on.
      */

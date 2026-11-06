@@ -7358,3 +7358,89 @@ async fn test_git_connection_refresh_lease_migration_up_and_down() -> anyhow::Re
     assert_eq!(survivors.len(), 1, "down must keep the connection row");
     Ok(())
 }
+
+async fn connector_host_suffix(db: &DatabaseConnection, id: i32) -> anyhow::Result<Option<String>> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT host_suffix FROM ingress_connectors WHERE id = $1",
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ingress connector {id} is gone"))?;
+    Ok(row.try_get::<Option<String>>("", "host_suffix")?)
+}
+
+#[tokio::test]
+async fn test_ingress_connector_host_suffix_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping host suffix migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping host suffix migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let migration = "m20261107_000006_ingress_connector_host_suffix";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(migration);
+    Migrator::up(&db, Some(before)).await?;
+    // A tunnel that existed before the column: it keeps `<label>.<domain>`.
+    db.execute_unprepared(
+        "INSERT INTO ingress_connectors (id, name, provider, domain, settings, edge_port, auto_publish, status, created_at, updated_at) \
+         VALUES (7201, 'homelab', 'cloudflare_tunnel', 'lab.example.com', '{}', 443, true, 'ready', now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        connector_host_suffix(&db, 7201).await?,
+        None,
+        "existing tunnels get no suffix"
+    );
+    db.execute_unprepared("UPDATE ingress_connectors SET host_suffix = 'lab' WHERE id = 7201")
+        .await?;
+    assert_eq!(
+        connector_host_suffix(&db, 7201).await?.as_deref(),
+        Some("lab")
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'ingress_connectors' AND column_name = 'host_suffix'".to_string(),
+        ))
+        .await?;
+    assert!(columns.is_empty(), "down must remove host_suffix");
+    let survivors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM ingress_connectors WHERE id = 7201".to_string(),
+        ))
+        .await?;
+    assert_eq!(survivors.len(), 1, "down must keep the tunnel");
+    Ok(())
+}

@@ -30,6 +30,15 @@ import {
   syncIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { hostSuffixError, suffixedHost } from '@/lib/tunnel-host-suffix'
+import {
+  type DomainPick,
+  EMPTY_PICK,
+  type LabelLayout,
+  providerHostSuffix,
+  providerValues,
+  subdomainLabel,
+} from '@/components/nodes/tunnel-setup-values'
 import type {
   ConnectorNodeView,
   ConnectorView,
@@ -74,6 +83,8 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
   SelectContent,
@@ -421,22 +432,11 @@ function defaultName(node: NodeInfoResponse) {
   return (name || `worker-${node.id}`).slice(0, 50)
 }
 
-/** A managed domain as picked: a zone and an optional label under it. */
-interface DomainPick {
-  zone: string
-  subdomain: string
-}
-
-const EMPTY_PICK: DomainPick = { zone: '', subdomain: '' }
 /** `temps_ingress::cloudflare::KIND`. */
 const CLOUDFLARE_TUNNEL = 'cloudflare_tunnel'
 const TUNNEL_NAME = /^[A-Za-z0-9-]{1,50}$/
 const DNS_LABELS =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
-
-function subdomainLabel(subdomain: string) {
-  return subdomain.trim().toLowerCase().replace(/\.+$/, '')
-}
 
 /** The answers for a provider: its own fields, checked against its descriptor. */
 function setupSchema(provider: ProviderInfo | null) {
@@ -450,7 +450,11 @@ function setupSchema(provider: ProviderInfo | null) {
       values: z.record(z.string(), z.string()),
       picks: z.record(
         z.string(),
-        z.object({ zone: z.string(), subdomain: z.string() })
+        z.object({
+          zone: z.string(),
+          subdomain: z.string(),
+          layout: z.enum(['suffix', 'subdomain']),
+        })
       ),
     })
     .superRefine((data, ctx) => {
@@ -464,6 +468,15 @@ function setupSchema(provider: ProviderInfo | null) {
               path: ['picks', field.key],
               message: 'Choose a domain.',
             })
+          } else if (label && pick.layout === 'suffix') {
+            const error = hostSuffixError(label)
+            if (error) {
+              ctx.addIssue({
+                code: 'custom',
+                path: ['picks', field.key],
+                message: error,
+              })
+            }
           } else if (label && !DNS_LABELS.test(label)) {
             ctx.addIssue({
               code: 'custom',
@@ -487,22 +500,6 @@ type SetupValues = z.infer<ReturnType<typeof setupSchema>>
 
 function setupDefaults(node: NodeInfoResponse): SetupValues {
   return { name: defaultName(node), values: {}, picks: {} }
-}
-
-/** The values the API takes: a picked domain becomes one hostname. */
-function providerValues(provider: ProviderInfo, answers: SetupValues) {
-  const values: Record<string, string> = {}
-  for (const [key, value] of Object.entries(answers.values)) {
-    if (value.trim()) values[key] = value
-  }
-  for (const field of provider.fields) {
-    if (field.kind.type !== 'managed_domain') continue
-    const pick = answers.picks[field.key] ?? EMPTY_PICK
-    const label = subdomainLabel(pick.subdomain)
-    const domain = pick.zone && label ? `${label}.${pick.zone}` : pick.zone
-    if (domain) values[field.key] = domain
-  }
-  return values
 }
 
 /**
@@ -561,11 +558,13 @@ function ProviderSetupDialog({
 
   const submit = form.handleSubmit((answers) => {
     if (!provider) return
+    const hostSuffix = providerHostSuffix(provider, answers)
     create.mutate({
       body: {
         name: answers.name.trim(),
         provider: provider.kind,
         values: providerValues(provider, answers),
+        ...(hostSuffix ? { host_suffix: hostSuffix } : {}),
         node_ids: [node.id],
       },
     })
@@ -796,7 +795,7 @@ function ManagedDomainSelect({
     ...listManagedDomainsOptions({ path: { id: providerId ?? 0 } }),
     enabled: providerId != null,
   })
-  const { zone, subdomain } = value
+  const { zone, subdomain, layout } = value
   if (providerId == null) {
     return (
       <Select disabled>
@@ -832,19 +831,23 @@ function ManagedDomainSelect({
         {allowSubdomain && (
           <>
             <Input
-              aria-label="Subdomain (optional)"
+              aria-label="Label (optional)"
               className="w-40"
-              placeholder="subdomain"
+              placeholder="label"
               autoComplete="off"
               value={subdomain}
-              onChange={(e) => onChange({ zone, subdomain: e.target.value })}
+              onChange={(e) =>
+                onChange({ ...value, subdomain: e.target.value })
+              }
             />
-            <span className="text-muted-foreground">.</span>
+            {(layout === 'subdomain' || !label) && (
+              <span className="text-muted-foreground">.</span>
+            )}
           </>
         )}
         <Select
           value={zone}
-          onValueChange={(next) => onChange({ zone: next, subdomain })}
+          onValueChange={(next) => onChange({ ...value, zone: next })}
         >
           <FormControl>
             <SelectTrigger className="flex-1">
@@ -863,11 +866,19 @@ function ManagedDomainSelect({
       </div>
       {allowSubdomain && !label && (
         <p className="text-xs text-muted-foreground">
-          Leave the subdomain empty to use the whole domain, or enter one (e.g.{' '}
-          <code>lab</code>) to keep this tunnel to it.
+          Leave the label empty to name apps directly under the domain, or enter
+          one (e.g. <code>lab</code>) to tell this tunnel&apos;s apps apart.
         </p>
       )}
       {label && zone && (
+        <LabelLayoutChoice
+          zone={zone}
+          label={label}
+          layout={layout}
+          onLayout={(next) => onChange({ ...value, layout: next })}
+        />
+      )}
+      {label && zone && layout === 'subdomain' && (
         <Alert>
           <AlertDescription className="space-y-1 text-xs">
             <p>
@@ -902,5 +913,64 @@ function ManagedDomainSelect({
         </Alert>
       )}
     </div>
+  )
+}
+
+/** One level deep with a suffix, or two levels under a subdomain. */
+function LabelLayoutChoice({
+  zone,
+  label,
+  layout,
+  onLayout,
+}: {
+  zone: string
+  label: string
+  layout: LabelLayout
+  onLayout: (layout: LabelLayout) => void
+}) {
+  return (
+    <RadioGroup
+      value={layout}
+      onValueChange={(next) => onLayout(next as LabelLayout)}
+      aria-label="Hostnames"
+      className="grid gap-2"
+    >
+      <Label
+        htmlFor="label-layout-suffix"
+        className="flex cursor-pointer items-start gap-2 font-normal"
+      >
+        <RadioGroupItem
+          id="label-layout-suffix"
+          value="suffix"
+          className="mt-0.5"
+        />
+        <span className="grid gap-0.5 text-sm">
+          <code>{suffixedHost('app', label, zone)}</code>
+          <span className="text-xs text-muted-foreground">
+            One level below {zone}: Cloudflare&apos;s free certificate covers
+            it. The tunnel serves {zone}.
+          </span>
+        </span>
+      </Label>
+      <Label
+        htmlFor="label-layout-subdomain"
+        className="flex cursor-pointer items-start gap-2 font-normal"
+      >
+        <RadioGroupItem
+          id="label-layout-subdomain"
+          value="subdomain"
+          className="mt-0.5"
+        />
+        <span className="grid gap-0.5 text-sm">
+          <code>
+            app.{label}.{zone}
+          </code>
+          <span className="text-xs text-muted-foreground">
+            Two levels down, under {label}.{zone}: needs Advanced Certificate
+            Manager.
+          </span>
+        </span>
+      </Label>
+    </RadioGroup>
   )
 }

@@ -252,7 +252,10 @@ impl EnvironmentAddressService {
                 .into_iter()
                 .map(|c| TunnelOffer {
                     connector_id: c.id,
-                    hostname: super::environment_hosts::natural_host(&label, &c.domain),
+                    hostname: super::environment_hosts::natural_host(
+                        &super::environment_hosts::tunnel_label(&label, c.host_suffix.as_deref()),
+                        &c.domain,
+                    ),
                     name: c.name,
                 })
                 .collect();

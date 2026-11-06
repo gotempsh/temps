@@ -92,6 +92,15 @@ pub struct CreateConnectorRequest {
     /// or only the hostnames chosen for this tunnel.
     #[serde(default)]
     pub auto_publish: Option<bool>,
+    /// Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`
+    /// (ADR 068 D3), e.g. `lab` with domain `example.com` gives
+    /// `shop-production-lab.example.com`: one level under the zone, which
+    /// Cloudflare's free certificate covers. Without it they are
+    /// `<label>.<domain>`. 1-20 lowercase letters, digits or hyphens; only
+    /// for a provider set up with a domain.
+    #[serde(default)]
+    #[schema(example = "lab")]
+    pub host_suffix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -170,9 +179,12 @@ pub struct ConnectorView {
     pub last_error: Option<String>,
     pub edge_port: i32,
     pub auto_publish: bool,
-    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3).
-    /// At most one tunnel does.
+    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3), or
+    /// `<label>-<host_suffix>.<domain>` with a host suffix. At most one
+    /// tunnel does.
     pub environment_hosts: bool,
+    /// Suffix of its environment hosts' first label; `null` for none.
+    pub host_suffix: Option<String>,
     pub nodes: Vec<ConnectorNodeView>,
     pub publications: Vec<PublicationView>,
     #[schema(value_type = String, format = DateTime)]
@@ -217,6 +229,8 @@ pub struct TunnelFact {
     pub auto_publish: bool,
     /// Publishes every environment's host (ADR 068 D3).
     pub environment_hosts: bool,
+    /// Its environment hosts are `<label>-<suffix>.<domain>`.
+    pub host_suffix: Option<String>,
 }
 
 /// Which tunnel would publish a hostname, by ADR 058 D9's selection (the
@@ -928,6 +942,7 @@ impl IngressConnectorService {
         // worker will refuse.
         self.validate_nodes(&request.node_ids).await?;
         let setup = self.resolve_setup(&info, &request.values).await?;
+        let host_suffix = host_suffix_for(&info, &setup, request.host_suffix.as_deref())?;
         factory.validate(&self.deps(), &setup).await?;
 
         let mut settings = serde_json::Map::new();
@@ -952,6 +967,7 @@ impl IngressConnectorService {
             settings: Set(serde_json::Value::Object(settings)),
             edge_port: Set(DEFAULT_EDGE_PORT),
             auto_publish: Set(request.auto_publish.unwrap_or(true)),
+            host_suffix: Set(host_suffix),
             status: Set("pending".into()),
             created_at: Set(now),
             updated_at: Set(now),
@@ -1094,6 +1110,7 @@ impl IngressConnectorService {
                 has_nodes: c.has_nodes,
                 auto_publish: c.model.auto_publish,
                 environment_hosts: c.model.environment_hosts,
+                host_suffix: c.model.host_suffix.clone(),
             })
             .collect();
         let mut choices: Vec<(String, Option<i32>)> = plan
@@ -2208,6 +2225,7 @@ fn connector_view(
         edge_port: connector.edge_port,
         auto_publish: connector.auto_publish,
         environment_hosts: connector.environment_hosts,
+        host_suffix: connector.host_suffix,
         nodes: node_rows
             .into_iter()
             .map(|n| ConnectorNodeView {
@@ -2246,6 +2264,25 @@ fn page_bounds(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
 /// Whether a publication in `state` has a DNS record out there.
 fn has_record(state: &str) -> bool {
     state == "published" || state == STALE
+}
+
+/// The checked `host_suffix` for a new tunnel: only a provider set up with a
+/// domain names hosts under one.
+fn host_suffix_for(
+    info: &ProviderInfo,
+    setup: &ProviderSetup,
+    requested: Option<&str>,
+) -> Result<Option<String>, IngressError> {
+    let suffix = crate::reachability::environment_hosts::normalize_host_suffix(requested)
+        .map_err(IngressError::Validation)?;
+    match (&suffix, &setup.domain) {
+        (Some(suffix), None) => Err(IngressError::Validation(format!(
+            "{} is not set up with a domain, so it has no hostnames to add the suffix \
+             '{suffix}' to. Leave the hostname suffix empty.",
+            info.name
+        ))),
+        _ => Ok(suffix),
+    }
 }
 
 /// The record name of `host` inside `domain`. Cloudflare's free certificate
@@ -2695,6 +2732,42 @@ mod tests {
         );
     }
 
+    fn setup_with_domain(domain: Option<&str>) -> ProviderSetup {
+        ProviderSetup {
+            dns_provider: None,
+            domain: domain.map(str::to_string),
+            settings: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+        }
+    }
+
+    /// A tunnel's host suffix is checked when it is created: normalised,
+    /// refused when malformed, and refused for a provider with no domain to
+    /// put hostnames under.
+    #[test]
+    fn a_new_tunnels_host_suffix_is_checked() {
+        use crate::registry::ProviderFactory;
+        let info = crate::cloudflare::CloudflareTunnelFactory.info();
+        let zone = setup_with_domain(Some("example.com"));
+        assert_eq!(host_suffix_for(&info, &zone, None).unwrap(), None);
+        assert_eq!(host_suffix_for(&info, &zone, Some("  ")).unwrap(), None);
+        assert_eq!(
+            host_suffix_for(&info, &zone, Some("Lab")).unwrap(),
+            Some("lab".to_string())
+        );
+        let malformed = host_suffix_for(&info, &zone, Some("lab.home")).unwrap_err();
+        assert!(
+            matches!(&malformed, IngressError::Validation(m) if m.contains("'lab.home'")),
+            "{malformed}"
+        );
+        let no_domain = host_suffix_for(&info, &setup_with_domain(None), Some("lab")).unwrap_err();
+        assert!(
+            matches!(&no_domain, IngressError::Validation(m)
+                if m.contains("not set up with a domain") && m.contains("'lab'")),
+            "{no_domain}"
+        );
+    }
+
     fn connector_model(id: i32, domain: &str, auto_publish: bool) -> ingress_connectors::Model {
         ingress_connectors::Model {
             id,
@@ -2708,6 +2781,7 @@ mod tests {
             edge_port: 443,
             auto_publish,
             environment_hosts: false,
+            host_suffix: None,
             status: "ready".into(),
             last_error: None,
             created_at: Utc::now(),
