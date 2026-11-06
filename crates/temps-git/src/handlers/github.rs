@@ -248,7 +248,7 @@ async fn github_webhook_events(
         .get("X-Hub-Signature-256")
         .and_then(|v| v.to_str().ok());
 
-    let signing_app = state
+    let signing = state
         .github_service
         .validate_webhook_signature(signature, &body)
         .await
@@ -344,18 +344,20 @@ async fn github_webhook_events(
     })?
     .unwrap_or(0);
 
+    let mut sender = None;
     if installation_id != 0 {
-        state
+        let app = state
             .github_service
-            .authorize_webhook_installation(signing_app, installation_id)
+            .authorize_webhook_installation(&signing, installation_id)
             .await
             .map_err(|e| {
-                warn!(app_id = signing_app.app_id, installation_id, error = %e,
+                warn!(installation_id, error = %e,
                     "Ignoring GitHub App webhook: installation ownership not confirmed");
                 problem_new(StatusCode::UNAUTHORIZED)
                     .with_title("Webhook Installation Not Authorized")
                     .with_detail("The installation could not be bound to the signing App")
             })?;
+        sender = Some(app.app_id);
     } else if !matches!(webhook_event.specific, WebhookEventPayload::Ping(_)) {
         return Err(problem_new(StatusCode::BAD_REQUEST)
             .with_title("Missing Webhook Installation")
@@ -378,20 +380,14 @@ async fn github_webhook_events(
         }
         WebhookEventPayload::Installation(installation_event) => {
             info!("Installation event received");
-            handle_installation_event(
-                &state,
-                installation_event,
-                installation_id,
-                signing_app.app_id,
-            )
-            .await;
+            handle_installation_event(&state, installation_event, installation_id, sender).await;
         }
         WebhookEventPayload::Ping(ping_event) => {
-            if let Some(app_id) = ping_event
-                .hook
-                .and_then(|h| h.app_id)
-                .filter(|id| id.into_inner() == signing_app.app_id as u64)
-            {
+            if let Some(app_id) = ping_event.hook.and_then(|h| h.app_id).filter(|id| {
+                signing
+                    .iter()
+                    .any(|app| id.into_inner() == app.app_id as u64)
+            }) {
                 info!("Ping event app_id: {:?}", app_id);
                 let _ = state
                     .github_service
@@ -794,7 +790,7 @@ async fn handle_installation_event(
     state: &Arc<AppState>,
     event: Box<octocrab::models::webhook_events::payload::InstallationWebhookEventPayload>,
     installation_id: i32,
-    signing_app_id: i32,
+    signing_app_id: Option<i32>,
 ) {
     use octocrab::models::webhook_events::payload::InstallationWebhookEventAction;
 
@@ -820,7 +816,7 @@ async fn handle_installation_event(
 
             match state
                 .github_service
-                .process_installation(installation_id, Some(signing_app_id))
+                .process_installation(installation_id, signing_app_id)
                 .await
             {
                 Ok(result) => {
@@ -1272,7 +1268,9 @@ async fn github_app_installation_callback(
 
 #[cfg(test)]
 mod tests {
-    async fn signed_installation_delivery(provider_id: i32) -> (bool, usize) {
+    /// Deliver a push signed by App 10, whose secret App 20 shares when
+    /// `shared` is set, for an installation owned by `provider_id`.
+    async fn signed_installation_delivery(provider_id: i32, shared: bool) -> (bool, usize) {
         use hmac::{Hmac, KeyInit, Mac};
         use sea_orm::{DatabaseBackend, MockDatabase};
         use temps_entities::{git_provider_connections, git_providers, projects};
@@ -1297,7 +1295,9 @@ mod tests {
         let mut other_app = app.clone();
         other_app.id = 20;
         other_app.auth_config["app_id"] = serde_json::json!(101);
-        other_app.auth_config["webhook_secret"] = serde_json::json!("other-test-secret");
+        if !shared {
+            other_app.auth_config["webhook_secret"] = serde_json::json!("other-test-secret");
+        }
         let connection: git_provider_connections::Model =
             serde_json::from_value(serde_json::json!({
                 "id": 30, "provider_id": provider_id, "account_name": "example",
@@ -1343,7 +1343,8 @@ mod tests {
         headers.insert("X-Hub-Signature-256", signature.parse().unwrap());
         headers.insert("X-GitHub-Event", "push".parse().unwrap());
         let result = github_webhook_events(headers, State(state.clone()), Bytes::from(body)).await;
-        if provider_id != 10 {
+        let owned = provider_id == 10 || (shared && provider_id == 20);
+        if !owned {
             assert_eq!(
                 result.as_ref().err().unwrap().status_code,
                 StatusCode::UNAUTHORIZED
@@ -1359,13 +1360,24 @@ mod tests {
     #[tokio::test]
     async fn signing_app_mismatch_dispatches_nothing() {
         // Only signature and ownership queries run; no dispatch queries or jobs.
-        assert_eq!(signed_installation_delivery(20).await, (false, 2));
+        assert_eq!(signed_installation_delivery(20, false).await, (false, 2));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_binds_the_app_that_owns_the_installation() {
+        // App 20 is checked first and shares the secret, but App 10 owns it.
+        assert_eq!(signed_installation_delivery(10, true).await, (true, 4));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_still_rejects_an_installation_no_signer_owns() {
+        assert_eq!(signed_installation_delivery(30, true).await, (false, 2));
     }
 
     #[tokio::test]
     async fn signing_app_pairing_dispatches_branch_deletion() {
         // The matching App reaches the installation and project dispatch queries.
-        assert_eq!(signed_installation_delivery(10).await, (true, 4));
+        assert_eq!(signed_installation_delivery(10, false).await, (true, 4));
     }
 
     use super::*;

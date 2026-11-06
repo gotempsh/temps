@@ -300,8 +300,11 @@ pub enum WebhookInstallationError {
         installation_id: i32,
         source: octocrab::Error,
     },
-    #[error("Installation {installation_id} does not belong to signing App {app_id}")]
-    NotOwned { app_id: i32, installation_id: i32 },
+    #[error("Installation {installation_id} does not belong to any signing App {app_ids:?}")]
+    NotOwned {
+        app_ids: Vec<i32>,
+        installation_id: i32,
+    },
 }
 
 // Helper struct to represent GitHub App data from git_providers
@@ -1540,9 +1543,9 @@ impl GithubAppService {
         &self,
         signature: Option<&str>,
         body: &[u8],
-    ) -> Result<WebhookSigningApp, GithubAppServiceError> {
-        // Try to validate with each GitHub App until one succeeds
-        // This is necessary because we don't know which app the webhook is from
+    ) -> Result<Vec<WebhookSigningApp>, GithubAppServiceError> {
+        // Every App whose secret matches is a candidate: Apps may share a
+        // secret, so the installation decides which one sent the delivery.
         let github_apps = self.get_all_github_apps().await?;
 
         if github_apps.is_empty() {
@@ -1560,6 +1563,7 @@ impl GithubAppService {
         // Try each GitHub App's webhook secret. `webhook_secret` is already
         // decrypted in GitHubAppData. The comparison is constant-time and an
         // app with no secret never matches (see the helper).
+        let mut signing = Vec::new();
         for github_app in github_apps {
             if let Ok(true) = github_webhook_signature_matches(
                 body,
@@ -1567,26 +1571,36 @@ impl GithubAppService {
                 &github_app.webhook_secret,
             ) {
                 debug!("Valid signature for GitHub App: {}", github_app.name);
-                return Ok(WebhookSigningApp {
+                signing.push(WebhookSigningApp {
                     app_id: github_app.app_id,
                     provider_id: github_app.provider_id,
                 });
             }
         }
 
-        // If no app's webhook secret matched, return error
-        debug!("No GitHub App webhook secret matched the signature");
-        Err(GithubAppServiceError::InvalidWebhookSignature)
+        if signing.is_empty() {
+            debug!("No GitHub App webhook secret matched the signature");
+            return Err(GithubAppServiceError::InvalidWebhookSignature);
+        }
+        Ok(signing)
     }
 
-    /// Check stored ownership before any dispatch. New installations are
-    /// confirmed through GitHub with only the signing App's credentials.
+    /// Return the signing App that owns the installation, checking stored
+    /// ownership before any dispatch. New installations are confirmed through
+    /// GitHub with only the signing Apps' credentials.
     pub async fn authorize_webhook_installation(
         &self,
-        app: WebhookSigningApp,
+        signing: &[WebhookSigningApp],
         installation_id: i32,
-    ) -> Result<(), WebhookInstallationError> {
-        let app_id = app.app_id;
+    ) -> Result<WebhookSigningApp, WebhookInstallationError> {
+        let not_owned = || WebhookInstallationError::NotOwned {
+            app_ids: signing.iter().map(|app| app.app_id).collect(),
+            installation_id,
+        };
+        let Some(first) = signing.first() else {
+            return Err(not_owned());
+        };
+
         let connection = git_provider_connections::Entity::find()
             .filter(
                 git_provider_connections::Column::InstallationId.eq(installation_id.to_string()),
@@ -1594,22 +1608,43 @@ impl GithubAppService {
             .one(self.db.as_ref())
             .await
             .map_err(|source| WebhookInstallationError::Database {
-                app_id,
+                app_id: first.app_id,
                 installation_id,
                 source,
             })?;
         if let Some(connection) = connection {
-            return if connection.provider_id == app.provider_id {
-                Ok(())
-            } else {
-                Err(WebhookInstallationError::NotOwned {
-                    app_id,
-                    installation_id,
-                })
-            };
+            return signing
+                .iter()
+                .find(|app| app.provider_id == connection.provider_id)
+                .copied()
+                .ok_or_else(not_owned);
         }
+
+        // An App can only read its own installations, so the first App that
+        // confirms ownership is the sender; a failed lookup is reported only
+        // when no other App confirms.
+        let mut failure = None;
+        for app in signing {
+            match self.github_installation_owner(*app, installation_id).await {
+                Ok(true) => return Ok(*app),
+                Ok(false) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        Err(failure.unwrap_or_else(not_owned))
+    }
+
+    /// Whether GitHub reports the installation as belonging to `app`.
+    async fn github_installation_owner(
+        &self,
+        app: WebhookSigningApp,
+        installation_id: i32,
+    ) -> Result<bool, WebhookInstallationError> {
+        let app_id = app.app_id;
         let (client, _) = self
-            .get_github_app_client_by_app_id(app.app_id)
+            .get_github_app_client_by_app_id(app_id)
             .await
             .map_err(|source| WebhookInstallationError::Client {
                 app_id,
@@ -1632,14 +1667,7 @@ impl GithubAppService {
             installation_id,
             source,
         })?;
-        if installation.app_id.map(|id| id.into_inner()) == Some(app.app_id as u64) {
-            Ok(())
-        } else {
-            Err(WebhookInstallationError::NotOwned {
-                app_id,
-                installation_id,
-            })
-        }
+        Ok(installation.app_id.map(|id| id.into_inner()) == Some(app_id as u64))
     }
 
     pub async fn delete_installation(
