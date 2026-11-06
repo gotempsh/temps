@@ -165,8 +165,12 @@ impl ExternalServiceManager {
             })
             .collect();
 
-        let create_params =
-            self.build_remote_create_params(&service.name, service_type, &string_params)?;
+        let create_params = self.build_remote_create_params(
+            service_id,
+            &service.name,
+            service_type,
+            &string_params,
+        )?;
 
         // Try to stop existing container first (ignore errors — may not exist)
         let container_name = create_params.name.clone();

@@ -2396,3 +2396,57 @@ async fn create_cluster_with_too_many_members_writes_nothing() {
         "{err:?}"
     );
 }
+
+/// A new service whose parameters are refused while it initializes reports
+/// the refusal as a validation failure under its own ID, not as a failed
+/// start wrapping a placeholder ID.
+#[test]
+fn a_refused_parameter_is_reported_under_the_new_services_id() {
+    let error = ExternalServiceManager::initialization_failure(
+        10,
+        ExternalServiceError::ParameterValidationFailed {
+            service_id: 0,
+            reason: "managed S3 backend 'garage' cannot be created on a worker node".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            error,
+            ExternalServiceError::ParameterValidationFailed { service_id: 10, .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "Parameter validation failed for service 10: managed S3 backend 'garage' cannot be created on a worker node"
+    );
+
+    let conflict = ExternalServiceManager::initialization_failure(
+        10,
+        ExternalServiceError::ServiceResourceConflict {
+            name: "orders".to_string(),
+            resource: "volume postgres-orders_data".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            conflict,
+            ExternalServiceError::ServiceResourceConflict { .. }
+        ),
+        "{conflict:?}"
+    );
+
+    let failed = ExternalServiceManager::initialization_failure(
+        10,
+        ExternalServiceError::InternalError {
+            reason: "agent unreachable".to_string(),
+        },
+    );
+    assert!(
+        matches!(
+            failed,
+            ExternalServiceError::InitializationFailed { id: 10, .. }
+        ),
+        "{failed:?}"
+    );
+}

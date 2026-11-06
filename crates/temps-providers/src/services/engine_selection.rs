@@ -158,9 +158,8 @@ impl EngineSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::ExternalServiceManager;
+    use crate::services::test_support::unreachable_docker_manager;
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     /// Every `ServiceType`. The match makes adding a variant a compile error
     /// here until it is listed, so the parity test below covers it.
@@ -193,36 +192,13 @@ mod tests {
         all
     }
 
-    /// A manager whose engines can be built but never reach a daemon: the
-    /// HTTP Docker client only connects when a request is made, so this runs
-    /// without Docker installed.
-    fn manager_with_unreachable_docker() -> ExternalServiceManager {
-        let db = Arc::new(
-            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-        );
-        let docker = bollard::Docker::connect_with_http(
-            "http://127.0.0.1:1",
-            1,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .expect("an HTTP Docker client is built without connecting");
-        ExternalServiceManager::new(
-            db.clone(),
-            Arc::new(temps_core::EncryptionService::new_from_password(
-                "engine-selection-test",
-            )),
-            Arc::new(docker),
-            Arc::new(temps_dns::DnsRegistry::new(db)),
-        )
-    }
-
     /// Remote paths name and address containers from a selection, without
     /// building the engine, so the selection must agree with the engine for
     /// every service type, backend spelling and name. A disagreement would
     /// send start, stop or delete to the wrong container on a worker.
     #[test]
     fn selection_matches_the_engine_it_builds() {
-        let manager = manager_with_unreachable_docker();
+        let manager = unreachable_docker_manager();
         let backends = [
             None,
             Some(serde_json::Value::Null),

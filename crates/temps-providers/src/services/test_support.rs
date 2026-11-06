@@ -471,6 +471,24 @@ pub(super) fn control_plane_manager() -> ExternalServiceManager {
     ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
 }
 
+/// A full-profile manager whose engines can be built but never reach a
+/// daemon: the HTTP Docker client only connects when a request is made, so
+/// tests using it run without Docker installed.
+pub(super) fn unreachable_docker_manager() -> ExternalServiceManager {
+    let db =
+        Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
+    let docker = Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+        .expect("an HTTP Docker client is built without connecting");
+    ExternalServiceManager::new(
+        db.clone(),
+        Arc::new(EncryptionService::new_from_password(
+            "unreachable-docker-test",
+        )),
+        Arc::new(docker),
+        Arc::new(temps_dns::DnsRegistry::new(db)),
+    )
+}
+
 /// A control-plane-profile manager (no Docker handle) over `db`, holding the
 /// key [`encrypted_service_model`] encrypts parameters with.
 pub(super) fn control_plane_manager_with_db(db: Arc<DatabaseConnection>) -> ExternalServiceManager {

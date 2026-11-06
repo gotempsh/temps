@@ -202,6 +202,7 @@ impl ExternalServiceManager {
     /// mislabelled RustFS image would then fail its healthcheck). New
     /// services always store `server` (see `MinioParameterStrategy`).
     fn remote_s3_server_kind_and_image(
+        service_id: i32,
         parameters: &HashMap<String, String>,
     ) -> Result<(crate::externalsvc::s3::S3ServerKind, String), ExternalServiceError> {
         use crate::externalsvc::s3::S3ServerKind;
@@ -213,7 +214,7 @@ impl ExternalServiceManager {
             .map(S3ServerKind::parse)
             .transpose()
             .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
+                service_id,
                 reason: e.to_string(),
             })?;
         let image = parameters
@@ -246,6 +247,7 @@ impl ExternalServiceManager {
     /// Docker container for a given service type and parameters.
     pub(super) fn build_remote_create_params(
         &self,
+        service_id: i32,
         service_name: &str,
         service_type: &ServiceType,
         parameters: &HashMap<String, String>,
@@ -260,13 +262,13 @@ impl ExternalServiceManager {
             (ServiceType::S3, Some(backend)) if backend == "minio" => ServiceType::Minio,
             (ServiceType::Blob, Some(backend)) if backend == "minio" => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
+                    service_id,
                     reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services".to_string(),
                 });
             }
             (ServiceType::Blob, Some(backend)) if backend == "garage" => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
+                    service_id,
                     reason: "managed S3 backend 'garage' is only supported for S3 services; the built-in Blob service runs on the default 'rustfs' backend".to_string(),
                 });
             }
@@ -274,12 +276,17 @@ impl ExternalServiceManager {
                 // Garage reads its configuration from a `garage.toml` that has
                 // to be written into the container before it starts; the
                 // agent's generic create request carries no files, so a worker
-                // cannot create one yet.
+                // cannot create one yet. Creating it on this server is only a
+                // remedy when this server runs local workloads.
+                let remedy = if self.local_workloads_enabled {
+                    "Create it on this server instead (leave node_id unset), or use the default 'rustfs' backend on the worker"
+                } else {
+                    "This server runs no local workloads (serve profile 'control-plane'), so use the default 'rustfs' backend on the worker"
+                };
                 return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
+                    service_id,
                     reason: format!(
-                        "managed S3 backend 'garage' cannot be created on a remote node for service '{}': the agent cannot yet deliver garage.toml. Create it on the control-plane host, or use the default 'rustfs' backend on the worker",
-                        service_name
+                        "managed S3 backend 'garage' cannot be created on a worker node for service '{service_name}': the worker agent cannot yet deliver garage.toml. {remedy}"
                     ),
                 });
             }
@@ -293,10 +300,7 @@ impl ExternalServiceManager {
                     .cloned()
                     .unwrap_or_else(|| MARIADB_DEFAULT_IMAGE.to_string());
                 validate_mariadb_image(&image).map_err(|reason| {
-                    ExternalServiceError::ParameterValidationFailed {
-                        service_id: 0,
-                        reason,
-                    }
+                    ExternalServiceError::ParameterValidationFailed { service_id, reason }
                 })?;
                 let size_profile = parameters
                     .get("size_profile")
@@ -446,7 +450,7 @@ impl ExternalServiceManager {
             }
             #[allow(deprecated)]
             ServiceType::Minio => {
-                let (kind, image) = Self::remote_s3_server_kind_and_image(parameters)?;
+                let (kind, image) = Self::remote_s3_server_kind_and_image(service_id, parameters)?;
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
@@ -613,7 +617,7 @@ mod tests {
                 HashMap::new()
             };
             let params = manager
-                .build_remote_create_params("orders", &service_type, &parameters)
+                .build_remote_create_params(7, "orders", &service_type, &parameters)
                 .expect("default remote service parameters should be valid");
             assert_eq!(params.name, expected_name, "wrong name for {service_type}");
             if let Some(expected_image) = expected_image {
@@ -637,7 +641,7 @@ mod tests {
                 ("password".to_string(), "seeded-secret".to_string()),
             ]);
             let params = manager
-                .build_remote_create_params("orders", &service_type, &dragonfly)
+                .build_remote_create_params(7, "orders", &service_type, &dragonfly)
                 .expect("a Dragonfly image is a valid override");
             assert_eq!(
                 params.command,
@@ -652,7 +656,7 @@ mod tests {
 
             let redis = HashMap::from([("password".to_string(), "seeded-secret".to_string())]);
             let params = manager
-                .build_remote_create_params("orders", &service_type, &redis)
+                .build_remote_create_params(7, "orders", &service_type, &redis)
                 .expect("default parameters are valid");
             assert_eq!(
                 params.command,
@@ -667,37 +671,57 @@ mod tests {
     }
 
     /// A worker cannot be handed `garage.toml` by the generic agent create
-    /// request, so a remote Garage service is refused up front with the
-    /// service name rather than started without its config.
+    /// request, so a remote Garage service is refused up front, under the
+    /// service's own ID and name, rather than started without its config.
+    /// Creating it on this server is offered only when this server runs
+    /// local workloads.
     #[test]
     fn remote_garage_creation_is_refused_with_an_actionable_error() {
-        let manager = mock_service_manager(vec![]);
         let parameters = HashMap::from([("backend".to_string(), "Garage".to_string())]);
-        let err = manager
-            .build_remote_create_params("orders", &ServiceType::S3, &parameters)
-            .unwrap_err();
-        match err {
-            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+        let refusal = |manager: ExternalServiceManager| match manager.build_remote_create_params(
+            7,
+            "orders",
+            &ServiceType::S3,
+            &parameters,
+        ) {
+            Err(ExternalServiceError::ParameterValidationFailed { service_id, reason }) => {
+                assert_eq!(service_id, 7, "{reason}");
                 assert!(
-                    reason.contains("garage") && reason.contains("orders"),
+                    reason.contains("'orders'") && reason.contains("garage.toml"),
                     "{reason}"
                 );
-                assert!(reason.contains("control-plane"), "{reason}");
+                reason
             }
             other => panic!("expected a validation error, got {other:?}"),
-        }
+        };
+
+        let full = refusal(unreachable_docker_manager());
+        assert!(full.contains("leave node_id unset"), "{full}");
+        assert!(!full.contains("control-plane"), "{full}");
+
+        let control_plane = refusal(control_plane_manager());
+        assert!(
+            control_plane.contains("serve profile 'control-plane'")
+                && control_plane.contains("'rustfs' backend"),
+            "{control_plane}"
+        );
+        assert!(
+            !control_plane.contains("this server instead"),
+            "{control_plane}"
+        );
     }
 
     /// The built-in Blob service has no Garage engine, on a worker or not.
     #[test]
     fn remote_blob_creation_rejects_the_garage_backend() {
-        let manager = mock_service_manager(vec![]);
+        let manager = control_plane_manager();
         let parameters = HashMap::from([("backend".to_string(), "garage".to_string())]);
         let err = manager
-            .build_remote_create_params("assets", &ServiceType::Blob, &parameters)
+            .build_remote_create_params(7, "assets", &ServiceType::Blob, &parameters)
             .unwrap_err();
         match err {
-            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+            ExternalServiceError::ParameterValidationFailed { service_id, reason } => {
+                assert_eq!(service_id, 7, "{reason}");
                 assert!(
                     reason.contains("only supported for S3 services"),
                     "{reason}"
@@ -720,7 +744,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<HashMap<_, _>>();
-            manager.build_remote_create_params("orders", &ServiceType::Minio, &parameters)
+            manager.build_remote_create_params(7, "orders", &ServiceType::Minio, &parameters)
         };
 
         let mirror = "registry.internal:5000/mirror/object-store:1.0.0";
@@ -941,7 +965,7 @@ mod tests {
             (ServiceType::Minio, HashMap::new(), "minio-orders"),
         ] {
             let params = manager
-                .build_remote_create_params("orders", &service_type, &parameters)
+                .build_remote_create_params(7, "orders", &service_type, &parameters)
                 .unwrap_or_else(|e| panic!("{service_type} on a worker needs no Docker: {e}"));
             assert_eq!(
                 params.name, expected_name,

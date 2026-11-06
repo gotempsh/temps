@@ -362,16 +362,30 @@ impl ExternalServiceManager {
                     );
                 }
 
-                if matches!(e, ExternalServiceError::ServiceResourceConflict { .. }) {
-                    return Err(e);
-                }
-                return Err(ExternalServiceError::InitializationFailed {
-                    id: service.id,
-                    reason: e.to_string(),
-                });
+                return Err(Self::initialization_failure(service.id, e));
             }
 
             self.get_service_info(service.id).await
+        }
+    }
+
+    /// The error to return when a new service failed to initialize and its
+    /// record was rolled back. A resource conflict keeps its own variant, and
+    /// a parameter validation failure stays one, under this service's ID:
+    /// the caller has a value to fix, not a failed start to retry.
+    fn initialization_failure(
+        service_id: i32,
+        error: ExternalServiceError,
+    ) -> ExternalServiceError {
+        match error {
+            ExternalServiceError::ServiceResourceConflict { .. } => error,
+            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+                ExternalServiceError::ParameterValidationFailed { service_id, reason }
+            }
+            other => ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: other.to_string(),
+            },
         }
     }
 
