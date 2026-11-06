@@ -10,11 +10,33 @@
 pub const NEUTRAL_VERIFY_PATH: &str = "/.well-known/security-check/verify";
 pub const NEUTRAL_SOLVER_JS_PATH: &str = "/.well-known/security-check/solver.js";
 pub const NEUTRAL_SOLVER_WASM_PATH: &str = "/.well-known/security-check/solver_bg.wasm";
+// Equal-width names preserve WASM section lengths and instruction offsets.
+const ORIGINAL_SOLVER_NAME: &[u8; 18] = b"temps_captcha_wasm";
+const NEUTRAL_SOLVER_NAME: &[u8; 18] = b"proof_work_runtime";
+
 pub static NEUTRAL_SOLVER_JS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    SOLVER_JS.replace(
-        "new URL('temps_captcha_wasm_bg.wasm'",
-        "new URL('solver_bg.wasm'",
-    )
+    SOLVER_JS
+        .replace("temps_captcha_wasm", "proof_work_runtime")
+        .replace(
+            "new URL('proof_work_runtime_bg.wasm'",
+            "new URL('solver_bg.wasm'",
+        )
+});
+
+/// Rename the embedded module/import/debug names together with the JS glue.
+/// This fixed-size embedded artifact is transformed once, never per request.
+pub static NEUTRAL_SOLVER_WASM: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    let mut bytes = SOLVER_WASM.to_vec();
+    let mut offset = 0;
+    while offset + ORIGINAL_SOLVER_NAME.len() <= bytes.len() {
+        if &bytes[offset..offset + ORIGINAL_SOLVER_NAME.len()] == ORIGINAL_SOLVER_NAME {
+            bytes[offset..offset + ORIGINAL_SOLVER_NAME.len()].copy_from_slice(NEUTRAL_SOLVER_NAME);
+            offset += ORIGINAL_SOLVER_NAME.len();
+        } else {
+            offset += 1;
+        }
+    }
+    bytes
 });
 
 pub const VERIFY_PATH: &str = "/api/_temps/captcha/verify";
@@ -92,6 +114,32 @@ pub fn escape_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neutral_solver_glue_and_binary_use_the_same_import_name() {
+        use super::*;
+        assert!(!NEUTRAL_SOLVER_JS.contains("temps_captcha_wasm"));
+        assert!(NEUTRAL_SOLVER_JS.contains("\"./proof_work_runtime_bg.js\": import0"));
+        assert!(NEUTRAL_SOLVER_JS.contains("SPDX-FileCopyrightText: 2024-2026 Temps Contributors"));
+        assert!(NEUTRAL_SOLVER_JS.contains("SPDX-License-Identifier: MIT OR Apache-2.0"));
+        assert_eq!(NEUTRAL_SOLVER_WASM.len(), SOLVER_WASM.len());
+        assert_eq!(&NEUTRAL_SOLVER_WASM[..8], &SOLVER_WASM[..8]);
+        let original_count = SOLVER_WASM
+            .windows(ORIGINAL_SOLVER_NAME.len())
+            .filter(|name| *name == ORIGINAL_SOLVER_NAME)
+            .count();
+        assert!(original_count > 0);
+        assert_eq!(
+            NEUTRAL_SOLVER_WASM
+                .windows(ORIGINAL_SOLVER_NAME.len())
+                .filter(|name| *name == NEUTRAL_SOLVER_NAME)
+                .count(),
+            original_count
+        );
+        assert!(!NEUTRAL_SOLVER_WASM
+            .windows(ORIGINAL_SOLVER_NAME.len())
+            .any(|name| name == ORIGINAL_SOLVER_NAME));
+    }
+
     #[test]
     fn hidden_identity_keeps_challenge_protocol_and_omits_branding() {
         let page = super::challenge_page_with_identity("token", 20, "127.0.0.1", true);

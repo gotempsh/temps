@@ -1669,3 +1669,68 @@ async fn platform_identity_controls_error_and_challenge_responses() {
         }
     }
 }
+
+#[tokio::test]
+async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app_headers() {
+    for hide in [false, true] {
+        for method in ["GET", "HEAD", "PUT"] {
+            let f = fixture();
+            f.lb.hide_platform_identity.store(hide, Ordering::Relaxed);
+            let (mut client, server) = tokio::io::duplex(4096);
+            client.write_all(get("/").as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = f.lb.new_ctx();
+            let mut request = pingora_http::RequestHeader::build(method, b"/asset", None).unwrap();
+            request.insert_header("If-None-Match", "\"v1\"").unwrap();
+            request
+                .insert_header("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+                .unwrap();
+            request
+                .insert_header("If-Match", "\"write-version\"")
+                .unwrap();
+            request
+                .insert_header("If-Unmodified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+                .unwrap();
+            f.lb.upstream_request_filter(&mut session, &mut request, &mut ctx)
+                .await
+                .unwrap();
+            let refresh = hide && method != "PUT";
+            assert_eq!(request.headers.contains_key("If-None-Match"), !refresh);
+            assert_eq!(request.headers.contains_key("If-Modified-Since"), !refresh);
+            assert!(request.headers.contains_key("If-Match"));
+            assert!(request.headers.contains_key("If-Unmodified-Since"));
+            // Model an unchanged app that returns 304 only for a conditional read.
+            if method != "PUT" {
+                let status = if request.headers.contains_key("If-None-Match") {
+                    304
+                } else {
+                    200
+                };
+                let mut response = pingora_http::ResponseHeader::build(status, None).unwrap();
+                response.insert_header("ETag", "\"v1\"").unwrap();
+                response
+                    .insert_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .unwrap();
+                response
+                    .insert_header("Cache-Control", "public, max-age=0")
+                    .unwrap();
+                response.insert_header("Server", "application").unwrap();
+                f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status.as_u16(), if hide { 200 } else { 304 });
+                assert_eq!(response.headers.get("ETag").unwrap(), "\"v1\"");
+                assert_eq!(
+                    response.headers.get("Cache-Control").unwrap(),
+                    "public, max-age=0"
+                );
+                assert_eq!(response.headers.get("Server").unwrap(), "application");
+                assert_eq!(
+                    response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+                    !hide
+                );
+            }
+        }
+    }
+}

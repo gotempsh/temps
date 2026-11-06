@@ -710,6 +710,8 @@ const SHIELD_HTTPS_REQUIRED_PAGE: &str = r#"<!DOCTYPE html>
 /// Entity tags of the solver files, from their content.
 static NEUTRAL_SOLVER_JS_ETAG: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| content_etag(temps_shield::assets::NEUTRAL_SOLVER_JS.as_bytes()));
+static NEUTRAL_SOLVER_WASM_ETAG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| content_etag(&temps_shield::assets::NEUTRAL_SOLVER_WASM));
 static SOLVER_JS_ETAG: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| content_etag(temps_shield::assets::SOLVER_JS.as_bytes()));
 static SOLVER_WASM_ETAG: std::sync::LazyLock<String> =
@@ -2224,9 +2226,13 @@ impl LoadBalancer {
                     assets::SOLVER_JS.as_bytes(),
                     &SOLVER_JS_ETAG,
                 )
-            } else if ctx.path == assets::SOLVER_WASM_PATH
-                || ctx.path == assets::NEUTRAL_SOLVER_WASM_PATH
-            {
+            } else if ctx.path == assets::NEUTRAL_SOLVER_WASM_PATH {
+                (
+                    "application/wasm",
+                    &assets::NEUTRAL_SOLVER_WASM,
+                    &NEUTRAL_SOLVER_WASM_ETAG,
+                )
+            } else if ctx.path == assets::SOLVER_WASM_PATH {
                 ("application/wasm", assets::SOLVER_WASM, &SOLVER_WASM_ETAG)
             } else {
                 return Ok(false);
@@ -4171,6 +4177,20 @@ impl ProxyHttp for LoadBalancer {
         Self::CTX: Send + Sync,
     {
         upstream_request.remove_header(temps_core::probe_auth::HEADER);
+        // A 304 merges into the client's old 200 and retains omitted proxy
+        // diagnostics. Request a full representation while hiding identity;
+        // leave app response validators and write preconditions untouched.
+        // This deliberately trades conditional GET/HEAD bandwidth for privacy.
+        if self.hide_platform_identity()
+            && matches!(
+                upstream_request.method,
+                axum::http::Method::GET | axum::http::Method::HEAD
+            )
+        {
+            upstream_request.remove_header("If-None-Match");
+            upstream_request.remove_header("If-Modified-Since");
+        }
+
         // ADR 065 D8: no app receives the gate's cookies, admitted or not,
         // gated host or not. A cookie left from before an address stopped
         // being signed-in is still a token.
