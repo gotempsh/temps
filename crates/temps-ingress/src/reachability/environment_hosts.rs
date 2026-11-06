@@ -62,13 +62,35 @@ pub fn normalize_host_suffix(suffix: Option<&str>) -> Result<Option<String>, Str
     Ok(Some(suffix))
 }
 
+/// The longest DNS label.
+const DNS_LABEL_MAX_LEN: usize = 63;
+
 /// The label a tunnel publishes an environment under: `label`, or
-/// `<label>-<suffix>` with a `host_suffix`. Always one DNS label: a long
-/// combination is cut and given a short hash, as [`single_dns_label`] does.
+/// `<label>-<suffix>` with a `host_suffix`. Always one DNS label, and the
+/// suffix always survives: when `<label>-<suffix>` is too long, the label
+/// is cut and given a short hash of itself, `<cut label>-<hash>-<suffix>`.
 pub fn tunnel_label(label: &str, suffix: Option<&str>) -> String {
-    match suffix.filter(|s| !s.is_empty()) {
-        Some(suffix) => single_dns_label(&format!("{label}-{suffix}")),
-        None => label.to_string(),
+    let Some(suffix) = suffix.filter(|s| !s.is_empty()) else {
+        return label.to_string();
+    };
+    let combined = format!("{label}-{suffix}");
+    if combined.len() <= DNS_LABEL_MAX_LEN {
+        return single_dns_label(&combined);
+    }
+    hashed_with_suffix(label, label, suffix)
+}
+
+/// `<stem>-<hash of seed>-<suffix>` as one DNS label: only the stem is cut
+/// to make room, never the hash or the suffix.
+fn hashed_with_suffix(stem: &str, seed: &str, suffix: &str) -> String {
+    // `<stem, cut>-<8 hex>`: split off the hash, then cut the stem further.
+    let hashed = hashed_label(stem, seed);
+    let (prefix, hash) = hashed.rsplit_once('-').unwrap_or(("", hashed.as_str()));
+    let room = DNS_LABEL_MAX_LEN.saturating_sub(hash.len() + suffix.len() + 2);
+    let prefix: String = prefix.chars().take(room).collect();
+    match prefix.trim_end_matches('-') {
+        "" => format!("{hash}-{suffix}"),
+        prefix => format!("{prefix}-{hash}-{suffix}"),
     }
 }
 
@@ -182,17 +204,39 @@ pub fn natural_host(label: &str, domain: &str) -> String {
 
 /// `<label>-<hash>.<domain>`: the fallback when the natural name is taken.
 /// The hash is of the environment and the natural name, so the fallback is
-/// stable across passes.
-pub fn fallback_host(label: &str, domain: &str, environment_id: i32) -> String {
+/// stable across passes. With the tunnel's `suffix` (and `label` from
+/// [`tunnel_label`], ending in it) the hash goes before the suffix,
+/// `<label>-<hash>-<suffix>`, so cutting a long name never drops it.
+pub fn fallback_host(
+    label: &str,
+    suffix: Option<&str>,
+    domain: &str,
+    environment_id: i32,
+) -> String {
     let seed = format!("{}#{environment_id}", natural_host(label, domain));
-    natural_host(&hashed_label(label, &seed), domain)
+    let stem_and_suffix = suffix
+        .filter(|s| !s.is_empty())
+        .and_then(|s| label.strip_suffix(&format!("-{s}")).map(|stem| (stem, s)));
+    let fallback = match stem_and_suffix {
+        Some((stem, suffix)) => hashed_with_suffix(stem, &seed, suffix),
+        None => hashed_label(label, &seed),
+    };
+    natural_host(&fallback, domain)
 }
 
 /// Whether `domain` is one of the names this module could have generated for
-/// `label`: what a pass keeps without asking DNS again.
-pub fn is_generated_name(domain: &str, label: &str, zone: &str, environment_id: i32) -> bool {
+/// `label` (and the tunnel's `suffix`): what a pass keeps without asking DNS
+/// again.
+pub fn is_generated_name(
+    domain: &str,
+    label: &str,
+    suffix: Option<&str>,
+    zone: &str,
+    environment_id: i32,
+) -> bool {
     let domain = domain.to_ascii_lowercase();
-    domain == natural_host(label, zone) || domain == fallback_host(label, zone, environment_id)
+    domain == natural_host(label, zone)
+        || domain == fallback_host(label, suffix, zone, environment_id)
 }
 
 /// The rows to insert and delete in one pass.
@@ -311,13 +355,14 @@ pub fn holders(rows: &[GeneratedRow]) -> HashMap<String, i32> {
 fn kept_row<'a>(
     env: &EnvironmentFacts,
     label: &str,
+    suffix: Option<&str>,
     domain: &str,
     rows: &'a [GeneratedRow],
     holder: &HashMap<String, i32>,
 ) -> Option<&'a GeneratedRow> {
     rows.iter().find(|r| {
         r.environment_id == env.environment_id
-            && is_generated_name(&r.domain, label, domain, env.environment_id)
+            && is_generated_name(&r.domain, label, suffix, domain, env.environment_id)
             && holder.get(&r.domain.to_ascii_lowercase()) == Some(&env.environment_id)
     })
 }
@@ -339,7 +384,7 @@ fn needing_names<'a>(
     let mut out = Vec::new();
     for env in envs.iter().filter(|e| e.excluded.is_none()) {
         let label = tunnel_label(&host_label(env, production_template), suffix);
-        if kept_row(env, &label, domain, rows, &holder).is_some() {
+        if kept_row(env, &label, suffix, domain, rows, &holder).is_some() {
             continue;
         }
         if !rows.iter().any(|r| r.environment_id == env.environment_id) {
@@ -390,7 +435,7 @@ pub fn assign_hosts(
     let mut desired = HashMap::new();
     for env in envs.iter().filter(|e| e.excluded.is_none()) {
         let label = tunnel_label(&host_label(env, production_template), suffix);
-        if let Some(row) = kept_row(env, &label, domain, rows, &claimed) {
+        if let Some(row) = kept_row(env, &label, suffix, domain, rows, &claimed) {
             desired.insert(env.environment_id, row.domain.to_ascii_lowercase());
         }
     }
@@ -401,7 +446,7 @@ pub fn assign_hosts(
         };
         let natural = natural_host(&label, domain);
         let host = if held(&claimed, &natural) {
-            fallback_host(&label, domain, id)
+            fallback_host(&label, suffix, domain, id)
         } else {
             natural
         };
@@ -932,7 +977,12 @@ impl EnvironmentHostService {
                     .then(|| {
                         format!(
                             "{natural} is already in use, so it will get {}",
-                            fallback_host(&label, &domain, env.environment_id)
+                            fallback_host(
+                                &label,
+                                snap.connector.host_suffix.as_deref(),
+                                &domain,
+                                env.environment_id
+                            )
                         )
                     }),
                     hostname: natural,
@@ -1280,32 +1330,35 @@ mod tests {
 
     #[test]
     fn the_fallback_is_a_stable_short_hash_name() {
-        let first = fallback_host("shop-staging", "tunnel.example.com", 2);
+        let first = fallback_host("shop-staging", None, "tunnel.example.com", 2);
         assert!(first.starts_with("shop-staging-"));
         assert!(first.ends_with(".tunnel.example.com"));
         assert_eq!(
             first,
-            fallback_host("shop-staging", "tunnel.example.com", 2)
+            fallback_host("shop-staging", None, "tunnel.example.com", 2)
         );
         assert_ne!(
             first,
-            fallback_host("shop-staging", "tunnel.example.com", 3)
+            fallback_host("shop-staging", None, "tunnel.example.com", 3)
         );
         assert!(is_generated_name(
             &first,
             "shop-staging",
+            None,
             "tunnel.example.com",
             2
         ));
         assert!(is_generated_name(
             "SHOP-STAGING.tunnel.example.com",
             "shop-staging",
+            None,
             "tunnel.example.com",
             2
         ));
         assert!(!is_generated_name(
             "shop-old.tunnel.example.com",
             "shop-staging",
+            None,
             "tunnel.example.com",
             2
         ));
@@ -1463,7 +1516,7 @@ mod tests {
             let rows = [row(10, 2, &natural)];
             let desired = assign(&envs, &rows);
             assert_eq!(desired[&2], natural);
-            assert_eq!(desired[&1], fallback_host("shop-staging", ZONE, 1));
+            assert_eq!(desired[&1], fallback_host("shop-staging", None, ZONE, 1));
         }
     }
 
@@ -1476,7 +1529,7 @@ mod tests {
         let envs = [env(1, "shop-staging"), env(2, "shop-qa")];
         let desired = assign(&envs, &rows);
         assert_eq!(desired[&2], natural_host("shop-qa", ZONE));
-        assert_eq!(desired[&1], fallback_host("shop-staging", ZONE, 1));
+        assert_eq!(desired[&1], fallback_host("shop-staging", None, ZONE, 1));
         let changes = plan_rows(&envs, &rows, &desired, &HashSet::new(), true);
         assert!(
             changes.delete.is_empty(),
@@ -1493,12 +1546,12 @@ mod tests {
         let rows = [row(11, 2, &name), row(10, 1, &name)];
         let desired = assign(&envs, &rows);
         assert_eq!(desired[&1], name);
-        assert_eq!(desired[&2], fallback_host("shop-staging", ZONE, 2));
+        assert_eq!(desired[&2], fallback_host("shop-staging", None, ZONE, 2));
         let changes = plan_rows(&envs, &rows, &desired, &HashSet::new(), true);
         assert_eq!(changes.delete, vec![11]);
         assert_eq!(
             changes.insert,
-            vec![(2, fallback_host("shop-staging", ZONE, 2))]
+            vec![(2, fallback_host("shop-staging", None, ZONE, 2))]
         );
     }
 
@@ -1509,7 +1562,7 @@ mod tests {
         let envs = [env(1, "www")];
         let natural = natural_host("www", ZONE);
         let desired = assign_hosts(&envs, &[], None, None, ZONE, &|h| h == natural, &|_| true);
-        assert_eq!(desired[&1], fallback_host("www", ZONE, 1));
+        assert_eq!(desired[&1], fallback_host("www", None, ZONE, 1));
         let desired = assign_hosts(&envs, &[], None, None, ZONE, &|_| true, &|_| true);
         assert!(desired.is_empty(), "both names taken");
         let desired = assign_hosts(&envs, &[], None, None, ZONE, &|_| false, &|_| false);
@@ -1689,8 +1742,9 @@ mod tests {
             &|_| true,
         );
         let host = &desired[&1];
-        assert_eq!(*host, fallback_host("www-lab", APEX, 1));
-        assert!(host.starts_with("www-lab-"), "{host}");
+        assert_eq!(*host, fallback_host("www-lab", Some("lab"), APEX, 1));
+        assert!(host.starts_with("www-"), "{host}");
+        assert!(host.ends_with("-lab.example.com"), "{host}");
         assert!(one_label_under(host, APEX), "{host}");
     }
 
@@ -1707,9 +1761,68 @@ mod tests {
         let label = tunnel_label(&long, Some("lab"));
         assert!(label.len() <= 63, "{label}");
         assert_ne!(label, format!("{long}-lab"));
+        // The label is cut, never the suffix the operator chose.
+        assert!(label.ends_with("-lab"), "{label}");
+        assert!(label.starts_with("aaaa"), "{label}");
+        // The longest suffix still fits, and so does the hash.
+        let label = tunnel_label(&long, Some(&"s".repeat(MAX_HOST_SUFFIX_LEN)));
+        assert!(label.len() <= 63, "{label}");
+        assert!(
+            label.ends_with(&format!("-{}", "s".repeat(MAX_HOST_SUFFIX_LEN))),
+            "{label}"
+        );
+        // Stable: the same label gives the same name every pass.
+        assert_eq!(
+            tunnel_label(&long, Some("lab")),
+            tunnel_label(&long, Some("lab"))
+        );
+        // Labels that differ only past the cut still get different names.
+        let other = format!("{}b", "a".repeat(59));
+        assert_ne!(
+            tunnel_label(&long, Some("lab")),
+            tunnel_label(&other, Some("lab"))
+        );
         assert_eq!(tunnel_label("shop", Some("lab")), "shop-lab");
         assert_eq!(tunnel_label("shop", None), "shop");
         assert_eq!(tunnel_label("shop", Some("")), "shop");
+    }
+
+    /// The fallback for a taken suffixed name keeps the suffix, whether the
+    /// natural name was cut or not.
+    #[test]
+    fn a_fallback_keeps_the_suffix_even_for_a_long_label() {
+        const APEX: &str = "example.com";
+        let long = tunnel_label(&"a".repeat(60), Some("lab"));
+        let host = fallback_host(&long, Some("lab"), APEX, 7);
+        assert!(one_label_under(&host, APEX), "{host}");
+        assert!(host.ends_with("-lab.example.com"), "{host}");
+        assert_ne!(host, natural_host(&long, APEX));
+        // Natural length that fits: the hash goes before the suffix.
+        let fits = tunnel_label(&"b".repeat(50), Some("lab"));
+        assert_eq!(fits, format!("{}-lab", "b".repeat(50)));
+        let host = fallback_host(&fits, Some("lab"), APEX, 7);
+        assert!(host.ends_with("-lab.example.com"), "{host}");
+        assert!(one_label_under(&host, APEX), "{host}");
+        // Both are what this module recognises as its own names.
+        assert!(is_generated_name(&host, &fits, Some("lab"), APEX, 7));
+        assert!(is_generated_name(
+            &natural_host(&fits, APEX),
+            &fits,
+            Some("lab"),
+            APEX,
+            7
+        ));
+        // Without a suffix the fallback is exactly what it always was.
+        assert_eq!(
+            fallback_host("shop-staging", None, APEX, 2),
+            natural_host(
+                &hashed_label(
+                    "shop-staging",
+                    &format!("{}#2", natural_host("shop-staging", APEX))
+                ),
+                APEX
+            )
+        );
     }
 
     #[test]

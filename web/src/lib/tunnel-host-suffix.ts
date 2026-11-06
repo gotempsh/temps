@@ -27,6 +27,14 @@ export function hostSuffixError(suffix: string): string | undefined {
   return undefined
 }
 
+/**
+ * Where a tunnel's "Publish environments" action is: its zone's page under
+ * Domains. Creating a tunnel publishes no environment hosts by itself.
+ */
+export function publishEnvironmentsHref(domain: string): string {
+  return `/domains/tunnel/${encodeURIComponent(`*.${domain}`)}`
+}
+
 /** `<label>-<suffix>.<domain>`, or `<label>.<domain>` without a suffix. */
 export function suffixedHost(
   label: string,

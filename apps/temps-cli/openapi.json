@@ -15673,7 +15673,7 @@
             ]
           },
           "host_suffix": {
-            "description": "Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`\n(ADR 068 D3), e.g. `lab` with domain `example.com` gives\n`shop-production-lab.example.com`: one level under the zone, which\nCloudflare's free certificate covers. Without it they are\n`<label>.<domain>`. 1-20 lowercase letters, digits or hyphens; only\nfor a provider set up with a domain.",
+            "description": "Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`\n(ADR 068 D3), e.g. `lab` with domain `example.com` gives\n`shop-production-lab.example.com`: one level under the zone, which\nCloudflare's free certificate covers. Without it they are\n`<label>.<domain>`. 1-20 lowercase letters, digits or hyphens,\nstarting and ending with a letter or digit; only for a provider set\nup with a domain. Creating the tunnel does not publish anything:\nenvironment hosts start when they are turned on for it\n(`PUT /ingress/connectors/{id}/environment-hosts`).",
             "example": "lab",
             "type": [
               "string",
