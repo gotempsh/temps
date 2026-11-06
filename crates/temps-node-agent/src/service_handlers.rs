@@ -272,6 +272,7 @@ fn mounted_volume_names(
     responses(
         (status = 200, description = "Service created", body = AgentResponse<ServiceCreateResponse>),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "A create for this service name is still running on this node"),
         (status = 500, description = "Service creation failed")
     ),
     security(("bearer_auth" = []))
@@ -284,9 +285,15 @@ pub async fn create_service(
     // Run the create as its own task. When the caller gives up (its request
     // timeout during a long image pull, a dropped connection), the server
     // drops this handler future; a create running inside it would stop at
-    // its next await and never remove the volumes it had made. The task
-    // finishes regardless, cleanup included.
-    match tokio::spawn(run_service_create(state, request)).await {
+    // its next await and never remove what it had made. The task instead
+    // sees `caller_waiting` dropped with the handler, stops, and undoes the
+    // attempt: the caller has already counted it as failed (a new service's
+    // record is rolled back), so a container left running would be one no
+    // record points at, holding the name against a retry.
+    let (caller_waiting, caller) = tokio::sync::watch::channel(());
+    let outcome = tokio::spawn(run_service_create(state, request, CallerWatch(caller))).await;
+    drop(caller_waiting);
+    match outcome {
         Ok(response) => response,
         Err(e) => {
             tracing::error!(service = %service_name, error = %e, "Service create task ended abnormally");
@@ -308,6 +315,7 @@ pub async fn create_service(
 async fn run_service_create(
     state: Arc<AgentState>,
     request: ServiceCreateRequest,
+    mut caller: CallerWatch,
 ) -> axum::response::Response {
     tracing::info!(
         service = %request.name,
@@ -328,6 +336,25 @@ async fn run_service_create(
     };
 
     let container_name = request.name.clone();
+
+    // One create per name at a time: a retry that arrives while an abandoned
+    // attempt is still undoing itself would otherwise race it for the name
+    // and the volumes.
+    let Some(_in_progress) = CreateInProgress::claim(&container_name) else {
+        tracing::warn!(service = %container_name, "Refusing a service create: another create for this name is still running");
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "A create for service '{}' is still running on this node (an earlier attempt \
+                 may be undoing itself); retry in a moment",
+                container_name
+            ),
+        )
+        .into_response();
+    };
+    // Marks the container this attempt creates, so an ambiguous create error
+    // removes it only when it is this attempt's.
+    let attempt = uuid::Uuid::new_v4().simple().to_string();
 
     // The volumes this request creates, so a failed create removes those and
     // never a volume an earlier service left holding its data.
@@ -476,6 +503,7 @@ async fn run_service_create(
                 request.service_type.clone(),
             ),
             ("sh.temps.service.name".to_string(), request.name.clone()),
+            (CREATE_ATTEMPT_LABEL.to_string(), attempt.clone()),
         ])),
         ..Default::default()
     };
@@ -485,9 +513,14 @@ async fn run_service_create(
         let image_ref = request.image.as_str();
         tracing::info!(image = %image_ref, "Pulling image (if not present)...");
 
-        if let Err(e) =
-            temps_docker_util::pull_image(docker, temps_docker_util::PullSpec::new(image_ref)).await
-        {
+        // The pull is the long step; it stops as soon as the caller does.
+        let pulled = tokio::select! {
+            pulled = temps_docker_util::pull_image(docker, temps_docker_util::PullSpec::new(image_ref)) => pulled,
+            () = caller.gone() => {
+                return abandon_create(docker, &container_name, None, &created_volumes).await;
+            }
+        };
+        if let Err(e) = pulled {
             let cause = e.cause_text();
             tracing::error!(image = %image_ref, "Failed to pull image: {}", cause);
             let message = with_cleanup_note(
@@ -497,6 +530,9 @@ async fn run_service_create(
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
         }
         tracing::info!(image = %image_ref, "Image ready");
+    }
+    if caller.has_gone() {
+        return abandon_create(docker, &container_name, None, &created_volumes).await;
     }
 
     let create_opts = bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -600,6 +636,16 @@ async fn run_service_create(
                 }
             }
 
+            if caller.has_gone() {
+                return abandon_create(
+                    docker,
+                    &container_name,
+                    Some(&container_name),
+                    &created_volumes,
+                )
+                .await;
+            }
+
             tracing::info!(
                 container = %container_name,
                 container_id = %response.id,
@@ -622,18 +668,126 @@ async fn run_service_create(
                 "Failed to create service container: {}",
                 e
             );
-            // No container was created; one already holding the name is
-            // someone else's and stays.
+            // A name conflict means the container is someone else's, and it
+            // stays. Any other error can arrive after Docker made the
+            // container (the reply lost on the way back), so remove one under
+            // the name only when it carries this attempt's label.
+            let ours = match &e {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409, ..
+                } => false,
+                _ => made_by_attempt(docker, &container_name, &attempt).await,
+            };
             let message = with_cleanup_note(
                 format!(
                     "Failed to create service container '{}': {}",
                     container_name, e
                 ),
-                remove_failed_service_create(docker, None, &created_volumes).await,
+                remove_failed_service_create(
+                    docker,
+                    ours.then_some(container_name.as_str()),
+                    &created_volumes,
+                )
+                .await,
             );
             error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
         }
     }
+}
+
+/// Label holding the create attempt that made a service container.
+const CREATE_ATTEMPT_LABEL: &str = "sh.temps.service.create-attempt";
+
+/// Whether the caller of a service create is still waiting for its answer.
+/// The handler holds the sender; the server drops the handler, and with it
+/// the sender, when the caller hangs up. Nothing is ever sent.
+struct CallerWatch(tokio::sync::watch::Receiver<()>);
+
+impl CallerWatch {
+    fn has_gone(&self) -> bool {
+        self.0.has_changed().is_err()
+    }
+
+    /// Resolves once the caller has hung up.
+    async fn gone(&mut self) {
+        while self.0.changed().await.is_ok() {}
+    }
+}
+
+/// Names of the services with a create running on this agent. Entries live
+/// only while their create runs, so the set holds at most one per create in
+/// flight.
+static CREATES_IN_PROGRESS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// This agent's claim on creating one service name; released on drop, on
+/// every path out of the create.
+struct CreateInProgress(String);
+
+impl CreateInProgress {
+    /// The claim on `name`, or `None` while another create holds it.
+    fn claim(name: &str) -> Option<Self> {
+        let mut names = CREATES_IN_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        names
+            .insert(name.to_string())
+            .then(|| Self(name.to_string()))
+    }
+}
+
+impl Drop for CreateInProgress {
+    fn drop(&mut self) {
+        CREATES_IN_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Whether the container named `name` was made by create attempt `attempt`.
+async fn made_by_attempt(docker: &bollard::Docker, name: &str, attempt: &str) -> bool {
+    match docker
+        .inspect_container(name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(info) => {
+            info.config
+                .and_then(|config| config.labels)
+                .and_then(|labels| labels.get(CREATE_ATTEMPT_LABEL).cloned())
+                .as_deref()
+                == Some(attempt)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Undo a create whose caller hung up: remove what it made and answer no
+/// one. The caller already counted the create as failed.
+async fn abandon_create(
+    docker: &bollard::Docker,
+    service: &str,
+    container: Option<&str>,
+    created_volumes: &[String],
+) -> axum::response::Response {
+    let left_behind = remove_failed_service_create(docker, container, created_volumes).await;
+    tracing::warn!(
+        service,
+        left_behind = ?left_behind,
+        "The caller stopped waiting for this service create; undid it on the node"
+    );
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        with_cleanup_note(
+            format!(
+                "The caller stopped waiting for service '{}', so this create was undone",
+                service
+            ),
+            left_behind,
+        ),
+    )
+    .into_response()
 }
 
 /// Create the named volumes a service mounts, returning the ones this call
@@ -3215,19 +3369,85 @@ mod failed_create_cleanup_tests {
         );
     }
 
-    /// A stub Docker daemon for the create path: every volume is missing, the
-    /// image pull hangs until the test releases it and then fails, and each
-    /// volume removal is reported on `removed`.
+    /// How the stub daemon answers the image pull.
+    #[derive(Clone, Copy)]
+    enum Pull {
+        /// Never answers, as a long pull does.
+        Hang,
+        Succeed,
+    }
+
+    /// How the stub daemon answers creating the container.
+    #[derive(Clone, Copy)]
+    enum ContainerCreate {
+        Created,
+        /// Makes the container, then fails the reply: the create's own
+        /// container, under an error.
+        FailAfterCreating,
+        /// Fails, and a container under the name carries another attempt's
+        /// label.
+        FailWithAnotherAttemptsContainer,
+        /// The name is taken (409).
+        NameTaken,
+    }
+
+    /// A stub Docker daemon for the create path. Every volume starts
+    /// missing, and every request is recorded in `events`.
     struct StubDaemon {
-        pull_started: tokio::sync::Notify,
-        release_pull: tokio::sync::Notify,
-        removed: tokio::sync::mpsc::Sender<String>,
+        pull: Pull,
+        container_create: ContainerCreate,
+        /// Hold the container start until `release_start`.
+        hang_start: bool,
+        release_start: tokio::sync::Notify,
+        events: std::sync::Mutex<Vec<String>>,
+        /// Labels of the container under the requested name, once there is one.
+        container_labels: std::sync::Mutex<Option<serde_json::Value>>,
+    }
+
+    impl StubDaemon {
+        fn new(pull: Pull, container_create: ContainerCreate, hang_start: bool) -> Self {
+            Self {
+                pull,
+                container_create,
+                hang_start,
+                release_start: tokio::sync::Notify::new(),
+                events: Default::default(),
+                container_labels: Default::default(),
+            }
+        }
+
+        fn record(&self, event: String) {
+            self.events.lock().expect("events").push(event);
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().expect("events").clone()
+        }
+
+        fn count(&self, prefix: &str) -> usize {
+            self.events()
+                .iter()
+                .filter(|event| event.starts_with(prefix))
+                .count()
+        }
+
+        /// Wait until `count` requests starting with `prefix` have arrived.
+        async fn wait_for(&self, prefix: &str, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while self.count(prefix) < count {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no '{prefix}' request #{count}; saw {:?}", self.events()));
+        }
     }
 
     async fn stub_daemon(
         axum::extract::State(daemon): axum::extract::State<std::sync::Arc<StubDaemon>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        body: axum::body::Bytes,
     ) -> axum::response::Response {
         use axum::http::{Method, StatusCode};
         use axum::response::IntoResponse;
@@ -3244,47 +3464,105 @@ mod failed_create_cleanup_tests {
         };
         let message = |text: &str| axum::Json(serde_json::json!({ "message": text }));
         match (method, path) {
-            (Method::POST, "volumes/create") => (
-                StatusCode::CREATED,
-                axum::Json(serde_json::json!({
-                    "Name": "created", "Driver": "local", "Mountpoint": "/stub",
-                    "Labels": {}, "Scope": "local", "Options": {}
-                })),
-            )
-                .into_response(),
-            (Method::GET, p) if p.starts_with("volumes/") => {
-                (StatusCode::NOT_FOUND, message("no such volume")).into_response()
-            }
-            (Method::POST, "images/create") => {
-                daemon.pull_started.notify_one();
-                daemon.release_pull.notified().await;
+            (Method::POST, "volumes/create") => {
+                daemon.record("create volume".to_string());
                 (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    message("registry unreachable"),
+                    StatusCode::CREATED,
+                    axum::Json(serde_json::json!({
+                        "Name": "created", "Driver": "local", "Mountpoint": "/stub",
+                        "Labels": {}, "Scope": "local", "Options": {}
+                    })),
                 )
                     .into_response()
             }
+            (Method::GET, p) if p.starts_with("volumes/") => {
+                daemon.record(format!("inspect volume {}", &p["volumes/".len()..]));
+                (StatusCode::NOT_FOUND, message("no such volume")).into_response()
+            }
             (Method::DELETE, p) if p.starts_with("volumes/") => {
-                let _ = daemon.removed.try_send(p["volumes/".len()..].to_string());
+                daemon.record(format!("remove volume {}", &p["volumes/".len()..]));
+                StatusCode::NO_CONTENT.into_response()
+            }
+            (Method::POST, "images/create") => {
+                daemon.record("pull".to_string());
+                match daemon.pull {
+                    Pull::Hang => std::future::pending().await,
+                    Pull::Succeed => {
+                        (StatusCode::OK, "{\"status\":\"Downloaded\"}\n").into_response()
+                    }
+                }
+            }
+            (Method::GET, "networks") => {
+                (StatusCode::OK, axum::Json(serde_json::json!([]))).into_response()
+            }
+            (Method::POST, "containers/create") => {
+                daemon.record("create container".to_string());
+                let labels = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|body| body.get("Labels").cloned());
+                match daemon.container_create {
+                    ContainerCreate::Created => {
+                        *daemon.container_labels.lock().expect("labels") = labels;
+                        (
+                            StatusCode::CREATED,
+                            axum::Json(
+                                serde_json::json!({ "Id": "stub-container", "Warnings": [] }),
+                            ),
+                        )
+                            .into_response()
+                    }
+                    ContainerCreate::FailAfterCreating => {
+                        *daemon.container_labels.lock().expect("labels") = labels;
+                        (StatusCode::INTERNAL_SERVER_ERROR, message("reply lost")).into_response()
+                    }
+                    ContainerCreate::FailWithAnotherAttemptsContainer => {
+                        *daemon.container_labels.lock().expect("labels") = Some(
+                            serde_json::json!({ super::CREATE_ATTEMPT_LABEL: "another-attempt" }),
+                        );
+                        (StatusCode::INTERNAL_SERVER_ERROR, message("reply lost")).into_response()
+                    }
+                    ContainerCreate::NameTaken => (
+                        StatusCode::CONFLICT,
+                        message("container name already in use"),
+                    )
+                        .into_response(),
+                }
+            }
+            (Method::POST, p) if p.starts_with("containers/") && p.ends_with("/start") => {
+                daemon.record("start container".to_string());
+                if daemon.hang_start {
+                    daemon.release_start.notified().await;
+                }
+                StatusCode::NO_CONTENT.into_response()
+            }
+            (Method::GET, p) if p.starts_with("containers/") && p.ends_with("/json") => {
+                daemon.record("inspect container".to_string());
+                match daemon.container_labels.lock().expect("labels").clone() {
+                    Some(labels) => (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "Id": "stub-container", "Config": { "Labels": labels }
+                        })),
+                    )
+                        .into_response(),
+                    None => (StatusCode::NOT_FOUND, message("no such container")).into_response(),
+                }
+            }
+            (Method::DELETE, p) if p.starts_with("containers/") => {
+                daemon.record(format!("remove container {}", &p["containers/".len()..]));
                 StatusCode::NO_CONTENT.into_response()
             }
             _ => (StatusCode::NOT_FOUND, message("not stubbed")).into_response(),
         }
     }
 
-    /// Regression: the control plane gives up on a create after its request
-    /// timeout, which a long image pull outlasts, and the server then drops
-    /// the handler mid-pull. The create must still finish and remove the
-    /// volume it made, or a retry under the same name finds that volume and
-    /// keeps it as an earlier service's.
-    #[tokio::test]
-    async fn a_create_abandoned_by_its_caller_still_removes_its_volume() {
-        let (removed_tx, mut removed) = tokio::sync::mpsc::channel(4);
-        let daemon = std::sync::Arc::new(StubDaemon {
-            pull_started: tokio::sync::Notify::new(),
-            release_pull: tokio::sync::Notify::new(),
-            removed: removed_tx,
-        });
+    /// Serve `daemon` and return agent state whose Docker client talks to it.
+    async fn agent_on(
+        daemon: &std::sync::Arc<StubDaemon>,
+    ) -> (
+        std::sync::Arc<crate::handlers::AgentState>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the stub daemon");
@@ -3293,7 +3571,6 @@ mod failed_create_cleanup_tests {
             .fallback(stub_daemon)
             .with_state(daemon.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-
         let docker = bollard::Docker::connect_with_http(
             &format!("http://{address}"),
             30,
@@ -3305,42 +3582,156 @@ mod failed_create_cleanup_tests {
             crate::test_engines::plugin_builder(),
             docker,
         );
-        let volume = unique("postgres-abandoned_data");
-        let request = crate::ServiceCreateRequest {
-            name: unique("postgres-abandoned"),
+        (state, server)
+    }
+
+    fn create_request(name: &str, volume: &str) -> crate::ServiceCreateRequest {
+        crate::ServiceCreateRequest {
+            name: name.to_string(),
             service_type: "postgres".to_string(),
             image: "stub/postgres:1".to_string(),
             environment: HashMap::new(),
             port_mappings: Vec::new(),
-            volumes: HashMap::from([(volume.clone(), "/var/lib/postgresql/data".to_string())]),
+            volumes: HashMap::from([(volume.to_string(), "/var/lib/postgresql/data".to_string())]),
             network: None,
             command: None,
             resource_limits: None,
-        };
+        }
+    }
 
-        let handler = tokio::spawn(async move {
+    /// Start the create handler as the server would, on its own task, so the
+    /// test can drop it the way the server does when the caller hangs up.
+    fn start_create(
+        state: std::sync::Arc<crate::handlers::AgentState>,
+        request: crate::ServiceCreateRequest,
+    ) -> tokio::task::JoinHandle<axum::response::Response> {
+        tokio::spawn(async move {
             use axum::response::IntoResponse;
             super::create_service(axum::extract::State(state), axum::Json(request))
                 .await
                 .into_response()
-        });
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            daemon.pull_started.notified(),
-        )
-        .await
-        .expect("the create reaches the image pull");
+        })
+    }
+
+    /// Regression: the control plane gives up on a create after its request
+    /// timeout, which a long image pull outlasts, and rolls back the
+    /// service's record. The create must stop there and remove the volume it
+    /// made, not finish later into a container no record points at, and not
+    /// leave a volume a retry would keep as an earlier service's.
+    #[tokio::test]
+    async fn a_create_whose_caller_hangs_up_mid_pull_is_undone() {
+        let daemon =
+            std::sync::Arc::new(StubDaemon::new(Pull::Hang, ContainerCreate::Created, false));
+        let (state, server) = agent_on(&daemon).await;
+        let volume = unique("postgres-abandoned_data");
+
+        let handler = start_create(
+            state,
+            create_request(&unique("postgres-abandoned"), &volume),
+        );
+        daemon.wait_for("pull", 1).await;
         // What the server does when the caller hangs up: drop the handler.
         handler.abort();
         let _ = handler.await;
-        daemon.release_pull.notify_one();
 
-        let removed_volume =
-            tokio::time::timeout(std::time::Duration::from_secs(10), removed.recv())
-                .await
-                .expect("the abandoned create removes the volume it made")
-                .expect("stub daemon is still running");
-        assert_eq!(removed_volume, volume);
+        daemon.wait_for(&format!("remove volume {volume}"), 1).await;
+        assert_eq!(daemon.count("create container"), 0, "{:?}", daemon.events());
         server.abort();
+    }
+
+    /// Regression: a caller that hangs up while the container is starting
+    /// leaves no running container behind; the create removes it and the
+    /// volume it made.
+    #[tokio::test]
+    async fn a_create_whose_caller_hangs_up_after_the_container_exists_removes_it() {
+        let daemon = std::sync::Arc::new(StubDaemon::new(
+            Pull::Succeed,
+            ContainerCreate::Created,
+            true,
+        ));
+        let (state, server) = agent_on(&daemon).await;
+        let name = unique("postgres-started");
+        let volume = unique("postgres-started_data");
+
+        let handler = start_create(state, create_request(&name, &volume));
+        daemon.wait_for("start container", 1).await;
+        handler.abort();
+        let _ = handler.await;
+        daemon.release_start.notify_one();
+
+        daemon
+            .wait_for(&format!("remove container {name}"), 1)
+            .await;
+        daemon.wait_for(&format!("remove volume {volume}"), 1).await;
+        server.abort();
+    }
+
+    /// Regression: a retry that arrives while an earlier create for the same
+    /// name is still running is refused, rather than racing it for the name
+    /// and the volumes; once the earlier one ends, a create goes ahead.
+    #[tokio::test]
+    async fn a_second_create_for_a_name_is_refused_while_the_first_runs() {
+        let daemon =
+            std::sync::Arc::new(StubDaemon::new(Pull::Hang, ContainerCreate::Created, false));
+        let (state, server) = agent_on(&daemon).await;
+        let name = unique("postgres-retried");
+        let volume = unique("postgres-retried_data");
+
+        let first = start_create(state.clone(), create_request(&name, &volume));
+        daemon.wait_for("pull", 1).await;
+
+        // Refused at once; without the claim it would join the hung pull.
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            start_create(state.clone(), create_request(&name, &volume)),
+        )
+        .await
+        .expect("the second create is refused, not run")
+        .expect("second create answers");
+        assert_eq!(refused.status(), axum::http::StatusCode::CONFLICT);
+        assert_eq!(daemon.count("inspect volume"), 1, "{:?}", daemon.events());
+
+        first.abort();
+        let _ = first.await;
+        daemon.wait_for(&format!("remove volume {volume}"), 1).await;
+        // The claim is released with the undo, so the retry now proceeds.
+        let retry = start_create(state, create_request(&name, &volume));
+        daemon.wait_for("pull", 2).await;
+        retry.abort();
+        server.abort();
+    }
+
+    /// Regression: a create error can arrive after Docker made the container
+    /// (the reply lost on the way back). The container this attempt made is
+    /// removed; one that is another attempt's, or that held the name before
+    /// (a 409), stays.
+    #[tokio::test]
+    async fn an_ambiguous_create_error_removes_only_this_attempts_container() {
+        for (outcome, removed) in [
+            (ContainerCreate::FailAfterCreating, true),
+            (ContainerCreate::FailWithAnotherAttemptsContainer, false),
+            (ContainerCreate::NameTaken, false),
+        ] {
+            let daemon = std::sync::Arc::new(StubDaemon::new(Pull::Succeed, outcome, false));
+            let (state, server) = agent_on(&daemon).await;
+            let name = unique("postgres-ambiguous");
+            let volume = unique("postgres-ambiguous_data");
+
+            let response = start_create(state, create_request(&name, &volume))
+                .await
+                .expect("create answers");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(
+                daemon.count(&format!("remove container {name}")),
+                usize::from(removed),
+                "{:?}",
+                daemon.events()
+            );
+            assert_eq!(daemon.count(&format!("remove volume {volume}")), 1);
+            server.abort();
+        }
     }
 }
