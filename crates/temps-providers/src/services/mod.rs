@@ -288,6 +288,9 @@ impl ExternalServiceManager {
         Ok(candidates)
     }
 
+    /// The engine for a service of `service_type` on its type's default
+    /// backend. Needs a local Docker handle; a service on a worker node is
+    /// addressed through [`EngineSelection`] instead.
     fn create_service_instance(
         &self,
         name: String,
@@ -357,6 +360,8 @@ impl ExternalServiceManager {
         }
     }
 
+    /// The engine for a stored service, following the S3/Blob backend in its
+    /// decrypted `parameters`. Needs a local Docker handle.
     #[allow(deprecated)]
     fn create_service_instance_for_parameters(
         &self,
@@ -371,6 +376,8 @@ impl ExternalServiceManager {
         self.create_service_instance_for_parameter_value(name, service_type, &parameter_value)
     }
 
+    /// [`Self::create_service_instance_for_parameters`] for parameters held
+    /// as one JSON value.
     fn create_service_instance_for_parameter_value(
         &self,
         name: String,

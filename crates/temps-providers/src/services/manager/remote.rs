@@ -148,6 +148,10 @@ impl ExternalServiceManager {
         }
     }
 
+    /// The container of a standalone service on a worker node: the name the
+    /// agent reported at create time, else the engine's canonical name, else
+    /// the bare instance name an earlier release used, whichever the node
+    /// has. Builds no engine, so it works without a local Docker handle.
     pub(super) async fn resolve_remote_container_name(
         &self,
         client: &RemoteServiceClient,

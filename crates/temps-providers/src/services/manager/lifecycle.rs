@@ -329,6 +329,10 @@ impl ExternalServiceManager {
         Ok(())
     }
 
+    /// Start a stopped service: through its node's agent when it runs on a
+    /// worker, otherwise through its local engine, falling back to
+    /// re-initializing it when the start fails. A local standalone service
+    /// reports `starting` until its readiness gate confirms it.
     pub async fn start_service(
         &self,
         service_id: i32,
@@ -618,6 +622,8 @@ impl ExternalServiceManager {
         })
     }
 
+    /// Stop a running service: through its node's agent when it runs on a
+    /// worker, otherwise through its local engine.
     pub async fn stop_service(
         &self,
         service_id: i32,

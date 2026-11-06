@@ -979,6 +979,10 @@ impl ExternalServiceManager {
         self.get_service_info(service_id).await
     }
 
+    /// Delete a service that no project links to: its record first, then its
+    /// containers and volumes, through the node's agent for a service on a
+    /// worker. An imported service is only forgotten; its container is the
+    /// operator's.
     pub async fn delete_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         // Get service to check if it exists
         let service = self.get_service(service_id).await?;
