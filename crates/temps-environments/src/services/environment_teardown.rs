@@ -85,7 +85,16 @@ impl EnvironmentTeardownService {
         self.environments
             .delete_environment(project_id, environment_id)
             .await?;
+        self.release(project_id, environment_id).await
+    }
 
+    /// Cancel a soft-deleted environment's deployments and remove its
+    /// containers.
+    async fn release(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<(), EnvironmentTeardownError> {
         let cancelled = self
             .deployments
             .cancel_all_environment_deployments(environment_id)
@@ -108,36 +117,99 @@ impl EnvironmentTeardownService {
     }
 
     /// Tear down every live preview environment of `branch` in the project,
-    /// retrying while a database or worker is unreachable. Returns the
-    /// previews torn down; none is not an error.
+    /// retrying while a database or worker is unreachable. Each preview is
+    /// attempted even when another fails. Only a failed lookup is an error.
     pub async fn tear_down_branch_previews(
         &self,
         project_id: i32,
         branch: &str,
-    ) -> Result<Vec<environments::Model>, EnvironmentTeardownError> {
+    ) -> Result<BranchTeardown, EnvironmentTeardownError> {
         let previews = self
-            .environments
-            .branch_previews(project_id, branch)
+            .retry
+            .retry_if(
+                || async {
+                    self.environments
+                        .branch_previews(project_id, branch)
+                        .await
+                        .map_err(EnvironmentTeardownError::from)
+                },
+                EnvironmentTeardownError::transient,
+            )
             .await?;
 
-        for preview in &previews {
-            self.retry
-                .retry_if(
-                    || self.tear_down(project_id, preview.id),
-                    EnvironmentTeardownError::transient,
-                )
-                .await
-                .inspect_err(|error| {
+        let mut outcome = BranchTeardown::default();
+        for preview in previews {
+            match self.retire_preview(project_id, preview.id).await {
+                Ok(true) => outcome.retired.push(preview),
+                Ok(false) => info!(
+                    project_id,
+                    environment_id = preview.id,
+                    branch,
+                    "Preview environment was restored during its teardown; leaving it running"
+                ),
+                Err(error) => {
                     warn!(
                         project_id,
                         environment_id = preview.id,
                         branch,
                         %error,
                         "Failed to tear down preview environment"
-                    )
-                })?;
+                    );
+                    outcome.failed.push((preview, error));
+                }
+            }
         }
 
-        Ok(previews)
+        Ok(outcome)
     }
+
+    /// Fence one preview, then release it. Returns false when the preview
+    /// was restored (an operator re-created it) while a retry waited: its
+    /// new deployments are not this teardown's to stop.
+    async fn retire_preview(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<bool, EnvironmentTeardownError> {
+        self.retry
+            .retry_if(
+                || async {
+                    self.environments
+                        .delete_environment(project_id, environment_id)
+                        .await
+                        .map_err(EnvironmentTeardownError::from)
+                },
+                EnvironmentTeardownError::transient,
+            )
+            .await?;
+
+        self.retry
+            .retry_if(
+                || async {
+                    let environment = self
+                        .environments
+                        .get_environment_for_deletion(project_id, environment_id)
+                        .await?;
+                    if environment.deleted_at.is_none() {
+                        return Ok(false);
+                    }
+                    self.release(project_id, environment_id).await?;
+                    Ok(true)
+                },
+                EnvironmentTeardownError::transient,
+            )
+            .await
+    }
+}
+
+/// What [`EnvironmentTeardownService::tear_down_branch_previews`] did to each
+/// preview of a branch.
+#[derive(Debug, Default)]
+pub struct BranchTeardown {
+    /// Soft-deleted, with deployments cancelled and containers removed.
+    pub retired: Vec<environments::Model>,
+    /// Not fully torn down. One that failed after its soft delete keeps its
+    /// containers until its deletion is retried through the environment
+    /// delete endpoint.
+    pub failed: Vec<(environments::Model, EnvironmentTeardownError)>,
 }
