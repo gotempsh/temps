@@ -228,18 +228,33 @@ pub fn fallback_host(
 }
 
 /// Whether `domain` is one of the names this module could have generated for
-/// `label` (and the tunnel's `suffix`): what a pass keeps without asking DNS
-/// again.
+/// an environment whose own label is `env_label`, under a tunnel with
+/// `suffix`: what a pass keeps without asking DNS again.
+///
+/// With a suffix this also accepts the names an earlier release generated,
+/// `single_dns_label("<label>-<suffix>")` and its `<that>-<hash>` fallback,
+/// whose suffix a long label could cut. A name already published keeps
+/// working; only new names take the current form.
 pub fn is_generated_name(
     domain: &str,
-    label: &str,
+    env_label: &str,
     suffix: Option<&str>,
     zone: &str,
     environment_id: i32,
 ) -> bool {
     let domain = domain.to_ascii_lowercase();
-    domain == natural_host(label, zone)
-        || domain == fallback_host(label, suffix, zone, environment_id)
+    let label = tunnel_label(env_label, suffix);
+    if domain == natural_host(&label, zone)
+        || domain == fallback_host(&label, suffix, zone, environment_id)
+    {
+        return true;
+    }
+    let Some(suffix) = suffix.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let earlier = single_dns_label(&format!("{env_label}-{suffix}"));
+    domain == natural_host(&earlier, zone)
+        || domain == fallback_host(&earlier, None, zone, environment_id)
 }
 
 /// The rows to insert and delete in one pass.
@@ -357,7 +372,7 @@ pub fn holders(rows: &[GeneratedRow]) -> HashMap<String, i32> {
 /// current label that no other environment holds.
 fn kept_row<'a>(
     env: &EnvironmentFacts,
-    label: &str,
+    env_label: &str,
     suffix: Option<&str>,
     domain: &str,
     rows: &'a [GeneratedRow],
@@ -365,7 +380,7 @@ fn kept_row<'a>(
 ) -> Option<&'a GeneratedRow> {
     rows.iter().find(|r| {
         r.environment_id == env.environment_id
-            && is_generated_name(&r.domain, label, suffix, domain, env.environment_id)
+            && is_generated_name(&r.domain, env_label, suffix, domain, env.environment_id)
             && holder.get(&r.domain.to_ascii_lowercase()) == Some(&env.environment_id)
     })
 }
@@ -386,10 +401,11 @@ fn needing_names<'a>(
     let mut fresh = 0usize;
     let mut out = Vec::new();
     for env in envs.iter().filter(|e| e.excluded.is_none()) {
-        let label = tunnel_label(&host_label(env, production_template), suffix);
-        if kept_row(env, &label, suffix, domain, rows, &holder).is_some() {
+        let env_label = host_label(env, production_template);
+        if kept_row(env, &env_label, suffix, domain, rows, &holder).is_some() {
             continue;
         }
+        let label = tunnel_label(&env_label, suffix);
         if !rows.iter().any(|r| r.environment_id == env.environment_id) {
             if fresh >= MAX_NEW_HOSTS_PER_PASS {
                 continue;
@@ -437,8 +453,8 @@ pub fn assign_hosts(
     let mut claimed = holders(rows);
     let mut desired = HashMap::new();
     for env in envs.iter().filter(|e| e.excluded.is_none()) {
-        let label = tunnel_label(&host_label(env, production_template), suffix);
-        if let Some(row) = kept_row(env, &label, suffix, domain, rows, &claimed) {
+        let env_label = host_label(env, production_template);
+        if let Some(row) = kept_row(env, &env_label, suffix, domain, rows, &claimed) {
             desired.insert(env.environment_id, row.domain.to_ascii_lowercase());
         }
     }
@@ -1807,10 +1823,11 @@ mod tests {
         assert!(host.ends_with("-lab.example.com"), "{host}");
         assert!(one_label_under(&host, APEX), "{host}");
         // Both are what this module recognises as its own names.
-        assert!(is_generated_name(&host, &fits, Some("lab"), APEX, 7));
+        let b50 = "b".repeat(50);
+        assert!(is_generated_name(&host, &b50, Some("lab"), APEX, 7));
         assert!(is_generated_name(
             &natural_host(&fits, APEX),
-            &fits,
+            &b50,
             Some("lab"),
             APEX,
             7
@@ -1870,14 +1887,83 @@ mod tests {
                     assert!(first.len() <= 63, "{host}");
                 }
                 assert_ne!(natural, fallback);
-                assert!(is_generated_name(
-                    &fallback,
-                    &label,
-                    Some(&suffix),
-                    "example.com",
-                    7
-                ));
+                for host in [&natural, &fallback] {
+                    assert!(is_generated_name(
+                        host,
+                        env_label,
+                        Some(&suffix),
+                        "example.com",
+                        7
+                    ));
+                }
             }
         }
+    }
+
+    /// Names an earlier release generated for a suffixed tunnel (the
+    /// `<label>-<suffix>-<hash>` fallback, and a long label cut through its
+    /// suffix) stay with their environment: a pass keeps them instead of
+    /// replacing them and withdrawing a published URL.
+    #[test]
+    fn names_from_the_earlier_suffix_form_are_kept() {
+        const APEX: &str = "example.com";
+        let earlier_fallback = |label: &str, id: i32| {
+            let seed = format!("{}#{id}", natural_host(label, APEX));
+            natural_host(&hashed_label(label, &seed), APEX)
+        };
+        // A taken natural name: the earlier fallback hashed after the suffix.
+        let www_old = earlier_fallback("www-lab", 1);
+        assert!(www_old.starts_with("www-lab-"), "{www_old}");
+        assert_ne!(www_old, fallback_host("www-lab", Some("lab"), APEX, 1));
+        // A long label: the earlier name cut the whole string, suffix and all.
+        let long = "a".repeat(60);
+        let long_old = natural_host(&single_dns_label(&format!("{long}-lab")), APEX);
+        assert!(!long_old.ends_with("-lab.example.com"), "{long_old}");
+        let long_old_fallback = earlier_fallback(&single_dns_label(&format!("{long}-lab")), 2);
+
+        for (old, label, id) in [
+            (www_old.as_str(), "www", 1),
+            (long_old.as_str(), long.as_str(), 2),
+            (long_old_fallback.as_str(), long.as_str(), 2),
+        ] {
+            assert!(
+                is_generated_name(old, label, Some("lab"), APEX, id),
+                "{old}"
+            );
+        }
+
+        let envs = [env(1, "www"), env(2, &long)];
+        for (rows, kept) in [
+            (
+                vec![row(10, 1, &www_old), row(11, 2, &long_old)],
+                [&www_old, &long_old],
+            ),
+            (
+                vec![row(10, 1, &www_old), row(11, 2, &long_old_fallback)],
+                [&www_old, &long_old_fallback],
+            ),
+        ] {
+            let desired = assign_hosts(
+                &envs,
+                &rows,
+                None,
+                Some("lab"),
+                APEX,
+                &|h| h == "www-lab.example.com",
+                &|_| true,
+            );
+            assert_eq!(&desired[&1], kept[0]);
+            assert_eq!(&desired[&2], kept[1]);
+            let published: HashSet<String> = rows.iter().map(|r| r.domain.clone()).collect();
+            assert_eq!(
+                plan_rows(&envs, &rows, &desired, &published, true),
+                RowChanges::default()
+            );
+        }
+
+        // Without a suffix nothing extra is recognised.
+        assert!(!is_generated_name(&www_old, "www", None, APEX, 1));
+        // Nor is another environment's earlier name.
+        assert!(!is_generated_name(&www_old, "shop", Some("lab"), APEX, 1));
     }
 }
