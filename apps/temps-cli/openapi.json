@@ -14054,6 +14054,13 @@
               "string",
               "null"
             ]
+          },
+          "unavailable_reason": {
+            "description": "Why the fields above could not be read, when they could not: this\nserver has no Docker daemon for a local container, the agent on the\ncontainer's node could not be reached, or it is too old to report\nthis. `None` with an empty `container_id` means the container does\nnot exist.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14140,6 +14147,13 @@
           },
           "role": {
             "type": "string"
+          },
+          "unavailable_reason": {
+            "description": "Why no sample could be taken, when none could: this server has no\nDocker daemon for a local container, the agent on the container's\nnode could not be reached, or it is too old to report usage. `None`\nwith empty fields means the container is missing or stopped.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -108350,7 +108364,7 @@
     },
     "/external-services/{id}/wal-health": {
       "get": {
-        "description": "Returns the latest WAL/archive health snapshot recorded by the background\nhealth monitor for a Postgres external service. Powers the warning banner\non the service detail page when the disk is filling up due to stale\nreplication slots, archive backlog, or misconfigured `archive_command`.\n\nReturns 404 when no snapshot exists yet (probe hasn't run, or the service\nisn't Postgres).",
+        "description": "Returns the latest WAL/archive health snapshot recorded by the background\nhealth monitor for a Postgres external service. Powers the warning banner\non the service detail page when the disk is filling up due to stale\nreplication slots, archive backlog, or misconfigured `archive_command`.\n\nReturns 404 when no snapshot exists yet (probe hasn't run, or the service\nisn't Postgres). When the last check could not run (a database on a\nworker whose agent predates the WAL probe, or cannot be reached), the 404\nhas type `https://temps.sh/probs/wal-health-not-checked` and carries\n`reason` and `checked_at`, so the page can say the check is not happening.",
         "operationId": "getPostgresWalHealth",
         "parameters": [
           {
@@ -108376,7 +108390,7 @@
             "description": "Latest WAL health snapshot"
           },
           "404": {
-            "description": "Service not found, or no WAL snapshot available"
+            "description": "Service not found, or no WAL snapshot available. Type `https://temps.sh/probs/wal-health-not-checked` with `reason` and `checked_at` when the last check could not run"
           },
           "500": {
             "description": "Internal server error"

@@ -6873,6 +6873,14 @@ export type ContainerRuntimeInfo = {
      * when the container does not exist.
      */
     status?: string | null;
+    /**
+     * Why the fields above could not be read, when they could not: this
+     * server has no Docker daemon for a local container, the agent on the
+     * container's node could not be reached, or it is too old to report
+     * this. `None` with an empty `container_id` means the container does
+     * not exist.
+     */
+    unavailable_reason?: string | null;
 };
 
 /**
@@ -6928,6 +6936,13 @@ export type ContainerStatsSample = {
      */
     online_cpus?: number | null;
     role: string;
+    /**
+     * Why no sample could be taken, when none could: this server has no
+     * Docker daemon for a local container, the agent on the container's
+     * node could not be reached, or it is too old to report usage. `None`
+     * with empty fields means the container is missing or stopped.
+     */
+    unavailable_reason?: string | null;
 };
 
 export type ContentPart = {
@@ -54547,7 +54562,7 @@ export type GetPostgresWalHealthData = {
 
 export type GetPostgresWalHealthErrors = {
     /**
-     * Service not found, or no WAL snapshot available
+     * Service not found, or no WAL snapshot available. Type `https://temps.sh/probs/wal-health-not-checked` with `reason` and `checked_at` when the last check could not run
      */
     404: unknown;
     /**

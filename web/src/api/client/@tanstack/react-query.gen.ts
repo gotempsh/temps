@@ -8896,7 +8896,10 @@ export const getPostgresWalHealthQueryKey = (options: Options<GetPostgresWalHeal
  * replication slots, archive backlog, or misconfigured `archive_command`.
  *
  * Returns 404 when no snapshot exists yet (probe hasn't run, or the service
- * isn't Postgres).
+ * isn't Postgres). When the last check could not run (a database on a
+ * worker whose agent predates the WAL probe, or cannot be reached), the 404
+ * has type `https://temps.sh/probs/wal-health-not-checked` and carries
+ * `reason` and `checked_at`, so the page can say the check is not happening.
  */
 export const getPostgresWalHealthOptions = (options: Options<GetPostgresWalHealthData>) => queryOptions<GetPostgresWalHealthResponse, DefaultError, GetPostgresWalHealthResponse, ReturnType<typeof getPostgresWalHealthQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
