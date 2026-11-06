@@ -392,13 +392,13 @@ async fn gitea_webhook_events(
 }
 
 /// The branch a Gitea `delete` event removed; `None` for a deleted tag.
+/// Gitea sends the short name, so a `refs/heads/` prefix is part of it.
 fn deleted_branch(payload: &serde_json::Value) -> Option<String> {
     if payload.get("ref_type").and_then(|v| v.as_str()) != Some("branch") {
         return None;
     }
 
-    let name = payload.get("ref").and_then(|v| v.as_str())?;
-    let branch = name.strip_prefix("refs/heads/").unwrap_or(name);
+    let branch = payload.get("ref").and_then(|v| v.as_str())?;
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
@@ -413,8 +413,8 @@ mod tests {
             Some("feat/topic")
         );
         assert_eq!(
-            super::deleted_branch(&event("branch", "refs/heads/feat/topic")).as_deref(),
-            Some("feat/topic")
+            super::deleted_branch(&event("branch", "refs/heads/topic")).as_deref(),
+            Some("refs/heads/topic")
         );
         assert_eq!(super::deleted_branch(&event("tag", "v1.0.0")), None);
         assert_eq!(super::deleted_branch(&event("branch", "")), None);
