@@ -13,6 +13,8 @@ import {
   shellWord,
   USER_TEMPS_BIN,
   userInstallCommand,
+  type WorkerInstall,
+  workerInstallFrom,
   workerJoinScript,
 } from './worker-join-script'
 
@@ -24,9 +26,9 @@ describe('the commands shared with the server', () => {
     expect(ROOT_TEMPS_BIN).toBe(golden.root_temps_bin)
     expect(USER_TEMPS_BIN).toBe(golden.user_temps_bin)
     expect(golden.installs.length).toBeGreaterThan(0)
-    for (const { tag, linux, mac } of golden.installs) {
-      expect(installCommand(tag)).toBe(linux)
-      expect(userInstallCommand(tag)).toBe(mac)
+    for (const { install, linux, mac } of golden.installs) {
+      expect(installCommand(install as WorkerInstall)).toBe(linux)
+      expect(userInstallCommand(install as WorkerInstall)).toBe(mac)
     }
     for (const { args, command } of golden.as_root_temps) {
       expect(asRootTemps(args)).toBe(command)
@@ -81,15 +83,54 @@ describe('releaseTag', () => {
 
 describe('installCommand', () => {
   test('pins the control plane release and installs as root', () => {
-    expect(installCommand('v0.1.0-nightly.20261104.0123abcde')).toBe(
+    expect(
+      installCommand({
+        kind: 'release',
+        tag: 'v0.1.0-nightly.20261104.0123abcde',
+      })
+    ).toBe(
       '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-nightly.20261104.0123abcde)'
     )
   })
 
   test('falls back to the installer default without a release', () => {
-    expect(installCommand(null)).toBe(
+    expect(installCommand({ kind: 'latest' })).toBe(
       '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash)'
     )
+  })
+
+  test('takes the newest nightly for a build between releases', () => {
+    expect(installCommand({ kind: 'nightly', after: 'v0.1.0-beta.61' })).toBe(
+      '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- --channel nightly)'
+    )
+  })
+
+  test('never pastes a tag that is not a release into the command', () => {
+    expect(installCommand({ kind: 'release', tag: 'v1.0.0; rm -rf /' })).toBe(
+      installCommand({ kind: 'latest' })
+    )
+  })
+})
+
+describe('workerInstallFrom', () => {
+  test("uses the server's choice when it reports one", () => {
+    expect(
+      workerInstallFrom({
+        current_version: 'v0.1.0-beta.61',
+        worker_install: { kind: 'nightly', after: 'v0.1.0-beta.61' },
+      })
+    ).toEqual({ kind: 'nightly', after: 'v0.1.0-beta.61' })
+  })
+
+  test('pins an older server to its version, and nothing to the newest stable', () => {
+    expect(workerInstallFrom({ current_version: 'v0.1.0-beta.58' })).toEqual({
+      kind: 'release',
+      tag: 'v0.1.0-beta.58',
+    })
+    expect(workerInstallFrom({ current_version: 'dev' })).toEqual({
+      kind: 'latest',
+    })
+    expect(workerInstallFrom(undefined)).toEqual({ kind: 'latest' })
   })
 })
 
@@ -128,13 +169,16 @@ describe('workerJoinScript', () => {
   const base = {
     url: 'https://cp.example.com',
     token: 'tk_enroll',
-    version: 'v0.1.0-nightly.20261104.0123abcde',
+    install: {
+      kind: 'release',
+      tag: 'v0.1.0-nightly.20261104.0123abcde',
+    } as WorkerInstall,
     joinFlags: ' --ingress delegated',
   }
 
   test('installs the control plane version, joins and starts the agent with sudo, each step only after the last worked', () => {
     const script = workerJoinScript(base)
-    expect(script.pinnedTo).toBe('v0.1.0-nightly.20261104.0123abcde')
+    expect(script.install).toEqual(base.install)
     expect(script.command).toBe(
       [
         '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v0.1.0-nightly.20261104.0123abcde) && \\',
@@ -166,8 +210,8 @@ describe('workerJoinScript', () => {
   })
 
   test('says so when the version cannot be pinned', () => {
-    const script = workerJoinScript({ ...base, version: undefined })
-    expect(script.pinnedTo).toBeNull()
+    const script = workerJoinScript({ ...base, install: { kind: 'latest' } })
+    expect(script.install).toEqual({ kind: 'latest' })
     expect(script.command.split('\n')[0]).toBe(
       '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash) && \\'
     )
@@ -176,10 +220,9 @@ describe('workerJoinScript', () => {
   test('a Mac installs and joins as the user, without sudo, and starts a LaunchAgent', () => {
     const script = workerJoinScript({
       ...base,
-      version: 'v0.1.0-beta.58',
+      install: { kind: 'release', tag: 'v0.1.0-beta.58' },
       os: 'macos',
     })
-    expect(script.pinnedTo).toBe('v0.1.0-beta.58')
     expect(script.command).not.toContain('sudo')
     expect(script.command).not.toContain('/root/')
     expect(script.command.split('\n')).toEqual([
@@ -187,6 +230,17 @@ describe('workerJoinScript', () => {
       '~/.temps/bin/temps join https://cp.example.com tk_enroll --ingress delegated && \\',
       '~/.temps/bin/temps agent service install',
     ])
+  })
+
+  test('a Mac on a build between releases also takes the newest nightly', () => {
+    const script = workerJoinScript({
+      ...base,
+      install: { kind: 'nightly', after: 'v0.1.0-beta.61' },
+      os: 'macos',
+    })
+    expect(script.command.split('\n')[0]).toBe(
+      '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | bash -s -- --channel nightly) && \\'
+    )
   })
 
   test('a Mac join never passes --private-address: it dials out', () => {

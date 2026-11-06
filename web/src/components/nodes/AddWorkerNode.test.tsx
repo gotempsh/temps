@@ -12,13 +12,17 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import type { WorkerInstall } from '@/lib/worker-join-script'
 import { AddWorkerNode } from './AddWorkerNode'
 
 afterEach(cleanup)
 
 const RELEASE = 'v0.1.0-nightly.20261104.0123abcde'
 
-function setup({ version = RELEASE }: { version?: string } = {}) {
+function setup({
+  version = RELEASE,
+  workerInstall,
+}: { version?: string; workerInstall?: WorkerInstall } = {}) {
   let minted = 0
   const api = mockApi({
     'GET /nodes/wireguard': () =>
@@ -54,7 +58,11 @@ function setup({ version = RELEASE }: { version?: string } = {}) {
       }),
     'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
     'GET /settings/update': () =>
-      jsonResponse({ current_version: version, phase: 'idle' }),
+      jsonResponse({
+        current_version: version,
+        worker_install: workerInstall,
+        phase: 'idle',
+      }),
     'POST /settings/enrollment-tokens': () => {
       minted += 1
       return jsonResponse({
@@ -149,6 +157,23 @@ test('a version that is not a release tag is not pinned, and the panel says so',
   expect(
     screen.getByText(/newest stable release, which may not match it/)
   ).toBeTruthy()
+})
+
+test('a build between releases installs the newest nightly, never the older release', async () => {
+  // The server reports the release before its build as its version.
+  setup({
+    version: 'v0.1.0-beta.61',
+    workerInstall: { kind: 'nightly', after: 'v0.1.0-beta.61' },
+  })
+  fireEvent.click(
+    await screen.findByRole('button', { name: 'Create join command' })
+  )
+  const command = await shownCommand()
+  expect(command).toContain(
+    '(set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- --channel nightly) && \\'
+  )
+  expect(command).not.toContain('bash -s -- v0.1.0-beta.61')
+  expect(screen.getByText(/which no release contains/)).toBeTruthy()
 })
 
 test('a Mac cannot take ingress on its main address or Tailscale, and the command falls back to delegated', async () => {

@@ -241,6 +241,12 @@ pub struct SelfUpdateCapability {
     /// Version tag of the running binary, e.g. `v0.1.0-beta.55`. Always
     /// present — the version page needs it whether or not an update exists.
     pub current_version: String,
+    /// What a new worker installs so it never runs an older Temps than this
+    /// server. Usually the release in `current_version`; for a build made
+    /// between releases, whose `current_version` is the older release, the
+    /// newest nightly build instead.
+    #[serde(default)]
+    pub worker_install: crate::worker_install::WorkerInstall,
     /// Channel this install actually tracks, after applying the configured
     /// override or falling back to inference from `current_version`.
     pub channel: String,

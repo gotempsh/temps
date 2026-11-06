@@ -17,6 +17,10 @@
  * does the same, see `ROOT_INSTALL_PATH` in `temps-nodes`).
  */
 
+import type { WorkerInstall } from '@/api/client/types.gen'
+
+export type { WorkerInstall }
+
 export const INSTALLER_URL = 'https://temps.sh/install.sh'
 /** Where the installer puts Temps when root runs it with `sudo -H`. */
 export const ROOT_TEMPS_BIN = '/root/.temps/bin/temps'
@@ -40,16 +44,51 @@ export function releaseTag(version: string | null | undefined): string | null {
     : null
 }
 
+/** The installer's default: the newest stable release. */
+export const NEWEST_STABLE: WorkerInstall = { kind: 'latest' }
+
 /**
- * Install Temps as root. With a tag it installs exactly that release (the
- * installer ignores its channel then); without one it takes the newest
- * stable release, which may not match the control plane.
+ * What a new worker installs, from the server's self-update capability:
+ * its `worker_install` (the release it runs, or the newest nightly build for
+ * a build between releases). A server too old to report it is pinned to its
+ * `current_version` as before; nothing readable installs the newest stable
+ * release.
  */
-export function installCommand(tag: string | null): string {
-  const pin = tag ? ` -s -- ${tag}` : ''
+export function workerInstallFrom(
+  capability:
+    | { worker_install?: WorkerInstall | null; current_version?: string | null }
+    | null
+    | undefined
+): WorkerInstall {
+  if (capability?.worker_install) return capability.worker_install
+  const tag = releaseTag(capability?.current_version)
+  return tag ? { kind: 'release', tag } : NEWEST_STABLE
+}
+
+/**
+ * The installer's arguments: ` -s -- <tag>` for exactly that release (the
+ * installer ignores its channel then), ` -s -- --channel nightly` for the
+ * newest nightly build, nothing for the newest stable release. A tag that
+ * is not a release tag never reaches the command.
+ */
+function installerArgs(install: WorkerInstall): string {
+  switch (install.kind) {
+    case 'release': {
+      const tag = releaseTag(install.tag)
+      return tag ? ` -s -- ${tag}` : ''
+    }
+    case 'nightly':
+      return ' -s -- --channel nightly'
+    default:
+      return ''
+  }
+}
+
+/** Install Temps as root, as `install` says. */
+export function installCommand(install: WorkerInstall): string {
   // Without pipefail a failed download feeds bash nothing, which exits 0,
   // and the next command would run whatever binary was there before.
-  return `(set -o pipefail; curl -fsSL ${INSTALLER_URL} | ${AS_ROOT} bash${pin})`
+  return `(set -o pipefail; curl -fsSL ${INSTALLER_URL} | ${AS_ROOT} bash${installerArgs(install)})`
 }
 
 /**
@@ -85,9 +124,8 @@ export type WorkerOs = 'linux' | 'macos'
 export const USER_TEMPS_BIN = '~/.temps/bin/temps'
 
 /** Install Temps for the current user (a Mac). */
-export function userInstallCommand(tag: string | null): string {
-  const pin = tag ? ` -s -- ${tag}` : ''
-  return `(set -o pipefail; curl -fsSL ${INSTALLER_URL} | bash${pin})`
+export function userInstallCommand(install: WorkerInstall): string {
+  return `(set -o pipefail; curl -fsSL ${INSTALLER_URL} | bash${installerArgs(install)})`
 }
 
 export interface WorkerJoinScriptOptions {
@@ -95,8 +133,8 @@ export interface WorkerJoinScriptOptions {
   url: string
   /** The single-use enrollment token. */
   token: string
-  /** The control plane's running version, if it could be read. */
-  version: string | null | undefined
+  /** What to install: see {@link workerInstallFrom}. */
+  install: WorkerInstall
   /** Extra `temps join` flags, starting with a space (` --ingress delegated`). */
   joinFlags?: string
   /**
@@ -112,32 +150,31 @@ export interface WorkerJoinScriptOptions {
  * What to paste on the new machine: one command over three lines, chained
  * with `&&` so a failed step stops the rest, and read whole by the shell
  * before it runs, so a sudo password prompt cannot swallow the lines after
- * it. Also says which release it installs.
+ * it.
  */
 export function workerJoinScript({
   url,
   token,
-  version,
+  install,
   joinFlags = '',
   force = false,
   os = 'linux',
-}: WorkerJoinScriptOptions): { command: string; pinnedTo: string | null } {
-  const tag = releaseTag(version)
+}: WorkerJoinScriptOptions): { command: string; install: WorkerInstall } {
   const join = `join ${shellWord(url)} ${shellWord(token)}${joinFlags}${force ? ' --force' : ''}`
   if (os === 'macos') {
     return {
-      pinnedTo: tag,
+      install,
       command: [
-        userInstallCommand(tag),
+        userInstallCommand(install),
         `${USER_TEMPS_BIN} ${join}`,
         `${USER_TEMPS_BIN} agent service install`,
       ].join(' && \\\n'),
     }
   }
   return {
-    pinnedTo: tag,
+    install,
     command: [
-      installCommand(tag),
+      installCommand(install),
       asRootTemps(join),
       AGENT_SERVICE_COMMAND,
     ].join(' && \\\n'),

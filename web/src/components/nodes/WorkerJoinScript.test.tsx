@@ -34,7 +34,9 @@ describe('WorkerOsChoice', () => {
     )
     expect(shown).toContain('What does the new machine run?')
     expect(shown).toContain('Linux')
-    expect(shown).toContain('Docker Desktop, OrbStack, colima or Rancher Desktop')
+    expect(shown).toContain(
+      'Docker Desktop, OrbStack, colima or Rancher Desktop'
+    )
     expect(shown).toContain('Runs as you, without sudo')
     expect(shown).toContain('development and personal use')
     expect(shown).toContain('offline while the Mac sleeps')
@@ -47,7 +49,11 @@ describe('WorkerJoinScript for a Mac', () => {
   test('tells the user to paste it as themselves with the Docker app running', () => {
     const shown = text(
       render(
-        <WorkerJoinScript command="x" pinnedTo="v0.1.0" os="macos" />
+        <WorkerJoinScript
+          command="x"
+          install={{ kind: 'release', tag: 'v0.1.0' }}
+          os="macos"
+        />
       )
     )
     expect(shown).toContain('Paste this in Terminal on the Mac, as yourself')
@@ -77,7 +83,7 @@ describe('WorkerJoinScript', () => {
   const script = workerJoinScript({
     url: 'https://cp.example.com',
     token: 'tk_enroll',
-    version: 'v0.1.0-nightly.20261104.0123abcde',
+    install: { kind: 'release', tag: 'v0.1.0-nightly.20261104.0123abcde' },
     joinFlags: ' --ingress delegated',
   })
 
@@ -109,12 +115,29 @@ describe('WorkerJoinScript', () => {
     const unpinned = workerJoinScript({
       url: 'https://cp.example.com',
       token: 'tk_enroll',
-      version: undefined,
+      install: { kind: 'latest' },
     })
     const html = render(<WorkerJoinScript {...unpinned} />)
     const shown = text(html)
     expect(shown).toContain('newest stable release, which may not match it')
     expect(shown).toContain('bash -s -- <version>')
     expect(html).toContain('href="/settings/version"')
+  })
+
+  test('a build between releases installs the newest nightly and says why', () => {
+    const between = workerJoinScript({
+      url: 'https://cp.example.com',
+      token: 'tk_enroll',
+      install: { kind: 'nightly', after: 'v0.1.0-beta.61' },
+    })
+    const shown = text(render(<WorkerJoinScript {...between} />))
+    expect(shown).toContain(
+      'curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- --channel nightly) && \\'
+    )
+    expect(shown).not.toContain('bash -s -- v0.1.0-beta.61')
+    expect(shown).toContain(
+      'This server runs a build made after v0.1.0-beta.61, which no release contains'
+    )
+    expect(shown).toContain('installs the newest nightly build')
   })
 })

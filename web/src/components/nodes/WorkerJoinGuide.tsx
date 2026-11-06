@@ -91,7 +91,7 @@ import {
 import { AGENT_SERVICE_COMMAND, installCommand } from '@/lib/worker-join-script'
 import { usePlaneRelease } from '@/hooks/usePlaneRelease'
 import {
-  UnpinnedInstallNote,
+  WorkerInstallNote,
   WorkerJoinScript,
 } from '@/components/nodes/WorkerJoinScript'
 const WITHOUT_SYSTEMD = (
@@ -103,16 +103,19 @@ const WITHOUT_SYSTEMD = (
 
 /**
  * Install Temps as root, pinned to the release this server runs so the worker
- * matches it. It waits (a bounded time) for that release before offering a
- * command, and says so when it installs the newest stable one instead.
+ * matches it (the newest nightly build for a build between releases). It
+ * waits (a bounded time) for that before offering a command, and says what
+ * it installs whenever that is not this server's release.
  */
 function InstallCommandLine() {
   const release = usePlaneRelease()
   if (release.pending) return <Skeleton className="mt-1 h-8 w-full" />
   return (
     <>
-      <CommandLine command={installCommand(release.tag)} />
-      {!release.tag && <UnpinnedInstallNote />}
+      <CommandLine command={installCommand(release.install)} />
+      {release.install.kind !== 'release' && (
+        <WorkerInstallNote install={release.install} />
+      )}
     </>
   )
 }
@@ -926,7 +929,7 @@ function CreatedPairing({
       <div className="mt-1">
         <WorkerJoinScript
           command={command}
-          pinnedTo={release.tag}
+          install={release.install}
           pending={release.pending}
         />
       </div>
