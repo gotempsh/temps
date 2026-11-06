@@ -67,6 +67,7 @@ export function NodeLabelsCard({
               An agent started with <code className="font-mono">--labels</code>{' '}
               or <code className="font-mono">TEMPS_NODE_LABELS</code> keeps
               those labels: the command refuses and says where they are set.
+              Remove the override, restart the agent, then run it again.
             </p>
             <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1">
               <code className="min-w-0 flex-1 truncate font-mono text-xs">

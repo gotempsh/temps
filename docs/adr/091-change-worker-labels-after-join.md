@@ -50,7 +50,7 @@ the read to the rename, so two overlapping edits take turns instead of one
 losing the other's change. "Still the file that was read" means the same
 inode, size and modification time, so a write in place is caught too.
 `temps join` replaces `agent.json` under the same lock, through a temporary
-file, so an edit overlapping a join cannot write the old enrollment back; it
+file (the file a symlinked `agent.json` points at, keeping the link), so an edit overlapping a join cannot write the old enrollment back; it
 waits for the lock as long as its holder runs, never writing without it.
 Temporary files a crashed run left behind are removed under the lock. The
 agent keeps its labels when `agent.json` is not a JSON object at all. `--data-dir` picks
@@ -121,9 +121,11 @@ Nodes.
 ### D6. An override is an error, not a silent no-op
 
 Before writing, the command looks for an override where the agent would get
-one: the installed systemd unit's effective environment and command line
-(drop-ins included), the LaunchAgent plist, and the record (D4) of the agent
-that last reported. Any of them fails the command, naming where the override
+one: the installed systemd unit's effective environment, environment files
+(wildcard patterns expanded) and command line (drop-ins included), the
+LaunchAgent plist, and the record (D4) of the agent that last reported. A
+unit or plist that runs the agent from another data directory than the one
+being edited is not this worker's, and is skipped. Any of them fails the command, naming where the override
 is and how to remove it, without touching `agent.json`. When the unit cannot
 be checked (`systemctl show` fails, or an environment file it names cannot be
 read) the command refuses too: an override it cannot rule out is treated as
@@ -140,7 +142,8 @@ service usually runs as root, so a permission error says to use `sudo`.
 
 Run as root, the command edits only a data directory that root alone
 controls: the directory, every directory above it and `agent.json` must be
-root's and not writable by others. Otherwise another user could swap files
+root's and writable by no group (root's own included: a member of group 0
+need not be root) and no one else. Otherwise another user could swap files
 under the root process and receive a copy of a root-only config (with its
 node token) in a file they own. Such a directory belongs to a user, who runs
 the command as themselves.

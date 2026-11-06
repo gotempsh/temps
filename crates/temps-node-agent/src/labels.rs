@@ -55,8 +55,10 @@ impl Default for LabelsSettings {
 
 /// Largest `agent.json` read: it holds a token, a few paths and the labels.
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-/// Largest [`STATUS_FILE`] read.
-pub const MAX_STATUS_BYTES: u64 = 64 * 1024;
+/// Largest [`STATUS_FILE`] read. The largest label set `temps agent labels`
+/// accepts (64 labels, 317-byte keys, 253 four-byte characters per value)
+/// records as about 90 KiB; this leaves room for escaping and indentation.
+pub const MAX_STATUS_BYTES: u64 = 256 * 1024;
 
 /// Read `path` only if it is a regular file of at most `max` bytes, without
 /// following a symlink at `path` and without blocking on a FIFO or device:
@@ -611,6 +613,42 @@ mod tests {
         // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         assert!(read_status(dir.path()).is_none());
+    }
+
+    /// The largest label set the CLI accepts still records and reads back,
+    /// so it can be confirmed.
+    #[test]
+    fn the_largest_valid_label_set_records_and_reads_back() {
+        use temps_core::node_labels;
+        let dir = tempfile::tempdir().unwrap();
+        let part = "p".repeat(63);
+        let prefix = format!("{part}.{part}.{part}.{}", "p".repeat(61));
+        assert_eq!(prefix.len(), node_labels::MAX_PREFIX_LEN);
+        // Four bytes per character, and a quote that JSON escapes.
+        let value = format!("\"{}", "🛰".repeat(node_labels::MAX_VALUE_LEN - 1));
+        let labels: serde_json::Map<String, serde_json::Value> = (0..node_labels::MAX_LABELS)
+            .map(|i| {
+                let name = format!("{i:02}{}", "n".repeat(node_labels::MAX_NAME_LEN - 2));
+                let key = format!("{prefix}/{name}");
+                node_labels::validate_key(&key).unwrap();
+                node_labels::validate_value(&key, &value).unwrap();
+                (key, serde_json::Value::String(value.clone()))
+            })
+            .collect();
+        let status = LabelsStatus {
+            node_id: 1,
+            control_plane_url: Some(PLANE.to_string()),
+            labels: serde_json::Value::Object(labels),
+            origin: LabelsOrigin::AgentJson,
+            accepted_at: Utc::now(),
+        };
+        record_accepted(dir.path(), &status).unwrap();
+        let size = std::fs::metadata(dir.path().join(STATUS_FILE))
+            .unwrap()
+            .len();
+        assert!(size > 64 * 1024, "the case is near the old limit: {size}");
+        assert!(size < MAX_STATUS_BYTES, "{size}");
+        assert_eq!(read_status(dir.path()), Some(status));
     }
 
     #[tokio::test]

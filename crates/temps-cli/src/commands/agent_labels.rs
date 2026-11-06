@@ -268,7 +268,7 @@ fn list(target: &Target) -> anyhow::Result<()> {
              Labels in the console under Settings > Nodes."
         ),
     }
-    match service_overrides() {
+    match service_overrides(&worker.data_dir) {
         Ok(found) => {
             for found in found {
                 println!("Warning: {found}");
@@ -289,7 +289,7 @@ fn change(
     edit: impl FnOnce(&mut Labels) -> anyhow::Result<Vec<String>>,
 ) -> anyhow::Result<()> {
     let mut worker = Worker::load(&args.target, true)?;
-    let overrides = service_overrides().map_err(|error| {
+    let overrides = service_overrides(&worker.data_dir).map_err(|error| {
         anyhow::anyhow!(
             "{error}, so it is not known whether the agent would use labels saved in \
              agent.json; nothing was changed. Fix that, then run this again."
@@ -811,15 +811,37 @@ fn remove_stale_temp_files(path: &Path) {
 /// it. An overlapping edit then either finishes first or reads the new
 /// file; it can never write the old enrollment back over this one.
 pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()> {
+    // The lock beside the canonical directory, where `temps agent labels`
+    // and `temps agent ingress` take it.
+    let dir = path
+        .parent()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve the directory of {}", path.display()))?;
+    let canonical = dir.join("agent.json");
+    // A symlinked agent.json (a config kept elsewhere) stays a link: the
+    // file it points at gets the new enrollment, as before, so the agent
+    // and whatever manages that file keep reading the same one.
+    let target =
+        if std::fs::symlink_metadata(&canonical).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            std::fs::canonicalize(&canonical).map_err(|e| {
+                anyhow::anyhow!(
+                    "{} is a symbolic link whose target cannot be resolved ({e}). Point it at the \
+                 config file, or remove it, then run `temps join` again.",
+                    canonical.display()
+                )
+            })?
+        } else {
+            canonical.clone()
+        };
     // Never without the lock: an edit that already checked the old file
     // would rename its copy over this one. Join has registered the node, so
     // it waits for such an edit rather than give up.
-    let _lock = open_config_lock(path, None)?;
-    remove_stale_temp_files(path);
-    let tmp = write_temp_file(path, text)?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let _lock = open_config_lock(&canonical, None)?;
+    remove_stale_temp_files(&canonical);
+    let tmp = write_temp_file(&target, text)?;
+    std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        anyhow::anyhow!("Could not replace {}: {e}", path.display())
+        anyhow::anyhow!("Could not replace {}: {e}", target.display())
     })
 }
 
@@ -871,26 +893,95 @@ fn shell_override_note() -> Option<String> {
     ))
 }
 
-/// Overrides of `agent.json` labels in the installed agent service. `Err`
-/// when the service could not be checked: a change is then refused rather
-/// than written blind.
-fn service_overrides() -> Result<Vec<String>, String> {
+/// Overrides of `agent.json` labels in the installed agent service, if that
+/// service runs the agent from `data_dir` (canonical): one for another
+/// directory does not read this `agent.json`. `Err` when the service could
+/// not be checked: a change is then refused rather than written blind.
+fn service_overrides(data_dir: &Path) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     if cfg!(target_os = "macos") {
         if let Some(home) = dirs::home_dir() {
             let plist = super::agent_launchd::plist_path(&home);
             if let Ok(text) = std::fs::read_to_string(&plist) {
-                found.extend(
-                    plist_override(&text).map(|what| format!("{} {what}", plist.display())),
-                );
+                let elsewhere = super::agent_launchd::installed_data_dir(&text)
+                    .is_some_and(|dir| !same_dir(&dir, data_dir));
+                if !elsewhere {
+                    found.extend(
+                        plist_override(&text).map(|what| format!("{} {what}", plist.display())),
+                    );
+                }
             }
         }
     } else if cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir() {
-        found.extend(systemd_override(|args| {
-            super::agent_service::systemctl_query(args)
-        })?);
+        found.extend(systemd_override(
+            super::agent_service::systemctl_query,
+            data_dir,
+        )?);
     }
     Ok(found)
+}
+
+/// Whether `dir` is `data_dir` (canonical), resolving `dir` when it exists.
+fn same_dir(dir: &Path, data_dir: &Path) -> bool {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()) == data_dir
+}
+
+/// The words of a `systemctl show` value. systemd quotes a word holding
+/// whitespace or quotes as a whole, in double quotes with `\` escapes
+/// (`"TEMPS_NODE_LABELS=zone=west coast"`); single quotes are honoured too.
+fn show_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => word.extend(chars.next()),
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                word.extend(chars.next());
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// The files an `EnvironmentFile=` entry names: systemd accepts a wildcard
+/// pattern as well as a path.
+fn environment_files(pattern: &str) -> Result<Vec<PathBuf>, String> {
+    if !pattern.contains(['*', '?', '[']) {
+        return Ok(vec![PathBuf::from(pattern)]);
+    }
+    let matches = glob::glob(pattern).map_err(|error| {
+        format!("Could not expand the environment file pattern {pattern}: {error}")
+    })?;
+    matches
+        .map(|entry| {
+            entry.map_err(|error| {
+                format!("Could not check a file matching the environment file pattern {pattern}: {error}")
+            })
+        })
+        .collect()
 }
 
 /// What in a LaunchAgent plist overrides `agent.json` labels.
@@ -910,6 +1001,7 @@ fn plist_override(plist: &str) -> Option<&'static str> {
 /// an `Err`: the override cannot be ruled out.
 fn systemd_override(
     query: impl Fn(&[&str]) -> Result<String, String>,
+    data_dir: &Path,
 ) -> Result<Option<String>, String> {
     let service = "temps-agent.service";
     let show = query(&[
@@ -928,19 +1020,26 @@ fn systemd_override(
              (`systemctl show {service}` failed: {error})"
         )
     })?;
-    // `systemctl show` quotes a word holding whitespace as a whole
-    // (`"TEMPS_NODE_LABELS=zone=west coast"`), so a word may start with a
-    // quote.
-    let word = |part: &str| part.trim_matches(['"', '\'']).to_string();
+    // A unit running the agent from another directory does not read this
+    // agent.json, so its labels do not override it. Without TEMPS_DATA_DIR
+    // the directory is not known, and the unit is checked.
+    let unit_dir = show
+        .lines()
+        .filter_map(|line| line.strip_prefix("Environment="))
+        .flat_map(show_words)
+        .find_map(|part| part.strip_prefix("TEMPS_DATA_DIR=").map(PathBuf::from));
+    if unit_dir.is_some_and(|dir| !same_dir(&dir, data_dir)) {
+        return Ok(None);
+    }
     for line in show.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         match key {
             "Environment"
-                if value
-                    .split_whitespace()
-                    .any(|part| word(part).starts_with("TEMPS_NODE_LABELS=")) =>
+                if show_words(value)
+                    .iter()
+                    .any(|part| part.starts_with("TEMPS_NODE_LABELS=")) =>
             {
                 return Ok(Some(format!(
                     "{service} sets {LABELS_ENV} (see `systemctl cat {service}`), which \
@@ -948,9 +1047,8 @@ fn systemd_override(
                 )));
             }
             "ExecStart"
-                if value
-                    .split_whitespace()
-                    .map(word)
+                if show_words(value)
+                    .iter()
                     .any(|arg| arg == "--labels" || arg.starts_with("--labels=")) =>
             {
                 return Ok(Some(format!(
@@ -967,29 +1065,33 @@ fn systemd_override(
                 if !file.starts_with('/') {
                     continue;
                 }
-                let text = match std::fs::read_to_string(file) {
-                    Ok(text) => text,
-                    // A missing optional file sets nothing.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(format!(
-                            "Could not read {file}, an environment file of {service}, to check \
-                             it for {LABELS_ENV}: {error}.{}",
-                            wrong_user_hint()
-                        ))
+                for file in environment_files(file)? {
+                    let text = match std::fs::read_to_string(&file) {
+                        Ok(text) => text,
+                        // A missing optional file sets nothing.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(format!(
+                                "Could not read {}, an environment file of {service}, to check \
+                                 it for {LABELS_ENV}: {error}.{}",
+                                file.display(),
+                                wrong_user_hint()
+                            ))
+                        }
+                    };
+                    let sets = text.lines().any(|line| {
+                        line.trim_start()
+                            .trim_start_matches("export ")
+                            .trim_start()
+                            .starts_with("TEMPS_NODE_LABELS=")
+                    });
+                    if sets {
+                        return Ok(Some(format!(
+                            "{}, an environment file of {service}, sets {LABELS_ENV}, which \
+                             overrides agent.json",
+                            file.display()
+                        )));
                     }
-                };
-                let sets = text.lines().any(|line| {
-                    line.trim_start()
-                        .trim_start_matches("export ")
-                        .trim_start()
-                        .starts_with("TEMPS_NODE_LABELS=")
-                });
-                if sets {
-                    return Ok(Some(format!(
-                        "{file}, an environment file of {service}, sets {LABELS_ENV}, which \
-                         overrides agent.json"
-                    )));
                 }
             }
             _ => {}
@@ -1112,40 +1214,64 @@ mod tests {
     }
 
     #[test]
+    fn systemctl_show_values_split_into_words_as_systemd_quotes_them() {
+        assert_eq!(
+            show_words(r#"A=1 "B=two words" "C=say \"hi\"" 'D=x y'  E="#),
+            ["A=1", "B=two words", r#"C=say "hi""#, "D=x y", "E="]
+        );
+        assert!(show_words("  ").is_empty());
+    }
+
+    #[test]
     fn overrides_in_the_systemd_unit_are_found() {
         let show = |text: &'static str| move |_: &[&str]| Ok::<_, String>(text.to_string());
+        let root = Path::new("/root/.temps");
+        let spaced_dir = Path::new("/srv/my temps");
         assert_eq!(
             systemd_override(show(
                 "LoadState=loaded\nEnvironment=TEMPS_DATA_DIR=/root/.temps\nExecStart={ path=/usr/local/bin/temps ; argv[]=/usr/local/bin/temps agent ; }\nEnvironmentFiles=\n"
-            )),
+            ), root),
             Ok(None)
         );
-        let env = systemd_override(show(
-            "Environment=TEMPS_DATA_DIR=/root/.temps TEMPS_NODE_LABELS=zone=a\n",
-        ))
+        let env = systemd_override(
+            show("Environment=TEMPS_DATA_DIR=/root/.temps TEMPS_NODE_LABELS=zone=a\n"),
+            root,
+        )
         .unwrap()
         .unwrap();
         assert!(env.contains("sets TEMPS_NODE_LABELS"), "{env}");
+        // A unit running the agent from another directory does not read
+        // this agent.json: its override is not this worker's.
+        assert_eq!(
+            systemd_override(
+                show("Environment=TEMPS_DATA_DIR=/root/.temps TEMPS_NODE_LABELS=zone=a\n"),
+                Path::new("/srv/second-worker")
+            ),
+            Ok(None)
+        );
         // systemd quotes an assignment whose value holds a space.
         let quoted = systemd_override(show(
             "Environment=\"TEMPS_DATA_DIR=/srv/my temps\" \"TEMPS_NODE_LABELS=zone=west coast\"\n",
-        ))
+        ), spaced_dir)
         .unwrap()
         .unwrap();
         assert!(quoted.contains("sets TEMPS_NODE_LABELS"), "{quoted}");
         assert_eq!(
-            systemd_override(show("Environment=\"TEMPS_DATA_DIR=/srv/my temps\"\n")),
+            systemd_override(
+                show("Environment=\"TEMPS_DATA_DIR=/srv/my temps\"\n"),
+                spaced_dir
+            ),
             Ok(None)
         );
         let flag = systemd_override(show(
             "ExecStart={ path=/usr/local/bin/temps ; argv[]=/usr/local/bin/temps agent --labels zone=a ; }\n",
-        ))
+        ), root)
         .unwrap()
         .unwrap();
         assert!(flag.contains("--labels"), "{flag}");
         let quoted_flag = systemd_override(show(
             "ExecStart={ path=/usr/local/bin/temps ; argv[]=/usr/local/bin/temps agent \"--labels=zone=west coast\" ; }\n",
-        ))
+        ), root)
         .unwrap()
         .unwrap();
         assert!(quoted_flag.contains("--labels"), "{quoted_flag}");
@@ -1156,21 +1282,30 @@ mod tests {
         let file = spaced.join("agent.env");
         std::fs::write(&file, "RUST_LOG=info\nexport TEMPS_NODE_LABELS=zone=a\n").unwrap();
         let text = format!("EnvironmentFiles={} (ignore_errors=no)\n", file.display());
-        let from_file = systemd_override(move |_: &[&str]| Ok(text.clone()))
+        let from_file = systemd_override(move |_: &[&str]| Ok(text.clone()), root)
             .unwrap()
             .unwrap();
         assert!(from_file.contains("environment file"), "{from_file}");
+        // systemd also takes a wildcard pattern: the files it matches count.
+        let pattern = format!(
+            "EnvironmentFiles={} (ignore_errors=yes)\n",
+            spaced.join("*.env").display()
+        );
+        let from_pattern = systemd_override(move |_: &[&str]| Ok(pattern.clone()), root)
+            .unwrap()
+            .unwrap();
+        assert!(from_pattern.contains("agent.env"), "{from_pattern}");
         // An optional file that does not exist sets nothing.
         let missing = format!(
             "EnvironmentFiles={} (ignore_errors=yes)\n",
             spaced.join("absent.env").display()
         );
         assert_eq!(
-            systemd_override(move |_: &[&str]| Ok(missing.clone())),
+            systemd_override(move |_: &[&str]| Ok(missing.clone()), root),
             Ok(None)
         );
         // systemctl failing is not "no override": the change is refused.
-        let error = systemd_override(|_: &[&str]| Err("timed out".to_string())).unwrap_err();
+        let error = systemd_override(|_: &[&str]| Err("timed out".to_string()), root).unwrap_err();
         assert!(error.contains("timed out"), "{error}");
     }
 
@@ -1393,6 +1528,28 @@ mod tests {
         drop(held);
         writer.join().unwrap().unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_join_keeps_a_symlinked_config_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        let real = managed.join("worker.json");
+        std::fs::write(&real, r#"{"token":"old"}"#).unwrap();
+        let link = dir.path().join("agent.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace_agent_config(&link, r#"{"token":"new"}"#).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&real).unwrap().contains("new"));
+        // A dangling link is an error naming it, not a silent new file.
+        std::fs::remove_file(&real).unwrap();
+        let error = replace_agent_config(&link, "{}").unwrap_err().to_string();
+        assert!(error.contains("symbolic link"), "{error}");
     }
 
     /// A root run refuses the world-writable temporary directory these tests
