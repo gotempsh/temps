@@ -335,28 +335,29 @@ async fn gitea_webhook_events(
         .unwrap_or("")
         .to_string();
 
-    // Dispatch through the existing push-event machinery.
-    let triggered = if let Err(e) = state
+    // Dispatch only to the projects whose secret signed this delivery: a
+    // same-named repository on another Gitea host is not the one pushed to.
+    let triggered = match state
         .git_provider_manager
-        .handle_push_event(
-            repo_owner.to_string(),
-            repo_name.to_string(),
+        .handle_push_event_for_projects(
             branch.clone(),
             tag.clone(),
             commit.clone(),
+            authorized_projects,
         )
         .await
     {
-        error!(
-            delivery_id = delivery_id,
-            repo_owner = repo_owner,
-            repo_name = repo_name,
-            "Failed to handle Gitea push event: {:?}",
-            e
-        );
-        0
-    } else {
-        matching_projects.len()
+        Ok(triggered) => triggered,
+        Err(e) => {
+            error!(
+                delivery_id = delivery_id,
+                repo_owner = repo_owner,
+                repo_name = repo_name,
+                "Failed to handle Gitea push event: {:?}",
+                e
+            );
+            0
+        }
     };
 
     info!(

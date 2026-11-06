@@ -404,16 +404,41 @@ async fn handle_push_event(
     let repo_name = repo.name;
 
     // Check if installation exists
-    if state
+    let Ok(installation) = state
         .github_service
         .get_installation_by_id(installation_id)
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
+    };
 
     let (branch, tag) = push_target(&push_event.r#ref, push_event.base_ref.as_deref());
+
+    // A deleted branch retires previews only on the projects this
+    // installation connects, never on a same-named repository elsewhere.
+    if crate::services::git_provider_manager::GitProviderManager::is_ref_deletion(&push_event.after)
+    {
+        let result = match state
+            .git_provider_manager
+            .connection_projects(installation.connection_id, &repo_owner, &repo_name)
+            .await
+        {
+            Ok(projects) => {
+                state
+                    .git_provider_manager
+                    .handle_push_event_for_projects(branch, tag, push_event.after.clone(), projects)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            error!(
+                "Failed to handle branch deletion on {}/{}: {:?}",
+                repo_owner, repo_name, e
+            );
+        }
+        return;
+    }
 
     // A project that also has its own repository webhook (a non-App
     // connection on a repository where the App is installed) receives this
@@ -450,20 +475,30 @@ async fn handle_pull_request_event(
         return;
     };
 
-    if state
+    let Ok(installation) = state
         .github_service
         .get_installation_by_id(installation_id)
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
+    };
 
-    if let Err(e) = state
+    // Only the projects this installation connects: a same-named repository
+    // on another connection is not the one whose pull request closed.
+    let result = match state
         .git_provider_manager
-        .handle_branch_closed(&repo_owner, &repo.name, branch, reason)
+        .connection_projects(installation.connection_id, &repo_owner, &repo.name)
         .await
     {
+        Ok(projects) => {
+            state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, projects)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
         error!(
             "Failed to queue preview teardown for {}/{} ({}): {:?}",
             repo_owner, repo.name, reason, e

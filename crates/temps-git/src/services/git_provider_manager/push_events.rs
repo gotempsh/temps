@@ -20,25 +20,18 @@ impl GitProviderManager {
         // field (GitHub, GitLab, and others all follow this Git convention).
         // There is no commit to deploy, so creating a deployment from it would
         // queue a download_repo job that fails with
-        // "Failed to checkout ref 0000000...". A deleted branch retires its
-        // preview instead.
-        if is_null_commit(&commit) {
+        // "Failed to checkout ref 0000000...". Retiring the branch's preview
+        // needs the projects that authenticated the delivery, which this
+        // repository-wide lookup does not have, so receivers route deletions
+        // through `handle_push_event_for_projects` instead.
+        if Self::is_ref_deletion(&commit) {
             tracing::info!(
-                "Push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                "Ignoring push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
                 owner,
                 repo,
                 branch,
                 tag
             );
-            if let Some(branch) = deleted_branch(branch, tag.as_deref()) {
-                self.handle_branch_closed(
-                    &owner,
-                    &repo,
-                    branch,
-                    temps_core::PreviewBranchCloseReason::BranchDeleted,
-                )
-                .await?;
-            }
             return Ok(());
         }
 
@@ -156,7 +149,7 @@ impl GitProviderManager {
         // Branch/tag deletions send the all-zeros "null SHA" in the `after`
         // field. There is no commit to deploy; a deleted branch retires its
         // preview instead.
-        if is_null_commit(&commit) {
+        if Self::is_ref_deletion(&commit) {
             tracing::info!(
                 "Push event with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
                 branch,
@@ -253,25 +246,27 @@ impl GitProviderManager {
         Ok(triggered)
     }
 
-    /// Retire the preview of `branch` on every project of `owner/repo`.
-    ///
-    /// For deliveries authenticated per repository (a GitHub App webhook);
-    /// secret-in-path handlers use [`Self::handle_branch_closed_for_projects`].
-    pub async fn handle_branch_closed(
+    /// Projects of `owner/repo` connected through the given provider
+    /// connection: the projects a GitHub App installation's delivery speaks
+    /// for.
+    pub async fn connection_projects(
         &self,
+        connection_id: i32,
         owner: &str,
         repo: &str,
-        branch: String,
-        reason: temps_core::PreviewBranchCloseReason,
-    ) -> Result<usize, GitProviderManagerError> {
-        let projects = projects::Entity::find()
+    ) -> Result<Vec<projects::Model>, GitProviderManagerError> {
+        Ok(projects::Entity::find()
+            .filter(projects::Column::GitProviderConnectionId.eq(connection_id))
             .filter(projects::Column::RepoOwner.eq(owner))
             .filter(projects::Column::RepoName.eq(repo))
             .all(self.db.as_ref())
-            .await?;
+            .await?)
+    }
 
-        self.handle_branch_closed_for_projects(branch, reason, projects)
-            .await
+    /// Whether `commit` is the all-zeros (or missing) SHA providers send for
+    /// a deleted branch or tag.
+    pub fn is_ref_deletion(commit: &str) -> bool {
+        commit.chars().all(|c| c == '0')
     }
 
     /// Retire the preview of `branch` on each of the authenticated `projects`.
@@ -323,11 +318,6 @@ impl GitProviderManager {
 
         Ok(queued)
     }
-}
-
-/// The all-zeros (or missing) commit providers send for a deleted ref.
-fn is_null_commit(commit: &str) -> bool {
-    commit.chars().all(|c| c == '0')
 }
 
 /// The branch a null-SHA push deleted; `None` for a deleted tag.
@@ -427,7 +417,7 @@ mod tests {
 
     /// A deleted branch arrives as a push to the all-zeros SHA (or, from some
     /// providers, an empty one). It deploys nothing and retires the branch's
-    /// preview on each Git-sourced project of the repository.
+    /// preview on each Git-sourced project that authenticated the delivery.
     #[tokio::test]
     async fn deleting_a_branch_queues_preview_teardown_instead_of_a_deploy() {
         use sea_orm::{DatabaseBackend, MockDatabase};
@@ -435,20 +425,15 @@ mod tests {
         for commit in ["0000000000000000000000000000000000000000", ""] {
             let mut image_project = github_repo_project(2, None);
             image_project.source_type = SourceType::DockerImage;
-            let db = Arc::new(
-                MockDatabase::new(DatabaseBackend::Postgres)
-                    .append_query_results(vec![vec![github_repo_project(1, None), image_project]])
-                    .into_connection(),
-            );
+            let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
             let queue = Arc::new(RecordingJobQueue::default());
 
             manager(db, queue.clone())
-                .handle_push_event(
-                    "example-owner".into(),
-                    "example-repository".into(),
+                .handle_push_event_for_projects(
                     Some("feature/login".into()),
                     None,
                     commit.into(),
+                    vec![github_repo_project(1, None), image_project],
                 )
                 .await
                 .unwrap();
@@ -459,6 +444,55 @@ mod tests {
                 "commit {commit:?}"
             );
         }
+    }
+
+    /// The repository-wide entry point cannot tell which projects a delivery
+    /// speaks for, so a deletion through it retires nothing, and it never
+    /// even looks the projects up.
+    #[tokio::test]
+    async fn repository_wide_branch_deletion_retires_nothing() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        manager(db, Arc::new(PanicOnSendJobQueue))
+            .handle_push_event(
+                "example-owner".into(),
+                "example-repository".into(),
+                Some("feature/login".into()),
+                None,
+                "0000000000000000000000000000000000000000".into(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A GitHub App delivery speaks only for the projects its installation
+    /// connects; a same-named repository on another connection or host must
+    /// not match.
+    #[tokio::test]
+    async fn connection_projects_are_scoped_to_the_connection() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![github_repo_project(1, None)]])
+                .into_connection(),
+        );
+        let projects = manager(db.clone(), Arc::new(PanicOnSendJobQueue))
+            .connection_projects(7, "example-owner", "example-repository")
+            .await
+            .unwrap();
+        assert_eq!(projects.len(), 1);
+
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        for clause in [
+            r#"\"projects\".\"git_provider_connection_id\" = $1"#,
+            r#"\"projects\".\"repo_owner\" = $2"#,
+            r#"\"projects\".\"repo_name\" = $3"#,
+        ] {
+            assert!(log.contains(clause), "missing {clause} in {log}");
+        }
+        assert!(log.contains("Int(Some(7))"), "{log}");
     }
 
     #[tokio::test]
