@@ -101,6 +101,15 @@ export default function ApiKeyEdit() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    // The server keeps the stored expiry when none is sent, so an emptied
+    // date would report success and change nothing.
+    if (formData.expires_at === '' && loadedApiKey?.expires_at) {
+      toast.error('The expiration date cannot be removed', {
+        description:
+          'Pick a new date, or create a new key that never expires and revoke this one.',
+      })
+      return
+    }
     const data: UpdateApiKeyRequest = {
       name: formData.name,
       is_active: formData.is_active,
@@ -180,6 +189,7 @@ export default function ApiKeyEdit() {
     formData.expires_at !== expiryDateInput(apiKey.expires_at)
   const isExpired =
     apiKey.expires_at && new Date(apiKey.expires_at) < new Date()
+  const hasStoredExpiry = Boolean(apiKey.expires_at)
 
   return (
     <div className="w-full min-w-0 space-y-6">
@@ -315,10 +325,16 @@ export default function ApiKeyEdit() {
                   // Only a newly picked date must be in the future: an
                   // already-expired key can still be renamed or deactivated.
                   min={expiryChanged ? earliestExpiryDate() : undefined}
+                  required={hasStoredExpiry}
+                  aria-describedby="expires_at_hint"
                 />
-                <p className="text-sm text-muted-foreground">
-                  Leave empty for no expiration. Current keys expire on the set
-                  date.
+                <p
+                  id="expires_at_hint"
+                  className="text-sm text-muted-foreground"
+                >
+                  {hasStoredExpiry
+                    ? 'The key stops working on this date. Pick a new date to change it; an expiration date cannot be removed.'
+                    : 'Leave empty for no expiration, or pick the date the key stops working.'}
                 </p>
                 {isExpired && (
                   <Alert variant="destructive">

@@ -110,3 +110,51 @@ test('a refused save is reported with the reason and stays on the form', async (
   expect(view.queryByText('API key list')).toBeNull()
   api.restore()
 })
+
+test('clearing a stored expiry is refused instead of reporting a save that changes nothing', async () => {
+  const api = mockApi({
+    'GET /api-keys/1': () => jsonResponse(KEY),
+    'PATCH /api-keys/1': () => jsonResponse(KEY),
+  })
+  const view = renderPage()
+  const expiry = await view.findByLabelText(/Expiration date/)
+  expect(expiry.hasAttribute('required')).toBe(true)
+  expect(view.getByText(/an expiration date cannot be removed/)).toBeTruthy()
+
+  await act(async () => {
+    fireEvent.change(expiry, { target: { value: '' } })
+  })
+  // Submitted directly: a browser's own `required` check would stop the
+  // click first.
+  await act(async () => {
+    fireEvent.submit(expiry.closest('form')!)
+  })
+
+  expect(
+    await view.findByText('The expiration date cannot be removed')
+  ).toBeTruthy()
+  expect(api.called('PATCH', '/api-keys/1')).toBe(false)
+  expect(view.queryByText('API key updated successfully')).toBeNull()
+  expect(view.queryByText('API key list')).toBeNull()
+  api.restore()
+})
+
+test('a key that never expires can still be saved without an expiry', async () => {
+  let sent: Record<string, unknown> | null = null
+  const api = mockApi({
+    'GET /api-keys/1': () => jsonResponse({ ...KEY, expires_at: null }),
+    'PATCH /api-keys/1': async (request) => {
+      sent = (await request.json()) as Record<string, unknown>
+      return jsonResponse({ ...KEY, expires_at: null, name: 'renamed-key' })
+    },
+  })
+  const view = renderPage()
+  const expiry = await view.findByLabelText(/Expiration date/)
+  expect(expiry.hasAttribute('required')).toBe(false)
+  await rename(view, 'renamed-key')
+
+  expect(await view.findByText('API key updated successfully')).toBeTruthy()
+  expect(sent).not.toBeNull()
+  expect(sent!.expires_at ?? null).toBeNull()
+  api.restore()
+})
