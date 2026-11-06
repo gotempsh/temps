@@ -644,6 +644,25 @@ mod tests {
         }
     }
 
+    /// Keep a second tracing dispatcher registered for the life of the test
+    /// process, so a capture's scoped subscriber is never the only one.
+    ///
+    /// While exactly one dispatcher is registered, `tracing-core` computes the
+    /// interest of a callsite that registers for the first time from the
+    /// *registering thread's* default subscriber, and caches it for every
+    /// thread. Other tests here reach the same `error!` on threads with no
+    /// subscriber: when one of them registers it while the capture is the lone
+    /// dispatcher, the cached answer is "never" and the capture records
+    /// nothing. With a second dispatcher registered, `tracing-core` combines
+    /// every registered dispatcher, under its lock, and each event is checked
+    /// against the emitting thread's subscriber.
+    fn keep_dispatchers_from_being_alone() {
+        static SECOND_DISPATCHER: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        SECOND_DISPATCHER
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    }
+
     /// Falling back to an empty list here is how a rotated key put real secret
     /// values into a report with nothing to show that it happened.
     #[test]
@@ -663,13 +682,18 @@ mod tests {
         .unwrap();
         let jobs = [job_with_config(77, serde_json::Value::Object(config))];
 
+        keep_dispatchers_from_being_alone();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
             .with_ansi(false)
             .finish();
-        let result =
-            tracing::subscriber::with_default(subscriber, || known_secret_values(&current, &jobs));
+        let result = tracing::subscriber::with_default(subscriber, || {
+            // Recompute what a registration already in flight on another
+            // thread cached against a lone dispatcher.
+            tracing::callsite::rebuild_interest_cache();
+            known_secret_values(&current, &jobs)
+        });
 
         match result {
             Err(FailureReportError::SecretsUnavailable {

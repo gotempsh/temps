@@ -1064,6 +1064,25 @@ mod tests {
         }
     }
 
+    /// Keep a second tracing dispatcher registered for the life of the test
+    /// process, so a capture's scoped subscriber is never the only one.
+    ///
+    /// While exactly one dispatcher is registered, `tracing-core` computes the
+    /// interest of a callsite that registers for the first time from the
+    /// *registering thread's* default subscriber, and caches it for every
+    /// thread. Other tests here call `exec_in_service` on threads with no
+    /// subscriber: when one of them registers its `info!` while the capture
+    /// below is the lone dispatcher, the cached answer is "never" and the
+    /// capture records nothing. With a second dispatcher registered,
+    /// `tracing-core` combines every registered dispatcher, under its lock,
+    /// and each event is checked against the emitting thread's subscriber.
+    fn keep_dispatchers_from_being_alone() {
+        static SECOND_DISPATCHER: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        SECOND_DISPATCHER
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_credential_in_a_service_exec_command_is_not_logged() {
         let (url, _seen) = recording_agent(
@@ -1071,14 +1090,19 @@ mod tests {
             serde_json::json!({"success": false, "data": null, "error": "stop here"}),
         )
         .await;
+        let client = client_at(url, test_sealing());
+        keep_dispatchers_from_being_alone();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_writer(logs.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // Recompute what a registration already in flight on another thread
+        // cached against a lone dispatcher before the capture was registered.
+        tracing::callsite::rebuild_interest_cache();
 
-        let _ = client_at(url, test_sealing())
+        let _ = client
             .exec_in_service(RemoteExecParams {
                 container_name: "redis-1".to_string(),
                 command: vec!["redis-cli".into(), "-a".into(), "db-password".into()],
