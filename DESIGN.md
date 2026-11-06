@@ -273,7 +273,11 @@ separately labeled controls during migration.
 Cards are appropriate for discovery surfaces such as the plugin catalog, where
 logos, descriptions, and categories help people choose. They are not a second
 default for administrative lists. Use a responsive grid with consistent card
-anatomy and the same state rules above.
+anatomy and the same state rules above. Cards need room: where fewer than three
+fit side by side (under about 56rem of content, measured with a container
+query), show the same entries as a list of rows (logo, name, one line of
+description, then category or host as width allows) rather than one or two
+cramped cards per row.
 
 ### No horizontal scrolling
 

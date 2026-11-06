@@ -217,6 +217,9 @@ identifiers break (`overflow-wrap: anywhere`). Tabs wrap. Check from 320px up.
 `DataTable`'s overflow wrapper and `ScrollableTabsList` are a safety net and a
 legacy gap, not a layout; convert a table when touching it.
 
+A card grid (a catalogue, a picker) becomes a list of rows where fewer than
+three cards fit side by side; never one or two cramped cards per row.
+
 Tables show only what is needed to scan and act: the name, its state, one
 compact time (relative within a day, then the date; the exact time in a
 tooltip). IDs, keys, certificates and full timestamps belong to the detail
