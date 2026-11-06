@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   hostSuffixError,
   MAX_HOST_SUFFIX_LEN,
+  publishEnvironmentsHref,
   suffixedHost,
 } from '@/lib/tunnel-host-suffix'
 
@@ -18,6 +19,8 @@ describe('tunnel host suffix', () => {
     expect(hostSuffixError('-lab')).toBeDefined()
     expect(hostSuffixError('lab-')).toBeDefined()
     expect(hostSuffixError('lab_1')).toBeDefined()
+    expect(hostSuffixError('a--b')).toBeDefined()
+    expect(hostSuffixError('a-b-c')).toBeUndefined()
     expect(hostSuffixError('a'.repeat(MAX_HOST_SUFFIX_LEN))).toBeUndefined()
     expect(hostSuffixError('a'.repeat(MAX_HOST_SUFFIX_LEN + 1))).toBeDefined()
   })
@@ -28,5 +31,11 @@ describe('tunnel host suffix', () => {
     )
     expect(suffixedHost('shop', null, 'example.com')).toBe('shop.example.com')
     expect(suffixedHost('shop', '', 'example.com')).toBe('shop.example.com')
+  })
+
+  test("links to the tunnel zone's page, where environments are published", () => {
+    expect(publishEnvironmentsHref('example.com')).toBe(
+      '/domains/tunnel/*.example.com'
+    )
   })
 })

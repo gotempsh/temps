@@ -105,6 +105,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { allTunnelsOptions, baseHost } from '@/lib/tunnel-domains'
+import { publishEnvironmentsHref, suffixedHost } from '@/lib/tunnel-host-suffix'
 import { addressScope } from '@/lib/worker-ingress'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { cn } from '@/lib/utils'
@@ -1302,15 +1303,17 @@ function SchemePicker({
             )}
           </div>
           {scheme === 'suffix' ? (
-            <p className="text-xs text-muted-foreground">
-              The tunnel serves {zone}, and each app it publishes gets a name
-              such as{' '}
-              <code>
-                {EXAMPLE_APP}-{sub}.{zone}
-              </code>
-              : one level below {zone}, which Cloudflare&apos;s free Universal
-              SSL (<code>*.{zone}</code>) covers.
-            </p>
+            <div className="space-y-1 text-xs text-muted-foreground">
+              <p>
+                The tunnel serves {zone}, and each environment it publishes gets
+                a name such as{' '}
+                <code>
+                  {EXAMPLE_APP}-{sub}.{zone}
+                </code>
+                : one level below {zone}, which Cloudflare&apos;s free Universal
+                SSL (<code>*.{zone}</code>) covers.
+              </p>
+            </div>
           ) : (
             <Alert className="border-amber-500/30 bg-amber-500/5">
               <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -1335,6 +1338,11 @@ function SchemePicker({
           )}
         </div>
       )}
+      <p className="text-xs text-muted-foreground">
+        Creating the tunnel gives no environment a name yet: you choose{' '}
+        <strong>Publish environments</strong> for it afterwards, once you have
+        seen the list of names it would make public.
+      </p>
     </div>
   )
 }
@@ -1579,6 +1587,23 @@ function OutcomePanel({
             </Link>
             .
           </p>
+          {domain && (
+            <p>
+              To give every environment a name such as{' '}
+              <code>
+                {suffixedHost(
+                  EXAMPLE_APP,
+                  outcome.connector.host_suffix,
+                  domain
+                )}
+              </code>
+              ,{' '}
+              <Link className="underline" to={publishEnvironmentsHref(domain)}>
+                publish environments through this tunnel
+              </Link>
+              . No environment gets a name until you do.
+            </p>
+          )}
           <WorkerLinks nodes={workers} />
         </AlertDescription>
       </Alert>

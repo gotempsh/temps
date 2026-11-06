@@ -96,8 +96,13 @@ pub struct CreateConnectorRequest {
     /// (ADR 068 D3), e.g. `lab` with domain `example.com` gives
     /// `shop-production-lab.example.com`: one level under the zone, which
     /// Cloudflare's free certificate covers. Without it they are
-    /// `<label>.<domain>`. 1-20 lowercase letters, digits or hyphens; only
-    /// for a provider set up with a domain.
+    /// `<label>.<domain>`. 1-20 lowercase letters, digits or single hyphens,
+    /// starting and ending with a letter or digit; only for a provider set
+    /// up with a domain. Creating the tunnel generates no environment
+    /// hostnames (with `auto_publish` it still publishes the worker-served
+    /// hostnames already under the domain): environment hosts start when
+    /// they are turned on for it
+    /// (`PUT /ingress/connectors/{id}/environment-hosts`).
     #[serde(default)]
     #[schema(example = "lab")]
     pub host_suffix: Option<String>,

@@ -7,7 +7,9 @@
 
 /** `temps_ingress::reachability::environment_hosts::MAX_HOST_SUFFIX_LEN`. */
 export const MAX_HOST_SUFFIX_LEN = 20
-const HOST_SUFFIX = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/
+// Single hyphens only: a DNS name keeps exactly this shape, so every host
+// ends in the suffix as typed.
+const HOST_SUFFIX = /^[a-z0-9]+(-[a-z0-9]+)*$/
 
 /** The suffix as the server stores it: trimmed and lowercase. */
 export function normalizeHostSuffix(suffix: string): string {
@@ -22,9 +24,17 @@ export function hostSuffixError(suffix: string): string | undefined {
   const value = normalizeHostSuffix(suffix)
   if (!value) return 'Enter the label, for example lab.'
   if (value.length > MAX_HOST_SUFFIX_LEN || !HOST_SUFFIX.test(value)) {
-    return `Use 1-${MAX_HOST_SUFFIX_LEN} letters, digits or hyphens, with no dots.`
+    return `Use 1-${MAX_HOST_SUFFIX_LEN} letters, digits or single hyphens, with no dots.`
   }
   return undefined
+}
+
+/**
+ * Where a tunnel's "Publish environments" action is: its zone's page under
+ * Domains. Creating a tunnel publishes no environment hosts by itself.
+ */
+export function publishEnvironmentsHref(domain: string): string {
+  return `/domains/tunnel/${encodeURIComponent(`*.${domain}`)}`
 }
 
 /** `<label>-<suffix>.<domain>`, or `<label>.<domain>` without a suffix. */

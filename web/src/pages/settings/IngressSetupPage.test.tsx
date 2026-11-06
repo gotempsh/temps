@@ -81,6 +81,8 @@ function setup({
   ],
 }: { nodes?: () => ReturnType<typeof worker>[] | Response } = {}) {
   const posted: { path: string; body: unknown }[] = []
+  // The tunnel comes back with the suffix it was created with.
+  let hostSuffix: string | null = null
   // A pasted token adds account 2 next to the existing account 1.
   const accounts = [cloudflareAccount(1, 'Cloudflare')]
   const perAccount = (id: number) => ({
@@ -137,10 +139,16 @@ function setup({
       return new Response(null, { status: 204 })
     },
     'POST /ingress/connectors': async (request) => {
-      posted.push({ path: 'connectors', body: await request.json() })
-      return jsonResponse(tunnel('pending'), 201)
+      const body = (await request.json()) as { host_suffix?: string }
+      posted.push({ path: 'connectors', body })
+      hostSuffix = body.host_suffix ?? null
+      return jsonResponse(
+        { ...tunnel('pending'), host_suffix: hostSuffix },
+        201
+      )
     },
-    'GET /ingress/connectors/9': () => jsonResponse(tunnel('ready')),
+    'GET /ingress/connectors/9': () =>
+      jsonResponse({ ...tunnel('ready'), host_suffix: hostSuffix }),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -204,23 +212,41 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   expect(
     screen.queryByText('HTTPS fails without Advanced Certificate Manager')
   ).toBeNull()
+  // Setup alone names no environment, and says so.
+  expect(
+    screen.getByText(/Creating the tunnel gives no environment a name yet/)
+  ).toBeTruthy()
   fireEvent.change(screen.getByLabelText('Label'), {
     target: { value: 'lab.eu' },
   })
   expect(
-    screen.getByText('Use 1-20 letters, digits or hyphens, with no dots.')
+    screen.getByText(
+      'Use 1-20 letters, digits or single hyphens, with no dots.'
+    )
   ).toBeTruthy()
   // Hostnames read as a pattern, with a concrete example.
   fireEvent.click(
     screen.getByRole('radio', { name: /<app-name>\.example\.com/ })
   )
   expect(screen.getByText('shop.example.com')).toBeTruthy()
+  // Without a label, setup still names no environment, and still says so.
+  expect(
+    screen.getByText(/Creating the tunnel gives no environment a name yet/)
+  ).toBeTruthy()
 
   const create = screen.getByRole('button', { name: 'Create tunnel' })
   await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
   fireEvent.click(create)
 
   await screen.findByText('Visitors can reach apps under example.com')
+  // Every layout points to the step that names environments.
+  const done = screen.getByText(/No environment gets a name until you do/)
+  expect(done.textContent).toContain('shop.example.com')
+  expect(
+    screen
+      .getByRole('link', { name: 'publish environments through this tunnel' })
+      .getAttribute('href')
+  ).toBe('/domains/tunnel/*.example.com')
   expect(screen.getByText('Connected on worker-a')).toBeTruthy()
   expect(screen.getByText('4 connections to Cloudflare')).toBeTruthy()
   expect(posted).toEqual([
@@ -235,6 +261,41 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
       },
     },
   ])
+})
+
+test('a one-level label creates the tunnel with its suffix and points to publishing environments', async () => {
+  const { posted } = setup()
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  fireEvent.click(screen.getByRole('radio', { name: /With a label/ }))
+  fireEvent.change(screen.getByLabelText('Label'), {
+    target: { value: 'lab' },
+  })
+
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(posted[1]).toEqual({
+    path: 'connectors',
+    body: {
+      name: 'example-com',
+      provider: 'cloudflare_tunnel',
+      values: { dns_provider_id: 1, domain: 'example.com' },
+      host_suffix: 'lab',
+      node_ids: [1],
+    },
+  })
+  // The names are not live yet: the panel links to the step that makes them.
+  const done = screen.getByText(/No environment gets a name until you do/)
+  expect(done.textContent).toContain('shop-lab.example.com')
+  const link = screen.getByRole('link', {
+    name: 'publish environments through this tunnel',
+  })
+  expect(link.getAttribute('href')).toBe('/domains/tunnel/*.example.com')
 })
 
 test('open ports hands over to each worker’s own page', async () => {

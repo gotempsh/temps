@@ -819,6 +819,16 @@ pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<
     })
 }
 
+/// How `tunnel` names environment hosts: `<environment>.<domain>`, or
+/// `<environment>-<suffix>.<domain>` with a host suffix.
+fn environment_host_pattern(tunnel: &TunnelFact) -> String {
+    let domain = tunnel.domain.trim_end_matches('.').to_ascii_lowercase();
+    match tunnel.host_suffix.as_deref().filter(|s| !s.is_empty()) {
+        Some(suffix) => format!("<environment>-{suffix}.{domain}"),
+        None => format!("<environment>.{domain}"),
+    }
+}
+
 fn address_field(suggested: Option<&str>) -> SetupField {
     SetupField {
         key: FIELD_ADDRESS.to_string(),
@@ -1197,10 +1207,11 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
                 kind: PlanOptionKind::TunnelEnvironmentHosts,
                 title: format!("Give every environment an address under {}", tunnel.domain),
                 description: format!(
-                    "Tunnel {} publishes each environment as <environment>.{}, and keeps \
+                    "Tunnel {} publishes each environment as {}, and keeps \
                      them as environments come, go and are renamed; {host} is this one's. \
                      Cloudflare serves HTTPS.",
-                    tunnel.name, tunnel.domain
+                    tunnel.name,
+                    environment_host_pattern(tunnel)
                 ),
                 actions: 1,
                 way_in: format!("tunnel:{}", tunnel.name),
@@ -3878,6 +3889,20 @@ mod tests {
             Some("homelab")
         );
         assert!(kinds(&plan(&suffixed)).contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // It names the pattern the tunnel uses, with the suffix.
+        let planned = plan(&suffixed);
+        let option = planned
+            .options
+            .iter()
+            .find(|o| o.kind == PlanOptionKind::TunnelEnvironmentHosts)
+            .expect("the environment hosts option");
+        assert!(
+            option
+                .description
+                .contains("publishes each environment as <environment>-lab.example.com,"),
+            "{}",
+            option.description
+        );
         // The unsuffixed name is not this tunnel's environment host.
         let plain = facts("myapp-production.example.com");
         assert!(environment_hosts_tunnel(&plain, "myapp-production.example.com").is_none());
