@@ -1966,4 +1966,32 @@ mod tests {
         // Nor is another environment's earlier name.
         assert!(!is_generated_name(&www_old, "shop", Some("lab"), APEX, 1));
     }
+
+    /// A renamed environment does not keep an earlier-form name of its old
+    /// label: it gets the current name for its new label, and the old row
+    /// goes only once that is published.
+    #[test]
+    fn a_rename_replaces_an_earlier_form_name_after_publishing() {
+        const APEX: &str = "example.com";
+        let seed = format!("{}#1", natural_host("www-lab", APEX));
+        let www_old = natural_host(&hashed_label("www-lab", &seed), APEX);
+        let envs = [env(1, "shop")];
+        let rows = vec![row(10, 1, &www_old)];
+        let desired = assign_hosts(&envs, &rows, None, Some("lab"), APEX, &|_| false, &|_| true);
+        assert_eq!(desired[&1], "shop-lab.example.com");
+
+        let published = HashSet::from([www_old.clone()]);
+        let first = plan_rows(&envs, &rows, &desired, &published, true);
+        assert_eq!(first.insert, vec![(1, "shop-lab.example.com".to_string())]);
+        assert!(
+            first.delete.is_empty(),
+            "the old host stays until the new one is live"
+        );
+
+        let rows = vec![row(10, 1, &www_old), row(11, 1, "shop-lab.example.com")];
+        let published = HashSet::from([www_old, "shop-lab.example.com".to_string()]);
+        let second = plan_rows(&envs, &rows, &desired, &published, true);
+        assert!(second.insert.is_empty());
+        assert_eq!(second.delete, vec![10]);
+    }
 }
