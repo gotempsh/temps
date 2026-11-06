@@ -964,14 +964,30 @@ pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()
         };
     // Never without the lock: an edit that already checked the old file
     // would rename its copy over this one. Join has registered the node, so
-    // it waits for such an edit far longer than an edit would.
-    let _lock = open_config_lock(&canonical, JOIN_LOCK_WAIT).map_err(|error| {
-        anyhow::anyhow!(
-            "{error} The node is registered on the control plane, but this worker's config was \
-             not saved: stop that command, then run `temps join` again with a new join token."
-        )
-    })?;
+    // it waits for such an edit far longer than an edit would. Through a
+    // symlink, the file written is the target, and an edit of it (`--data-dir`
+    // with the target's directory) locks beside the target: that lock is
+    // taken too, after the link's, so both kinds of edit take turns with
+    // this write.
+    let lock = |path: &Path| {
+        open_config_lock(path, JOIN_LOCK_WAIT).map_err(|error| {
+            anyhow::anyhow!(
+                "{error} The node is registered on the control plane, but this worker's config \
+                 was not saved: stop that command, then run `temps join` again with a new join \
+                 token."
+            )
+        })
+    };
+    let _lock = lock(&canonical)?;
+    let _target_lock = if target == canonical {
+        None
+    } else {
+        Some(lock(&target)?)
+    };
     remove_stale_temp_files(&canonical);
+    if target != canonical {
+        remove_stale_temp_files(&target);
+    }
     let tmp = write_temp_file(&target, text)?;
     std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -1435,6 +1451,22 @@ mod tests {
         assert!(systemd_override(move |_: &[&str]| Ok(text.clone()), root)
             .unwrap()
             .is_some());
+        // The environment file both moves the unit to this worker and pins
+        // its labels: found, though Environment= names another directory.
+        let moved = files.path().join("moved.env");
+        std::fs::write(
+            &moved,
+            "TEMPS_DATA_DIR=/root/.temps\nTEMPS_NODE_LABELS=zone=a\n",
+        )
+        .unwrap();
+        let text = format!(
+            "Environment=TEMPS_DATA_DIR=/old\nEnvironmentFiles={} (ignore_errors=no)\n",
+            moved.display()
+        );
+        let found = systemd_override(move |_: &[&str]| Ok(text.clone()), root)
+            .unwrap()
+            .unwrap();
+        assert!(found.contains("moved.env"), "{found}");
         // An unrelated environment file does not hide which worker the unit
         // runs: a pinned worker A does not block editing worker B.
         let logging = files.path().join("logging.env");
@@ -1833,11 +1865,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let managed = dir.path().join("managed");
         std::fs::create_dir(&managed).unwrap();
-        let real = managed.join("worker.json");
+        let real = managed.join("agent.json");
         std::fs::write(&real, r#"{"token":"old"}"#).unwrap();
-        let link = dir.path().join("agent.json");
+        let worker = dir.path().join("worker");
+        std::fs::create_dir(&worker).unwrap();
+        let link = worker.join("agent.json");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        replace_agent_config(&link, r#"{"token":"new"}"#).unwrap();
+        // An edit of the target directly (`--data-dir managed`) holds the
+        // target's lock: the join waits for it, though it locks the link's
+        // directory too.
+        let held = lock_agent_config(&real).unwrap();
+        let writer = {
+            let link = link.clone();
+            std::thread::spawn(move || replace_agent_config(&link, r#"{"token":"new"}"#))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!writer.is_finished(), "join waits for the target's lock");
+        assert!(std::fs::read_to_string(&real).unwrap().contains("old"));
+        drop(held);
+        writer.join().unwrap().unwrap();
         assert!(std::fs::symlink_metadata(&link)
             .unwrap()
             .file_type()

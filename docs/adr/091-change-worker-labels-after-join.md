@@ -54,7 +54,9 @@ file (the file a symlinked `agent.json` points at, keeping the link), so an edit
 waits up to five minutes for the lock, never writing without it. Run as
 root, `temps join` saves the config only in a directory root alone controls
 (checked before anything is registered), and follows a symlinked
-`agent.json` only to a root-owned file in such a directory.
+`agent.json` only to a root-owned file in such a directory. Writing through
+a symlink, it takes the lock beside the target as well as the one beside the
+link, so an edit of the target's directory also takes turns with it.
 Temporary files a crashed run left behind are removed under the lock. The
 agent keeps its labels when `agent.json` is not a JSON object at all. `--data-dir` picks
 another agent directory, as for `temps agent ingress`, which uses the same
