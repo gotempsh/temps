@@ -185,7 +185,7 @@ impl LoadBalancer {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                mark_served_by_proxy(&mut resp)?;
+                mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
 
                 resp.insert_header(
                     header::CACHE_CONTROL,
@@ -207,7 +207,7 @@ impl LoadBalancer {
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp)?;
+        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
         Self::insert_static_validators(&mut resp, &ctx.path, &etag, opened.matched)?;
 
         // Set visitor and session tracking cookies for static file responses
@@ -339,7 +339,7 @@ impl LoadBalancer {
             Self::static_cache_control(&ctx.path, matched),
         )?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp)?;
+        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
         self.ensure_static_visitor_session(session, ctx, page_content_type)
             .await;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
@@ -462,7 +462,7 @@ impl LoadBalancer {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                mark_served_by_proxy(&mut resp)?;
+                mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
                 resp.insert_header(
                     header::CACHE_CONTROL,
                     Self::static_cache_control(&ctx.path, matched),
@@ -478,7 +478,7 @@ impl LoadBalancer {
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp)?;
+        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
         Self::insert_static_validators(&mut resp, &ctx.path, &etag, matched)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
@@ -655,7 +655,7 @@ impl LoadBalancer {
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                mark_served_by_proxy(&mut resp)?;
+                mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -671,7 +671,7 @@ impl LoadBalancer {
             resp.insert_header("ETag", &etag)?;
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
             resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            mark_served_by_proxy(&mut resp)?;
+            mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
             self.set_tracking_cookies(session, &mut resp, ctx).await?;
             session.write_response_header(Box::new(resp), false).await?;
             session.write_response_body(None, true).await?;
@@ -684,7 +684,7 @@ impl LoadBalancer {
         resp.insert_header("ETag", &etag)?;
         resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp)?;
+        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         session.write_response_header(Box::new(resp), false).await?;

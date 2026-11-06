@@ -351,8 +351,9 @@ mod https_redirect_tests {
 
     #[test]
     fn proxy_https_redirect_response_has_monitor_marker() {
-        let response = https_redirect_response("https://app.example.test/health", "request-1")
-            .expect("build HTTPS redirect response");
+        let response =
+            https_redirect_response("https://app.example.test/health", "request-1", true)
+                .expect("build HTTPS redirect response");
         assert_eq!(response.status.as_u16(), 301);
         assert_eq!(
             response
@@ -379,7 +380,7 @@ mod https_redirect_tests {
 
     #[test]
     fn domain_redirect_says_temps_answered() {
-        let response = domain_redirect_response(301, "https://example.test/pricing")
+        let response = domain_redirect_response(301, "https://example.test/pricing", true)
             .expect("build domain redirect response");
         assert_eq!(response.status.as_u16(), 301);
         assert_eq!(
@@ -3583,4 +3584,23 @@ mod upstream_retry_tests {
         assert!(session.pipelining_enabled());
         assert_eq!(session.req_header().uri.path(), "/a");
     }
+}
+
+#[test]
+fn hidden_identity_redirect_keeps_request_id_and_local_probe_protocol() {
+    let public =
+        https_redirect_response("https://app.example.test/health", "request-1", false).unwrap();
+    assert_eq!(public.headers.get("X-Request-ID").unwrap(), "request-1");
+    assert!(!public.headers.contains_key("X-Temps-Proxy-Probe-Capable"));
+    assert!(!public.headers.contains_key("X-Temps-Proxy-Https-Redirect"));
+    let local =
+        https_redirect_response("https://app.example.test/health", "request-1", true).unwrap();
+    assert_eq!(
+        local.headers.get("X-Temps-Proxy-Probe-Capable").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        local.headers.get("X-Temps-Proxy-Https-Redirect").unwrap(),
+        "1"
+    );
 }

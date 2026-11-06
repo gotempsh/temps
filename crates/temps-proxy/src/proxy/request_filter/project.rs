@@ -336,7 +336,9 @@ impl LoadBalancer {
         // the environment in the signed token, and a page served just
         // before Shield was turned off can still finish. Neither they nor
         // ACME HTTP-01 are ever challenged (D7).
-        if ctx.path == crate::shield::VERIFY_PATH {
+        if ctx.path == crate::shield::VERIFY_PATH
+            || ctx.path == temps_shield::assets::NEUTRAL_VERIFY_PATH
+        {
             return self
                 .answer_challenge_verify(
                     session,

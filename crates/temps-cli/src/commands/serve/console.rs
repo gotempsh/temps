@@ -2363,6 +2363,10 @@ async fn serve_public_only(
 async fn public_only_not_found(req: Request) -> Response {
     use axum::response::IntoResponse;
 
+    let hide_identity = req
+        .extensions()
+        .get::<Arc<temps_config::ConfigService>>()
+        .is_some_and(|settings| settings.hide_platform_identity());
     let headers = req.headers();
     let wants_html = !req.uri().path().starts_with("/api/")
         && headers
@@ -2386,7 +2390,7 @@ async fn public_only_not_found(req: Request) -> Response {
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
         ],
-        temps_proxy::branded_404::render(host, request_id),
+        temps_proxy::branded_404::render_with_identity(host, request_id, hide_identity),
     )
         .into_response()
 }
@@ -2564,6 +2568,48 @@ mod public_only_app_tests {
             .body(Body::empty())
             .expect("request builds");
         assert_eq!(send(app(), request).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_ingress_hides_platform_identity() {
+        let now = chrono::Utc::now();
+        let settings = temps_config::AppSettings {
+            hide_platform_identity: Some(true),
+            ..Default::default()
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![temps_entities::settings::Model {
+                    id: 1,
+                    data: settings.to_json(),
+                    created_at: now,
+                    updated_at: now,
+                }]])
+                .into_connection(),
+        );
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".into(),
+            "postgresql://test".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
+        service.get_settings().await.unwrap();
+        let request = Request::builder()
+            .uri("/dashboard")
+            .header(header::HOST, "hooks.example.test")
+            .header(header::ACCEPT, "text/html")
+            .body(Body::empty())
+            .unwrap();
+        let response = send(app().layer(axum::Extension(service)), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body)
+            .to_lowercase()
+            .contains("temps"));
     }
 
     #[tokio::test]

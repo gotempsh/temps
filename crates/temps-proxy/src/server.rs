@@ -88,6 +88,7 @@ async fn load_initial_forwarded_ip_trust(
 #[derive(Debug)]
 struct LoopbackTrust {
     forwarded_ip: Arc<AtomicBool>,
+    hide_platform_identity: Arc<AtomicBool>,
     /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
     ja4_header: Arc<ArcSwapOption<HeaderName>>,
 }
@@ -137,10 +138,15 @@ fn start_forwarded_ip_trust_refresh(
         ja4_header = initial_ja4_header.as_deref().map(HeaderName::as_str),
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
+    let initial_identity = runtime
+        .block_on(config_service.get_settings())?
+        .hide_platform_identity();
     let trust = LoopbackTrust {
+        hide_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
         forwarded_ip: Arc::new(AtomicBool::new(initial)),
         ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
     };
+    let identity = Arc::downgrade(&trust.hide_platform_identity);
     let snapshot = Arc::downgrade(&trust.forwarded_ip);
     let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
@@ -159,6 +165,9 @@ fn start_forwarded_ip_trust_refresh(
                 info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
             }
             if let Some(settings) = &settings {
+                if let Some(identity) = identity.upgrade() {
+                    identity.store(settings.hide_platform_identity(), Ordering::Relaxed);
+                }
                 let header = loopback_ja4_header(settings);
                 let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
                 if apply_loopback_ja4_header_refresh(&ja4_header, header) {
@@ -740,6 +749,7 @@ pub fn setup_proxy_server(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_hide_platform_identity(loopback_trust.hide_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
@@ -1175,6 +1185,7 @@ pub fn create_proxy_service(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_hide_platform_identity(loopback_trust.hide_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)

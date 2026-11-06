@@ -70,8 +70,11 @@ impl LoadBalancer {
                             response.insert_header("Cache-Control", "no-store")?;
                             response.insert_header("X-Request-ID", &ctx.request_id)?;
                             response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                            let body =
-                                Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
+                            let body = Bytes::from(crate::branded_404::render_with_identity(
+                                &ctx.host,
+                                &ctx.request_id,
+                                self.hide_platform_identity(),
+                            ));
                             response.insert_header("Content-Length", body.len().to_string())?;
                             session
                                 .write_response_header(Box::new(response), false)

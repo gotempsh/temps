@@ -150,7 +150,10 @@ impl LoadBalancer {
                 Ok(Flow::Continue)
             }
             crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {
-                let (response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
+                let (mut response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
+                if !self.expose_probe_markers(session) {
+                    response.remove_header(temps_core::gate::GATE_HEADER);
+                }
                 session
                     .write_response_header(Box::new(response), body.is_none())
                     .await?;

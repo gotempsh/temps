@@ -88,7 +88,7 @@ impl LoadBalancer {
                     ctx.path.clone()
                 };
 
-                let html = crate::handler::password_wall::generate_password_form_html_for_route(
+                let html = crate::handler::password_wall::generate_password_form_with_identity(
                     &current_path,
                     false,
                     project_name,
@@ -102,6 +102,7 @@ impl LoadBalancer {
                         ctx.query_string.as_deref(),
                     )
                     .as_deref(),
+                    self.hide_platform_identity(),
                 );
                 let html_bytes = Bytes::from(html);
 
@@ -236,7 +237,7 @@ impl LoadBalancer {
         } else {
             // Wrong password — the attempt is already counted;
             // show the form again with an error
-            let html = crate::handler::password_wall::generate_password_form_html_for_route(
+            let html = crate::handler::password_wall::generate_password_form_with_identity(
                 redirect,
                 true,
                 project_name,
@@ -250,6 +251,7 @@ impl LoadBalancer {
                     ctx.query_string.as_deref(),
                 )
                 .as_deref(),
+                self.hide_platform_identity(),
             );
             let html_bytes = Bytes::from(html);
 

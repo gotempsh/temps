@@ -204,22 +204,32 @@ fn should_redirect_to_https(
     env_force_https.unwrap_or_else(host_has_cert)
 }
 
-fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<ResponseHeader> {
+fn https_redirect_response(
+    redirect_url: &str,
+    request_id: &str,
+    expose: bool,
+) -> Result<ResponseHeader> {
     let mut response = ResponseHeader::build(301, None)?;
     response.insert_header("Location", redirect_url)?;
     response.insert_header("Content-Length", "0")?;
     response.insert_header("X-Request-ID", request_id)?;
-    response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
-    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    if expose {
+        response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+        response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    }
     Ok(response)
 }
 
 /// A custom domain's "Redirect to" answer, marked as the proxy's own so a
 /// reachability check of a redirecting domain can tell Temps answered it.
-fn domain_redirect_response(status_code: u16, location: &str) -> Result<ResponseHeader> {
+fn domain_redirect_response(
+    status_code: u16,
+    location: &str,
+    expose: bool,
+) -> Result<ResponseHeader> {
     let mut response = ResponseHeader::build(status_code, None)?;
     response.insert_header(header::LOCATION, location)?;
-    mark_served_by_proxy(&mut response)?;
+    mark_served_by_proxy(&mut response, expose)?;
     Ok(response)
 }
 
@@ -523,6 +533,7 @@ pub struct LoadBalancer {
     cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
     trust_loopback_forwarded_ip: Arc<AtomicBool>,
+    hide_platform_identity: Arc<AtomicBool>,
     /// The header a trusted loopback proxy sends the visitor's JA4 in
     /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
     loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
@@ -697,6 +708,8 @@ const SHIELD_HTTPS_REQUIRED_PAGE: &str = r#"<!DOCTYPE html>
 "#;
 
 /// Entity tags of the solver files, from their content.
+static NEUTRAL_SOLVER_JS_ETAG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| content_etag(temps_shield::assets::NEUTRAL_SOLVER_JS.as_bytes()));
 static SOLVER_JS_ETAG: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| content_etag(temps_shield::assets::SOLVER_JS.as_bytes()));
 static SOLVER_WASM_ETAG: std::sync::LazyLock<String> =
@@ -809,6 +822,7 @@ impl LoadBalancer {
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
+            hide_platform_identity: Arc::new(AtomicBool::new(false)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
             on_demand_manager: None,
             on_demand_cert_manager: None,
@@ -937,6 +951,24 @@ impl LoadBalancer {
     pub fn with_admin_gate(mut self, handle: temps_core::admin_gate::AdminGateHandle) -> Self {
         self.admin_gate = Some(handle);
         self
+    }
+
+    /// Wire the refreshed instance-wide response privacy setting.
+    pub fn with_hide_platform_identity(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.hide_platform_identity = enabled;
+        self
+    }
+
+    fn hide_platform_identity(&self) -> bool {
+        self.hide_platform_identity.load(Ordering::Relaxed)
+    }
+
+    fn expose_probe_markers(&self, session: &PingoraSession) -> bool {
+        !self.hide_platform_identity()
+            || session
+                .client_addr()
+                .and_then(|a| a.as_inet())
+                .is_some_and(|a| a.ip().is_loopback())
     }
 
     /// Enable forwarded client IPs only for an explicitly configured local proxy.
@@ -1089,6 +1121,15 @@ impl LoadBalancer {
             ConsolePhase::Starting | ConsolePhase::Running => return None,
         };
 
+        let body = if self.hide_platform_identity() {
+            match format {
+                crate::console_unavailable::ResponseFormat::Html => Bytes::from_static(b"<!doctype html><title>Service unavailable</title><h1>Service unavailable</h1><p>Please retry shortly.</p>"),
+                crate::console_unavailable::ResponseFormat::Json => Bytes::from_static(b"{\"type\":\"about:blank\",\"title\":\"Service unavailable\",\"status\":503}"),
+            }
+        } else {
+            body
+        };
+
         // The cause was logged once, at ERROR, when startup failed; one line
         // per request here would only repeat it.
         debug!(
@@ -1104,7 +1145,9 @@ impl LoadBalancer {
         let error_code = 503;
         let written = async {
             let mut header = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-            header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            if !self.hide_platform_identity() {
+                header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            }
             header.insert_header(header::CACHE_CONTROL, "no-store")?;
             header.insert_header(header::CONTENT_TYPE, format.content_type())?;
             header.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
@@ -1535,7 +1578,11 @@ impl LoadBalancer {
         } else if !self.disable_https_redirect {
             // A verified hostname always has its certificate: upgrade.
             let location = format!("https://{host}{}", ctx.path);
-            let resp = https_redirect_response(&location, &ctx.request_id)?;
+            let resp = https_redirect_response(
+                &location,
+                &ctx.request_id,
+                self.expose_probe_markers(session),
+            )?;
             ctx.routing_status = "status_page_host_https_redirect".to_string();
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
@@ -1765,9 +1812,18 @@ impl LoadBalancer {
             duration.as_millis(),
             ctx.ip_address.clone().unwrap_or_default()
         );
-        upstream_response
-            .insert_header("X-Response-Time", format!("{}ms", duration.as_millis()))?;
-        if let Some(pending_ms) = ctx.upstream_write_pending_time_ms {
+        if self.hide_platform_identity() {
+            return Ok(());
+        }
+        if !upstream_response.headers.contains_key("X-Response-Time") {
+            upstream_response
+                .insert_header("X-Response-Time", format!("{}ms", duration.as_millis()))?;
+        }
+        if let Some(pending_ms) = ctx.upstream_write_pending_time_ms.filter(|_| {
+            !upstream_response
+                .headers
+                .contains_key("X-Upstream-Write-Pending")
+        }) {
             upstream_response
                 .insert_header("X-Upstream-Write-Pending", format!("{}ms", pending_ms))?;
         }
@@ -1907,10 +1963,11 @@ impl LoadBalancer {
             } => (
                 StatusCode::FORBIDDEN,
                 "text/html; charset=utf-8",
-                Bytes::from(crate::shield::challenge_page(
+                Bytes::from(temps_shield::assets::challenge_page_with_identity(
                     &token,
                     difficulty,
                     ctx.ip_address.as_deref().unwrap_or("unknown"),
+                    self.hide_platform_identity(),
                 )),
                 "shield_challenge",
             ),
@@ -1938,7 +1995,7 @@ impl LoadBalancer {
         response.insert_header("Content-Length", body.len().to_string())?;
         response.insert_header("Cache-Control", "no-store")?;
         response.insert_header("X-Request-ID", &ctx.request_id)?;
-        if let Some(verdict) = ctx.shield_header {
+        if let Some(verdict) = ctx.shield_header.filter(|_| !self.hide_platform_identity()) {
             response.insert_header(
                 temps_shield::RESPONSE_HEADER,
                 temps_shield::response_header_value(verdict, &ctx.request_id),
@@ -2124,13 +2181,21 @@ impl LoadBalancer {
     ) -> Result<bool> {
         use temps_shield::assets;
         let (content_type, content, etag): (_, &'static [u8], &str) =
-            if ctx.path == assets::SOLVER_JS_PATH {
+            if ctx.path == assets::NEUTRAL_SOLVER_JS_PATH {
+                (
+                    "application/javascript; charset=utf-8",
+                    assets::NEUTRAL_SOLVER_JS.as_bytes(),
+                    &NEUTRAL_SOLVER_JS_ETAG,
+                )
+            } else if ctx.path == assets::SOLVER_JS_PATH {
                 (
                     "application/javascript; charset=utf-8",
                     assets::SOLVER_JS.as_bytes(),
                     &SOLVER_JS_ETAG,
                 )
-            } else if ctx.path == assets::SOLVER_WASM_PATH {
+            } else if ctx.path == assets::SOLVER_WASM_PATH
+                || ctx.path == assets::NEUTRAL_SOLVER_WASM_PATH
+            {
                 ("application/wasm", assets::SOLVER_WASM, &SOLVER_WASM_ETAG)
             } else {
                 return Ok(false);
@@ -2565,7 +2630,13 @@ impl LoadBalancer {
                     session,
                     ctx,
                     StatusCode::FORBIDDEN,
-                    crate::preview_auth::ip_denied_message(&host.hex, client_ip),
+                    if self.hide_platform_identity() {
+                        crate::branded_404::neutralize_access_response(
+                            crate::preview_auth::ip_denied_message(&host.hex, client_ip),
+                        )
+                    } else {
+                        crate::preview_auth::ip_denied_message(&host.hex, client_ip)
+                    },
                     "preview_ip_denied",
                 )
                 .await
@@ -2579,7 +2650,13 @@ impl LoadBalancer {
                     session,
                     ctx,
                     StatusCode::FORBIDDEN,
-                    crate::preview_auth::password_missing_message(&host.hex),
+                    if self.hide_platform_identity() {
+                        crate::branded_404::neutralize_access_response(
+                            crate::preview_auth::password_missing_message(&host.hex),
+                        )
+                    } else {
+                        crate::preview_auth::password_missing_message(&host.hex)
+                    },
                     "preview_password_missing",
                 )
                 .await
@@ -2603,7 +2680,12 @@ impl LoadBalancer {
                         session,
                         ctx,
                         StatusCode::UNAUTHORIZED,
-                        crate::preview_auth::temps_login_required_message(&host.hex),
+                        if self.hide_platform_identity() {
+                            "Sign in to open this preview. Open it in a browser to continue.\n"
+                                .to_string()
+                        } else {
+                            crate::preview_auth::temps_login_required_message(&host.hex)
+                        },
                         "preview_temps_login_required",
                     )
                     .await;
@@ -2662,7 +2744,11 @@ impl LoadBalancer {
                             session,
                             ctx,
                             StatusCode::FORBIDDEN,
-                            crate::preview_auth::temps_login_unconfigured_message(&host.hex),
+                            if self.hide_platform_identity() {
+                                "Sign-in is unavailable. Contact the administrator.\n".to_string()
+                            } else {
+                                crate::preview_auth::temps_login_unconfigured_message(&host.hex)
+                            },
                             "preview_temps_login_unconfigured",
                         )
                         .await
@@ -2694,7 +2780,13 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                crate::preview_auth::ip_denied_message(hex, client_ip),
+                if self.hide_platform_identity() {
+                    crate::branded_404::neutralize_access_response(
+                        crate::preview_auth::ip_denied_message(hex, client_ip),
+                    )
+                } else {
+                    crate::preview_auth::ip_denied_message(hex, client_ip)
+                },
                 "preview_ip_denied",
             )
             .await;
@@ -2729,6 +2821,11 @@ impl LoadBalancer {
                 false,
                 settings.external_url.as_deref(),
             )
+        };
+        let html = if self.hide_platform_identity() {
+            crate::branded_404::neutralize_access_response(html)
+        } else {
+            html
         };
         let mut response = ResponseHeader::build(StatusCode::OK, None)?;
         response.insert_header("Content-Type", "text/html; charset=utf-8")?;
@@ -2772,7 +2869,13 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                crate::preview_auth::ip_denied_message(hex, client_ip),
+                if self.hide_platform_identity() {
+                    crate::branded_404::neutralize_access_response(
+                        crate::preview_auth::ip_denied_message(hex, client_ip),
+                    )
+                } else {
+                    crate::preview_auth::ip_denied_message(hex, client_ip)
+                },
                 "preview_ip_denied",
             )
             .await;
@@ -2879,6 +2982,11 @@ impl LoadBalancer {
                 true,
                 settings.external_url.as_deref(),
             );
+            let html = if self.hide_platform_identity() {
+                crate::branded_404::neutralize_access_response(html)
+            } else {
+                html
+            };
             let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
             response.insert_header("Content-Type", "text/html; charset=utf-8")?;
             response.insert_header("Cache-Control", "no-store")?;
@@ -3007,7 +3115,13 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                crate::preview_auth::ip_denied_message(hex, client_ip),
+                if self.hide_platform_identity() {
+                    crate::branded_404::neutralize_access_response(
+                        crate::preview_auth::ip_denied_message(hex, client_ip),
+                    )
+                } else {
+                    crate::preview_auth::ip_denied_message(hex, client_ip)
+                },
                 "preview_ip_denied",
             )
             .await;
@@ -3528,7 +3642,9 @@ impl ProxyHttp for LoadBalancer {
 
         // The solver files bypass IP access control: the challenge page needs them.
         let is_wasm_request = path == temps_shield::assets::SOLVER_JS_PATH
-            || path == temps_shield::assets::SOLVER_WASM_PATH;
+            || path == temps_shield::assets::SOLVER_WASM_PATH
+            || path == temps_shield::assets::NEUTRAL_SOLVER_JS_PATH
+            || path == temps_shield::assets::NEUTRAL_SOLVER_WASM_PATH;
 
         // Check if IP is blocked - this happens at infrastructure level before any processing
         // WASM routes bypass this check since they're needed for challenge solving
@@ -3736,7 +3852,9 @@ impl ProxyHttp for LoadBalancer {
         if ctx.gated_host {
             crate::handler::gate::strip_gate_from_app_response(upstream_response)?;
         }
-        upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+        if self.expose_probe_markers(session) {
+            upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+        }
 
         // First upstream header = backend latency (connect + upstream time).
         if ctx.upstream_response_time_ms.is_none() {
@@ -3788,8 +3906,14 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Add X-Served-By header with the container name that handled this request
-        if let Some(name) = &ctx.container_name {
-            upstream_response.insert_header("X-Served-By", name).ok();
+        if let Some(name) = ctx
+            .container_name
+            .as_ref()
+            .filter(|_| !self.hide_platform_identity())
+        {
+            if !upstream_response.headers.contains_key("X-Served-By") {
+                upstream_response.insert_header("X-Served-By", name).ok();
+            }
         }
 
         // Confirm or cancel Markdown conversion now that we know the upstream status and
@@ -3870,8 +3994,10 @@ impl ProxyHttp for LoadBalancer {
 
         // `X-Temps-Shield` says what Shield did (ADR 066, D11): only Shield
         // sets it, and only when it acted.
-        let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
-        if let Some(verdict) = ctx.shield_header {
+        if !self.hide_platform_identity() {
+            let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
+        }
+        if let Some(verdict) = ctx.shield_header.filter(|_| !self.hide_platform_identity()) {
             upstream_response.insert_header(
                 temps_shield::RESPONSE_HEADER,
                 temps_shield::response_header_value(verdict, &ctx.request_id),
@@ -4427,8 +4553,15 @@ impl ProxyHttp for LoadBalancer {
             }
         };
 
-        if let Err(e) = header.insert_header(header::SERVER, &SERVER_NAME[..]) {
-            error!("Failed to insert SERVER header: {:?}", e);
+        if !self.hide_platform_identity() {
+            if let Err(e) = header.insert_header(header::SERVER, &SERVER_NAME[..]) {
+                error!("Failed to insert SERVER header: {:?}", e);
+            }
+        }
+        if self.hide_platform_identity() {
+            if let Err(e) = header.insert_header("X-Request-ID", &ctx.request_id) {
+                error!(error = %e, "Failed to insert request ID in proxy error response");
+            }
         }
         if let Err(e) = header.insert_header(header::DATE, "Sun, 06 Nov 1994 08:49:37 GMT") {
             error!("Failed to insert DATE header: {:?}", e);
@@ -4448,7 +4581,7 @@ impl ProxyHttp for LoadBalancer {
             };
         }
 
-        let page = unavailable_page(ctx.preview_route.is_some());
+        let page = unavailable_page(ctx.preview_route.is_some() && !self.hide_platform_identity());
         if let Err(e) = session
             .write_response_body(Some(Bytes::from(page)), true)
             .await

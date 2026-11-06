@@ -932,6 +932,7 @@ pub struct ConfigService {
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
     settings_cache: tokio::sync::RwLock<SettingsCacheState>,
+    hide_platform_identity: std::sync::atomic::AtomicBool,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -997,6 +998,7 @@ impl ConfigService {
             config,
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
+            hide_platform_identity: std::sync::atomic::AtomicBool::new(false),
             listener_handle: std::sync::Mutex::new(None),
             build_limits: tokio::sync::watch::channel(None).0,
             clickhouse_compression: ClickHouseCompression::default(),
@@ -1490,7 +1492,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
     }
 
-    /// Get the application settings
+    /// Lock-free view for console ingress error pages, updated with the settings cache.
+    pub fn hide_platform_identity(&self) -> bool {
+        self.hide_platform_identity
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the application settings.
     pub async fn get_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         // Serve from the in-memory cache while it is fresh — this is what keeps
         // the proxy's per-request callers off the database (see field docs).
@@ -1642,6 +1650,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // guard as the settings snapshot. A DB read started before an
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
+        self.hide_platform_identity.store(
+            settings.hide_platform_identity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_process_wide_settings(&settings);
         if publish_limits {
             self.publish_build_limits(&settings);
@@ -1660,6 +1672,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return false;
         }
         cache.generation = cache.generation.wrapping_add(1);
+        self.hide_platform_identity.store(
+            settings.hide_platform_identity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_process_wide_settings(&settings);
         self.publish_build_limits(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));

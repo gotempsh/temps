@@ -1421,3 +1421,178 @@ async fn the_admin_gate_hands_a_denied_client_to_the_public_only_listener() {
     reply.assert_forwarded("no_project");
     assert!(reply.ctx.public_surface_only);
 }
+
+#[tokio::test]
+async fn hidden_platform_identity_preserves_application_headers() {
+    for hide in [false, true] {
+        let fixture = fixture_with(ProxyConfig::default());
+        fixture
+            .lb
+            .hide_platform_identity
+            .store(hide, Ordering::Relaxed);
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(get("/").as_bytes()).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        let mut ctx = fixture.lb.new_ctx();
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        for (name, value) in [
+            ("Server", "application-server"),
+            ("X-Powered-By", "application"),
+            ("X-Upstream-Custom", "app-diagnostic"),
+            ("X-Temps-Custom", "app-value"),
+        ] {
+            response.insert_header(name, value).unwrap();
+        }
+        fixture
+            .lb
+            .upstream_response_filter(&mut session, &mut response, &mut ctx)
+            .await
+            .unwrap();
+        for (name, value) in [
+            ("Server", "application-server"),
+            ("X-Powered-By", "application"),
+            ("X-Upstream-Custom", "app-diagnostic"),
+            ("X-Temps-Custom", "app-value"),
+        ] {
+            assert_eq!(response.headers.get(name).unwrap(), value);
+        }
+        assert_eq!(
+            response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+            !hide
+        );
+        ctx.upstream_write_pending_time_ms = Some(12);
+        fixture.lb.add_response_timing(&mut response, &ctx).unwrap();
+        assert_eq!(
+            response.headers.contains_key("X-Upstream-Write-Pending"),
+            !hide
+        );
+        assert_eq!(response.headers.contains_key("X-Response-Time"), !hide);
+    }
+}
+
+#[tokio::test]
+async fn hidden_platform_identity_keeps_app_timing_headers() {
+    for hide in [false, true] {
+        let fixture = fixture_with(ProxyConfig::default());
+        fixture
+            .lb
+            .hide_platform_identity
+            .store(hide, Ordering::Relaxed);
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        response
+            .insert_header("X-Upstream-Write-Pending", "app-owned")
+            .unwrap();
+        response
+            .insert_header("X-Response-Time", "app-owned")
+            .unwrap();
+        fixture
+            .lb
+            .add_response_timing(&mut response, &fixture.lb.new_ctx())
+            .unwrap();
+        assert_eq!(
+            response.headers.get("X-Upstream-Write-Pending").unwrap(),
+            "app-owned"
+        );
+        assert_eq!(
+            response.headers.get("X-Response-Time").unwrap(),
+            "app-owned"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hidden_platform_identity_keeps_loopback_monitor_markers() {
+    let fixture = fixture_with(ProxyConfig::default());
+    fixture
+        .lb
+        .hide_platform_identity
+        .store(true, Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    client.write_all(get("/").as_bytes()).await.unwrap();
+    use pingora_core::protocols::GetSocketDigest;
+    use std::os::fd::AsRawFd;
+    let digest = pingora_core::protocols::SocketDigest::from_raw_fd(server.as_raw_fd());
+    let mut stream = pingora_core::protocols::l4::stream::Stream::from(server);
+    stream.set_socket_digest(digest);
+    let mut session = Session::new_h1(Box::new(stream));
+    assert!(session.read_request().await.unwrap());
+    assert!(fixture.lb.expose_probe_markers(&session));
+    let response = crate::proxy::https_redirect_response(
+        "https://app.example.test/",
+        "probe-request",
+        fixture.lb.expose_probe_markers(&session),
+    )
+    .unwrap();
+    assert_eq!(
+        response
+            .headers
+            .get("X-Temps-Proxy-Https-Redirect")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response.headers.get("X-Temps-Proxy-Probe-Capable").unwrap(),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn platform_identity_controls_error_and_challenge_responses() {
+    for hide in [false, true] {
+        for outcome in [
+            None,
+            Some(temps_shield::Outcome::HttpsRequired),
+            Some(temps_shield::Outcome::Block),
+            Some(temps_shield::Outcome::Unavailable),
+            Some(temps_shield::Outcome::Challenge {
+                token: "token".to_string(),
+                difficulty: 20,
+            }),
+        ] {
+            let fixture = fixture_with(ProxyConfig::default());
+            fixture
+                .lb
+                .hide_platform_identity
+                .store(hide, Ordering::Relaxed);
+            let (mut client, server) = tokio::io::duplex(65536);
+            client.write_all(get("/").as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = fixture.lb.new_ctx();
+            let failed_upstream = outcome.is_none();
+            ctx.shield_header = Some("challenge");
+            if let Some(outcome) = outcome {
+                fixture
+                    .lb
+                    .answer_shield(&mut session, &mut ctx, outcome, None)
+                    .await
+                    .unwrap();
+            } else {
+                fixture
+                    .lb
+                    .fail_to_proxy(
+                        &mut session,
+                        &pingora::Error::new(pingora::ErrorType::ConnectRefused),
+                        &mut ctx,
+                    )
+                    .await;
+            }
+            drop(session);
+            let mut raw = Vec::new();
+            client.read_to_end(&mut raw).await.unwrap();
+            let response = String::from_utf8(raw).unwrap();
+            if hide {
+                assert!(!response.to_lowercase().contains("temps"), "{response}");
+                assert!(response.to_lowercase().contains("x-request-id:"));
+            } else if failed_upstream {
+                assert!(response.contains("Temps"));
+            }
+        }
+    }
+}

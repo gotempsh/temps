@@ -38,6 +38,31 @@ fn escape(input: &str) -> String {
     out
 }
 
+/// Remove visible product copy from proxy-owned password and preview templates.
+/// Protocol paths and postMessage names remain unchanged for existing clients.
+pub(crate) fn neutralize_access_response(html: String) -> String {
+    html.replace(
+        "<!-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors -->",
+        "",
+    )
+    .replace("<div class=\"footer\">Protected by Temps</div>", "")
+    .replace("If you use Temps, ", "")
+    .replace("open or sign in to Temps", "sign in to the console")
+    .replace("automatic sign-in through Temps", "automatic sign-in")
+    .replace("Temps console", "console")
+}
+
+/// Render without a product mark or external links when identity is hidden.
+pub fn render_with_identity(host: &str, request_id: &str, hide: bool) -> String {
+    if !hide {
+        return render(host, request_id);
+    }
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>404 — Not found</title></head><body><h1>Not found</h1><p>No application is available for this host.</p><dl><dt>Host</dt><dd>{}</dd><dt>Request ID</dt><dd>{}</dd></dl></body></html>",
+        escape(host), escape(request_id)
+    )
+}
+
 /// Render the branded 404 HTML for `host` and `request_id`.
 ///
 /// The returned string is a complete, self-contained HTML document. It is
@@ -195,6 +220,45 @@ pub fn render(host: &str, request_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn access_pages_omit_visible_product_copy_but_keep_protocol() {
+        let password = crate::handler::password_wall::generate_password_form_html(
+            "/",
+            false,
+            "App",
+            "production",
+        );
+        assert!(password.contains("Protected by Temps"));
+        let neutral = super::neutralize_access_response(password);
+        assert!(!neutral.contains("Temps"));
+        let preview = crate::handler::preview_wall::generate_preview_form_html_labeled(
+            "preview", 3000, "/", false, None,
+        );
+        let neutral = super::neutralize_access_response(preview);
+        assert!(!neutral.contains("Temps"));
+        assert!(!neutral.contains("through Temps"));
+        assert!(neutral.contains("/__temps/preview/login"));
+        for message in [
+            crate::preview_auth::ip_denied_message("abc", None),
+            crate::preview_auth::password_missing_message("abc"),
+        ] {
+            assert!(!super::neutralize_access_response(message).contains("Temps"));
+        }
+    }
+
+    #[test]
+    fn identity_toggle_preserves_default_and_escapes_neutral_page() {
+        assert_eq!(
+            super::render_with_identity("site.test", "request-1", false),
+            super::render("site.test", "request-1")
+        );
+        let page = super::render_with_identity("<script>", "request-1", true);
+        assert!(!page.to_lowercase().contains("temps"));
+        assert!(!page.contains("<script>"));
+        assert!(page.contains("&lt;script&gt;"));
+        assert!(page.contains("request-1"));
+    }
+
     use super::*;
 
     #[test]

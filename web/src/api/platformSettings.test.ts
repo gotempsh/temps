@@ -6,6 +6,15 @@ import { buildPlatformSettingsUpdateBody } from './platformSettings'
 import type { PlatformSettings } from './platformSettings'
 
 describe('buildPlatformSettingsUpdateBody', () => {
+  test('round-trips both platform identity choices', () => {
+    for (const hide_platform_identity of [true, false]) {
+      const body = buildPlatformSettingsUpdateBody({
+        hide_platform_identity,
+      } as PlatformSettings)
+      expect(body.hide_platform_identity).toBe(hide_platform_identity)
+    }
+  })
+
   test('round-trips the admin proxy trust setting on unrelated saves', () => {
     const body = buildPlatformSettingsUpdateBody({
       trust_loopback_forwarded_ip: true,

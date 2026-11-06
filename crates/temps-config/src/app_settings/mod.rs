@@ -116,6 +116,9 @@ pub struct AppSettings {
     /// This is the sole control surface — there is no CLI/env override.
     #[serde(default)]
     pub trust_loopback_forwarded_ip: Option<bool>,
+    /// Omit platform identity from proxy responses. Missing values preserve the stored choice.
+    #[serde(default)]
+    pub hide_platform_identity: Option<bool>,
     /// The header a trusted loopback proxy puts the visitor's JA4 TLS
     /// fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
     /// `trust_loopback_forwarded_ip` trusts, and removed from every request
@@ -2471,6 +2474,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             trust_loopback_forwarded_ip: None,
+            hide_platform_identity: None,
             loopback_ja4_header: None,
             docker_registry: DockerRegistrySettings::default(),
             registry_mirror_prefix: None,
@@ -2522,6 +2526,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// The database-backed opt-in, disabled until explicitly set by an admin.
+    pub fn hide_platform_identity(&self) -> bool {
+        self.hide_platform_identity.unwrap_or(false)
+    }
+
     /// The database-backed opt-in, disabled until explicitly set by an admin.
     pub fn trust_loopback_forwarded_ip(&self) -> bool {
         self.trust_loopback_forwarded_ip.unwrap_or(false)

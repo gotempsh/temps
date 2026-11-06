@@ -251,6 +251,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
+  /** Omit platform branding from proxy responses. */
+  hide_platform_identity: boolean
   /** Database-backed proxy forwarded-IP trust opt-in. */
   trust_loopback_forwarded_ip: boolean
   /** Header a trusted loopback proxy sends the visitor's JA4 in; null = none. */
@@ -354,8 +356,8 @@ export async function updatePlatformSettings(
 
 export function buildPlatformSettingsUpdateBody(
   updated: PlatformSettings
-): AppSettings {
-  const body: AppSettings = {
+): AppSettings & Pick<PlatformSettings, 'hide_platform_identity'> {
+  const body: AppSettings & Pick<PlatformSettings, 'hide_platform_identity'> = {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
@@ -374,6 +376,7 @@ export function buildPlatformSettingsUpdateBody(
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
+    hide_platform_identity: updated.hide_platform_identity,
     trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
     loopback_ja4_header: updated.loopback_ja4_header ?? null,
     // Edited on the Security page; the server also preserves an omitted
