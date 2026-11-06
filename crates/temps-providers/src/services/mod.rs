@@ -21,6 +21,7 @@ mod cluster_topology;
 mod engine_selection;
 mod manager;
 mod schema;
+mod service_metadata;
 #[cfg(test)]
 mod test_support;
 mod transactions;
@@ -29,6 +30,8 @@ mod types;
 pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
 use engine_selection::{EngineKind, EngineSelection};
+pub(crate) use manager::record_wal_outcome;
+pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
 pub use schema::*;
 pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
@@ -300,21 +303,34 @@ impl ExternalServiceManager {
     }
 
     /// The engine `selection` names, for a service of `service_type`.
-    #[allow(
-        deprecated,
-        reason = "existing MinIO services keep running on the MinIO engine"
-    )]
     fn build_engine(
         &self,
         selection: EngineSelection,
         service_type: ServiceType,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         let docker = self.require_docker()?;
+        Ok(self.engine_with(selection, service_type, docker))
+    }
+
+    /// The engine `selection` names, over `docker`. Callers decide which
+    /// client that is: [`Self::build_engine`] requires the real one,
+    /// [`Self::service_metadata`] may pass an inert one because it exposes
+    /// no method that uses it.
+    #[allow(
+        deprecated,
+        reason = "existing MinIO services keep running on the MinIO engine"
+    )]
+    fn engine_with(
+        &self,
+        selection: EngineSelection,
+        service_type: ServiceType,
+        docker: Arc<Docker>,
+    ) -> Box<dyn ExternalService> {
         let EngineSelection {
             kind,
             instance_name: name,
         } = selection;
-        Ok(match kind {
+        match kind {
             EngineKind::Mariadb => Box::new(MariaDbService::new(name, docker)),
             EngineKind::Mongodb => Box::new(MongodbService::new(name, docker)),
             EngineKind::Postgres => Box::new(PostgresService::new(name, docker)),
@@ -336,7 +352,7 @@ impl ExternalServiceManager {
                 self.encryption_service.clone(),
                 service_type,
             )),
-        })
+        }
     }
 
     /// Parameter-strategy key for updating a stored service. An S3/Blob

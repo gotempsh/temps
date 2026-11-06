@@ -15609,9 +15609,11 @@ version = "0.1.0-beta.61"
 dependencies = [
  "async-trait",
  "bollard",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "utoipa",
 ]
 

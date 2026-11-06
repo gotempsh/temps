@@ -18,8 +18,18 @@ use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
     RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse,
+    RemoteRuntimeEnvResponse, RemoteWalHealthRequest, RemoteWalHealthResponse,
+    ServiceContainerRuntime, ServiceContainerStats,
 };
+
+/// Whether a node's agent has a route this release added. An agent that
+/// predates it is not failing: the caller says which agent to update rather
+/// than reporting an error.
+#[derive(Debug)]
+pub enum AgentSupport<T> {
+    Supported(T),
+    Unsupported,
+}
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-node-agent).
 #[derive(Deserialize)]
@@ -32,6 +42,12 @@ struct AgentResponse<T> {
 const MAX_AGENT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEALTH_ERROR_BYTES: usize = 2 * 1024;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Runtime and stats are read on every poll of the service page; two stats
+/// samples take a second on the agent.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The WAL probe's connect and its queries are bounded at 5s each on the
+/// agent, after a container inspection.
+const WAL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Lightweight client for the agent's service endpoints.
 pub struct RemoteServiceClient {
@@ -450,6 +466,126 @@ impl RemoteServiceClient {
         .await
     }
 
+    /// The lifecycle state of a service container on the remote node (status,
+    /// restarts, OOM kill, applied limits). An agent from before this route
+    /// answers [`AgentSupport::Unsupported`].
+    pub async fn service_runtime(
+        &self,
+        container_name: &str,
+    ) -> Result<AgentSupport<ServiceContainerRuntime>, ExternalServiceError> {
+        let path = format!("/agent/services/{}/runtime", container_name);
+        let request = self
+            .client
+            .get(format!("{}{}", self.agent_url, path))
+            .timeout(OBSERVE_TIMEOUT);
+        self.agent_call_if_supported(request, &path).await
+    }
+
+    /// Raw one-shot stats samples of a service container on the remote node,
+    /// oldest first, a second apart (`samples` is 1 or 2). An agent from
+    /// before this route answers [`AgentSupport::Unsupported`].
+    pub async fn service_stats(
+        &self,
+        container_name: &str,
+        samples: usize,
+    ) -> Result<AgentSupport<ServiceContainerStats>, ExternalServiceError> {
+        let path = format!("/agent/services/{}/stats", container_name);
+        let samples = samples.clamp(1, temps_service_protocol::MAX_SERVICE_STATS_SAMPLES);
+        let request = self
+            .client
+            .get(format!("{}{}?samples={}", self.agent_url, path, samples))
+            .timeout(OBSERVE_TIMEOUT);
+        self.agent_call_if_supported(request, &path).await
+    }
+
+    /// Run the Postgres WAL and archive probe on the node that owns the
+    /// service. The service config holds its password, so the body is
+    /// sealed to the node. An agent from before this route answers
+    /// [`AgentSupport::Unsupported`].
+    pub async fn probe_wal_health(
+        &self,
+        request: RemoteWalHealthRequest,
+    ) -> Result<AgentSupport<RemoteWalHealthResponse>, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            "Probing Postgres WAL health on remote node"
+        );
+        let path = "/agent/services/wal-health";
+        let builder = self
+            .client
+            .post(format!("{}{}", self.agent_url, path))
+            .timeout(WAL_PROBE_TIMEOUT);
+        let builder = self
+            .with_sealed_body(builder, path, &request)
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: error.to_string(),
+            })?;
+        let mut response: AgentSupport<RemoteWalHealthResponse> =
+            self.agent_call_if_supported(builder, path).await?;
+        if let AgentSupport::Supported(RemoteWalHealthResponse {
+            error: Some(error), ..
+        }) = &mut response
+        {
+            truncate_utf8(error, MAX_HEALTH_ERROR_BYTES);
+        }
+        Ok(response)
+    }
+
+    /// Send `builder` with this client's token. A route the agent does not
+    /// have (`404`, or `405` where the path matches another route's pattern)
+    /// is [`AgentSupport::Unsupported`]; any other failure is an error.
+    async fn agent_call_if_supported<T: for<'de> Deserialize<'de>>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        path: &str,
+    ) -> Result<AgentSupport<T>, ExternalServiceError> {
+        let url = format!("{}{}", self.agent_url, path);
+        let response = builder.bearer_auth(&self.token).send().await.map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to reach agent on node {} at {}: {}",
+                    self.node_name, url, e
+                ),
+            }
+        })?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(AgentSupport::Unsupported);
+        }
+        // Only a sealed request gets this: the agent predates sealing.
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.older_agent_error());
+        }
+        let (status, body): (_, AgentResponse<T>) =
+            self.decode_agent_response(response, &url).await?;
+        if !body.success {
+            let mut error = body.error.unwrap_or_default();
+            truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Agent on node {} returned error ({}): {}",
+                    self.node_name, status, error
+                ),
+            });
+        }
+        body.data
+            .map(AgentSupport::Supported)
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Agent on node {} returned success but no data at {}",
+                    self.node_name, url
+                ),
+            })
+    }
+
+    /// The node this client talks to, for messages.
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
     /// Create (or, with `replace_existing`, recreate) a database container
     /// from its admitted spec on the remote node.
     pub async fn create_service_workload(
@@ -820,6 +956,9 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
     value.push('…');
 }
+
+#[cfg(test)]
+mod observe_tests;
 
 #[cfg(test)]
 mod tests {

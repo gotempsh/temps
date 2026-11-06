@@ -225,6 +225,177 @@ pub struct ContainerSnapshot {
     pub image_cmd: Option<Vec<String>>,
 }
 
+/// A managed service container's lifecycle state, read from `docker inspect`
+/// on the node that runs it.
+///
+/// Only status fields, never the container's environment or command: those
+/// hold the service's credentials, and this is read on every poll of the
+/// service page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ServiceContainerRuntime {
+    /// `false` when no container has this name on the node.
+    pub found: bool,
+    #[serde(default)]
+    pub container_id: Option<String>,
+    /// Docker's state: "running", "exited", "dead" and so on.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub restart_count: Option<i64>,
+    #[serde(default)]
+    pub oom_killed: Option<bool>,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    /// The limits applied to the container's `HostConfig`, in Docker's
+    /// units (bytes, nano-CPUs, relative shares). Absent when unlimited.
+    #[serde(default)]
+    pub memory_bytes: Option<i64>,
+    #[serde(default)]
+    pub memory_swap_bytes: Option<i64>,
+    #[serde(default)]
+    pub nano_cpus: Option<i64>,
+    #[serde(default)]
+    pub cpu_shares: Option<i64>,
+    #[serde(default)]
+    pub shm_size_bytes: Option<i64>,
+}
+
+impl ServiceContainerRuntime {
+    /// The status fields of an inspected container. The one projection both
+    /// the control plane (for its own containers) and a worker's agent use.
+    pub fn from_inspect(info: &ContainerInspectResponse) -> Self {
+        let state = info.state.as_ref();
+        let host_config = info.host_config.as_ref();
+        let positive = |value: Option<i64>| value.filter(|value| *value > 0);
+        Self {
+            found: true,
+            container_id: info.id.clone(),
+            status: state
+                .and_then(|state| state.status.as_ref())
+                .map(|status| format!("{status:?}").to_lowercase()),
+            restart_count: info.restart_count,
+            oom_killed: state.and_then(|state| state.oom_killed),
+            exit_code: state.and_then(|state| state.exit_code),
+            started_at: state.and_then(|state| state.started_at.clone()),
+            finished_at: state.and_then(|state| state.finished_at.clone()),
+            image: info.image.clone(),
+            memory_bytes: positive(host_config.and_then(|config| config.memory)),
+            memory_swap_bytes: positive(host_config.and_then(|config| config.memory_swap)),
+            nano_cpus: positive(host_config.and_then(|config| config.nano_cpus)),
+            cpu_shares: positive(host_config.and_then(|config| config.cpu_shares)),
+            shm_size_bytes: positive(host_config.and_then(|config| config.shm_size)),
+        }
+    }
+}
+
+/// The most samples one stats request takes, and the pause between two. Two
+/// samples a second apart are what a CPU percentage needs: Docker zeroes
+/// `precpu_stats` on a one-shot response, so the delta has to come from two.
+pub const MAX_SERVICE_STATS_SAMPLES: usize = 2;
+pub const SERVICE_STATS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Raw one-shot `docker stats` samples of a managed service container,
+/// oldest first. The caller computes CPU and memory from them, so a worker's
+/// container is measured with exactly the control plane's formula.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceContainerStats {
+    /// `false` when no container has this name on the node.
+    pub found: bool,
+    /// Empty when the container is missing or Docker returned no frame
+    /// (a stopped container).
+    #[serde(default)]
+    pub samples: Vec<bollard::models::ContainerStatsResponse>,
+}
+
+fn is_container_missing(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+/// Take one `one_shot` stats sample of `container_name`. `Ok(None)` when
+/// Docker returns no frame (a stopped container).
+async fn sample_container_stats_once(
+    docker: &Docker,
+    container_name: &str,
+) -> Result<Option<bollard::models::ContainerStatsResponse>, bollard::errors::Error> {
+    use futures::StreamExt;
+    let options = bollard::query_parameters::StatsOptionsBuilder::default()
+        .stream(false)
+        .one_shot(true)
+        .build();
+    match docker.stats(container_name, Some(options)).next().await {
+        Some(Ok(sample)) => Ok(Some(sample)),
+        Some(Err(error)) => Err(error),
+        None => Ok(None),
+    }
+}
+
+/// Take up to `samples` (at most [`MAX_SERVICE_STATS_SAMPLES`]) one-shot
+/// stats samples of `container_name`, [`SERVICE_STATS_SAMPLE_INTERVAL`]
+/// apart. A missing container is `found: false`, not an error; a sample that
+/// returns no frame ends the series early.
+pub async fn sample_container_stats(
+    docker: &Docker,
+    container_name: &str,
+    samples: usize,
+) -> Result<ServiceContainerStats, bollard::errors::Error> {
+    let wanted = samples.clamp(1, MAX_SERVICE_STATS_SAMPLES);
+    let mut taken = Vec::with_capacity(wanted);
+    for index in 0..wanted {
+        if index > 0 {
+            tokio::time::sleep(SERVICE_STATS_SAMPLE_INTERVAL).await;
+        }
+        match sample_container_stats_once(docker, container_name).await {
+            Ok(Some(sample)) => taken.push(sample),
+            Ok(None) => break,
+            Err(error) if is_container_missing(&error) => {
+                return Ok(ServiceContainerStats {
+                    found: false,
+                    samples: Vec::new(),
+                })
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(ServiceContainerStats {
+        found: true,
+        samples: taken,
+    })
+}
+
+/// Request to run the Postgres WAL and archive probe on the node that owns
+/// the service. Like the health probe, it names no host, port or query: the
+/// node derives the target from the stored configuration and its own
+/// published address, and the queries are fixed in the engine.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteWalHealthRequest {
+    pub service_config: ServiceConfig,
+}
+
+/// The probe's result. `snapshot` is the engine's `PostgresWalHealth`,
+/// carried opaque because this crate does not build the engines; the control
+/// plane parses it into that type. `None` when the probe could not connect
+/// or a query failed, with the reason in `error`.
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct RemoteWalHealthResponse {
+    #[serde(default)]
+    pub snapshot: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Where on its node an instance is attached. The only part of a database
 /// request that differs by node, on purpose.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -368,6 +539,18 @@ pub trait NodeServiceRuntime: Send + Sync {
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError>;
+
+    /// Run the Postgres WAL and archive probe for `config`, against the
+    /// container this node runs for it. `published_address` is as for
+    /// [`Self::probe_service_health`]. Refuses a service that is not
+    /// Postgres, a host that is not this node and a port that is not the
+    /// service container's.
+    async fn probe_postgres_wal(
+        &self,
+        config: ServiceConfig,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteWalHealthResponse, NodeServiceError>;
 }
 
 #[cfg(test)]

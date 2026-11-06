@@ -466,6 +466,85 @@ pub async fn probe_service_health(
     Ok(result)
 }
 
+/// Run the Postgres WAL and archive probe against a service owned by the
+/// Docker daemon supplied by the caller: the worker-side half of the health
+/// monitor's WAL check for a database on a worker node.
+///
+/// Held to the same rules as [`probe_service_health`]: the caller-supplied
+/// host must be loopback and is then pointed at `published_address` (from
+/// the node's own configuration), and the stored port must be the one the
+/// service's own container publishes, so the probe cannot be aimed at an
+/// arbitrary address or at another container. The queries are fixed in
+/// [`postgres_wal_health`]; nothing in the request is executed.
+///
+/// A probe that cannot connect or whose queries fail is not an error here:
+/// it answers no snapshot and says why, as the local probe would skip.
+pub async fn probe_postgres_wal_health(
+    mut config: ServiceConfig,
+    docker: Arc<bollard::Docker>,
+    published_address: Option<IpAddr>,
+) -> std::result::Result<temps_service_protocol::RemoteWalHealthResponse, ServiceHealthProbeError> {
+    use temps_service_protocol::RemoteWalHealthResponse;
+
+    if config.service_type != ServiceType::Postgres {
+        return Err(ServiceHealthProbeError::Configuration(
+            EngineError::invalid_value(
+                "postgres",
+                format!(
+                    "the WAL probe only runs for Postgres services; '{}' is {}",
+                    config.name, config.service_type
+                ),
+            ),
+        ));
+    }
+    resolve_managed_probe_target(&mut config, published_address)?;
+    if let Some(field) = missing_required_probe_credential(&config) {
+        return Ok(RemoteWalHealthResponse {
+            snapshot: None,
+            error: Some(format!(
+                "stored postgres configuration of '{}' is missing required credential field '{}'",
+                config.name, field
+            )),
+        });
+    }
+    let instance = PostgresService::new(config.name.clone(), docker.clone());
+    validate_owned_container_port(&config, &instance, &docker)
+        .await
+        .map_err(|error| {
+            ServiceHealthProbeError::Configuration(error.into_engine_error(&config.name))
+        })?;
+
+    let Some(conn_str) = postgres_wal_health::build_conn_str(&config.parameters) else {
+        return Ok(RemoteWalHealthResponse {
+            snapshot: None,
+            error: Some(format!(
+                "stored postgres configuration of '{}' lacks the port, username, password or \
+                 database the WAL probe connects with",
+                config.name
+            )),
+        });
+    };
+    let Some(snapshot) = postgres_wal_health::probe_wal_health(&conn_str).await else {
+        return Ok(RemoteWalHealthResponse {
+            snapshot: None,
+            error: Some(format!(
+                "the WAL probe could not connect to '{}' or its queries failed",
+                config.name
+            )),
+        });
+    };
+    let snapshot = serde_json::to_value(&snapshot).map_err(|error| {
+        ServiceHealthProbeError::Provider(EngineError::failed(
+            &config.name,
+            format!("failed to encode the WAL health snapshot: {error}"),
+        ))
+    })?;
+    Ok(RemoteWalHealthResponse {
+        snapshot: Some(snapshot),
+        error: None,
+    })
+}
+
 /// Creation-time config parsers may generate credentials for a new service.
 /// A health probe must never do that: generated credentials cannot match an
 /// already-running container. Redis is the exception because no password is

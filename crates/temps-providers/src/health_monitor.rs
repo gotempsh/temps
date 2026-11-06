@@ -17,7 +17,7 @@ use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
-use crate::services::ExternalServiceManager;
+use crate::services::{record_wal_outcome, ExternalServiceManager, WalProbeOutcome};
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use sea_orm::{
@@ -37,11 +37,6 @@ use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-
-/// Key under `external_services.health_metadata` for Postgres WAL probe output.
-/// Future engines add sibling keys (e.g., `redis_memory`, `mongo_oplog`) so
-/// the column stays generic.
-const POSTGRES_WAL_KEY: &str = "postgres_wal";
 
 /// How many failed probes in a row before we raise an alert.
 pub(crate) const CONSECUTIVE_FAILURES_BEFORE_ALERT: i32 = 3;
@@ -116,6 +111,9 @@ pub struct ExternalServiceHealthMonitor {
     /// service id. The health loop ticks every `poll_interval_secs`; we gate
     /// archiving so it only fires once per service's `binlog_archive_interval`.
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
+    /// MariaDB services on worker nodes whose missing binlog shipping has
+    /// been logged, so it is logged once per service, not every tick.
+    binlog_gap_logged: Arc<Mutex<std::collections::HashSet<i32>>>,
     /// Optional metrics store. When set, container CPU/memory samples for
     /// running services with `metrics_enabled` are written to it on every
     /// health tick (`container.cpu_percent`, `container.memory_used_bytes`,
@@ -146,6 +144,7 @@ impl ExternalServiceHealthMonitor {
             docker,
             encryption_service,
             last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
+            binlog_gap_logged: Arc::new(Mutex::new(std::collections::HashSet::new())),
             metrics_store: None,
             stats_baselines: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -279,17 +278,46 @@ impl ExternalServiceHealthMonitor {
         // The result is persisted under `health_metadata.postgres_wal` so the
         // UI can render warnings. WAL warnings downgrade Operational to
         // Degraded but never escalate Down upward — liveness wins.
-        let wal_snapshot = if service.service_type == "postgres"
+        //
+        // A database on a worker publishes its port on that worker, behind a
+        // host recorded as `localhost`, so this process cannot connect: the
+        // probe runs on the worker through its agent. When it cannot run,
+        // the reason is recorded (`postgres_wal_unchecked`) so the page says
+        // the check is not happening instead of showing nothing.
+        let wal_outcome = if service.service_type == "postgres"
             && service.topology == "standalone"
-            && service.node_id.is_none()
             && !matches!(status, HealthProbeStatus::Down)
         {
-            self.run_postgres_wal_probe(service).await
+            match service.node_id {
+                None => self
+                    .run_postgres_wal_probe(service)
+                    .await
+                    .map(WalProbeOutcome::Snapshot),
+                Some(node_id) => {
+                    let outcome = self
+                        .manager
+                        .probe_worker_postgres_wal(service, node_id)
+                        .await;
+                    if let WalProbeOutcome::Unchecked(reason) = &outcome {
+                        debug!(
+                            service_id = service.id,
+                            service = %service.name,
+                            node_id,
+                            "WAL probe on worker produced no snapshot: {reason}"
+                        );
+                    }
+                    Some(outcome)
+                }
+            }
         } else {
             None
         };
+        let wal_snapshot = match &wal_outcome {
+            Some(WalProbeOutcome::Snapshot(snapshot)) => Some(snapshot),
+            _ => None,
+        };
 
-        if let Some(snapshot) = &wal_snapshot {
+        if let Some(snapshot) = wal_snapshot {
             if snapshot.has_warnings() && matches!(status, HealthProbeStatus::Operational) {
                 status = HealthProbeStatus::Degraded;
                 if error_message.is_none() {
@@ -334,11 +362,16 @@ impl ExternalServiceHealthMonitor {
             0
         };
 
-        let merged_metadata = merge_health_metadata(
-            service.health_metadata.as_ref(),
-            POSTGRES_WAL_KEY,
-            wal_snapshot.as_ref(),
-        );
+        let merged_metadata = wal_outcome.as_ref().and_then(|outcome| {
+            record_wal_outcome(service.health_metadata.as_ref(), outcome, now)
+                .map_err(|e| {
+                    warn!(
+                        "Failed to serialize WAL health for service {}: {}",
+                        service.id, e
+                    )
+                })
+                .ok()
+        });
 
         // Partial update, not `service.clone().into()`: that stamps every
         // column from this cycle's snapshot, including
@@ -380,21 +413,32 @@ impl ExternalServiceHealthMonitor {
         //    service's configured cadence. Only for running standalone
         //    MariaDB services that have a backup schedule (→ S3 destination).
         //    Failures here never affect health monitoring of other services.
+        //
+        //    Not for a MariaDB on a worker node: the shipper reads closed
+        //    binlog segments out of the container through this host's Docker,
+        //    and a worker's container is not on it. Shipping from the worker
+        //    needs an agent route that does not exist yet, so such a service
+        //    has no binlog archive and no point-in-time recovery beyond its
+        //    base backups. That is logged once per service per process, so it
+        //    is not a silent gap.
         if service.service_type == "mariadb"
             && service.topology == "standalone"
-            && service.node_id.is_none()
             && service.status == "running"
             && !matches!(status, HealthProbeStatus::Down)
         {
-            self.maybe_archive_mariadb_binlogs(service).await;
+            match service.node_id {
+                None => self.maybe_archive_mariadb_binlogs(service).await,
+                Some(node_id) => self.note_worker_binlog_gap(service, node_id).await,
+            }
         }
 
         // 5. Container resource metrics: sample docker stats for every
         //    member container and write CPU/memory points to the metrics
         //    store. Gated on the same per-service `metrics_enabled` flag the
-        //    engine-metrics scraper uses. Failures are logged and swallowed —
+        //    engine-metrics scraper uses. A container on a worker is sampled
+        //    through that node's agent. Failures are logged and swallowed —
         //    metrics must never disrupt health monitoring.
-        if service.status == "running" && service.node_id.is_none() && service.metrics_enabled {
+        if service.status == "running" && service.metrics_enabled {
             if let Some(store) = self.metrics_store.clone() {
                 self.record_container_metrics(&store, service).await;
             }
@@ -457,25 +501,43 @@ impl ExternalServiceHealthMonitor {
         store: &Arc<dyn MetricsStore>,
         service: &external_services::Model,
     ) {
-        let report = {
-            let mut baselines = self.stats_baselines.lock().await;
-            let service_baselines = baselines.entry(service.id).or_default();
-            match self
-                .manager
-                .sample_service_stats(service, service_baselines)
-                .await
-            {
-                Ok(report) => report,
-                Err(e) => {
-                    debug!(
-                        service_id = service.id,
-                        service = %service.name,
-                        "Container stats sampling failed: {}", e
-                    );
-                    return;
-                }
+        // Take this service's baselines out and put them back after
+        // sampling, so the lock is never held across a Docker or agent call
+        // (an agent call may take seconds, and every service shares the map).
+        let mut service_baselines = self
+            .stats_baselines
+            .lock()
+            .await
+            .remove(&service.id)
+            .unwrap_or_default();
+        let sampled = self
+            .manager
+            .sample_service_stats(service, &mut service_baselines)
+            .await;
+        self.stats_baselines
+            .lock()
+            .await
+            .insert(service.id, service_baselines);
+        let report = match sampled {
+            Ok(report) => report,
+            Err(e) => {
+                debug!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "Container stats sampling failed: {}", e
+                );
+                return;
             }
         };
+        for member in &report.members {
+            if let Some(reason) = &member.unavailable_reason {
+                debug!(
+                    service_id = service.id,
+                    container = %member.container_name,
+                    "Container stats unavailable: {reason}"
+                );
+            }
+        }
 
         let now = Utc::now();
         let mut points = Vec::with_capacity(report.members.len() * 3);
@@ -922,6 +984,22 @@ impl ExternalServiceHealthMonitor {
         })
     }
 
+    /// Log, once per service per process, that a MariaDB on a worker node
+    /// has no binlog shipping (see the gate in `check_service`).
+    async fn note_worker_binlog_gap(&self, service: &external_services::Model, node_id: i32) {
+        if !self.binlog_gap_logged.lock().await.insert(service.id) {
+            return;
+        }
+        warn!(
+            service_id = service.id,
+            service = %service.name,
+            node_id,
+            "MariaDB binlog archiving is not run for databases on worker nodes yet: closed \
+             binlog segments of this service are not shipped to S3, so point-in-time recovery \
+             is limited to its base backups"
+        );
+    }
+
     /// Run the WAL/archive probe for a standalone Postgres service.
     ///
     /// Best-effort: any failure returns `None` and is logged at debug level
@@ -1077,40 +1155,6 @@ impl ExternalServiceHealthMonitor {
     }
 }
 
-/// Merge a single engine snapshot into the existing `health_metadata` JSON
-/// object under `key`. Preserves sibling keys that other engines may have
-/// written, so future engines can plug in without coordinating writes.
-///
-/// Returns:
-/// - `Some(updated)` when the merged object differs from the input or when a
-///   new snapshot is being recorded.
-/// - `None` when `snapshot` is `None` AND nothing in the input needs touching
-///   (avoids gratuitous UPDATEEs on services with no metadata).
-fn merge_health_metadata<T: serde::Serialize>(
-    existing: Option<&sea_orm::JsonValue>,
-    key: &str,
-    snapshot: Option<&T>,
-) -> Option<sea_orm::JsonValue> {
-    let snapshot = snapshot?;
-    let snapshot_value = match serde_json::to_value(snapshot) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                "Failed to serialize health metadata snapshot for key '{}': {}",
-                key, e
-            );
-            return None;
-        }
-    };
-
-    let mut map = match existing {
-        Some(serde_json::Value::Object(m)) => m.clone(),
-        _ => serde_json::Map::new(),
-    };
-    map.insert(key.to_string(), snapshot_value);
-    Some(serde_json::Value::Object(map))
-}
-
 /// What the health monitor does with a service, given its lifecycle
 /// `external_services.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1178,47 +1222,5 @@ mod tests {
     fn failed_and_unknown_services_are_down() {
         assert_eq!(lifecycle_probe("failed"), LifecycleProbe::Down);
         assert_eq!(lifecycle_probe("something-new"), LifecycleProbe::Down);
-    }
-
-    #[test]
-    fn merge_writes_new_key_into_empty_metadata() {
-        let merged =
-            merge_health_metadata(None, "postgres_wal", Some(&serde_json::json!({"a": 1})));
-        let merged = merged.expect("expected merged value");
-        assert_eq!(merged["postgres_wal"]["a"], 1);
-    }
-
-    #[test]
-    fn merge_preserves_sibling_keys() {
-        let existing = serde_json::json!({"redis_memory": {"used_bytes": 42}});
-        let merged = merge_health_metadata(
-            Some(&existing),
-            "postgres_wal",
-            Some(&serde_json::json!({"pg_wal_bytes": 100})),
-        )
-        .expect("expected merged value");
-        assert_eq!(merged["redis_memory"]["used_bytes"], 42);
-        assert_eq!(merged["postgres_wal"]["pg_wal_bytes"], 100);
-    }
-
-    #[test]
-    fn merge_overwrites_same_key() {
-        let existing = serde_json::json!({"postgres_wal": {"old": true}});
-        let merged = merge_health_metadata(
-            Some(&existing),
-            "postgres_wal",
-            Some(&serde_json::json!({"new": true})),
-        )
-        .expect("expected merged value");
-        assert!(merged["postgres_wal"].get("old").is_none());
-        assert_eq!(merged["postgres_wal"]["new"], true);
-    }
-
-    #[test]
-    fn merge_returns_none_when_snapshot_missing() {
-        let existing = serde_json::json!({"postgres_wal": {"old": true}});
-        let merged =
-            merge_health_metadata::<serde_json::Value>(Some(&existing), "postgres_wal", None);
-        assert!(merged.is_none());
     }
 }

@@ -697,6 +697,12 @@ pub struct ContainerRuntimeInfo {
     /// `HostConfig`. Compare this against the user-configured limits to
     /// detect drift (an old container that never picked up new caps).
     pub resource_limits: crate::externalsvc::ServiceResourceLimits,
+    /// Why the fields above could not be read, when they could not: this
+    /// server has no Docker daemon for a local container, the agent on the
+    /// container's node could not be reached, or it is too old to report
+    /// this. `None` with an empty `container_id` means the container does
+    /// not exist.
+    pub unavailable_reason: Option<String>,
 }
 
 /// Aggregate runtime info for an external service. For standalone services,
@@ -731,6 +737,11 @@ pub struct ContainerStatsSample {
     /// Number of cores Docker observed at sample time. Used by the UI
     /// to label "x/y cores" instead of just a percent.
     pub online_cpus: Option<u32>,
+    /// Why no sample could be taken, when none could: this server has no
+    /// Docker daemon for a local container, the agent on the container's
+    /// node could not be reached, or it is too old to report usage. `None`
+    /// with empty fields means the container is missing or stopped.
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]

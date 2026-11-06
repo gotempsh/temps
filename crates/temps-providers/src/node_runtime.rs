@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
     AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, NodeAttachment,
-    NodeServiceError, NodeServiceRuntime, ServiceConfig, ServiceType,
+    NodeServiceError, NodeServiceRuntime, RemoteWalHealthResponse, ServiceConfig, ServiceType,
 };
 
 use crate::externalsvc;
@@ -106,6 +106,17 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         published_address: Option<IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError> {
         externalsvc::probe_service_health(config, docker, published_address)
+            .await
+            .map_err(engine_error)
+    }
+
+    async fn probe_postgres_wal(
+        &self,
+        config: ServiceConfig,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteWalHealthResponse, NodeServiceError> {
+        externalsvc::probe_postgres_wal_health(config, docker, published_address)
             .await
             .map_err(engine_error)
     }

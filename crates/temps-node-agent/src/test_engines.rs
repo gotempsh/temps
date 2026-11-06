@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
     AdmittedWorkload, ContainerSnapshot, HealthProbeResult, NodeServiceError, NodeServiceRuntime,
-    ServiceConfig, ServiceType,
+    RemoteWalHealthResponse, ServiceConfig, ServiceType,
 };
 
 use crate::handlers::AgentState;
@@ -97,6 +97,15 @@ impl NodeServiceRuntime for StubRuntime {
         _published_address: Option<std::net::IpAddr>,
     ) -> Result<HealthProbeResult, NodeServiceError> {
         Err(not_available("probe"))
+    }
+
+    async fn probe_postgres_wal(
+        &self,
+        _config: ServiceConfig,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<RemoteWalHealthResponse, NodeServiceError> {
+        Err(not_available("WAL probe"))
     }
 }
 
