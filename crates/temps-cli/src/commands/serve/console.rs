@@ -2366,7 +2366,7 @@ async fn public_only_not_found(req: Request) -> Response {
     let hide_identity = req
         .extensions()
         .get::<Arc<temps_config::ConfigService>>()
-        .is_some_and(|settings| settings.hide_platform_identity());
+        .is_none_or(|settings| settings.hide_platform_identity());
     let headers = req.headers();
     let wants_html = !req.uri().path().starts_with("/api/")
         && headers
@@ -2613,7 +2613,7 @@ mod public_only_app_tests {
     }
 
     #[tokio::test]
-    async fn a_browser_gets_the_branded_404_and_an_api_client_an_empty_one() {
+    async fn a_browser_gets_a_neutral_404_by_default_and_an_api_client_an_empty_one() {
         let browser = Request::builder()
             .uri("/dashboard")
             .header(header::HOST, "hooks.example.com")
@@ -2628,9 +2628,10 @@ mod public_only_app_tests {
         let html = String::from_utf8_lossy(&body);
         assert!(
             html.contains("<!doctype html>"),
-            "expected the branded page"
+            "expected the neutral page"
         );
         assert!(html.contains("hooks.example.com"));
+        assert!(!html.to_lowercase().contains("temps"));
         assert!(
             !html.contains("id=\"root\""),
             "the dashboard bundle must never be served here"

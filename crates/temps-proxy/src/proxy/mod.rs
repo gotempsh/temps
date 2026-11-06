@@ -22,7 +22,7 @@
 
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
-    generate_preview_bridge_html, generate_preview_form_html_labeled, sanitize_next,
+    generate_preview_bridge_html, generate_preview_form_with_identity, sanitize_next,
     PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
@@ -822,7 +822,7 @@ impl LoadBalancer {
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
-            hide_platform_identity: Arc::new(AtomicBool::new(false)),
+            hide_platform_identity: Arc::new(AtomicBool::new(true)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
             on_demand_manager: None,
             on_demand_cert_manager: None,
@@ -963,12 +963,42 @@ impl LoadBalancer {
         self.hide_platform_identity.load(Ordering::Relaxed)
     }
 
+    fn authenticated_probe(&self, session: &PingoraSession) -> bool {
+        let headers = &session.req_header().headers;
+        let Some(token) = headers
+            .get(temps_core::probe_auth::HEADER)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return false;
+        };
+        let host = headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        // Probe URLs use DNS hosts; discard the optional listener port.
+        let host = host.split(':').next().unwrap_or_default();
+        temps_core::probe_auth::verify(
+            &self.config_service.get_server_config().encryption_key,
+            host,
+            token,
+            temps_core::probe_auth::now(),
+        )
+    }
+
     fn expose_probe_markers(&self, session: &PingoraSession) -> bool {
-        !self.hide_platform_identity()
-            || session
-                .client_addr()
-                .and_then(|a| a.as_inet())
-                .is_some_and(|a| a.ip().is_loopback())
+        !self.hide_platform_identity() || self.authenticated_probe(session)
+    }
+
+    fn protect_probe_response(
+        &self,
+        session: &PingoraSession,
+        response: &mut ResponseHeader,
+    ) -> Result<()> {
+        response.append_header("Vary", temps_core::probe_auth::HEADER)?;
+        if self.authenticated_probe(session) {
+            response.insert_header("Cache-Control", "private, no-store")?;
+        }
+        Ok(())
     }
 
     /// Enable forwarded client IPs only for an explicitly configured local proxy.
@@ -1578,12 +1608,13 @@ impl LoadBalancer {
         } else if !self.disable_https_redirect {
             // A verified hostname always has its certificate: upgrade.
             let location = format!("https://{host}{}", ctx.path);
-            let resp = https_redirect_response(
+            let mut resp = https_redirect_response(
                 &location,
                 &ctx.request_id,
                 self.expose_probe_markers(session),
             )?;
             ctx.routing_status = "status_page_host_https_redirect".to_string();
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }
@@ -2814,18 +2845,14 @@ impl LoadBalancer {
         let html = if has_session_grant {
             generate_preview_bridge_html(&label, &next)
         } else {
-            generate_preview_form_html_labeled(
+            generate_preview_form_with_identity(
                 &label,
                 preview_host.port,
                 &next,
                 false,
                 settings.external_url.as_deref(),
+                self.hide_platform_identity(),
             )
-        };
-        let html = if self.hide_platform_identity() {
-            crate::branded_404::neutralize_access_response(html)
-        } else {
-            html
         };
         let mut response = ResponseHeader::build(StatusCode::OK, None)?;
         response.insert_header("Content-Type", "text/html; charset=utf-8")?;
@@ -2975,18 +3002,14 @@ impl LoadBalancer {
             self.preview_auth_limiter.record_failure(limiter_ip, hex);
             debug!(sandbox = %hex, "preview-auth: sandbox login failed (bad password)");
             let label = format!("sandbox sbx_{}", hex);
-            let html = generate_preview_form_html_labeled(
+            let html = generate_preview_form_with_identity(
                 &label,
                 preview_host.port,
                 &next,
                 true,
                 settings.external_url.as_deref(),
+                self.hide_platform_identity(),
             );
-            let html = if self.hide_platform_identity() {
-                crate::branded_404::neutralize_access_response(html)
-            } else {
-                html
-            };
             let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
             response.insert_header("Content-Type", "text/html; charset=utf-8")?;
             response.insert_header("Cache-Control", "no-store")?;
@@ -3848,6 +3871,7 @@ impl ProxyHttp for LoadBalancer {
 
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
+        self.protect_probe_response(session, upstream_response)?;
         strip_proxy_owned_response_headers(upstream_response);
         if ctx.gated_host {
             crate::handler::gate::strip_gate_from_app_response(upstream_response)?;
@@ -4146,6 +4170,7 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        upstream_request.remove_header(temps_core::probe_auth::HEADER);
         // ADR 065 D8: no app receives the gate's cookies, admitted or not,
         // gated host or not. A cookie left from before an address stopped
         // being signed-in is still a token.
@@ -4558,10 +4583,8 @@ impl ProxyHttp for LoadBalancer {
                 error!("Failed to insert SERVER header: {:?}", e);
             }
         }
-        if self.hide_platform_identity() {
-            if let Err(e) = header.insert_header("X-Request-ID", &ctx.request_id) {
-                error!(error = %e, "Failed to insert request ID in proxy error response");
-            }
+        if let Err(e) = header.insert_header("X-Request-ID", &ctx.request_id) {
+            error!(error = %e, "Failed to insert request ID in proxy error response");
         }
         if let Err(e) = header.insert_header(header::DATE, "Sun, 06 Nov 1994 08:49:37 GMT") {
             error!("Failed to insert DATE header: {:?}", e);

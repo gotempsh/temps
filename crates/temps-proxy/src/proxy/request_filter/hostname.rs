@@ -154,6 +154,7 @@ impl LoadBalancer {
                 if !self.expose_probe_markers(session) {
                     response.remove_header(temps_core::gate::GATE_HEADER);
                 }
+                self.protect_probe_response(session, &mut response)?;
                 session
                     .write_response_header(Box::new(response), body.is_none())
                     .await?;

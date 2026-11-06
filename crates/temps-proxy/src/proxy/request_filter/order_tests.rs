@@ -603,6 +603,7 @@ async fn client_supplied_trust_headers_never_reach_the_app_or_the_log() {
     f.route_host(|_, _| {});
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {HOST}\r\n\
+         X-Origin-Probe-Authorization: test-credential\r\n\
          X-Temps-Demo-Mode: true\r\n\
          {identity}-email: spoofed@example.test\r\n\
          {status_host}: status.example.test\r\n\
@@ -643,6 +644,7 @@ async fn client_supplied_trust_headers_never_reach_the_app_or_the_log() {
         .as_ref()
         .expect("headers captured");
     for name in [
+        temps_core::probe_auth::HEADER,
         "x-real-ip",
         "cf-connecting-ip",
         "forwarded",
@@ -1503,7 +1505,7 @@ async fn hidden_platform_identity_keeps_app_timing_headers() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn hidden_platform_identity_keeps_loopback_monitor_markers() {
+async fn hidden_platform_identity_requires_authentication_even_on_loopback() {
     let fixture = fixture_with(ProxyConfig::default());
     fixture
         .lb
@@ -1522,13 +1524,82 @@ async fn hidden_platform_identity_keeps_loopback_monitor_markers() {
     stream.set_socket_digest(digest);
     let mut session = Session::new_h1(Box::new(stream));
     assert!(session.read_request().await.unwrap());
+    assert!(!fixture.lb.expose_probe_markers(&session));
+    session
+        .req_header_mut()
+        .insert_header("User-Agent", "Temps-Reachability/1.0")
+        .unwrap();
+    assert!(!fixture.lb.expose_probe_markers(&session));
+    session
+        .req_header_mut()
+        .insert_header(temps_core::probe_auth::HEADER, "invalid")
+        .unwrap();
+    assert!(!fixture.lb.expose_probe_markers(&session));
+    let host = session
+        .req_header()
+        .headers
+        .get("host")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let token = temps_core::probe_auth::sign(
+        &fixture.lb.config_service.get_server_config().encryption_key,
+        host,
+        temps_core::probe_auth::now(),
+    );
+    session
+        .req_header_mut()
+        .insert_header(temps_core::probe_auth::HEADER, token)
+        .unwrap();
     assert!(fixture.lb.expose_probe_markers(&session));
-    let response = crate::proxy::https_redirect_response(
+    let mut ctx = fixture.lb.new_ctx();
+    let mut upstream = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    upstream
+        .insert_header(temps_core::probe_auth::HEADER, "credential")
+        .unwrap();
+    upstream.insert_header("X-App-Header", "preserved").unwrap();
+    fixture
+        .lb
+        .upstream_request_filter(&mut session, &mut upstream, &mut ctx)
+        .await
+        .unwrap();
+    assert!(!upstream
+        .headers
+        .contains_key(temps_core::probe_auth::HEADER));
+    assert_eq!(upstream.headers.get("X-App-Header").unwrap(), "preserved");
+    let mut app_response = pingora_http::ResponseHeader::build(200, None).unwrap();
+    app_response.insert_header("Server", "app-owned").unwrap();
+    fixture
+        .lb
+        .upstream_response_filter(&mut session, &mut app_response, &mut ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        app_response
+            .headers
+            .get("X-Temps-Proxy-Probe-Capable")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(app_response.headers.get("Server").unwrap(), "app-owned");
+    let mut response = crate::proxy::https_redirect_response(
         "https://app.example.test/",
         "probe-request",
         fixture.lb.expose_probe_markers(&session),
     )
     .unwrap();
+    fixture
+        .lb
+        .protect_probe_response(&session, &mut response)
+        .unwrap();
+    assert_eq!(
+        response.headers.get("cache-control").unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(
+        response.headers.get("vary").unwrap(),
+        temps_core::probe_auth::HEADER
+    );
     assert_eq!(
         response
             .headers
@@ -1587,9 +1658,11 @@ async fn platform_identity_controls_error_and_challenge_responses() {
             let mut raw = Vec::new();
             client.read_to_end(&mut raw).await.unwrap();
             let response = String::from_utf8(raw).unwrap();
+            assert!(response
+                .to_lowercase()
+                .contains(&format!("x-request-id: {}", ctx.request_id)));
             if hide {
                 assert!(!response.to_lowercase().contains("temps"), "{response}");
-                assert!(response.to_lowercase().contains("x-request-id:"));
             } else if failed_upstream {
                 assert!(response.contains("Temps"));
             }

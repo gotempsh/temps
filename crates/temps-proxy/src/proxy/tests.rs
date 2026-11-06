@@ -400,6 +400,18 @@ mod https_redirect_tests {
     }
 
     #[test]
+    fn domain_redirect_hides_markers_without_changing_redirect() {
+        let response =
+            domain_redirect_response(302, "https://example.test/pricing", false).unwrap();
+        assert_eq!(response.status.as_u16(), 302);
+        assert_eq!(
+            response.headers.get("location").unwrap(),
+            "https://example.test/pricing"
+        );
+        assert!(!response.headers.contains_key("x-temps-proxy-probe-capable"));
+    }
+
+    #[test]
     fn application_cannot_spoof_proxy_https_redirect_marker() {
         let mut response = ResponseHeader::build(302, None).expect("build application response");
         response
@@ -2618,6 +2630,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .hide_platform_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), BLOCKED, true).await?);
@@ -2649,6 +2664,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .hide_platform_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
@@ -2693,6 +2711,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .hide_platform_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
         let (head, _, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, false).await?);
         assert!(head.starts_with("HTTP/1.1 426"), "{head}");

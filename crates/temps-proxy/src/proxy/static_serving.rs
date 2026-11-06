@@ -5,6 +5,29 @@
 
 use super::*;
 
+// A 304 merges into a cached response: omitting a formerly present marker
+// does not remove it. Neutral responses use a different validator, including
+// for validators emitted before the privacy setting existed.
+fn static_response_etag(etag: String, expose: bool) -> String {
+    if expose {
+        etag
+    } else {
+        format!("{}-n1\"", etag.trim_end_matches('"'))
+    }
+}
+
+fn static_validator_matches(value: &str, etag: &str, expose: bool) -> bool {
+    if expose {
+        if_none_match_matches(value, etag)
+    } else {
+        // A wildcard does not prove the cached response used neutral headers.
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == etag)
+    }
+}
+
 impl LoadBalancer {
     /// Check if a request path should be logged (HTML pages only, skip static assets)
     fn should_log_static_request(path: &str) -> bool {
@@ -168,7 +191,11 @@ impl LoadBalancer {
 
         // Metadata + immutable deployment identity produce the validator before
         // body IO. Conditional requests therefore never read the file body.
-        let etag = metadata_etag(&opened.canonical_path, &opened.metadata);
+        let expose = self.expose_probe_markers(session);
+        let etag = static_response_etag(
+            metadata_etag(&opened.canonical_path, &opened.metadata),
+            expose,
+        );
         let is_not_found_page = opened.matched == StaticFileMatch::NotFoundPage;
 
         // Check If-None-Match header for 304 Not Modified response. A 404 has
@@ -180,12 +207,12 @@ impl LoadBalancer {
             .and_then(|v| v.to_str().ok())
             .filter(|_| !is_not_found_page)
         {
-            if if_none_match_matches(if_none_match, &etag) {
+            if static_validator_matches(if_none_match, &etag, expose) {
                 debug!("ETag match - returning 304 Not Modified for: {}", ctx.path);
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+                mark_served_by_proxy(&mut resp, expose)?;
 
                 resp.insert_header(
                     header::CACHE_CONTROL,
@@ -196,6 +223,7 @@ impl LoadBalancer {
                 // Without this, visitors won't get cookies on cached root URLs (/) and events will fail
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
+                self.protect_probe_response(session, &mut resp)?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
                 return Ok(StaticFileServeOutcome::Served);
@@ -207,7 +235,7 @@ impl LoadBalancer {
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+        mark_served_by_proxy(&mut resp, expose)?;
         Self::insert_static_validators(&mut resp, &ctx.path, &etag, opened.matched)?;
 
         // Set visitor and session tracking cookies for static file responses
@@ -215,6 +243,7 @@ impl LoadBalancer {
 
         // HEAD has the same metadata as GET and intentionally never reads a body.
         let outcome = Self::static_served_outcome(opened.matched);
+        self.protect_probe_response(session, &mut resp)?;
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
@@ -343,6 +372,7 @@ impl LoadBalancer {
         self.ensure_static_visitor_session(session, ctx, page_content_type)
             .await;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
+        self.protect_probe_response(session, &mut resp)?;
         session.write_response_header(Box::new(resp), true).await?;
         Ok(Self::static_served_outcome(matched))
     }
@@ -449,7 +479,8 @@ impl LoadBalancer {
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
-        let etag = object_etag(&resolved_key, opened.size_bytes);
+        let expose = self.expose_probe_markers(session);
+        let etag = static_response_etag(object_etag(&resolved_key, opened.size_bytes), expose);
 
         if let Some(if_none_match) = session
             .req_header()
@@ -458,16 +489,17 @@ impl LoadBalancer {
             .and_then(|v| v.to_str().ok())
             .filter(|_| matched != StaticFileMatch::NotFoundPage)
         {
-            if if_none_match_matches(if_none_match, &etag) {
+            if static_validator_matches(if_none_match, &etag, expose) {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+                mark_served_by_proxy(&mut resp, expose)?;
                 resp.insert_header(
                     header::CACHE_CONTROL,
                     Self::static_cache_control(&ctx.path, matched),
                 )?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
+                self.protect_probe_response(session, &mut resp)?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
                 return Ok(StaticFileServeOutcome::Served);
@@ -478,11 +510,12 @@ impl LoadBalancer {
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
         resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+        mark_served_by_proxy(&mut resp, expose)?;
         Self::insert_static_validators(&mut resp, &ctx.path, &etag, matched)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         let outcome = Self::static_served_outcome(matched);
+        self.protect_probe_response(session, &mut resp)?;
         session.write_response_header(Box::new(resp), false).await?;
         if ctx.method == "HEAD" {
             session.write_response_body(None, true).await?;
@@ -610,6 +643,9 @@ impl LoadBalancer {
             return Ok(false);
         };
 
+        let expose = self.expose_probe_markers(session);
+        let etag = static_response_etag(etag, expose);
+
         // Open first so 304/HEAD validate the actual blob size without reading
         // body bytes or trusting stale/corrupt database metadata.
         let mut opened = match file_store.open_blob(&asset.content_hash).await {
@@ -650,13 +686,14 @@ impl LoadBalancer {
             .get("if-none-match")
             .and_then(|value| value.to_str().ok())
         {
-            if if_none_match_matches(if_none_match, &etag) {
+            if static_validator_matches(if_none_match, &etag, expose) {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+                mark_served_by_proxy(&mut resp, expose)?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
+                self.protect_probe_response(session, &mut resp)?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
                 return Ok(true);
@@ -671,8 +708,9 @@ impl LoadBalancer {
             resp.insert_header("ETag", &etag)?;
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
             resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+            mark_served_by_proxy(&mut resp, expose)?;
             self.set_tracking_cookies(session, &mut resp, ctx).await?;
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), false).await?;
             session.write_response_body(None, true).await?;
             return Ok(true);
@@ -684,9 +722,10 @@ impl LoadBalancer {
         resp.insert_header("ETag", &etag)?;
         resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
+        mark_served_by_proxy(&mut resp, expose)?;
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
+        self.protect_probe_response(session, &mut resp)?;
         session.write_response_header(Box::new(resp), false).await?;
         let mut remaining = opened.size_bytes;
         while remaining > 0 {
@@ -970,6 +1009,15 @@ pub(super) mod static_path_route_redirect_tests {
         path_route: Option<PathRoute>,
         path_and_query: &str,
     ) -> Result<(StaticFileServeOutcome, String, String)> {
+        serve_conditional(lb, path_route, path_and_query, None).await
+    }
+
+    async fn serve_conditional(
+        lb: &LoadBalancer,
+        path_route: Option<PathRoute>,
+        path_and_query: &str,
+        validator: Option<&str>,
+    ) -> Result<(StaticFileServeOutcome, String, String)> {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client
             .write_all(
@@ -980,6 +1028,11 @@ pub(super) mod static_path_route_redirect_tests {
         let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
         assert!(session.read_request().await?, "request must parse");
 
+        if let Some(validator) = validator {
+            session
+                .req_header_mut()
+                .insert_header("If-None-Match", validator)?;
+        }
         let mut ctx = lb.new_ctx();
         let (path, query) = match path_and_query.split_once('?') {
             Some((path, query)) => (path, Some(query.to_string())),
@@ -1023,6 +1076,58 @@ pub(super) mod static_path_route_redirect_tests {
     }
 
     #[tokio::test]
+    async fn toggling_identity_hiding_replaces_cached_branded_static_response() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+        lb.hide_platform_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let (_, branded, _) = serve(&lb, None, "/").await?;
+        let etag = |head: &str| {
+            head.lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("etag")
+                        .then(|| value.trim().to_string())
+                })
+                .unwrap()
+        };
+        let old = etag(&branded);
+        assert!(branded
+            .to_ascii_lowercase()
+            .contains("x-temps-proxy-probe-capable: 1"));
+        lb.hide_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for old_validator in [old.as_str(), "*"] {
+            let (_, neutral, _) = serve_conditional(&lb, None, "/", Some(old_validator)).await?;
+            assert!(neutral.starts_with("HTTP/1.1 200"), "{neutral}");
+            assert!(!neutral.to_ascii_lowercase().contains("x-temps-"));
+            let current = etag(&neutral);
+            assert_ne!(current, old);
+            let (_, unchanged, _) = serve_conditional(&lb, None, "/", Some(&current)).await?;
+            assert!(unchanged.starts_with("HTTP/1.1 304"), "{unchanged}");
+            assert!(!unchanged.to_ascii_lowercase().contains("x-temps-"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_static_validator_shapes_change_with_privacy_mode() {
+        for base in [
+            super::object_etag("deployment/index.html", 42),
+            super::bounded_cas_etag(&"a".repeat(64), 42).unwrap(),
+            "W/\"disk-metadata\"".to_string(),
+        ] {
+            let neutral = super::static_response_etag(base.clone(), false);
+            assert_ne!(neutral, base);
+            assert!(!super::static_validator_matches(&base, &neutral, false));
+            assert!(!super::static_validator_matches("*", &neutral, false));
+            assert!(super::static_validator_matches(&neutral, &neutral, false));
+            assert_eq!(super::static_response_etag(base.clone(), true), base);
+        }
+    }
+
+    #[tokio::test]
     async fn stripped_route_redirect_keeps_the_mount_prefix_and_query() -> Result<()> {
         let data_dir = TempDir::new()?;
         write_deployment(data_dir.path())?;
@@ -1048,6 +1153,8 @@ pub(super) mod static_path_route_redirect_tests {
         write_deployment(data_dir.path())?;
         let lb = load_balancer(data_dir.path())?;
 
+        lb.hide_platform_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         for requested in ["/docs/", "/docs/guide/"] {
             let (_, head, _) = serve(&lb, Some(route("/docs", true)), requested).await?;
             assert!(
@@ -1055,6 +1162,18 @@ pub(super) mod static_path_route_redirect_tests {
                     .contains("x-temps-proxy-probe-capable: 1"),
                 "{requested}: {head}"
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn static_responses_hide_identity_by_default() -> Result<()> {
+        let data_dir = TempDir::new()?;
+        write_deployment(data_dir.path())?;
+        let lb = load_balancer(data_dir.path())?;
+        for requested in ["/docs/", "/docs/guide/"] {
+            let (_, head, _) = serve(&lb, Some(route("/docs", true)), requested).await?;
+            assert!(!head.to_ascii_lowercase().contains("x-temps-"));
         }
         Ok(())
     }

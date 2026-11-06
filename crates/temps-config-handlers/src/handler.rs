@@ -4631,7 +4631,7 @@ mod tests {
     #[test]
     fn platform_identity_defaults_and_omitted_updates() {
         let mut incoming = AppSettings::default();
-        assert!(!incoming.hide_platform_identity());
+        assert!(incoming.hide_platform_identity());
         let stored = AppSettings {
             hide_platform_identity: Some(true),
             ..AppSettings::default()
@@ -4644,6 +4644,13 @@ mod tests {
         };
         preserve_omitted_security_fields(&mut explicit, &stored);
         assert!(!AppSettingsResponse::from(explicit).hide_platform_identity);
+        let mut omitted = AppSettings::default();
+        let stored = AppSettings {
+            hide_platform_identity: Some(false),
+            ..AppSettings::default()
+        };
+        preserve_omitted_security_fields(&mut omitted, &stored);
+        assert!(!AppSettingsResponse::from(omitted).hide_platform_identity);
     }
 
     #[tokio::test]
@@ -7463,7 +7470,9 @@ mod tests {
                 host: "localhost".to_string(),
                 is_secure: false,
             })
-            .body(axum::body::Body::from(r#"{"hide_platform_identity":true}"#))
+            .body(axum::body::Body::from(
+                r#"{"hide_platform_identity":false}"#,
+            ))
             .unwrap();
         let response = configure_routes()
             .with_state(state.clone())
@@ -7475,7 +7484,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        assert!(state
+        assert!(!state
             .config_service
             .get_settings()
             .await

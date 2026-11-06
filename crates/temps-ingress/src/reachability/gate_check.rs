@@ -99,8 +99,35 @@ pub fn classify(
     }
 }
 
+/// Without either proxy marker, a missing gate header is not proof of an
+/// open app: an intermediary may have removed the probe credential or answer.
+fn classify_probe_response(
+    gate: GateKind,
+    team_domain: Option<&str>,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+) -> GateProbe {
+    let result = classify(
+        gate,
+        team_domain,
+        status,
+        headers.get(GATE_HEADER).and_then(|v| v.to_str().ok()),
+        headers
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+    );
+    if matches!(result, GateProbe::Open { .. })
+        && !headers.contains_key(GATE_HEADER)
+        && !headers.contains_key(super::forward_check::TEMPS_ANSWER_HEADER)
+    {
+        GateProbe::Unchecked("the response carried no origin probe markers; an intermediary may have blocked the authenticated check".to_string())
+    } else {
+        result
+    }
+}
+
 /// Ask `host` over HTTPS as a browser would, without a cookie.
-pub async fn probe(host: &str, gate: GateKind, team_domain: Option<&str>) -> GateProbe {
+pub async fn probe(host: &str, gate: GateKind, team_domain: Option<&str>, key: &str) -> GateProbe {
     let addresses = match resolve_and_validate_domain(host, 443).await {
         Ok(addresses) => addresses,
         Err(UrlValidationError::DnsResolutionFailed(reason)) => {
@@ -125,24 +152,22 @@ pub async fn probe(host: &str, gate: GateKind, team_domain: Option<&str>) -> Gat
     };
     let response = client
         .get(format!("https://{host}/"))
+        .header(
+            temps_core::probe_auth::HEADER,
+            temps_core::probe_auth::sign(key, host, temps_core::probe_auth::now()),
+        )
+        .header("cache-control", "no-cache, no-store")
         .header("accept", "text/html")
         .header("sec-fetch-mode", "navigate")
         .header("sec-fetch-dest", "document")
         .send()
         .await;
     match response {
-        Ok(response) => classify(
+        Ok(response) => classify_probe_response(
             gate,
             team_domain,
             response.status().as_u16(),
-            response
-                .headers()
-                .get(GATE_HEADER)
-                .and_then(|v| v.to_str().ok()),
-            response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok()),
+            response.headers(),
         ),
         Err(error) => GateProbe::Unchecked(format!("https://{host}/ did not answer: {error}")),
     }
@@ -227,6 +252,28 @@ mod tests {
             classify(GateKind::Temps, None, 401, Some("sign-in"), None),
             GateProbe::Unchecked(_)
         ));
+    }
+
+    #[test]
+    fn stripped_probe_markers_are_inconclusive_not_an_open_gate() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(matches!(
+            classify_probe_response(GateKind::Temps, None, 302, &headers),
+            GateProbe::Unchecked(_)
+        ));
+        headers.insert(
+            super::super::forward_check::TEMPS_ANSWER_HEADER,
+            "1".parse().unwrap(),
+        );
+        assert_eq!(
+            classify_probe_response(GateKind::Temps, None, 200, &headers),
+            GateProbe::Open { status: 200 }
+        );
+        headers.insert(GATE_HEADER, GATE_SIGN_IN.parse().unwrap());
+        assert_eq!(
+            classify_probe_response(GateKind::Temps, None, 302, &headers),
+            GateProbe::InFront
+        );
     }
 
     const TEAM: Option<&str> = Some("team.cloudflareaccess.com");
@@ -329,7 +376,7 @@ mod tests {
         // `localhost` resolves to loopback, which the outbound policy
         // refuses: nothing is dialled.
         assert!(matches!(
-            probe("localhost", GateKind::Temps, None).await,
+            probe("localhost", GateKind::Temps, None, "test-key").await,
             GateProbe::Unchecked(_)
         ));
     }

@@ -2526,9 +2526,9 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    /// The database-backed opt-in, disabled until explicitly set by an admin.
+    /// Hide identity by default, including settings saved before this field existed.
     pub fn hide_platform_identity(&self) -> bool {
-        self.hide_platform_identity.unwrap_or(false)
+        self.hide_platform_identity.unwrap_or(true)
     }
 
     /// The database-backed opt-in, disabled until explicitly set by an admin.
@@ -2739,6 +2739,11 @@ impl AppSettings {
                 Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
                 Some(_) => Some(false),
             };
+            // Preserve an explicit branding choice when another section is malformed.
+            // An absent or invalid flag keeps the privacy-preserving default.
+            let hide_platform_identity = value
+                .get("hide_platform_identity")
+                .and_then(serde_json::Value::as_bool);
             // Same for the ClickHouse wire-compression mode: resetting a saved
             // `none` to the LZ4 default would silently re-break a deployment
             // whose proxy corrupts LZ4 framing, over an unrelated bad section.
@@ -2768,6 +2773,7 @@ impl AppSettings {
             };
             Self {
                 anonymous_telemetry_enabled,
+                hide_platform_identity,
                 clickhouse,
                 on_demand_tls,
                 shield,

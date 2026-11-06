@@ -72,7 +72,7 @@ export function SecurityPage() {
         permissions_policy: null,
       },
       rate_limiting: DEFAULT_RATE_LIMITING,
-      hide_platform_identity: false,
+      hide_platform_identity: true,
       trust_loopback_forwarded_ip: false,
       loopback_ja4_header: '',
       trusted_private_networks_text: '',

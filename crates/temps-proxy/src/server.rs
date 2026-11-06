@@ -73,13 +73,14 @@ fn apply_forwarded_ip_trust_refresh(
 /// ignored and loopback is used as the client IP for IP-based controls.
 async fn load_initial_forwarded_ip_trust(
     config_service: &temps_config::ConfigService,
-) -> Result<(bool, Option<Arc<HeaderName>>)> {
+) -> Result<(bool, Option<Arc<HeaderName>>, bool)> {
     let settings = config_service.get_settings().await.map_err(|error| {
         anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
     })?;
     Ok((
         settings.trust_loopback_forwarded_ip(),
         loopback_ja4_header(&settings),
+        settings.hide_platform_identity(),
     ))
 }
 
@@ -131,16 +132,13 @@ fn start_forwarded_ip_trust_refresh(
     // (the outer runtime is only driving synchronous setup at this point), but this
     // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
     // for — worth knowing before attempting to un-ignore those tests.
-    let (initial, initial_ja4_header) =
+    let (initial, initial_ja4_header, initial_identity) =
         runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
     info!(
         enabled = initial,
         ja4_header = initial_ja4_header.as_deref().map(HeaderName::as_str),
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
-    let initial_identity = runtime
-        .block_on(config_service.get_settings())?
-        .hide_platform_identity();
     let trust = LoopbackTrust {
         hide_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
         forwarded_ip: Arc::new(AtomicBool::new(initial)),
@@ -1308,6 +1306,7 @@ mod preflight_bind_tests {
     fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
         let settings = AppSettings {
             trust_loopback_forwarded_ip: Some(true),
+            hide_platform_identity: Some(false),
             ..AppSettings::default()
         };
         let row = settings::Model {
@@ -1327,6 +1326,7 @@ mod preflight_bind_tests {
         let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
         assert!(trust.forwarded_ip.load(Ordering::Relaxed));
+        assert!(!trust.hide_platform_identity.load(Ordering::Relaxed));
         assert!(
             trust.ja4_header.load().is_none(),
             "no JA4 header configured"

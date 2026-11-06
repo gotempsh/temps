@@ -69,10 +69,32 @@ enum ProbeSendError {
     Timeout { attempts: u32 },
 }
 
+fn authenticated_probe_request(
+    client: &reqwest::Client,
+    url: &str,
+    key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.get(url);
+    let Some((key, host)) = key.zip(
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned)),
+    ) else {
+        return request;
+    };
+    request
+        .header(
+            temps_core::probe_auth::HEADER,
+            temps_core::probe_auth::sign(key, &host, temps_core::probe_auth::now()),
+        )
+        .header("cache-control", "no-cache, no-store")
+}
+
 async fn send_with_timeout_retries(
     client: &reqwest::Client,
     url: &str,
     request_timeout: Duration,
+    probe_key: Option<&str>,
 ) -> Result<(reqwest::Response, u32), ProbeSendError> {
     for attempt in 0..=MAX_RETRIES {
         if attempt > 0 {
@@ -80,7 +102,12 @@ async fn send_with_timeout_retries(
             sleep(Duration::from_millis(delay)).await;
         }
 
-        match timeout(request_timeout, client.get(url).send()).await {
+        match timeout(
+            request_timeout,
+            authenticated_probe_request(client, url, probe_key).send(),
+        )
+        .await
+        {
             Ok(Ok(response)) => return Ok((response, attempt + 1)),
             Ok(Err(source)) if source.is_timeout() && attempt < MAX_RETRIES => continue,
             Ok(Err(source)) => {
@@ -1256,7 +1283,13 @@ impl HealthCheckService {
 
             let check_result = timeout(
                 Duration::from_secs(10),
-                probe_client.get(&health_url).send(),
+                authenticated_probe_request(
+                    &probe_client,
+                    &health_url,
+                    is_local_probe
+                        .then_some(config_service.get_server_config().encryption_key.as_str()),
+                )
+                .send(),
             )
             .await;
 
@@ -1348,6 +1381,7 @@ impl HealthCheckService {
                             &tls_client,
                             &https_url,
                             Duration::from_secs(10),
+                            Some(&config_service.get_server_config().encryption_key),
                         )
                         .await;
                         total_response_time_ms = start_time.elapsed().as_millis() as i32;
@@ -2475,7 +2509,7 @@ mod tests {
             .expect("build pinned TLS client with test root");
 
         let (response, attempts) =
-            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1), None)
                 .await
                 .expect("HTTPS follow-up succeeds");
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
@@ -2499,7 +2533,7 @@ mod tests {
             .expect("build pinned TLS client with test root");
 
         let (response, _) =
-            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1), None)
                 .await
                 .expect("HTTPS follow-up succeeds");
         assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
@@ -2673,9 +2707,10 @@ mod tests {
         let client = local_proxy_client(logical_url, &destination.to_string())
             .expect("build pinned timeout client");
 
-        let error = send_with_timeout_retries(&client, logical_url, Duration::from_millis(20))
-            .await
-            .expect_err("all attempts should time out");
+        let error =
+            send_with_timeout_retries(&client, logical_url, Duration::from_millis(20), None)
+                .await
+                .expect_err("all attempts should time out");
         assert!(matches!(
             error,
             ProbeSendError::Timeout { attempts } if attempts == MAX_RETRIES + 1
@@ -4057,6 +4092,47 @@ mod tests {
         assert!(
             !due_ids.contains(&monitor.id),
             "the on-demand monitor must drop out of the next sweep's result set"
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_auth_tests {
+    use super::*;
+    #[test]
+    fn only_local_probe_requests_carry_host_bound_credentials() {
+        let client = reqwest::Client::new();
+        let url = "http://app.example.test/health";
+        let public = authenticated_probe_request(&client, url, None)
+            .build()
+            .unwrap();
+        assert!(!public
+            .headers()
+            .contains_key(temps_core::probe_auth::HEADER));
+        let local = authenticated_probe_request(&client, url, Some("test-key"))
+            .build()
+            .unwrap();
+        let token = local
+            .headers()
+            .get(temps_core::probe_auth::HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(temps_core::probe_auth::verify(
+            "test-key",
+            "app.example.test",
+            token,
+            temps_core::probe_auth::now()
+        ));
+        assert!(!temps_core::probe_auth::verify(
+            "test-key",
+            "other.example.test",
+            token,
+            temps_core::probe_auth::now()
+        ));
+        assert_eq!(
+            local.headers().get("cache-control").unwrap(),
+            "no-cache, no-store"
         );
     }
 }
