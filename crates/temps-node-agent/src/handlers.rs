@@ -2491,7 +2491,21 @@ pub async fn pull_image(
         }
     };
 
-    // 6. Inspect to confirm the image landed and obtain its ID and digest.
+    // 6. A replacing pull that failed leaves the cached copy it was meant to
+    //    replace, which the inspect below would report as pulled. Report the
+    //    failure instead, so the control plane can fall back to another way
+    //    of delivering the image.
+    if pull_replacement_failed(request.replace_cached, &stream_errors) {
+        let (status, message) = pull_failure(&request.image, &stream_errors);
+        tracing::error!(
+            image = %request.image,
+            reason = %message,
+            "Replacing pull failed; the cached image was left in place"
+        );
+        return error_response(status, message).into_response();
+    }
+
+    // 7. Inspect to confirm the image landed and obtain its ID and digest.
     match docker.inspect_image(&request.image).await {
         Ok(info) => {
             let image_id = info.id.unwrap_or_default();
@@ -2509,48 +2523,7 @@ pub async fn pull_image(
             AgentResponse::ok(PullImageResponse { image_id, digest }).into_response()
         }
         Err(_) => {
-            // The image is not present after the pull. Classify the failure
-            // from stream errors so the caller can distinguish auth problems
-            // from "no such image" from network issues. Credentials are never
-            // included in these messages — we only surface what the daemon
-            // told us, which is limited to the HTTP status/body from the
-            // registry.
-            let combined = stream_errors.join("; ");
-
-            let (status, message) = if stream_errors.is_empty() {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "Failed to pull image '{}': pull stream ended without confirming a downloaded image",
-                        request.image
-                    ),
-                )
-            } else {
-                match classify_pull_error(&combined) {
-                    PullErrorKind::Auth => (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "Registry authentication failed for '{}': check credentials (registry said: {})",
-                            request.image, combined
-                        ),
-                    ),
-                    PullErrorKind::NotFound => (
-                        StatusCode::NOT_FOUND,
-                        format!(
-                            "Image '{}' was not found in the registry (registry said: {})",
-                            request.image, combined
-                        ),
-                    ),
-                    PullErrorKind::Network => (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "Network or registry error pulling '{}': {}",
-                            request.image, combined
-                        ),
-                    ),
-                }
-            };
-
+            let (status, message) = pull_failure(&request.image, &stream_errors);
             tracing::error!(
                 image = %request.image,
                 reason = %message,
@@ -2558,6 +2531,46 @@ pub async fn pull_image(
             );
             error_response(status, message).into_response()
         }
+    }
+}
+
+/// Whether a pull asked to replace a cached image failed. Without a pull that
+/// replaced it, the image found afterwards is the cached copy itself.
+fn pull_replacement_failed(replace_cached: bool, stream_errors: &[String]) -> bool {
+    replace_cached && !stream_errors.is_empty()
+}
+
+/// The status and message for a pull that did not deliver its image.
+///
+/// Classified from the daemon's stream errors so the caller can tell auth
+/// problems from "no such image" from network issues. Credentials are never
+/// included: only what the daemon reported, which is limited to the
+/// registry's HTTP status and body.
+fn pull_failure(image: &str, stream_errors: &[String]) -> (StatusCode, String) {
+    if stream_errors.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Failed to pull image '{image}': pull stream ended without confirming a downloaded image"
+            ),
+        );
+    }
+    let combined = stream_errors.join("; ");
+    match classify_pull_error(&combined) {
+        PullErrorKind::Auth => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Registry authentication failed for '{image}': check credentials (registry said: {combined})"
+            ),
+        ),
+        PullErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("Image '{image}' was not found in the registry (registry said: {combined})"),
+        ),
+        PullErrorKind::Network => (
+            StatusCode::BAD_GATEWAY,
+            format!("Network or registry error pulling '{image}': {combined}"),
+        ),
     }
 }
 
@@ -2889,6 +2902,23 @@ mod pull_image_tests {
         assert_eq!(creds.username.as_deref(), Some("alice"));
         // Verify the password field round-trips (serde still sees it).
         assert_eq!(creds.password.as_deref(), Some("hunter2"));
+    }
+
+    /// A failed replacing pull leaves the cached copy in place; it must be
+    /// reported as the failure it is, not as the cached image "pulled".
+    #[test]
+    fn a_replacing_pull_with_errors_is_a_failure_even_though_the_image_remains() {
+        let errors = vec!["no matching manifest for linux/amd64 in the manifest list".to_string()];
+        assert!(pull_replacement_failed(true, &errors));
+        // An ordinary pull only runs when the image was absent, so an image
+        // present afterwards is the one it pulled.
+        assert!(!pull_replacement_failed(false, &errors));
+        assert!(!pull_replacement_failed(true, &[]));
+
+        let (status, message) = pull_failure("ghcr.io/org/app:v1.0", &errors);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains("ghcr.io/org/app:v1.0"), "{message}");
+        assert!(message.contains("no matching manifest"), "{message}");
     }
 
     /// A control plane that predates `replace_cached` sends no such field:

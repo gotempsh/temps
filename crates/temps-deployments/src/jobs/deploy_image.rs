@@ -8743,6 +8743,29 @@ mod tests {
         assert!(!save_image_called.load(Ordering::SeqCst));
     }
 
+    /// A replacing pull the registry refuses (the agent reports it failed
+    /// rather than handing back the cached copy) falls back to the verified
+    /// control-plane copy, which is checked like any import.
+    #[tokio::test]
+    async fn ensure_image_on_remote_falls_back_when_replacing_a_cached_image_fails() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_FAILS, true, vec!["linux/arm64", "linux/amd64"])
+                .await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
+
+        job.ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("the verified control-plane copy replaces the cached image");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "pull-replacing", "import", "inspect"],
+            "a failed replacing pull falls back to importing the verified copy, then rechecks",
+        );
+        assert!(save_image_called.load(Ordering::SeqCst));
+    }
+
     /// An agent that predates replacing a cached image hands the old copy back
     /// from the pull: the deploy is refused with the reason instead of starting
     /// a container that dies with `exec format error`.
