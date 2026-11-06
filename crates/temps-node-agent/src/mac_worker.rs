@@ -22,6 +22,10 @@
 //!   Containers cannot reach the VM's loopback, so workloads gain no path to
 //!   the control plane.
 //!
+//! The agent also opens its runtime health probe connections from the
+//! sidecar ([`SidecarProbeDialer`]): the published ports they check bind the
+//! mesh address, in the VM.
+//!
 //! [`MacWorker`] is what `temps join` records about this in the agent's data
 //! directory (`mac-worker.json`), and what `temps agent` reads to keep the
 //! sidecar running.
@@ -35,6 +39,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub use temps_wireguard::vm::{DockerEndpoint, SIDECAR_CONTAINER};
+
+mod probe_dialer;
+pub use probe_dialer::{probe_exec_args, SidecarProbeDialer};
 
 /// File in the agent data directory holding [`MacWorker`].
 pub const CONFIG_FILE: &str = "mac-worker.json";
@@ -361,17 +368,28 @@ pub enum MacWorkerError {
     ForeignContainer,
 }
 
-static RUNNING: std::sync::OnceLock<DockerApp> = std::sync::OnceLock::new();
+static RUNNING: std::sync::OnceLock<(DockerApp, DockerEndpoint)> = std::sync::OnceLock::new();
 
-/// Record that this agent runs as a Mac worker, for its heartbeat.
+/// Record that this agent runs as a Mac worker, for its heartbeat and its
+/// runtime health probes.
 pub fn set_running(worker: &MacWorker) {
-    let _ = RUNNING.set(worker.docker_app);
+    let _ = RUNNING.set((worker.docker_app, worker.endpoint()));
+}
+
+/// How this agent's runtime health probes reach published ports: from the
+/// mesh sidecar on a Mac worker (macOS has no route into the Docker app's
+/// VM, where they bind), directly anywhere else.
+pub fn probe_dialer() -> std::sync::Arc<dyn temps_runtime_health::ProbeDialer> {
+    match RUNNING.get() {
+        Some((_, endpoint)) => std::sync::Arc::new(SidecarProbeDialer::new(endpoint.clone())),
+        None => std::sync::Arc::new(temps_runtime_health::TcpDialer),
+    }
 }
 
 /// What the heartbeat reports under `AGENT_HOST_KEY`: `None` unless this
 /// agent runs as a Mac worker.
 pub fn heartbeat_host() -> Option<serde_json::Value> {
-    let app = RUNNING.get()?;
+    let (app, _) = RUNNING.get()?;
     Some(serde_json::json!({
         "os": temps_core::node_address::HOST_OS_MACOS,
         "docker_app": app,

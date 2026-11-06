@@ -317,6 +317,8 @@ impl RuntimeHealthService {
                     docker,
                     temps_deployer::runtime_health::data_root(),
                     false,
+                    // The embedded host runs where the daemon publishes.
+                    Arc::new(temps_runtime_health::TcpDialer),
                 )
                 .await
                 .map_err(|_| RuntimeHealthError::Transport { node_id: None })?;

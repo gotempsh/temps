@@ -65,6 +65,9 @@ pub fn router(
     let slot = Arc::new(OnceCell::new());
     if let Some(docker) = docker {
         let slot = slot.clone();
+        // Set before the server starts (`temps agent` records a Mac worker
+        // first), so a Mac worker probes through its mesh sidecar.
+        let dialer = crate::mac_worker::probe_dialer();
         tokio::spawn(async move {
             let docker = Arc::new(docker);
             loop {
@@ -72,6 +75,7 @@ pub fn router(
                     docker.clone(),
                     temps_deployer::runtime_health::data_root(),
                     true,
+                    dialer.clone(),
                 )
                 .await
                 {

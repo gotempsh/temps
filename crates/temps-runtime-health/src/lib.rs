@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, time::Duration};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 /// Limits are implementation bounds, independent of any future API settings.
@@ -148,6 +149,41 @@ pub trait RuntimeInspector: Send + Sync {
         Ok(Box::new(()))
     }
     async fn inspect(&self, assignment: &Assignment) -> Result<RuntimeSnapshot, InspectFailure>;
+
+    /// How network probes reach the endpoints [`Self::inspect`] derives.
+    /// Hosts where the probing process shares the network namespace the
+    /// ports are published in keep the default, [`TcpDialer`].
+    fn dialer(&self) -> &dyn ProbeDialer {
+        &TcpDialer
+    }
+}
+
+/// An open connection a network probe runs over.
+pub trait ProbeConnection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProbeConnection for T {}
+
+/// Opens a network probe's connection to a container endpoint.
+///
+/// The endpoint always comes from the trusted inspector, never from a
+/// caller. A dialer only decides the route: a Mac worker publishes ports in
+/// its Docker app's VM, which macOS, where the agent runs, cannot route to,
+/// so its dialer connects from inside that VM. A dialer must resolve only
+/// once the connection is established, and fail if it cannot be: the TCP
+/// probe passes on a connection that stays open.
+#[async_trait]
+pub trait ProbeDialer: Send + Sync {
+    async fn connect(&self, endpoint: SocketAddr) -> std::io::Result<Box<dyn ProbeConnection>>;
+}
+
+/// Dials the endpoint directly, from this process's network namespace.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TcpDialer;
+
+#[async_trait]
+impl ProbeDialer for TcpDialer {
+    async fn connect(&self, endpoint: SocketAddr) -> std::io::Result<Box<dyn ProbeConnection>> {
+        Ok(Box::new(tokio::net::TcpStream::connect(endpoint).await?))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
