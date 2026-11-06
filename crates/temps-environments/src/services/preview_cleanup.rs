@@ -5,7 +5,7 @@
 //! pull request is closed or merged (`Job::PreviewBranchClosed`), so previews
 //! stop holding containers after the work they showed is done.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,29 +63,53 @@ impl AuditOperation for PreviewEnvironmentRetiredAudit {
 
 type BranchKey = (i32, String);
 
+/// Branches being retired, each with the reason of a close that arrived
+/// meanwhile and still needs its own pass.
+type InFlight = Arc<Mutex<HashMap<BranchKey, Option<PreviewBranchCloseReason>>>>;
+
 pub struct PreviewCleanupService {
     teardown: Arc<EnvironmentTeardownService>,
     audit: Arc<dyn AuditLogger>,
     pending: Arc<Semaphore>,
     slots: Arc<Semaphore>,
-    in_flight: Arc<Mutex<HashSet<BranchKey>>>,
+    in_flight: InFlight,
 }
 
 /// Holds a branch for one retirement; dropping it releases the branch.
 struct BranchClaim {
-    in_flight: Arc<Mutex<HashSet<BranchKey>>>,
+    in_flight: InFlight,
     key: BranchKey,
+    released: bool,
+}
+
+impl BranchClaim {
+    /// The reason of a close that arrived during the pass just finished, or
+    /// `None` after releasing the branch. Both happen under one lock, so a
+    /// close is either seen here or claims the branch itself, never lost.
+    fn next_pass(&mut self) -> Option<PreviewBranchCloseReason> {
+        let mut in_flight = lock(&self.in_flight);
+        if let Some(reason) = in_flight.get_mut(&self.key).and_then(Option::take) {
+            return Some(reason);
+        }
+        in_flight.remove(&self.key);
+        self.released = true;
+        None
+    }
 }
 
 impl Drop for BranchClaim {
     fn drop(&mut self) {
-        lock(&self.in_flight).remove(&self.key);
+        if !self.released {
+            lock(&self.in_flight).remove(&self.key);
+        }
     }
 }
 
-/// The set only holds plain keys, so a panic elsewhere cannot leave it
-/// inconsistent; recover it rather than stop cleaning up.
-fn lock(in_flight: &Mutex<HashSet<BranchKey>>) -> std::sync::MutexGuard<'_, HashSet<BranchKey>> {
+/// The map only holds plain keys and reasons, so a panic elsewhere cannot
+/// leave it inconsistent; recover it rather than stop cleaning up.
+fn lock(
+    in_flight: &InFlight,
+) -> std::sync::MutexGuard<'_, HashMap<BranchKey, Option<PreviewBranchCloseReason>>> {
     in_flight
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -98,7 +122,7 @@ impl PreviewCleanupService {
             audit,
             pending: Arc::new(Semaphore::new(MAX_PENDING_TEARDOWNS)),
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_TEARDOWNS)),
-            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -140,47 +164,81 @@ impl PreviewCleanupService {
 
     /// Claim the job's branch, or `None` when another job is already
     /// retiring it (a deleted branch and its merged pull request usually
-    /// arrive together): that job tears down and audits the same previews.
+    /// arrive together). That job then runs one more pass for this close, so
+    /// a preview created after its lookup is retired too.
     fn claim(&self, job: &PreviewBranchClosedJob) -> Option<BranchClaim> {
         let key = (job.project_id, job.branch.clone());
-        if !lock(&self.in_flight).insert(key.clone()) {
+        let mut in_flight = lock(&self.in_flight);
+        if let Some(rerun) = in_flight.get_mut(&key) {
+            *rerun = Some(job.reason);
             return None;
         }
+        in_flight.insert(key.clone(), None);
         Some(BranchClaim {
             in_flight: Arc::clone(&self.in_flight),
             key,
+            released: false,
         })
     }
 
     /// Tear down the previews of the job's branch and audit each one
-    /// retired. Returns how many were retired, or the first preview's
-    /// failure once every preview has been attempted and the retired ones
-    /// audited.
+    /// retired, then once more for each close that arrived meanwhile.
+    /// Returns how many were retired, or the first failure once every pass
+    /// has run and the retired previews are audited.
     pub async fn retire(
         &self,
         job: PreviewBranchClosedJob,
     ) -> Result<usize, EnvironmentTeardownError> {
-        let Some(_claim) = self.claim(&job) else {
+        let Some(mut claim) = self.claim(&job) else {
             info!(
                 project_id = job.project_id,
                 branch = %job.branch,
                 reason = %job.reason,
-                "Previews of this branch are already being retired"
+                "Previews of this branch are being retired; queued another pass for this close"
             );
             return Ok(0);
         };
         // The semaphore is never closed, so acquiring cannot fail.
         let _slot = self.slots.acquire().await.ok();
 
+        let mut reason = job.reason;
+        let mut retired = 0;
+        let mut first_failure = None;
+        loop {
+            match self.retire_pass(job.project_id, &job.branch, reason).await {
+                Ok(count) => retired += count,
+                Err(error) => {
+                    first_failure.get_or_insert(error);
+                }
+            }
+            match claim.next_pass() {
+                Some(next) => reason = next,
+                None => break,
+            }
+        }
+
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(retired),
+        }
+    }
+
+    /// One lookup and teardown of the branch's live previews.
+    async fn retire_pass(
+        &self,
+        project_id: i32,
+        branch: &str,
+        reason: PreviewBranchCloseReason,
+    ) -> Result<usize, EnvironmentTeardownError> {
         let outcome = self
             .teardown
-            .tear_down_branch_previews(job.project_id, &job.branch)
+            .tear_down_branch_previews(project_id, branch)
             .await
             .inspect_err(|error| {
                 error!(
-                    project_id = job.project_id,
-                    branch = %job.branch,
-                    reason = %job.reason,
+                    project_id,
+                    branch,
+                    %reason,
                     %error,
                     "Failed to look up the preview environments of a closed branch"
                 )
@@ -188,22 +246,22 @@ impl PreviewCleanupService {
 
         for preview in &outcome.retired {
             info!(
-                project_id = job.project_id,
+                project_id,
                 environment_id = preview.id,
-                branch = %job.branch,
-                reason = %job.reason,
+                branch,
+                %reason,
                 "Retired preview environment"
             );
             let audit = PreviewEnvironmentRetiredAudit {
-                project_id: job.project_id,
+                project_id,
                 environment_id: preview.id,
                 environment_name: preview.name.clone(),
-                branch: job.branch.clone(),
-                reason: job.reason,
+                branch: branch.to_string(),
+                reason,
             };
             if let Err(error) = self.audit.create_audit_log(&audit).await {
                 error!(
-                    project_id = job.project_id,
+                    project_id,
                     environment_id = preview.id,
                     %error,
                     "Failed to audit a retired preview environment"
@@ -213,14 +271,14 @@ impl PreviewCleanupService {
 
         for (preview, error) in &outcome.failed {
             error!(
-                project_id = job.project_id,
+                project_id,
                 environment_id = preview.id,
-                branch = %job.branch,
-                reason = %job.reason,
+                branch,
+                %reason,
                 %error,
                 "Failed to retire preview environment; retry by deleting environment {} of project {}",
                 preview.id,
-                job.project_id
+                project_id
             );
         }
 
@@ -316,6 +374,8 @@ mod tests {
         cancelled: Mutex<Vec<i32>>,
         cleaned: Mutex<Vec<(i32, i32)>>,
         cleanup_failures: Mutex<Vec<ContainerCleanupError>>,
+        /// Runs once, during the first container cleanup.
+        during_cleanup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     #[temps_core::async_trait::async_trait]
@@ -354,6 +414,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((project_id, environment_id));
+            let hook = self.during_cleanup.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             match self.cleanup_failures.lock().unwrap().pop() {
                 Some(error) => Err(error),
                 None => Ok(1),
@@ -635,18 +699,50 @@ mod tests {
     }
 
     /// A deleted branch and its merged pull request usually arrive together;
-    /// the second job finds the branch claimed and does nothing, so the
-    /// preview is torn down and audited once.
+    /// the second job finds the branch claimed and leaves one more pass to
+    /// the claim's holder instead of tearing down the same preview itself.
     #[tokio::test]
-    async fn a_branch_already_being_retired_is_not_retired_twice() {
+    async fn a_close_during_a_teardown_queues_one_more_pass() {
         // No query results: the claimed job must not touch the database.
         let db = MockDatabase::new(DatabaseBackend::Postgres);
         let deployments = Arc::new(RecordingDeployments::default());
         let audit = Arc::new(RecordingAudit::default());
         let service = cleanup(db, deployments.clone(), audit.clone());
 
-        let claim = service.claim(&job(PreviewBranchCloseReason::BranchDeleted));
-        assert!(claim.is_some());
+        let mut claim = service
+            .claim(&job(PreviewBranchCloseReason::BranchDeleted))
+            .unwrap();
+        let merged = PreviewBranchCloseReason::PullRequestMerged { number: 12 };
+        assert_eq!(service.retire(job(merged)).await.unwrap(), 0);
+        assert!(deployments.cancelled.lock().unwrap().is_empty());
+
+        assert_eq!(claim.next_pass(), Some(merged));
+        assert_eq!(claim.next_pass(), None);
+        drop(claim);
+        assert!(service
+            .claim(&job(PreviewBranchCloseReason::BranchDeleted))
+            .is_some());
+    }
+
+    /// A push recreated the preview and its reopened pull request closed
+    /// again while the first teardown was still running: the extra pass finds
+    /// and retires the new preview.
+    #[tokio::test]
+    async fn a_preview_created_during_a_teardown_is_retired_by_the_next_pass() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![preview_with_id(7)]]);
+        let db = retiring(db, 7).append_query_results(vec![vec![preview_with_id(8)]]);
+        let db = retiring(db, 8);
+        let deployments = Arc::new(RecordingDeployments::default());
+        let audit = Arc::new(RecordingAudit::default());
+        let service = Arc::new(cleanup(db, deployments.clone(), audit.clone()));
+
+        let closed_again = PreviewBranchCloseReason::PullRequestClosed { number: 13 };
+        let during = Arc::clone(&service);
+        *deployments.during_cleanup.lock().unwrap() = Some(Box::new(move || {
+            assert!(during.claim(&job(closed_again)).is_none());
+        }));
+
         let retired = service
             .retire(job(PreviewBranchCloseReason::PullRequestMerged {
                 number: 12,
@@ -654,11 +750,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(retired, 0);
-        assert!(deployments.cancelled.lock().unwrap().is_empty());
-        drop(claim);
-        assert!(service
-            .claim(&job(PreviewBranchCloseReason::BranchDeleted))
-            .is_some());
+        assert_eq!(retired, 2);
+        assert_eq!(
+            *deployments.cleaned.lock().unwrap(),
+            vec![(PROJECT_ID, 7), (PROJECT_ID, 8)]
+        );
+        let operations = audit.operations.lock().unwrap();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[1].1["environment_id"], 8);
+        assert_eq!(
+            operations[1].1["reason"],
+            serde_json::json!({ "kind": "pull_request_closed", "number": 13 })
+        );
     }
 }
