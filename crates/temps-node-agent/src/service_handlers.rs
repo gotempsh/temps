@@ -300,20 +300,9 @@ pub async fn create_service(
 
     let container_name = request.name.clone();
 
-    // Create volumes
-    for volume_name in request.volumes.keys() {
-        let create_opts = bollard::models::VolumeCreateRequest {
-            name: Some(volume_name.clone()),
-            ..Default::default()
-        };
-        if let Err(e) = docker.create_volume(create_opts).await {
-            tracing::warn!(
-                volume = %volume_name,
-                "Volume creation returned error (may already exist): {}",
-                e
-            );
-        }
-    }
+    // The volumes this request creates, so a failed create removes those and
+    // never a volume an earlier service left holding its data.
+    let created_volumes = create_service_volumes(docker, request.volumes.keys()).await;
 
     // Build port bindings
     let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
@@ -407,6 +396,10 @@ pub async fn create_service(
         Ok(None) => {}
         Err(message) => {
             tracing::error!(service = %container_name, "{}", message);
+            let message = with_cleanup_note(
+                message,
+                remove_failed_service_create(docker, None, &created_volumes).await,
+            );
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
         }
     }
@@ -468,11 +461,11 @@ pub async fn create_service(
         {
             let cause = e.cause_text();
             tracing::error!(image = %image_ref, "Failed to pull image: {}", cause);
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            let message = with_cleanup_note(
                 format!("Failed to pull image '{}': {}", image_ref, cause),
-            )
-            .into_response();
+                remove_failed_service_create(docker, None, &created_volumes).await,
+            );
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
         }
         tracing::info!(image = %image_ref, "Image ready");
     }
@@ -511,11 +504,15 @@ pub async fn create_service(
                     "Failed to start service container: {}",
                     e
                 );
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                // Docker refuses a create under a name that is taken, so the
+                // container is this request's: remove it, and the volumes it
+                // created, so a retry finds the name free and no stray data.
+                let message = with_cleanup_note(
                     format!("Container created but failed to start: {}", e),
-                )
-                .into_response();
+                    remove_failed_service_create(docker, Some(&container_name), &created_volumes)
+                        .await,
+                );
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
             }
 
             // Install per-peer overlay routes inside the container's netns
@@ -596,15 +593,112 @@ pub async fn create_service(
                 "Failed to create service container: {}",
                 e
             );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            // No container was created; one already holding the name is
+            // someone else's and stays.
+            let message = with_cleanup_note(
                 format!(
                     "Failed to create service container '{}': {}",
                     container_name, e
                 ),
-            )
-            .into_response()
+                remove_failed_service_create(docker, None, &created_volumes).await,
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
         }
+    }
+}
+
+/// Create the named volumes a service mounts, returning the ones this call
+/// created. A volume that already exists belongs to an earlier service (a
+/// re-create keeps its data on it), so it is never this request's to remove.
+async fn create_service_volumes<'a>(
+    docker: &bollard::Docker,
+    names: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let mut created = Vec::new();
+    for name in names {
+        match docker.inspect_volume(name).await {
+            Ok(_) => continue,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(e) => {
+                // Unknown: treat it as existing, so it is never removed.
+                tracing::warn!(volume = %name, error = %e, "Could not inspect service volume; leaving it to Docker");
+                continue;
+            }
+        }
+        let create_opts = bollard::models::VolumeCreateRequest {
+            name: Some(name.clone()),
+            ..Default::default()
+        };
+        match docker.create_volume(create_opts).await {
+            Ok(_) => created.push(name.clone()),
+            Err(e) => {
+                tracing::warn!(volume = %name, error = %e, "Volume creation returned an error");
+            }
+        }
+    }
+    created
+}
+
+/// Undo a failed `create_service` request: remove the container it created,
+/// if it got that far, then the volumes it created. Nothing that existed
+/// before the request is touched. Returns what could not be removed, for the
+/// error the control plane reports; cleanup never replaces the original error.
+async fn remove_failed_service_create(
+    docker: &bollard::Docker,
+    container: Option<&str>,
+    created_volumes: &[String],
+) -> Option<String> {
+    let mut left_behind = Vec::new();
+    if let Some(container) = container {
+        // `v` drops the container's anonymous volumes, which only it used;
+        // named volumes are never removed by it.
+        let options = bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+            .force(true)
+            .v(true)
+            .build();
+        match docker.remove_container(container, Some(options)).await {
+            Ok(()) => tracing::info!(container, "Removed service container after a failed create"),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(e) => {
+                tracing::warn!(container, error = %e, "Could not remove service container after a failed create");
+                left_behind.push(format!("container '{container}' ({e})"));
+            }
+        }
+    }
+    for volume in created_volumes {
+        match docker
+            .remove_volume(
+                volume,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(volume = %volume, "Removed service volume after a failed create")
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(e) => {
+                tracing::warn!(volume = %volume, error = %e, "Could not remove service volume after a failed create");
+                left_behind.push(format!("volume '{volume}' ({e})"));
+            }
+        }
+    }
+    (!left_behind.is_empty()).then(|| left_behind.join(", "))
+}
+
+/// `message`, plus what a failed create could not clean up, if anything.
+fn with_cleanup_note(message: String, left_behind: Option<String>) -> String {
+    match left_behind {
+        Some(left_behind) => format!(
+            "{message}. Could not remove what this attempt created on the node: {left_behind}"
+        ),
+        None => message,
     }
 }
 
@@ -2902,5 +2996,193 @@ mod injected_engine_tests {
         assert!(body_text(response)
             .await
             .contains("snapshot failed in the test engine"));
+    }
+}
+
+#[cfg(test)]
+mod failed_create_cleanup_tests {
+    use super::{create_service_volumes, remove_failed_service_create, with_cleanup_note};
+    use std::collections::HashMap;
+
+    async fn docker() -> Option<bollard::Docker> {
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(e) => {
+                println!("Docker not available, skipping: {e}");
+                return None;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return None;
+        }
+        Some(docker)
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        )
+    }
+
+    async fn volume_exists(docker: &bollard::Docker, name: &str) -> bool {
+        docker.inspect_volume(name).await.is_ok()
+    }
+
+    async fn container_exists(docker: &bollard::Docker, name: &str) -> bool {
+        docker
+            .inspect_container(
+                name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .is_ok()
+    }
+
+    /// Regression: a worker that created a service container but could not
+    /// start it (its port bound to an address the host does not have) left
+    /// the container and its new volume behind after the control plane
+    /// rolled the service back. Cleanup removes exactly what that attempt
+    /// created, and never a volume that was there before it.
+    #[tokio::test]
+    async fn a_failed_start_removes_only_what_the_attempt_created() {
+        let Some(docker) = docker().await else {
+            return;
+        };
+        let existing = unique("temps-agent-create-it-existing");
+        let fresh = unique("temps-agent-create-it-fresh");
+        let container = unique("temps-agent-create-it");
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(existing.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("create the pre-existing volume");
+
+        let created = create_service_volumes(&docker, [&existing, &fresh]).await;
+
+        let image = "busybox:1.36";
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(image))
+            .await
+            .expect("pull the test image");
+        let host_config = bollard::models::HostConfig {
+            binds: Some(vec![
+                format!("{existing}:/existing"),
+                format!("{fresh}:/fresh"),
+            ]),
+            // TEST-NET-3: no host has it, so the start fails after the
+            // container exists, as on a worker whose private address is not
+            // on the Docker host.
+            port_bindings: Some(HashMap::from([(
+                "8080/tcp".to_string(),
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("203.0.113.7".to_string()),
+                    host_port: None,
+                }]),
+            )])),
+            ..Default::default()
+        };
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(image.to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "60".to_string()]),
+                    exposed_ports: Some(vec!["8080/tcp".to_string()]),
+                    host_config: Some(host_config),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the test container");
+        let started = docker
+            .start_container(
+                &container,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await;
+
+        let left_behind = remove_failed_service_create(&docker, Some(&container), &created).await;
+        let container_left = container_exists(&docker, &container).await;
+        let fresh_left = volume_exists(&docker, &fresh).await;
+        let existing_kept = volume_exists(&docker, &existing).await;
+        // Clean up whatever the assertions below would otherwise leak.
+        let _ = docker
+            .remove_container(
+                &container,
+                Some(
+                    bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                        .force(true)
+                        .build(),
+                ),
+            )
+            .await;
+        let _ = docker
+            .remove_volume(
+                &fresh,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+        let _ = docker
+            .remove_volume(
+                &existing,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+
+        assert_eq!(
+            created,
+            vec![fresh.clone()],
+            "only the new volume is this attempt's"
+        );
+        assert!(
+            started.is_err(),
+            "the start must fail on an unassignable address"
+        );
+        assert_eq!(left_behind, None);
+        assert!(!container_left, "the failed container must be removed");
+        assert!(
+            !fresh_left,
+            "the volume this attempt created must be removed"
+        );
+        assert!(existing_kept, "a volume that existed before must be kept");
+    }
+
+    /// Cleaning up after an attempt that never created its container, or
+    /// whose volume is already gone, is not an error.
+    #[tokio::test]
+    async fn cleanup_tolerates_what_is_already_gone() {
+        let Some(docker) = docker().await else {
+            return;
+        };
+        let left_behind = remove_failed_service_create(
+            &docker,
+            Some(&unique("temps-agent-create-it-missing")),
+            &[unique("temps-agent-create-it-missing-volume")],
+        )
+        .await;
+        assert_eq!(left_behind, None);
+    }
+
+    #[test]
+    fn the_original_error_leads_and_leftovers_are_named() {
+        assert_eq!(
+            with_cleanup_note("Container created but failed to start: x".to_string(), None),
+            "Container created but failed to start: x"
+        );
+        assert_eq!(
+            with_cleanup_note(
+                "Container created but failed to start: x".to_string(),
+                Some("volume 'postgres-orders_data' (in use)".to_string())
+            ),
+            "Container created but failed to start: x. Could not remove what this attempt \
+             created on the node: volume 'postgres-orders_data' (in use)"
+        );
     }
 }
