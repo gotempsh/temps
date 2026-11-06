@@ -98,11 +98,33 @@ in a narrower column.
 - Use `space-y-6` between major sections, `gap-4` within groups, and
   `gap-2` between related controls.
 
-A page header has one `h1`, a short description, and its primary action.
+A page header has one `h1`, its primary action, and usually nothing else.
 Use `PageHeader` instead of hand-written variants. The title is
-`text-2xl font-semibold tracking-tight`; the description is
+`text-2xl font-semibold tracking-tight`; an optional description is
 `text-sm text-muted-foreground`. Actions wrap below the title on small screens.
 No large hero, oversized title, or decorative introduction before useful content.
+
+### Pages don't explain themselves
+
+People open a page to do something, not to read about it. A page or section
+title is not followed by a paragraph saying what the page is, how the feature
+works, or why it is safe. Users skip that text, and it pushes the content down.
+
+- **No description by default.** `PageHeader` and section headings carry a
+  description only when it states something the user must know to act and the
+  page can't show any other way, in one short line ("Use in a service as
+  `{{NAME}}`."). Never a definition of the noun in the title, a tour of the
+  feature, or how it works inside.
+- **Data, not prose.** A record's own description or scope may sit under its
+  title. A placeholder like "No description" is noise; render nothing.
+- **Say it where it applies.** A constraint goes next to the control it
+  affects: "can't be read back once saved" belongs on the secret field, a
+  consequence in the confirm dialog, a requirement in the empty or not-set-up
+  state. Longer background goes in a `HelpPopover`, `Disclosure` or the docs.
+- **A setting gets one line** saying what it controls when its title doesn't.
+  Not the reasoning behind it.
+- **Instructions are the command, not the story.** A "connect a client" or
+  "run this" section shows the snippet with at most a one-line caption.
 
 ## 2. Canonical resource-list structure
 
@@ -111,7 +133,8 @@ Do not copy its oversized empty panel or Authentication's nested dashed box.
 
 The order is:
 
-1. Page heading, description, and primary create/add action.
+1. Page heading and primary create/add action (no explanatory description;
+   see "Pages don't explain themselves").
 2. Search, filters, and optional bulk actions when applicable.
 3. One full-width, solid-bordered collection surface.
 4. Shared pagination when needed.
@@ -427,7 +450,8 @@ selected text after its hover background becomes light.
 Before handing off a changed screen:
 
 - [ ] The route's width (`form` or `full`), one padding owner, shared page header.
-- [ ] Primary content appears promptly below the heading.
+- [ ] Primary content appears promptly below the heading: no paragraph
+      explaining the page or a section under its title.
 - [ ] One collection surface; no nested dashed empty panel or decorative shadow.
 - [ ] Compact EmptyState explicitly selected; loading, empty, filtered, error,
       and unconfigured states are distinguished.

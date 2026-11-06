@@ -28,7 +28,9 @@ manager is `bun`.
   practical; `Skeleton` placeholders matching the real layout for content
   loading, never centred `Loader2` spinners (inline spinners on mutation buttons
   are fine); `ServiceIcon` for a project's icon anywhere one is listed, never a
-  hand-built initial or a media lookup of a page's own.
+  hand-built initial or a media lookup of a page's own. Pages don't explain
+  themselves: no paragraph under a page or section title; at most one short
+  line the user needs to act (`DESIGN.md` "Pages don't explain themselves").
 - **Mobile**: nothing scrolls sideways at any width. Tables show columns by
   priority with container queries (`hidden @xl:table-cell`), keep the name,
   state and actions, and move what a hidden column says that is needed to act

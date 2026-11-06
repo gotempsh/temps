@@ -21,6 +21,12 @@ Imperative digest. If a rule and a screenshot disagree, fix the screenshot.
   concrete example, a link to the settings page. Never nothing. `PageState`
   variant `not-set-up` enforces this at the type level — `requirement`,
   `example`, `settingsHref` are required props.
+- Pages don't explain themselves. No paragraph under a page or section title
+  saying what the page is or how the feature works: users skip it and it
+  pushes the content down. A description appears only when it is one short
+  line the user needs to act; constraints sit beside the control, consequences
+  in the confirm dialog, background in `HelpPopover`/`Disclosure` or the docs
+  (see Progressive disclosure and `DESIGN.md`).
 - Nothing scrolls sideways, at any width: not the page, a table, or a tab
   strip. Tables show columns by priority with container queries and fold
   what is needed to act under the record's name (see Responsive).
@@ -243,12 +249,17 @@ Filters, tab, page number, selected record: `useUrlState`, not local
    this, but re-scan by eye for anything the regex can't (inline `<style>`,
    a `boxShadow` object).
 4. The record recipe order (title → verdict → facts → main → aside) holds.
+5. No page or section opens with a paragraph explaining itself.
 
 ## Progressive disclosure
 
-Show only what the user needs for the next action. Page descriptions are optional;
-omit copy that repeats a title, label, or obvious control. Keep field-format
-requirements next to the field. Prefer one short sentence over a paragraph.
+Show only what the user needs for the next action. Page and section
+descriptions are off by default: never define the title's noun, tour the
+feature, or explain how it works or why it is safe. Keep field-format
+requirements and constraints next to the field. When a line is needed to act,
+it is one short sentence, never a paragraph. A record's own description is
+data and may show under its name; an empty one renders nothing, not
+"No description".
 
 Use `HelpPopover` for optional, short context and `Disclosure` for longer technical
 details or advanced settings. Name the topic in the trigger ("Retention details",
@@ -287,8 +298,9 @@ Use `SettingsGroup` for the aligned open layout and `SettingsSection` for a
 titled group of settings; each caller retains its own save scope. `Disclosure`
 stays for informational detail only, never for settings.
 
-SettingsGroup descriptions are optional: one short sentence beneath the heading
-that clarifies scope or outcome. Omit repeated labels and detailed instructions.
+SettingsGroup descriptions are optional: one short line beneath the heading
+saying what the setting controls when the title doesn't. Omit the reasoning
+behind it, repeated labels and detailed instructions.
 
 ## Resource detail navigation
 
