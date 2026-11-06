@@ -397,10 +397,12 @@ pub struct DeploymentConfig {
     /// How long, in seconds, a superseded deployment's containers get to
     /// finish in-flight work after SIGTERM before they are killed, once a new
     /// deployment has gone live. Raise it for long requests (uploads,
-    /// exports, streaming responses, WebSockets). `None` = the platform
-    /// default ([`DEFAULT_STOP_TIMEOUT_SECONDS`]); valid overrides are
-    /// [`MIN_STOP_TIMEOUT_SECONDS`]..=[`MAX_STOP_TIMEOUT_SECONDS`].
-    /// Environments inherit the project value and may override it.
+    /// exports, streaming responses, WebSockets). Absent means the platform
+    /// default of 10 seconds; an override is 1 to 3600 seconds. Environments
+    /// inherit the project value and may override it.
+    // The numbers above are spelled out because this comment is the OpenAPI
+    // description, where an intra-doc link would show as raw brackets. They
+    // are DEFAULT/MIN/MAX_STOP_TIMEOUT_SECONDS, which a test keeps in step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_timeout_seconds: Option<i32>,
     /// Deploy-time probe; environment overrides project, repository config overrides both.
@@ -579,6 +581,31 @@ impl DeploymentConfigSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stop timeout's field docs are its OpenAPI description, so they
+    /// spell the bounds out instead of linking the constants; this keeps the
+    /// two in step and the description free of intra-doc link brackets.
+    #[test]
+    fn stop_timeout_description_states_the_enforced_bounds() {
+        let schema = serde_json::to_value(<DeploymentConfig as utoipa::PartialSchema>::schema())
+            .expect("schema serializes");
+        let description = schema["properties"]["stopTimeoutSeconds"]["description"]
+            .as_str()
+            .expect("stopTimeoutSeconds has a description");
+        assert!(
+            description.contains(&format!(
+                "default of {DEFAULT_STOP_TIMEOUT_SECONDS} seconds"
+            )),
+            "{description}"
+        );
+        assert!(
+            description.contains(&format!(
+                "{MIN_STOP_TIMEOUT_SECONDS} to {MAX_STOP_TIMEOUT_SECONDS} seconds"
+            )),
+            "{description}"
+        );
+        assert!(!description.contains("[`"), "{description}");
+    }
 
     /// Rows written before the setting existed must keep deserializing, and
     /// the wire format is the documented snake_case value.
