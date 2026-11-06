@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.61] - 2026-11-06
+
+### Added
+
+- **nodes:** Join a Mac as a worker with its Docker app, as the user and without sudo ([#1824](https://github.com/gotempsh/temps/issues/1824))
+
+### CI
+
+- **release:** Build the macOS binaries on macos-15 ([#1830](https://github.com/gotempsh/temps/issues/1830))
+
+### Documentation
+
+- **adr:** Record how a Mac joins as a worker with no VM to manage (ADR 090)
+- **adr:** State that Mac workloads can reach the node API through the Mac (ADR 090)
+- **adr:** Say the Mac policy window lasts until a successful pass, not 15 s (ADR 090)
+
+### Fixed
+
+- **web:** Stop the dark theme rendering light-only colours
+- **web:** Keep cache-hit badges readable and only accept dark colours in the scan
+- **web:** Match native controls to the console theme and keep the Cloudflare link readable
+- **web:** Unbreak the console build and reject variant-only dark colours in the scan
+- **cli:** Restart the agent service after temps join rewrites its config ([#1829](https://github.com/gotempsh/temps/issues/1829))
+
+### Testing
+
+- **web:** Keep the colour-scheme test beside globals.css
+- **web:** Require an all-sides dark border and a real arbitrary colour in the scan
+
 ## [0.1.0-beta.60] - 2026-11-05
 
 ### CI
