@@ -105,23 +105,21 @@ export function RoutesManagement({
           host: data.host,
           port: data.port,
         },
+        throwOnError: true,
       }),
     meta: {
       errorTitle: 'Failed to update route',
     },
-    onSuccess: ({ response }: any) => {
-      if (response.status >= 300) {
-        toast.error('Failed to update route')
-      } else {
-        setEditRoute(null)
-        toast.success('Route updated successfully')
-        reloadRoutes()
-      }
+    onSuccess: () => {
+      setEditRoute(null)
+      toast.success('Route updated successfully')
+      reloadRoutes()
     },
   })
 
   const deleteRouteMutation = useMutation({
-    mutationFn: (domain: string) => deleteRoute({ path: { domain } }),
+    mutationFn: (domain: string) =>
+      deleteRoute({ path: { domain }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to delete route',
     },

@@ -83,6 +83,16 @@ pub struct ReplicaWorkload {
     /// The workload is already deleted: the plane is removing (or has
     /// removed) its instance.
     pub retired: bool,
+    /// The instance is a container (local Docker, or a worker's container
+    /// run from its stream) that the node's deployer can stop by this id. A
+    /// microVM is not: only the plane can stop it.
+    pub container: bool,
+}
+
+/// Whether instances of `driver` are containers a node's deployer can stop
+/// by the id the plane recorded.
+fn is_container_driver(driver: &str) -> bool {
+    driver == temps_workload_docker::DRIVER || driver == temps_workload::stream::STREAM_DRIVER
 }
 
 /// Why a plane-started replica could not be retired.
@@ -136,7 +146,7 @@ pub async fn deployment_replica_workload(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
     use temps_entities::{workload_instances, workloads};
 
-    let row: Option<(i64, Option<chrono::DateTime<chrono::Utc>>)> =
+    let row: Option<(i64, Option<chrono::DateTime<chrono::Utc>>, String)> =
         workload_instances::Entity::find()
             .inner_join(workloads::Entity)
             .filter(Expr::cust_with_values(
@@ -149,6 +159,7 @@ pub async fn deployment_replica_workload(
             .select_only()
             .column(workloads::Column::Id)
             .column(workloads::Column::DeletedAt)
+            .column(workload_instances::Column::Driver)
             .into_tuple()
             .one(db)
             .await
@@ -157,10 +168,47 @@ pub async fn deployment_replica_workload(
                 container_id: container_id.to_string(),
                 source,
             })?;
-    Ok(row.map(|(workload_id, deleted_at)| ReplicaWorkload {
-        workload_id,
-        retired: deleted_at.is_some(),
-    }))
+    Ok(
+        row.map(|(workload_id, deleted_at, driver)| ReplicaWorkload {
+            workload_id,
+            retired: deleted_at.is_some(),
+            container: is_container_driver(&driver),
+        }),
+    )
+}
+
+/// Gives a plane replica that is still running its stop grace period before
+/// the plane retires it. The plane removes a deleted workload's instance
+/// outright (a forced removal, so no SIGTERM at all), which would cut off the
+/// requests a replaced deployment is still finishing whatever the configured
+/// stop timeout. Stopping the container first through its node's deployer
+/// sends SIGTERM and waits up to `grace`; neither the plane nor a worker's
+/// runtime starts a replica its owner stopped, so it stays down until the
+/// plane removes it. A failed stop only loses the grace period: the caller
+/// still retires the replica.
+pub async fn stop_replica_before_retiring(
+    deployer: &dyn temps_deployer::ContainerDeployer,
+    container_id: &str,
+    workload: ReplicaWorkload,
+    grace: std::time::Duration,
+) {
+    if workload.retired || !workload.container {
+        return;
+    }
+    match deployer
+        .stop_container_with_grace(container_id, grace)
+        .await
+    {
+        Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+        Err(error) => tracing::warn!(
+            container_id,
+            workload_id = workload.workload_id,
+            grace_seconds = grace.as_secs(),
+            %error,
+            "Could not stop the replica gracefully before retiring it; the workload plane \
+             removes it without the stop grace period"
+        ),
+    }
 }
 
 /// Retire `workload`, found by [`deployment_replica_workload`]: the plane
@@ -1100,6 +1148,19 @@ impl ContainerDeployer for PlaneContainerDeployer {
             return self.retire(workload_id, container_id).await;
         }
         self.local.stop_container(container_id).await
+    }
+
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        if let Some(workload_id) = self.plane_only_workload(container_id).await? {
+            return self.retire(workload_id, container_id).await;
+        }
+        self.local
+            .stop_container_with_grace(container_id, grace)
+            .await
     }
 
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError> {
@@ -2612,6 +2673,120 @@ mod tests {
         );
     }
 
+    /// Records the grace each stop was given; nothing else is expected.
+    #[derive(Default)]
+    struct GraceRecordingDeployer {
+        stops: std::sync::Mutex<Vec<(String, Duration)>>,
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for GraceRecordingDeployer {
+        async fn deploy_container(&self, _: DeployRequest) -> Result<DeployResult, DeployerError> {
+            Err(unused("deploy"))
+        }
+        async fn exec_in_container(
+            &self,
+            _: &str,
+            _: Vec<String>,
+            _: Duration,
+        ) -> Result<temps_deployer::ExecResult, DeployerError> {
+            Err(unused("exec"))
+        }
+        async fn start_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("start"))
+        }
+        async fn stop_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("stop without a grace period"))
+        }
+        async fn stop_container_with_grace(
+            &self,
+            container_id: &str,
+            grace: Duration,
+        ) -> Result<(), DeployerError> {
+            self.stops
+                .lock()
+                .map_err(|_| unused("record a stop"))?
+                .push((container_id.to_string(), grace));
+            Ok(())
+        }
+        async fn pause_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("pause"))
+        }
+        async fn resume_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("resume"))
+        }
+        async fn remove_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("remove"))
+        }
+        async fn get_container_info(&self, _: &str) -> Result<ContainerInfo, DeployerError> {
+            Err(unused("inspect"))
+        }
+        async fn get_container_stats(
+            &self,
+            _: &str,
+        ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+            Err(unused("read stats"))
+        }
+        async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
+            Ok(Vec::new())
+        }
+        async fn get_container_logs(&self, _: &str) -> Result<String, DeployerError> {
+            Err(unused("read logs"))
+        }
+        async fn stream_container_logs(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+            Err(unused("stream logs"))
+        }
+    }
+
+    /// #1806: the plane removes a retired replica outright, so a container
+    /// replica is first stopped with the configured grace. A microVM (which
+    /// Docker cannot see) and a replica already retired are left to the plane.
+    #[tokio::test]
+    async fn a_container_replica_gets_its_stop_grace_before_the_plane_retires_it() {
+        let deployer = GraceRecordingDeployer::default();
+        let grace = Duration::from_secs(120);
+        let replica = ReplicaWorkload {
+            workload_id: 7,
+            retired: false,
+            container: true,
+        };
+        stop_replica_before_retiring(&deployer, "c-old", replica, grace).await;
+        stop_replica_before_retiring(
+            &deployer,
+            "vm-old",
+            ReplicaWorkload {
+                container: false,
+                ..replica
+            },
+            grace,
+        )
+        .await;
+        stop_replica_before_retiring(
+            &deployer,
+            "c-gone",
+            ReplicaWorkload {
+                retired: true,
+                ..replica
+            },
+            grace,
+        )
+        .await;
+        assert_eq!(
+            *deployer.stops.lock().expect("stops"),
+            vec![("c-old".to_string(), grace)]
+        );
+    }
+
+    #[test]
+    fn only_container_drivers_are_stopped_through_a_deployer() {
+        assert!(is_container_driver(temps_workload_docker::DRIVER));
+        assert!(is_container_driver(temps_workload::stream::STREAM_DRIVER));
+        assert!(!is_container_driver("firecracker"));
+    }
+
     #[tokio::test]
     async fn a_plane_owned_replica_is_retired_through_the_plane() {
         let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
@@ -2660,9 +2835,26 @@ mod tests {
             found,
             ReplicaWorkload {
                 workload_id,
-                retired: false
+                retired: false,
+                container: true,
             }
         );
+
+        // A microVM replica is the plane's alone to stop.
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-44-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-44",
+        )
+        .await;
+        let micro_vm = deployment_replica_workload(db.as_ref(), 42, "vm-44")
+            .await
+            .expect("lookup")
+            .expect("plane-owned");
+        assert!(!micro_vm.container, "a microVM is not a container");
 
         // Without a plane it is left in place, never assumed gone.
         let error = retire_replica_workload(None, 42, "c-worker", found)

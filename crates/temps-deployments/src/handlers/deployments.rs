@@ -34,10 +34,10 @@ use utoipa::OpenApi;
 
 use crate::handlers::failure_report::*;
 use crate::handlers::types::{
-    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerHistoryEntry,
-    ContainerHistoryListResponse, ContainerHistoryQuery, ContainerInfoResponse,
-    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
+    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, AssetCachePurgeResponse,
+    ContainerActionResponse, ContainerDetailResponse, ContainerEnvironmentVariableValueResponse,
+    ContainerHistoryEntry, ContainerHistoryListResponse, ContainerHistoryQuery,
+    ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
@@ -226,9 +226,12 @@ async fn deployment_response_with_service_urls(
         get_container_metrics_history,
         stream_container_metrics,
         get_activity_graph,
-        list_managed_environment_variables
+        list_managed_environment_variables,
+        purge_asset_cache,
+        purge_environment_asset_cache
     ),
     components(schemas(
+        AssetCachePurgeResponse,
         DeploymentListResponse,
         DeploymentResponse,
         crate::services::DeploymentFailureInfo,
@@ -811,35 +814,97 @@ pub async fn rollback_to_deployment(
         .ensure_project_hosted_locally(project_id)
         .await?;
 
-    let deployment = state
-        .deployment_service
-        // ADR 045: a project that holds host Docker access may only be
-        // deployed — in any direction — by an instance admin.
-        .rollback_to_deployment_as(
+    // ADR 045: a project that holds host Docker access may only be
+    // deployed — in any direction — by an instance admin.
+    let caller = temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+        auth.is_instance_admin(),
+    );
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+
+    // A rollback waits for the new container's health check inside the
+    // request. Run it detached so a client disconnect (a CLI timeout, a closed
+    // tab) cannot drop it half-way and leave the deployment `running` forever
+    // with its container behind (#1802).
+    let task_state = state.clone();
+    let deployment = run_detached("rollback", project_id, deployment_id, async move {
+        let deployment = task_state
+            .deployment_service
+            .rollback_to_deployment_as(project_id, deployment_id, caller)
+            .await
+            .map_err(|error| {
+                warn!(
+                    project_id,
+                    deployment_id,
+                    %error,
+                    "Rollback failed"
+                );
+                Problem::from(error)
+            })?;
+
+        let audit = DeploymentRollbackAudit {
+            context: audit_context,
             project_id,
             deployment_id,
-            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
-                auth.is_instance_admin(),
-            ),
-        )
-        .await?;
-
-    let audit = DeploymentRollbackAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        project_id,
-        deployment_id,
-    };
-    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
+        };
+        if let Err(e) = task_state.audit_service.create_audit_log(&audit).await {
+            error!(
+                project_id,
+                deployment_id, "Failed to create rollback audit log: {}", e
+            );
+        }
+        Ok(deployment)
+    })
+    .await?;
 
     Ok(Json(DeploymentResponse::from_service_deployment(
         deployment,
     )))
+}
+
+/// Run a lifecycle operation (rollback, promotion) on its own task and await it.
+///
+/// Axum drops the handler future when the client disconnects. These operations
+/// start a container and wait for its health check before they record the
+/// outcome, so being dropped half-way leaves a deployment `running` with no
+/// job driving it and a container nobody owns. A spawned task is not cancelled
+/// when its `JoinHandle` is dropped: the operation runs to completion (or fails
+/// and cleans up) whether or not anyone is still waiting for the answer. The
+/// task logs its own failure, because after a disconnect nobody else will.
+async fn run_detached<T, F>(
+    operation: &'static str,
+    project_id: i32,
+    deployment_id: i32,
+    work: F,
+) -> Result<T, Problem>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, Problem>> + Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(join_error) => {
+            error!(
+                project_id,
+                deployment_id,
+                operation,
+                %join_error,
+                "Deployment lifecycle task did not finish"
+            );
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Deployment operation failed")
+                // The panic payload is internal; it is in the log above, not
+                // in the response.
+                .detail(format!(
+                    "The {operation} of deployment {deployment_id} in project {project_id} \
+                     stopped unexpectedly; the server log has the cause"
+                ))
+                .build())
+        }
+    }
 }
 
 /// Promote a deployment to another environment
@@ -885,31 +950,50 @@ pub async fn promote_deployment(
         deployment_id, request.target_environment_id, project_id
     );
 
-    let deployment = state
-        .deployment_service
-        .promote_deployment_as(
-            project_id,
-            deployment_id,
-            request.target_environment_id,
-            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
-                auth.is_instance_admin(),
-            ),
-        )
-        .await?;
-
-    let audit = DeploymentPromotedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        project_id,
-        source_deployment_id: deployment_id,
-        target_environment_id: request.target_environment_id,
+    let caller = temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+        auth.is_instance_admin(),
+    );
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
     };
-    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
+    let target_environment_id = request.target_environment_id;
+
+    // Same as rollback: the promotion health-checks the new container inside
+    // the request, so it must not be dropped when the client goes away.
+    let task_state = state.clone();
+    let deployment = run_detached("promotion", project_id, deployment_id, async move {
+        let deployment = task_state
+            .deployment_service
+            .promote_deployment_as(project_id, deployment_id, target_environment_id, caller)
+            .await
+            .map_err(|error| {
+                warn!(
+                    project_id,
+                    deployment_id,
+                    target_environment_id,
+                    %error,
+                    "Promotion failed"
+                );
+                Problem::from(error)
+            })?;
+
+        let audit = DeploymentPromotedAudit {
+            context: audit_context,
+            project_id,
+            source_deployment_id: deployment_id,
+            target_environment_id,
+        };
+        if let Err(e) = task_state.audit_service.create_audit_log(&audit).await {
+            error!(
+                project_id,
+                deployment_id, "Failed to create promotion audit log: {}", e
+            );
+        }
+        Ok(deployment)
+    })
+    .await?;
 
     Ok(Json(DeploymentResponse::from_service_deployment(
         deployment,
@@ -2950,9 +3034,10 @@ pub async fn get_activity_graph(
     path = "/projects/{project_id}/asset-cache",
     tag = "Deployments",
     responses(
-        (status = 200, description = "Asset cache purged"),
+        (status = 200, description = "Asset cache purged", body = AssetCachePurgeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID")
@@ -2973,7 +3058,7 @@ pub async fn purge_asset_cache(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted })))
+    Ok(Json(AssetCachePurgeResponse { deleted }))
 }
 
 /// Purge cached static assets for a specific environment.
@@ -2982,9 +3067,10 @@ pub async fn purge_asset_cache(
     path = "/projects/{project_id}/environments/{environment_id}/asset-cache",
     tag = "Deployments",
     responses(
-        (status = 200, description = "Environment asset cache purged"),
+        (status = 200, description = "Environment asset cache purged", body = AssetCachePurgeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -3006,11 +3092,32 @@ pub async fn purge_environment_asset_cache(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted })))
+    Ok(Json(AssetCachePurgeResponse { deleted }))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// #1795: the purge endpoints are in the OpenAPI document, so the console
+    /// calls them through the generated client and sees a refusal.
+    #[test]
+    fn asset_cache_purge_endpoints_are_documented() {
+        use utoipa::OpenApi;
+        let doc = super::DeploymentsApiDoc::openapi();
+        for path in [
+            "/projects/{project_id}/asset-cache",
+            "/projects/{project_id}/environments/{environment_id}/asset-cache",
+        ] {
+            let item = doc
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} is documented"));
+            assert!(item.delete.is_some(), "{path} documents DELETE");
+        }
+        let schemas = doc.components.expect("components").schemas;
+        assert!(schemas.contains_key("AssetCachePurgeResponse"));
+    }
 
     mod lifecycle_conflict_tests {
         use crate::services::services::DeploymentError;
@@ -6814,5 +6921,66 @@ pub(crate) mod tests {
 
         println!("✅ DELETE /projects/{{project_id}}/environments/{{env_id}}/teardown test passed");
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// #1802: the client giving up (its request future dropped) must not stop
+    /// the rollback it started.
+    #[tokio::test]
+    async fn detached_lifecycle_work_finishes_after_the_request_is_dropped() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let request = tokio::spawn(super::run_detached("rollback", 1, 2, async move {
+            let _ = started_tx.send(());
+            // Stands in for the health-check wait.
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+            Ok::<_, Problem>(())
+        }));
+
+        started_rx.await.expect("the work starts");
+        // The client disconnects: axum drops the handler future.
+        request.abort();
+        let _ = request.await;
+
+        release_tx.send(()).expect("the work is still running");
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("the detached work finishes")
+            .expect("the detached work reports completion");
+    }
+
+    #[tokio::test]
+    async fn detached_lifecycle_work_returns_its_own_error() {
+        let result = super::run_detached("rollback", 1, 2, async {
+            Err::<(), _>(
+                temps_core::error_builder::bad_request()
+                    .detail("Cannot rollback to deployment in 'failed' state")
+                    .build(),
+            )
+        })
+        .await;
+        let problem = result.expect_err("the work's error is returned");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn detached_lifecycle_work_that_panics_is_a_500_naming_the_deployment() {
+        let result = super::run_detached("rollback", 7, 42, async {
+            if true {
+                panic!("boom");
+            }
+            Ok::<(), Problem>(())
+        })
+        .await;
+        let problem = result.expect_err("a panicked task is an error");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&problem.body).expect("problem serializes");
+        assert!(body.contains("deployment 42 in project 7"), "{body}");
+        assert!(
+            !body.contains("boom") && !body.contains("panicked"),
+            "the panic payload must stay out of the response: {body}"
+        );
     }
 }

@@ -877,7 +877,7 @@ export const getApiKey = <ThrowOnError extends boolean = false>(options: Options
 };
 
 export const updateApiKey = <ThrowOnError extends boolean = false>(options: Options<UpdateApiKeyData, ThrowOnError>) => {
-    return (options.client ?? _heyApiClient).put<UpdateApiKeyResponses, UpdateApiKeyErrors, ThrowOnError>({
+    return (options.client ?? _heyApiClient).patch<UpdateApiKeyResponses, UpdateApiKeyErrors, ThrowOnError>({
         security: [
             {
                 scheme: 'bearer',

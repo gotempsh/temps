@@ -489,6 +489,15 @@ fn bounded_strings(items: &[String], max_entries: usize, max_bytes: usize) -> Ve
     kept
 }
 
+/// Body of a worker agent's `POST /agent/containers/{id}/stop`. Every field is
+/// optional so an empty body (older control planes) keeps the default stop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StopContainerRequest {
+    /// Seconds between SIGTERM and SIGKILL; the agent's default (10) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_seconds: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeployRequest {
     pub image_name: String,
@@ -1144,6 +1153,17 @@ pub trait ImageBuilder: Send + Sync {
     /// Inspect an image and return its metadata including architecture
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
+    /// Every platform `image_name` can run on from this builder's local store.
+    ///
+    /// A multi-platform image (a manifest list or OCI index) pulled for
+    /// several architectures holds a runnable image for each, while
+    /// [`Self::inspect_image`] only reports the one the daemon picks for its
+    /// own architecture. The default answers with that one platform; a
+    /// builder whose store can list an image's manifests overrides it.
+    async fn image_platforms(&self, image_name: &str) -> Result<Vec<String>, BuilderError> {
+        Ok(vec![self.inspect_image(image_name).await?.platform])
+    }
+
     /// The identity of the image `image_name` currently resolves to.
     ///
     /// `id` is whatever the daemon reports as the image ID: the config digest
@@ -1257,6 +1277,22 @@ pub trait ContainerDeployer: Send + Sync {
 
     /// Stop a running container
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError>;
+
+    /// Stop a running container, giving it `grace` between SIGTERM and
+    /// SIGKILL to finish in-flight work. Used when a superseded deployment is
+    /// torn down, where the project's stop timeout applies.
+    ///
+    /// Every deployer that stops real containers overrides this. The default
+    /// is for test doubles and deployers without a grace period to honour; it
+    /// stops the container the way [`Self::stop_container`] does.
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        let _ = grace;
+        self.stop_container(container_id).await
+    }
 
     /// Pause a running container
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError>;

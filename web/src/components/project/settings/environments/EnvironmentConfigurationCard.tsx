@@ -1,4 +1,11 @@
 import { SettingsSection } from '@/components/ui/settings-section'
+import {
+  DEFAULT_STOP_TIMEOUT_SECONDS,
+  MAX_STOP_TIMEOUT_SECONDS,
+  MIN_STOP_TIMEOUT_SECONDS,
+  stopTimeoutProblem,
+  stopTimeoutSeconds,
+} from '@/lib/deployment-stop-timeout'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -164,6 +171,8 @@ export function EnvironmentConfigurationCard({
       environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
     request_timeout_seconds:
       environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+    stop_timeout_seconds:
+      environment.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
     sse_idle_timeout_seconds:
       environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
     websocket_idle_timeout_seconds:
@@ -238,6 +247,8 @@ export function EnvironmentConfigurationCard({
         environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
       request_timeout_seconds:
         environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+      stop_timeout_seconds:
+        environment.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
       sse_idle_timeout_seconds:
         environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
       websocket_idle_timeout_seconds:
@@ -295,6 +306,7 @@ export function EnvironmentConfigurationCard({
   })
 
   const [exemptPathsError, setExemptPathsError] = useState<string | null>(null)
+  const [stopTimeoutError, setStopTimeoutError] = useState<string | null>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -303,6 +315,12 @@ export function EnvironmentConfigurationCard({
     const exemptProblem = validateExemptPaths(exemptPaths)
     setExemptPathsError(exemptProblem)
     if (exemptProblem) return
+    const stopTimeoutError = stopTimeoutProblem(formData.stop_timeout_seconds)
+    setStopTimeoutError(stopTimeoutError)
+    if (stopTimeoutError) {
+      toast.error('Check the stop timeout', { description: stopTimeoutError })
+      return
+    }
 
     updateEnvironmentSettings.mutateAsync({
       path: {
@@ -365,6 +383,9 @@ export function EnvironmentConfigurationCard({
         // the override (inherit service/global default, itself unlimited by
         // default), "0" is a valid, distinct override meaning "explicitly
         // unlimited for this environment."
+        // Blank sends null, which clears the override so the environment
+        // follows the project (or the 10-second default).
+        stop_timeout_seconds: stopTimeoutSeconds(formData.stop_timeout_seconds),
         max_concurrent_connections: formData.max_concurrent_connections
           ? parseInt(formData.max_concurrent_connections)
           : null,
@@ -776,6 +797,43 @@ export function EnvironmentConfigurationCard({
                 placeholder="Inherit"
               />
             </div>
+          </div>
+        </SettingsSection>
+
+        <SettingsSection
+          id="setting-environment-stop-timeout"
+          title="Stop timeout"
+          icon={Clock}
+        >
+          <p className="text-xs text-muted-foreground mb-4">
+            How long this environment&apos;s previous deployment gets to finish
+            in-flight work after SIGTERM, before it is killed, when a new
+            deployment replaces it. Leave blank to follow the project (default{' '}
+            {DEFAULT_STOP_TIMEOUT_SECONDS} seconds).
+          </p>
+          <div className="w-full sm:w-[200px]">
+            <Label htmlFor="environment-stop-timeout">Seconds</Label>
+            <Input
+              id="environment-stop-timeout"
+              type="number"
+              min={MIN_STOP_TIMEOUT_SECONDS}
+              max={MAX_STOP_TIMEOUT_SECONDS}
+              value={formData.stop_timeout_seconds}
+              aria-invalid={stopTimeoutError !== null}
+              onChange={(e) => {
+                setStopTimeoutError(null)
+                setFormData((prev) => ({
+                  ...prev,
+                  stop_timeout_seconds: e.target.value,
+                }))
+              }}
+              placeholder="Inherit"
+            />
+            {stopTimeoutError && (
+              <p className="mt-1 text-xs text-destructive">
+                {stopTimeoutError}
+              </p>
+            )}
           </div>
         </SettingsSection>
 

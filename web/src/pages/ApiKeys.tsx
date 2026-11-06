@@ -41,7 +41,8 @@ export default function ApiKeys() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteApiKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteApiKey({ path: { id }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to delete API key',
     },
@@ -54,7 +55,8 @@ export default function ApiKeys() {
 
   // Activate mutation
   const activateMutation = useMutation({
-    mutationFn: (id: number) => activateApiKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      activateApiKey({ path: { id }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to activate API key',
     },
@@ -66,7 +68,8 @@ export default function ApiKeys() {
 
   // Deactivate mutation
   const deactivateMutation = useMutation({
-    mutationFn: (id: number) => deactivateApiKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deactivateApiKey({ path: { id }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to deactivate API key',
     },

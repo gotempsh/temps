@@ -39,6 +39,11 @@ import {
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isVerifiedNotFound } from '@/lib/read-failure'
 import { listApiKeysQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  earliestExpiryDate,
+  expiryDateInput,
+  expiryForUpdate,
+} from './api-key-expiry'
 
 export default function ApiKeyEdit() {
   usePageTitle('Edit API key')
@@ -69,16 +74,18 @@ export default function ApiKeyEdit() {
       setFormData({
         name: apiKey.name,
         is_active: apiKey.is_active,
-        expires_at: apiKey.expires_at
-          ? new Date(apiKey.expires_at).toISOString().split('T')[0]
-          : '',
+        expires_at: expiryDateInput(apiKey.expires_at),
       })
     }
   }
 
   const updateMutation = useMutation({
     mutationFn: (data: UpdateApiKeyRequest) =>
-      updateApiKey({ path: { id: parseInt(id!) }, body: data }),
+      updateApiKey({
+        path: { id: parseInt(id!) },
+        body: data,
+        throwOnError: true,
+      }),
     meta: {
       errorTitle: 'Failed to update API key',
     },
@@ -94,12 +101,23 @@ export default function ApiKeyEdit() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    // The server keeps the stored expiry when none is sent, so an emptied
+    // date would report success and change nothing.
+    if (formData.expires_at === '' && loadedApiKey?.expires_at) {
+      toast.error('The expiration date cannot be removed', {
+        description:
+          'Pick a new date, or create a new key that never expires and revoke this one.',
+      })
+      return
+    }
     const data: UpdateApiKeyRequest = {
       name: formData.name,
       is_active: formData.is_active,
-      expires_at: formData.expires_at
-        ? new Date(formData.expires_at).toISOString()
-        : null,
+      // An untouched date keeps the stored expiry, time of day included.
+      expires_at: expiryForUpdate(
+        formData.expires_at,
+        loadedApiKey?.expires_at
+      ),
     }
     updateMutation.mutate(data)
   }
@@ -166,8 +184,12 @@ export default function ApiKeyEdit() {
     )
   }
 
+  const expiryChanged =
+    formData.expires_at !== '' &&
+    formData.expires_at !== expiryDateInput(apiKey.expires_at)
   const isExpired =
     apiKey.expires_at && new Date(apiKey.expires_at) < new Date()
+  const hasStoredExpiry = Boolean(apiKey.expires_at)
 
   return (
     <div className="w-full min-w-0 space-y-6">
@@ -300,11 +322,19 @@ export default function ApiKeyEdit() {
                   onChange={(e) =>
                     setFormData({ ...formData, expires_at: e.target.value })
                   }
-                  min={new Date().toISOString().split('T')[0]}
+                  // Only a newly picked date must be in the future: an
+                  // already-expired key can still be renamed or deactivated.
+                  min={expiryChanged ? earliestExpiryDate() : undefined}
+                  required={hasStoredExpiry}
+                  aria-describedby="expires_at_hint"
                 />
-                <p className="text-sm text-muted-foreground">
-                  Leave empty for no expiration. Current keys expire on the set
-                  date.
+                <p
+                  id="expires_at_hint"
+                  className="text-sm text-muted-foreground"
+                >
+                  {hasStoredExpiry
+                    ? 'The key stops working on this date. Pick a new date to change it; an expiration date cannot be removed.'
+                    : 'Leave empty for no expiration, or pick the date the key stops working.'}
                 </p>
                 {isExpired && (
                   <Alert variant="destructive">

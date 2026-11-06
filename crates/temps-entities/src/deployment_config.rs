@@ -394,6 +394,18 @@ pub struct DeploymentConfig {
     /// value and may override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_timeout_seconds: Option<i32>,
+    /// How long, in seconds, a superseded deployment's containers get to
+    /// finish in-flight work after SIGTERM before they are killed, once a new
+    /// deployment has gone live. Raise it for long requests (uploads,
+    /// exports, streaming responses, WebSockets).
+    /// An override is 1 to 3600 seconds. Absent on a project means the
+    /// platform default of 10 seconds; absent on an environment means it
+    /// inherits the project's value, else the platform default.
+    // The numbers above are spelled out because this comment is the OpenAPI
+    // description, where an intra-doc link would show as raw brackets. They
+    // are DEFAULT/MIN/MAX_STOP_TIMEOUT_SECONDS, which a test keeps in step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_seconds: Option<i32>,
     /// Deploy-time probe; environment overrides project, repository config overrides both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<temps_core::repo_config::HealthCheckConfig>,
@@ -405,6 +417,14 @@ pub const DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 300;
 pub const MIN_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 30;
 /// Largest accepted readiness-budget override, in seconds (1 hour).
 pub const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 3600;
+
+/// Default grace period between SIGTERM and SIGKILL when a superseded
+/// deployment's containers are stopped, in seconds.
+pub const DEFAULT_STOP_TIMEOUT_SECONDS: i32 = 10;
+/// Smallest accepted stop grace period override, in seconds.
+pub const MIN_STOP_TIMEOUT_SECONDS: i32 = 1;
+/// Largest accepted stop grace period override, in seconds (1 hour).
+pub const MAX_STOP_TIMEOUT_SECONDS: i32 = 3600;
 
 /// Deployment configuration snapshot for deployments
 ///
@@ -506,6 +526,7 @@ impl Default for DeploymentConfig {
             websocket_idle_timeout_seconds: None,
             max_concurrent_connections: None,
             health_check_timeout_seconds: None,
+            stop_timeout_seconds: None,
             health: None,
         }
     }
@@ -561,6 +582,41 @@ impl DeploymentConfigSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stop timeout's field docs are its OpenAPI description, so they
+    /// spell the bounds out instead of linking the constants; this keeps the
+    /// two in step and the description free of intra-doc link brackets.
+    #[test]
+    fn stop_timeout_description_states_the_enforced_bounds() {
+        let schema = serde_json::to_value(<DeploymentConfig as utoipa::PartialSchema>::schema())
+            .expect("schema serializes");
+        let description = schema["properties"]["stopTimeoutSeconds"]["description"]
+            .as_str()
+            .expect("stopTimeoutSeconds has a description")
+            // Doc comment line breaks are kept; match the words, not the wrap.
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            description.contains(&format!(
+                "default of {DEFAULT_STOP_TIMEOUT_SECONDS} seconds"
+            )),
+            "{description}"
+        );
+        assert!(
+            description.contains(&format!(
+                "{MIN_STOP_TIMEOUT_SECONDS} to {MAX_STOP_TIMEOUT_SECONDS} seconds"
+            )),
+            "{description}"
+        );
+        assert!(!description.contains("[`"), "{description}");
+        // The same schema describes project and environment settings, where
+        // an absent value means different things.
+        assert!(
+            description.contains("absent on an environment means it inherits the project's value"),
+            "{description}"
+        );
+    }
 
     /// Rows written before the setting existed must keep deserializing, and
     /// the wire format is the documented snake_case value.

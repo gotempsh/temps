@@ -498,6 +498,13 @@ pub struct WorkflowExecutionService {
     audit_logger: OnceCell<Arc<dyn temps_core::AuditLogger>>,
 }
 
+/// The platform's stop grace period, for containers that never served traffic.
+fn default_stop_grace() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+    )
+}
+
 impl WorkflowExecutionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -2046,6 +2053,7 @@ impl WorkflowExecutionService {
         &self,
         container: temps_entities::deployment_containers::Model,
         retry_failed_cleanup: bool,
+        stop_grace: std::time::Duration,
     ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
@@ -2126,6 +2134,46 @@ impl WorkflowExecutionService {
 
         let removal: Result<(), String> = match teardown {
             TeardownPath::Plane(workload) => {
+                // The plane removes a retired replica without a graceful stop,
+                // so give a container replica its stop grace first, bounded
+                // like the deployer path below. An unreachable node only loses
+                // the grace period; the replica is still retired.
+                if workload.container && !workload.retired {
+                    match self.teardown_deployer_for_node(container.node_id).await {
+                        Ok(deployer) => {
+                            let budget = crate::jobs::mark_deployment_complete::teardown_budget(
+                                self.container_teardown_timeout,
+                                stop_grace,
+                            );
+                            if tokio::time::timeout(
+                                budget,
+                                crate::services::plane_deployer::stop_replica_before_retiring(
+                                    deployer.as_ref(),
+                                    &container_id,
+                                    workload,
+                                    stop_grace,
+                                ),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!(
+                                    container_id = %container_id,
+                                    budget_seconds = budget.as_secs(),
+                                    "Graceful stop of the replica did not answer in time; retiring it \
+                                     through the workload plane"
+                                );
+                            }
+                        }
+                        Err(error) => warn!(
+                            container_id = %container_id,
+                            node_id = ?container.node_id,
+                            %error,
+                            "Cannot reach the replica's node to stop it gracefully; retiring it \
+                             through the workload plane without the stop grace period"
+                        ),
+                    }
+                }
                 crate::services::plane_deployer::retire_replica_workload(
                     self.workload_plane.get().map(Arc::as_ref),
                     container.deployment_id,
@@ -2140,8 +2188,15 @@ impl WorkflowExecutionService {
                 // still reaches the code below, which restores the row claimed
                 // above. An unanswering worker's client would otherwise take
                 // minutes per call while a sweep holds the lifecycle lock.
-                let removal = tokio::time::timeout(self.container_teardown_timeout, async {
-                    if let Err(error) = deployer.stop_container(&container_id).await {
+                let teardown_timeout = crate::jobs::mark_deployment_complete::teardown_budget(
+                    self.container_teardown_timeout,
+                    stop_grace,
+                );
+                let removal = tokio::time::timeout(teardown_timeout, async {
+                    if let Err(error) = deployer
+                        .stop_container_with_grace(&container_id, stop_grace)
+                        .await
+                    {
                         warn!(
                             "Failed to stop container {} on node {:?}: {}",
                             container_id, container.node_id, error
@@ -2156,7 +2211,7 @@ impl WorkflowExecutionService {
                 removal.unwrap_or_else(|_| {
                     Err(format!(
                         "no answer after {}s; it may still be running",
-                        self.container_teardown_timeout.as_secs()
+                        teardown_timeout.as_secs()
                     ))
                 })
             }
@@ -2289,6 +2344,16 @@ impl WorkflowExecutionService {
 
         let mut first_stopped_container_id: Option<String> = None;
         let mut total_containers_cleaned = 0;
+        // Superseded containers drain for the project's stop timeout (#1806).
+        let stop_grace = if previous_deployments.is_empty() {
+            std::time::Duration::ZERO
+        } else {
+            crate::jobs::mark_deployment_complete::superseded_stop_grace(
+                self.db.as_ref(),
+                environment_id,
+            )
+            .await
+        };
 
         for deployment in previous_deployments {
             let lifecycle_lock =
@@ -2326,14 +2391,13 @@ impl WorkflowExecutionService {
 
             // Several at once, so a worker that stops answering costs this lock
             // one timeout per batch rather than one per replica.
-            let removals: Vec<_> = futures::stream::iter(
-                containers
-                    .into_iter()
-                    .map(|container| self.teardown_registered_container(container, false)),
-            )
-            .buffered(crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS)
-            .collect()
-            .await;
+            let removals: Vec<_> =
+                futures::stream::iter(containers.into_iter().map(|container| {
+                    self.teardown_registered_container(container, false, stop_grace)
+                }))
+                .buffered(crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS)
+                .collect()
+                .await;
             let mut removed_every_container = true;
             for removal in removals {
                 match removal {
@@ -2436,7 +2500,10 @@ impl WorkflowExecutionService {
         let cleanup_results = futures::stream::iter(
             retained_failed
                 .into_iter()
-                .map(|(container, _)| self.teardown_registered_container(container, true)),
+                // Containers that failed readiness never served: default grace.
+                .map(|(container, _)| {
+                    self.teardown_registered_container(container, true, default_stop_grace())
+                }),
         )
         .buffer_unordered(RETAINED_CLEANUP_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -5958,12 +6025,12 @@ mod tests {
         .insert(db.as_ref())
         .await?;
         let first_result = service
-            .teardown_registered_container(stale_snapshot.clone(), true)
+            .teardown_registered_container(stale_snapshot.clone(), true, default_stop_grace())
             .await?;
         assert_eq!(first_result, Some(stale_snapshot.container_id.clone()));
         let calls_after_winner = remove_calls.load(std::sync::atomic::Ordering::SeqCst);
         let stale_result = service
-            .teardown_registered_container(stale_snapshot.clone(), true)
+            .teardown_registered_container(stale_snapshot.clone(), true, default_stop_grace())
             .await?;
         assert_eq!(stale_result, None);
         assert_eq!(

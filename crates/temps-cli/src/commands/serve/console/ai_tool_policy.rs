@@ -72,6 +72,11 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "kv_disable",
             "plan_restore",
             "promote_cluster_member",
+            // Drops the asset versions the proxy keeps for pages still open
+            // on an older deployment, which then fail to load their scripts;
+            // the console asks before purging.
+            "purge_asset_cache",
+            "purge_environment_asset_cache",
             "purge_project_logs",
             "put_environment_ip_access",
             "put_project_ip_access",

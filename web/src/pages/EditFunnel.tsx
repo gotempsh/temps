@@ -15,9 +15,13 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import * as React from 'react'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { useNavigate } from 'react-router'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+
+/** How long the saved message shows before the funnel opens. */
+const FUNNEL_SAVED_REDIRECT_DELAY_MS = 1500
 
 interface EditFunnelProps {
   project: ProjectResponse
@@ -67,17 +71,28 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
       queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
       queryClient.invalidateQueries({ queryKey: ['getFunnelMetrics'] })
       setFeedback({ type: 'success', message: 'Funnel updated successfully!' })
-      setTimeout(() => {
-        navigate(`/projects/${project.slug}/analytics/funnels/${funnelId}`)
-      }, 1500)
     },
-    onError: (error: any) => {
+    onError: (error) => {
       setFeedback({
         type: 'error',
-        message: error?.message || 'Failed to update funnel. Please try again.',
+        message: getErrorMessage(
+          error,
+          'Failed to update funnel. Please try again.'
+        ),
       })
     },
   })
+
+  // The success message stays up briefly before returning to the funnel; the
+  // form stays disabled until then so a second click cannot save again.
+  const funnelSaved = updateFunnel.isSuccess
+  React.useEffect(() => {
+    if (!funnelSaved) return
+    const timer = setTimeout(() => {
+      navigate(`/projects/${project.slug}/analytics/funnels/${funnelId}`)
+    }, FUNNEL_SAVED_REDIRECT_DELAY_MS)
+    return () => clearTimeout(timer)
+  }, [funnelSaved, funnelId, navigate, project.slug])
 
   const handleSubmit = (formData: FunnelFormData) => {
     if (!formData.name.trim()) {
@@ -202,7 +217,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
       <FunnelForm
         project={project}
         initialData={initialData}
-        isSubmitting={updateFunnel.isPending}
+        isSubmitting={updateFunnel.isPending || updateFunnel.isSuccess}
         feedback={feedback}
         onSubmit={handleSubmit}
         onCancel={handleCancel}

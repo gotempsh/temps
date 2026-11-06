@@ -35,9 +35,11 @@ use tracing::{debug, info, warn};
 const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
 
 mod paused_sweep;
+mod stop_grace;
 pub(crate) use paused_sweep::{
     deployment_still_swept, environment_lifecycle_lock, MAX_CONCURRENT_REPLICA_STOPS,
 };
+pub(crate) use stop_grace::{superseded_stop_grace, teardown_budget};
 
 /// Deployment states the previous-deployment teardown sweeps pick up. "deployed"
 /// is what `resume_deployment` leaves behind, and a later deploy supersedes it
@@ -2301,6 +2303,7 @@ WHERE project.id = $2
         container: deployment_containers::Model,
         project_id: i32,
         environment_id: i32,
+        stop_grace: std::time::Duration,
     ) -> Result<(), String> {
         let container_id = container.container_id.clone();
         let plane_workload = crate::services::plane_deployer::deployment_replica_workload(
@@ -2357,7 +2360,19 @@ WHERE project.id = $2
         }
 
         match (plane_workload, deployer) {
-            (Some(workload), _) => {
+            (Some(workload), deployer) => {
+                // The plane removes a retired replica without a graceful stop,
+                // so give it the configured grace first. Without a reachable
+                // deployer the replica is still retired, only without it.
+                if let Some(deployer) = deployer.as_ref() {
+                    crate::services::plane_deployer::stop_replica_before_retiring(
+                        deployer.as_ref(),
+                        &container_id,
+                        workload,
+                        stop_grace,
+                    )
+                    .await;
+                }
                 if let Err(e) = crate::services::plane_deployer::retire_replica_workload(
                     self.workload_plane.as_deref(),
                     container.deployment_id,
@@ -2379,7 +2394,7 @@ WHERE project.id = $2
                 .ok();
             }
             (None, Some(deployer)) => {
-                self.stop_and_remove_container(deployer.as_ref(), &container_id)
+                self.stop_and_remove_container(deployer.as_ref(), &container_id, stop_grace)
                     .await?;
             }
             (None, None) => {
@@ -2397,61 +2412,6 @@ WHERE project.id = $2
             .update(self.db.as_ref())
             .await
             .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
-
-        Ok(())
-    }
-
-    /// Stop (best effort) and remove a legacy container through its node's
-    /// deployer. An already-removed container counts as removed.
-    async fn stop_and_remove_container(
-        &self,
-        deployer: &dyn temps_deployer::ContainerDeployer,
-        container_id: &str,
-    ) -> Result<(), String> {
-        // Stop container first
-        match deployer.stop_container(container_id).await {
-            Ok(_) => {
-                self.log(format!("Stopped container {}", container_id))
-                    .await
-                    .ok();
-            }
-            Err(e) => {
-                self.log(format!("Failed to stop container {}: {}", container_id, e))
-                    .await
-                    .ok();
-            }
-        }
-
-        // Remove container from Docker. A container that is already gone
-        // (pruned, removed by hand, lost with its node's disk) is torn down:
-        // retrying could never succeed and would keep the deployment in the
-        // sweep forever.
-        match deployer.remove_container(container_id).await {
-            Ok(_) => {
-                self.log(format!("Removed container {}", container_id))
-                    .await
-                    .ok();
-            }
-            Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
-                self.log(format!(
-                    "Container {} was already removed from Docker",
-                    container_id
-                ))
-                .await
-                .ok();
-            }
-            Err(e) => {
-                self.log(format!(
-                    "Failed to remove container {}: {}",
-                    container_id, e
-                ))
-                .await
-                .ok();
-                return Err(format!(
-                    "Failed to remove rejected container {container_id}: {e}"
-                ));
-            }
-        }
 
         Ok(())
     }
@@ -2518,12 +2478,17 @@ WHERE project.id = $2
         let teardowns = containers.into_iter().map(|container| {
             let container_id = container.container_id.clone();
             async move {
+                // A rejected deployment never went live, so it has no
+                // traffic to drain: the default grace period.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
                     self.teardown_container(
                         container,
                         deployment.project_id,
                         deployment.environment_id,
+                        std::time::Duration::from_secs(
+                            temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+                        ),
                     ),
                 )
                 .await
@@ -2638,6 +2603,22 @@ WHERE project.id = $2
         .await
         .ok();
 
+        // The previous deployment drains its in-flight requests for the
+        // project's stop timeout before it is killed (#1806).
+        let stop_grace = superseded_stop_grace(self.db.as_ref(), environment_id).await;
+        let teardown_timeout = teardown_budget(
+            std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
+            stop_grace,
+        );
+        if !previous_deployments.is_empty() {
+            self.log(format!(
+                "Stopping previous containers with a {}s grace period",
+                stop_grace.as_secs()
+            ))
+            .await
+            .ok();
+        }
+
         let mut incomplete_teardowns = 0usize;
         for deployment in previous_deployments {
             let deployment_id = deployment.id;
@@ -2732,8 +2713,8 @@ WHERE project.id = $2
                 async move {
                     let container_id = container.container_id.clone();
                     let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
-                        self.teardown_container(container, project_id, env_id),
+                        teardown_timeout,
+                        self.teardown_container(container, project_id, env_id, stop_grace),
                     )
                     .await;
                     match result {
@@ -2747,7 +2728,8 @@ WHERE project.id = $2
                         Err(_) => {
                             self.log(format!(
                                 "Timed out tearing down container {} after {}s — will retry on next sweep",
-                                container_id, CONTAINER_TEARDOWN_TIMEOUT_SECS
+                                container_id,
+                                teardown_timeout.as_secs()
                             ))
                             .await
                             .ok();
@@ -3498,6 +3480,8 @@ mod teardown_tests {
         stop_delay: StdMutex<Option<std::time::Duration>>,
         stops_in_flight: std::sync::atomic::AtomicUsize,
         most_stops_in_flight: std::sync::atomic::AtomicUsize,
+        /// The grace period of every graceful stop, by container.
+        stop_graces: Arc<StdMutex<Vec<(String, std::time::Duration)>>>,
     }
 
     /// Holds a deployer operation open so a test can run something against it.
@@ -3522,6 +3506,7 @@ mod teardown_tests {
                 stop_delay: StdMutex::new(None),
                 stops_in_flight: std::sync::atomic::AtomicUsize::new(0),
                 most_stops_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                stop_graces: Arc::new(StdMutex::new(Vec::new())),
             }
         }
 
@@ -3604,6 +3589,17 @@ mod teardown_tests {
             self.stopped.lock().unwrap().push(id.to_string());
             self.operations.lock().unwrap().push(format!("stop {id}"));
             Ok(())
+        }
+        async fn stop_container_with_grace(
+            &self,
+            id: &str,
+            grace: std::time::Duration,
+        ) -> Result<(), DeployerError> {
+            self.stop_graces
+                .lock()
+                .unwrap()
+                .push((id.to_string(), grace));
+            self.stop_container(id).await
         }
         async fn pause_container(&self, _id: &str) -> Result<(), DeployerError> {
             Ok(())
@@ -4481,11 +4477,134 @@ mod teardown_tests {
         );
     }
 
+    /// #1806: a superseded deployment's containers drain for the stop timeout
+    /// the environment sets, else the project's, else the default 10 s.
+    #[tokio::test]
+    async fn test_teardown_stops_previous_containers_with_the_configured_grace() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+
+        async fn graces_after_a_deploy(
+            db: &Arc<DbConnection>,
+            project_id: i32,
+            environment_id: i32,
+            round: &str,
+        ) -> Vec<(String, std::time::Duration)> {
+            let prev = insert_deployment(
+                db,
+                project_id,
+                environment_id,
+                &format!("prev-{round}"),
+                "completed",
+            )
+            .await;
+            insert_container(db, prev.id, &format!("prev-container-{round}")).await;
+            let new = insert_deployment(
+                db,
+                project_id,
+                environment_id,
+                &format!("new-{round}"),
+                "completed",
+            )
+            .await;
+            let deployer = Arc::new(RecordingDeployer::new());
+            let job = make_job(db.clone(), new.id, deployer.clone());
+            job.cancel_previous_deployments(environment_id, new.created_at)
+                .await;
+            let graces = deployer.stop_graces.lock().unwrap().clone();
+            // Leave only `new` live, so the next round starts clean.
+            deployments::Entity::update_many()
+                .col_expr(
+                    deployments::Column::State,
+                    sea_orm::sea_query::Expr::value("stopped"),
+                )
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+            graces
+        }
+
+        // Nothing configured: the 10 s Temps has always used.
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "default").await,
+            [(
+                "prev-container-default".to_string(),
+                std::time::Duration::from_secs(10)
+            )]
+        );
+
+        // The project's stop timeout.
+        let mut active: projects::ActiveModel = project.clone().into();
+        active.deployment_config = Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            stop_timeout_seconds: Some(120),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "project").await,
+            [(
+                "prev-container-project".to_string(),
+                std::time::Duration::from_secs(120)
+            )]
+        );
+
+        // An environment override wins over the project.
+        let mut active: environments::ActiveModel = env.clone().into();
+        active.deployment_config = Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            stop_timeout_seconds: Some(30),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "environment").await,
+            [(
+                "prev-container-environment".to_string(),
+                std::time::Duration::from_secs(30)
+            )]
+        );
+    }
+
     /// Regression: a previous deployment whose container could not be removed
     /// used to be flipped to "stopped" anyway. "stopped" deployments are never
     /// swept again, so the container row stayed live forever and the health
     /// monitor reported the leftover exited container as a crash on every
     /// poll. The deployment must stay sweepable until teardown succeeds.
+    /// The stop-and-remove helper tears down every superseded container, not
+    /// only a rejected deployment's, so its failure must not call the
+    /// container rejected: the sweep logs it as the teardown failure.
+    #[tokio::test]
+    async fn a_failed_container_removal_does_not_call_the_container_rejected() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db, 42, deployer.clone());
+
+        let error = job
+            .stop_and_remove_container(
+                deployer.as_ref(),
+                "prev-container",
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a refused removal is an error");
+
+        assert_eq!(
+            error,
+            "Failed to remove container prev-container: Other error: removal of container \
+             prev-container is already in progress"
+        );
+    }
+
     #[tokio::test]
     async fn test_failed_teardown_keeps_previous_deployment_sweepable() {
         let test_db = match TestDatabase::with_migrations().await {

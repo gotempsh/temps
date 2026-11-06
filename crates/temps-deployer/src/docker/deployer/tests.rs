@@ -48,6 +48,114 @@ fn block_io_saturates_instead_of_wrapping() {
     assert_eq!(block_io_bytes(&entries).0, u64::MAX);
 }
 
+/// A daemon that records each request line and answers `204 No Content`,
+/// after `delay` for a container stop (the daemon only answers a stop once the
+/// container has exited).
+async fn recording_stop_daemon(
+    delay: std::time::Duration,
+    client_timeout_secs: u64,
+) -> (bollard::Docker, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let recorder = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let recorder = recorder.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if line.contains("/stop") {
+                    tokio::time::sleep(delay).await;
+                }
+                recorder.lock().unwrap().push(line);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    let docker = bollard::Docker::connect_with_http(
+        &format!("http://{address}"),
+        client_timeout_secs,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap();
+    (docker, seen)
+}
+
+/// #1806: the project's stop timeout reaches Docker as the stop's `t`, and a
+/// stop that names none keeps the 10 s it always had.
+#[tokio::test]
+async fn graceful_stop_sends_the_requested_grace_period_to_docker() {
+    let (docker, seen) = recording_stop_daemon(std::time::Duration::ZERO, 120).await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    runtime
+        .stop_container_with_grace("old-replica", std::time::Duration::from_secs(45))
+        .await
+        .expect("stop succeeds");
+    runtime
+        .stop_container("other-replica")
+        .await
+        .expect("stop succeeds");
+
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|line| line.contains("/containers/old-replica/stop") && line.contains("t=45")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|line| line.contains("/containers/other-replica/stop") && line.contains("t=10")),
+        "{seen:?}"
+    );
+}
+
+/// A container that drains for longer than the client's own timeout must not
+/// fail the stop while it is still finishing requests.
+#[tokio::test]
+async fn graceful_stop_outlasts_the_shared_client_timeout() {
+    // A 1 s client timeout stands in for bollard's 120 s default.
+    let (docker, _) = recording_stop_daemon(std::time::Duration::from_secs(2), 1).await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    runtime
+        .stop_container_with_grace("draining", std::time::Duration::from_secs(5))
+        .await
+        .expect("a stop within its grace period must not hit the client timeout");
+}
+
+#[test]
+fn stop_request_client_covers_the_grace_period_and_leaves_the_shared_client_alone() {
+    let docker =
+        bollard::Docker::connect_with_http("http://127.0.0.1:9", 120, bollard::API_DEFAULT_VERSION)
+            .unwrap();
+    let short = stop_request_client(&docker, std::time::Duration::from_secs(10));
+    assert_eq!(short.timeout(), std::time::Duration::from_secs(120));
+    let long = stop_request_client(&docker, std::time::Duration::from_secs(1800));
+    assert_eq!(long.timeout(), std::time::Duration::from_secs(1860));
+    assert_eq!(docker.timeout(), std::time::Duration::from_secs(120));
+    assert_eq!(
+        stop_grace_seconds(std::time::Duration::from_secs(u64::MAX)),
+        i32::MAX
+    );
+}
+
 #[test]
 fn only_a_docker_404_makes_a_failed_stop_read_as_not_found() {
     let missing = stop_error(

@@ -770,3 +770,148 @@ fn image_archive_client_leaves_the_shared_client_timeout_alone() {
     assert_eq!(archive_client.timeout(), IMAGE_ARCHIVE_CLIENT_TIMEOUT);
     assert_eq!(docker.timeout(), Duration::from_secs(120));
 }
+
+/// A daemon that answers an image inspect with `inspect` and an image list
+/// with `list`, as JSON.
+async fn image_store_daemon(inspect: serde_json::Value, list: serde_json::Value) -> Docker {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let inspect = inspect.to_string();
+    let list = list.to_string();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (inspect, list) = (inspect.clone(), list.clone());
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = if path.contains("/images/json") {
+                    list
+                } else {
+                    inspect
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Docker::connect_with_http(
+        &format!("http://{address}"),
+        5,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap()
+}
+
+fn manifest(
+    os: &str,
+    arch: &str,
+    variant: Option<&str>,
+    kind: &str,
+    available: bool,
+) -> serde_json::Value {
+    let mut platform = serde_json::json!({"os": os, "architecture": arch});
+    if let Some(variant) = variant {
+        platform["variant"] = serde_json::json!(variant);
+    }
+    serde_json::json!({
+        "ID": format!("sha256:{arch}{}", variant.unwrap_or_default()),
+        "Descriptor": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:00", "size": 1},
+        "Available": available,
+        "Size": {"Total": 1, "Content": 1},
+        "Kind": kind,
+        "ImageData": {"Platform": platform, "Containers": [], "Size": {"Unpacked": 1}},
+    })
+}
+
+fn summary(id: &str, manifests: Option<Vec<serde_json::Value>>) -> serde_json::Value {
+    let mut summary = serde_json::json!({
+        "Id": id, "ParentId": "", "RepoTags": ["app:1"], "RepoDigests": [],
+        "Created": 0, "Size": 1, "SharedSize": -1, "Labels": {}, "Containers": -1,
+    });
+    if let Some(manifests) = manifests {
+        summary["Manifests"] = serde_json::json!(manifests);
+    }
+    summary
+}
+
+const INSPECTED_ID: &str = "sha256:1111";
+
+fn inspected_amd64() -> serde_json::Value {
+    serde_json::json!({"Id": INSPECTED_ID, "Architecture": "amd64", "Os": "linux", "RepoTags": ["app:1"]})
+}
+
+/// #1789: a multi-arch image with every architecture pulled locally is
+/// schedulable on each of them, not only on the daemon's own.
+#[tokio::test]
+async fn image_platforms_lists_every_locally_available_architecture() {
+    let docker = image_store_daemon(
+        inspected_amd64(),
+        serde_json::json!([summary(
+            INSPECTED_ID,
+            Some(vec![
+                manifest("linux", "amd64", None, "image", true),
+                manifest("linux", "arm64", Some("v8"), "image", true),
+                // Pulled for amd64 and arm64 only: listed, not runnable here.
+                manifest("linux", "arm", Some("v7"), "image", false),
+                // Build provenance is not a platform.
+                manifest("unknown", "unknown", None, "attestation", true),
+            ]),
+        )]),
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let platforms = runtime.image_platforms("app:1").await.unwrap();
+
+    assert_eq!(platforms.len(), 2, "{platforms:?}");
+    for node in ["linux/amd64", "linux/arm64"] {
+        assert!(
+            platforms
+                .iter()
+                .any(|platform| crate::platform::platforms_match(platform, node)),
+            "a {node} node must be eligible: {platforms:?}"
+        );
+    }
+    assert!(
+        !platforms
+            .iter()
+            .any(|platform| crate::platform::platforms_match(platform, "linux/arm/v7")),
+        "an architecture whose content is not local is not runnable: {platforms:?}"
+    );
+}
+
+/// The classic image store lists no manifests: one platform, as before.
+#[tokio::test]
+async fn image_platforms_falls_back_to_the_inspected_platform() {
+    for list in [
+        serde_json::json!([summary(INSPECTED_ID, None)]),
+        serde_json::json!([summary(INSPECTED_ID, Some(vec![]))]),
+        // A summary for some other image under the same reference is not this one.
+        serde_json::json!([summary(
+            "sha256:other",
+            Some(vec![manifest("linux", "arm64", None, "image", true)]),
+        )]),
+        serde_json::json!([]),
+    ] {
+        let docker = image_store_daemon(inspected_amd64(), list.clone()).await;
+        let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+        assert_eq!(
+            runtime.image_platforms("app:1").await.unwrap(),
+            ["linux/amd64"],
+            "{list}"
+        );
+    }
+}

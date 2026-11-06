@@ -194,7 +194,8 @@ export default function ApiKeyDetail() {
   const { data: permissionsData } = useApiKeyPermissions()
 
   const deleteMutation = useMutation({
-    mutationFn: () => deleteApiKey({ path: { id: parseInt(id!) } }),
+    mutationFn: () =>
+      deleteApiKey({ path: { id: parseInt(id!) }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to delete API key',
     },
@@ -205,7 +206,8 @@ export default function ApiKeyDetail() {
   })
 
   const activateMutation = useMutation({
-    mutationFn: () => activateApiKey({ path: { id: parseInt(id!) } }),
+    mutationFn: () =>
+      activateApiKey({ path: { id: parseInt(id!) }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to activate API key',
     },
@@ -217,7 +219,8 @@ export default function ApiKeyDetail() {
   })
 
   const deactivateMutation = useMutation({
-    mutationFn: () => deactivateApiKey({ path: { id: parseInt(id!) } }),
+    mutationFn: () =>
+      deactivateApiKey({ path: { id: parseInt(id!) }, throwOnError: true }),
     meta: {
       errorTitle: 'Failed to deactivate API key',
     },

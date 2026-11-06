@@ -29,6 +29,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { EllipsisVertical, FileCode, Loader2, Plus, Wand2 } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { blankRequiredField } from '@/lib/blank-required-field'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   deleteSkillMutation,
   listSkillsOptions,
@@ -67,7 +69,10 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
       queryClient.invalidateQueries({ queryKey: skillsListKey })
       setSkillToDelete(null)
     },
-    onError: () => toast.error('Failed to delete skill'),
+    onError: (error) =>
+      toast.error('Failed to delete skill', {
+        description: getErrorMessage(error),
+      }),
   })
 
   const openCreate = () => {
@@ -290,7 +295,15 @@ function SkillDialog({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!name.trim() || !slug.trim() || !content.trim()) return
+    const blank = blankRequiredField([
+      ['Name', name],
+      ['Slug', slug],
+      ['Content', content],
+    ])
+    if (blank) {
+      toast.error(blank)
+      return
+    }
 
     setIsPending(true)
     try {
@@ -319,8 +332,13 @@ function SkillDialog({
         toast.success('Skill created')
       }
       onSuccess()
-    } catch {
-      toast.error(isEdit ? 'Failed to update skill' : 'Failed to create skill')
+    } catch (error) {
+      toast.error(
+        isEdit ? 'Failed to update skill' : 'Failed to create skill',
+        {
+          description: getErrorMessage(error),
+        }
+      )
     } finally {
       setIsPending(false)
     }

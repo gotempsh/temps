@@ -72,11 +72,10 @@ fn validate_trigger_config(
     trigger_type: &str,
     trigger_config: &serde_json::Value,
 ) -> Result<(), ErrorTrackingError> {
-    if !matches!(
-        AlertTriggerType::from_str(trigger_type),
-        Some(AlertTriggerType::Frequency)
-    ) {
-        return Ok(());
+    match AlertTriggerType::from_str(trigger_type) {
+        Some(AlertTriggerType::Frequency) => {}
+        Some(AlertTriggerType::UserCount) => return validate_user_count_config(trigger_config),
+        _ => return Ok(()),
     }
     let config: FrequencyConfig =
         serde_json::from_value(trigger_config.clone()).map_err(|error| {
@@ -101,6 +100,26 @@ fn validate_trigger_config(
     Ok(())
 }
 
+/// A user count rule without a count of at least 1 could never fire, and
+/// nothing would say so.
+fn validate_user_count_config(
+    trigger_config: &serde_json::Value,
+) -> Result<(), ErrorTrackingError> {
+    let config: UserCountConfig =
+        serde_json::from_value(trigger_config.clone()).map_err(|error| {
+            ErrorTrackingError::Validation(format!(
+                "Invalid trigger config for 'user_count': expected count: {error}"
+            ))
+        })?;
+    if config.count < 1 {
+        return Err(ErrorTrackingError::Validation(format!(
+            "User count rule count must be at least 1, got {}",
+            config.count
+        )));
+    }
+    Ok(())
+}
+
 /// Start of a frequency rule's window, or `None` when `window_minutes` can't be
 /// represented. Saves refuse such a value, but a rule stored before that check
 /// existed still reaches here on the ingest path, which must not panic.
@@ -120,8 +139,33 @@ pub struct FrequencyConfig {
 
 /// Configuration for user count triggers
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredUserCountConfig")]
 pub struct UserCountConfig {
     pub count: i64,
+}
+
+/// A user count config as stored. Consoles before #1749 saved the value as
+/// `threshold`, which the server never read, and could also carry a `count`
+/// left over from a frequency rule. `count` wins when both are present (as the
+/// console reads it back); `threshold` alone is read as the count. A serde
+/// alias would refuse the both-present shape as a duplicate field, silencing
+/// rules that worked before.
+#[derive(Deserialize)]
+struct StoredUserCountConfig {
+    count: Option<i64>,
+    threshold: Option<i64>,
+}
+
+impl TryFrom<StoredUserCountConfig> for UserCountConfig {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredUserCountConfig) -> Result<Self, Self::Error> {
+        stored
+            .count
+            .or(stored.threshold)
+            .map(|count| Self { count })
+            .ok_or("missing field `count`")
+    }
 }
 
 /// Configuration for status change triggers
@@ -894,6 +938,55 @@ mod tests {
         let json = serde_json::json!({"count": 10});
         let config: UserCountConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.count, 10);
+    }
+
+    /// #1749: rules the console saved under `threshold` never fired, because
+    /// the server only read `count`. They now read the same.
+    #[test]
+    fn user_count_rule_saved_as_threshold_reads_its_count() {
+        let config: UserCountConfig =
+            serde_json::from_value(serde_json::json!({"threshold": 3})).unwrap();
+        assert_eq!(config.count, 3);
+        assert!(
+            validate_trigger_config("user_count", &serde_json::json!({"threshold": 3})).is_ok()
+        );
+    }
+
+    /// A rule saved by an older console can hold both keys (a `count` left
+    /// from a frequency rule plus the `threshold` it showed). It must still
+    /// load, reading `count` first, rather than fail as a duplicate field.
+    #[test]
+    fn user_count_rule_with_both_count_and_threshold_reads_the_count() {
+        let both = serde_json::json!({"count": 5, "threshold": 9, "window_minutes": 60});
+        let config: UserCountConfig = serde_json::from_value(both.clone()).unwrap();
+        assert_eq!(config.count, 5);
+        assert!(validate_trigger_config("user_count", &both).is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({"count": 5})
+        );
+    }
+
+    /// #1749: a user count rule saved with no count never fired, silently.
+    #[test]
+    fn user_count_rule_config_is_refused_without_a_positive_count() {
+        assert!(validate_trigger_config("user_count", &serde_json::json!({"count": 1})).is_ok());
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"count": 0}),
+            serde_json::json!({"count": -2}),
+            serde_json::json!({"count": "ten"}),
+        ] {
+            match validate_trigger_config("user_count", &bad) {
+                Err(ErrorTrackingError::Validation(message)) => {
+                    assert!(
+                        message.contains("user_count") || message.contains("User count"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{bad} must be refused, got {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -2716,6 +2716,16 @@ export type Assessment = {
     signals: Array<Signal>;
 };
 
+/**
+ * Result of purging cached static assets.
+ */
+export type AssetCachePurgeResponse = {
+    /**
+     * How many cached asset entries were removed (0 when the cache was empty).
+     */
+    deleted: number;
+};
+
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
@@ -10021,6 +10031,16 @@ export type DeploymentConfig = {
      * the global hard ceiling at resolution time.
      */
     sseIdleTimeoutSeconds?: number | null;
+    /**
+     * How long, in seconds, a superseded deployment's containers get to
+     * finish in-flight work after SIGTERM before they are killed, once a new
+     * deployment has gone live. Raise it for long requests (uploads,
+     * exports, streaming responses, WebSockets).
+     * An override is 1 to 3600 seconds. Absent on a project means the
+     * platform default of 10 seconds; absent on an environment means it
+     * inherits the project's value, else the platform default.
+     */
+    stopTimeoutSeconds?: number | null;
     /**
      * Label selector for node-based scheduling. Replicas are only deployed to
      * nodes whose labels match the selector.
@@ -35025,6 +35045,13 @@ export type UpdateDeploymentConfigRequest = {
      */
     sseIdleTimeoutSeconds?: number | null;
     /**
+     * How long, in seconds (1-3600), the previous deployment's containers get
+     * to finish in-flight requests after SIGTERM, once a new deployment is
+     * live, before they are killed. Absent leaves the current value
+     * unchanged; the platform default is 10 seconds.
+     */
+    stopTimeoutSeconds?: number | null;
+    /**
      * Project-level default idle timeout for WebSocket connections, in
      * seconds (0 = no timeout, or 1-86400). Environments may override this;
      * always clamped to the operator's global hard ceiling. Absent leaves
@@ -35236,6 +35263,14 @@ export type UpdateEnvironmentSettingsRequest = {
      * unchanged. Send JSON `null` to clear the override.
      */
     sse_idle_timeout_seconds?: number | null;
+    /**
+     * Override how long, in seconds (1-3600), this environment's previous
+     * deployment gets to finish in-flight requests after SIGTERM, once a new
+     * deployment is live, before it is killed. Absent leaves the current
+     * value unchanged. Send JSON `null` to clear the override (inherit the
+     * project value, else 10 seconds).
+     */
+    stop_timeout_seconds?: number | null;
     /**
      * Label selector for node-based scheduling (overrides project-level setting).
      * Send an empty object to clear the environment-level override.
@@ -71412,6 +71447,42 @@ export type GetApiTimeseriesResponses = {
 
 export type GetApiTimeseriesResponse = GetApiTimeseriesResponses[keyof GetApiTimeseriesResponses];
 
+export type PurgeAssetCacheData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/asset-cache';
+};
+
+export type PurgeAssetCacheErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PurgeAssetCacheResponses = {
+    /**
+     * Asset cache purged
+     */
+    200: AssetCachePurgeResponse;
+};
+
+export type PurgeAssetCacheResponse = PurgeAssetCacheResponses[keyof PurgeAssetCacheResponses];
+
 export type GetAutofixCapabilityData = {
     body?: never;
     path: {
@@ -75798,6 +75869,46 @@ export type WakeEnvironmentResponses = {
 };
 
 export type WakeEnvironmentResponse = WakeEnvironmentResponses[keyof WakeEnvironmentResponses];
+
+export type PurgeEnvironmentAssetCacheData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/asset-cache';
+};
+
+export type PurgeEnvironmentAssetCacheErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PurgeEnvironmentAssetCacheResponses = {
+    /**
+     * Environment asset cache purged
+     */
+    200: AssetCachePurgeResponse;
+};
+
+export type PurgeEnvironmentAssetCacheResponse = PurgeEnvironmentAssetCacheResponses[keyof PurgeEnvironmentAssetCacheResponses];
 
 export type GetComposePlacementData = {
     body?: never;

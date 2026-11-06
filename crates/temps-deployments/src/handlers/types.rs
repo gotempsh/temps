@@ -586,6 +586,13 @@ pub struct UpdateCustomDomainRequest {
     pub branch: Option<String>,
 }
 
+/// Result of purging cached static assets.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AssetCachePurgeResponse {
+    /// How many cached asset entries were removed (0 when the cache was empty).
+    pub deleted: u64,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeploymentStateResponse {
     pub id: i32,

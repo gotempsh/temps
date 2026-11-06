@@ -134,6 +134,37 @@ fn split_repository_and_tag(image: &str) -> (&str, &str) {
     }
 }
 
+/// The platforms of `manifests` that can run from the local store: image
+/// manifests (not attestations) whose content is all present. A manifest list
+/// pulled for one architecture still lists the others, unavailable.
+fn locally_available_platforms(manifests: &[bollard::models::ImageManifestSummary]) -> Vec<String> {
+    let mut platforms: Vec<String> = Vec::new();
+    for manifest in manifests {
+        if !manifest.available
+            || manifest.kind != Some(bollard::models::ImageManifestSummaryKindEnum::IMAGE)
+        {
+            continue;
+        }
+        let Some(platform) = manifest.image_data.as_ref().map(|data| &data.platform) else {
+            continue;
+        };
+        let (Some(os), Some(architecture)) =
+            (platform.os.as_deref(), platform.architecture.as_deref())
+        else {
+            continue;
+        };
+        let architecture = match platform.variant.as_deref().map(str::trim) {
+            Some(variant) if !variant.is_empty() => format!("{architecture}/{variant}"),
+            _ => architecture.to_string(),
+        };
+        let platform = crate::platform::normalize_platform(os, &architecture);
+        if !platforms.contains(&platform) {
+            platforms.push(platform);
+        }
+    }
+    platforms
+}
+
 /// How long the daemon may take to start answering an image archive request.
 ///
 /// bollard's client timeout covers the wait for response headers, and it is two
@@ -1146,6 +1177,41 @@ impl ImageBuilder for DockerRuntime {
             id: inspect.id.unwrap_or_default(),
             repo_digests: inspect.repo_digests.unwrap_or_default(),
         })
+    }
+
+    /// Lists the image's manifests (Docker's multi-platform image store) and
+    /// reports each architecture whose content is fully present locally. A
+    /// daemon without that store lists no manifests, and an image it cannot
+    /// list is answered by inspection: one platform, as before.
+    async fn image_platforms(&self, image_name: &str) -> Result<Vec<String>, BuilderError> {
+        let inspected = self.inspect_image(image_name).await?;
+        let docker = self.require_docker_for_build()?;
+        let filters = std::collections::HashMap::from([("reference", vec![image_name])]);
+        let options = bollard::query_parameters::ListImagesOptionsBuilder::new()
+            .filters(&filters)
+            .manifests(true)
+            .build();
+        let listed = match docker.list_images(Some(options)).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                debug!(
+                    image = %image_name,
+                    %error,
+                    "Could not list the image's manifests; using its inspected platform"
+                );
+                return Ok(vec![inspected.platform]);
+            }
+        };
+        let platforms = listed
+            .iter()
+            .find(|summary| summary.id == inspected.id)
+            .and_then(|summary| summary.manifests.as_deref())
+            .map(locally_available_platforms)
+            .unwrap_or_default();
+        if platforms.is_empty() {
+            return Ok(vec![inspected.platform]);
+        }
+        Ok(platforms)
     }
 
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {

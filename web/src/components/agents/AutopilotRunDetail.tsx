@@ -55,6 +55,8 @@ import {
   retryRun,
   startFix,
 } from '@/api/client/sdk.gen'
+import { CancelRunButton } from './CancelRunButton'
+import { useCancelRun } from './useCancelRun'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import {
@@ -991,6 +993,11 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   // Retry/start-over config dialog: prefilled from the run's stored config
   // so the user can change harness/model/turns/branch and add retry notes.
   const [showRetryConfig, setShowRetryConfig] = useState(false)
+  // Owned here, not by the button: the button unmounts when the run stops
+  // being active, which can happen while a cancel is still in flight.
+  const cancelMutation = useCancelRun(project.id, Number(runId), () =>
+    window.location.reload()
+  )
 
   const runQueryOptions = getRunWithLogsOptions({
     path: { project_id: project.id, run_id: Number(runId) },
@@ -1235,17 +1242,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     setShowRetryConfig(true)
   }
 
-  const onCancel = async () => {
-    try {
-      await fetch(`/api/projects/${project.id}/agents/runs/${run.id}/cancel`, {
-        method: 'POST',
-      })
-      window.location.reload()
-    } catch {
-      // ignore
-    }
-  }
-
   const durationText = formatDuration(run.started_at, run.completed_at)
   const costText =
     run.estimated_cost_cents != null
@@ -1304,9 +1300,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         </Button>
       )}
       {isActive && (
-        <Button size="sm" variant="destructive" onClick={onCancel}>
-          Cancel
-        </Button>
+        <CancelRunButton
+          pending={cancelMutation.isPending}
+          onCancel={() => cancelMutation.mutate()}
+        />
       )}
     </>
   )

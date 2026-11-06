@@ -42,6 +42,13 @@ import {
   healthProbeFormSchema,
   healthConfigFromForm,
 } from './health-probe'
+import {
+  DEFAULT_STOP_TIMEOUT_SECONDS,
+  MAX_STOP_TIMEOUT_SECONDS,
+  MIN_STOP_TIMEOUT_SECONDS,
+  stopTimeoutProblem,
+  stopTimeoutSeconds,
+} from '@/lib/deployment-stop-timeout'
 
 const schema = z
   .object({
@@ -63,6 +70,13 @@ const schema = z
             Number(value) <= 3600),
         { message: 'Enter a whole number of seconds between 30 and 3600' }
       ),
+    stopTimeout: z
+      .string()
+      .optional()
+      .superRefine((value, ctx) => {
+        const problem = stopTimeoutProblem(value)
+        if (problem) ctx.addIssue({ code: 'custom', message: problem })
+      }),
     buildLocation: z.enum(['control_plane', 'node', 'ci']),
   })
   .and(healthProbeFormSchema)
@@ -102,6 +116,7 @@ const GROUP_FIELDS: Record<Group, (keyof FormValues)[]> = {
     'probeInterval',
     'probeCommand',
     'healthCheckTimeout',
+    'stopTimeout',
   ],
   build: ['buildLocation'],
 }
@@ -163,6 +178,8 @@ export function DeployDefaultsCard({
       port: project?.deployment_config?.exposedPort?.toString() ?? '',
       healthCheckTimeout:
         project?.deployment_config?.healthCheckTimeoutSeconds?.toString() ?? '',
+      stopTimeout:
+        project?.deployment_config?.stopTimeoutSeconds?.toString() ?? '',
       probeType: configuredProbeType(project.deployment_config?.health),
       stableFor: project.deployment_config?.health?.stable_for ?? 15,
       probeTimeout: project.deployment_config?.health?.timeout ?? 5,
@@ -198,6 +215,14 @@ export function DeployDefaultsCard({
           exposedPort: optionalInt(values.port),
           healthCheckTimeoutSeconds:
             optionalInt(values.healthCheckTimeout) ?? 300,
+          // Blank sends nothing for a project that never set one, so saving
+          // the port does not pin today's default. The API cannot clear a
+          // stored value, so blanking one resets it to the default.
+          stopTimeoutSeconds:
+            stopTimeoutSeconds(values.stopTimeout) ??
+            (project.deployment_config?.stopTimeoutSeconds != null
+              ? DEFAULT_STOP_TIMEOUT_SECONDS
+              : undefined),
           health: healthConfigFromForm(values),
         }
       case 'build':
@@ -576,6 +601,31 @@ export function DeployDefaultsCard({
                       How long a new deployment may take to start and pass its
                       health check before it fails. Raise it for apps that run
                       migrations or warm caches on boot. Default 300.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="stopTimeout"
+                render={({ field }) => (
+                  <FormItem id="stop-timeout">
+                    <FormLabel>Stop timeout (seconds)</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        min={MIN_STOP_TIMEOUT_SECONDS}
+                        max={MAX_STOP_TIMEOUT_SECONDS}
+                        placeholder={String(DEFAULT_STOP_TIMEOUT_SECONDS)}
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      How long the previous deployment gets to finish in-flight
+                      work after it receives SIGTERM, before it is killed. Raise
+                      it for workers that drain queues or long requests on
+                      shutdown. Default {DEFAULT_STOP_TIMEOUT_SECONDS}.
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

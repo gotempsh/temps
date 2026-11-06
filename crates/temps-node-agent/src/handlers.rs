@@ -659,6 +659,10 @@ pub async fn deploy_container(
     }
 }
 
+/// Longest grace period a stop request may ask for (1 hour), matching the
+/// largest stop timeout a project can be configured with.
+const MAX_STOP_GRACE_SECONDS: u64 = 3600;
+
 /// Stop a running container
 #[utoipa::path(
     tag = "Containers",
@@ -667,6 +671,7 @@ pub async fn deploy_container(
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
+    request_body(content = Option<temps_deployer::StopContainerRequest>, description = "Optional grace period; an empty body stops with the default 10 s"),
     responses(
         (status = 200, description = "Container stopped", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
@@ -678,9 +683,25 @@ pub async fn deploy_container(
 pub async fn stop_container(
     State(state): State<Arc<AgentState>>,
     Path(container_id): Path<String>,
+    body: Option<Json<temps_deployer::StopContainerRequest>>,
 ) -> impl IntoResponse {
-    tracing::info!(container_id = %container_id, "Stopping container");
-    match state.container_deployer.stop_container(&container_id).await {
+    let grace_seconds = body.and_then(|Json(request)| request.grace_seconds);
+    tracing::info!(container_id = %container_id, ?grace_seconds, "Stopping container");
+    let stopped = match grace_seconds {
+        // The control plane validated the project's stop timeout; bound it
+        // again so a hand-made request cannot hold the agent for days.
+        Some(seconds) => {
+            state
+                .container_deployer
+                .stop_container_with_grace(
+                    &container_id,
+                    std::time::Duration::from_secs(seconds.clamp(1, MAX_STOP_GRACE_SECONDS)),
+                )
+                .await
+        }
+        None => state.container_deployer.stop_container(&container_id).await,
+    };
+    match stopped {
         Ok(()) => {
             tracing::info!(container_id = %container_id, "Container stopped");
             AgentResponse::ok("stopped".to_string()).into_response()
@@ -847,11 +868,118 @@ mod container_error_tests {
             host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
         });
 
-        let response = stop_container(State(state), Path("some-container".to_string()))
+        let response = stop_container(State(state), Path("some-container".to_string()), None)
             .await
             .into_response();
         server.await.expect("mock runtime task");
         response.status()
+    }
+
+    /// The stop request this agent forwards to its runtime for `body`.
+    async fn forwarded_stop(body: Option<temps_deployer::StopContainerRequest>) -> String {
+        use axum::extract::{Path, State};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock runtime");
+        let address = listener.local_addr().expect("mock runtime address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            // Read the head, then the (small, fixed-length) JSON body.
+            loop {
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= length {
+                        break;
+                    }
+                }
+                let read = stream.read(&mut buffer).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"success":true,"data":"stopped","error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                format!("http://{address}"),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .expect("create deployer"),
+        );
+        let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
+            container_deployer: runtime.clone(),
+            image_builder: runtime,
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+
+        let response = stop_container(
+            State(state),
+            Path("old-replica".to_string()),
+            body.map(Json),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.await.expect("mock runtime task")
+    }
+
+    /// #1806: the control plane's grace period is the one the container gets.
+    #[tokio::test]
+    async fn a_stop_with_a_grace_period_applies_it() {
+        let forwarded = forwarded_stop(Some(temps_deployer::StopContainerRequest {
+            grace_seconds: Some(90),
+        }))
+        .await;
+        assert!(forwarded.contains(r#"{"grace_seconds":90}"#), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_grace_period_is_bounded_to_an_hour() {
+        let forwarded = forwarded_stop(Some(temps_deployer::StopContainerRequest {
+            grace_seconds: Some(u64::MAX),
+        }))
+        .await;
+        assert!(
+            forwarded.contains(r#"{"grace_seconds":3600}"#),
+            "{forwarded}"
+        );
+    }
+
+    /// An older control plane sends no grace period: the default stop.
+    #[tokio::test]
+    async fn a_stop_without_a_grace_period_uses_the_default_stop() {
+        let forwarded = forwarded_stop(None).await;
+        assert!(!forwarded.contains("grace_seconds"), "{forwarded}");
     }
 
     #[tokio::test]
@@ -2216,37 +2344,46 @@ pub async fn pull_image(
         }
     };
 
-    // 3. Fast-path: if the image is already present, skip the pull entirely.
-    match docker.inspect_image(&request.image).await {
-        Ok(info) => {
-            let image_id = info.id.unwrap_or_default();
-            let digest = info
-                .repo_digests
-                .as_ref()
-                .and_then(|d| d.first())
-                .and_then(|s| s.rsplit('@').next())
-                .map(String::from);
-            tracing::info!(
-                image = %request.image,
-                image_id = %image_id,
-                "Image already present locally; skipping pull"
-            );
-            return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
-        }
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => {
-            // Not present — proceed to pull.
-        }
-        Err(e) => {
-            // An unexpected inspect error is non-fatal: fall through and let
-            // the pull attempt surface a cleaner error if the daemon is really
-            // broken.
-            tracing::warn!(
-                image = %request.image,
-                "Pre-pull image inspect failed ({}); proceeding with pull attempt",
-                e
-            );
+    // 3. Fast-path: if the image is already present, skip the pull entirely,
+    //    unless the control plane asked to replace a cached copy it found to
+    //    be for another architecture.
+    if request.replace_cached {
+        tracing::info!(
+            image = %request.image,
+            "Replacing the cached image; pulling it again"
+        );
+    } else {
+        match docker.inspect_image(&request.image).await {
+            Ok(info) => {
+                let image_id = info.id.unwrap_or_default();
+                let digest = info
+                    .repo_digests
+                    .as_ref()
+                    .and_then(|d| d.first())
+                    .and_then(|s| s.rsplit('@').next())
+                    .map(String::from);
+                tracing::info!(
+                    image = %request.image,
+                    image_id = %image_id,
+                    "Image already present locally; skipping pull"
+                );
+                return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Not present — proceed to pull.
+            }
+            Err(e) => {
+                // An unexpected inspect error is non-fatal: fall through and let
+                // the pull attempt surface a cleaner error if the daemon is really
+                // broken.
+                tracing::warn!(
+                    image = %request.image,
+                    "Pre-pull image inspect failed ({}); proceeding with pull attempt",
+                    e
+                );
+            }
         }
     }
 
@@ -2354,7 +2491,21 @@ pub async fn pull_image(
         }
     };
 
-    // 6. Inspect to confirm the image landed and obtain its ID and digest.
+    // 6. A replacing pull that failed leaves the cached copy it was meant to
+    //    replace, which the inspect below would report as pulled. Report the
+    //    failure instead, so the control plane can fall back to another way
+    //    of delivering the image.
+    if pull_replacement_failed(request.replace_cached, &stream_errors) {
+        let (status, message) = pull_failure(&request.image, &stream_errors);
+        tracing::error!(
+            image = %request.image,
+            reason = %message,
+            "Replacing pull failed; the cached image was left in place"
+        );
+        return error_response(status, message).into_response();
+    }
+
+    // 7. Inspect to confirm the image landed and obtain its ID and digest.
     match docker.inspect_image(&request.image).await {
         Ok(info) => {
             let image_id = info.id.unwrap_or_default();
@@ -2372,48 +2523,7 @@ pub async fn pull_image(
             AgentResponse::ok(PullImageResponse { image_id, digest }).into_response()
         }
         Err(_) => {
-            // The image is not present after the pull. Classify the failure
-            // from stream errors so the caller can distinguish auth problems
-            // from "no such image" from network issues. Credentials are never
-            // included in these messages — we only surface what the daemon
-            // told us, which is limited to the HTTP status/body from the
-            // registry.
-            let combined = stream_errors.join("; ");
-
-            let (status, message) = if stream_errors.is_empty() {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "Failed to pull image '{}': pull stream ended without confirming a downloaded image",
-                        request.image
-                    ),
-                )
-            } else {
-                match classify_pull_error(&combined) {
-                    PullErrorKind::Auth => (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "Registry authentication failed for '{}': check credentials (registry said: {})",
-                            request.image, combined
-                        ),
-                    ),
-                    PullErrorKind::NotFound => (
-                        StatusCode::NOT_FOUND,
-                        format!(
-                            "Image '{}' was not found in the registry (registry said: {})",
-                            request.image, combined
-                        ),
-                    ),
-                    PullErrorKind::Network => (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "Network or registry error pulling '{}': {}",
-                            request.image, combined
-                        ),
-                    ),
-                }
-            };
-
+            let (status, message) = pull_failure(&request.image, &stream_errors);
             tracing::error!(
                 image = %request.image,
                 reason = %message,
@@ -2421,6 +2531,46 @@ pub async fn pull_image(
             );
             error_response(status, message).into_response()
         }
+    }
+}
+
+/// Whether a pull asked to replace a cached image failed. Without a pull that
+/// replaced it, the image found afterwards is the cached copy itself.
+fn pull_replacement_failed(replace_cached: bool, stream_errors: &[String]) -> bool {
+    replace_cached && !stream_errors.is_empty()
+}
+
+/// The status and message for a pull that did not deliver its image.
+///
+/// Classified from the daemon's stream errors so the caller can tell auth
+/// problems from "no such image" from network issues. Credentials are never
+/// included: only what the daemon reported, which is limited to the
+/// registry's HTTP status and body.
+fn pull_failure(image: &str, stream_errors: &[String]) -> (StatusCode, String) {
+    if stream_errors.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Failed to pull image '{image}': pull stream ended without confirming a downloaded image"
+            ),
+        );
+    }
+    let combined = stream_errors.join("; ");
+    match classify_pull_error(&combined) {
+        PullErrorKind::Auth => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Registry authentication failed for '{image}': check credentials (registry said: {combined})"
+            ),
+        ),
+        PullErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("Image '{image}' was not found in the registry (registry said: {combined})"),
+        ),
+        PullErrorKind::Network => (
+            StatusCode::BAD_GATEWAY,
+            format!("Network or registry error pulling '{image}': {combined}"),
+        ),
     }
 }
 
@@ -2726,6 +2876,7 @@ mod pull_image_tests {
         let req = PullImageRequest {
             image: "ghcr.io/org/app:v1.0".to_string(),
             credentials: None,
+            replace_cached: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
@@ -2743,6 +2894,7 @@ mod pull_image_tests {
                 identity_token: None,
                 server_address: Some("private.registry.io".to_string()),
             }),
+            replace_cached: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
@@ -2750,6 +2902,37 @@ mod pull_image_tests {
         assert_eq!(creds.username.as_deref(), Some("alice"));
         // Verify the password field round-trips (serde still sees it).
         assert_eq!(creds.password.as_deref(), Some("hunter2"));
+    }
+
+    /// A failed replacing pull leaves the cached copy in place; it must be
+    /// reported as the failure it is, not as the cached image "pulled".
+    #[test]
+    fn a_replacing_pull_with_errors_is_a_failure_even_though_the_image_remains() {
+        let errors = vec!["no matching manifest for linux/amd64 in the manifest list".to_string()];
+        assert!(pull_replacement_failed(true, &errors));
+        // An ordinary pull only runs when the image was absent, so an image
+        // present afterwards is the one it pulled.
+        assert!(!pull_replacement_failed(false, &errors));
+        assert!(!pull_replacement_failed(true, &[]));
+
+        let (status, message) = pull_failure("ghcr.io/org/app:v1.0", &errors);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains("ghcr.io/org/app:v1.0"), "{message}");
+        assert!(message.contains("no matching manifest"), "{message}");
+    }
+
+    /// A control plane that predates `replace_cached` sends no such field:
+    /// the cached image keeps being used, as before.
+    #[test]
+    fn pull_image_request_without_replace_cached_uses_the_cached_image() {
+        let parsed: PullImageRequest =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/app:v1.0"}"#).expect("deserialize");
+        assert!(!parsed.replace_cached);
+
+        let parsed: PullImageRequest =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/app:v1.0","replace_cached":true}"#)
+                .expect("deserialize");
+        assert!(parsed.replace_cached);
     }
 
     #[test]

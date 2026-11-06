@@ -752,6 +752,12 @@ pub struct PullImageRequest {
     /// **never** logged or echoed in error messages.
     #[serde(default)]
     pub credentials: Option<RegistryCredentials>,
+    /// Pull even when the daemon already holds `image`. The control plane sets
+    /// it when the cached copy is for another architecture: without it the
+    /// cached copy is returned as-is and the container fails with `exec format
+    /// error`. Absent (an older control plane) means the cached copy is used.
+    #[serde(default)]
+    pub replace_cached: bool,
 }
 
 /// Registry credentials for private-registry access.

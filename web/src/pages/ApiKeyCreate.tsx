@@ -43,6 +43,7 @@ import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
+import { earliestExpiryDate, expiryFromDateInput } from './api-key-expiry'
 
 export default function ApiKeyCreate() {
   usePageTitle('Create API key')
@@ -164,6 +165,13 @@ export default function ApiKeyCreate() {
     if (!trimmedName || isSubmittingRef.current || createMutation.isPending) {
       return
     }
+    if (expiresAt && expiresAt < earliestExpiryDate()) {
+      toast.error('Choose an expiration date after today', {
+        description:
+          'A key expires at the start of its expiration date (UTC), so today would create a key that is already expired.',
+      })
+      return
+    }
     isSubmittingRef.current = true
 
     const data: CreateApiKeyRequest = {
@@ -172,7 +180,7 @@ export default function ApiKeyCreate() {
       permissions: useCustomPermissions
         ? Array.from(selectedPermissions)
         : undefined,
-      expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
+      expires_at: expiryFromDateInput(expiresAt) ?? undefined,
     }
     createMutation.mutate(
       {
@@ -410,7 +418,8 @@ export default function ApiKeyCreate() {
                   type="date"
                   value={expiresAt}
                   onChange={(e) => setExpiresAt(e.target.value)}
-                  min={new Date().toISOString().split('T')[0]}
+                  // Today would mean 00:00 UTC today: a key already expired.
+                  min={earliestExpiryDate()}
                   className="max-w-md"
                 />
                 <p className="text-sm text-muted-foreground">

@@ -544,6 +544,7 @@ function ProviderKeyModelDetail({
       updateProviderKey({
         path: { id: providerKey.id },
         body: { default_model: modelId },
+        throwOnError: true,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey })
@@ -4157,7 +4158,8 @@ export function AiGatewayPage() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteProviderKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteProviderKey({ path: { id }, throwOnError: true }),
     meta: { errorTitle: 'Failed to delete provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4170,7 +4172,11 @@ export function AiGatewayPage() {
   // Toggle active mutation
   const toggleMutation = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
-      updateProviderKey({ path: { id }, body: { is_active } }),
+      updateProviderKey({
+        path: { id },
+        body: { is_active },
+        throwOnError: true,
+      }),
     meta: { errorTitle: 'Failed to update provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
