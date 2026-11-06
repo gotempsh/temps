@@ -2012,6 +2012,23 @@ mod tests {
         replace_agent_config(&link, r#"{"token":"same-dir"}"#).unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(std::fs::read_to_string(&conf).unwrap().contains("same-dir"));
+        // A link to `worker.json` beside another worker's own agent.json:
+        // join cleans up only `worker.json`'s leftovers, never the temporary
+        // file an edit of that agent.json (under its own lock) has in flight.
+        let worker_json = managed.join("worker.json");
+        std::fs::write(&worker_json, r#"{"token":"old"}"#).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&worker_json, &link).unwrap();
+        let in_flight = managed.join("agent.json.7.8.tmp");
+        std::fs::write(&in_flight, "{").unwrap();
+        let leftover = managed.join("worker.json.7.8.tmp");
+        std::fs::write(&leftover, "{").unwrap();
+        replace_agent_config(&link, r#"{"token":"worker"}"#).unwrap();
+        assert!(in_flight.exists(), "another file's temp file is left alone");
+        assert!(!leftover.exists(), "this file's leftover is removed");
+        assert!(std::fs::read_to_string(&worker_json)
+            .unwrap()
+            .contains("worker"));
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         // A dangling link is an error naming it, not a silent new file.
