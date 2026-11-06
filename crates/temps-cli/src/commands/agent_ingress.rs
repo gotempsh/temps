@@ -314,6 +314,7 @@ fn status(path: &Path) -> anyhow::Result<()> {
 /// Replace `ingress` in agent.json, keeping every other field, and retire the
 /// legacy listen fields so the two cannot disagree.
 fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
+    let _lock = super::agent_labels::lock_agent_config(path)?;
     let file = super::agent_labels::read_agent_config(path)?;
     let mut value = file.value;
     let object = value

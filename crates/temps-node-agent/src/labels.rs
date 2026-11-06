@@ -119,6 +119,12 @@ pub fn read_saved_labels(path: &Path) -> Option<serde_json::Value> {
             return None;
         }
     };
+    // A document that is not an object (`null`, an array: a broken hand
+    // edit) says nothing about labels; it must not clear them.
+    if !config.is_object() {
+        warn!(path = %path.display(), "agent.json is not an object; keeping the current labels");
+        return None;
+    }
     match config.get("labels") {
         None | Some(serde_json::Value::Null) => Some(serde_json::json!({})),
         Some(labels @ serde_json::Value::Object(_)) => Some(labels.clone()),
@@ -305,6 +311,12 @@ mod tests {
         assert_eq!(read_saved_labels(&path), None);
         write(dir.path(), r#"{"labels":"gpu=true"}"#);
         assert_eq!(read_saved_labels(&path), None);
+        // Valid JSON but not a config object: keep, never clear, the labels
+        // (a dedicated node must not turn ordinary on a broken edit).
+        for broken in ["null", "[]", "\"x\"", "3"] {
+            write(dir.path(), broken);
+            assert_eq!(read_saved_labels(&path), None, "{broken}");
+        }
         assert_eq!(read_saved_labels(&dir.path().join("missing.json")), None);
     }
 

@@ -102,15 +102,24 @@ struct Worker {
     data_dir: PathBuf,
     config: serde_json::Value,
     identity: FileIdentity,
+    /// Held from the read to the write, by commands that change labels.
+    _lock: Option<ConfigLock>,
     node_id: Option<i64>,
     node_name: Option<String>,
 }
 
 impl Worker {
-    fn load(target: &Target) -> anyhow::Result<Self> {
+    /// `agent.json` for `target`; with `lock`, locked until dropped, for a
+    /// read-edit-write.
+    fn load(target: &Target, lock: bool) -> anyhow::Result<Self> {
         refuse_wrong_user(target)?;
         let path = super::agent_ingress::config_path(target)
             .map_err(|error| anyhow::anyhow!("{error}{}", wrong_user_hint()))?;
+        let lock = if lock {
+            Some(lock_agent_config(&path)?)
+        } else {
+            None
+        };
         let AgentConfigFile {
             value: config,
             identity,
@@ -129,6 +138,7 @@ impl Worker {
             data_dir,
             config,
             identity,
+            _lock: lock,
         })
     }
 
@@ -193,7 +203,7 @@ fn role_line(labels: &Labels) -> &'static str {
 }
 
 fn list(target: &Target) -> anyhow::Result<()> {
-    let worker = Worker::load(target)?;
+    let worker = Worker::load(target, false)?;
     let labels = worker.labels()?;
     println!("Labels saved in {}:", worker.path.display());
     if labels.is_empty() {
@@ -249,7 +259,7 @@ fn change(
     args: &ApplyArgs,
     edit: impl FnOnce(&mut Labels) -> anyhow::Result<Vec<String>>,
 ) -> anyhow::Result<()> {
-    let worker = Worker::load(&args.target)?;
+    let mut worker = Worker::load(&args.target, true)?;
     if let Some(found) = service_overrides().into_iter().next() {
         anyhow::bail!(
             "{found}. The agent would ignore labels saved in agent.json, so nothing was changed. \
@@ -294,6 +304,8 @@ fn change(
     );
     let written_at = chrono::Utc::now();
     write_config_atomically(&worker.path, &config, worker.identity)?;
+    // Written: another edit may go ahead while this one waits for the agent.
+    worker._lock = None;
     println!("Saved to {}:", worker.path.display());
     if after.is_empty() {
         println!("  (no labels)");
@@ -514,22 +526,7 @@ pub(super) struct AgentConfigFile {
 /// another user could swap files under this command, and turn a root read
 /// of another worker's config (with its node token) into a file they own.
 pub(super) fn read_agent_config(path: &Path) -> anyhow::Result<AgentConfigFile> {
-    if running_as_root() {
-        let dir = path
-            .parent()
-            .and_then(|dir| std::fs::canonicalize(dir).ok())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Could not resolve the directory of {}", path.display())
-            })?;
-        if let Some(why) = super::agent_service::not_root_controlled(&dir)? {
-            anyhow::bail!(
-                "Refusing to edit {} as root: {why}, so another user could swap files under \
-                 this command. Run it as the user who owns {}, without sudo.",
-                path.display(),
-                dir.display()
-            );
-        }
-    }
+    refuse_shared_dir_as_root(path)?;
     let (text, meta) = temps_node_agent::labels::read_regular_file(
         path,
         temps_node_agent::labels::MAX_CONFIG_BYTES,
@@ -564,13 +561,88 @@ pub(super) fn read_agent_config(path: &Path) -> anyhow::Result<AgentConfigFile> 
     })
 }
 
+/// Run as root, refuse unless the directory holding `path` and every one
+/// above it are root's alone (see [`read_agent_config`]).
+fn refuse_shared_dir_as_root(path: &Path) -> anyhow::Result<()> {
+    if !running_as_root() {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve the directory of {}", path.display()))?;
+    if let Some(why) = super::agent_service::not_root_controlled(&dir)? {
+        anyhow::bail!(
+            "Refusing to edit {} as root: {why}, so another user could swap files under this \
+             command. Run it as the user who owns {}, without sudo.",
+            path.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// How long a command waits for another one editing the same `agent.json`.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Held while a command reads, edits and replaces `agent.json`: two
+/// overlapping `temps agent labels` / `temps agent ingress` runs take turns,
+/// so neither loses the other's change. Released on drop.
+pub(super) struct ConfigLock {
+    _file: std::fs::File,
+}
+
+/// Lock `path` for a read-edit-write (an exclusive lock on
+/// `agent.json.lock` beside it), waiting up to [`LOCK_WAIT`].
+pub(super) fn lock_agent_config(path: &Path) -> anyhow::Result<ConfigLock> {
+    lock_agent_config_within(path, LOCK_WAIT)
+}
+
+fn lock_agent_config_within(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
+    refuse_shared_dir_as_root(path)?;
+    let lock_path = path.with_extension("json.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&lock_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Could not open {}: {e}.{}",
+            lock_path.display(),
+            wrong_user_hint()
+        )
+    })?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(ConfigLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "Another `temps agent labels` or `temps agent ingress` is editing {} (it holds \
+                 {}). Run this again when it has finished.",
+                path.display(),
+                lock_path.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => {
+                anyhow::bail!("Could not lock {}: {e}", lock_path.display())
+            }
+        }
+    }
+}
+
 /// Replace the file [`read_agent_config`] read at `path` with `config`: a
 /// temporary file in the same directory, owner-only, synced, then renamed
 /// over it, but only if `path` is still that file.
 ///
-/// The temporary file is created exclusively, after removing any leftover:
-/// `O_EXCL` never follows a symlink, so one planted in its place is never
-/// written through.
+/// The temporary file has a name of this process's own and is created
+/// exclusively: `O_EXCL` never follows a symlink, so one planted in its place
+/// is never written through, and another writer's file is never touched.
+/// Callers hold [`lock_agent_config`] across the read and this write.
 pub(super) fn write_config_atomically(
     path: &Path,
     config: &serde_json::Value,
@@ -578,14 +650,12 @@ pub(super) fn write_config_atomically(
 ) -> anyhow::Result<()> {
     let text = serde_json::to_string_pretty(config)
         .map_err(|e| anyhow::anyhow!("Could not serialize the agent config: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let tmp = path.with_extension(format!("json.{}.{unique}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         use std::io::Write;
-        match std::fs::remove_file(&tmp) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -823,6 +893,7 @@ mod tests {
             data_dir: PathBuf::from("/x"),
             config: serde_json::json!({}),
             identity: FileIdentity { dev: 0, ino: 0 },
+            _lock: None,
             node_id: Some(3),
             node_name: None,
         };
@@ -957,14 +1028,9 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            // A leftover temp file from an interrupted run is replaced.
-            std::fs::write(path.with_extension("json.tmp"), "junk").unwrap();
-            std::fs::set_permissions(
-                path.with_extension("json.tmp"),
-                std::fs::Permissions::from_mode(0o666),
-            )
-            .unwrap();
         }
+        // Another writer's temporary file is not this run's to touch.
+        std::fs::write(path.with_extension("json.tmp"), "junk").unwrap();
         let file = read_agent_config(&path).unwrap();
         let mut config = file.value.clone();
         config["labels"] = serde_json::json!({"temps.sh/role": "dedicated"});
@@ -972,7 +1038,15 @@ mod tests {
         let back = read_agent_config(&path).unwrap().value;
         assert_eq!(back["token"], "t");
         assert_eq!(back["labels"]["temps.sh/role"], "dedicated");
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.tmp")).unwrap(),
+            "junk"
+        );
+        assert_eq!(
+            own_temp_files(dir.path()),
+            0,
+            "nothing of this run's is left"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1025,7 +1099,42 @@ mod tests {
             "{error}"
         );
         assert!(std::fs::read_to_string(&path).unwrap().contains("mine"));
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(own_temp_files(dir.path()), 0);
+    }
+
+    /// Temporary files [`write_config_atomically`] names after its process.
+    fn own_temp_files(dir: &Path) -> usize {
+        let prefix = format!("agent.json.{}.", std::process::id());
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .count()
+    }
+
+    #[test]
+    fn overlapping_edits_take_turns_on_the_lock() {
+        if running_as_root() {
+            eprintln!("skipped: runs as root");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        std::fs::write(&path, r#"{"labels":{}}"#).unwrap();
+        let held = lock_agent_config(&path).unwrap();
+        let error = lock_agent_config_within(&path, Duration::from_millis(300))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("is editing"), "{error}");
+        drop(held);
+        assert!(lock_agent_config_within(&path, Duration::from_millis(300)).is_ok());
     }
 
     #[test]

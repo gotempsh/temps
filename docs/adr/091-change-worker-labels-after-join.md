@@ -43,8 +43,12 @@ temps agent labels unset gpu
 `set` and `unset` rewrite only the `labels` object of `agent.json`, keeping
 every other field, through a temporary file renamed over the original, mode
 `0600`. `agent.json` is read as a bounded regular file, never through a
-symlink; the temporary file is created exclusively; and the rename happens
-only if `agent.json` is still the file that was read. `--data-dir` picks
+symlink; the temporary file has a name of the writing process's own and is
+created exclusively; the rename happens only if `agent.json` is still the
+file that was read; and an exclusive lock on `agent.json.lock` is held from
+the read to the rename, so two overlapping edits take turns instead of one
+losing the other's change. The agent keeps its labels when `agent.json` is
+not a JSON object at all. `--data-dir` picks
 another agent directory, as for `temps agent ingress`, which uses the same
 reader and writer.
 
