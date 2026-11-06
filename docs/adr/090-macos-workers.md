@@ -122,6 +122,12 @@ worker to another VM.
   URL's address, so the forwarder is not trusted with anything.
 - Publishes workload ports on its mesh address through the Docker API, as on
   Linux: the address exists in the VM, where Docker binds it.
+- Runs runtime health probes from the sidecar: macOS has no route to the
+  mesh address, so each probe connection is a `docker exec -i temps-mac-mesh
+  socat … STDIO TCP4:<ip>:<port>` to the endpoint the inspector derived from
+  the container's own published port (one argv element, no shell). The probe
+  starts once `socat` reports the connection established, and dropping it
+  kills the exec.
 - Reports `capacity.host = {"os": "macos", "docker_app": …}` in its heartbeat.
 
 ### 3. `temps join` on a Mac

@@ -18,8 +18,8 @@ use std::{
 };
 use temps_runtime_health::{
     host::{persist, private_directory, private_file, read_record, HostError, ProbeHost},
-    Assignment, ExecutionOwner, InspectFailure, ProbePermit, RuntimeInspector, RuntimeSnapshot,
-    MAX_CONCURRENT_PROBES,
+    Assignment, ExecutionOwner, InspectFailure, ProbeDialer, ProbePermit, RuntimeInspector,
+    RuntimeSnapshot, TcpDialer, MAX_CONCURRENT_PROBES,
 };
 use uuid::Uuid;
 
@@ -136,16 +136,26 @@ pub struct DockerProbeInspector {
     receipts: PathBuf,
     locks: PathBuf,
     role_claim: std::sync::Mutex<(Option<ExecutionOwner>, std::sync::Weak<File>)>,
+    /// How probes reach this daemon's published ports from this process.
+    dialer: Arc<dyn ProbeDialer>,
 }
 
 impl DockerProbeInspector {
-    pub async fn new(docker: Arc<Docker>, root: &Path) -> Result<Self, HostError> {
-        Self::with_coordination(
+    /// `dialer` is how this process reaches the daemon's published ports:
+    /// [`TcpDialer`] when it shares their network namespace.
+    pub async fn new(
+        docker: Arc<Docker>,
+        root: &Path,
+        dialer: Arc<dyn ProbeDialer>,
+    ) -> Result<Self, HostError> {
+        let mut inspector = Self::with_coordination(
             docker,
             root,
             crate::runtime_health_coordination::COORDINATION_VOLUME,
         )
-        .await
+        .await?;
+        inspector.dialer = dialer;
+        Ok(inspector)
     }
     async fn with_coordination(
         docker: Arc<Docker>,
@@ -174,6 +184,7 @@ impl DockerProbeInspector {
             receipts,
             locks,
             role_claim: std::sync::Mutex::new((None, std::sync::Weak::new())),
+            dialer: Arc::new(TcpDialer),
         })
     }
 
@@ -306,12 +317,20 @@ impl RuntimeInspector for DockerProbeInspector {
             endpoint,
         })
     }
+
+    fn dialer(&self) -> &dyn ProbeDialer {
+        self.dialer.as_ref()
+    }
 }
 
+/// Open the probe host for `docker`. `dialer` is how this process reaches
+/// the daemon's published ports: [`TcpDialer`] unless they bind in another
+/// network namespace (a Mac worker's Docker app VM).
 pub async fn open_host(
     docker: Arc<Docker>,
     root: PathBuf,
     agent: bool,
+    dialer: Arc<dyn ProbeDialer>,
 ) -> Result<Arc<ProbeHost>, HostError> {
     private_directory(&root)?;
     let identity_path = root.join("identity.json");
@@ -328,7 +347,7 @@ pub async fn open_host(
             identity
         }
     };
-    let inspector = Arc::new(DockerProbeInspector::new(docker, &root).await?);
+    let inspector = Arc::new(DockerProbeInspector::new(docker, &root, dialer).await?);
     let owner = if agent {
         ExecutionOwner::Agent(identity)
     } else {

@@ -1,20 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::{HealthReason, Probe, RuntimeSnapshot};
+use crate::{HealthReason, Probe, ProbeDialer, RuntimeSnapshot};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
     time::{timeout_at, Duration, Instant},
 };
 
 /// Network operations are bounded by the attempt/lease deadline. HTTP reads
 /// bounded informational headers and a fixed-size final status line. It follows
-/// no redirect and never captures response bodies.
+/// no redirect and never captures response bodies. `dialer` opens the
+/// connection (the inspector's route to the endpoint), inside the deadline.
 pub(crate) async fn network_probe(
     probe: &Probe,
     snapshot: &RuntimeSnapshot,
     deadline: Instant,
+    dialer: &dyn ProbeDialer,
 ) -> Result<(), HealthReason> {
     if Instant::now() >= deadline {
         return Err(HealthReason::ProbeTimeout);
@@ -24,15 +25,18 @@ pub(crate) async fn network_probe(
         return Err(HealthReason::EndpointUnavailable);
     }
     let operation = async {
-        let mut stream = TcpStream::connect(endpoint)
+        let mut stream = dialer
+            .connect(endpoint)
             .await
             .map_err(|_| HealthReason::ConnectionFailed)?;
         match probe {
             Probe::Tcp {} => {
                 // Published-port forwarders may accept before a refused backend.
+                // The connection is dropped afterwards, so reading (rather
+                // than peeking) the byte loses nothing.
                 let confirmation = Instant::now() + Duration::from_millis(100);
                 let mut byte = [0u8; 1];
-                match timeout_at(confirmation.min(deadline), stream.peek(&mut byte)).await {
+                match timeout_at(confirmation.min(deadline), stream.read(&mut byte)).await {
                     Ok(Ok(0)) | Ok(Err(_)) => Err(HealthReason::ConnectionFailed),
                     Ok(Ok(_)) => Ok(()),
                     Err(_) if confirmation <= deadline => Ok(()),
@@ -176,6 +180,7 @@ mod tests {
             },
             &snapshot,
             Instant::now() + Duration::from_secs(1),
+            &crate::TcpDialer,
         )
         .await;
         server.await.unwrap();
@@ -252,6 +257,105 @@ mod tests {
         );
     }
 
+    /// Answers every connection in memory with `response` (or refuses), and
+    /// records the endpoint it was asked for.
+    struct InMemoryDialer {
+        response: Option<&'static [u8]>,
+        dialed: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ProbeDialer for InMemoryDialer {
+        async fn connect(
+            &self,
+            endpoint: std::net::SocketAddr,
+        ) -> std::io::Result<Box<dyn crate::ProbeConnection>> {
+            self.dialed.lock().unwrap().push(endpoint);
+            let response = self.response.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused")
+            })?;
+            let (client, mut server) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let mut request = [0; 2048];
+                if response.is_empty() {
+                    return; // close at once, like a forwarder whose backend refused
+                }
+                let _ = server.read(&mut request).await;
+                let _ = server.write_all(response).await;
+            });
+            Ok(Box::new(client))
+        }
+    }
+
+    fn snapshot_at(endpoint: std::net::SocketAddr) -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            container_id: format!("{:064x}", 1),
+            running: true,
+            restart_count: 0,
+            started_at: "runtime-start-1".into(),
+            endpoint: Some(endpoint),
+        }
+    }
+
+    /// A Mac worker publishes ports in its Docker app's VM, which the agent
+    /// cannot route to: the probe must go through the inspector's dialer, to
+    /// the inspected endpoint, and never dial it directly.
+    #[tokio::test]
+    async fn probes_connect_through_the_dialer_to_the_inspected_endpoint() {
+        // TEST-NET-1: nothing answers here, so a direct dial would time out.
+        let endpoint: std::net::SocketAddr = "192.0.2.10:32768".parse().unwrap();
+        let dialer = InMemoryDialer {
+            response: Some(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            dialed: Default::default(),
+        };
+        let http = Probe::Http {
+            path: "/".into(),
+            expected_status: 200,
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let snapshot = snapshot_at(endpoint);
+        assert_eq!(
+            network_probe(&http, &snapshot, deadline, &dialer).await,
+            Ok(())
+        );
+        assert_eq!(
+            network_probe(&Probe::Tcp {}, &snapshot, deadline, &dialer).await,
+            Ok(())
+        );
+        assert_eq!(*dialer.dialed.lock().unwrap(), vec![endpoint, endpoint]);
+    }
+
+    #[tokio::test]
+    async fn a_dialer_that_cannot_connect_or_is_closed_at_once_fails_the_probe() {
+        let snapshot = snapshot_at("192.0.2.10:32768".parse().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let refused = InMemoryDialer {
+            response: None,
+            dialed: Default::default(),
+        };
+        let closed = InMemoryDialer {
+            response: Some(b""),
+            dialed: Default::default(),
+        };
+        let http = Probe::Http {
+            path: "/".into(),
+            expected_status: 200,
+        };
+        for probe in [&Probe::Tcp {}, &http] {
+            assert_eq!(
+                network_probe(probe, &snapshot, deadline, &refused).await,
+                Err(HealthReason::ConnectionFailed)
+            );
+        }
+        assert_eq!(
+            network_probe(&Probe::Tcp {}, &snapshot, deadline, &closed).await,
+            Err(HealthReason::ConnectionFailed)
+        );
+        assert!(network_probe(&http, &snapshot, deadline, &closed)
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn hanging_informational_headers_use_the_original_attempt_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -278,6 +382,7 @@ mod tests {
             },
             &snapshot,
             Instant::now() + Duration::from_millis(100),
+            &crate::TcpDialer,
         )
         .await;
         server.abort();
