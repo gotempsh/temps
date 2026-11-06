@@ -21,6 +21,9 @@ Imperative digest. If a rule and a screenshot disagree, fix the screenshot.
   concrete example, a link to the settings page. Never nothing. `PageState`
   variant `not-set-up` enforces this at the type level — `requirement`,
   `example`, `settingsHref` are required props.
+- Nothing scrolls sideways, at any width: not the page, a table, or a tab
+  strip. Tables show columns by priority with container queries and fold
+  what is needed to act under the record's name (see Responsive).
 - Color never decorates. It appears only through `Status` (badges, dots,
   chart series). If you reach for a raw color to convey meaning outside
   `Status`, stop and add a tone to `Status` instead. Existing provider logos
@@ -97,6 +100,11 @@ optional; `main` is not.
 
 ## Forms
 
+A form beyond a few fields is a routed page with its URL, not a modal; a modal
+form is one column. Catch predictable failures beside the field before Save (a
+name already used in its scope: say so and suggest a free one), never as a raw
+server or database error after it.
+
 `Field` for every control (label + control + description + error, wired
 `aria-describedby`). `FormErrors` above the sticky save bar, not only inline. Error summaries identify
 the field as well as the problem. Pass Field props through `Picker inputProps`
@@ -140,8 +148,8 @@ Keep the section heading and filter controls mounted while data changes.
 
 Keep errors, empty content, and loading in the collection's usual location.
 Do not nest a second bordered empty-state panel inside a table surface.
-`DataTable` owns its border and horizontal scroll; `PageState` can replace
-it or sit inside an existing surface without adding another border.
+`DataTable` owns its border; `PageState` can replace it or sit inside an
+existing surface without adding another border.
 
 Example: sandbox `/table-states` has shareable scenarios, working retries,
 and filtering. Production reference: `CronJobDetail.tsx`.
@@ -199,10 +207,21 @@ opt-in, never needed to communicate success; use a text-labeled `Status`.
 
 ## Responsive
 
-`PageHeader` actions wrap to a second row before they overflow. `Detail`'s
-aside stacks below `main` under `lg`. Tables scroll horizontally before they
-break layout — never let a fact grid or button row force horizontal page
-scroll.
+No horizontal scrolling, anywhere. `PageHeader` actions keep their width and
+wrap to a second row; the description wraps, never under them. `Detail`'s aside
+stacks below `main` under `lg`. Tables are query containers: give each
+`DataTableColumn` a priority class (`hidden @xl:table-cell` on its head and
+cells) so a narrow table keeps the name, the state and the actions, and move
+what a hidden column says that is needed to act under the name. Long
+identifiers break (`overflow-wrap: anywhere`). Tabs wrap. Check from 320px up.
+`DataTable`'s overflow wrapper and `ScrollableTabsList` are a safety net and a
+legacy gap, not a layout; convert a table when touching it.
+
+Tables show only what is needed to scan and act: the name, its state, one
+compact time (relative within a day, then the date; the exact time in a
+tooltip). IDs, keys, certificates and full timestamps belong to the detail
+view. A row has at most one inline action; the rest go in one "…" menu,
+destructive last, disabled items saying why.
 
 ## Requirements: the URL is the state
 
@@ -335,8 +354,9 @@ touching it.
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is
+a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 

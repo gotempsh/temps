@@ -29,14 +29,18 @@ manager is `bun`.
   loading, never centred `Loader2` spinners (inline spinners on mutation buttons
   are fine); `ServiceIcon` for a project's icon anywhere one is listed, never a
   hand-built initial or a media lookup of a page's own.
-- **Mobile**: tables use the shared overflow wrapper (hide a column only if a
-  detail view still shows it); filter bars `flex flex-col gap-2 sm:flex-row
+- **Mobile**: nothing scrolls sideways at any width. Tables show columns by
+  priority with container queries (`hidden @xl:table-cell`), keep the name,
+  state and actions, and move what a hidden column says that is needed to act
+  under the name (a column hides only if a detail view still shows it); see
+  `DESIGN.md` "No horizontal scrolling". Filter bars `flex flex-col gap-2 sm:flex-row
   sm:flex-wrap` with `w-full sm:w-[Npx]` selects; grids `grid-cols-1
   md:grid-cols-2 lg:grid-cols-3` (stat cards `grid-cols-2 md:grid-cols-4`); side
   panels `flex-col lg:flex-row` with `w-full lg:w-[Npx]`; the shared `PageHeader`
   (`web/src/components/layout/PageContainer.tsx`); icon-button labels
-  `max-sm:sr-only`, never `hidden sm:inline`; `min-w-[Npx]` on scrollable
-  containers.
+  `max-sm:sr-only`, never `hidden sm:inline`; long identifiers break
+  (`[overflow-wrap:anywhere]`) instead of setting a `min-w-[Npx]` that forces
+  scrolling.
 - **Pagination** is the shared `ResponsivePagination`
   (`web/src/components/ui/responsive-pagination.tsx`), never rebuilt per call
   site. It measures its own width, so a narrow card gets what a phone gets: below

@@ -127,8 +127,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 ## Responsive & keyboard
 
 `PageHeader` actions wrap under the title below `sm`. `Detail`'s aside stacks
-below `main` below `lg`. `Ledger`'s table is the one thing allowed to scroll
-horizontally. `Picker` is fully keyboard-filterable from focus; shortcuts get
+below `main` below `lg`. Nothing scrolls horizontally, `Ledger`'s
+table included: columns show by priority (see `RULES.md`, Responsive). `Picker` is fully keyboard-filterable from focus; shortcuts get
 a visible `Kbd` badge next to their control — never a keyboard-only entry
 point (repo-wide discoverability rule, `CLAUDE.md`).
 
@@ -145,7 +145,8 @@ the sample request without clearing filters; a selection with no matches
 has a reset action. Fixture dates are relative to when the page opens, so
 presets remain useful; custom ranges preserve absolute timestamps. All records are invented and no API is called.
 
-`DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
+`DataTable` owns the header, rows, skeleton and border; columns carry priority
+classes so the table never scrolls sideways.
 The caller owns request errors, empty/no-match copy, filters, and retries.
 Give the table an accessible name with `aria-label`. Rows are `RecordRow`s:
 put a `RecordLink` in the identity column and the whole row opens it. Loading cells retain
@@ -543,8 +544,9 @@ touching it.
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is
+a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 

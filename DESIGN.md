@@ -193,9 +193,17 @@ administrative resources. Do not invent a different row component per page.
   exists, make its name a real [RecordLink](web/packages/ds/src/record-link.tsx)
   inside a `RecordRow`: the name reads as plain text (no underline, no arrow)
   and the whole row opens the record. Secondary metadata is muted.
+- Show only the columns needed to scan and act: the name, its state, and one
+  time. Identifiers, serials, keys, certificates, full timestamps and
+  instance-wide settings belong in the record's detail view, not the table.
+- Times are compact: relative within a day ("3 hours ago"), then the date
+  alone, with the exact time in a tooltip and on the detail view.
 - Put status in a text-labeled badge; color alone never carries the meaning.
-- Right-align row actions in the last column. Give icon-only actions an
-  accessible name that identifies the resource.
+- Right-align row actions in the last column. A row shows at most one inline
+  action (or a state such as a switch); everything else goes in one "…" row
+  menu with labelled items, destructive items last after a separator, and
+  disabled items saying why. Give icon-only actions an accessible name that
+  identifies the resource.
 - Keep links, menus, and selection independently operable. A row navigates
   only through `RecordRow`, which follows its `RecordLink`; never a hand-written
   row `onClick`, link overlay, or `role="button"`.
@@ -262,15 +270,36 @@ when their tables are touched; this decision does not claim all legacy tables
 have already been converted. Preserve row expansion/selection as explicit,
 separately labeled controls during migration.
 
-The shared Table already owns a horizontal overflow wrapper. On narrow screens,
-scroll the table rather than the entire page. Keep identity and primary actions
-reachable; if columns are hidden, essential information must remain available
-through a detail view or an accessible compact presentation.
-
 Cards are appropriate for discovery surfaces such as the plugin catalog, where
 logos, descriptions, and categories help people choose. They are not a second
 default for administrative lists. Use a responsive grid with consistent card
 anatomy and the same state rules above.
+
+### No horizontal scrolling
+
+Nothing scrolls sideways: not the page, not a table, not a tab strip. A layout
+that needs it is a bug at that width, fixed by changing the layout.
+
+- A table gives each column a priority and shows it by the width the table has,
+  with container queries (`hidden @xl:table-cell`), so the sidebar and side
+  panels count. The viewport is the wrong measure: the same table is narrower
+  with the sidebar open.
+- A narrow table keeps the record's name, its state and its actions. What a
+  hidden column says that is needed to act moves under the name as muted text
+  (a bundle's "no services" warning, a rule's credential); the rest stays on
+  the detail view.
+- Long identifiers, hosts and commands break (`overflow-wrap: anywhere`)
+  rather than widening their column. Truncate only with a way to see the full
+  value.
+- Cells pad less in a narrow table; tabs wrap to a second line; header actions
+  keep their width and the description wraps beside or under them.
+- Check every changed screen from 320px up, in the content area after the
+  sidebar. The overflow wrappers around the shared Table and tab strips are a
+  safety net, never the layout.
+
+Existing tables and `ScrollableTabsList` still scroll where they were built to;
+convert a table to column priorities when touching it, and do not add new
+scrolling surfaces.
 
 ### Pagination
 
@@ -308,6 +337,16 @@ with native lookalikes or locally styled forks.
   `htmlFor`, or a correctly wrapping label. A placeholder is not a label.
 - **Forms:** use existing React Hook Form, Zod, and shared form patterns.
   Put validation next to the field; retain user input after failures.
+  A form beyond a few fields (several steps, a catalogue then configuration
+  then a secret) is a routed page with its own URL, never a modal or a chain of
+  modals. A form that stays in a modal is one column: no side-by-side fields,
+  one choice card per row.
+- **Predictable failures:** catch them before Save. Check what the client can
+  know (a name already used in the same scope, a missing dependency) next to
+  the field, suggest a value that works ("GitHub 2"), and hold Save until it is
+  fixed. Never show a raw database or constraint error; a server conflict is a
+  sentence naming the record and its scope. Show a save error next to the
+  buttons, where the user is when they press Save.
 - **Async actions:** show progress and prevent duplicate submission. Keep
   readable contrast while pending; communicate the result and recovery action.
 - **Destructive actions:** require confirmation that identifies the target
@@ -351,14 +390,20 @@ selected text after its hover background becomes light.
 
 ## 7. Responsive, accessible, and functional
 
-- Check at 390px, 768px, and a wide desktop width. Widths are measured in the
+- Check at 320px, 390px, 768px, and a wide desktop width. Widths are measured in the
   content area after the sidebar, not the entire viewport; on a wide screen a
   `form` page is a column that starts at the left edge with the header, and a
   `full` page fills it.
 - Verify both light and dark mode, including hover, selected, pending, and
   disabled controls.
-- No document-level horizontal overflow, clipped actions, or inaccessible
+- No horizontal scrolling at any width, in the document or in any surface
+  (see "No horizontal scrolling" in section 4), no clipped actions, and no
   fixed-width forms. Let toolbars wrap and long labels break sensibly.
+- Pages say when something is wrong or needs the user: a banner at the top
+  naming the problem, its consequence and the fix (a button or the exact
+  command), and a signal visible from elsewhere, such as a dot on the sidebar
+  item. Status stays current by polling or live updates; it never freezes at
+  page load.
 - Keep visible focus indicators and a logical keyboard order. Test checkbox
   labels and Space, menus, dialogs, and table links.
 - Preserve heading hierarchy: one page `h1`, then section headings.
@@ -383,7 +428,8 @@ Before handing off a changed screen:
 - [ ] Shared table and pagination, or a justified discovery-card layout.
 - [ ] Shared Checkbox/Switch and properly associated labels; no native lookalikes.
 - [ ] Permission-aware actions, useful failures, and working retry/setup links.
-- [ ] Keyboard, mobile, wide-screen, light, and dark behavior checked.
+- [ ] Keyboard, mobile, wide-screen, light, and dark behavior checked; nothing
+      scrolls sideways from 320px up.
 - [ ] Regression tests cover the changed behavior and important failure states.
 - [ ] Documentation and shared components agree, or the remaining legacy gap
       is explicitly identified rather than presented as complete.
@@ -400,7 +446,7 @@ the shared implementation rather than creating a competing design guide.
 
 Plugins inherit the resolved Temps light/dark theme and follow live changes. They do not expose an independent theme toggle or persist a separate theme preference. Standalone previews may follow the OS preference.
 
-The host owns plugin identity. Inside the plugin, use a compact view title rather than repeating the plugin name and description. Multi-view plugins use an internal sidebar with Lucide icons and text labels; on narrow screens it becomes a horizontally scrollable navigation strip.
+The host owns plugin identity. Inside the plugin, use a compact view title rather than repeating the plugin name and description. Multi-view plugins use an internal sidebar with Lucide icons and text labels; on narrow screens it becomes a navigation strip that wraps.
 
 Separate history lists from record details using addressable routes. Paginate history and result collections with shared responsive pagination, clamp pages after filtering or deletion, and preserve keyboard navigation. Starting a job opens its detail view; returning to history must not cancel it.
 
@@ -436,8 +482,9 @@ touching it.
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is a
+legacy gap, see section 4). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 
