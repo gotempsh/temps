@@ -256,8 +256,15 @@ fn describe(ingress: &LocalIngress) -> String {
 }
 
 /// `--data-dir`, else `TEMPS_DATA_DIR`/`~/.temps`, else the data directory
-/// the installed service runs with (`sudo` changes `~`).
+/// the installed service runs with (`sudo` changes `~`). The directory is
+/// resolved once, here: every later read, check and write uses the same
+/// canonical path, so a symlinked directory cannot be repointed between a
+/// root run's ownership check and its writes.
 pub(super) fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
+    canonical_config(found_config_path(target)?)
+}
+
+fn found_config_path(target: &Target) -> anyhow::Result<PathBuf> {
     if let Some(dir) = &target.data_dir {
         return Ok(dir.join("agent.json"));
     }
@@ -275,6 +282,20 @@ pub(super) fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
         "No agent.json at {}. Run `temps join` first, or pass --data-dir with the directory the agent runs from.",
         default.display()
     )
+}
+
+/// `path` with its directory canonicalized (`agent.json` itself is kept as
+/// named: a symlink there is refused when it is read).
+fn canonical_config(path: PathBuf) -> anyhow::Result<PathBuf> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = std::fs::canonicalize(dir).map_err(|e| {
+        anyhow::anyhow!(
+            "No agent.json at {} ({e}). Run `temps join` first, or pass --data-dir with the \
+             directory the agent runs from.",
+            path.display()
+        )
+    })?;
+    Ok(dir.join("agent.json"))
 }
 
 fn unit_text() -> Option<String> {

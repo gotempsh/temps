@@ -830,8 +830,8 @@ fn classify_unit(unit: &str, data_dir: &Path) -> UnitFile {
         Some(installed) if installed == data_dir => {}
         installed => {
             return UnitFile::Refused(format!(
-                "it runs the agent from {}, but this join saved its config in {}, so join left \
-                 it alone and it keeps the old config",
+                "it runs the agent from {}, but the config being applied is in {}, so it was \
+                 left alone and it keeps the old config",
                 installed.map_or_else(
                     || "an unknown directory".to_string(),
                     |dir| dir.display().to_string()

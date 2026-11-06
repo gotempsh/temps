@@ -64,14 +64,27 @@ pub const MAX_STATUS_BYTES: u64 = 64 * 1024;
 /// user can change. Returns the text and the metadata of the file read, so
 /// a caller can check it was not swapped before writing over it.
 pub fn read_regular_file(path: &Path, max: u64) -> std::io::Result<(String, std::fs::Metadata)> {
+    read_bounded(path, max, false)
+}
+
+/// [`read_regular_file`], but following a symlink at `path`: for the agent
+/// reading its own config, which it already follows at start.
+fn read_bounded(
+    path: &Path,
+    max: u64,
+    follow_symlink: bool,
+) -> std::io::Result<(String, std::fs::Metadata)> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let no_follow = if follow_symlink { 0 } else { libc::O_NOFOLLOW };
+        options.custom_flags(no_follow | libc::O_NONBLOCK);
     }
+    #[cfg(not(unix))]
+    let _ = follow_symlink;
     let file = options.open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -111,7 +124,9 @@ pub struct LabelsStatus {
 /// cannot be read or parsed, or `labels` is not an object, so the caller
 /// keeps the labels it has. A file without `labels` has none.
 pub fn read_saved_labels(path: &Path) -> Option<serde_json::Value> {
-    let (text, _) = read_regular_file(path, MAX_CONFIG_BYTES).ok()?;
+    // The agent's own config: a symlinked agent.json is followed, as at
+    // start, so its labels still reload.
+    let (text, _) = read_bounded(path, MAX_CONFIG_BYTES, true).ok()?;
     let config: serde_json::Value = match serde_json::from_str(&text) {
         Ok(config) => config,
         Err(error) => {
@@ -216,8 +231,14 @@ pub fn record_accepted(data_dir: &Path, status: &LabelsStatus) -> std::io::Resul
 
 /// [`STATUS_FILE`] in `data_dir`, if there is a readable one.
 pub fn read_status(data_dir: &Path) -> Option<LabelsStatus> {
-    let (text, _) = read_regular_file(&data_dir.join(STATUS_FILE), MAX_STATUS_BYTES).ok()?;
-    serde_json::from_str(&text).ok()
+    read_status_file(data_dir).map(|(status, _)| status)
+}
+
+/// [`read_status`] with the metadata of the file read, so a root caller can
+/// check who wrote it.
+pub fn read_status_file(data_dir: &Path) -> Option<(LabelsStatus, std::fs::Metadata)> {
+    let (text, meta) = read_regular_file(&data_dir.join(STATUS_FILE), MAX_STATUS_BYTES).ok()?;
+    Some((serde_json::from_str(&text).ok()?, meta))
 }
 
 /// Records each newly accepted label set, once.
@@ -412,7 +433,8 @@ mod tests {
             read_regular_file(&link, 1024).is_err(),
             "a symlink is not followed"
         );
-        assert_eq!(read_saved_labels(&link), None);
+        // The agent's own config is followed, as it is at start.
+        assert_eq!(read_saved_labels(&link), Some(serde_json::json!({})));
         assert!(read_regular_file(dir.path(), 1024).is_err(), "a directory");
         // A FIFO would block a plain read forever.
         let fifo = dir.path().join(STATUS_FILE);

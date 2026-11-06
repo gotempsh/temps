@@ -149,8 +149,18 @@ impl Worker {
     /// The agent's record of what the control plane accepted, if it is about
     /// this node (a re-join gets a new node ID).
     fn status(&self) -> Option<LabelsStatus> {
-        temps_node_agent::labels::read_status(&self.data_dir)
-            .filter(|status| Some(i64::from(status.node_id)) == self.node_id)
+        let (status, meta) = temps_node_agent::labels::read_status_file(&self.data_dir)?;
+        // Run as root, only a record root wrote counts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if running_as_root() && meta.uid() != 0 {
+                return None;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = meta;
+        Some(status).filter(|status| Some(i64::from(status.node_id)) == self.node_id)
     }
 
     fn display_name(&self) -> String {
@@ -527,6 +537,13 @@ pub(super) struct AgentConfigFile {
 /// of another worker's config (with its node token) into a file they own.
 pub(super) fn read_agent_config(path: &Path) -> anyhow::Result<AgentConfigFile> {
     refuse_shared_dir_as_root(path)?;
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        anyhow::bail!(
+            "{} is a symbolic link, which this command does not follow or replace. Pass \
+             --data-dir with the directory holding the real agent.json.",
+            path.display()
+        );
+    }
     let (text, meta) = temps_node_agent::labels::read_regular_file(
         path,
         temps_node_agent::labels::MAX_CONFIG_BYTES,
@@ -907,9 +924,7 @@ mod tests {
     /// agent.json is touched.
     #[test]
     fn a_pinned_agents_record_refuses_the_change_before_writing() {
-        if running_as_root() {
-            // A root run refuses a temporary directory others can write.
-            eprintln!("skipped: runs as root");
+        if skip_as_root() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1021,6 +1036,9 @@ mod tests {
 
     #[test]
     fn the_config_is_replaced_whole_owner_only_and_keeps_other_fields() {
+        if skip_as_root() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.json");
         std::fs::write(&path, r#"{"token":"t","labels":{}}"#).unwrap();
@@ -1058,6 +1076,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_planted_symlink_is_never_read_or_written_through() {
+        if skip_as_root() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.json");
         std::fs::write(&victim, r#"{"token":"secret of another node"}"#).unwrap();
@@ -1076,13 +1097,16 @@ mod tests {
         std::fs::create_dir(linked.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&victim, &linked).unwrap();
         let error = read_agent_config(&linked).err().unwrap().to_string();
-        assert!(error.contains("Could not read"), "{error}");
+        assert!(error.contains("symbolic link"), "{error}");
         assert!(!error.contains("another node"), "{error}");
     }
 
     #[cfg(unix)]
     #[test]
     fn a_config_swapped_after_it_was_read_is_not_replaced() {
+        if skip_as_root() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.json");
         std::fs::write(&path, r#"{"labels":{}}"#).unwrap();
@@ -1100,6 +1124,16 @@ mod tests {
         );
         assert!(std::fs::read_to_string(&path).unwrap().contains("mine"));
         assert_eq!(own_temp_files(dir.path()), 0);
+    }
+
+    /// A root run refuses the world-writable temporary directory these tests
+    /// use, by design (see `read_agent_config`).
+    fn skip_as_root() -> bool {
+        let root = running_as_root();
+        if root {
+            eprintln!("skipped: runs as root");
+        }
+        root
     }
 
     /// Temporary files [`write_config_atomically`] names after its process.
@@ -1120,8 +1154,7 @@ mod tests {
 
     #[test]
     fn overlapping_edits_take_turns_on_the_lock() {
-        if running_as_root() {
-            eprintln!("skipped: runs as root");
+        if skip_as_root() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
