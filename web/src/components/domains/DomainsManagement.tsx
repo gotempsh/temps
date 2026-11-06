@@ -246,7 +246,7 @@ export function DomainsManagement({
     {
       ...sortable('domain', 'Domain'),
       render: (row) => (
-        // Rows themselves never navigate (DESIGN.md).
+        // The row follows this link (RecordRow, DESIGN.md).
         <RecordLink to={domainRowHref(row)}>{row.name}</RecordLink>
       ),
     },

@@ -21,6 +21,15 @@ Imperative digest. If a rule and a screenshot disagree, fix the screenshot.
   concrete example, a link to the settings page. Never nothing. `PageState`
   variant `not-set-up` enforces this at the type level — `requirement`,
   `example`, `settingsHref` are required props.
+- Pages don't explain themselves. No paragraph under a page or section title
+  saying what the page is or how the feature works: users skip it and it
+  pushes the content down. A description appears only when it is one short
+  line the user needs to act; constraints sit beside the control, consequences
+  in the confirm dialog, background in `HelpPopover`/`Disclosure` or the docs
+  (see Progressive disclosure and `DESIGN.md`).
+- Nothing scrolls sideways, at any width: not the page, a table, or a tab
+  strip. Tables show columns by priority with container queries and fold
+  what is needed to act under the record's name (see Responsive).
 - Color never decorates. It appears only through `Status` (badges, dots,
   chart series). If you reach for a raw color to convey meaning outside
   `Status`, stop and add a tone to `Status` instead. Existing provider logos
@@ -97,6 +106,11 @@ optional; `main` is not.
 
 ## Forms
 
+A form beyond a few fields is a routed page with its URL, not a modal; a modal
+form is one column. Catch predictable failures beside the field before Save (a
+name already used in its scope: say so and suggest a free one), never as a raw
+server or database error after it.
+
 `Field` for every control (label + control + description + error, wired
 `aria-describedby`). `FormErrors` above the sticky save bar, not only inline. Error summaries identify
 the field as well as the problem. Pass Field props through `Picker inputProps`
@@ -140,8 +154,8 @@ Keep the section heading and filter controls mounted while data changes.
 
 Keep errors, empty content, and loading in the collection's usual location.
 Do not nest a second bordered empty-state panel inside a table surface.
-`DataTable` owns its border and horizontal scroll; `PageState` can replace
-it or sit inside an existing surface without adding another border.
+`DataTable` owns its border; `PageState` can replace it or sit inside an
+existing surface without adding another border.
 
 Example: sandbox `/table-states` has shareable scenarios, working retries,
 and filtering. Production reference: `CronJobDetail.tsx`.
@@ -199,10 +213,28 @@ opt-in, never needed to communicate success; use a text-labeled `Status`.
 
 ## Responsive
 
-`PageHeader` actions wrap to a second row before they overflow. `Detail`'s
-aside stacks below `main` under `lg`. Tables scroll horizontally before they
-break layout — never let a fact grid or button row force horizontal page
-scroll.
+No horizontal scrolling, anywhere. `PageHeader` actions keep their width and
+wrap to a second row; the description wraps, never under them. `Detail`'s aside
+stacks below `main` under `lg`. Tables are query containers: `DataTable`
+declares one around its table, so give each `DataTableColumn` a priority class
+(`hidden @xl:table-cell`; it applies to the head and every cell) and a narrow
+table keeps the name, the state and the actions. A hand-built shared `Table`
+is not a container by itself: wrap it in `<div className="@container">`
+directly around the table, or the `@` classes measure some ancestor instead
+(and with none, the columns never show). Move
+what a hidden column says that is needed to act under the name. Long
+identifiers break (`overflow-wrap: anywhere`). Tabs wrap. Check from 320px up.
+`DataTable`'s overflow wrapper and `ScrollableTabsList` are a safety net and a
+legacy gap, not a layout; convert a table when touching it.
+
+A card grid (a catalogue, a picker) becomes a list of rows where fewer than
+three cards fit side by side; never one or two cramped cards per row.
+
+Tables show only what is needed to scan and act: the name, its state, one
+compact time (relative within a day, then the date; the exact time in a
+tooltip). IDs, keys, certificates and full timestamps belong to the detail
+view. A row has at most one inline action; the rest go in one "…" menu,
+destructive last, disabled items saying why.
 
 ## Requirements: the URL is the state
 
@@ -217,12 +249,17 @@ Filters, tab, page number, selected record: `useUrlState`, not local
    this, but re-scan by eye for anything the regex can't (inline `<style>`,
    a `boxShadow` object).
 4. The record recipe order (title → verdict → facts → main → aside) holds.
+5. No page or section opens with a paragraph explaining itself.
 
 ## Progressive disclosure
 
-Show only what the user needs for the next action. Page descriptions are optional;
-omit copy that repeats a title, label, or obvious control. Keep field-format
-requirements next to the field. Prefer one short sentence over a paragraph.
+Show only what the user needs for the next action. Page and section
+descriptions are off by default: never define the title's noun, tour the
+feature, or explain how it works or why it is safe. Keep field-format
+requirements and constraints next to the field. When a line is needed to act,
+it is one short sentence, never a paragraph. A record's own description is
+data and may show under its name; an empty one renders nothing, not
+"No description".
 
 Use `HelpPopover` for optional, short context and `Disclosure` for longer technical
 details or advanced settings. Name the topic in the trigger ("Retention details",
@@ -261,20 +298,30 @@ Use `SettingsGroup` for the aligned open layout and `SettingsSection` for a
 titled group of settings; each caller retains its own save scope. `Disclosure`
 stays for informational detail only, never for settings.
 
-SettingsGroup descriptions are optional: one short sentence beneath the heading
-that clarifies scope or outcome. Omit repeated labels and detailed instructions.
+SettingsGroup descriptions are optional: one short line beneath the heading
+saying what the setting controls when the title doesn't. Omit the reasoning
+behind it, repeated labels and detailed instructions.
 
 ## Resource detail navigation
 
-- Use `RecordLink` for the resource name in a table's identity column. Its
-  underline and right arrow are always visible, including on touch screens.
-- No row-click navigation, overlay links, or duplicate View/Details buttons in
-  the actions column. `DataTable` and `Ledger` intentionally have no `onRowClick`.
-- Keep selection, expansion, copy, menus, Edit, and Delete independently operable.
-  Use a labeled button for expansion; row whitespace does not navigate.
+- Use `RecordLink` for the resource name in a table's identity column, inside
+  a `RecordRow`. The name has no underline and no arrow, including on hover;
+  the whole row opens the record. `DataTable` and `Ledger` rows already are
+  `RecordRow`s; use it yourself only in a `renderRow` or a hand-built table.
+- No `onRowClick`, overlay links, `role="button"` rows, or duplicate
+  View/Details buttons in the actions column. `RecordRow` is the only row
+  navigation, and it follows the row's `RecordLink`. One `RecordLink` per row;
+  counts and related resources are plain router links in `text-primary`.
+  Record lists (`<ul role="list">`) use `RecordListItem`.
+- Keep selection, expansion, copy, menus, Edit, and Delete independently
+  operable: clicks on them, or in a menu or dialog they open, never navigate.
+  Custom widgets count when they carry their ARIA role (`tab`, `combobox`,
+  `radio`, …), and so do disabled controls, even though they take no pointer
+  events. Mark a value meant to be selected or copied, such as a revealed
+  value, with `data-row-ignore`. Use a labeled button for expansion.
 - Use real routed URLs for details/configuration; preserve Enter, modifier-click,
   new-tab, refresh, and browser history. Do not replace links with buttons.
-- Records without a detail route use plain text, with no navigation arrow.
+- Records without a detail route use plain text and do not respond to clicks.
 - Detail facts, checks, forms, and history fill the parent width. No page-level
   `max-w-*`; reserve aside space only when an aside exists.
 - Migrate touched legacy tables to this pattern. Reference: sandbox `/ledger`,
@@ -326,8 +373,9 @@ touching it.
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is
+a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 

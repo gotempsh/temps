@@ -3,9 +3,9 @@
 
 import { useState } from 'react'
 import { GitCommitHorizontal } from 'lucide-react'
-import { useSearchParams } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { Button, Callout, Ledger, PageState, RecordLink } from '@temps-sdk/ds'
+import { Button, Callout, Ledger, PageState } from '@temps-sdk/ds'
 import {
   Input,
   Select,
@@ -52,7 +52,12 @@ export default function TelemetryReleases({
     })
   const countLink = (count: number, href?: string) =>
     href && count ? (
-      <RecordLink to={href}>{count.toLocaleString()}</RecordLink>
+      <Link
+        to={href}
+        className="font-medium text-primary hover:text-primary/80"
+      >
+        {count.toLocaleString()}
+      </Link>
     ) : (
       count.toLocaleString()
     )

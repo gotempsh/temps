@@ -21,7 +21,7 @@ import {
   canonicalAttributeFilter,
   planAttributeUrlSync,
 } from '@/lib/attribute-facets'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -244,7 +244,7 @@ export function TraceRow({
   const outcome = OUTCOME[traceOutcome(trace)]
   const projectPath = `/projects/${encodeURIComponent(trace.project_slug)}`
   return (
-    <TableRow>
+    <RecordRow>
       <TableCell className="min-w-36 py-2.5">
         <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground md:hidden">
           {projectImage}
@@ -323,6 +323,6 @@ export function TraceRow({
       <TableCell className="hidden whitespace-nowrap py-2.5 text-sm text-muted-foreground md:table-cell">
         <TimeAgo date={trace.start_time} />
       </TableCell>
-    </TableRow>
+    </RecordRow>
   )
 }

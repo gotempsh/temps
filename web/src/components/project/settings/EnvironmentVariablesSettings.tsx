@@ -37,7 +37,12 @@ import {
 } from '@/components/ui/popover'
 import { Button } from '@/components/ui/button'
 import { EnvironmentVariableValue } from './EnvironmentVariableValue'
-import { RecordLink, useUrlSearchText, useUrlState } from '@temps-sdk/ds'
+import {
+  RecordLink,
+  RecordRow,
+  useUrlSearchText,
+  useUrlState,
+} from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -815,7 +820,9 @@ function EnvironmentVariableRow({
     isVisible &&
     !isSecret &&
     credentialValueForScope(revealedValue, revealScope) !== undefined ? (
-      <div className="flex min-w-0 items-center gap-1">
+      // A revealed value is for selecting and copying: a click on it
+      // (the first half of a double-click, say) must not open the row.
+      <div data-row-ignore="" className="flex min-w-0 items-center gap-1">
         <EnvironmentVariableValue name={variable.key} value={dataValue} />
         <Button
           variant="ghost"
@@ -854,7 +861,7 @@ function EnvironmentVariableRow({
 
   return (
     <>
-      <TableRow
+      <RecordRow
         className={cn('border-b border-border/60', hiddenByFilter && 'hidden')}
         data-state={isSelected ? 'selected' : undefined}
       >
@@ -975,7 +982,7 @@ function EnvironmentVariableRow({
             />
           </div>
         </TableCell>
-      </TableRow>
+      </RecordRow>
 
       <Dialog open={isEditModalOpen} onOpenChange={handleEditDialogOpenChange}>
         <DialogContent>

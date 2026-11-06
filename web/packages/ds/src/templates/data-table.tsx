@@ -16,6 +16,7 @@ import {
   type ResponsivePaginationProps,
 } from '../responsive-pagination'
 import { cn } from '../lib/cn'
+import { RecordRow } from '../record-link'
 
 export interface DataTableColumn<T> {
   key: string
@@ -29,7 +30,10 @@ export interface DataTableProps<T> {
   columns: DataTableColumn<T>[]
   rows: T[]
   rowKey: (row: T) => string | number
-  /** Advanced rows own their cells, expansion and interactions; return table rows only. */
+  /**
+   * Advanced rows own their cells, expansion and interactions; return table
+   * rows only, as a `RecordRow` when the row has a `RecordLink`.
+   */
   renderRow?: (row: T) => ReactNode
   isLoading?: boolean
   /** Accessible name when the surrounding heading does not label the table. */
@@ -64,7 +68,9 @@ export function DataTable<T>({
           Loading rows…
         </p>
       ) : null}
-      <div className="rounded-md border">
+      {/* A query container: columns use `hidden @xl:table-cell` and show by
+          the width this table has, sidebar and side panels included. */}
+      <div className="@container rounded-md border">
         <Table aria-label={ariaLabel} aria-busy={isLoading}>
           <TableHeader>
             <TableRow>
@@ -94,7 +100,7 @@ export function DataTable<T>({
                   renderRow ? (
                     <Fragment key={rowKey(row)}>{renderRow(row)}</Fragment>
                   ) : (
-                    <TableRow key={rowKey(row)}>
+                    <RecordRow key={rowKey(row)}>
                       {columns.map((column) => (
                         <TableCell
                           key={column.key}
@@ -103,7 +109,7 @@ export function DataTable<T>({
                           {column.render(row)}
                         </TableCell>
                       ))}
-                    </TableRow>
+                    </RecordRow>
                   )
                 )}
           </TableBody>
