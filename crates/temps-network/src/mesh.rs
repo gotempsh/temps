@@ -946,7 +946,12 @@ mod db {
         if i32::from(requested_port) == cfg.vxlan_port {
             return Err(MeshError::PortClashesWithVxlan(requested_port));
         }
-        let current = parse_mesh_cidr(&cfg.wireguard_cidr, pool)?;
+        // The stored pool is only compared against, never validated here:
+        // until the mesh is first turned on it is the migration's default,
+        // which can overlap an upgraded cluster's compute pool. Validating it
+        // refused every request, including one that names a clear range.
+        // The requested pool was checked above, and is what gets stored.
+        let current = reserved_mesh_pool(&cfg.wireguard_cidr);
         // Addresses are in use as underlays and every endpoint (the control
         // plane's, --wg-endpoint values) carries the port: both are frozen
         // once any node is on the mesh.
