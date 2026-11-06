@@ -8235,7 +8235,7 @@ export type CreateNodePairingRequest = {
  */
 export type CreateNodePairingResponse = {
     /**
-     * Run this on the node, as root. It pipes the pairing code into `temps join --pair -`, so the code stays out of the process list and shell history.
+     * Run this on the node (a Linux machine; it uses sudo where it needs root). It installs Temps pinned to the release this server runs, pipes the pairing code into `temps join --pair -` (so the code stays out of the process list, sudo's log and the shell history), then installs the agent service.
      */
     join_command: string;
     pairing: NodePairingResponse;

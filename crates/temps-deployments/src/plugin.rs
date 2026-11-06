@@ -1311,10 +1311,22 @@ impl TempsPlugin for DeploymentsPlugin {
                 enrollment_token_service.clone(),
             ),
         );
+        // Optional: only `temps serve` knows the version it was built as.
+        // Without it the pairing command installs the newest stable
+        // release, as it did before it was pinned.
+        let plane_build = context
+            .get_service::<temps_core::worker_install::PlaneBuild>()
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    "no PlaneBuild registered; pairing commands install the newest stable release"
+                );
+                Arc::new(temps_core::worker_install::PlaneBuild::new(""))
+            });
         let node_pairing_state = handlers::node_pairings::NodePairingAdminState {
             pairing_service: node_pairing_admin.clone(),
             audit_service: audit_service.clone(),
             sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+            plane_build,
         };
 
         let node_public_ingress_service = Arc::new(

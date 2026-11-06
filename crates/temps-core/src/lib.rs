@@ -84,6 +84,7 @@ pub mod update_status;
 pub mod ways_in;
 pub mod websocket_origin;
 pub mod worker_ingress;
+pub mod worker_install;
 pub mod worker_shield;
 pub mod worker_sync;
 pub use docker_handle::{

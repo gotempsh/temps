@@ -729,29 +729,11 @@ fn restart_guidance(split: bool) -> String {
 /// Extract the clean version tag from the compiled TEMPS_VERSION string.
 /// TEMPS_VERSION format: "v1.0.0 (abc1234) built 2025-01-25 12:34:56 UTC"
 /// or: "v1.0.0-abc1234 built 2025-01-25 12:34:56 UTC"
+///
+/// The parsing lives in `temps_core::worker_install::version_tag`, so the
+/// server's worker commands pin the same version this reports.
 pub fn current_version_tag() -> String {
-    let full_version = env!("TEMPS_VERSION");
-
-    // If it contains a space, take everything before the first space
-    // Then strip any "-commitsha" suffix (non-tag builds)
-    let version = full_version
-        .split_whitespace()
-        .next()
-        .unwrap_or(full_version);
-
-    // For "v1.0.0-abc1234" (not on a tag), strip the commit hash suffix
-    // A tag looks like "v1.0.0" or "v1.0.0-beta.1", a non-tag looks like "v1.0.0-abc1234"
-    // We identify commit hashes as short hex strings after the last dash
-    if let Some(last_dash_pos) = version.rfind('-') {
-        let suffix = &version[last_dash_pos + 1..];
-        // If suffix looks like a commit hash (all hex, 7-12 chars), strip it
-        if suffix.len() >= 7 && suffix.len() <= 12 && suffix.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            return version[..last_dash_pos].to_string();
-        }
-    }
-
-    version.to_string()
+    temps_core::worker_install::version_tag(env!("TEMPS_VERSION"))
 }
 
 /// How long the pre-update lock capacity check may take. It is advisory and
@@ -4059,25 +4041,9 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
-    /// Helper to parse version tag from a TEMPS_VERSION-like string,
-    /// replicating the logic from `current_version_tag()` but on arbitrary input.
+    /// The parser `current_version_tag()` applies to `TEMPS_VERSION`.
     fn parse_version_tag(full_version: &str) -> String {
-        let version = full_version
-            .split_whitespace()
-            .next()
-            .unwrap_or(full_version);
-
-        if let Some(last_dash_pos) = version.rfind('-') {
-            let suffix = &version[last_dash_pos + 1..];
-            if suffix.len() >= 7
-                && suffix.len() <= 12
-                && suffix.chars().all(|c| c.is_ascii_hexdigit())
-            {
-                return version[..last_dash_pos].to_string();
-            }
-        }
-
-        version.to_string()
+        temps_core::worker_install::version_tag(full_version)
     }
 
     // ── Startup update notifier ──────────────────────────────────────────

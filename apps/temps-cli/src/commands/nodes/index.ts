@@ -106,6 +106,19 @@ export function joinCommand(
   return `temps join ${url} <join-token> --private-address ${address}`
 }
 
+/**
+ * `command` with every line indented by `indent`. A server command spans
+ * several lines joined with `\` continuations, so each line is indented
+ * rather than only the first; the leading space the pairing command starts
+ * with (it keeps the command out of the shell history) is kept.
+ */
+export function indentCommand(command: string, indent: string): string {
+  return command
+    .split('\n')
+    .map((line) => `${indent}${line}`)
+    .join('\n')
+}
+
 /** A pairing's progress in words an operator can act on. */
 export function describePairing(pairing: NodePairingResponse): string {
   switch (pairing.status) {
@@ -751,12 +764,13 @@ async function pairCreateAction(options: {
   }
   success(`Pairing ${result.pairing.name} (${result.pairing.node_endpoint}) created`)
   newline()
-  console.log(`  ${colors.muted('On the node, as root (the command holds a secret; it is shown once):')}`)
-  console.log(`    ${result.join_command}`)
   console.log(
-    `  ${colors.muted('It pipes the code to `temps join --pair -`, keeping it out of the process list. Not in a root shell? Put sudo right before `temps join`.')}`
+    `  ${colors.muted('On the node (Linux), as a user who can use sudo. The command holds a secret; it is shown once:')}`
   )
-  console.log(`  ${colors.muted('Then:')} temps agent service install`)
+  console.log(indentCommand(result.join_command, '    '))
+  console.log(
+    `  ${colors.muted('It installs the release this control plane runs, pipes the code to `temps join --pair -` (out of the process list and sudo\'s log), then starts the agent service.')}`
+  )
   newline()
   console.log(
     `  ${colors.muted('The control plane dials')} ${result.pairing.node_endpoint} ` +
