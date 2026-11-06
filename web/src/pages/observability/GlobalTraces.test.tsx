@@ -52,7 +52,7 @@ test('a trace is one row with no separate status column: a dot, spans and ID inl
   expect(row.textContent).not.toMatch(/\d+ errors?/)
 })
 
-test('the trace name, waterfall and service are separate links, and the row itself is not one', () => {
+test('the trace name, waterfall and service are separate links, and the row is not an overlay', () => {
   const view = renderRow(trace({}))
   const name = view.getByRole('link', { name: 'GET /checkout' })
 
@@ -62,9 +62,9 @@ test('the trace name, waterfall and service are separate links, and the row itse
   // DESIGN.md: no link overlay across the row. It would also stop the status
   // dot's explanation appearing on hover.
   expect(name.className).not.toContain('after:')
-  // Visible without hover for touch screens, and still one line (DESIGN.md).
-  expect(name.className.split(' ')).toContain('underline')
-  expect(name.querySelector('svg')).not.toBeNull()
+  // Styled as the trace's name, not as a link, and still one line (DESIGN.md).
+  expect(name.className.split(' ')).toContain('no-underline')
+  expect(name.querySelector('svg')).toBeNull()
   expect(name.className).toContain('[&>span]:truncate')
   const waterfall = view.getByRole('link', { name: 'Cross-service waterfall' })
   expect(waterfall.getAttribute('href')).toStartWith(

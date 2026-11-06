@@ -189,14 +189,16 @@ administrative resources. Do not invent a different row component per page.
 
 - Use `TableHeader`, `TableBody`, `TableRow`, `TableHead`, and
   `TableCell`. Preserve their shared padding and typography.
-- The first meaningful column identifies the resource. Make its name a real
-  [RecordLink](web/packages/ds/src/record-link.tsx) when a detail page exists.
-  It is visibly underlined with a persistent right arrow. Secondary metadata is muted.
+- The first meaningful column identifies the resource. When a detail page
+  exists, make its name a real [RecordLink](web/packages/ds/src/record-link.tsx)
+  inside a `RecordRow`: the name reads as plain text (no underline, no arrow)
+  and the whole row opens the record. Secondary metadata is muted.
 - Put status in a text-labeled badge; color alone never carries the meaning.
 - Right-align row actions in the last column. Give icon-only actions an
   accessible name that identifies the resource.
-- Keep links, menus, and selection independently operable. Table rows never
-  navigate: no row `onClick`, link overlay, or `role="button"`.
+- Keep links, menus, and selection independently operable. A row navigates
+  only through `RecordRow`, which follows its `RecordLink`; never a hand-written
+  row `onClick`, link overlay, or `role="button"`.
 - Use monospace only for identifiers, hashes, commands, and code. Truncate
   long values intentionally, with a way to inspect or copy the full value.
 - Sorting uses a real button in the header and exposes its sort state.
@@ -224,27 +226,37 @@ Never include secret values. Keep full-width page content below the shared heade
 
 ### Resource-detail navigation decision
 
-Use **one `RecordLink` in the identity column** for a record's primary detail
-route. Its name is underlined and its arrow remains visible before hover, on
-touch screens, and in both themes. This is the canonical detail affordance;
-do not alternate between plain text links, a separate "View" button, and
-clickable rows. The record name is the link text; use `aria-label` when context
-is needed (for example, "View GITHUB_TOKEN details").
+Use **one `RecordLink` in the identity column, inside a `RecordRow`**, for a
+record's primary detail route. The name is styled as the record's name, not as
+a link: no underline, no arrow, not even on hover. The row is the affordance:
+it shows the pointer and the shared row hover, and clicking anywhere on it
+opens the record. This is the canonical detail affordance; do not alternate
+between visible text links, a separate "View" button, and hand-made clickable
+rows. The record name is the link text; use `aria-label` when context is needed
+(for example, "View GITHUB_TOKEN details").
 
-Navigation is a real router link: Enter, modifier-click, middle-click, copy link,
-and open in a new tab work normally. Clicking row whitespace does nothing.
-Checkboxes, copy/reveal, status popovers, menus, Edit, and Delete remain separate
-controls; they never open details. Do not add a second primary-detail link in
-the Actions column. Links to related resources are allowed in their own columns.
-Rows without a detail route render plain identity text, without an arrow.
+The name stays a real router link, so Tab, Enter, copy link and the browser's
+link menu work, and screen readers announce it. `RecordRow` follows that link:
+a click opens it, Cmd/Ctrl-click and middle-click open a new tab, and selecting
+text never navigates. The row itself gets no `tabIndex` or role, so it keeps
+its table semantics. Checkboxes, copy/reveal, status popovers, menus, Edit, and
+Delete remain separate controls; a click on them, or in a menu or dialog they
+open, never opens details. A row holds exactly one `RecordLink`: links to other
+places (counts, related resources) are ordinary router links styled
+`text-primary`, and a row with two record links does not navigate at all. A
+`<ul role="list">` of records uses `RecordListItem`, which behaves the same. Do not add a second primary-detail link in the
+Actions column. Links to related resources in their own columns are real
+controls and keep their own destination. Rows without a detail route render
+plain identity text and do not respond to clicks.
 
 Details and their configuration have stable URLs, not modal-only entry points.
 Their facts, checks, forms, and history fill the parent content width. A detail
 layout reserves an aside column only when an aside is actually present; never
 cap the whole page with `max-w-*`. Paragraphs may have a reading-width limit.
 
-Enforcement: `@temps-sdk/ds` exports `RecordLink`; `DataTable` and `Ledger` do
-not expose row-click navigation. The sandbox `/ledger` and the environment
+Enforcement: `@temps-sdk/ds` exports `RecordLink` and `RecordRow`; `DataTable`
+and `Ledger` render every row as a `RecordRow`, so a `RecordLink` in a column is
+all a row needs, and they expose no other row-click navigation. The sandbox `/ledger` and the environment
 variables table are reference implementations. Existing screens are migrated
 when their tables are touched; this decision does not claim all legacy tables
 have already been converted. Preserve row expansion/selection as explicit,
@@ -316,6 +328,10 @@ Do not load a different font for an individual console page.
 - Supporting copy: `text-sm text-muted-foreground`.
 - Small metadata: `text-xs text-muted-foreground`, never the only place for
   information needed to complete an action.
+- Links never gain an underline on hover. Standalone links and `variant="link"`
+  buttons use `text-primary` and darken on hover; a link inside a sentence keeps
+  a permanent underline, since that is its only cue. Record names in tables are
+  not styled as links at all (see section 4).
 - Use semantic pairs: `bg-background text-foreground`,
   `bg-card text-card-foreground`, `bg-primary text-primary-foreground`,
   and `border-border`.

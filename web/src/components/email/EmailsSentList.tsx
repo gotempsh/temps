@@ -8,7 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { EmptyState } from '@/components/ui/empty-state'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import {
   Select,
   SelectContent,
@@ -221,7 +221,7 @@ export function EmailsSentList({ domainId }: { domainId?: number }) {
               </TableHeader>
               <TableBody>
                 {emails.data.map((email) => (
-                  <TableRow key={email.id}>
+                  <RecordRow key={email.id}>
                     <TableCell className="max-w-[300px]">
                       <RecordLink to={`/email/${email.id}`} className="min-h-0">
                         {email.subject}
@@ -268,7 +268,7 @@ export function EmailsSentList({ domainId }: { domainId?: number }) {
                         { addSuffix: true }
                       )}
                     </TableCell>
-                  </TableRow>
+                  </RecordRow>
                 ))}
               </TableBody>
             </Table>

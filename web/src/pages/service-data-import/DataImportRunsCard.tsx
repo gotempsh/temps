@@ -30,7 +30,7 @@ import {
 } from '@/components/ui/table'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { DatabaseZap, Loader2, XCircle } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -227,7 +227,7 @@ function RunsBody({
           <TableBody>
             {runs.map((run) => (
               <Fragment key={run.id}>
-                <TableRow>
+                <RecordRow>
                   <TableCell className="font-mono text-sm">
                     <RecordLink
                       to={importRunPath(serviceId, run.id)}
@@ -271,7 +271,7 @@ function RunsBody({
                       </Button>
                     )}
                   </TableCell>
-                </TableRow>
+                </RecordRow>
                 {run.error_message && (
                   <TableRow className="hover:bg-transparent">
                     <TableCell colSpan={6} className="pt-0">

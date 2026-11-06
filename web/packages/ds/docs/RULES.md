@@ -266,15 +266,21 @@ that clarifies scope or outcome. Omit repeated labels and detailed instructions.
 
 ## Resource detail navigation
 
-- Use `RecordLink` for the resource name in a table's identity column. Its
-  underline and right arrow are always visible, including on touch screens.
-- No row-click navigation, overlay links, or duplicate View/Details buttons in
-  the actions column. `DataTable` and `Ledger` intentionally have no `onRowClick`.
-- Keep selection, expansion, copy, menus, Edit, and Delete independently operable.
-  Use a labeled button for expansion; row whitespace does not navigate.
+- Use `RecordLink` for the resource name in a table's identity column, inside
+  a `RecordRow`. The name has no underline and no arrow, including on hover;
+  the whole row opens the record. `DataTable` and `Ledger` rows already are
+  `RecordRow`s; use it yourself only in a `renderRow` or a hand-built table.
+- No `onRowClick`, overlay links, `role="button"` rows, or duplicate
+  View/Details buttons in the actions column. `RecordRow` is the only row
+  navigation, and it follows the row's `RecordLink`. One `RecordLink` per row;
+  counts and related resources are plain router links in `text-primary`.
+  Record lists (`<ul role="list">`) use `RecordListItem`.
+- Keep selection, expansion, copy, menus, Edit, and Delete independently
+  operable: clicks on them, or in a menu or dialog they open, never navigate.
+  Use a labeled button for expansion.
 - Use real routed URLs for details/configuration; preserve Enter, modifier-click,
   new-tab, refresh, and browser history. Do not replace links with buttons.
-- Records without a detail route use plain text, with no navigation arrow.
+- Records without a detail route use plain text and do not respond to clicks.
 - Detail facts, checks, forms, and history fill the parent width. No page-level
   `max-w-*`; reserve aside space only when an aside exists.
 - Migrate touched legacy tables to this pattern. Reference: sandbox `/ledger`,

@@ -147,8 +147,8 @@ presets remain useful; custom ranges preserve absolute timestamps. All records a
 
 `DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
 The caller owns request errors, empty/no-match copy, filters, and retries.
-Give the table an accessible name with `aria-label`. Prefer a real link in
-the identity column over row-click-only navigation. Loading cells retain
+Give the table an accessible name with `aria-label`. Rows are `RecordRow`s:
+put a `RecordLink` in the identity column and the whole row opens it. Loading cells retain
 column visibility/alignment classes. Pagination boundary controls guard
 keyboard activation as well as pointer interaction.
 
@@ -515,13 +515,15 @@ The UI retains that existing request; this pass changes its discoverability and
 copy. The live action was intentionally not invoked. Console TypeScript, DS lint,
 and sandbox build passed; browser confirmed the named section and exposed action.
 
-## Resource navigation convention (2026-09-21)
+## Resource navigation convention (2026-09-21, revised 2026-11-06)
 
-`RecordLink` is the single primary-detail affordance for tables: underlined name
-and persistent right arrow, implemented as a router link. `DataTable` and
-`Ledger` no longer accept `onRowClick`; render `RecordLink` in the identity
-column instead. The `/ledger` reference screen demonstrates this. Do not turn
-rows into buttons or add a redundant View action. Full-width details reserve
+`RecordLink` is the single primary-detail affordance for tables, implemented as
+a router link. Since 2026-11-06 it renders as the plain record name (no
+underline, no arrow) and `RecordRow` makes the whole row follow it, with
+modifier-click and middle-click opening a new tab. `DataTable` and `Ledger`
+render `RecordRow`s and accept no `onRowClick`; render `RecordLink` in the
+identity column instead. The `/ledger` reference screen demonstrates this. Do
+not turn rows into buttons or add a redundant View action. Full-width details reserve
 aside space only when there is an aside. See `RULES.md` and root `DESIGN.md`.
 
 ### Canonical tabs: underline navigation

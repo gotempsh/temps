@@ -37,7 +37,12 @@ import {
 } from '@/components/ui/popover'
 import { Button } from '@/components/ui/button'
 import { EnvironmentVariableValue } from './EnvironmentVariableValue'
-import { RecordLink, useUrlSearchText, useUrlState } from '@temps-sdk/ds'
+import {
+  RecordLink,
+  RecordRow,
+  useUrlSearchText,
+  useUrlState,
+} from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -854,7 +859,7 @@ function EnvironmentVariableRow({
 
   return (
     <>
-      <TableRow
+      <RecordRow
         className={cn('border-b border-border/60', hiddenByFilter && 'hidden')}
         data-state={isSelected ? 'selected' : undefined}
       >
@@ -975,7 +980,7 @@ function EnvironmentVariableRow({
             />
           </div>
         </TableCell>
-      </TableRow>
+      </RecordRow>
 
       <Dialog open={isEditModalOpen} onOpenChange={handleEditDialogOpenChange}>
         <DialogContent>

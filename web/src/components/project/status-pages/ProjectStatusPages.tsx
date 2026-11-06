@@ -4,7 +4,7 @@
 import { listStatusPagesOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse, StatusPageResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -163,7 +163,7 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
             </TableHeader>
             <TableBody>
               {items.map((item) => (
-                <TableRow key={item.id}>
+                <RecordRow key={item.id}>
                   <TableCell className="min-w-0 font-medium">
                     <RecordLink to={statusPageUrl(item.id)}>
                       {item.title}
@@ -186,7 +186,7 @@ export function StatusPagesList({ project }: { project?: ProjectResponse }) {
                       addSuffix: true,
                     })}
                   </TableCell>
-                </TableRow>
+                </RecordRow>
               ))}
             </TableBody>
           </Table>

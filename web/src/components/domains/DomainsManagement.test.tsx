@@ -82,19 +82,16 @@ function renderTable() {
   )
 }
 
-test('the domain name is a visible link to the domain, and the row itself does not navigate', async () => {
+test('the domain name links to the domain, and a click on the row follows it', async () => {
   const view = renderTable()
 
   const link = view.getByRole('link', { name: 'app.example.com' })
   expect(link.getAttribute('href')).toBe('/domains/12')
-  // Visible without hover, for touch screens (DESIGN.md).
-  expect(link.className.split(' ')).toContain('underline')
-  expect(link.querySelector('svg')).not.toBeNull()
-  // DESIGN.md: no link overlay across the row.
+  // The name reads as the record's name, not as a link (DESIGN.md).
+  expect(link.className.split(' ')).toContain('no-underline')
+  expect(link.querySelector('svg')).toBeNull()
+  // DESIGN.md: no link overlay across the row; the row follows the link.
   expect(link.className).not.toContain('after:')
-  fireEvent.click(link.closest('tr') as HTMLElement)
-  expect(view.queryByText('Opened domain 12')).toBeNull()
-
-  fireEvent.click(link)
+  fireEvent.click(link.closest('td') as HTMLElement)
   await waitFor(() => view.getByText('Opened domain 12'))
 })
