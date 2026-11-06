@@ -515,6 +515,9 @@ struct RemotePullImageRequest {
     image: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     credentials: Option<RemotePullCredentials>,
+    /// Sent only when set, so an ordinary pull keeps its original body.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    replace_cached: bool,
 }
 
 /// Wire response from `POST /agent/images/pull`, mirroring
@@ -1256,16 +1259,39 @@ impl RemoteNodeDeployer {
         image: &str,
         credentials: Option<RemotePullCredentials>,
     ) -> Result<String, DeployerError> {
+        self.pull_image(image, credentials, false).await
+    }
+
+    /// [`Self::pull_image_from_registry`], pulling even when the worker
+    /// already holds `image`: for a cached copy found to be for another
+    /// architecture. An agent that predates this keeps its cached copy, so
+    /// the caller must check the image's platform again afterwards.
+    pub async fn pull_image_replacing_cached(
+        &self,
+        image: &str,
+        credentials: Option<RemotePullCredentials>,
+    ) -> Result<String, DeployerError> {
+        self.pull_image(image, credentials, true).await
+    }
+
+    async fn pull_image(
+        &self,
+        image: &str,
+        credentials: Option<RemotePullCredentials>,
+        replace_cached: bool,
+    ) -> Result<String, DeployerError> {
         tracing::info!(
             node = %self.node_name,
             image = %image,
             has_credentials = credentials.is_some(),
+            replace_cached,
             "Requesting remote pull from registry"
         );
 
         let request = RemotePullImageRequest {
             image: image.to_string(),
             credentials,
+            replace_cached,
         };
 
         let path = "/agent/images/pull";
@@ -4373,6 +4399,82 @@ mod tests {
             .expect("pull should succeed against a mock agent reporting success");
 
         assert_eq!(image_id, "sha256:abc123");
+    }
+
+    /// Serves one pull with success and returns the raw request it received.
+    async fn capture_one_pull_request() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buf).await.expect("read request");
+                request.extend_from_slice(&buf[..read]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+                if read == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"success":true,"data":{"image_id":"sha256:abc123","digest":null},"error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// An ordinary pull keeps the body older agents know; only a pull over a
+    /// cached image for another architecture asks the agent to pull anyway.
+    #[tokio::test]
+    async fn only_a_replacing_pull_asks_the_agent_to_skip_its_cached_image() {
+        let (url, server) = capture_one_pull_request().await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".to_string(), "worker-1".to_string()).unwrap();
+        deployer
+            .pull_image_from_registry("ghcr.io/acme/app:v1", None)
+            .await
+            .expect("ordinary pull");
+        let ordinary = server.await.expect("mock agent task");
+        assert!(!ordinary.contains("replace_cached"), "{ordinary}");
+
+        let (url, server) = capture_one_pull_request().await;
+        let deployer =
+            RemoteNodeDeployer::new(url, "token".to_string(), "worker-1".to_string()).unwrap();
+        deployer
+            .pull_image_replacing_cached("ghcr.io/acme/app:v1", None)
+            .await
+            .expect("replacing pull");
+        let replacing = server.await.expect("mock agent task");
+        assert!(
+            replacing.contains(r#""replace_cached":true"#),
+            "{replacing}"
+        );
     }
 
     #[tokio::test]

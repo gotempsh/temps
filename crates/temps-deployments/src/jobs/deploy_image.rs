@@ -2270,6 +2270,10 @@ impl DeployImageJob {
         self.verify_image_platform_for_node(image_tag, remote, node_name, context)
             .await?;
 
+        // Set when the node holds the tag for another architecture: an
+        // ordinary pull would hand that cached copy straight back.
+        let mut replacing_cached = false;
+
         // Check if image already exists on the remote node
         match remote.image_exists(image_tag).await {
             Ok(true) => {
@@ -2300,6 +2304,7 @@ impl DeployImageJob {
                             ),
                         )
                         .await?;
+                        replacing_cached = true;
                     }
                 }
             }
@@ -2340,10 +2345,17 @@ impl DeployImageJob {
                 )
                 .await?;
 
-                let pull_error = match remote
-                    .pull_image_from_registry(image_tag, self.registry_credentials.clone())
-                    .await
-                {
+                let credentials = self.registry_credentials.clone();
+                let pulled = if replacing_cached {
+                    remote
+                        .pull_image_replacing_cached(image_tag, credentials)
+                        .await
+                } else {
+                    remote
+                        .pull_image_from_registry(image_tag, credentials)
+                        .await
+                };
+                let pull_error = match pulled {
                     Ok(_image_id) => {
                         self.log(
                             context,
@@ -2353,6 +2365,13 @@ impl DeployImageJob {
                             ),
                         )
                         .await?;
+                        if replacing_cached {
+                            return self
+                                .verify_replaced_image_platform(
+                                    image_tag, remote, node_name, context,
+                                )
+                                .await;
+                        }
                         return Ok(());
                     }
                     Err(e) => e,
@@ -2447,6 +2466,33 @@ impl DeployImageJob {
              {node}, but the node resolves it as {resolved}. The image's {node} \
              variant did not arrive with it; push the image to a registry the node can pull \
              from, or restrict this environment to {resolved} nodes with target nodes/labels."
+        );
+        self.log_at(context, LogLevel::Error, format!("ERROR: {msg}"))
+            .await?;
+        Err(WorkflowError::JobExecutionFailed(msg))
+    }
+
+    /// After pulling over a cached image for another architecture, the node
+    /// must now resolve the tag for its own. An agent that predates replacing
+    /// a cached image hands the old copy back, which is refused here rather
+    /// than started.
+    async fn verify_replaced_image_platform(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        node_name: &str,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        let Some(NodeImagePlatformMismatch { resolved, node }) =
+            self.node_image_platform_mismatch(image_tag, remote).await
+        else {
+            return Ok(());
+        };
+        let msg = format!(
+            "Node '{node_name}' runs {node} but still resolves image '{image_tag}' as \
+             {resolved} after pulling it again. Its agent may be too old to replace a \
+             cached image: upgrade the node agent, or remove the image on the node, then \
+             redeploy."
         );
         self.log_at(context, LogLevel::Error, format!("ERROR: {msg}"))
             .await?;
@@ -8259,7 +8305,11 @@ mod tests {
         if path.starts_with("/agent/images/") && path.ends_with("/exists") {
             "exists".to_string()
         } else if path.starts_with("/agent/images/pull") {
-            "pull".to_string()
+            if request_text.contains(r#""replace_cached":true"#) {
+                "pull-replacing".to_string()
+            } else {
+                "pull".to_string()
+            }
         } else if path.starts_with("/agent/images/import") {
             "import".to_string()
         } else if path.starts_with("/agent/images/inspect") {
@@ -8321,7 +8371,7 @@ mod tests {
                     "200 OK",
                     format!(r#"{{"success":true,"data":{image_exists}}}"#),
                 ),
-                "pull" => (pull_response.0, pull_response.1.to_string()),
+                "pull" | "pull-replacing" => (pull_response.0, pull_response.1.to_string()),
                 "import" => (
                     "200 OK",
                     r#"{"success":true,"data":"sha256:imported"}"#.to_string(),
@@ -8671,12 +8721,13 @@ mod tests {
         assert!(save_image_called.load(Ordering::SeqCst));
     }
 
-    /// A cached registry image for another architecture is pulled again, so
-    /// the node resolves the tag for its own platform.
+    /// A cached registry image for another architecture is pulled again, past
+    /// the agent's cached-image shortcut, and the node is checked to resolve
+    /// the tag for its own platform afterwards.
     #[tokio::test]
     async fn ensure_image_on_remote_pulls_again_over_a_cached_image_for_another_architecture() {
         let (remote, requests) =
-            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/arm64"]).await;
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/arm64", "linux/amd64"]).await;
         let save_image_called = Arc::new(AtomicBool::new(false));
         let (job, context) = registry_fallback_job(&save_image_called, None);
 
@@ -8686,9 +8737,37 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "inspect", "pull"],
-            "a cached registry image for another architecture is pulled again",
+            &["exists", "inspect", "pull-replacing", "inspect"],
+            "a cached registry image for another architecture is pulled again and rechecked",
         );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// An agent that predates replacing a cached image hands the old copy back
+    /// from the pull: the deploy is refused with the reason instead of starting
+    /// a container that dies with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_a_cached_image_the_pull_did_not_replace() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/arm64"]).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, None);
+
+        let message = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect_err("a cached image still for another architecture is refused")
+            .to_string();
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "pull-replacing", "inspect"],
+            "the image is rechecked after the replacing pull",
+        );
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("linux/amd64"), "{message}");
+        assert!(message.contains("linux/arm64"), "{message}");
+        assert!(message.contains("upgrade the node agent"), "{message}");
         assert!(!save_image_called.load(Ordering::SeqCst));
     }
 

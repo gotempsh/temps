@@ -2344,37 +2344,46 @@ pub async fn pull_image(
         }
     };
 
-    // 3. Fast-path: if the image is already present, skip the pull entirely.
-    match docker.inspect_image(&request.image).await {
-        Ok(info) => {
-            let image_id = info.id.unwrap_or_default();
-            let digest = info
-                .repo_digests
-                .as_ref()
-                .and_then(|d| d.first())
-                .and_then(|s| s.rsplit('@').next())
-                .map(String::from);
-            tracing::info!(
-                image = %request.image,
-                image_id = %image_id,
-                "Image already present locally; skipping pull"
-            );
-            return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
-        }
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => {
-            // Not present — proceed to pull.
-        }
-        Err(e) => {
-            // An unexpected inspect error is non-fatal: fall through and let
-            // the pull attempt surface a cleaner error if the daemon is really
-            // broken.
-            tracing::warn!(
-                image = %request.image,
-                "Pre-pull image inspect failed ({}); proceeding with pull attempt",
-                e
-            );
+    // 3. Fast-path: if the image is already present, skip the pull entirely,
+    //    unless the control plane asked to replace a cached copy it found to
+    //    be for another architecture.
+    if request.replace_cached {
+        tracing::info!(
+            image = %request.image,
+            "Replacing the cached image; pulling it again"
+        );
+    } else {
+        match docker.inspect_image(&request.image).await {
+            Ok(info) => {
+                let image_id = info.id.unwrap_or_default();
+                let digest = info
+                    .repo_digests
+                    .as_ref()
+                    .and_then(|d| d.first())
+                    .and_then(|s| s.rsplit('@').next())
+                    .map(String::from);
+                tracing::info!(
+                    image = %request.image,
+                    image_id = %image_id,
+                    "Image already present locally; skipping pull"
+                );
+                return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Not present — proceed to pull.
+            }
+            Err(e) => {
+                // An unexpected inspect error is non-fatal: fall through and let
+                // the pull attempt surface a cleaner error if the daemon is really
+                // broken.
+                tracing::warn!(
+                    image = %request.image,
+                    "Pre-pull image inspect failed ({}); proceeding with pull attempt",
+                    e
+                );
+            }
         }
     }
 
@@ -2854,6 +2863,7 @@ mod pull_image_tests {
         let req = PullImageRequest {
             image: "ghcr.io/org/app:v1.0".to_string(),
             credentials: None,
+            replace_cached: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
@@ -2871,6 +2881,7 @@ mod pull_image_tests {
                 identity_token: None,
                 server_address: Some("private.registry.io".to_string()),
             }),
+            replace_cached: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
@@ -2878,6 +2889,20 @@ mod pull_image_tests {
         assert_eq!(creds.username.as_deref(), Some("alice"));
         // Verify the password field round-trips (serde still sees it).
         assert_eq!(creds.password.as_deref(), Some("hunter2"));
+    }
+
+    /// A control plane that predates `replace_cached` sends no such field:
+    /// the cached image keeps being used, as before.
+    #[test]
+    fn pull_image_request_without_replace_cached_uses_the_cached_image() {
+        let parsed: PullImageRequest =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/app:v1.0"}"#).expect("deserialize");
+        assert!(!parsed.replace_cached);
+
+        let parsed: PullImageRequest =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/app:v1.0","replace_cached":true}"#)
+                .expect("deserialize");
+        assert!(parsed.replace_cached);
     }
 
     #[test]
