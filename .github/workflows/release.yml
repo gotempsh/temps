@@ -499,7 +499,9 @@ jobs:
     # workspace's native deps (openssl via openssl-src, jemalloc via cc-rs)
     # build from source per-target rather than linking a host-arch system
     # lib, so there's no arch-mismatch risk at link time.
-    runs-on: macos-14
+    # macos-15, not macos-14: GitHub retired the macOS 14 image on 2026-11-02,
+    # and a job that asks for it is cancelled before it gets a runner.
+    runs-on: macos-15
     permissions:
       contents: read
     steps:
@@ -574,7 +576,7 @@ jobs:
   build-darwin-arm64:
     name: Build macOS ARM64
     needs: [build-web-assets, runtime-image-manifest]
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     steps:
