@@ -10035,9 +10035,10 @@ export type DeploymentConfig = {
      * How long, in seconds, a superseded deployment's containers get to
      * finish in-flight work after SIGTERM before they are killed, once a new
      * deployment has gone live. Raise it for long requests (uploads,
-     * exports, streaming responses, WebSockets). Absent means the platform
-     * default of 10 seconds; an override is 1 to 3600 seconds. Environments
-     * inherit the project value and may override it.
+     * exports, streaming responses, WebSockets).
+     * An override is 1 to 3600 seconds. Absent on a project means the
+     * platform default of 10 seconds; absent on an environment means it
+     * inherits the project's value, else the platform default.
      */
     stopTimeoutSeconds?: number | null;
     /**

@@ -397,9 +397,10 @@ pub struct DeploymentConfig {
     /// How long, in seconds, a superseded deployment's containers get to
     /// finish in-flight work after SIGTERM before they are killed, once a new
     /// deployment has gone live. Raise it for long requests (uploads,
-    /// exports, streaming responses, WebSockets). Absent means the platform
-    /// default of 10 seconds; an override is 1 to 3600 seconds. Environments
-    /// inherit the project value and may override it.
+    /// exports, streaming responses, WebSockets).
+    /// An override is 1 to 3600 seconds. Absent on a project means the
+    /// platform default of 10 seconds; absent on an environment means it
+    /// inherits the project's value, else the platform default.
     // The numbers above are spelled out because this comment is the OpenAPI
     // description, where an intra-doc link would show as raw brackets. They
     // are DEFAULT/MIN/MAX_STOP_TIMEOUT_SECONDS, which a test keeps in step.
@@ -591,7 +592,11 @@ mod tests {
             .expect("schema serializes");
         let description = schema["properties"]["stopTimeoutSeconds"]["description"]
             .as_str()
-            .expect("stopTimeoutSeconds has a description");
+            .expect("stopTimeoutSeconds has a description")
+            // Doc comment line breaks are kept; match the words, not the wrap.
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             description.contains(&format!(
                 "default of {DEFAULT_STOP_TIMEOUT_SECONDS} seconds"
@@ -605,6 +610,12 @@ mod tests {
             "{description}"
         );
         assert!(!description.contains("[`"), "{description}");
+        // The same schema describes project and environment settings, where
+        // an absent value means different things.
+        assert!(
+            description.contains("absent on an environment means it inherits the project's value"),
+            "{description}"
+        );
     }
 
     /// Rows written before the setting existed must keep deserializing, and
