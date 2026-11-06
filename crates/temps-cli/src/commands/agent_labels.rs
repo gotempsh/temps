@@ -649,12 +649,12 @@ pub(super) fn lock_agent_config(path: &Path) -> anyhow::Result<ConfigLock> {
 
 fn lock_agent_config_within(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
     refuse_shared_dir_as_root(path)?;
-    open_config_lock(path, Some(wait))
+    open_config_lock(path, wait)
 }
 
-/// Lock `path`, giving up after `wait`; with `None`, waiting as long as the
-/// holder runs (the lock goes with the process holding it), saying so once.
-fn open_config_lock(path: &Path, wait: Option<Duration>) -> anyhow::Result<ConfigLock> {
+/// Lock `path`, giving up after `wait`. A wait longer than [`LOCK_WAIT`]
+/// says, once, what it is waiting for.
+fn open_config_lock(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
     let lock_path = path.with_extension("json.lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -675,10 +675,8 @@ fn open_config_lock(path: &Path, wait: Option<Duration>) -> anyhow::Result<Confi
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(ConfigLock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock)
-                if wait.is_none_or(|wait| started.elapsed() < wait) =>
-            {
-                if wait.is_none() && !told && started.elapsed() >= LOCK_WAIT {
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                if wait > LOCK_WAIT && !told && started.elapsed() >= LOCK_WAIT {
                     told = true;
                     println!(
                         "Waiting for another `temps agent labels` or `temps agent ingress` \
@@ -805,12 +803,91 @@ fn remove_stale_temp_files(path: &Path) {
     }
 }
 
+/// How long `temps join`, which has registered the node by then, waits for
+/// an edit holding the config lock: long past any edit, which holds it for
+/// milliseconds, but not forever.
+const JOIN_LOCK_WAIT: Duration = Duration::from_secs(300);
+
+/// For `temps join` run as root, before it registers anything and again
+/// before it writes: the directory `path` (`agent.json`) goes in (or, until
+/// it exists, the nearest existing directory above) and every directory
+/// above it must be root's alone, and a symlinked `agent.json` must point at
+/// a root-owned file in such a directory. Otherwise another user could
+/// point `agent.json` at a system file, or hold the config lock, under a
+/// root process.
+pub(super) fn check_join_target(path: &Path) -> anyhow::Result<()> {
+    check_join_target_as(path, running_as_root())
+}
+
+fn check_join_target_as(path: &Path, as_root: bool) -> anyhow::Result<()> {
+    if !as_root {
+        return Ok(());
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut existing = dir;
+    while !existing.as_os_str().is_empty() && !existing.exists() {
+        existing = existing.parent().unwrap_or_else(|| Path::new("."));
+    }
+    let existing = if existing.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        existing
+    };
+    let refuse = |dir: &Path, why: String| {
+        anyhow::anyhow!(
+            "Refusing to save the agent config to {} as root: {why}, so another user could swap \
+             files under this root process. Use a data directory only root controls (the \
+             default ~/.temps of root, or TEMPS_DATA_DIR), or join as the user who owns {}, \
+             without sudo.",
+            path.display(),
+            dir.display()
+        )
+    };
+    let canonical = std::fs::canonicalize(existing)
+        .map_err(|e| anyhow::anyhow!("Could not resolve {}: {e}", existing.display()))?;
+    if let Some(why) = super::agent_service::not_root_controlled(&canonical)? {
+        return Err(refuse(&canonical, why));
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        let target = std::fs::canonicalize(path).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is a symbolic link whose target cannot be resolved ({e}). Point it at the \
+                 config file, or remove it, then run `temps join` again.",
+                path.display()
+            )
+        })?;
+        let target_dir = target.parent().unwrap_or_else(|| Path::new("/"));
+        if let Some(why) = super::agent_service::not_root_controlled(target_dir)? {
+            return Err(refuse(target_dir, why));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(&target)
+                .map_err(|e| anyhow::anyhow!("Could not check {}: {e}", target.display()))?
+                .uid();
+            if owner != 0 {
+                return Err(refuse(
+                    target_dir,
+                    format!(
+                        "{} points at {}, owned by uid {owner}",
+                        path.display(),
+                        target.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// For `temps join`, which replaces `agent.json` with a new enrollment's
 /// config (or writes the first one): under the same lock as `temps agent
 /// labels` and `temps agent ingress`, through a temporary file renamed over
 /// it. An overlapping edit then either finishes first or reads the new
 /// file; it can never write the old enrollment back over this one.
 pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()> {
+    check_join_target(path)?;
     // The lock beside the canonical directory, where `temps agent labels`
     // and `temps agent ingress` take it.
     let dir = path
@@ -835,8 +912,13 @@ pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()
         };
     // Never without the lock: an edit that already checked the old file
     // would rename its copy over this one. Join has registered the node, so
-    // it waits for such an edit rather than give up.
-    let _lock = open_config_lock(&canonical, None)?;
+    // it waits for such an edit far longer than an edit would.
+    let _lock = open_config_lock(&canonical, JOIN_LOCK_WAIT).map_err(|error| {
+        anyhow::anyhow!(
+            "{error} The node is registered on the control plane, but this worker's config was \
+             not saved: stop that command, then run `temps join` again with a new join token."
+        )
+    })?;
     remove_stale_temp_files(&canonical);
     let tmp = write_temp_file(&target, text)?;
     std::fs::rename(&tmp, &target).map_err(|e| {
@@ -966,6 +1048,18 @@ fn show_words(value: &str) -> Vec<String> {
     words
 }
 
+/// Largest environment file read: they hold a few variables.
+const MAX_ENVIRONMENT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// An environment file's text, read as a bounded regular file (a FIFO or a
+/// huge file is refused, not waited on). A symlink is resolved first, as
+/// systemd follows it.
+fn read_environment_file(file: &Path) -> std::io::Result<String> {
+    let resolved = std::fs::canonicalize(file)?;
+    temps_node_agent::labels::read_regular_file(&resolved, MAX_ENVIRONMENT_FILE_BYTES)
+        .map(|(text, _)| text)
+}
+
 /// The files an `EnvironmentFile=` entry names: systemd accepts a wildcard
 /// pattern as well as a path.
 fn environment_files(pattern: &str) -> Result<Vec<PathBuf>, String> {
@@ -1021,13 +1115,20 @@ fn systemd_override(
         )
     })?;
     // A unit running the agent from another directory does not read this
-    // agent.json, so its labels do not override it. Without TEMPS_DATA_DIR
-    // the directory is not known, and the unit is checked.
+    // agent.json, so its labels do not override it. The last assignment
+    // wins, as in systemd. When an environment file could set it too, or
+    // nothing does, the directory is not known, and the unit is checked.
+    let env_files = show.lines().any(|line| {
+        line.strip_prefix("EnvironmentFiles=")
+            .is_some_and(|value| !value.trim().is_empty())
+    });
     let unit_dir = show
         .lines()
         .filter_map(|line| line.strip_prefix("Environment="))
         .flat_map(show_words)
-        .find_map(|part| part.strip_prefix("TEMPS_DATA_DIR=").map(PathBuf::from));
+        .filter_map(|part| part.strip_prefix("TEMPS_DATA_DIR=").map(PathBuf::from))
+        .next_back()
+        .filter(|_| !env_files);
     if unit_dir.is_some_and(|dir| !same_dir(&dir, data_dir)) {
         return Ok(None);
     }
@@ -1066,7 +1167,7 @@ fn systemd_override(
                     continue;
                 }
                 for file in environment_files(file)? {
-                    let text = match std::fs::read_to_string(&file) {
+                    let text = match read_environment_file(&file) {
                         Ok(text) => text,
                         // A missing optional file sets nothing.
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1240,6 +1341,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(env.contains("sets TEMPS_NODE_LABELS"), "{env}");
+        // systemd uses the last TEMPS_DATA_DIR: a drop-in pointing the unit
+        // at this worker makes its override this worker's.
+        let redirected = systemd_override(
+            show("Environment=TEMPS_DATA_DIR=/srv/other TEMPS_DATA_DIR=/root/.temps TEMPS_NODE_LABELS=zone=a\n"),
+            root,
+        )
+        .unwrap();
+        assert!(redirected.is_some());
+        // An environment file could set it as well: the unit is checked.
+        let unknown = systemd_override(
+            show("Environment=TEMPS_DATA_DIR=/srv/other TEMPS_NODE_LABELS=zone=a\nEnvironmentFiles=/nonexistent/temps.env (ignore_errors=yes)\n"),
+            root,
+        )
+        .unwrap();
+        assert!(unknown.is_some());
         // A unit running the agent from another directory does not read
         // this agent.json: its override is not this worker's.
         assert_eq!(
@@ -1304,6 +1420,17 @@ mod tests {
             systemd_override(move |_: &[&str]| Ok(missing.clone()), root),
             Ok(None)
         );
+        // A FIFO named as an environment file is refused, not waited on.
+        #[cfg(unix)]
+        {
+            let fifo = spaced.join("fifo.env");
+            let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            let text = format!("EnvironmentFiles={} (ignore_errors=no)\n", fifo.display());
+            let error = systemd_override(move |_: &[&str]| Ok(text.clone()), root).unwrap_err();
+            assert!(error.contains("fifo.env"), "{error}");
+        }
         // systemctl failing is not "no override": the change is refused.
         let error = systemd_override(|_: &[&str]| Err("timed out".to_string()), root).unwrap_err();
         assert!(error.contains("timed out"), "{error}");
@@ -1528,6 +1655,30 @@ mod tests {
         drop(held);
         writer.join().unwrap().unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_join_saves_only_where_root_alone_controls_the_directory() {
+        // A user's directory (the temporary one here): refused as root,
+        // before anything is registered.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker").join("agent.json");
+        let error = check_join_target_as(&path, true).unwrap_err().to_string();
+        assert!(
+            error.contains("Refusing to save the agent config"),
+            "{error}"
+        );
+        assert!(check_join_target_as(&path, false).is_ok());
+        // A directory still to be created under a root-owned one is checked
+        // by its nearest existing parent.
+        let under_root = Path::new("/etc/temps-join-check-absent/agent.json");
+        if std::fs::metadata("/etc").is_ok_and(|meta| {
+            use std::os::unix::fs::MetadataExt;
+            meta.uid() == 0 && meta.mode() & 0o022 == 0
+        }) {
+            check_join_target_as(under_root, true).unwrap();
+        }
     }
 
     #[cfg(unix)]

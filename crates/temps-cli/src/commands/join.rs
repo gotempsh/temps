@@ -990,6 +990,11 @@ impl JoinCommand {
 
     async fn run(mut self) -> anyhow::Result<()> {
         let labels = self.parse_labels()?;
+        // Refused before anything is registered: a root join must not save
+        // its config where another user could redirect it.
+        super::agent_labels::check_join_target(
+            &crate::commands::agent::agent_data_dir().join("agent.json"),
+        )?;
 
         let node_name = self
             .name

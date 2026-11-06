@@ -51,7 +51,10 @@ losing the other's change. "Still the file that was read" means the same
 inode, size and modification time, so a write in place is caught too.
 `temps join` replaces `agent.json` under the same lock, through a temporary
 file (the file a symlinked `agent.json` points at, keeping the link), so an edit overlapping a join cannot write the old enrollment back; it
-waits for the lock as long as its holder runs, never writing without it.
+waits up to five minutes for the lock, never writing without it. Run as
+root, `temps join` saves the config only in a directory root alone controls
+(checked before anything is registered), and follows a symlinked
+`agent.json` only to a root-owned file in such a directory.
 Temporary files a crashed run left behind are removed under the lock. The
 agent keeps its labels when `agent.json` is not a JSON object at all. `--data-dir` picks
 another agent directory, as for `temps agent ingress`, which uses the same
