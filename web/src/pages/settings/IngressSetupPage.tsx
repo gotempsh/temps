@@ -62,9 +62,11 @@ import {
   type SetupPlan,
   type SetupStep,
   type UndoResult,
+  exampleHost,
+  hostSuffixFor,
   runTunnelSetup,
+  schemeLabelError,
   sdkIngressSetupApi,
-  subdomainLabelError,
   tunnelDomainFor,
   undoSetup,
   uniqueProviderName,
@@ -422,9 +424,8 @@ function TunnelSetup({
     (d) => d.domain.toLowerCase() === zone.toLowerCase()
   )
   const schemeValue: HostnameScheme =
-    scheme === 'zone' ? { kind: 'zone' } : { kind: 'subdomain', label }
-  const labelError =
-    scheme === 'subdomain' ? subdomainLabelError(label) : undefined
+    scheme === 'zone' ? { kind: 'zone' } : { kind: scheme, label }
+  const labelError = schemeLabelError(schemeValue)
   const tunnelDomain =
     zone && !labelError ? tunnelDomainFor(zone, schemeValue) : ''
   const conflict = tunnelDomain
@@ -529,6 +530,7 @@ function TunnelSetup({
       zone,
       managed,
       tunnelDomain,
+      hostSuffix: hostSuffixFor(schemeValue),
       tunnelName,
       nodes: chosenNodes.map((n) => ({ id: n.id, name: n.name })),
     })
@@ -1214,6 +1216,40 @@ function SchemePicker({
           </span>
         </Label>
         <Label
+          htmlFor="scheme-suffix"
+          className="flex cursor-pointer items-start gap-2 font-normal"
+        >
+          <RadioGroupItem
+            id="scheme-suffix"
+            value="suffix"
+            className="mt-0.5"
+          />
+          <span className="grid gap-0.5 text-sm">
+            <span>
+              With a label, one level deep:{' '}
+              <code>
+                &lt;app-name&gt;-{sub}.{zone}
+              </code>{' '}
+              <span className="text-muted-foreground">
+                (the free certificate covers it too)
+              </span>
+            </span>
+            <span className="text-xs text-muted-foreground">
+              For example{' '}
+              <code>
+                {exampleHost(EXAMPLE_APP, zone, { kind: 'suffix', label: sub })}
+              </code>
+              , instead of{' '}
+              <code>
+                {exampleHost(EXAMPLE_APP, zone, {
+                  kind: 'subdomain',
+                  label: sub,
+                })}
+              </code>
+            </span>
+          </span>
+        </Label>
+        <Label
           htmlFor="scheme-subdomain"
           className="flex cursor-pointer items-start gap-2 font-normal"
         >
@@ -1238,11 +1274,18 @@ function SchemePicker({
           </span>
         </Label>
       </RadioGroup>
-      {scheme === 'subdomain' && (
+      {scheme !== 'zone' && (
         <div className="space-y-3 pl-6">
           <div className="space-y-1">
-            <Label htmlFor="scheme-label">Subdomain</Label>
+            <Label htmlFor="scheme-label">
+              {scheme === 'suffix' ? 'Label' : 'Subdomain'}
+            </Label>
             <div className="flex items-center gap-2">
+              {scheme === 'suffix' && (
+                <span className="text-sm text-muted-foreground">
+                  &lt;app-name&gt;-
+                </span>
+              )}
               <Input
                 id="scheme-label"
                 className="w-40"
@@ -1258,25 +1301,38 @@ function SchemePicker({
               <p className="text-sm text-destructive">{labelError}</p>
             )}
           </div>
-          <Alert className="border-amber-500/30 bg-amber-500/5">
-            <AlertTriangle className="h-4 w-4 text-amber-500" />
-            <AlertTitle className="text-amber-700 dark:text-amber-400">
-              HTTPS fails without Advanced Certificate Manager
-            </AlertTitle>
-            <AlertDescription className="text-amber-700 dark:text-amber-300">
-              Cloudflare&apos;s free Universal SSL covers {zone} and one level
-              below it (<code>*.{zone}</code>). Names such as{' '}
+          {scheme === 'suffix' ? (
+            <p className="text-xs text-muted-foreground">
+              The tunnel serves {zone}, and each app it publishes gets a name
+              such as{' '}
               <code>
-                {EXAMPLE_APP}.{sub}.{zone}
-              </code>{' '}
-              are two levels down, so visitors get a certificate error unless
-              the zone has Advanced Certificate Manager (or Total TLS) covering{' '}
-              <code>
-                *.{sub}.{zone}
+                {EXAMPLE_APP}-{sub}.{zone}
               </code>
-              .
-            </AlertDescription>
-          </Alert>
+              : one level below {zone}, which Cloudflare&apos;s free Universal
+              SSL (<code>*.{zone}</code>) covers.
+            </p>
+          ) : (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                HTTPS fails without Advanced Certificate Manager
+              </AlertTitle>
+              <AlertDescription className="text-amber-700 dark:text-amber-300">
+                Cloudflare&apos;s free Universal SSL covers {zone} and one level
+                below it (<code>*.{zone}</code>). Names such as{' '}
+                <code>
+                  {EXAMPLE_APP}.{sub}.{zone}
+                </code>{' '}
+                are two levels down, so visitors get a certificate error unless
+                the zone has Advanced Certificate Manager (or Total TLS)
+                covering{' '}
+                <code>
+                  *.{sub}.{zone}
+                </code>
+                .
+              </AlertDescription>
+            </Alert>
+          )}
         </div>
       )}
     </div>

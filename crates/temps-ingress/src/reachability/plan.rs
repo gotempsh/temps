@@ -791,8 +791,10 @@ pub const ENVIRONMENT_HOSTS_WARNING: &str = "Every environment, including previe
      become public, and each name's certificate appears in Certificate Transparency logs.";
 
 /// The tunnel whose environment hosts would give this environment `host`
-/// (ADR 068 D3): `host` is `<its label>.<tunnel domain>`, the tunnel can
-/// publish, its environment hosts are off, and no other tunnel's are on.
+/// (ADR 068 D3): `host` is `<its label>.<tunnel domain>` (or
+/// `<its label>-<suffix>.<tunnel domain>` for a tunnel with a host suffix),
+/// the tunnel can publish, its environment hosts are off, and no other
+/// tunnel's are on.
 pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<&'a TunnelFact> {
     let label = facts.environment_host_label.as_deref()?;
     if facts.tunnels.iter().any(|t| t.environment_hosts) {
@@ -810,9 +812,9 @@ pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<
         usable(t)
             && t.zone.is_some()
             && host
-                == format!(
-                    "{label}.{}",
-                    t.domain.trim_end_matches('.').to_ascii_lowercase()
+                == super::environment_hosts::natural_host(
+                    &super::environment_hosts::tunnel_label(label, t.host_suffix.as_deref()),
+                    &t.domain,
                 )
     })
 }
@@ -3240,6 +3242,7 @@ mod tests {
             has_nodes: true,
             auto_publish: true,
             environment_hosts: false,
+            host_suffix: None,
         }
     }
 
@@ -3851,6 +3854,34 @@ mod tests {
             permissions_for(PlanOptionKind::TunnelEnvironmentHosts),
             vec![Permission::SettingsWrite]
         );
+    }
+
+    /// A tunnel with a host suffix names the environment's host one level
+    /// under its zone (`<label>-<suffix>.<zone>`), and offers environment
+    /// hosts for that name, not for `<label>.<zone>`.
+    #[test]
+    fn a_tunnel_with_a_host_suffix_offers_the_suffixed_environment_host() {
+        let lab = || TunnelFact {
+            host_suffix: Some("lab".into()),
+            ..tunnel("homelab", "example.com", "example.com")
+        };
+        let facts = |requested: &str| PlanFacts {
+            tunnels: vec![lab()],
+            requested: Some(requested.into()),
+            environment_host_label: Some("myapp-production".into()),
+            ..base()
+        };
+        let suffixed = facts("myapp-production-lab.example.com");
+        assert_eq!(
+            environment_hosts_tunnel(&suffixed, "myapp-production-lab.example.com")
+                .map(|t| t.name.as_str()),
+            Some("homelab")
+        );
+        assert!(kinds(&plan(&suffixed)).contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // The unsuffixed name is not this tunnel's environment host.
+        let plain = facts("myapp-production.example.com");
+        assert!(environment_hosts_tunnel(&plain, "myapp-production.example.com").is_none());
+        assert!(!kinds(&plan(&plain)).contains(&PlanOptionKind::TunnelEnvironmentHosts));
     }
 
     #[test]

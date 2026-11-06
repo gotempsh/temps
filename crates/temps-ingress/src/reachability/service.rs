@@ -3599,6 +3599,7 @@ impl RunOps for LiveOps {
             // Publish only what runs choose, so a tunnel on a whole zone
             // never puts other apps under it online by surprise.
             auto_publish: Some(false),
+            host_suffix: None,
         };
         match self.deps.connectors.create(request).await {
             Ok(view) => Ok((

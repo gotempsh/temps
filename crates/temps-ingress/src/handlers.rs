@@ -290,6 +290,7 @@ async fn create_ingress_connector(
             "domain": view.domain,
             "node_ids": view.nodes.iter().map(|n| n.node_id).collect::<Vec<_>>(),
             "auto_publish": view.auto_publish,
+            "host_suffix": view.host_suffix,
             "outcome": "created",
         }))
         .record(&state)

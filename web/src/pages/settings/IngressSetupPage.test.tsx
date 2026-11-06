@@ -198,6 +198,18 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   expect(
     screen.getByText('HTTPS fails without Advanced Certificate Manager')
   ).toBeTruthy()
+  // One level deep with a label: the free certificate covers it, no warning.
+  fireEvent.click(screen.getByRole('radio', { name: /With a label/ }))
+  expect(screen.getAllByText('shop-lab.example.com').length).toBeGreaterThan(0)
+  expect(
+    screen.queryByText('HTTPS fails without Advanced Certificate Manager')
+  ).toBeNull()
+  fireEvent.change(screen.getByLabelText('Label'), {
+    target: { value: 'lab.eu' },
+  })
+  expect(
+    screen.getByText('Use 1-20 letters, digits or hyphens, with no dots.')
+  ).toBeTruthy()
   // Hostnames read as a pattern, with a concrete example.
   fireEvent.click(
     screen.getByRole('radio', { name: /<app-name>\.example\.com/ })

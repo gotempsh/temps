@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tunnel environment hosts (ADR 068 D3): with `environment_hosts` on, one
-//! tunnel publishes every environment as `<label>.<connector.domain>`.
+//! tunnel publishes every environment as `<label>.<connector.domain>`, or
+//! `<label>-<suffix>.<connector.domain>` when the tunnel has a
+//! `host_suffix` (one level deep under its zone, which Cloudflare's free
+//! certificate covers, where a subdomain domain would put them two deep).
 //!
 //! The rows are `environment_domains` rows holding the full hostname, marked
 //! with `generated_by_connector_id`. This module decides which rows should
@@ -29,6 +32,45 @@
 use std::collections::{HashMap, HashSet};
 
 use temps_core::public_hostname::{environment_label, hashed_label, single_dns_label};
+
+/// The longest `host_suffix`, so `<label>-<suffix>` keeps most of the label
+/// within one 63-character DNS label.
+pub const MAX_HOST_SUFFIX_LEN: usize = 20;
+
+/// `suffix` as a tunnel's `host_suffix`: lowercase letters, digits and
+/// hyphens, starting and ending with a letter or digit, at most
+/// [`MAX_HOST_SUFFIX_LEN`] characters. `Ok(None)` for nothing (or only
+/// spaces). The error says what is wrong with it.
+pub fn normalize_host_suffix(suffix: Option<&str>) -> Result<Option<String>, String> {
+    let Some(suffix) = suffix.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let suffix = suffix.to_ascii_lowercase();
+    let valid = suffix.len() <= MAX_HOST_SUFFIX_LEN
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !suffix.starts_with('-')
+        && !suffix.ends_with('-');
+    if !valid {
+        return Err(format!(
+            "The hostname suffix '{suffix}' must be 1-{MAX_HOST_SUFFIX_LEN} lowercase letters, \
+             digits or hyphens, starting and ending with a letter or digit (for example 'lab', \
+             which names hosts like shop-production-lab.example.com)."
+        ));
+    }
+    Ok(Some(suffix))
+}
+
+/// The label a tunnel publishes an environment under: `label`, or
+/// `<label>-<suffix>` with a `host_suffix`. Always one DNS label: a long
+/// combination is cut and given a short hash, as [`single_dns_label`] does.
+pub fn tunnel_label(label: &str, suffix: Option<&str>) -> String {
+    match suffix.filter(|s| !s.is_empty()) {
+        Some(suffix) => single_dns_label(&format!("{label}-{suffix}")),
+        None => label.to_string(),
+    }
+}
 
 /// What [`plan_rows`] needs to know about one environment.
 #[derive(Debug, Clone)]
@@ -289,13 +331,14 @@ fn needing_names<'a>(
     envs: &'a [EnvironmentFacts],
     rows: &[GeneratedRow],
     production_template: Option<&str>,
+    suffix: Option<&str>,
     domain: &str,
 ) -> Vec<(&'a EnvironmentFacts, String)> {
     let holder = holders(rows);
     let mut fresh = 0usize;
     let mut out = Vec::new();
     for env in envs.iter().filter(|e| e.excluded.is_none()) {
-        let label = host_label(env, production_template);
+        let label = tunnel_label(&host_label(env, production_template), suffix);
         if kept_row(env, &label, domain, rows, &holder).is_some() {
             continue;
         }
@@ -315,9 +358,10 @@ fn names_to_check(
     envs: &[EnvironmentFacts],
     rows: &[GeneratedRow],
     production_template: Option<&str>,
+    suffix: Option<&str>,
     domain: &str,
 ) -> Vec<String> {
-    needing_names(envs, rows, production_template, domain)
+    needing_names(envs, rows, production_template, suffix, domain)
         .into_iter()
         .map(|(_, label)| natural_host(&label, domain))
         .collect()
@@ -337,6 +381,7 @@ pub fn assign_hosts(
     envs: &[EnvironmentFacts],
     rows: &[GeneratedRow],
     production_template: Option<&str>,
+    suffix: Option<&str>,
     domain: &str,
     taken: &dyn Fn(&str) -> bool,
     publishable: &dyn Fn(&str) -> bool,
@@ -344,12 +389,12 @@ pub fn assign_hosts(
     let mut claimed = holders(rows);
     let mut desired = HashMap::new();
     for env in envs.iter().filter(|e| e.excluded.is_none()) {
-        let label = host_label(env, production_template);
+        let label = tunnel_label(&host_label(env, production_template), suffix);
         if let Some(row) = kept_row(env, &label, domain, rows, &claimed) {
             desired.insert(env.environment_id, row.domain.to_ascii_lowercase());
         }
     }
-    for (env, label) in needing_names(envs, rows, production_template, domain) {
+    for (env, label) in needing_names(envs, rows, production_template, suffix, domain) {
         let id = env.environment_id;
         let held = |claimed: &HashMap<String, i32>, host: &str| {
             taken(host) || claimed.get(host).is_some_and(|holder| *holder != id)
@@ -440,6 +485,10 @@ pub struct EnvironmentHostsResponse {
     pub connector_id: i32,
     pub connector_name: String,
     pub domain: String,
+    /// The tunnel's hostname suffix: environments are published as
+    /// `<label>-<suffix>.<domain>` with one, `<label>.<domain>` without.
+    #[schema(example = "lab")]
+    pub host_suffix: Option<String>,
     pub enabled: bool,
     /// The hosts it publishes, or would publish once turned on.
     pub hosts: Vec<EnvironmentHostView>,
@@ -705,9 +754,16 @@ impl EnvironmentHostService {
     /// here, for the natural names [`assign_hosts`] would try.
     async fn desired(&self, snap: &Snapshot) -> HashMap<i32, String> {
         let domain = snap.connector.domain.as_str();
+        let suffix = snap.connector.host_suffix.as_deref();
         let zone = self.zone(&snap.connector).await;
         let mut foreign = HashSet::new();
-        for natural in names_to_check(&snap.envs, &snap.rows, snap.production_template(), domain) {
+        for natural in names_to_check(
+            &snap.envs,
+            &snap.rows,
+            snap.production_template(),
+            suffix,
+            domain,
+        ) {
             if !snap.is_taken(&natural)
                 && self.foreign_record(zone.as_deref(), domain, &natural).await
             {
@@ -718,6 +774,7 @@ impl EnvironmentHostService {
             &snap.envs,
             &snap.rows,
             snap.production_template(),
+            suffix,
             domain,
             &|host| snap.is_taken(host) || foreign.contains(host),
             &|host| {
@@ -852,7 +909,10 @@ impl EnvironmentHostService {
                 }
                 continue;
             }
-            let label = host_label(env, snap.production_template());
+            let label = tunnel_label(
+                &host_label(env, snap.production_template()),
+                snap.connector.host_suffix.as_deref(),
+            );
             let natural = natural_host(&label, &domain);
             let rows: Vec<&GeneratedRow> = snap
                 .rows
@@ -906,6 +966,7 @@ impl EnvironmentHostService {
             connector_id,
             connector_name: snap.connector.name.clone(),
             domain,
+            host_suffix: snap.connector.host_suffix.clone(),
             enabled: snap.connector.environment_hosts,
             confirm_token: confirm_token(connector_id, snap.connector.environment_hosts, &hosts),
             hosts,
@@ -1093,6 +1154,7 @@ mod tests {
             edge_port: 443,
             auto_publish: false,
             environment_hosts,
+            host_suffix: None,
             status: CONNECTOR_READY.into(),
             last_error: None,
             created_at: chrono::Utc::now(),
@@ -1380,7 +1442,7 @@ mod tests {
     const ZONE: &str = "t.example.com";
 
     fn assign(envs: &[EnvironmentFacts], rows: &[GeneratedRow]) -> HashMap<i32, String> {
-        assign_hosts(envs, rows, None, ZONE, &|_| false, &|_| true)
+        assign_hosts(envs, rows, None, None, ZONE, &|_| false, &|_| true)
     }
 
     /// Two environments with one label never share a host, whichever comes
@@ -1446,11 +1508,11 @@ mod tests {
     fn a_taken_name_gets_the_fallback_and_an_unpublishable_one_nothing() {
         let envs = [env(1, "www")];
         let natural = natural_host("www", ZONE);
-        let desired = assign_hosts(&envs, &[], None, ZONE, &|h| h == natural, &|_| true);
+        let desired = assign_hosts(&envs, &[], None, None, ZONE, &|h| h == natural, &|_| true);
         assert_eq!(desired[&1], fallback_host("www", ZONE, 1));
-        let desired = assign_hosts(&envs, &[], None, ZONE, &|_| true, &|_| true);
+        let desired = assign_hosts(&envs, &[], None, None, ZONE, &|_| true, &|_| true);
         assert!(desired.is_empty(), "both names taken");
-        let desired = assign_hosts(&envs, &[], None, ZONE, &|_| false, &|_| false);
+        let desired = assign_hosts(&envs, &[], None, None, ZONE, &|_| false, &|_| false);
         assert!(desired.is_empty());
     }
 
@@ -1492,6 +1554,7 @@ mod tests {
             connector_id: 1,
             connector_name: "edge".into(),
             domain: ZONE.into(),
+            host_suffix: None,
             enabled,
             confirm_token: confirm_token(1, enabled, &hosts),
             hosts,
@@ -1589,5 +1652,86 @@ mod tests {
             hostname_holder(&db, "free.t.example.com").await.unwrap(),
             None
         );
+    }
+
+    /// With a host suffix, hosts stay one label under the tunnel's domain:
+    /// `<label>-<suffix>.<zone>`, never `<label>.<suffix>.<zone>`.
+    #[test]
+    fn a_host_suffix_keeps_hosts_one_level_under_the_zone() {
+        const APEX: &str = "example.com";
+        let envs = [env(1, "shop-production"), env(2, "shop-staging")];
+        let desired = assign_hosts(&envs, &[], None, Some("lab"), APEX, &|_| false, &|_| true);
+        assert_eq!(desired[&1], "shop-production-lab.example.com");
+        assert_eq!(desired[&2], "shop-staging-lab.example.com");
+        for host in desired.values() {
+            assert!(one_label_under(host, APEX), "{host} is one level deep");
+        }
+        // A rename keeps working: the row for the old name is kept until the
+        // new one is live, and the new one is the suffixed name.
+        let rows = [row(10, 1, "shop-production-lab.example.com")];
+        let desired = assign_hosts(&envs, &rows, None, Some("lab"), APEX, &|_| false, &|_| true);
+        assert_eq!(desired[&1], "shop-production-lab.example.com");
+    }
+
+    /// A taken suffixed name falls back to a hashed one that is still one
+    /// label and still carries the suffix.
+    #[test]
+    fn a_taken_suffixed_name_falls_back_within_one_label() {
+        const APEX: &str = "example.com";
+        let envs = [env(1, "www")];
+        let desired = assign_hosts(
+            &envs,
+            &[],
+            None,
+            Some("lab"),
+            APEX,
+            &|h| h == "www-lab.example.com",
+            &|_| true,
+        );
+        let host = &desired[&1];
+        assert_eq!(*host, fallback_host("www-lab", APEX, 1));
+        assert!(host.starts_with("www-lab-"), "{host}");
+        assert!(one_label_under(host, APEX), "{host}");
+    }
+
+    /// `host` is exactly one DNS label under `apex`.
+    fn one_label_under(host: &str, apex: &str) -> bool {
+        host.strip_suffix(apex)
+            .and_then(|rest| rest.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+    }
+
+    #[test]
+    fn a_long_label_with_a_suffix_is_cut_to_one_dns_label() {
+        let long = "a".repeat(60);
+        let label = tunnel_label(&long, Some("lab"));
+        assert!(label.len() <= 63, "{label}");
+        assert_ne!(label, format!("{long}-lab"));
+        assert_eq!(tunnel_label("shop", Some("lab")), "shop-lab");
+        assert_eq!(tunnel_label("shop", None), "shop");
+        assert_eq!(tunnel_label("shop", Some("")), "shop");
+    }
+
+    #[test]
+    fn host_suffixes_are_lowercase_dns_label_fragments() {
+        assert_eq!(normalize_host_suffix(None), Ok(None));
+        assert_eq!(normalize_host_suffix(Some("  ")), Ok(None));
+        assert_eq!(normalize_host_suffix(Some(" Lab ")), Ok(Some("lab".into())));
+        assert_eq!(
+            normalize_host_suffix(Some("home-2")),
+            Ok(Some("home-2".into()))
+        );
+        for bad in [
+            "-lab",
+            "lab-",
+            "lab.home",
+            "la b",
+            "l\u{e1}b",
+            "lab_1",
+            &"x".repeat(21),
+        ] {
+            let error = normalize_host_suffix(Some(bad)).unwrap_err();
+            assert!(error.contains("hostname suffix"), "{bad}: {error}");
+        }
     }
 }

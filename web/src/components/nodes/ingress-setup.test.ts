@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import type {
   ConnectorNodeView,
   ConnectorView,
+  CreateConnectorRequest,
   ManagedDomainResponse,
 } from '@/api/client/types.gen'
 import {
@@ -15,6 +16,9 @@ import {
   type SetupStep,
   subdomainLabelError,
   tunnelDomainFor,
+  hostSuffixFor,
+  schemeLabelError,
+  exampleHost,
   uniqueProviderName,
   uniqueTunnelName,
   unavailableWorker,
@@ -148,6 +152,27 @@ describe('runTunnelSetup', () => {
       'done',
     ])
     expect(last[4].detail).toBe('4 connections to Cloudflare')
+  })
+
+  test('a one-level label is sent as the tunnel host suffix, and only then', async () => {
+    const requests: CreateConnectorRequest[] = []
+    const record = async (request: CreateConnectorRequest) => {
+      requests.push(request)
+      return connector([{ node_id: 1, state: 'ready', ready_connections: 4 }])
+    }
+    const { api } = fakeApi({ createConnector: record })
+    await runTunnelSetup(
+      { ...plan, managed: managed(), hostSuffix: 'lab' },
+      api,
+      () => {}
+    )
+    await runTunnelSetup({ ...plan, managed: managed() }, api, () => {})
+    expect(requests[0].values).toEqual({
+      dns_provider_id: 1,
+      domain: 'example.com',
+    })
+    expect(requests[0].host_suffix).toBe('lab')
+    expect('host_suffix' in requests[1]).toBe(false)
   })
 
   test('a verified managed domain is used as it is', async () => {
@@ -344,6 +369,23 @@ describe('helpers', () => {
     expect(
       tunnelDomainFor('example.com', { kind: 'subdomain', label: ' Lab ' })
     ).toBe('lab.example.com')
+    expect(
+      tunnelDomainFor('example.com', { kind: 'suffix', label: 'lab' })
+    ).toBe('example.com')
+    expect(hostSuffixFor({ kind: 'suffix', label: ' Lab ' })).toBe('lab')
+    expect(hostSuffixFor({ kind: 'subdomain', label: 'lab' })).toBeUndefined()
+    expect(hostSuffixFor({ kind: 'zone' })).toBeUndefined()
+    expect(schemeLabelError({ kind: 'suffix', label: 'lab.eu' })).toBeDefined()
+    expect(
+      schemeLabelError({ kind: 'subdomain', label: 'lab.eu' })
+    ).toBeUndefined()
+    expect(schemeLabelError({ kind: 'zone' })).toBeUndefined()
+    expect(
+      exampleHost('shop', 'example.com', { kind: 'suffix', label: 'lab' })
+    ).toBe('shop-lab.example.com')
+    expect(
+      exampleHost('shop', 'example.com', { kind: 'subdomain', label: 'lab' })
+    ).toBe('shop.lab.example.com')
     expect(subdomainLabelError('')).toBeDefined()
     expect(subdomainLabelError('lab_1')).toBeDefined()
     expect(subdomainLabelError('lab')).toBeUndefined()

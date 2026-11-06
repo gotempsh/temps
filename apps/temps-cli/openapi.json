@@ -13095,10 +13095,17 @@
             "type": "integer"
           },
           "environment_hosts": {
-            "description": "Publishes every environment as `<label>.<domain>` (ADR 068 D3).\nAt most one tunnel does.",
+            "description": "Publishes every environment as `<label>.<domain>` (ADR 068 D3), or\n`<label>-<host_suffix>.<domain>` with a host suffix. At most one\ntunnel does.",
             "type": "boolean"
           },
           "external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_suffix": {
+            "description": "Suffix of its environment hosts' first label; `null` for none.",
             "type": [
               "string",
               "null"
@@ -15662,6 +15669,14 @@
             "description": "Publish every worker-served hostname under the domain (the default),\nor only the hostnames chosen for this tunnel.",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "host_suffix": {
+            "description": "Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`\n(ADR 068 D3), e.g. `lab` with domain `example.com` gives\n`shop-production-lab.example.com`: one level under the zone, which\nCloudflare's free certificate covers. Without it they are\n`<label>.<domain>`. 1-20 lowercase letters, digits or hyphens; only\nfor a provider set up with a domain.",
+            "example": "lab",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -26935,6 +26950,14 @@
           },
           "enabled_elsewhere": {
             "description": "The tunnel that has environment hosts on instead, if another does:\nat most one may.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_suffix": {
+            "description": "The tunnel's hostname suffix: environments are published as\n`<label>-<suffix>.<domain>` with one, `<label>.<domain>` without.",
+            "example": "lab",
             "type": [
               "string",
               "null"

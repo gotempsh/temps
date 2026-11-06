@@ -30,6 +30,7 @@ import {
 } from '@/components/domains/delivery-errors'
 import { tunnelNameFor } from '@/components/domains/ZoneTunnelChoice'
 import { replicaState } from '@/components/nodes/WorkerTunnels'
+import { hostSuffixError } from '@/lib/tunnel-host-suffix'
 import { ALLOW_INGRESS_COMMANDS, workerIngressWay } from '@/lib/worker-ingress'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 
@@ -52,9 +53,15 @@ export function ingressSetupUrl(
 /** `temps_ingress::cloudflare::KIND`. */
 export const CLOUDFLARE_TUNNEL_KIND = 'cloudflare_tunnel'
 
-/** Apps directly under the zone, or under one label below it. */
+/**
+ * Apps directly under the zone (`shop.example.com`), one level under it with
+ * a label appended (`shop-lab.example.com`, the tunnel's `host_suffix`), or
+ * under a subdomain (`shop.lab.example.com`, two levels down).
+ */
 export type HostnameScheme =
-  { kind: 'zone' } | { kind: 'subdomain'; label: string }
+  | { kind: 'zone' }
+  | { kind: 'suffix'; label: string }
+  | { kind: 'subdomain'; label: string }
 
 const DNS_LABELS =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
@@ -73,11 +80,39 @@ export function subdomainLabelError(label: string): string | undefined {
   return undefined
 }
 
-/** The domain the tunnel serves: the zone, or `label.zone`. */
+/** Why the scheme's label is unusable, or `undefined` when it is fine. */
+export function schemeLabelError(scheme: HostnameScheme): string | undefined {
+  if (scheme.kind === 'suffix') return hostSuffixError(scheme.label)
+  if (scheme.kind === 'subdomain') return subdomainLabelError(scheme.label)
+  return undefined
+}
+
+/**
+ * The domain the tunnel serves: the zone (also with a suffix, whose hosts
+ * sit directly under it), or `label.zone` for a subdomain.
+ */
 export function tunnelDomainFor(zone: string, scheme: HostnameScheme): string {
   const base = zone.trim().toLowerCase().replace(/\.$/, '')
-  if (scheme.kind === 'zone') return base
+  if (scheme.kind !== 'subdomain') return base
   return `${normalizeLabel(scheme.label)}.${base}`
+}
+
+/** The tunnel's `host_suffix` for the scheme, if it has one. */
+export function hostSuffixFor(scheme: HostnameScheme): string | undefined {
+  return scheme.kind === 'suffix' ? normalizeLabel(scheme.label) : undefined
+}
+
+/** An example app hostname under the scheme: `shop-lab.example.com`. */
+export function exampleHost(
+  app: string,
+  zone: string,
+  scheme: HostnameScheme
+): string {
+  const base = zone.trim().toLowerCase().replace(/\.$/, '')
+  const label = scheme.kind === 'zone' ? '' : normalizeLabel(scheme.label)
+  if (scheme.kind === 'suffix') return `${app}-${label || 'lab'}.${base}`
+  if (scheme.kind === 'subdomain') return `${app}.${label || 'lab'}.${base}`
+  return `${app}.${base}`
 }
 
 /** A tunnel name from the domain that no existing tunnel uses. */
@@ -190,6 +225,8 @@ export interface SetupPlan {
   /** The zone's managed-domain row under this provider, if it has one. */
   managed: ManagedDomainResponse | undefined
   tunnelDomain: string
+  /** Environment hosts become `<label>-<hostSuffix>.<tunnelDomain>`. */
+  hostSuffix?: string
   tunnelName: string
   nodes: { id: number; name: string }[]
 }
@@ -536,6 +573,9 @@ export async function runTunnelSetup(
       name: plan.tunnelName,
       provider: CLOUDFLARE_TUNNEL_KIND,
       values: { dns_provider_id: plan.provider.id, domain: plan.tunnelDomain },
+      // Sent only with one, so a tunnel without a suffix asks exactly what
+      // it asked before suffixes existed.
+      ...(plan.hostSuffix ? { host_suffix: plan.hostSuffix } : {}),
       node_ids: plan.nodes.map((n) => n.id),
     })
     created.connectorId = connector.id
