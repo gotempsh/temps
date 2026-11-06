@@ -7,7 +7,7 @@
 use crate::externalsvc::{
     mariadb::{validate_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     rustfs::DEFAULT_RUSTFS_IMAGE,
-    ExternalService, ServiceType,
+    ServiceType,
 };
 use crate::remote_service_client::{
     RemotePortMapping, RemoteServiceClient, RemoteServiceCreateParams,
@@ -152,7 +152,8 @@ impl ExternalServiceManager {
     pub(super) async fn resolve_remote_container_name(
         &self,
         client: &RemoteServiceClient,
-        service_instance: &dyn ExternalService,
+        service_name: &str,
+        service_type: ServiceType,
         parameters: &HashMap<String, serde_json::Value>,
     ) -> Result<String, ExternalServiceError> {
         let persisted_name = parameters
@@ -163,14 +164,18 @@ impl ExternalServiceManager {
             return Ok(container_name.to_string());
         }
 
-        let canonical_name = service_instance.get_docker_container_name();
+        // The container is on the node, so the names are all that's needed.
+        // No engine is built: that would need a local Docker handle.
+        let identity =
+            Self::engine_identity_for_parameters(service_name, service_type, parameters)?;
+        let canonical_name = identity.container_name;
         let canonical_exists = client
             .service_status(&canonical_name)
             .await?
             .container_id
             .is_some();
 
-        let legacy_name = service_instance.get_name();
+        let legacy_name = identity.instance_name;
         let legacy_exists = if legacy_name != canonical_name && !canonical_exists {
             client
                 .service_status(&legacy_name)
@@ -470,9 +475,10 @@ impl ExternalServiceManager {
             .and_then(|p| p.parse().ok())
             .unwrap_or(container_port);
 
-        let container_name = self
-            .create_service_instance(service_name.to_string(), backend_service_type)?
-            .get_docker_container_name();
+        // No engine is built here: that needs a local Docker handle, which a
+        // control-plane-profile server does not have.
+        let container_name =
+            Self::engine_identity(service_name, backend_service_type).container_name;
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
@@ -575,6 +581,7 @@ mod tests {
     use super::*;
     use crate::externalsvc::{rustfs::DEFAULT_RUSTFS_IMAGE, ServiceType};
     use crate::services::test_support::*;
+    use crate::services::EngineIdentity;
     use std::collections::HashMap;
 
     #[test]
@@ -784,6 +791,122 @@ mod tests {
             select_remote_container_name(None, "postgres-orders", false, "orders", false),
             "postgres-orders"
         );
+    }
+
+    /// Remote paths name containers without building an engine, so the names
+    /// they compute must stay the ones the engines use.
+    #[test]
+    #[allow(deprecated)]
+    fn engine_identity_matches_the_engine_for_every_service_type() {
+        let manager = mock_service_manager(vec![]);
+
+        for service_type in [
+            ServiceType::Mariadb,
+            ServiceType::Mongodb,
+            ServiceType::Postgres,
+            ServiceType::Redis,
+            ServiceType::S3,
+            ServiceType::Rustfs,
+            ServiceType::Kv,
+            ServiceType::Blob,
+            ServiceType::Minio,
+        ] {
+            let instance = manager
+                .create_service_instance("orders".to_string(), service_type)
+                .expect("mock manager always has an available Docker handle");
+            assert_eq!(
+                ExternalServiceManager::engine_identity("orders", service_type),
+                EngineIdentity {
+                    instance_name: instance.get_name(),
+                    container_name: instance.get_docker_container_name(),
+                },
+                "wrong identity for {service_type}"
+            );
+        }
+
+        for (service_type, backend) in [
+            (ServiceType::S3, None),
+            (ServiceType::S3, Some("rustfs")),
+            (ServiceType::S3, Some("minio")),
+            (ServiceType::S3, Some("garage")),
+            (ServiceType::Blob, None),
+            (ServiceType::Blob, Some("rustfs")),
+            (ServiceType::Blob, Some("garage")),
+        ] {
+            let parameters: HashMap<String, serde_json::Value> = backend
+                .map(|backend| HashMap::from([("backend".to_string(), backend.into())]))
+                .unwrap_or_default();
+            let instance = manager
+                .create_service_instance_for_parameters(
+                    "orders".to_string(),
+                    service_type,
+                    &parameters,
+                )
+                .expect("a valid backend builds an engine");
+            assert_eq!(
+                ExternalServiceManager::engine_identity_for_parameters(
+                    "orders",
+                    service_type,
+                    &parameters,
+                )
+                .expect("a valid backend has an identity"),
+                EngineIdentity {
+                    instance_name: instance.get_name(),
+                    container_name: instance.get_docker_container_name(),
+                },
+                "wrong identity for {service_type} on backend {backend:?}"
+            );
+        }
+
+        let minio_blob = HashMap::from([("backend".to_string(), serde_json::Value::from("minio"))]);
+        assert!(matches!(
+            ExternalServiceManager::engine_identity_for_parameters(
+                "orders",
+                ServiceType::Blob,
+                &minio_blob,
+            ),
+            Err(ExternalServiceError::ParameterValidationFailed { .. })
+        ));
+    }
+
+    /// A `--profile control-plane` server has no Docker handle, but must
+    /// still be able to create services on worker nodes.
+    #[test]
+    fn remote_create_params_need_no_local_docker() {
+        let manager = control_plane_manager();
+        assert!(
+            manager.require_docker().is_err(),
+            "the control-plane manager must have no Docker handle"
+        );
+
+        for (service_type, expected_name) in [
+            (ServiceType::Postgres, "postgres-orders"),
+            (ServiceType::Mongodb, "temps-mongodb-orders"),
+            (ServiceType::Redis, "redis-orders"),
+            (ServiceType::Kv, "redis-orders"),
+            (ServiceType::S3, "rustfs-orders"),
+            (ServiceType::Blob, "rustfs-orders"),
+        ] {
+            let params = manager
+                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .unwrap_or_else(|e| panic!("{service_type} on a worker needs no Docker: {e}"));
+            assert_eq!(params.name, expected_name, "wrong name for {service_type}");
+        }
+    }
+
+    /// Starting a service on a worker ends by asking for its readiness gate.
+    /// There is none for a worker service, and asking must not need Docker.
+    #[tokio::test]
+    async fn remote_service_readiness_gate_needs_no_local_docker() {
+        let manager = control_plane_manager();
+        let mut service = encrypted_service_model(1, serde_json::json!({}));
+        service.node_id = Some(2);
+
+        let gate = manager
+            .readiness_gate_for(&service)
+            .await
+            .expect("a worker service has no gate to build");
+        assert!(gate.is_none());
     }
 
     // ── repoint_continuous_archive_source ───────────────────────────────────

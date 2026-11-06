@@ -1245,13 +1245,13 @@ impl ExternalServiceManager {
                 );
             } else if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
-                let service_instance = self.create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?;
                 let container_name = self
-                    .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                    .resolve_remote_container_name(
+                        &client,
+                        &service.name,
+                        service_type_enum,
+                        &parameters,
+                    )
                     .await?;
                 client.remove_service(&container_name).await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
