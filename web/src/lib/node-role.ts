@@ -54,3 +54,15 @@ export function targetNodesHint(
   }
   return 'Restrict deployments to specific nodes. Leave empty to use all active nodes except dedicated ones: a dedicated node only runs environments that select it here, and label selectors never match it.'
 }
+
+/**
+ * The command, run on the worker, that changes its role (ADR-091): labels
+ * are set by the node itself, so the console can only say how. A dedicated
+ * or builder node is shown how to go back to an ordinary worker; any other
+ * node how to become dedicated.
+ */
+export function nodeRoleChangeCommand(labels: unknown): string {
+  return nodeSchedulingRole(labels)
+    ? `temps agent labels unset ${NODE_ROLE_LABEL}`
+    : `temps agent labels set ${NODE_ROLE_LABEL}=dedicated`
+}

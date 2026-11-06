@@ -21,9 +21,9 @@ use temps_entities::nodes::node_matches_labels;
 /// from a control plane without a Docker daemon and never hosts application
 /// replicas. It speaks the same `POST /agent/images/build` protocol as any
 /// worker; the label only changes where the scheduler sends work.
-pub const NODE_ROLE_LABEL: &str = "temps.sh/role";
+pub const NODE_ROLE_LABEL: &str = temps_core::node_labels::NODE_ROLE_LABEL;
 /// Value of [`NODE_ROLE_LABEL`] that marks a build-only node.
-pub const BUILDER_NODE_ROLE: &str = "builder";
+pub const BUILDER_NODE_ROLE: &str = temps_core::node_labels::BUILDER_NODE_ROLE;
 /// Value of [`NODE_ROLE_LABEL`] that marks a dedicated node.
 ///
 /// A node joined with `--labels temps.sh/role=dedicated` only runs
@@ -32,8 +32,9 @@ pub const BUILDER_NODE_ROLE: &str = "builder";
 /// placement all pass it over, so a hardware host (KVM, GPU) or an isolated
 /// machine never fills up with arbitrary workloads. Workloads already running
 /// on a node when it becomes dedicated are left where they are; the label only
-/// affects future placement decisions.
-pub const DEDICATED_NODE_ROLE: &str = "dedicated";
+/// affects future placement decisions. The values a worker may set are
+/// checked by `temps_core::node_labels` (ADR-091).
+pub const DEDICATED_NODE_ROLE: &str = temps_core::node_labels::DEDICATED_NODE_ROLE;
 
 /// The node's `temps.sh/role` label value, if it has one.
 fn node_role(node: &nodes::Model) -> Option<&str> {

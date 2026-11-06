@@ -1073,6 +1073,11 @@ pub(super) fn stays_up(mut up: impl FnMut() -> bool, window: Duration, interval:
     }
 }
 
+/// A read-only `systemctl` query, bounded by [`QUERY_TIMEOUT`].
+pub(super) fn systemctl_query(args: &[&str]) -> Result<String, String> {
+    systemctl_output(args, QUERY_TIMEOUT)
+}
+
 /// Run `systemctl args`, killed after `timeout`, and return its stdout.
 fn systemctl_output(args: &[&str], timeout: Duration) -> Result<String, String> {
     // By absolute path: join runs as root, maybe with the caller's PATH.

@@ -87,7 +87,8 @@ pub struct AgentCommand {
     pub node_id: Option<i32>,
 
     /// Node labels for scheduling (comma-separated key=value pairs, e.g., "region=us-east,gpu=true").
-    /// Overrides labels from saved config. Sent in every heartbeat.
+    /// Overrides labels from saved config for the life of the process: `temps
+    /// agent labels set` changes are then ignored. Sent in every heartbeat.
     #[arg(long, env = "TEMPS_NODE_LABELS", value_delimiter = ',')]
     pub labels: Vec<String>,
 
@@ -153,6 +154,10 @@ pub enum AgentSubcommand {
     /// Choose whether this worker takes public traffic (ADR 058 D7)
     #[command(subcommand)]
     Ingress(super::agent_ingress::AgentIngressCommand),
+    /// Show or change this worker's scheduling labels, such as
+    /// `temps.sh/role=dedicated` (ADR-091)
+    #[command(subcommand)]
+    Labels(super::agent_labels::AgentLabelsCommand),
 }
 
 impl AgentCommand {
@@ -160,6 +165,7 @@ impl AgentCommand {
         match &self.service {
             Some(AgentSubcommand::Service(command)) => return command.execute(),
             Some(AgentSubcommand::Ingress(command)) => return command.execute(),
+            Some(AgentSubcommand::Labels(command)) => return command.execute(),
             None => {}
         }
         // A Mac worker (ADR 090): pin the Docker app `temps join` recorded
@@ -182,6 +188,7 @@ impl AgentCommand {
         rt.block_on(async move {
             let disable_state_stream = self.disable_state_stream;
             let config = self.resolve_config()?;
+            let labels = self.labels_settings();
 
             #[cfg(target_os = "macos")]
             if let Some(worker) = mac_worker.clone() {
@@ -580,6 +587,7 @@ impl AgentCommand {
                 docker_socket_grant,
                 temps_node_agent::server::AgentServerOptions {
                     state_stream: !disable_state_stream,
+                    labels,
                     engines: temps_node_agent::server::AgentEngines {
                         service_runtime: Arc::new(
                             temps_providers::node_runtime::ProvidersNodeRuntime,
@@ -813,6 +821,23 @@ impl AgentCommand {
 
     /// Try to load `agent.json` from the configured agent data directory.
     /// Returns None if not found or unparsable.
+    /// ADR-091: labels from `--labels`/`TEMPS_NODE_LABELS` are pinned;
+    /// labels from a saved `agent.json` are reloaded from it while the agent
+    /// runs, and either way the labels the control plane accepts are recorded
+    /// next to it for `temps agent labels`.
+    fn labels_settings(&self) -> temps_node_agent::labels::LabelsSettings {
+        use temps_node_agent::labels::{LabelsOrigin, LabelsSettings};
+        let data_dir = agent_data_dir();
+        LabelsSettings {
+            origin: if self.labels.is_empty() {
+                LabelsOrigin::AgentJson
+            } else {
+                LabelsOrigin::Override
+            },
+            data_dir: data_dir.join("agent.json").is_file().then_some(data_dir),
+        }
+    }
+
     fn load_saved_config(&self) -> Option<temps_node_agent::AgentConfig> {
         let config_path = agent_data_dir().join("agent.json");
         let data = std::fs::read_to_string(&config_path).ok()?;

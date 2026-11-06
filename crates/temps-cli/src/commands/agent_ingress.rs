@@ -257,7 +257,7 @@ fn describe(ingress: &LocalIngress) -> String {
 
 /// `--data-dir`, else `TEMPS_DATA_DIR`/`~/.temps`, else the data directory
 /// the installed service runs with (`sudo` changes `~`).
-fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
+pub(super) fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
     if let Some(dir) = &target.data_dir {
         return Ok(dir.join("agent.json"));
     }
@@ -292,7 +292,7 @@ fn unit_pins_listen() -> bool {
     unit_text().is_some_and(|text| text.contains("--public-ingress-address"))
 }
 
-fn read_config(path: &Path) -> anyhow::Result<serde_json::Value> {
+pub(super) fn read_config(path: &Path) -> anyhow::Result<serde_json::Value> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("Could not read {}: {e}", path.display()))?;
     let value: serde_json::Value = serde_json::from_str(&text)
@@ -328,29 +328,7 @@ fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
         "public_ingress_address".to_string(),
         serde_json::Value::Null,
     );
-    let text = serde_json::to_string_pretty(&value)?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp).map_err(|e| {
-            anyhow::anyhow!(
-                "Could not write {}: {e}. Run this as the user the agent runs as (often root).",
-                tmp.display()
-            )
-        })?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-        .map_err(|e| anyhow::anyhow!("Could not replace {}: {e}", path.display()))?;
-    Ok(())
+    super::agent_labels::write_config_atomically(path, &value)
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ import { workerIngressWay } from '@/lib/worker-ingress'
 import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NodeLabelsCard } from '@/components/nodes/NodeLabelsCard'
 import { NodeRowActions } from '@/components/nodes/NodeRowActions'
 import { useNodeRemoval } from '@/components/nodes/useNodeRemoval'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
@@ -114,7 +115,6 @@ import {
   RefreshCw,
   Server,
   Shield,
-  Tag,
   Terminal,
   Trash2,
 } from 'lucide-react'
@@ -710,10 +710,7 @@ function NodeTable({
                   </div>
                 </TableCell>
                 <TableCell>
-                  <StatusBadge
-                    status={node.status}
-                    capacity={node.capacity}
-                  />
+                  <StatusBadge status={node.status} capacity={node.capacity} />
                 </TableCell>
                 <TableCell className="hidden sm:table-cell">
                   <NodeArchitecture architecture={node.architecture} />
@@ -818,32 +815,6 @@ function MetricCard({
             className={`h-full rounded-full transition-all ${barColor}`}
             style={{ width: `${Math.min(percent, 100)}%` }}
           />
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function NodeDetailLabels({ labels }: { labels: unknown }) {
-  if (!labels || typeof labels !== 'object') return null
-  const entries = Object.entries(labels as Record<string, unknown>)
-  if (entries.length === 0) return null
-
-  return (
-    <Card>
-      <CardHeader className="py-3 px-4">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <Tag className="h-4 w-4" />
-          Labels
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="px-4 pb-3">
-        <div className="flex flex-wrap gap-1.5">
-          {entries.map(([key, value]) => (
-            <Badge key={key} variant="secondary" className="text-xs font-mono">
-              {key}={String(value)}
-            </Badge>
-          ))}
         </div>
       </CardContent>
     </Card>
@@ -1695,7 +1666,10 @@ function NodeDetail({
               nodeId={node.id}
             />
           )}
-          <NodeDetailLabels labels={node.labels} />
+          <NodeLabelsCard
+            labels={node.labels}
+            showChangeHint={node.role === 'worker'}
+          />
           {(node.role === 'worker' || node.role === 'control-plane') && (
             <NodeStateStreamStatus />
           )}

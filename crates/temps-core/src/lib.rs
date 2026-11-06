@@ -63,6 +63,7 @@ pub mod release_images {
 pub mod docker_handle;
 /// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
 pub mod docker_socket_grant;
+pub mod node_labels;
 pub mod retention;
 pub mod retry;
 pub mod runtime;

@@ -145,7 +145,7 @@ temps join <url> <token> --private-address 10.0.0.5 \
 ```
 
 - `--name` — A friendly name for this node (defaults to the hostname)
-- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`). The `temps.sh/role` key is reserved: `temps.sh/role=builder` makes a [build-only node](#control-plane-builds) and `temps.sh/role=dedicated` makes a [dedicated node](#dedicated-nodes)
+- `--labels` — Key-value pairs for scheduling hints (e.g., `region=us-east,tier=production`). The `temps.sh/role` key is reserved: `temps.sh/role=builder` makes a [build-only node](#control-plane-builds) and `temps.sh/role=dedicated` makes a [dedicated node](#dedicated-nodes). An invalid label stops the join before anything is registered. Change labels later with [`temps agent labels`](#dedicated-nodes)
 - `--agent-address` — The address the agent server listens on (default: `0.0.0.0:3100`)
 
 After joining, the node is registered and the agent config is saved to `~/.temps/agent.json`. Start the agent separately:
@@ -493,7 +493,16 @@ No eligible node for this deployment: node 7 (gpu-1) is dedicated (temps.sh/role
 
 If the control plane can run the workload, unpinned deployments simply stay on it, and the deploy log notes `Skipping node 'gpu-1' is dedicated ...`. A dedicated node is not counted when anti-affinity decides whether there are enough nodes: marking a node dedicated never makes an unpinned multi-replica deployment fail where it previously wrapped around.
 
-**Changing an existing node's role.** The agent reports its labels on every heartbeat, from the `labels` object in the `~/.temps/agent.json` that `temps join` wrote. To make an existing node dedicated, add `"temps.sh/role": "dedicated"` there and restart `temps agent`; the control plane picks it up on the next heartbeat (within 30 seconds), and the scheduler reads it at every placement decision. Workloads already running on a node when it becomes dedicated are **not moved or stopped** — they keep running until their next deployment, which is then placed under the new rules (so an unpinned environment moves off the node on its next deploy). Sandboxes already on the node keep running too. To stop using the node for something now, redeploy that environment or drain the node.
+**Changing an existing node's role or labels.** Run `temps agent labels` on the worker, as the user the agent runs as (`sudo` on Linux, where the service runs as root; never `sudo` on a Mac, where it runs as the user who joined):
+
+```bash
+temps agent labels list                          # labels, role, and what the control plane last accepted
+temps agent labels set temps.sh/role=dedicated   # make this node dedicated
+temps agent labels set gpu=true zone=b           # add or change labels
+temps agent labels unset temps.sh/role           # back to an ordinary worker
+```
+
+`set` and `unset` rewrite only the `labels` object of `~/.temps/agent.json` (owner-only, replaced atomically) and check every label the way `temps join --labels` does: a key is `name` or `prefix/name` (letters, digits, `-`, `_`, `.`), a value has no commas or control characters, and `temps.sh/role` is only `builder` or `dedicated`. The running agent picks the change up within about 5 seconds, without a restart, and reports it to the control plane at once; the command waits until the control plane has accepted it and says so. An agent older than this release reads its labels only at start, so the command restarts the Temps-managed service (`temps-agent.service`, or the `sh.temps.agent` LaunchAgent on a Mac) instead; pass `--no-restart` to leave that to you. If the agent is started with `--labels` or `TEMPS_NODE_LABELS`, those override `agent.json`: the command finds them in the installed service and refuses rather than saving a change the agent would ignore. In the console, the node's labels are under **Settings > Nodes > (node) > Scheduling**, and a dedicated node carries a *Dedicated* badge. The scheduler reads labels at every placement decision. Workloads already running on a node when it becomes dedicated are **not moved or stopped** — they keep running until their next deployment, which is then placed under the new rules (so an unpinned environment moves off the node on its next deploy). Sandboxes already on the node keep running too. To stop using the node for something now, redeploy that environment or drain the node. Labels are set on the worker only: the control plane cannot change them.
 
 A node has one role: `builder` and `dedicated` are mutually exclusive values of the same `temps.sh/role` label. A build-only node never hosts replicas, pinned or not.
 
