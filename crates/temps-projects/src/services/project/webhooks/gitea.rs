@@ -121,7 +121,7 @@ impl ProjectService {
                 WebhookConfig {
                     url: webhook_url,
                     secret: Some(signing_token.clone()), // HMAC secret
-                    events: vec!["push".to_string()],
+                    events: vec!["push".to_string(), "pull_request".to_string()],
                 },
             )
             .await

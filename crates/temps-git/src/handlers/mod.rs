@@ -10,6 +10,7 @@ pub mod gitea;
 pub mod github;
 pub mod gitlab;
 pub mod public;
+mod pull_request;
 pub mod reauthorize;
 pub mod repositories;
 pub mod types;

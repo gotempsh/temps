@@ -20,15 +20,25 @@ impl GitProviderManager {
         // field (GitHub, GitLab, and others all follow this Git convention).
         // There is no commit to deploy, so creating a deployment from it would
         // queue a download_repo job that fails with
-        // "Failed to checkout ref 0000000...". Ignore these events.
-        if commit.is_empty() || commit.chars().all(|c| c == '0') {
+        // "Failed to checkout ref 0000000...". A deleted branch retires its
+        // preview instead.
+        if is_null_commit(&commit) {
             tracing::info!(
-                "Ignoring push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                "Push event for {}/{} with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
                 owner,
                 repo,
                 branch,
                 tag
             );
+            if let Some(branch) = deleted_branch(branch, tag.as_deref()) {
+                self.handle_branch_closed(
+                    &owner,
+                    &repo,
+                    branch,
+                    temps_core::PreviewBranchCloseReason::BranchDeleted,
+                )
+                .await?;
+            }
             return Ok(());
         }
 
@@ -144,14 +154,25 @@ impl GitProviderManager {
         matching_projects: Vec<projects::Model>,
     ) -> Result<usize, GitProviderManagerError> {
         // Branch/tag deletions send the all-zeros "null SHA" in the `after`
-        // field. There is no commit to deploy, so skip them before queueing.
-        if commit.is_empty() || commit.chars().all(|c| c == '0') {
+        // field. There is no commit to deploy; a deleted branch retires its
+        // preview instead.
+        if is_null_commit(&commit) {
             tracing::info!(
-                "Ignoring push event with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
+                "Push event with null SHA (branch/tag deletion), branch: {:?}, tag: {:?}",
                 branch,
                 tag
             );
-            return Ok(0);
+            return match deleted_branch(branch, tag.as_deref()) {
+                Some(branch) => {
+                    self.handle_branch_closed_for_projects(
+                        branch,
+                        temps_core::PreviewBranchCloseReason::BranchDeleted,
+                        matching_projects,
+                    )
+                    .await
+                }
+                None => Ok(0),
+            };
         }
 
         // A project that has been switched away from Git keeps its
@@ -231,6 +252,91 @@ impl GitProviderManager {
 
         Ok(triggered)
     }
+
+    /// Retire the preview of `branch` on every project of `owner/repo`.
+    ///
+    /// For deliveries authenticated per repository (a GitHub App webhook);
+    /// secret-in-path handlers use [`Self::handle_branch_closed_for_projects`].
+    pub async fn handle_branch_closed(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: String,
+        reason: temps_core::PreviewBranchCloseReason,
+    ) -> Result<usize, GitProviderManagerError> {
+        let projects = projects::Entity::find()
+            .filter(projects::Column::RepoOwner.eq(owner))
+            .filter(projects::Column::RepoName.eq(repo))
+            .all(self.db.as_ref())
+            .await?;
+
+        self.handle_branch_closed_for_projects(branch, reason, projects)
+            .await
+    }
+
+    /// Retire the preview of `branch` on each of the authenticated `projects`.
+    /// Returns how many teardowns were queued.
+    pub async fn handle_branch_closed_for_projects(
+        &self,
+        branch: String,
+        reason: temps_core::PreviewBranchCloseReason,
+        projects: Vec<projects::Model>,
+    ) -> Result<usize, GitProviderManagerError> {
+        if branch.is_empty() {
+            return Ok(0);
+        }
+
+        let mut queued = 0;
+        for project in projects {
+            if !Self::project_accepts_git_push(&project.source_type) {
+                continue;
+            }
+
+            let job = temps_core::PreviewBranchClosedJob {
+                project_id: project.id,
+                branch: branch.clone(),
+                reason,
+            };
+            match self
+                .queue_service
+                .send(temps_core::Job::PreviewBranchClosed(job))
+                .await
+            {
+                Ok(()) => {
+                    queued += 1;
+                    tracing::info!(
+                        project_id = project.id,
+                        branch = %branch,
+                        %reason,
+                        "Queued preview teardown for closed branch"
+                    );
+                }
+                Err(e) => tracing::error!(
+                    project_id = project.id,
+                    branch = %branch,
+                    %reason,
+                    "Failed to queue preview teardown for closed branch: {}",
+                    e
+                ),
+            }
+        }
+
+        Ok(queued)
+    }
+}
+
+/// The all-zeros (or missing) commit providers send for a deleted ref.
+fn is_null_commit(commit: &str) -> bool {
+    commit.chars().all(|c| c == '0')
+}
+
+/// The branch a null-SHA push deleted; `None` for a deleted tag.
+fn deleted_branch(branch: Option<String>, tag: Option<&str>) -> Option<String> {
+    if tag.is_some() {
+        return None;
+    }
+
+    branch.filter(|branch| !branch.is_empty())
 }
 
 #[cfg(test)]
@@ -280,61 +386,151 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn handle_push_event_ignores_null_sha_deletion() {
-        use sea_orm::{DatabaseBackend, MockDatabase};
-
-        // A MockDatabase with no queued results errors on the first query —
-        // proving the null-SHA guard returns before touching the database. The
-        // panic-on-send queue proves no deployment job is enqueued.
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
-
+    fn manager(
+        db: Arc<sea_orm::DatabaseConnection>,
+        queue_service: Arc<dyn JobQueue>,
+    ) -> GitProviderManager {
         let encryption_service = Arc::new(
             temps_core::EncryptionService::new(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             )
             .unwrap(),
         );
-        let queue_service = Arc::new(PanicOnSendJobQueue) as Arc<dyn JobQueue>;
         let config_service = create_test_config_service(db.clone());
-
-        let manager = GitProviderManager::new(
+        GitProviderManager::new(
             db,
             encryption_service,
             queue_service,
             config_service,
             Arc::new(temps_core::NoopAuditLogger),
-        );
+        )
+    }
 
-        // Full all-zeros null SHA (GitHub/GitLab branch deletion).
-        let result = manager
+    fn preview_teardowns(queue: &RecordingJobQueue) -> Vec<(i32, String)> {
+        queue
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|job| match job {
+                Job::PreviewBranchClosed(job) => {
+                    assert_eq!(
+                        job.reason,
+                        temps_core::PreviewBranchCloseReason::BranchDeleted
+                    );
+                    (job.project_id, job.branch.clone())
+                }
+                other => panic!("only preview teardowns should be queued, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A deleted branch arrives as a push to the all-zeros SHA (or, from some
+    /// providers, an empty one). It deploys nothing and retires the branch's
+    /// preview on each Git-sourced project of the repository.
+    #[tokio::test]
+    async fn deleting_a_branch_queues_preview_teardown_instead_of_a_deploy() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        for commit in ["0000000000000000000000000000000000000000", ""] {
+            let mut image_project = github_repo_project(2, None);
+            image_project.source_type = SourceType::DockerImage;
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![github_repo_project(1, None), image_project]])
+                    .into_connection(),
+            );
+            let queue = Arc::new(RecordingJobQueue::default());
+
+            manager(db, queue.clone())
+                .handle_push_event(
+                    "example-owner".into(),
+                    "example-repository".into(),
+                    Some("feature/login".into()),
+                    None,
+                    commit.into(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                preview_teardowns(&queue),
+                vec![(1, "feature/login".to_string())],
+                "commit {commit:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_tag_queues_nothing() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        // No queued query results: the guard must not touch the database.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let manager = manager(db, Arc::new(PanicOnSendJobQueue));
+
+        manager
             .handle_push_event(
-                "owner".into(),
-                "repo".into(),
-                Some("deleted-branch".into()),
+                "example-owner".into(),
+                "example-repository".into(),
                 None,
+                Some("v1.0.0".into()),
                 "0000000000000000000000000000000000000000".into(),
             )
-            .await;
-        assert!(
-            result.is_ok(),
-            "null-SHA push event should be ignored: {result:?}"
-        );
-
-        // Empty commit string is treated the same way.
-        let result = manager
-            .handle_push_event(
-                "owner".into(),
-                "repo".into(),
-                Some("b".into()),
+            .await
+            .unwrap();
+        let queued = manager
+            .handle_push_event_for_projects(
                 None,
+                Some("v1.0.0".into()),
                 String::new(),
+                vec![github_repo_project(1, None)],
             )
-            .await;
-        assert!(
-            result.is_ok(),
-            "empty-SHA push event should be ignored: {result:?}"
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
+    }
+
+    /// Secret-in-path receivers pass the projects that authenticated the
+    /// delivery; only those get a teardown.
+    #[tokio::test]
+    async fn authenticated_branch_deletion_retires_only_the_signing_projects() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let queue = Arc::new(RecordingJobQueue::default());
+
+        let queued = manager(db, queue.clone())
+            .handle_push_event_for_projects(
+                Some("feature/login".into()),
+                None,
+                "0000000000000000000000000000000000000000".into(),
+                vec![github_repo_project(3, None)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(queued, 1);
+        assert_eq!(
+            preview_teardowns(&queue),
+            vec![(3, "feature/login".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn closing_an_empty_branch_name_queues_nothing() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let queued = manager(db, Arc::new(PanicOnSendJobQueue))
+            .handle_branch_closed_for_projects(
+                String::new(),
+                temps_core::PreviewBranchCloseReason::PullRequestMerged { number: 4 },
+                vec![github_repo_project(1, None)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 
     /// Records every job it is sent.

@@ -108,8 +108,8 @@ async fn bitbucket_webhook_events(
     //   repo:push                           → existing push pipeline
     //   pullrequest:created                 → PR preview deploy pipeline
     //   pullrequest:updated                 → PR preview deploy pipeline
+    //   pullrequest:fulfilled / :rejected   → preview teardown
     // Discarded (non-fatal):
-    //   pullrequest:fulfilled / :rejected   → logged, no action in v1
     //   everything else                     → logged, discarded
     let is_push = event_key == "repo:push";
     let is_pr_open = event_key == "pullrequest:created" || event_key == "pullrequest:updated";
@@ -122,18 +122,6 @@ async fn bitbucket_webhook_events(
             "Ignoring unhandled Bitbucket event type"
         );
         // ALWAYS return 200 — no existence oracle.
-        return axum::Json(BitbucketWebhookResponse {
-            message: "processed".to_string(),
-        });
-    }
-
-    if is_pr_closed {
-        // pullrequest:fulfilled / :rejected — log and discard.
-        info!(
-            hook_uuid = %hook_uuid,
-            event_key = %event_key,
-            "Ignoring Bitbucket pullrequest closed/merged event (no deploy action in v1)"
-        );
         return axum::Json(BitbucketWebhookResponse {
             message: "processed".to_string(),
         });
@@ -249,6 +237,29 @@ async fn bitbucket_webhook_events(
         });
     }
 
+    if is_pr_closed {
+        let queued = match closed_pull_request(&payload, &event_key) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, authorized_projects)
+                .await
+                .unwrap_or_else(|e| {
+                    error!(
+                        hook_uuid = %hook_uuid,
+                        repo_owner = %repo_owner,
+                        repo_name = %repo_name,
+                        event_key = %event_key,
+                        "Failed to queue preview teardown for Bitbucket pull request: {:?}", e
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        return axum::Json(BitbucketWebhookResponse {
+            message: format!("Queued preview teardown for {} project(s)", queued),
+        });
+    }
+
     // Dispatch only to projects authenticated by the matched delivery token.
     let triggered = match state
         .git_provider_manager
@@ -326,6 +337,42 @@ fn extract_pr_branch_and_commit(payload: &serde_json::Value) -> (String, String)
     (branch_name, commit_sha)
 }
 
+/// The source branch of a `pullrequest:fulfilled` (merged) or
+/// `pullrequest:rejected` (declined) delivery, and which of the two. `None`
+/// for a pull request from a fork: its branch lives in another repository,
+/// so a same-named preview here belongs to a branch of this repository.
+fn closed_pull_request(
+    payload: &serde_json::Value,
+    event_key: &str,
+) -> Option<(String, temps_core::PreviewBranchCloseReason)> {
+    let pull_request = payload.get("pullrequest")?;
+    let repository = |side: &str| {
+        pull_request
+            .get(side)
+            .and_then(|s| s.get("repository"))
+            .and_then(|r| r.get("full_name"))
+            .and_then(|v| v.as_str())
+    };
+    let source = repository("source")?;
+    let destination = repository("destination")?;
+    if !source.eq_ignore_ascii_case(destination) {
+        return None;
+    }
+
+    let number = pull_request.get("id")?.as_i64()?;
+    let reason = match event_key {
+        "pullrequest:fulfilled" => {
+            temps_core::PreviewBranchCloseReason::PullRequestMerged { number }
+        }
+        "pullrequest:rejected" => {
+            temps_core::PreviewBranchCloseReason::PullRequestClosed { number }
+        }
+        _ => return None,
+    };
+    let (branch, _) = extract_pr_branch_and_commit(payload);
+    Some((branch, reason))
+}
+
 /// Extract the git ref and commit SHA from a Bitbucket push payload.
 ///
 /// Bitbucket push payload structure:
@@ -345,6 +392,8 @@ fn extract_pr_branch_and_commit(payload: &serde_json::Value) -> (String, String)
 ///
 /// Returns `(ref_string, commit_sha)` where `ref_string` is in
 /// `refs/heads/{branch}` form for branches or `refs/tags/{tag}` for tags.
+/// A deleted ref has `"new": null`; its name then comes from `old` and the
+/// commit SHA is empty.
 fn extract_push_ref_and_commit(payload: &serde_json::Value) -> (String, String) {
     let changes = payload
         .get("push")
@@ -353,7 +402,19 @@ fn extract_push_ref_and_commit(payload: &serde_json::Value) -> (String, String) 
 
     let first_change = changes.and_then(|arr| arr.first());
 
-    let new_ref = first_change.and_then(|c| c.get("new"));
+    let new_ref = first_change
+        .and_then(|c| c.get("new"))
+        .filter(|r| !r.is_null());
+    if new_ref.is_none() {
+        if let Some(old_ref) = first_change.and_then(|c| c.get("old")) {
+            let name = old_ref.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let git_ref = match old_ref.get("type").and_then(|v| v.as_str()) {
+                Some("tag") => format!("refs/tags/{}", name),
+                _ => format!("refs/heads/{}", name),
+            };
+            return (git_ref, String::new());
+        }
+    }
 
     let ref_type = new_ref
         .and_then(|r| r.get("type"))
@@ -669,5 +730,72 @@ mod tests {
             None
         };
         assert_eq!(branch, None);
+    }
+
+    fn pull_request(source_repository: &str) -> serde_json::Value {
+        serde_json::json!({
+            "pullrequest": {
+                "id": 31,
+                "source": {
+                    "branch": { "name": "feature/login" },
+                    "commit": { "hash": "abc123" },
+                    "repository": { "full_name": source_repository }
+                },
+                "destination": {
+                    "branch": { "name": "main" },
+                    "repository": { "full_name": "example-workspace/example-repository" }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn merged_and_declined_pull_requests_retire_their_branch() {
+        let payload = pull_request("example-workspace/example-repository");
+        assert_eq!(
+            closed_pull_request(&payload, "pullrequest:fulfilled"),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestMerged { number: 31 }
+            ))
+        );
+        assert_eq!(
+            closed_pull_request(&payload, "pullrequest:rejected"),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestClosed { number: 31 }
+            ))
+        );
+        assert_eq!(closed_pull_request(&payload, "pullrequest:updated"), None);
+    }
+
+    #[test]
+    fn a_pull_request_from_a_fork_retires_nothing() {
+        let payload = pull_request("someone-else/example-repository");
+        assert_eq!(closed_pull_request(&payload, "pullrequest:fulfilled"), None);
+    }
+
+    /// A deleted branch has `"new": null`; its name comes from `old` and the
+    /// empty commit marks it as a deletion downstream.
+    #[test]
+    fn a_deleted_branch_push_names_the_old_ref_with_no_commit() {
+        let payload = serde_json::json!({
+            "push": { "changes": [{
+                "new": null,
+                "old": { "type": "branch", "name": "feature/login", "target": { "hash": "abc123" } }
+            }]}
+        });
+        assert_eq!(
+            extract_push_ref_and_commit(&payload),
+            ("refs/heads/feature/login".to_string(), String::new())
+        );
+
+        let payload = serde_json::json!({
+            "push": { "changes": [{ "new": null, "old": { "type": "tag", "name": "v1.0.0" } }]}
+        });
+        assert_eq!(
+            extract_push_ref_and_commit(&payload),
+            ("refs/tags/v1.0.0".to_string(), String::new())
+        );
     }
 }

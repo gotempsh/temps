@@ -397,7 +397,10 @@ async fn reinstall_github_webhook_updates_the_existing_hook_in_place() {
         mock.assert_async().await;
     }
     let request = captured.lock().unwrap().clone().expect("hook update body");
-    assert_eq!(request["events"], serde_json::json!(["push"]));
+    assert_eq!(
+        request["events"],
+        serde_json::json!(["push", "pull_request"])
+    );
     assert_eq!(request["active"], serde_json::json!(true));
     assert!(
         request["config"]["url"]

@@ -349,6 +349,26 @@ async fn gitlab_webhook_events(
 
     let authorized_ids: Vec<i32> = authorized_projects.iter().map(|p| p.id).collect();
 
+    if event_type == "Merge Request Hook" {
+        let queued = match closed_merge_request(&payload) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, authorized_projects)
+                .await
+                .unwrap_or_else(|e| {
+                    error!(
+                        "Failed to queue preview teardown for GitLab merge request on {}/{} (projects {:?}): {:?}",
+                        repo_owner, repo_name, authorized_ids, e
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        return Ok(axum::Json(GitLabWebhookResponse {
+            message: format!("Queued preview teardown for {queued} project(s)"),
+        }));
+    }
+
     // Dispatch only to the projects that authenticated this delivery. Do NOT
     // use `handle_push_event(owner, repo, ..)`, which re-queries and deploys
     // every project sharing the repository path.
@@ -458,6 +478,30 @@ async fn gitlab_oauth_callback(
     );
 
     Ok(Redirect::to(&redirect_url))
+}
+
+/// The source branch of a merge request this delivery reports as closed or
+/// merged, and which of the two. `None` for any other event, and for a merge
+/// request from a fork: its branch lives in another project, so a same-named
+/// preview here belongs to a branch of this project, not to it.
+fn closed_merge_request(
+    payload: &serde_json::Value,
+) -> Option<(String, temps_core::PreviewBranchCloseReason)> {
+    let attributes = payload.get("object_attributes")?;
+    let source_project = attributes.get("source_project_id")?.as_i64()?;
+    let target_project = attributes.get("target_project_id")?.as_i64()?;
+    if source_project != target_project {
+        return None;
+    }
+
+    let number = attributes.get("iid")?.as_i64()?;
+    let reason = match attributes.get("action")?.as_str()? {
+        "close" => temps_core::PreviewBranchCloseReason::PullRequestClosed { number },
+        "merge" => temps_core::PreviewBranchCloseReason::PullRequestMerged { number },
+        _ => return None,
+    };
+    let branch = attributes.get("source_branch")?.as_str()?;
+    Some((branch.to_string(), reason))
 }
 
 #[cfg(test)]
@@ -571,5 +615,52 @@ mod tests {
             .decode(tok.strip_prefix("whsec_").unwrap())
             .expect("valid base64");
         assert_eq!(decoded.len(), 32);
+    }
+
+    fn merge_request_hook(action: &str, source_project_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "iid": 8,
+                "action": action,
+                "source_branch": "feature/login",
+                "target_branch": "main",
+                "source_project_id": source_project_id,
+                "target_project_id": 100
+            }
+        })
+    }
+
+    #[test]
+    fn closed_and_merged_merge_requests_retire_their_branch() {
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("close", 100)),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestClosed { number: 8 }
+            ))
+        );
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("merge", 100)),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestMerged { number: 8 }
+            ))
+        );
+    }
+
+    #[test]
+    fn other_merge_request_actions_and_forks_retire_nothing() {
+        for action in ["open", "update", "reopen", "approved"] {
+            assert_eq!(
+                super::closed_merge_request(&merge_request_hook(action, 100)),
+                None
+            );
+        }
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("merge", 200)),
+            None
+        );
+        assert_eq!(super::closed_merge_request(&serde_json::json!({})), None);
     }
 }

@@ -242,12 +242,11 @@ async fn gitea_webhook_events(
     // event type. This prevents a non-push event from returning a different
     // response ("event type not handled") that an unsigned sender could use
     // as an oracle to distinguish event types from signature failures.
-    let mut any_valid = false;
+    let mut authorized_projects = Vec::new();
 
     for project in &matching_projects {
         if verify_gitea_webhook_signature(project, &body, signature, &state).await {
-            any_valid = true;
-            break;
+            authorized_projects.push(project.clone());
         } else {
             warn!(
                 delivery_id = delivery_id,
@@ -257,7 +256,7 @@ async fn gitea_webhook_events(
         }
     }
 
-    if !any_valid {
+    if authorized_projects.is_empty() {
         // SECURITY: Return HTTP 200 (not 401/403) so the caller cannot
         // determine whether a signature check was performed or whether the
         // project exists (ADR Decision 4, matching gitlab.rs:285).
@@ -273,7 +272,30 @@ async fn gitea_webhook_events(
     }
 
     // Signature is valid. NOW branch on event type.
-    // Non-push events are accepted (200) and logged but not dispatched.
+    // A closed pull request retires its branch's preview on the projects that
+    // signed the delivery.
+    if event_type == "pull_request" {
+        if let Some((branch, reason)) = super::pull_request::closed_pull_request(&body) {
+            if let Err(e) = state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, authorized_projects)
+                .await
+            {
+                error!(
+                    delivery_id = delivery_id,
+                    repo_owner = repo_owner,
+                    repo_name = repo_name,
+                    "Failed to queue preview teardown for Gitea pull request: {:?}",
+                    e
+                );
+            }
+        }
+        return axum::Json(GiteaWebhookResponse {
+            message: "processed".to_string(),
+        });
+    }
+
+    // Other non-push events are accepted (200) and logged but not dispatched.
     if event_type != "push" {
         info!(
             delivery_id = delivery_id,

@@ -14,6 +14,7 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::services::environment_service::EnvironmentService;
 use crate::services::environment_teardown::EnvironmentTeardownService;
 use crate::services::ingress_service::IngressService;
+use crate::services::preview_cleanup::PreviewCleanupService;
 use crate::services::secret_service::SecretService;
 use crate::EnvVarService;
 
@@ -81,6 +82,26 @@ impl TempsPlugin for EnvironmentsPlugin {
             context.register_service(secret_service);
             context.register_service(Arc::new(IngressService::new(db.clone())));
             tracing::debug!("Environments plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Built here, not in `register_services`: the deployment canceller
+            // and container cleaner are registered by the deployments plugin.
+            let cleanup = Arc::new(PreviewCleanupService::new(
+                Self::environment_teardown(context),
+                context.require_service::<dyn temps_core::AuditLogger>(),
+            ));
+            let receiver = context
+                .require_service::<dyn temps_core::JobQueue>()
+                .subscribe();
+            tokio::spawn(cleanup.run(receiver));
+            tracing::debug!("Preview cleanup listening for closed branches");
             Ok(())
         })
     }

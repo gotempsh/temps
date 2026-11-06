@@ -1702,6 +1702,22 @@ impl EnvironmentService {
         )))
     }
 
+    /// The project's live preview environments that track `branch`.
+    pub async fn branch_previews(
+        &self,
+        project_id: i32,
+        branch: &str,
+    ) -> Result<Vec<environments::Model>, EnvironmentError> {
+        Ok(environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::IsPreview.eq(true))
+            .filter(environments::Column::Branch.eq(branch))
+            .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::Id)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
     /// Soft-delete an environment by setting its `deleted_at` timestamp.
     ///
     /// The environment row is preserved for historical data (deployments, analytics)

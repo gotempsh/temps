@@ -353,6 +353,9 @@ async fn github_webhook_events(
             info!("Push event received");
             handle_push_event(&state, webhook_event_clone, push_event, installation_id).await;
         }
+        WebhookEventPayload::PullRequest(_) => {
+            handle_pull_request_event(&state, webhook_event_clone, &body, installation_id).await;
+        }
         WebhookEventPayload::InstallationRepositories(installation_repos) => {
             info!("Installation repositories event received");
             handle_installation_repositories(&state, installation_repos, installation_id).await;
@@ -423,6 +426,47 @@ async fn handle_push_event(
         error!(
             "Failed to handle push event via git provider manager: {:?}",
             e
+        );
+    }
+}
+
+/// Retire the preview of a pull request's branch once the pull request is
+/// closed or merged.
+async fn handle_pull_request_event(
+    state: &Arc<AppState>,
+    webhook_event: WebhookEvent,
+    body: &[u8],
+    installation_id: i32,
+) {
+    let Some((branch, reason)) = super::pull_request::closed_pull_request(body) else {
+        return;
+    };
+    let Some(repo) = webhook_event.repository else {
+        error!("Pull request webhook event missing repository field, skipping");
+        return;
+    };
+    let Some(repo_owner) = repo.owner.map(|owner| owner.login) else {
+        error!("Pull request webhook event repository missing owner field, skipping");
+        return;
+    };
+
+    if state
+        .github_service
+        .get_installation_by_id(installation_id)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    if let Err(e) = state
+        .git_provider_manager
+        .handle_branch_closed(&repo_owner, &repo.name, branch, reason)
+        .await
+    {
+        error!(
+            "Failed to queue preview teardown for {}/{} ({}): {:?}",
+            repo_owner, repo.name, reason, e
         );
     }
 }
@@ -561,6 +605,34 @@ async fn github_repo_webhook_events(
     }
 
     let project_ids: Vec<i32> = projects.iter().map(|p| p.id).collect();
+
+    if event_type == "pull_request" {
+        let queued = match super::pull_request::closed_pull_request(&body) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, projects)
+                .await
+                .map_err(|e| {
+                    error!(
+                        delivery_id = delivery_id,
+                        "Failed to queue preview teardown for GitHub repository webhook on {}/{} (projects {:?}): {}",
+                        owner,
+                        repo,
+                        project_ids,
+                        e
+                    );
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Webhook Processing Failed")
+                        .with_detail(format!(
+                            "Failed to queue preview teardown for GitHub pull request delivery {delivery_id} on {owner}/{repo}"
+                        ))
+                })?,
+            None => 0,
+        };
+        return Ok(Json(EventResponse {
+            message: format!("Queued preview teardown for {queued} project(s)"),
+        }));
+    }
 
     if event_type != "push" {
         info!(
