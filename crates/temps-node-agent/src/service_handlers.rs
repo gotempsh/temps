@@ -280,6 +280,35 @@ pub async fn create_service(
     State(state): State<Arc<AgentState>>,
     Json(request): Json<ServiceCreateRequest>,
 ) -> impl IntoResponse {
+    let service_name = request.name.clone();
+    // Run the create as its own task. When the caller gives up (its request
+    // timeout during a long image pull, a dropped connection), the server
+    // drops this handler future; a create running inside it would stop at
+    // its next await and never remove the volumes it had made. The task
+    // finishes regardless, cleanup included.
+    match tokio::spawn(run_service_create(state, request)).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!(service = %service_name, error = %e, "Service create task ended abnormally");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Creating service '{}' ended before it finished: {}",
+                    service_name, e
+                ),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Create, start and report one service container, removing what this
+/// attempt made on the node when a step fails. Runs detached from the request
+/// (see [`create_service`]).
+async fn run_service_create(
+    state: Arc<AgentState>,
+    request: ServiceCreateRequest,
+) -> axum::response::Response {
     tracing::info!(
         service = %request.name,
         service_type = %request.service_type,
@@ -3184,5 +3213,134 @@ mod failed_create_cleanup_tests {
             "Container created but failed to start: x. Could not remove what this attempt \
              created on the node: volume 'postgres-orders_data' (in use)"
         );
+    }
+
+    /// A stub Docker daemon for the create path: every volume is missing, the
+    /// image pull hangs until the test releases it and then fails, and each
+    /// volume removal is reported on `removed`.
+    struct StubDaemon {
+        pull_started: tokio::sync::Notify,
+        release_pull: tokio::sync::Notify,
+        removed: tokio::sync::mpsc::Sender<String>,
+    }
+
+    async fn stub_daemon(
+        axum::extract::State(daemon): axum::extract::State<std::sync::Arc<StubDaemon>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+    ) -> axum::response::Response {
+        use axum::http::{Method, StatusCode};
+        use axum::response::IntoResponse;
+        // A versioned client prefixes the path with the API version (`v1.47/`).
+        let path = uri.path().trim_start_matches('/');
+        let path = match path.split_once('/') {
+            Some((version, rest))
+                if version.starts_with('v')
+                    && version[1..].chars().all(|c| c.is_ascii_digit() || c == '.') =>
+            {
+                rest
+            }
+            _ => path,
+        };
+        let message = |text: &str| axum::Json(serde_json::json!({ "message": text }));
+        match (method, path) {
+            (Method::POST, "volumes/create") => (
+                StatusCode::CREATED,
+                axum::Json(serde_json::json!({
+                    "Name": "created", "Driver": "local", "Mountpoint": "/stub",
+                    "Labels": {}, "Scope": "local", "Options": {}
+                })),
+            )
+                .into_response(),
+            (Method::GET, p) if p.starts_with("volumes/") => {
+                (StatusCode::NOT_FOUND, message("no such volume")).into_response()
+            }
+            (Method::POST, "images/create") => {
+                daemon.pull_started.notify_one();
+                daemon.release_pull.notified().await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    message("registry unreachable"),
+                )
+                    .into_response()
+            }
+            (Method::DELETE, p) if p.starts_with("volumes/") => {
+                let _ = daemon.removed.try_send(p["volumes/".len()..].to_string());
+                StatusCode::NO_CONTENT.into_response()
+            }
+            _ => (StatusCode::NOT_FOUND, message("not stubbed")).into_response(),
+        }
+    }
+
+    /// Regression: the control plane gives up on a create after its request
+    /// timeout, which a long image pull outlasts, and the server then drops
+    /// the handler mid-pull. The create must still finish and remove the
+    /// volume it made, or a retry under the same name finds that volume and
+    /// keeps it as an earlier service's.
+    #[tokio::test]
+    async fn a_create_abandoned_by_its_caller_still_removes_its_volume() {
+        let (removed_tx, mut removed) = tokio::sync::mpsc::channel(4);
+        let daemon = std::sync::Arc::new(StubDaemon {
+            pull_started: tokio::sync::Notify::new(),
+            release_pull: tokio::sync::Notify::new(),
+            removed: removed_tx,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stub daemon");
+        let address = listener.local_addr().expect("stub daemon address");
+        let app = axum::Router::new()
+            .fallback(stub_daemon)
+            .with_state(daemon.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let docker = bollard::Docker::connect_with_http(
+            &format!("http://{address}"),
+            30,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("client for the stub daemon");
+        let state = crate::test_engines::agent_state_with_docker(
+            crate::test_engines::service_runtime(),
+            crate::test_engines::plugin_builder(),
+            docker,
+        );
+        let volume = unique("postgres-abandoned_data");
+        let request = crate::ServiceCreateRequest {
+            name: unique("postgres-abandoned"),
+            service_type: "postgres".to_string(),
+            image: "stub/postgres:1".to_string(),
+            environment: HashMap::new(),
+            port_mappings: Vec::new(),
+            volumes: HashMap::from([(volume.clone(), "/var/lib/postgresql/data".to_string())]),
+            network: None,
+            command: None,
+            resource_limits: None,
+        };
+
+        let handler = tokio::spawn(async move {
+            use axum::response::IntoResponse;
+            super::create_service(axum::extract::State(state), axum::Json(request))
+                .await
+                .into_response()
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            daemon.pull_started.notified(),
+        )
+        .await
+        .expect("the create reaches the image pull");
+        // What the server does when the caller hangs up: drop the handler.
+        handler.abort();
+        let _ = handler.await;
+        daemon.release_pull.notify_one();
+
+        let removed_volume =
+            tokio::time::timeout(std::time::Duration::from_secs(10), removed.recv())
+                .await
+                .expect("the abandoned create removes the volume it made")
+                .expect("stub daemon is still running");
+        assert_eq!(removed_volume, volume);
+        server.abort();
     }
 }

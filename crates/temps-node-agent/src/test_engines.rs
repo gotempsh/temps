@@ -149,6 +149,21 @@ pub(crate) fn agent_state(
     service_runtime: Arc<dyn NodeServiceRuntime>,
     plugin_builder: Arc<dyn PluginContainerBuilder>,
 ) -> Arc<AgentState> {
+    agent_state_with_docker(
+        service_runtime,
+        plugin_builder,
+        Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+            .expect("build an unused Docker client"),
+    )
+}
+
+/// Agent state whose Docker client is `docker` (a stub daemon, for a test
+/// that drives the service paths). The deployer points at nothing.
+pub(crate) fn agent_state_with_docker(
+    service_runtime: Arc<dyn NodeServiceRuntime>,
+    plugin_builder: Arc<dyn PluginContainerBuilder>,
+    docker: Docker,
+) -> Arc<AgentState> {
     let remote = Arc::new(
         temps_deployer::remote::RemoteNodeDeployer::new(
             "http://127.0.0.1:1".into(),
@@ -162,10 +177,7 @@ pub(crate) fn agent_state(
         plugin_builder,
         container_deployer: remote.clone(),
         image_builder: remote,
-        docker: Some(
-            Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
-                .expect("build an unused Docker client"),
-        ),
+        docker: Some(docker),
         overlay_bridge_address: Default::default(),
         overlay_peers: Default::default(),
         platform: Default::default(),
