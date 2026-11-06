@@ -32,6 +32,15 @@ use tokio::time::{sleep, Duration};
 
 mod replica;
 
+/// An image a node holds under a tag, resolved for a platform the node does
+/// not run.
+struct NodeImagePlatformMismatch {
+    /// The platform the node resolves the tag to.
+    resolved: String,
+    /// The platform the node runs.
+    node: String,
+}
+
 fn verify_worker_image_platform(
     image: &str,
     built: &str,
@@ -2264,15 +2273,35 @@ impl DeployImageJob {
         // Check if image already exists on the remote node
         match remote.image_exists(image_tag).await {
             Ok(true) => {
-                self.log(
-                    context,
-                    format!(
-                        "Image '{}' already exists on node '{}'",
-                        image_tag, node_name
-                    ),
-                )
-                .await?;
-                return Ok(());
+                // The tag alone says nothing about the architecture: a node
+                // that cached it for another platform (an earlier single-arch
+                // push, a tag re-pointed since) would start the container
+                // only to fail with `exec format error`. Replace that copy.
+                match self.node_image_platform_mismatch(image_tag, remote).await {
+                    None => {
+                        self.log(
+                            context,
+                            format!(
+                                "Image '{}' already exists on node '{}'",
+                                image_tag, node_name
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Some(mismatch) => {
+                        self.log_at(
+                            context,
+                            LogLevel::Warning,
+                            format!(
+                                "WARNING: Image '{}' already exists on node '{}' as {}, but the \
+                                 node runs {}; replacing it",
+                                image_tag, node_name, mismatch.resolved, mismatch.node
+                            ),
+                        )
+                        .await?;
+                    }
+                }
             }
             Ok(false) => {
                 self.log(
@@ -2354,14 +2383,16 @@ impl DeployImageJob {
                     ),
                 )
                 .await?;
+                self.transfer_image_via_import(
+                    image_tag,
+                    Some(&verified_image_id),
+                    remote,
+                    node_name,
+                    context,
+                )
+                .await?;
                 return self
-                    .transfer_image_via_import(
-                        image_tag,
-                        Some(&verified_image_id),
-                        remote,
-                        node_name,
-                        context,
-                    )
+                    .verify_imported_image_platform(image_tag, remote, node_name, context)
                     .await;
             }
             DeployImageSource::ControlPlaneLocal => {
@@ -2410,38 +2441,48 @@ impl DeployImageJob {
         node_name: &str,
         context: &WorkflowContext,
     ) -> Result<(), WorkflowError> {
-        let node_platform = match remote.platform() {
-            Some(platform) => platform,
-            None => match remote.refresh_platform().await {
-                Some(platform) => platform,
-                None => return Ok(()),
-            },
-        };
-        let imported = match remote.inspect_image(image_tag).await {
-            Ok(imported) => imported,
-            Err(error) => {
-                tracing::debug!(
-                    image = %image_tag,
-                    node = %node_name,
-                    %error,
-                    "Could not inspect the imported image to verify its platform"
-                );
-                return Ok(());
-            }
-        };
-        if temps_deployer::platform::platforms_match(&imported.platform, &node_platform) {
+        let Some(NodeImagePlatformMismatch { resolved, node }) =
+            self.node_image_platform_mismatch(image_tag, remote).await
+        else {
             return Ok(());
-        }
+        };
         let msg = format!(
             "Image '{image_tag}' was transferred to node '{node_name}', which runs \
-             {node_platform}, but the node resolves it as {}. The image's {node_platform} \
+             {node}, but the node resolves it as {resolved}. The image's {node} \
              variant did not arrive with it; push the image to a registry the node can pull \
-             from, or restrict this environment to {} nodes with target nodes/labels.",
-            imported.platform, imported.platform
+             from, or restrict this environment to {resolved} nodes with target nodes/labels."
         );
         self.log_at(context, LogLevel::Error, format!("ERROR: {msg}"))
             .await?;
         Err(WorkflowError::JobExecutionFailed(msg))
+    }
+
+    /// The platform the node resolves `image_tag` to, when it is not one the
+    /// node runs. `None` when they match, or when the node cannot report its
+    /// platform or inspect the image (an older agent), which is let through.
+    async fn node_image_platform_mismatch(
+        &self,
+        image_tag: &str,
+        remote: &Arc<temps_deployer::remote::RemoteNodeDeployer>,
+    ) -> Option<NodeImagePlatformMismatch> {
+        let node = match remote.platform() {
+            Some(platform) => platform,
+            None => remote.refresh_platform().await?,
+        };
+        let resolved = match remote.inspect_image(image_tag).await {
+            Ok(image) => image.platform,
+            Err(error) => {
+                tracing::debug!(
+                    image = %image_tag,
+                    node = %remote.node_name(),
+                    %error,
+                    "Could not inspect the image on the node to verify its platform"
+                );
+                return None;
+            }
+        };
+        (!temps_deployer::platform::platforms_match(&resolved, &node))
+            .then_some(NodeImagePlatformMismatch { resolved, node })
     }
 
     /// Save `image_tag` from the control plane's Docker (`docker save`) and
@@ -8250,8 +8291,23 @@ mod tests {
         Arc<temps_deployer::remote::RemoteNodeDeployer>,
         AgentRequestLog,
     ) {
+        spawn_recording_agent_holding(pull_response, false, vec![imported_platform]).await
+    }
+
+    /// [`spawn_recording_agent`] whose node answers `/exists` with
+    /// `image_exists` and resolves the image, on its n-th inspect, as
+    /// `inspected_platforms[n]` (the last entry repeats).
+    async fn spawn_recording_agent_holding(
+        pull_response: (&'static str, &'static str),
+        image_exists: bool,
+        inspected_platforms: Vec<&'static str>,
+    ) -> (
+        Arc<temps_deployer::remote::RemoteNodeDeployer>,
+        AgentRequestLog,
+    ) {
         let requests: AgentRequestLog = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
+        let inspections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // More slots than any expected sequence needs, so an unexpected extra
         // request is still recorded rather than refused.
         let agent_url = spawn_sequenced_agent(6, move |request_text| {
@@ -8261,13 +8317,22 @@ mod tests {
                 .expect("agent request log")
                 .push(kind.clone());
             match kind.as_str() {
-                "exists" => ("200 OK", r#"{"success":true,"data":false}"#.to_string()),
+                "exists" => (
+                    "200 OK",
+                    format!(r#"{{"success":true,"data":{image_exists}}}"#),
+                ),
                 "pull" => (pull_response.0, pull_response.1.to_string()),
                 "import" => (
                     "200 OK",
                     r#"{"success":true,"data":"sha256:imported"}"#.to_string(),
                 ),
                 "inspect" => {
+                    let nth = inspections.fetch_add(1, Ordering::SeqCst);
+                    let imported_platform = inspected_platforms
+                        .get(nth)
+                        .or(inspected_platforms.last())
+                        .copied()
+                        .unwrap_or("linux/amd64");
                     let (os, architecture) = imported_platform
                         .split_once('/')
                         .unwrap_or(("linux", "amd64"));
@@ -8512,14 +8577,119 @@ mod tests {
 
         assert_agent_requests(
             &requests,
-            &["exists", "pull", "import"],
-            "a failed registry pull must fall back to importing the verified control-plane copy",
+            &["exists", "pull", "import", "inspect"],
+            "a failed registry pull must fall back to importing the verified control-plane copy, \
+             then check the node can run it",
         );
         result.expect("a failed registry pull must fall back to the verified control-plane copy");
         assert!(
             save_image_called.load(Ordering::SeqCst),
             "expected the fallback to export the control plane's copy"
         );
+    }
+
+    /// The registry fallback imports the control plane's copy; a copy without
+    /// the node's architecture is refused like any other import, instead of
+    /// failing at start with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_refuses_a_fallback_import_the_node_cannot_run() {
+        let (remote, requests) = spawn_recording_agent_resolving(PULL_FAILS, "linux/arm64").await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, Some("sha256:local"));
+
+        let message = job
+            .ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect_err("a fallback import the node resolves for another architecture is refused")
+            .to_string();
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "pull", "import", "inspect"],
+            "the fallback import is inspected on the node",
+        );
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("linux/amd64"), "{message}");
+        assert!(message.contains("linux/arm64"), "{message}");
+    }
+
+    /// A node that already holds the tag for its own architecture keeps it:
+    /// nothing is pulled or imported.
+    #[tokio::test]
+    async fn ensure_image_on_remote_reuses_a_cached_image_the_node_can_run() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/amd64"]).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-cached".to_string(), 1, 1, 1);
+
+        job.ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("a cached image for the node's architecture is reused");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect"],
+            "a cached image the node can run is only inspected",
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A node that cached the tag for another architecture (an earlier
+    /// single-arch push) gets the image again rather than starting a
+    /// container that dies with `exec format error`.
+    #[tokio::test]
+    async fn ensure_image_on_remote_replaces_a_cached_image_for_another_architecture() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_FAILS, true, vec!["linux/arm64", "linux/amd64"])
+                .await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let job = uploaded_image_job(
+            Some(DeployImageSource::ControlPlaneLocal),
+            Some(RecordingImageBuilder {
+                save_image_called: save_image_called.clone(),
+                has_image: true,
+            }),
+        );
+        let context = crate::test_utils::create_test_context("wf-stale".to_string(), 1, 1, 1);
+
+        job.ensure_image_on_remote(UPLOADED_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("a cached image for another architecture is replaced");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "import", "inspect"],
+            "a cached image for another architecture is re-imported and checked again",
+        );
+        assert!(save_image_called.load(Ordering::SeqCst));
+    }
+
+    /// A cached registry image for another architecture is pulled again, so
+    /// the node resolves the tag for its own platform.
+    #[tokio::test]
+    async fn ensure_image_on_remote_pulls_again_over_a_cached_image_for_another_architecture() {
+        let (remote, requests) =
+            spawn_recording_agent_holding(PULL_OK, true, vec!["linux/arm64"]).await;
+        let save_image_called = Arc::new(AtomicBool::new(false));
+        let (job, context) = registry_fallback_job(&save_image_called, None);
+
+        job.ensure_image_on_remote(REGISTRY_IMAGE, &remote, "worker-1", &context, None, Some(1))
+            .await
+            .expect("the registry pull replaces the cached image");
+
+        assert_agent_requests(
+            &requests,
+            &["exists", "inspect", "pull"],
+            "a cached registry image for another architecture is pulled again",
+        );
+        assert!(!save_image_called.load(Ordering::SeqCst));
     }
 
     /// The tag was re-pointed on the control plane after this deployment
