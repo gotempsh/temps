@@ -542,9 +542,9 @@ function ProviderSetupDialog({
         connector.status === 'ready'
           ? `${provider?.name ?? 'Tunnel'} created. The worker connects within a few seconds.`
           : `${provider?.name ?? 'Tunnel'} saved`,
-        connector.host_suffix
+        connector.domain
           ? {
-              description: `Choose Publish environments on the tunnel to give environments names such as app-${connector.host_suffix}.${connector.domain}.`,
+              description: `No environment has a name through it yet. Choose Publish environments on the tunnel to give them names such as ${suffixedHost('app', connector.host_suffix, connector.domain)}.`,
             }
           : undefined
       )
@@ -953,8 +953,8 @@ function LabelLayoutChoice({
           <code>{suffixedHost('app', label, zone)}</code>
           <span className="text-xs text-muted-foreground">
             One level below {zone}: Cloudflare&apos;s free certificate covers
-            it. The tunnel serves {zone}. Environments get these names once you
-            choose Publish environments on the tunnel, after creating it.
+            it. The tunnel serves {zone}. Environments get these names only once
+            you choose Publish environments on the tunnel, after creating it.
           </span>
         </span>
       </Label>

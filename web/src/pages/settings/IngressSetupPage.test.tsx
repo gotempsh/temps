@@ -212,27 +212,41 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   expect(
     screen.queryByText('HTTPS fails without Advanced Certificate Manager')
   ).toBeNull()
-  // Setup alone publishes no environment, and says so.
+  // Setup alone names no environment, and says so.
   expect(
-    screen.getByText(/Creating the tunnel publishes no environment yet/)
+    screen.getByText(/Creating the tunnel gives no environment a name yet/)
   ).toBeTruthy()
   fireEvent.change(screen.getByLabelText('Label'), {
     target: { value: 'lab.eu' },
   })
   expect(
-    screen.getByText('Use 1-20 letters, digits or hyphens, with no dots.')
+    screen.getByText(
+      'Use 1-20 letters, digits or single hyphens, with no dots.'
+    )
   ).toBeTruthy()
   // Hostnames read as a pattern, with a concrete example.
   fireEvent.click(
     screen.getByRole('radio', { name: /<app-name>\.example\.com/ })
   )
   expect(screen.getByText('shop.example.com')).toBeTruthy()
+  // Without a label, setup still names no environment, and still says so.
+  expect(
+    screen.getByText(/Creating the tunnel gives no environment a name yet/)
+  ).toBeTruthy()
 
   const create = screen.getByRole('button', { name: 'Create tunnel' })
   await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
   fireEvent.click(create)
 
   await screen.findByText('Visitors can reach apps under example.com')
+  // Every layout points to the step that names environments.
+  const done = screen.getByText(/No environment gets a name until you do/)
+  expect(done.textContent).toContain('shop.example.com')
+  expect(
+    screen
+      .getByRole('link', { name: 'publish environments through this tunnel' })
+      .getAttribute('href')
+  ).toBe('/domains/tunnel/*.example.com')
   expect(screen.getByText('Connected on worker-a')).toBeTruthy()
   expect(screen.getByText('4 connections to Cloudflare')).toBeTruthy()
   expect(posted).toEqual([
@@ -276,7 +290,7 @@ test('a one-level label creates the tunnel with its suffix and points to publish
     },
   })
   // The names are not live yet: the panel links to the step that makes them.
-  const done = screen.getByText(/Nothing is published until you do/)
+  const done = screen.getByText(/No environment gets a name until you do/)
   expect(done.textContent).toContain('shop-lab.example.com')
   const link = screen.getByRole('link', {
     name: 'publish environments through this tunnel',

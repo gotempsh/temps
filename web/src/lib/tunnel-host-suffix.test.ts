@@ -19,6 +19,8 @@ describe('tunnel host suffix', () => {
     expect(hostSuffixError('-lab')).toBeDefined()
     expect(hostSuffixError('lab-')).toBeDefined()
     expect(hostSuffixError('lab_1')).toBeDefined()
+    expect(hostSuffixError('a--b')).toBeDefined()
+    expect(hostSuffixError('a-b-c')).toBeUndefined()
     expect(hostSuffixError('a'.repeat(MAX_HOST_SUFFIX_LEN))).toBeUndefined()
     expect(hostSuffixError('a'.repeat(MAX_HOST_SUFFIX_LEN + 1))).toBeDefined()
   })

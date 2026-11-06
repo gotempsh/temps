@@ -38,9 +38,11 @@ use temps_core::public_hostname::{environment_label, hashed_label, single_dns_la
 pub const MAX_HOST_SUFFIX_LEN: usize = 20;
 
 /// `suffix` as a tunnel's `host_suffix`: lowercase letters, digits and
-/// hyphens, starting and ending with a letter or digit, at most
-/// [`MAX_HOST_SUFFIX_LEN`] characters. `Ok(None)` for nothing (or only
-/// spaces). The error says what is wrong with it.
+/// single hyphens, starting and ending with a letter or digit, at most
+/// [`MAX_HOST_SUFFIX_LEN`] characters. Exactly the shape a DNS label keeps
+/// as-is, so every name ends in the suffix the operator typed (a `--`
+/// would be collapsed, and is reserved for IDN labels anyway). `Ok(None)`
+/// for nothing (or only spaces). The error says what is wrong with it.
 pub fn normalize_host_suffix(suffix: Option<&str>) -> Result<Option<String>, String> {
     let Some(suffix) = suffix.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -51,12 +53,13 @@ pub fn normalize_host_suffix(suffix: Option<&str>) -> Result<Option<String>, Str
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !suffix.starts_with('-')
-        && !suffix.ends_with('-');
+        && !suffix.ends_with('-')
+        && !suffix.contains("--");
     if !valid {
         return Err(format!(
             "The hostname suffix '{suffix}' must be 1-{MAX_HOST_SUFFIX_LEN} lowercase letters, \
-             digits or hyphens, starting and ending with a letter or digit (for example 'lab', \
-             which names hosts like shop-production-lab.example.com)."
+             digits or single hyphens, starting and ending with a letter or digit (for example \
+             'lab', which names hosts like shop-production-lab.example.com)."
         ));
     }
     Ok(Some(suffix))
@@ -1841,10 +1844,40 @@ mod tests {
             "la b",
             "l\u{e1}b",
             "lab_1",
+            "a--b",
             &"x".repeat(21),
         ] {
             let error = normalize_host_suffix(Some(bad)).unwrap_err();
             assert!(error.contains("hostname suffix"), "{bad}: {error}");
+        }
+    }
+
+    /// Whatever the server accepts as a suffix ends every name it generates,
+    /// verbatim: the natural name and the fallback, for short and long labels.
+    #[test]
+    fn every_accepted_suffix_ends_the_names_it_generates() {
+        let max = "s".repeat(MAX_HOST_SUFFIX_LEN);
+        for raw in ["lab", "a-b", "x1-y2-z3", "9", max.as_str()] {
+            let suffix = normalize_host_suffix(Some(raw)).unwrap().expect("a suffix");
+            let tail = format!("-{suffix}.example.com");
+            for env_label in ["shop", "shop-production", &"a".repeat(60)] {
+                let label = tunnel_label(env_label, Some(&suffix));
+                let natural = natural_host(&label, "example.com");
+                let fallback = fallback_host(&label, Some(&suffix), "example.com", 7);
+                for host in [&natural, &fallback] {
+                    assert!(host.ends_with(&tail), "{raw} / {env_label}: {host}");
+                    let first = host.split('.').next().unwrap_or_default();
+                    assert!(first.len() <= 63, "{host}");
+                }
+                assert_ne!(natural, fallback);
+                assert!(is_generated_name(
+                    &fallback,
+                    &label,
+                    Some(&suffix),
+                    "example.com",
+                    7
+                ));
+            }
         }
     }
 }
