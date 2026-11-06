@@ -60,7 +60,7 @@ export function DNSConfigurationHelper() {
   // Cloudflare Tunnel - domains managed externally
   if (isUsingCloudflare()) {
     return (
-      <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
+      <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
         <Cloud className="h-4 w-4 text-purple-600" />
         <AlertTitle>Cloudflare Tunnel Active</AlertTitle>
         <AlertDescription className="space-y-2 mt-2">
@@ -71,19 +71,19 @@ export function DNSConfigurationHelper() {
           <div className="flex items-center gap-2 mt-3">
             <Badge
               variant="secondary"
-              className="bg-purple-100 text-purple-800"
+              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
             >
               Automatic SSL
             </Badge>
             <Badge
               variant="secondary"
-              className="bg-purple-100 text-purple-800"
+              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
             >
               Managed DNS
             </Badge>
             <Badge
               variant="secondary"
-              className="bg-purple-100 text-purple-800"
+              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
             >
               DDoS protection
             </Badge>
@@ -94,7 +94,7 @@ export function DNSConfigurationHelper() {
               href="https://dash.cloudflare.com"
               target="_blank"
               rel="noopener noreferrer"
-              className="text-purple-600 hover:text-purple-700 underline"
+              className="text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 underline"
             >
               Cloudflare Dashboard
             </a>
@@ -154,7 +154,7 @@ export function DNSConfigurationHelper() {
   // Local mode - needs external setup
   if (accessMode === 'local') {
     return (
-      <Alert className="border-yellow-200 bg-yellow-50/50 dark:bg-yellow-950/10">
+      <Alert className="border-yellow-200 dark:border-yellow-900 bg-yellow-50/50 dark:bg-yellow-950/10">
         <Server className="h-4 w-4 text-yellow-600" />
         <AlertTitle>Local Development Mode</AlertTitle>
         <AlertDescription className="space-y-2 mt-2">
@@ -189,11 +189,11 @@ export function DNSConfigurationHelper() {
     const getAccessModeBadgeColor = () => {
       switch (accessMode) {
         case 'direct':
-          return 'bg-green-100 text-green-800 border-green-200'
+          return 'bg-green-100 dark:bg-green-950/40 text-green-800 dark:text-green-400 border-green-200 dark:border-green-900'
         case 'nat':
-          return 'bg-orange-100 text-orange-800 border-orange-200'
+          return 'bg-orange-100 dark:bg-orange-950/40 text-orange-800 dark:text-orange-400 border-orange-200 dark:border-orange-900'
         default:
-          return 'bg-blue-100 text-blue-800 border-blue-200'
+          return 'bg-blue-100 dark:bg-blue-950/40 text-blue-800 dark:text-blue-400 border-blue-200 dark:border-blue-900'
       }
     }
 
@@ -232,7 +232,7 @@ export function DNSConfigurationHelper() {
             </div>
 
             {needsPortForwarding() && (
-              <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/10">
+              <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/10">
                 <Router className="h-4 w-4 text-orange-600" />
                 <AlertDescription>
                   <strong>Port Forwarding Required:</strong> Ensure ports 80
@@ -284,7 +284,7 @@ export function DNSConfigurationHelper() {
           </div>
 
           {/* TTL Recommendation */}
-          <div className="p-3 bg-blue-50/50 dark:bg-blue-950/10 rounded-lg border border-blue-200">
+          <div className="p-3 bg-blue-50/50 dark:bg-blue-950/10 rounded-lg border border-blue-200 dark:border-blue-900">
             <div className="flex gap-2">
               <Info className="h-4 w-4 text-blue-600 mt-0.5" />
               <div className="space-y-1 text-sm">
@@ -314,7 +314,7 @@ export function DNSConfigurationHelper() {
           </div>
 
           {/* SSL Certificate Note */}
-          <div className="flex items-start gap-2 p-3 bg-green-50/50 dark:bg-green-950/10 rounded-lg border border-green-200">
+          <div className="flex items-start gap-2 p-3 bg-green-50/50 dark:bg-green-950/10 rounded-lg border border-green-200 dark:border-green-900">
             <CheckCircle2 className="h-4 w-4 text-green-600 mt-0.5" />
             <div className="text-sm">
               <p className="text-green-900 dark:text-green-100">

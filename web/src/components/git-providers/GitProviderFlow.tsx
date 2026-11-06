@@ -866,7 +866,7 @@ export function GitProviderFlow({
                         {existingGitHubApp && (
                           <Badge
                             variant="outline"
-                            className="text-xs bg-green-50 text-green-700 border-green-200"
+                            className="text-xs bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400 border-green-200 dark:border-green-900"
                           >
                             App ready
                           </Badge>
@@ -1308,7 +1308,7 @@ export function GitProviderFlow({
                             Use existing GitHub App
                             <Badge
                               variant="outline"
-                              className="text-xs bg-green-50 text-green-700 border-green-200"
+                              className="text-xs bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400 border-green-200 dark:border-green-900"
                             >
                               Recommended
                             </Badge>
@@ -1345,7 +1345,7 @@ export function GitProviderFlow({
                     </div>
                   </div>
 
-                  <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+                  <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
                     <Sparkles className="h-4 w-4" />
                     <AlertDescription className="text-sm">
                       This GitHub App is already set up. Just install it to your
@@ -1450,7 +1450,7 @@ export function GitProviderFlow({
               </CardHeader>
               <CardContent className="space-y-4">
                 {isLocalMode ? (
-                  <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+                  <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                     <AlertCircle className="h-4 w-4" />
                     <AlertDescription className="space-y-2">
                       <p className="font-medium text-sm">Local mode detected</p>
@@ -1501,7 +1501,7 @@ export function GitProviderFlow({
                 )}
 
                 {!isLocalMode && !isLocalhost && (
-                  <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+                  <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
                     <Sparkles className="h-4 w-4" />
                     <AlertDescription className="text-sm">
                       Click below and we&apos;ll automatically configure
@@ -1660,7 +1660,7 @@ export function GitProviderFlow({
           </div>
 
           {isLocalhost && selectedMethod === 'app' && !isLocalMode && (
-            <Card className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+            <Card className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
               <CardContent className="pt-6 space-y-4">
                 <div className="flex items-center gap-2 text-orange-800 dark:text-orange-200">
                   <Settings className="h-5 w-5" />
@@ -1826,7 +1826,7 @@ export function GitProviderFlow({
               </CardHeader>
               <CardContent className="space-y-4">
                 {isLocalMode ? (
-                  <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+                  <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                     <AlertCircle className="h-4 w-4" />
                     <AlertDescription className="space-y-2">
                       <p className="font-medium text-sm">Local mode detected</p>
@@ -1879,7 +1879,7 @@ export function GitProviderFlow({
                 )}
 
                 {!isLocalMode && selectedMethod === 'gitlab-app' && (
-                  <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+                  <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                     <Info className="h-4 w-4 text-blue-600" />
                     <AlertDescription className="text-sm">
                       <p className="font-medium mb-2">Manual setup required</p>
@@ -2074,7 +2074,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <div className="space-y-2">
@@ -2197,7 +2197,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <div className="space-y-2">
@@ -2263,7 +2263,7 @@ export function GitProviderFlow({
 
           <Card>
             <CardContent className="pt-6 space-y-6">
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <p className="font-medium mb-2">Manual Setup Required</p>
@@ -2485,7 +2485,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <div className="space-y-2">
@@ -2751,7 +2751,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription className="text-sm">
                   A webhook will be automatically registered on your Bitbucket
@@ -2949,7 +2949,7 @@ export function GitProviderFlow({
                 </>
               )}
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Server className="h-4 w-4 text-blue-600" />
                 <AlertDescription className="text-sm">
                   Webhooks for generic providers are not registered

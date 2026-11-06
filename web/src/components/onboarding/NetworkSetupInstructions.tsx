@@ -101,7 +101,7 @@ export function NetworkSetupInstructions({
                     </div>
                   </div>
                   {publicIp && (
-                    <Alert className="mt-2 border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+                    <Alert className="mt-2 border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                       <Info className="h-4 w-4 text-orange-600" />
                       <AlertDescription className="text-xs">
                         <strong>Note:</strong> Your public IP ({publicIp}) may
@@ -158,7 +158,7 @@ export function NetworkSetupInstructions({
               </div>
             </div>
 
-            <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+            <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
               <Info className="h-4 w-4 text-blue-600" />
               <AlertDescription>
                 After DNS propagation, we&apos;ll automatically provision SSL
@@ -248,7 +248,7 @@ export function NetworkSetupInstructions({
                     <div>Value: {publicIpDisplay}</div>
                   </div>
                   {publicIp && (
-                    <Alert className="mt-2 border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+                    <Alert className="mt-2 border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                       <Info className="h-4 w-4 text-orange-600" />
                       <AlertDescription className="text-xs">
                         <strong>Note:</strong> Your public IP ({publicIp}) may
@@ -262,7 +262,7 @@ export function NetworkSetupInstructions({
               </div>
             </div>
 
-            <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+            <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
               <AlertTriangle className="h-4 w-4 text-orange-600" />
               <AlertDescription>
                 <strong>Note:</strong> Some ISPs use CGNAT which prevents port
@@ -286,7 +286,7 @@ export function NetworkSetupInstructions({
             </Alert>
 
             {isSubdomain && (
-              <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+              <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                 <AlertTriangle className="h-4 w-4 text-orange-600" />
                 <AlertTitle>Wildcard Domain Limitation</AlertTitle>
                 <AlertDescription>
@@ -442,7 +442,7 @@ ingress:
         </p>
       </div>
 
-      <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+      <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
         <Info className="h-4 w-4 text-blue-600" />
         <AlertDescription>
           <strong>Important:</strong> Wildcard domains (*.{baseDomain}) require

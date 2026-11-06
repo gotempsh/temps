@@ -742,7 +742,7 @@ function StatCell({
         {badge === 'good' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-green-700 dark:text-green-600 border-green-200 bg-green-50"
+            className="text-[10px] text-green-700 dark:text-green-400 border-green-200 dark:border-green-900 bg-green-50 dark:bg-green-950/30"
           >
             good
           </Badge>
@@ -750,7 +750,7 @@ function StatCell({
         {badge === 'warn' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-amber-700 border-amber-200 bg-amber-50"
+            className="text-[10px] text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30"
           >
             low
           </Badge>
@@ -758,7 +758,7 @@ function StatCell({
         {badge === 'bad' && (
           <Badge
             variant="outline"
-            className="text-[10px] text-red-700 dark:text-red-600 border-red-200 bg-red-50"
+            className="text-[10px] text-red-700 dark:text-red-400 border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30"
           >
             poor
           </Badge>

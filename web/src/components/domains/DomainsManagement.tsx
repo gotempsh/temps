@@ -344,7 +344,7 @@ export function DomainsManagement({
       </Collapsible>
 
       {isUsingCloudflare() && (
-        <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
+        <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
           <Info className="h-4 w-4 text-purple-600" />
           <AlertDescription>
             Domain and certificate management is handled automatically by
@@ -366,7 +366,7 @@ export function DomainsManagement({
       )}
 
       {pendingProvisioningCount > 0 && (
-        <Alert className="border-yellow-200 bg-yellow-50/50 dark:bg-yellow-950/10">
+        <Alert className="border-yellow-200 dark:border-yellow-900 bg-yellow-50/50 dark:bg-yellow-950/10">
           <AlertTriangle className="h-4 w-4 text-yellow-600" />
           <AlertTitle className="flex items-center gap-2">
             <span>TLS Certificates Pending</span>
