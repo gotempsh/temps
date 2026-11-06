@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 
@@ -518,6 +519,521 @@ fn require_systemd() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The commands for the agent service on this platform, as the operator
+/// would type them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentService {
+    /// How the service is named in messages.
+    pub name: String,
+    /// Restart it onto the config on disk.
+    pub restart: String,
+    /// Start it again after someone turned it off.
+    pub start: String,
+    /// Its most recent log lines.
+    pub logs: String,
+}
+
+/// What `temps join` found, and did, about the agent service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceAfterJoin {
+    /// No Temps-managed service runs from this data directory: whoever starts
+    /// the agent next reads the new config.
+    NotInstalled,
+    /// The managed service exists but is stopped (and, on Linux, disabled):
+    /// someone turned it off on purpose, so join leaves it off.
+    Stopped(AgentService),
+    /// The managed service was running or enabled, was restarted on the new
+    /// config, and stayed up.
+    Restarted(AgentService),
+    /// The managed service exists but runs on the old config: a check before
+    /// the restart refused it, the restart failed, or it did not stay up.
+    /// `fix` is the command that puts it on this config once `reason` is
+    /// dealt with, when there is one.
+    NotRestarted {
+        service: AgentService,
+        reason: String,
+        fix: Option<String>,
+    },
+}
+
+/// How long a restarted agent must stay up before join calls the restart
+/// good. Long enough for a config the agent rejects at start to show, and
+/// shorter than the services' restart delays (systemd's 5s `RestartSec`,
+/// launchd's 10s throttle), so a crash cannot hide behind a respawn.
+pub(super) const STAY_UP_WINDOW: Duration = Duration::from_secs(4);
+pub(super) const STAY_UP_INTERVAL: Duration = Duration::from_millis(500);
+/// How long `systemctl restart` may take: the unit's 30s stop timeout plus
+/// the start.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a read-only `systemctl` query may take.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one stay-up sample may take, so the watch ends near its window.
+pub(super) const SAMPLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The agent reads `agent.json` only at start. After `temps join` rewrites it,
+/// a service that was already running keeps serving the cluster this machine
+/// left (with that cluster's certificates in memory) while the new control
+/// plane sees a worker that registered and then went silent. So a join ends
+/// by restarting the managed service that runs from this data directory, if
+/// it was running or enabled: the systemd unit on Linux, the LaunchAgent on
+/// macOS. A unit or plist Temps did not write, or one for another data
+/// directory, is never touched. Never fails: by now the join token is spent
+/// and the config saved, so every problem becomes an outcome to print.
+/// Blocks for a few seconds while it watches the restarted service.
+pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
+    // `temps agent service install` writes the canonical path.
+    let Ok(data_dir) = std::fs::canonicalize(data_dir) else {
+        return ServiceAfterJoin::NotInstalled;
+    };
+    if cfg!(target_os = "macos") {
+        return super::agent_launchd::restart_after_join(&data_dir);
+    }
+    restart_unit_after_join(&data_dir)
+}
+
+fn systemd_service() -> AgentService {
+    AgentService {
+        name: SERVICE_NAME.to_string(),
+        restart: format!("sudo systemctl restart {SERVICE_NAME}"),
+        start: format!("sudo systemctl enable --now {SERVICE_NAME}"),
+        logs: format!("sudo journalctl -u {SERVICE_NAME} -n 50 --no-pager"),
+    }
+}
+
+fn restart_unit_after_join(data_dir: &Path) -> ServiceAfterJoin {
+    if !cfg!(target_os = "linux") || !Path::new("/run/systemd/system").is_dir() {
+        return ServiceAfterJoin::NotInstalled;
+    }
+    let Ok(unit) = std::fs::read_to_string(UNIT_PATH) else {
+        return ServiceAfterJoin::NotInstalled;
+    };
+    let service = systemd_service();
+    let reinstall = format!(
+        "sudo temps agent service install --data-dir {}",
+        shell_quoted(data_dir)
+    );
+    let refuse = |reason: String, fix: Option<String>| ServiceAfterJoin::NotRestarted {
+        service: systemd_service(),
+        reason,
+        fix,
+    };
+    let binary = match classify_unit(&unit, data_dir) {
+        UnitFile::Foreign => return ServiceAfterJoin::NotInstalled,
+        UnitFile::Refused(reason) => return refuse(reason, Some(reinstall)),
+        UnitFile::Ours { binary } => binary,
+    };
+    let show = match systemctl_output(
+        &[
+            "show",
+            SERVICE_NAME,
+            "-p",
+            "FragmentPath",
+            "-p",
+            "DropInPaths",
+            "-p",
+            "NeedDaemonReload",
+            "-p",
+            "ActiveState",
+            "-p",
+            "UnitFileState",
+        ],
+        QUERY_TIMEOUT,
+    ) {
+        Ok(show) => show,
+        Err(error) => return refuse(error, Some(service.restart.clone())),
+    };
+    let loaded = LoadedUnit::parse(&show);
+    if let Err(reason) = loaded.check(UNIT_PATH, |path| std::fs::read_to_string(path)) {
+        return refuse(reason, Some(service.restart.clone()));
+    }
+    if !loaded.wanted() {
+        return ServiceAfterJoin::Stopped(service);
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return refuse(
+            format!("this join did not run as root, and only root restarts {SERVICE_NAME}"),
+            Some(service.restart.clone()),
+        );
+    }
+    if let Err(reason) = check_joined_config(data_dir) {
+        return refuse(reason, Some(service.restart.clone()));
+    }
+    // Install wrote the canonical path; a symlink there now could point
+    // somewhere the ownership check below would not cover.
+    match std::fs::canonicalize(&binary) {
+        Ok(canonical) if canonical == binary && canonical.is_file() => {}
+        Ok(canonical) => {
+            return refuse(
+                format!(
+                    "{UNIT_PATH} runs {}, which now resolves to {}",
+                    binary.display(),
+                    canonical.display()
+                ),
+                Some(reinstall),
+            )
+        }
+        Err(error) => {
+            return refuse(
+                format!(
+                    "{UNIT_PATH} runs {}, which is unusable ({error})",
+                    binary.display()
+                ),
+                Some(reinstall),
+            )
+        }
+    }
+    // The same ownership check install makes: the restarted agent runs as
+    // root, so a binary or config another user could swap must not start.
+    if let Err(error) = refuse_unsafe_paths(&binary, data_dir, &data_dir.join("agent.json")) {
+        return refuse(
+            format!("join will not restart it as root: {error}"),
+            Some(reinstall),
+        );
+    }
+    if let Err(error) = systemctl_output(
+        &["restart", "--no-ask-password", SERVICE_NAME],
+        RESTART_TIMEOUT,
+    ) {
+        return refuse(
+            format!("{error} (systemd may still finish the restart; check `temps agent service status`)"),
+            Some(service.restart.clone()),
+        );
+    }
+    let active = || {
+        systemctl_output(
+            &["show", SERVICE_NAME, "-p", "ActiveState", "--value"],
+            SAMPLE_TIMEOUT,
+        )
+        .is_ok_and(|state| state.trim() == "active")
+    };
+    if !stays_up(active, STAY_UP_WINDOW, STAY_UP_INTERVAL) {
+        return refuse(
+            format!(
+                "it restarted but did not stay up for {}s, so the agent likely rejects this \
+                 config; see its logs: {}",
+                STAY_UP_WINDOW.as_secs(),
+                service.logs
+            ),
+            Some(service.restart.clone()),
+        );
+    }
+    ServiceAfterJoin::Restarted(service)
+}
+
+/// What join may do with the unit file at [`UNIT_PATH`].
+#[derive(Debug, PartialEq, Eq)]
+enum UnitFile {
+    /// Not written by Temps: never touched.
+    Foreign,
+    /// Temps' unit, exactly as this version writes it for the data
+    /// directory, running `binary`.
+    Ours { binary: PathBuf },
+    /// Temps' unit, but join must not restart it, for this reason; `temps
+    /// agent service install` rewrites it.
+    Refused(String),
+}
+
+fn classify_unit(unit: &str, data_dir: &Path) -> UnitFile {
+    if !unit.lines().any(|line| line == MANAGED_MARKER) {
+        return UnitFile::Foreign;
+    }
+    // A Temps unit for another data directory would keep running the old
+    // config: say so rather than print the hint for a machine without one.
+    match unit_data_dir(unit) {
+        Some(installed) if installed == data_dir => {}
+        installed => {
+            return UnitFile::Refused(format!(
+                "it runs the agent from {}, but this join saved its config in {}, so join left \
+                 it alone and it keeps the old config",
+                installed.map_or_else(
+                    || "an unknown directory".to_string(),
+                    |dir| dir.display().to_string()
+                ),
+                data_dir.display()
+            ))
+        }
+    }
+    // Only the unit exactly as this Temps writes it: a hand-edited one, or
+    // one from an older Temps (without KillMode=process, a restart would take
+    // every sandbox VM down), is rewritten by install instead.
+    let Some(binary) = unit_binary(unit) else {
+        return UnitFile::Refused(format!("{UNIT_PATH} has no ExecStart Temps can read"));
+    };
+    if render_unit(&binary, data_dir).ok().as_deref() != Some(unit) {
+        return UnitFile::Refused(format!(
+            "{UNIT_PATH} differs from the unit this version of Temps writes (edited by hand, or \
+             installed by an older Temps)"
+        ));
+    }
+    UnitFile::Ours { binary }
+}
+
+/// The data directory a unit written by [`render_unit`] runs the agent
+/// with, unescaped.
+fn unit_data_dir(unit: &str) -> Option<PathBuf> {
+    let quoted = unit
+        .lines()
+        .find_map(|line| line.strip_prefix("Environment=\"TEMPS_DATA_DIR="))?;
+    systemd_unquoted(quoted, "").map(PathBuf::from)
+}
+
+/// `value` for a POSIX shell command line.
+pub(super) fn shell_quoted(value: &Path) -> String {
+    let text = value.to_string_lossy();
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@%".contains(c));
+    if plain {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
+/// The binary a unit written by [`render_unit`] runs, unescaped.
+fn unit_binary(unit: &str) -> Option<PathBuf> {
+    let quoted = unit
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart=\""))?;
+    systemd_unquoted(quoted, " agent").map(PathBuf::from)
+}
+
+/// Undo [`systemd_quoted`] on the text after an opening `"`: the value up to
+/// the closing `"`, which must be followed by exactly `rest`.
+fn systemd_unquoted(quoted: &str, rest: &str) -> Option<String> {
+    let mut value = String::new();
+    let mut chars = quoted.chars();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '\\' => value.push(chars.next()?),
+            '%' => {
+                if chars.next()? != '%' {
+                    return None;
+                }
+                value.push('%');
+            }
+            other => value.push(other),
+        }
+    }
+    (chars.as_str() == rest).then_some(value)
+}
+
+/// What systemd has loaded for the agent unit, from `systemctl show`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LoadedUnit {
+    fragment_path: String,
+    drop_in_paths: Vec<String>,
+    need_daemon_reload: bool,
+    active_state: String,
+    unit_file_state: String,
+}
+
+impl LoadedUnit {
+    fn parse(show: &str) -> Self {
+        let mut loaded = Self::default();
+        for line in show.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "FragmentPath" => loaded.fragment_path = value.to_string(),
+                "DropInPaths" => {
+                    loaded.drop_in_paths = value.split_whitespace().map(str::to_string).collect()
+                }
+                "NeedDaemonReload" => loaded.need_daemon_reload = value == "yes",
+                "ActiveState" => loaded.active_state = value.to_string(),
+                "UnitFileState" => loaded.unit_file_state = value.to_string(),
+                _ => {}
+            }
+        }
+        loaded
+    }
+
+    /// Whether a restart would run the unit Temps wrote, as written: loaded
+    /// from `unit_path` (not shadowed by a unit elsewhere), current with the
+    /// file, and with no drop-in changing what runs, as whom, or from which
+    /// data directory.
+    fn check(
+        &self,
+        unit_path: &str,
+        read: impl Fn(&str) -> std::io::Result<String>,
+    ) -> Result<(), String> {
+        if self.fragment_path.is_empty() {
+            return Err(format!(
+                "systemd has not loaded {SERVICE_NAME}; run `sudo systemctl daemon-reload` first"
+            ));
+        }
+        if self.fragment_path != unit_path {
+            return Err(format!(
+                "systemd loads {SERVICE_NAME} from '{}', not from the unit Temps installed at \
+                 {unit_path}, so join leaves it alone",
+                self.fragment_path
+            ));
+        }
+        if self.need_daemon_reload {
+            return Err(format!(
+                "{unit_path} changed since systemd loaded it; run `sudo systemctl daemon-reload` \
+                 first"
+            ));
+        }
+        for drop_in in &self.drop_in_paths {
+            let contents = read(drop_in)
+                .map_err(|error| format!("could not read the drop-in {drop_in}: {error}"))?;
+            if drop_in_overrides(&contents) {
+                return Err(format!(
+                    "the drop-in {drop_in} changes what {SERVICE_NAME} runs or its data \
+                     directory, so join leaves it alone"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Running, starting, or enabled to start at boot.
+    fn wanted(&self) -> bool {
+        matches!(
+            self.active_state.as_str(),
+            "active" | "activating" | "reloading"
+        ) || matches!(self.unit_file_state.as_str(), "enabled" | "enabled-runtime")
+    }
+}
+
+/// Whether a drop-in sets anything beyond tuning: join restarts as root,
+/// so only resource limits, restart and timeout policy, ordering, and
+/// environment variables other than `TEMPS_DATA_DIR` pass. Anything else
+/// (the program, hooks such as `ExecStartPre`, the user, mounts, the
+/// working directory, an `EnvironmentFile`) leaves the restart to the
+/// operator.
+fn drop_in_overrides(contents: &str) -> bool {
+    const ALLOWED: [&str; 31] = [
+        "Description",
+        "Documentation",
+        "After",
+        "Before",
+        "Wants",
+        "Requires",
+        "StartLimitIntervalSec",
+        "StartLimitBurst",
+        "Restart",
+        "RestartSec",
+        "TimeoutStartSec",
+        "TimeoutStopSec",
+        "TimeoutSec",
+        "Nice",
+        "OOMScoreAdjust",
+        "CPUQuota",
+        "CPUWeight",
+        "CPUShares",
+        "IOWeight",
+        "MemoryMin",
+        "MemoryLow",
+        "MemoryHigh",
+        "MemoryMax",
+        "MemorySwapMax",
+        "TasksMax",
+        "LimitNOFILE",
+        "LimitNPROC",
+        "LimitCORE",
+        "LimitMEMLOCK",
+        "Environment",
+        "WantedBy",
+    ];
+    // systemd joins a line ending in `\` with the next one.
+    let joined = contents.replace("\\\n", " ");
+    joined.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(['#', ';', '[']) {
+            return false;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return true;
+        };
+        let key = key.trim();
+        !ALLOWED.contains(&key) || (key == "Environment" && value.contains("TEMPS_DATA_DIR"))
+    })
+}
+
+/// Whether the agent can start on the config join just saved: what
+/// `temps agent` needs from `agent.json` before it serves anything.
+pub(super) fn check_joined_config(data_dir: &Path) -> Result<(), String> {
+    let path = data_dir.join("agent.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let config: temps_node_agent::AgentConfig = serde_json::from_str(&text)
+        .map_err(|error| format!("{} does not parse: {error}", path.display()))?;
+    if config.private_address.is_none() {
+        return Err(format!("{} has no private_address", path.display()));
+    }
+    let files = [
+        ("certificate", &config.tls_cert_path),
+        ("key", &config.tls_key_path),
+        ("cluster CA", &config.cluster_ca_path),
+    ];
+    for (what, file) in files {
+        match file {
+            Some(file) if !file.is_file() => {
+                return Err(format!(
+                    "{} names the TLS {what} {}, which is missing",
+                    path.display(),
+                    file.display()
+                ))
+            }
+            None if config.require_mtls => {
+                return Err(format!(
+                    "{} requires mTLS but names no TLS {what}",
+                    path.display()
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether `up` holds on every sample for `window`.
+pub(super) fn stays_up(mut up: impl FnMut() -> bool, window: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        if !up() {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Run `systemctl args`, killed after `timeout`, and return its stdout.
+fn systemctl_output(args: &[&str], timeout: Duration) -> Result<String, String> {
+    // By absolute path: join runs as root, maybe with the caller's PATH.
+    let program = ["/usr/bin/systemctl", "/bin/systemctl"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .ok_or_else(|| "systemctl is not in /usr/bin or /bin".to_string())?;
+    let mut command = Command::new(program);
+    command.args(args);
+    let rendered = format!("systemctl {}", args.join(" "));
+    match temps_wireguard::vm::output_within(command, None, timeout) {
+        Ok(Some(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(Some(output)) => Err(format!(
+            "`{rendered}` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Ok(None) => Err(format!(
+            "`{rendered}` did not finish within {}s and was stopped",
+            timeout.as_secs()
+        )),
+        Err(error) => Err(format!("could not run `{rendered}`: {error}")),
+    }
+}
+
 fn systemctl(args: &[&str]) -> anyhow::Result<()> {
     let status = Command::new("systemctl")
         .args(args)
@@ -598,6 +1114,232 @@ mod tests {
         assert!(unit.contains("Environment=\"TEMPS_DATA_DIR=/root/.temps\""));
         assert!(unit.contains("ExecStart=\"/usr/local/bin/temps\" agent"));
         assert!(unit.contains("Requires=docker.service"));
+    }
+
+    #[test]
+    fn join_restarts_only_the_managed_unit_for_its_own_data_dir() {
+        let binary = Path::new("/usr/local/bin/temps");
+        let unit = render_unit(binary, Path::new("/root/.temps")).unwrap();
+        assert_eq!(
+            classify_unit(&unit, Path::new("/root/.temps")),
+            UnitFile::Ours {
+                binary: binary.to_path_buf()
+            }
+        );
+        let foreign = unit.replacen(MANAGED_MARKER, "# mine", 1);
+        assert_eq!(
+            classify_unit(&foreign, Path::new("/root/.temps")),
+            UnitFile::Foreign
+        );
+
+        // The incident's shape with a moved data dir: Temps' unit keeps the
+        // old config, so join warns instead of printing the install hint.
+        for other in ["/srv/temps", "/root/.temps/sub"] {
+            let UnitFile::Refused(reason) = classify_unit(&unit, Path::new(other)) else {
+                panic!("a unit for /root/.temps must not run {other}");
+            };
+            assert!(
+                reason.contains("/root/.temps") && reason.contains(other),
+                "{reason}"
+            );
+        }
+
+        // Hand edits and older templates are left to install.
+        for edited in [
+            unit.replace("KillMode=process\n", ""),
+            unit.replace(
+                "UMask=0077\n",
+                "UMask=0077\nEnvironment=\"TEMPS_DATA_DIR=/srv/other\"\n",
+            ),
+            unit.replace(
+                "ExecStart=\"/usr/local/bin/temps\" agent\n",
+                "ExecStart=\"/usr/local/bin/temps\" agent\nExecStartPre=/tmp/x\n",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    classify_unit(&edited, Path::new("/root/.temps")),
+                    UnitFile::Refused(_)
+                ),
+                "{edited}"
+            );
+        }
+        assert_eq!(
+            unit_data_dir(&render_unit(binary, Path::new("/srv/a \"b\" 100%")).unwrap()),
+            Some(PathBuf::from("/srv/a \"b\" 100%"))
+        );
+    }
+
+    #[test]
+    fn commands_join_prints_are_shell_quoted() {
+        assert_eq!(shell_quoted(Path::new("/root/.temps")), "/root/.temps");
+        assert_eq!(shell_quoted(Path::new("/srv/my temps")), "'/srv/my temps'");
+        assert_eq!(shell_quoted(Path::new("/srv/it's")), r"'/srv/it'\''s'");
+        assert_eq!(shell_quoted(Path::new("/srv/$(x)")), "'/srv/$(x)'");
+    }
+
+    #[test]
+    fn join_reads_back_the_binary_the_unit_runs() {
+        let unit =
+            render_unit(Path::new("/usr/local/bin/temps"), Path::new("/root/.temps")).unwrap();
+        assert_eq!(
+            unit_binary(&unit),
+            Some(PathBuf::from("/usr/local/bin/temps"))
+        );
+        let odd = Path::new("/opt/te\"mp%s\\x/temps");
+        let unit = render_unit(odd, Path::new("/root/.temps")).unwrap();
+        assert_eq!(unit_binary(&unit).as_deref(), Some(odd));
+        assert_eq!(unit_binary("ExecStart=/bin/sh -c evil"), None);
+        assert_eq!(unit_binary("ExecStart=\"/bin/sh\" -c evil"), None);
+    }
+
+    fn loaded(fragment: &str, drop_ins: &str) -> LoadedUnit {
+        LoadedUnit::parse(&format!(
+            "FragmentPath={fragment}\nDropInPaths={drop_ins}\nNeedDaemonReload=no\n\
+             ActiveState=active\nUnitFileState=enabled\n"
+        ))
+    }
+
+    #[test]
+    fn join_restarts_only_the_unit_systemd_loaded_from_the_temps_file() {
+        let no_files = |path: &str| -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.to_string(),
+            ))
+        };
+        let ours = loaded(UNIT_PATH, "");
+        assert!(ours.wanted());
+        assert_eq!(ours.check(UNIT_PATH, no_files), Ok(()));
+
+        // A unit elsewhere (e.g. a transient one) shadows the file Temps wrote.
+        let shadowed = loaded("/run/systemd/transient/temps-agent.service", "");
+        let error = shadowed.check(UNIT_PATH, no_files).unwrap_err();
+        assert!(error.contains("/run/systemd/transient"), "{error}");
+
+        let mut stale = loaded(UNIT_PATH, "");
+        stale.need_daemon_reload = true;
+        assert!(stale
+            .check(UNIT_PATH, no_files)
+            .unwrap_err()
+            .contains("daemon-reload"));
+
+        // A drop-in limiting memory is fine; one moving the data dir is not.
+        let drop_in = "/etc/systemd/system/temps-agent.service.d/override.conf";
+        let with_drop_in = loaded(UNIT_PATH, drop_in);
+        let limits =
+            |_: &str| Ok("[Service]\nMemoryMax=1G\nEnvironment=RUST_LOG=debug\n".to_string());
+        assert_eq!(with_drop_in.check(UNIT_PATH, limits), Ok(()));
+        let moved =
+            |_: &str| Ok("[Service]\nEnvironment=\"TEMPS_DATA_DIR=/srv/other\"\n".to_string());
+        assert!(with_drop_in
+            .check(UNIT_PATH, moved)
+            .unwrap_err()
+            .contains(drop_in));
+        assert!(
+            with_drop_in.check(UNIT_PATH, no_files).is_err(),
+            "an unreadable drop-in"
+        );
+        for key in [
+            "ExecStart=",
+            "ExecStart=/tmp/evil agent",
+            "ExecStartPre=/tmp/evil",
+            "User=nobody",
+            "EnvironmentFile=/tmp/env",
+            "BindPaths=/srv/x:/root/.temps",
+            "WorkingDirectory=/tmp",
+            "PassEnvironment=TEMPS_DATA_DIR",
+            "Environment=A=1 \\\n  TEMPS_DATA_DIR=/srv/x",
+            "not a setting",
+        ] {
+            assert!(drop_in_overrides(&format!("[Service]\n{key}\n")), "{key}");
+        }
+        assert!(!drop_in_overrides(
+            "# tuning\n[Unit]\nStartLimitBurst=10\n\n[Service]\nLimitNOFILE=65536\n; done\n"
+        ));
+        let off =
+            LoadedUnit::parse("FragmentPath=x\nActiveState=inactive\nUnitFileState=disabled\n");
+        assert!(!off.wanted(), "stopped and disabled stays off");
+        let enabled = LoadedUnit::parse("ActiveState=failed\nUnitFileState=enabled\n");
+        assert!(enabled.wanted(), "enabled but crashed on the old config");
+    }
+
+    #[test]
+    fn join_checks_the_saved_config_before_restarting() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = check_joined_config(dir.path()).unwrap_err();
+        assert!(error.contains("agent.json"), "{error}");
+
+        std::fs::write(dir.path().join("agent.json"), "{not json").unwrap();
+        assert!(check_joined_config(dir.path())
+            .unwrap_err()
+            .contains("does not parse"));
+
+        let cert = dir.path().join("node.crt");
+        let config = |cert_path: &Path, require_mtls: bool| temps_node_agent::AgentConfig {
+            listen_address: "10.0.0.5:3100".into(),
+            token: "t".into(),
+            node_name: "worker".into(),
+            control_plane_url: "https://cp.example.com".into(),
+            node_id: 1,
+            labels: serde_json::json!({}),
+            dns_data_dir: dir.path().join("dns"),
+            tls_cert_path: Some(cert_path.to_path_buf()),
+            tls_key_path: None,
+            cluster_ca_path: None,
+            require_mtls,
+            underlay_dev: None,
+            underlay_mtu: None,
+            private_address: Some("10.0.0.5".into()),
+            public_ingress_address: None,
+            public_ingress_http_port: 80,
+            public_ingress_https_port: 443,
+            public_ingress_private_key: None,
+            ingress: None,
+            mesh_key_dir: dir.path().join("wireguard"),
+            wg_endpoint: None,
+            control_plane_trust: None,
+            control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
+        };
+        let save = |config: &temps_node_agent::AgentConfig| {
+            std::fs::write(
+                dir.path().join("agent.json"),
+                serde_json::to_string(config).unwrap(),
+            )
+            .unwrap();
+        };
+        save(&config(&cert, false));
+        let error = check_joined_config(dir.path()).unwrap_err();
+        assert!(
+            error.contains("node.crt") && error.contains("missing"),
+            "{error}"
+        );
+
+        std::fs::write(&cert, "pem").unwrap();
+        assert_eq!(check_joined_config(dir.path()), Ok(()));
+
+        save(&config(&cert, true));
+        let error = check_joined_config(dir.path()).unwrap_err();
+        assert!(error.contains("requires mTLS"), "{error}");
+    }
+
+    #[test]
+    fn a_restart_counts_only_when_the_service_stays_up() {
+        let window = Duration::from_millis(50);
+        let interval = Duration::from_millis(5);
+        assert!(stays_up(|| true, window, interval));
+        let mut samples = 0;
+        assert!(!stays_up(
+            || {
+                samples += 1;
+                samples < 3
+            },
+            window,
+            interval
+        ));
+        assert_eq!(samples, 3, "stops at the first sample that is down");
     }
 
     /// A restart of the agent must not kill the sandbox VMs it started.

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::agent_service::{AgentServiceCommand, InstallArgs};
+use super::agent_service::{AgentService, AgentServiceCommand, InstallArgs, ServiceAfterJoin};
 
 /// The launchd label, and the plist's file name.
 pub const LABEL: &str = "sh.temps.agent";
@@ -187,9 +187,16 @@ fn installed_data_dir(plist: &str) -> Option<PathBuf> {
 const LAUNCHCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn launchctl(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    launchctl_within(args, LAUNCHCTL_TIMEOUT)
+}
+
+fn launchctl_within(
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
     let mut command = Command::new("/bin/launchctl");
     command.args(args);
-    output_within_deadline(command, LAUNCHCTL_TIMEOUT)
+    output_within_deadline(command, timeout)
 }
 
 /// Run `command` to completion, killing it and failing if it takes longer
@@ -429,6 +436,295 @@ fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn launch_agent(home: &Path, as_root: bool) -> AgentService {
+    // Root has no GUI domain of its own: name the user's in the command.
+    let target = if as_root {
+        format!("gui/$(id -u)/{LABEL}")
+    } else {
+        service_target()
+    };
+    AgentService {
+        name: format!("the {LABEL} LaunchAgent"),
+        restart: format!("launchctl kickstart -k {target}"),
+        start: "temps agent service install".to_string(),
+        logs: format!(
+            "tail -n 50 {}",
+            super::agent_service::shell_quoted(&log_path(home))
+        ),
+    }
+}
+
+/// Whether `plist` carries the marker [`render_plist`] writes.
+fn plist_is_managed(plist: &str) -> bool {
+    let marker = format!("<!-- {MANAGED_MARKER} -->");
+    plist.lines().any(|line| line == marker)
+}
+
+/// The binary a plist written by [`render_plist`] runs.
+fn plist_binary(plist: &str) -> Option<PathBuf> {
+    let value = plist
+        .split("<key>ProgramArguments</key>")
+        .nth(1)?
+        .split("<string>")
+        .nth(1)?
+        .split("</string>")
+        .next()?;
+    Some(PathBuf::from(
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    ))
+}
+
+/// What launchd has loaded for the agent, from `launchctl print`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LoadedJob {
+    path: Option<String>,
+    state: Option<String>,
+    pid: Option<String>,
+    data_dir: Option<String>,
+}
+
+impl LoadedJob {
+    fn parse(print: &str) -> Self {
+        let mut job = Self::default();
+        let mut in_environment = false;
+        for line in print.lines() {
+            // Top-level fields are indented by exactly one tab.
+            let Some(field) = line.strip_prefix('\t') else {
+                continue;
+            };
+            if in_environment {
+                if field == "}" {
+                    in_environment = false;
+                } else if let Some(value) = field.trim().strip_prefix("TEMPS_DATA_DIR => ") {
+                    job.data_dir = Some(value.to_string());
+                }
+                continue;
+            }
+            if field.starts_with('\t') {
+                continue;
+            }
+            if field == "environment = {" {
+                in_environment = true;
+            } else if let Some(value) = field.strip_prefix("path = ") {
+                job.path = Some(value.to_string());
+            } else if let Some(value) = field.strip_prefix("state = ") {
+                job.state = Some(value.to_string());
+            } else if let Some(value) = field.strip_prefix("pid = ") {
+                job.pid = Some(value.to_string());
+            }
+        }
+        job
+    }
+
+    /// Whether launchd runs the plist at `plist` for `data_dir`: the job a
+    /// kickstart restarts is the definition launchd loaded, which may no
+    /// longer match the file.
+    fn check(&self, plist: &Path, data_dir: &Path) -> Result<(), String> {
+        let plist = plist.to_string_lossy();
+        if self.path.as_deref() != Some(plist.as_ref()) {
+            return Err(format!(
+                "launchd loaded {LABEL} from '{}', not from {plist}, so join leaves it alone",
+                self.path.as_deref().unwrap_or("an unknown path")
+            ));
+        }
+        let data_dir = data_dir.to_string_lossy();
+        if self.data_dir.as_deref() != Some(data_dir.as_ref()) {
+            return Err(format!(
+                "the loaded {LABEL} runs from '{}', not {data_dir}; run `temps agent service \
+                 install` to reload it",
+                self.data_dir
+                    .as_deref()
+                    .unwrap_or("an unknown data directory")
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// [`super::agent_service::restart_after_join`] on macOS: kickstart the
+/// LaunchAgent when it is the plist Temps wrote for `data_dir` and launchd
+/// has it loaded, after checking the agent can start on the new config, and
+/// watch that it stays up.
+pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
+    let Ok(home) = home() else {
+        return ServiceAfterJoin::NotInstalled;
+    };
+    // Root has no LaunchAgent of its own and sudo points HOME at root's, so
+    // a root join cannot see the user's: say so instead of guessing.
+    if uid() == 0 {
+        return ServiceAfterJoin::NotRestarted {
+            service: launch_agent(&home, true),
+            reason: "this join ran as root, so it saved root's agent config, and cannot reach \
+                     a LaunchAgent, which runs as you. On a Mac, run `temps join` without sudo"
+                .to_string(),
+            fix: None,
+        };
+    }
+    let path = plist_path(&home);
+    let Ok(plist) = std::fs::read_to_string(&path) else {
+        return ServiceAfterJoin::NotInstalled;
+    };
+    if !plist_is_managed(&plist) {
+        return ServiceAfterJoin::NotInstalled;
+    }
+    let service = launch_agent(&home, false);
+    let reinstall = format!(
+        "temps agent service install --data-dir {}",
+        super::agent_service::shell_quoted(data_dir)
+    );
+    let refuse = |reason: String, fix: &str| ServiceAfterJoin::NotRestarted {
+        service: launch_agent(&home, false),
+        reason,
+        fix: Some(fix.to_string()),
+    };
+    match installed_data_dir(&plist) {
+        Some(installed) if installed == data_dir => {}
+        installed => {
+            return refuse(
+                format!(
+                    "it runs the agent from {}, but this join saved its config in {}, so join \
+                     left it alone and it keeps the old config",
+                    installed.map_or_else(
+                        || "an unknown directory".to_string(),
+                        |dir| dir.display().to_string()
+                    ),
+                    data_dir.display()
+                ),
+                &reinstall,
+            )
+        }
+    }
+    let loaded = match launchctl(&["print", &service_target()]) {
+        Ok(output) if output.status.success() => {
+            LoadedJob::parse(&String::from_utf8_lossy(&output.stdout))
+        }
+        // Not loaded: booted out, so someone turned it off.
+        Ok(_) => return ServiceAfterJoin::Stopped(service),
+        Err(error) => return refuse(error.to_string(), &service.restart),
+    };
+    if let Err(reason) = loaded.check(&path, data_dir) {
+        return refuse(reason, &reinstall);
+    }
+    if let Err(reason) = super::agent_service::check_joined_config(data_dir) {
+        return refuse(reason, &service.restart);
+    }
+    match temps_node_agent::mac_worker::MacWorker::load(data_dir) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return refuse(
+                format!(
+                    "{} is missing: the LaunchAgent needs the Docker app's mesh sidecar, which a \
+                 join with --private-address does not set up",
+                    temps_node_agent::mac_worker::MacWorker::path(data_dir).display()
+                ),
+                &service.restart,
+            )
+        }
+        Err(error) => return refuse(error.to_string(), &service.restart),
+    }
+    let Some(binary) = plist_binary(&plist) else {
+        return refuse(format!("{} names no program", path.display()), &reinstall);
+    };
+    // Install wrote the canonical path; a symlink there now could point
+    // somewhere the ownership check below would not cover.
+    match std::fs::canonicalize(&binary) {
+        Ok(canonical) if canonical == binary && canonical.is_file() => {}
+        Ok(canonical) => {
+            return refuse(
+                format!(
+                    "{} runs {}, which now resolves to {}",
+                    path.display(),
+                    binary.display(),
+                    canonical.display()
+                ),
+                &reinstall,
+            )
+        }
+        Err(error) => {
+            return refuse(
+                format!(
+                    "{} runs {}, which is unusable ({error})",
+                    path.display(),
+                    binary.display()
+                ),
+                &reinstall,
+            )
+        }
+    }
+    // The same check install makes, against a binary swapped since.
+    match unsafe_component(&binary) {
+        Ok(None) => {}
+        Ok(Some(unsafe_path)) => {
+            return refuse(
+                format!(
+                    "join will not restart it: {} is not safe to run, {unsafe_path} can be \
+                     changed by another user",
+                    binary.display()
+                ),
+                &reinstall,
+            )
+        }
+        Err(error) => return refuse(error.to_string(), &service.restart),
+    }
+    match launchctl(&["kickstart", "-k", &service_target()]) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            return refuse(
+                format!(
+                    "`launchctl kickstart -k {}` failed: {}",
+                    service_target(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                &service.restart,
+            )
+        }
+        Err(error) => return refuse(error.to_string(), &service.restart),
+    }
+    // Running, under one pid: launchd respawns a crashed agent only after
+    // its throttle interval, longer than the window.
+    let mut first_pid: Option<String> = None;
+    let running = || {
+        let Ok(output) = launchctl_within(
+            &["print", &service_target()],
+            super::agent_service::SAMPLE_TIMEOUT,
+        ) else {
+            return false;
+        };
+        let job = LoadedJob::parse(&String::from_utf8_lossy(&output.stdout));
+        if !output.status.success() || job.state.as_deref() != Some("running") {
+            return false;
+        }
+        match (&first_pid, job.pid) {
+            (None, pid) => {
+                first_pid = pid;
+                true
+            }
+            (Some(first), pid) => pid.as_ref() == Some(first),
+        }
+    };
+    if !super::agent_service::stays_up(
+        running,
+        super::agent_service::STAY_UP_WINDOW,
+        super::agent_service::STAY_UP_INTERVAL,
+    ) {
+        return refuse(
+            format!(
+                "it restarted but did not stay up for {}s, so the agent likely rejects this \
+                 config; see its logs: {}",
+                super::agent_service::STAY_UP_WINDOW.as_secs(),
+                service.logs
+            ),
+            &service.restart,
+        );
+    }
+    ServiceAfterJoin::Restarted(service)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +785,73 @@ mod tests {
             !path_is_safe(501, 20, 0o775, 501),
             "group-writable by a shared group (staff): another member could swap the binary"
         );
+    }
+
+    #[test]
+    fn join_restarts_only_the_temps_plist_for_its_own_data_dir() {
+        let plist = render_plist(
+            Path::new("/Users/someone/.temps/bin/te&mps"),
+            Path::new("/Users/someone/.temps"),
+            Path::new("/opt/homebrew/bin/docker"),
+            Path::new("/Users/someone/Library/Logs/Temps/agent.log"),
+        )
+        .unwrap();
+        assert!(plist_is_managed(&plist));
+        assert_eq!(
+            installed_data_dir(&plist),
+            Some(PathBuf::from("/Users/someone/.temps"))
+        );
+        let foreign = plist.replacen(MANAGED_MARKER, "mine", 1);
+        assert!(!plist_is_managed(&foreign));
+        // The marker as text elsewhere is not the comment install writes.
+        let mention = foreign.replace("<dict>", &format!("<dict><!-- x {MANAGED_MARKER} -->"));
+        assert!(!plist_is_managed(&mention));
+        assert_eq!(
+            plist_binary(&plist),
+            Some(PathBuf::from("/Users/someone/.temps/bin/te&mps"))
+        );
+    }
+
+    #[test]
+    fn join_restarts_only_the_job_launchd_loaded_from_that_plist() {
+        let print = "gui/501/sh.temps.agent = {\n\
+                     \tactive count = 1\n\
+                     \tpath = /Users/someone/Library/LaunchAgents/sh.temps.agent.plist\n\
+                     \ttype = LaunchAgent\n\
+                     \tstate = running\n\
+                     \n\
+                     \tdefault environment = {\n\
+                     \t\tTEMPS_DATA_DIR => /decoy\n\
+                     \t}\n\
+                     \n\
+                     \tenvironment = {\n\
+                     \t\tPATH => /opt/homebrew/bin:/usr/bin:/bin\n\
+                     \t\tTEMPS_DATA_DIR => /Users/someone/.temps\n\
+                     \t}\n\
+                     \n\
+                     \tpid = 4242\n\
+                     \tendpoints = {\n\
+                     \t\tstate = decoy\n\
+                     \t}\n\
+                     }\n";
+        let job = LoadedJob::parse(print);
+        assert_eq!(job.state.as_deref(), Some("running"));
+        assert_eq!(job.pid.as_deref(), Some("4242"));
+        assert_eq!(job.data_dir.as_deref(), Some("/Users/someone/.temps"));
+        let plist = Path::new("/Users/someone/Library/LaunchAgents/sh.temps.agent.plist");
+        assert_eq!(job.check(plist, Path::new("/Users/someone/.temps")), Ok(()));
+        let error = job
+            .check(plist, Path::new("/Users/someone/other"))
+            .unwrap_err();
+        assert!(error.contains("/Users/someone/.temps"), "{error}");
+        let error = job
+            .check(
+                Path::new("/Users/other/Library/LaunchAgents/sh.temps.agent.plist"),
+                Path::new("/Users/someone/.temps"),
+            )
+            .unwrap_err();
+        assert!(error.contains("join leaves it alone"), "{error}");
+        assert_eq!(LoadedJob::parse(""), LoadedJob::default());
     }
 
     #[test]
