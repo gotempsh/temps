@@ -47,3 +47,24 @@ export function followsRecordLink(row: Element, target: Element): boolean {
   const control = target.closest(ROW_CONTROLS)
   return !control || control === row || !row.contains(control)
 }
+
+/** Disabled controls; they often take no pointer events at all. */
+const DISABLED_CONTROLS =
+  'button:disabled,input:disabled,select:disabled,textarea:disabled,[aria-disabled=true]'
+
+/**
+ * Whether the point (`x`, `y`, viewport pixels) lies on a disabled control
+ * inside `row`. Disabled buttons use `pointer-events: none`, so a click on
+ * one reaches the row with the cell behind it as its target; this tells it
+ * apart from a click on empty space. Controls with no box are never hit.
+ */
+export function onDisabledControl(row: Element, x: number, y: number): boolean {
+  for (const control of row.querySelectorAll(DISABLED_CONTROLS)) {
+    const box = control.getBoundingClientRect()
+    if (box.width === 0 || box.height === 0) continue
+    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) {
+      return true
+    }
+  }
+  return false
+}

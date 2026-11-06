@@ -219,6 +219,33 @@ describe('RecordRow', () => {
     expect(view.queryByText('Opened record')).toBeNull()
   })
 
+  test('a click on a disabled button, which takes no pointer events, stays put', () => {
+    const view = renderRecords(
+      table(
+        <>
+          <TableCell>
+            <RecordLink to="/records/1">first</RecordLink>
+          </TableCell>
+          <TableCell data-testid="actions">
+            <button type="button" disabled className="pointer-events-none">
+              Move up
+            </button>
+          </TableCell>
+        </>
+      )
+    )
+    const button = view.getByRole('button', { name: 'Move up' })
+    button.getBoundingClientRect = () =>
+      DOMRect.fromRect({ x: 100, y: 10, width: 40, height: 20 })
+    const cell = view.getByTestId('actions')
+    // The browser targets the cell behind the button; so does this click.
+    fireEvent.click(cell, { clientX: 120, clientY: 20 })
+    expect(view.queryByText('Opened record')).toBeNull()
+    // Beside the button is still row space.
+    fireEvent.click(cell, { clientX: 20, clientY: 20 })
+    expect(view.getByText('Opened record')).not.toBeNull()
+  })
+
   test('a row with two record links cannot tell which is meant and stays put', () => {
     const view = renderRecords(
       table(

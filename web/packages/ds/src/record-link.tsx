@@ -4,7 +4,7 @@ import type { ComponentProps, MouseEvent } from 'react'
 import { Link, type LinkProps } from 'react-router'
 import { TableRow } from '@temps-sdk/ui'
 import { cn } from './lib/cn'
-import { followsRecordLink } from './lib/follows-record-link'
+import { followsRecordLink, onDisabledControl } from './lib/follows-record-link'
 
 /**
  * Canonical resource-detail navigation in a table's identity column. It is
@@ -34,8 +34,8 @@ type FollowHandlers<E extends HTMLElement> = {
 /**
  * Click handlers that make an element follow the one `RecordLink` it
  * contains. Cmd/Ctrl-click and middle click open a new tab; clicks on the
- * element's own controls, in portals they open, or that select text never
- * navigate. With no record link, or more than one, a click does nothing:
+ * element's own controls (disabled ones included), in portals they open, or
+ * that select text never navigate. With no record link, or more than one, a click does nothing:
  * the row cannot know which record is meant.
  */
 function followHandlers<E extends HTMLElement>({
@@ -49,6 +49,7 @@ function followHandlers<E extends HTMLElement>({
     )
     if (links.length !== 1) return
     if (!followsRecordLink(item, event.target as Element)) return
+    if (onDisabledControl(item, event.clientX, event.clientY)) return
     if (window.getSelection()?.toString()) return
     if (newTab) window.open(links[0].href, '_blank', 'noopener')
     else links[0].click()

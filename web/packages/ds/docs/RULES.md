@@ -278,7 +278,8 @@ that clarifies scope or outcome. Omit repeated labels and detailed instructions.
 - Keep selection, expansion, copy, menus, Edit, and Delete independently
   operable: clicks on them, or in a menu or dialog they open, never navigate.
   Custom widgets count when they carry their ARIA role (`tab`, `combobox`,
-  `radio`, …). Mark a value meant to be selected or copied, such as a revealed
+  `radio`, …), and so do disabled controls, even though they take no pointer
+  events. Mark a value meant to be selected or copied, such as a revealed
   value, with `data-row-ignore`. Use a labeled button for expansion.
 - Use real routed URLs for details/configuration; preserve Enter, modifier-click,
   new-tab, refresh, and browser history. Do not replace links with buttons.
