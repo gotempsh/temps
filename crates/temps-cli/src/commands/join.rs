@@ -709,13 +709,80 @@ fn apply_saved_public_ingress_settings(
     config.public_ingress_https_port = https_port;
 }
 
-/// How to start the worker once it has joined; `mac_worker` when this Mac
-/// joined with its Docker app (ADR 090).
-fn print_start_agent_hint(mac_worker: bool) {
+/// End a join with the agent on the config just saved: restart the managed
+/// service if one runs from this data directory, else say how to start it.
+/// `mac_worker` when this Mac joined with its Docker app (ADR 090). Never
+/// fails the join: the token is spent and the config saved, so a service
+/// that could not be restarted is a warning with the command to run.
+async fn finish_agent_after_join(mac_worker: bool) {
+    use crate::commands::agent_service::{restart_after_join, start_agent_hint, ServiceAfterJoin};
+    let data_dir = crate::commands::agent::agent_data_dir();
+    let outcome = tokio::task::spawn_blocking(move || restart_after_join(&data_dir)).await;
     println!();
-    for line in super::agent_service::start_agent_hint(cfg!(target_os = "macos"), mac_worker) {
-        println!("{line}");
+    match outcome {
+        Ok(ServiceAfterJoin::Restarted(service)) => {
+            println!(
+                "Restarted {}: the worker now runs on this config.",
+                service.name
+            );
+            println!("  temps agent service status    to check it");
+        }
+        Ok(ServiceAfterJoin::NotRestarted {
+            service,
+            reason,
+            fix,
+        }) => {
+            println!(
+                "Warning: {} was not restarted onto this config: {reason}",
+                service.name
+            );
+            println!("Until it runs on this config, this control plane sees the worker offline.");
+            if let Some(fix) = fix {
+                println!("Once that is dealt with, run:");
+                println!("  {fix}");
+            }
+        }
+        Ok(ServiceAfterJoin::Stopped(service)) => {
+            println!(
+                "{} is installed but stopped, so the worker stays offline until it runs:",
+                service.name
+            );
+            println!("  {}", service.start);
+        }
+        Ok(ServiceAfterJoin::NotInstalled) => {
+            for line in start_agent_hint(cfg!(target_os = "macos"), mac_worker) {
+                println!("{line}");
+            }
+            println!(
+                "If `temps agent` already runs under your own supervisor, restart it: it reads \
+                 its config only at start."
+            );
+        }
+        Err(error) => {
+            println!(
+                "Warning: could not check the agent service ({error}). If it is running, restart \
+                 it: it reads its config only at start."
+            );
+            for line in start_agent_hint(cfg!(target_os = "macos"), mac_worker) {
+                println!("{line}");
+            }
+        }
     }
+}
+
+/// Save the Mac worker's sidecar settings, the last file the agent reads at
+/// start. A failure here comes after agent.json was rewritten and the token
+/// spent, so it says what a running agent is left on.
+fn save_mac_worker(worker: &temps_node_agent::mac_worker::MacWorker) -> anyhow::Result<()> {
+    worker
+        .save(&crate::commands::agent::agent_data_dir())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{error}. agent.json is already rewritten for this control plane, but a running \
+                 agent keeps its previous config until it restarts: fix this and run `temps join` \
+                 again"
+            )
+        })
 }
 
 /// Extract the port `temps agent` will listen on from `--agent-address`.
@@ -972,6 +1039,10 @@ impl JoinCommand {
                     .await?;
             }
         }
+
+        // Last, after every file the agent reads at start is written (on a
+        // Mac, the sidecar's mac_worker.json follows agent.json).
+        finish_agent_after_join(self.mac.is_some()).await;
 
         Ok(())
     }
@@ -1356,8 +1427,6 @@ impl JoinCommand {
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
-
-        print_start_agent_hint(self.mac.is_some());
 
         Ok(())
     }
@@ -1865,9 +1934,7 @@ impl JoinCommand {
         )
         .await?;
         if let Some(sidecar) = mac_worker {
-            sidecar
-                .worker
-                .save(&crate::commands::agent::agent_data_dir())?;
+            save_mac_worker(&sidecar.worker)?;
             let worker = sidecar.keep();
             println!(
                 "This Mac is a worker. Its containers and its end of the mesh run in {}'s VM; \
@@ -2114,8 +2181,6 @@ impl JoinCommand {
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
-
-        print_start_agent_hint(self.mac.is_some());
 
         Ok(())
     }
