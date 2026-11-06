@@ -166,11 +166,14 @@ impl Worker {
         }
         #[cfg(not(unix))]
         let _ = meta;
+        // A record from before it named its control plane counts by node
+        // ID alone, as it always did.
         let url = |url: &str| url.trim_end_matches('/').to_string();
         Some(status).filter(|status| {
             Some(i64::from(status.node_id)) == self.node_id
-                && self.control_plane_url.as_deref().map(url)
-                    == Some(url(&status.control_plane_url))
+                && status.control_plane_url.as_deref().is_none_or(|recorded| {
+                    self.control_plane_url.as_deref().map(url) == Some(url(recorded))
+                })
         })
     }
 
@@ -646,10 +649,12 @@ pub(super) fn lock_agent_config(path: &Path) -> anyhow::Result<ConfigLock> {
 
 fn lock_agent_config_within(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
     refuse_shared_dir_as_root(path)?;
-    open_config_lock(path, wait)
+    open_config_lock(path, Some(wait))
 }
 
-fn open_config_lock(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
+/// Lock `path`, giving up after `wait`; with `None`, waiting as long as the
+/// holder runs (the lock goes with the process holding it), saying so once.
+fn open_config_lock(path: &Path, wait: Option<Duration>) -> anyhow::Result<ConfigLock> {
     let lock_path = path.with_extension("json.lock");
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -665,11 +670,23 @@ fn open_config_lock(path: &Path, wait: Duration) -> anyhow::Result<ConfigLock> {
             wrong_user_hint()
         )
     })?;
-    let deadline = Instant::now() + wait;
+    let started = Instant::now();
+    let mut told = false;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(ConfigLock { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Err(std::fs::TryLockError::WouldBlock)
+                if wait.is_none_or(|wait| started.elapsed() < wait) =>
+            {
+                if wait.is_none() && !told && started.elapsed() >= LOCK_WAIT {
+                    told = true;
+                    println!(
+                        "Waiting for another `temps agent labels` or `temps agent ingress` \
+                         editing {} (it holds {}): let it finish, or stop it, to continue.",
+                        path.display(),
+                        lock_path.display()
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
@@ -794,18 +811,11 @@ fn remove_stale_temp_files(path: &Path) {
 /// it. An overlapping edit then either finishes first or reads the new
 /// file; it can never write the old enrollment back over this one.
 pub(super) fn replace_agent_config(path: &Path, text: &str) -> anyhow::Result<()> {
-    // Join has registered the node by now: a lock held by a hung edit must
-    // not lose the new enrollment, so it is written anyway.
-    let lock = match open_config_lock(path, LOCK_WAIT) {
-        Ok(lock) => Some(lock),
-        Err(error) => {
-            println!("Warning: {error} Writing the new config anyway.");
-            None
-        }
-    };
-    if lock.is_some() {
-        remove_stale_temp_files(path);
-    }
+    // Never without the lock: an edit that already checked the old file
+    // would rename its copy over this one. Join has registered the node, so
+    // it waits for such an edit rather than give up.
+    let _lock = open_config_lock(path, None)?;
+    remove_stale_temp_files(path);
     let tmp = write_temp_file(path, text)?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -998,7 +1008,7 @@ mod tests {
     fn status(labels: serde_json::Value, origin: LabelsOrigin, age_secs: i64) -> LabelsStatus {
         LabelsStatus {
             node_id: 3,
-            control_plane_url: PLANE.to_string(),
+            control_plane_url: Some(PLANE.to_string()),
             labels,
             origin,
             accepted_at: Utc::now() - ChronoDuration::seconds(age_secs),
@@ -1068,7 +1078,7 @@ mod tests {
         // A record from the same node ID on another control plane is not
         // this worker's.
         let mut elsewhere = status(serde_json::json!({"zone": "b"}), LabelsOrigin::AgentJson, 1);
-        elsewhere.control_plane_url = "https://other.example.test".to_string();
+        elsewhere.control_plane_url = Some("https://other.example.test".to_string());
         temps_node_agent::labels::record_accepted(dir.path(), &elsewhere).unwrap();
         assert!(Worker::load(
             &Target {
@@ -1370,13 +1380,15 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        // A join waits for an edit holding the lock, then writes.
+        // A join waits for an edit holding the lock, past the time an edit
+        // would give up, and never writes without it.
         let held = lock_agent_config(&path).unwrap();
         let writer = {
             let path = path.clone();
             std::thread::spawn(move || replace_agent_config(&path, r#"{"token":"third"}"#))
         };
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(LOCK_WAIT + Duration::from_millis(500));
+        assert!(!writer.is_finished(), "join is still waiting for the lock");
         assert!(std::fs::read_to_string(&path).unwrap().contains("new"));
         drop(held);
         writer.join().unwrap().unwrap();

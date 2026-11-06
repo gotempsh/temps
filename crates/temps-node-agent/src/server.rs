@@ -1669,7 +1669,7 @@ pub(crate) mod tests {
         let status = crate::labels::read_status(dir.path()).unwrap();
         assert_eq!(status.origin, crate::labels::LabelsOrigin::AgentJson);
         assert_eq!(status.node_id, 1);
-        assert_eq!(status.control_plane_url, url);
+        assert_eq!(status.control_plane_url.as_deref(), Some(url.as_str()));
     }
 
     #[test]

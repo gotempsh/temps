@@ -115,8 +115,9 @@ fn read_bounded(
 pub struct LabelsStatus {
     pub node_id: i32,
     /// The control plane that accepted them: node IDs are only unique
-    /// within one.
-    pub control_plane_url: String,
+    /// within one. `None` in a record written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane_url: Option<String>,
     pub labels: serde_json::Value,
     pub origin: LabelsOrigin,
     /// When the heartbeat carrying `labels` succeeded.
@@ -377,7 +378,7 @@ impl AcceptedLabels {
         let node_id = self.enrollment.node_id;
         let status = LabelsStatus {
             node_id,
-            control_plane_url: self.enrollment.control_plane_url.clone(),
+            control_plane_url: Some(self.enrollment.control_plane_url.clone()),
             labels: labels.clone(),
             origin: self.settings.origin,
             accepted_at: Utc::now(),
@@ -565,7 +566,14 @@ mod tests {
         accepted.accepted(&a).await;
         let second = read_status(dir.path()).unwrap();
         assert_eq!(second.labels, a);
-        assert_eq!(second.control_plane_url, PLANE);
+        assert_eq!(second.control_plane_url.as_deref(), Some(PLANE));
+        // A record from before the field existed still reads.
+        std::fs::write(
+            dir.path().join(STATUS_FILE),
+            r#"{"node_id":1,"labels":{},"origin":"agent_json","accepted_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(read_status(dir.path()).unwrap().control_plane_url, None);
         assert!(
             second.accepted_at > first,
             "a new acceptance gets a new record"

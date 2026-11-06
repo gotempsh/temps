@@ -50,7 +50,8 @@ the read to the rename, so two overlapping edits take turns instead of one
 losing the other's change. "Still the file that was read" means the same
 inode, size and modification time, so a write in place is caught too.
 `temps join` replaces `agent.json` under the same lock, through a temporary
-file, so an edit overlapping a join cannot write the old enrollment back.
+file, so an edit overlapping a join cannot write the old enrollment back; it
+waits for the lock as long as its holder runs, never writing without it.
 Temporary files a crashed run left behind are removed under the lock. The
 agent keeps its labels when `agent.json` is not a JSON object at all. `--data-dir` picks
 another agent directory, as for `temps agent ingress`, which uses the same
