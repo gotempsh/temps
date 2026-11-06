@@ -483,6 +483,7 @@ fn plist_binary(plist: &str) -> Option<PathBuf> {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct LoadedJob {
     path: Option<String>,
+    program: Option<String>,
     state: Option<String>,
     pid: Option<String>,
     data_dir: Option<String>,
@@ -512,6 +513,8 @@ impl LoadedJob {
                 in_environment = true;
             } else if let Some(value) = field.strip_prefix("path = ") {
                 job.path = Some(value.to_string());
+            } else if let Some(value) = field.strip_prefix("program = ") {
+                job.program = Some(value.to_string());
             } else if let Some(value) = field.strip_prefix("state = ") {
                 job.state = Some(value.to_string());
             } else if let Some(value) = field.strip_prefix("pid = ") {
@@ -521,15 +524,24 @@ impl LoadedJob {
         job
     }
 
-    /// Whether launchd runs the plist at `plist` for `data_dir`: the job a
-    /// kickstart restarts is the definition launchd loaded, which may no
-    /// longer match the file.
-    fn check(&self, plist: &Path, data_dir: &Path) -> Result<(), String> {
+    /// Whether launchd runs the plist at `plist` for `data_dir`, running
+    /// `binary`: the job a kickstart restarts is the definition launchd
+    /// loaded, which may no longer match the file, so the binary checked
+    /// before the restart must be the one launchd runs.
+    fn check(&self, plist: &Path, data_dir: &Path, binary: &Path) -> Result<(), String> {
         let plist = plist.to_string_lossy();
         if self.path.as_deref() != Some(plist.as_ref()) {
             return Err(format!(
                 "launchd loaded {LABEL} from '{}', not from {plist}, so join leaves it alone",
                 self.path.as_deref().unwrap_or("an unknown path")
+            ));
+        }
+        let binary = binary.to_string_lossy();
+        if self.program.as_deref() != Some(binary.as_ref()) {
+            return Err(format!(
+                "the loaded {LABEL} runs '{}', not {binary} as its plist says; run `temps agent \
+                 service install` to reload it",
+                self.program.as_deref().unwrap_or("an unknown program")
             ));
         }
         let data_dir = data_dir.to_string_lossy();
@@ -599,6 +611,9 @@ pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
             )
         }
     }
+    let Some(binary) = plist_binary(&plist) else {
+        return refuse(format!("{} names no program", path.display()), &reinstall);
+    };
     let loaded = match launchctl(&["print", &service_target()]) {
         Ok(output) if output.status.success() => {
             LoadedJob::parse(&String::from_utf8_lossy(&output.stdout))
@@ -607,7 +622,7 @@ pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
         Ok(_) => return ServiceAfterJoin::Stopped(service),
         Err(error) => return refuse(error.to_string(), &service.restart),
     };
-    if let Err(reason) = loaded.check(&path, data_dir) {
+    if let Err(reason) = loaded.check(&path, data_dir, &binary) {
         return refuse(reason, &reinstall);
     }
     if let Err(reason) = super::agent_service::check_joined_config(data_dir) {
@@ -627,9 +642,6 @@ pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
         }
         Err(error) => return refuse(error.to_string(), &service.restart),
     }
-    let Some(binary) = plist_binary(&plist) else {
-        return refuse(format!("{} names no program", path.display()), &reinstall);
-    };
     // Install wrote the canonical path; a symlink there now could point
     // somewhere the ownership check below would not cover.
     match std::fs::canonicalize(&binary) {
@@ -819,6 +831,7 @@ mod tests {
                      \tpath = /Users/someone/Library/LaunchAgents/sh.temps.agent.plist\n\
                      \ttype = LaunchAgent\n\
                      \tstate = running\n\
+                     \tprogram = /opt/homebrew/bin/temps\n\
                      \n\
                      \tdefault environment = {\n\
                      \t\tTEMPS_DATA_DIR => /decoy\n\
@@ -838,19 +851,29 @@ mod tests {
         assert_eq!(job.state.as_deref(), Some("running"));
         assert_eq!(job.pid.as_deref(), Some("4242"));
         assert_eq!(job.data_dir.as_deref(), Some("/Users/someone/.temps"));
+        assert_eq!(job.program.as_deref(), Some("/opt/homebrew/bin/temps"));
         let plist = Path::new("/Users/someone/Library/LaunchAgents/sh.temps.agent.plist");
-        assert_eq!(job.check(plist, Path::new("/Users/someone/.temps")), Ok(()));
+        let home = Path::new("/Users/someone/.temps");
+        let binary = Path::new("/opt/homebrew/bin/temps");
+        assert_eq!(job.check(plist, home, binary), Ok(()));
         let error = job
-            .check(plist, Path::new("/Users/someone/other"))
+            .check(plist, Path::new("/Users/someone/other"), binary)
             .unwrap_err();
         assert!(error.contains("/Users/someone/.temps"), "{error}");
         let error = job
             .check(
                 Path::new("/Users/other/Library/LaunchAgents/sh.temps.agent.plist"),
-                Path::new("/Users/someone/.temps"),
+                home,
+                binary,
             )
             .unwrap_err();
         assert!(error.contains("join leaves it alone"), "{error}");
+        // The plist on disk names another binary than the one launchd loaded:
+        // the binary join checked is not the one a kickstart would run.
+        let error = job
+            .check(plist, home, Path::new("/Users/someone/bin/temps"))
+            .unwrap_err();
+        assert!(error.contains("/opt/homebrew/bin/temps"), "{error}");
         assert_eq!(LoadedJob::parse(""), LoadedJob::default());
     }
 

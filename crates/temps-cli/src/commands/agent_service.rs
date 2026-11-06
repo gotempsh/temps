@@ -146,7 +146,8 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
     require_root()?;
     require_systemd()?;
     warn_about_host(&config);
-    refuse_unsafe_paths(&binary, &data_dir, &config)?;
+    refuse_unsafe_paths(ServiceAction::Install, &binary, &data_dir, &config)
+        .map_err(|(_, error)| error)?;
     refuse_foreign_unit(Path::new(UNIT_PATH))?;
     let temporary = Path::new(UNIT_PATH).with_extension("service.tmp");
     std::fs::write(&temporary, unit)?;
@@ -370,6 +371,14 @@ fn ownership_problem(uid: u32, gid: u32, mode: u32) -> Option<UnsafeOwnership> {
     }
 }
 
+/// What the ownership check guards, for the error's wording: `temps agent
+/// service install`, or `temps join` restarting the installed service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceAction {
+    Install,
+    Restart,
+}
+
 /// What a trusted path is, for the error and its fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrustedPath {
@@ -400,6 +409,7 @@ fn first_unsafe_component(
 
 /// The refusal for `unsafe_path`, found while checking `checked` as `role`.
 fn unsafe_path_error(
+    action: ServiceAction,
     role: TrustedPath,
     checked: &Path,
     unsafe_path: &Path,
@@ -423,9 +433,13 @@ fn unsafe_path_error(
         TrustedPath::Binary => format!(
             "The service runs as root, so whoever can change that path can run code as root. \
              Install the binary where only root can write, e.g. \
-             `sudo install -D -o root -g root -m 0755 {} /opt/temps/bin/temps`, then rerun with \
-             `--binary /opt/temps/bin/temps`.",
-            checked.display()
+             `sudo install -D -o root -g root -m 0755 {} {SAFE_BINARY}`, then {}.",
+            checked.display(),
+            match action {
+                ServiceAction::Install => format!("rerun with `--binary {SAFE_BINARY}`"),
+                ServiceAction::Restart =>
+                    format!("reinstall the service with `--binary {SAFE_BINARY}`"),
+            }
         ),
         TrustedPath::DataDir => format!(
             "The service runs as root and trusts the agent's configuration, so whoever can change \
@@ -442,20 +456,31 @@ fn unsafe_path_error(
             file = checked.display()
         ),
     };
+    let refusal = match action {
+        ServiceAction::Install => "refusing to install",
+        ServiceAction::Restart => "join will not restart",
+    };
     anyhow::anyhow!(
-        "refusing to install {SERVICE_NAME}: {}{within} {why}. {fix}",
+        "{refusal} {SERVICE_NAME}: {}{within} {why}. {fix}",
         unsafe_path.display()
     )
 }
 
 /// Check `path` (canonical) and its ancestors for [`ownership_problem`]s.
 fn require_root_owned(
+    action: ServiceAction,
     role: TrustedPath,
     path: &Path,
     lookup: impl Fn(&Path) -> std::io::Result<(u32, u32, u32)>,
 ) -> anyhow::Result<()> {
     match first_unsafe_component(path, lookup)? {
-        Some((unsafe_path, problem)) => Err(unsafe_path_error(role, path, &unsafe_path, &problem)),
+        Some((unsafe_path, problem)) => Err(unsafe_path_error(
+            action,
+            role,
+            path,
+            &unsafe_path,
+            &problem,
+        )),
         None => Ok(()),
     }
 }
@@ -463,25 +488,48 @@ fn require_root_owned(
 /// Refuse to point a root service at a binary, data directory or agent
 /// config that anyone but root could change (or swap through a writable
 /// directory above it). All three paths are canonical.
+/// Where the ownership error suggests installing the binary.
+const SAFE_BINARY: &str = "/opt/temps/bin/temps";
+
+/// Refuse to point a root service at a binary, data directory or agent
+/// config that anyone but root could change (or swap through a writable
+/// directory above it). All three paths are canonical. The error comes
+/// with the path that failed, so a caller can tailor its fix.
 #[cfg(unix)]
-fn refuse_unsafe_paths(binary: &Path, data_dir: &Path, config: &Path) -> anyhow::Result<()> {
+fn refuse_unsafe_paths(
+    action: ServiceAction,
+    binary: &Path,
+    data_dir: &Path,
+    config: &Path,
+) -> Result<(), (TrustedPath, anyhow::Error)> {
     use std::os::unix::fs::MetadataExt;
     let lookup =
         |path: &Path| std::fs::metadata(path).map(|meta| (meta.uid(), meta.gid(), meta.mode()));
-    require_root_owned(TrustedPath::Binary, binary, lookup)?;
-    require_root_owned(TrustedPath::DataDir, data_dir, lookup)?;
+    require_root_owned(action, TrustedPath::Binary, binary, lookup)
+        .map_err(|error| (TrustedPath::Binary, error))?;
+    require_root_owned(action, TrustedPath::DataDir, data_dir, lookup)
+        .map_err(|error| (TrustedPath::DataDir, error))?;
     // agent.json may itself be a symlink out of the data directory.
     let config = std::fs::canonicalize(config).map_err(|error| {
-        anyhow::anyhow!(
-            "the agent config {} is unusable ({error})",
-            config.display()
+        (
+            TrustedPath::AgentConfig,
+            anyhow::anyhow!(
+                "the agent config {} is unusable ({error})",
+                config.display()
+            ),
         )
     })?;
-    require_root_owned(TrustedPath::AgentConfig, &config, lookup)
+    require_root_owned(action, TrustedPath::AgentConfig, &config, lookup)
+        .map_err(|error| (TrustedPath::AgentConfig, error))
 }
 
 #[cfg(not(unix))]
-fn refuse_unsafe_paths(_binary: &Path, _data_dir: &Path, _config: &Path) -> anyhow::Result<()> {
+fn refuse_unsafe_paths(
+    _action: ServiceAction,
+    _binary: &Path,
+    _data_dir: &Path,
+    _config: &Path,
+) -> Result<(), (TrustedPath, anyhow::Error)> {
     Ok(())
 }
 
@@ -685,11 +733,20 @@ fn restart_unit_after_join(data_dir: &Path) -> ServiceAfterJoin {
     }
     // The same ownership check install makes: the restarted agent runs as
     // root, so a binary or config another user could swap must not start.
-    if let Err(error) = refuse_unsafe_paths(&binary, data_dir, &data_dir.join("agent.json")) {
-        return refuse(
-            format!("join will not restart it as root: {error}"),
-            Some(reinstall),
-        );
+    if let Err((role, error)) = refuse_unsafe_paths(
+        ServiceAction::Restart,
+        &binary,
+        data_dir,
+        &data_dir.join("agent.json"),
+    ) {
+        // An unsafe binary needs a safe copy first (the reason says how), then
+        // a unit pointing at it; the other paths need only their ownership
+        // fixed before install rewrites the unit.
+        let fix = match role {
+            TrustedPath::Binary => format!("{reinstall} --binary {SAFE_BINARY}"),
+            TrustedPath::DataDir | TrustedPath::AgentConfig => reinstall,
+        };
+        return refuse(error.to_string(), Some(fix));
     }
     if let Err(error) = systemctl_output(
         &["restart", "--no-ask-password", SERVICE_NAME],
@@ -908,7 +965,7 @@ impl LoadedUnit {
 /// working directory, an `EnvironmentFile`) leaves the restart to the
 /// operator.
 fn drop_in_overrides(contents: &str) -> bool {
-    const ALLOWED: [&str; 31] = [
+    const ALLOWED: [&str; 34] = [
         "Description",
         "Documentation",
         "After",
@@ -922,6 +979,11 @@ fn drop_in_overrides(contents: &str) -> bool {
         "TimeoutStartSec",
         "TimeoutStopSec",
         "TimeoutSec",
+        // Fedora ships a drop-in for every service setting
+        // `TimeoutStopFailureMode=abort`.
+        "TimeoutStopFailureMode",
+        "TimeoutStartFailureMode",
+        "TimeoutAbortSec",
         "Nice",
         "OOMScoreAdjust",
         "CPUQuota",
@@ -952,7 +1014,11 @@ fn drop_in_overrides(contents: &str) -> bool {
             return true;
         };
         let key = key.trim();
-        !ALLOWED.contains(&key) || (key == "Environment" && value.contains("TEMPS_DATA_DIR"))
+        // An empty `Environment=` clears every earlier assignment, the
+        // unit's TEMPS_DATA_DIR included.
+        !ALLOWED.contains(&key)
+            || (key == "Environment"
+                && (value.trim().is_empty() || value.contains("TEMPS_DATA_DIR")))
     })
 }
 
@@ -1250,12 +1316,19 @@ mod tests {
             "WorkingDirectory=/tmp",
             "PassEnvironment=TEMPS_DATA_DIR",
             "Environment=A=1 \\\n  TEMPS_DATA_DIR=/srv/x",
+            "Environment=",
+            "Environment=  ",
+            "UnsetEnvironment=TEMPS_DATA_DIR",
             "not a setting",
         ] {
             assert!(drop_in_overrides(&format!("[Service]\n{key}\n")), "{key}");
         }
         assert!(!drop_in_overrides(
             "# tuning\n[Unit]\nStartLimitBurst=10\n\n[Service]\nLimitNOFILE=65536\n; done\n"
+        ));
+        // Fedora's drop-in for every service (service.d/10-timeout-abort.conf).
+        assert!(!drop_in_overrides(
+            "# Abort services that do not stop in time.\n[Service]\nTimeoutStopFailureMode=abort\n"
         ));
         let off =
             LoadedUnit::parse("FragmentPath=x\nActiveState=inactive\nUnitFileState=disabled\n");
@@ -1464,7 +1537,13 @@ mod tests {
             ("/usr/local/bin/temps", 0, 0o100755),
         ];
         let binary = Path::new("/usr/local/bin/temps");
-        assert!(require_root_owned(TrustedPath::Binary, binary, table(&safe)).is_ok());
+        assert!(require_root_owned(
+            ServiceAction::Install,
+            TrustedPath::Binary,
+            binary,
+            table(&safe)
+        )
+        .is_ok());
 
         // A root-owned binary in a user's directory can be swapped by that user.
         let in_home = [
@@ -1474,6 +1553,7 @@ mod tests {
             ("/home/dev/temps", 0, 0o100755),
         ];
         let error = require_root_owned(
+            ServiceAction::Install,
             TrustedPath::Binary,
             Path::new("/home/dev/temps"),
             table(&in_home),
@@ -1493,6 +1573,7 @@ mod tests {
             ("/opt/temps", 0, 0o100755),
         ];
         let error = require_root_owned(
+            ServiceAction::Install,
             TrustedPath::Binary,
             Path::new("/opt/temps"),
             table(&group_writable),
@@ -1512,6 +1593,7 @@ mod tests {
             ("/home/dev/.temps", 1000, 0o40700),
         ];
         let error = require_root_owned(
+            ServiceAction::Install,
             TrustedPath::DataDir,
             Path::new("/home/dev/.temps"),
             table(&entries),
@@ -1533,6 +1615,7 @@ mod tests {
     #[test]
     fn a_path_that_cannot_be_checked_is_refused() {
         let error = require_root_owned(
+            ServiceAction::Install,
             TrustedPath::Binary,
             Path::new("/usr/local/bin/temps"),
             table(&[]),
@@ -1560,11 +1643,28 @@ mod tests {
         let config = data_dir.join("agent.json");
         std::fs::write(&config, "{}").unwrap();
         let binary = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        let error = refuse_unsafe_paths(&binary, &data_dir, &config)
-            .unwrap_err()
-            .to_string();
+        let (role, error) =
+            refuse_unsafe_paths(ServiceAction::Install, &binary, &data_dir, &config).unwrap_err();
+        let error = error.to_string();
+        assert_eq!(role, TrustedPath::Binary, "{error}");
         assert!(
             error.starts_with("refusing to install temps-agent.service"),
+            "{error}"
+        );
+        assert!(error.contains("rerun with `--binary"), "{error}");
+
+        // The same refusal when join would restart the service, worded for
+        // join: there is no install to rerun.
+        let (role, error) =
+            refuse_unsafe_paths(ServiceAction::Restart, &binary, &data_dir, &config).unwrap_err();
+        let error = error.to_string();
+        assert_eq!(role, TrustedPath::Binary, "{error}");
+        assert!(
+            error.starts_with("join will not restart temps-agent.service"),
+            "{error}"
+        );
+        assert!(
+            error.contains("reinstall the service with `--binary /opt/temps/bin/temps`"),
             "{error}"
         );
     }
