@@ -680,6 +680,7 @@ fn spawn_heartbeat_loop(
             };
 
             let labels = labels_rx.borrow_and_update().clone();
+            accepted_labels.sending(&labels);
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,

@@ -292,15 +292,10 @@ fn unit_pins_listen() -> bool {
     unit_text().is_some_and(|text| text.contains("--public-ingress-address"))
 }
 
-pub(super) fn read_config(path: &Path) -> anyhow::Result<serde_json::Value> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Could not read {}: {e}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?;
-    if !value.is_object() {
-        anyhow::bail!("{} is not an agent config object", path.display());
-    }
-    Ok(value)
+/// `agent.json` as an object, read safely (see
+/// [`super::agent_labels::read_agent_config`]).
+fn read_config(path: &Path) -> anyhow::Result<serde_json::Value> {
+    Ok(super::agent_labels::read_agent_config(path)?.value)
 }
 
 fn status(path: &Path) -> anyhow::Result<()> {
@@ -319,7 +314,8 @@ fn status(path: &Path) -> anyhow::Result<()> {
 /// Replace `ingress` in agent.json, keeping every other field, and retire the
 /// legacy listen fields so the two cannot disagree.
 fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
-    let mut value = read_config(path)?;
+    let file = super::agent_labels::read_agent_config(path)?;
+    let mut value = file.value;
     let object = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not an agent config object", path.display()))?;
@@ -328,7 +324,7 @@ fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
         "public_ingress_address".to_string(),
         serde_json::Value::Null,
     );
-    super::agent_labels::write_config_atomically(path, &value)
+    super::agent_labels::write_config_atomically(path, &value, file.identity)
 }
 
 #[cfg(test)]

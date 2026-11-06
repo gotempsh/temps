@@ -101,6 +101,7 @@ struct Worker {
     path: PathBuf,
     data_dir: PathBuf,
     config: serde_json::Value,
+    identity: FileIdentity,
     node_id: Option<i64>,
     node_name: Option<String>,
 }
@@ -110,8 +111,10 @@ impl Worker {
         refuse_wrong_user(target)?;
         let path = super::agent_ingress::config_path(target)
             .map_err(|error| anyhow::anyhow!("{error}{}", wrong_user_hint()))?;
-        let config = super::agent_ingress::read_config(&path)
-            .map_err(|error| anyhow::anyhow!("{error}{}", wrong_user_hint()))?;
+        let AgentConfigFile {
+            value: config,
+            identity,
+        } = read_agent_config(&path)?;
         let data_dir = path
             .parent()
             .map(Path::to_path_buf)
@@ -125,6 +128,7 @@ impl Worker {
             path,
             data_dir,
             config,
+            identity,
         })
     }
 
@@ -252,6 +256,24 @@ fn change(
              Remove the override, restart the agent, then run this again."
         );
     }
+    if let Some(status) = worker
+        .status()
+        .filter(|status| status.origin == LabelsOrigin::Override)
+    {
+        anyhow::bail!(
+            "The agent that last reported (at {}) was started with --labels or {LABELS_ENV}, \
+             which override agent.json, so it would ignore this change; nothing was changed. \
+             Restart it without them, then run this again. If that agent no longer runs, remove \
+             {} first.",
+            status
+                .accepted_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            worker
+                .data_dir
+                .join(temps_node_agent::labels::STATUS_FILE)
+                .display()
+        );
+    }
     let before = worker.labels()?;
     let mut after = before.clone();
     let absent = edit(&mut after)?;
@@ -271,7 +293,7 @@ fn change(
         serde_json::Value::Object(after.clone()),
     );
     let written_at = chrono::Utc::now();
-    write_config_atomically(&worker.path, &config)?;
+    write_config_atomically(&worker.path, &config, worker.identity)?;
     println!("Saved to {}:", worker.path.display());
     if after.is_empty() {
         println!("  (no labels)");
@@ -341,14 +363,24 @@ fn apply(
     since: chrono::DateTime<chrono::Utc>,
     no_restart: bool,
 ) -> anyhow::Result<()> {
-    // Only an agent of this release or later reloads; it has left a record
-    // after its first heartbeat. Without one, waiting is pointless.
-    let previous = worker.status();
-    if previous.is_some() {
+    // Only an agent of this release or later reloads, and it has left a
+    // record after its first heartbeat. Such an agent is never restarted:
+    // a restart drops the traffic it serves, and when its report is late
+    // (the control plane is unreachable, say) it reports the change as soon
+    // as it can on its own.
+    if worker.status().is_some() {
         println!("Waiting for the running agent to report them...");
         if let Some(done) = settled(worker, wait_for(worker, wanted, since, RELOAD_WAIT))? {
             return Ok(done);
         }
+        println!(
+            "Not reported yet. The agent applies agent.json by itself and reports it on its \
+             next successful heartbeat: if the control plane is unreachable, that is when it \
+             reconnects. If the agent is not running, start it (`temps agent service status`). \
+             Check with `temps agent labels list`."
+        );
+        console_hint(worker, wanted);
+        return Ok(());
     }
     if no_restart {
         println!(
@@ -392,16 +424,6 @@ fn apply(
                  only at start.",
                 worker.data_dir.display()
             );
-            if let Some(status) = previous.filter(|status| status.origin == LabelsOrigin::Override)
-            {
-                println!(
-                    "The agent that last reported (at {}) was started with --labels or \
-                     {LABELS_ENV}, which override agent.json. Restart it without them.",
-                    status
-                        .accepted_at
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                );
-            }
         }
     }
     console_hint(worker, wanted);
@@ -457,30 +479,105 @@ fn console_hint(worker: &Worker, wanted: &serde_json::Value) {
     }
 }
 
-/// Replace `path` with `config`: a temporary file in the same directory,
-/// owner-only and owned by whoever owned `path` (so `sudo` never leaves a
-/// user's agent config owned by root), synced, then renamed over it.
+/// Which file was read: a write replaces only that file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn of(_meta: &std::fs::Metadata) -> Self {
+        Self { dev: 0, ino: 0 }
+    }
+}
+
+/// `agent.json` as read, and which file that was.
+pub(super) struct AgentConfigFile {
+    pub(super) value: serde_json::Value,
+    pub(super) identity: FileIdentity,
+}
+
+/// Read `path` as an agent config object: a regular file, never through a
+/// symlink, bounded in size. Run as root, the directory holding it and every
+/// directory above must be root's alone, and so must the file: otherwise
+/// another user could swap files under this command, and turn a root read
+/// of another worker's config (with its node token) into a file they own.
+pub(super) fn read_agent_config(path: &Path) -> anyhow::Result<AgentConfigFile> {
+    if running_as_root() {
+        let dir = path
+            .parent()
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Could not resolve the directory of {}", path.display())
+            })?;
+        if let Some(why) = super::agent_service::not_root_controlled(&dir)? {
+            anyhow::bail!(
+                "Refusing to edit {} as root: {why}, so another user could swap files under \
+                 this command. Run it as the user who owns {}, without sudo.",
+                path.display(),
+                dir.display()
+            );
+        }
+    }
+    let (text, meta) = temps_node_agent::labels::read_regular_file(
+        path,
+        temps_node_agent::labels::MAX_CONFIG_BYTES,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "Could not read {}: {e}.{}",
+            path.display(),
+            wrong_user_hint()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if running_as_root() && meta.uid() != 0 {
+            anyhow::bail!(
+                "Refusing to edit {} as root: it is owned by uid {}. Run this as that user, \
+                 without sudo.",
+                path.display(),
+                meta.uid()
+            );
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?;
+    if !value.is_object() {
+        anyhow::bail!("{} is not an agent config object", path.display());
+    }
+    Ok(AgentConfigFile {
+        value,
+        identity: FileIdentity::of(&meta),
+    })
+}
+
+/// Replace the file [`read_agent_config`] read at `path` with `config`: a
+/// temporary file in the same directory, owner-only, synced, then renamed
+/// over it, but only if `path` is still that file.
 ///
 /// The temporary file is created exclusively, after removing any leftover:
-/// `O_EXCL` never follows a symlink, so a user who owns the directory cannot
-/// point the file a root run writes at another file. A symlinked
-/// `agent.json` is refused for the same reason.
+/// `O_EXCL` never follows a symlink, so one planted in its place is never
+/// written through.
 pub(super) fn write_config_atomically(
     path: &Path,
     config: &serde_json::Value,
+    read: FileIdentity,
 ) -> anyhow::Result<()> {
     let text = serde_json::to_string_pretty(config)
         .map_err(|e| anyhow::anyhow!("Could not serialize the agent config: {e}"))?;
-    let original = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
-            "{} is a symbolic link; refusing to replace it. Point --data-dir at the directory \
-             that holds the real agent.json.",
-            path.display()
-        ),
-        Ok(meta) => Some(meta),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => anyhow::bail!("Could not inspect {}: {error}", path.display()),
-    };
     let tmp = path.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
         use std::io::Write;
@@ -499,18 +596,10 @@ pub(super) fn write_config_atomically(
         let mut file = options.open(&tmp)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::fs::PermissionsExt;
             // The umask may have taken bits off; never more than 0600.
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            if let Some(original) = &original {
-                let mine = file.metadata()?;
-                if (original.uid(), original.gid()) != (mine.uid(), mine.gid()) {
-                    std::os::unix::fs::fchown(&file, Some(original.uid()), Some(original.gid()))?;
-                }
-            }
         }
-        #[cfg(not(unix))]
-        let _ = &original;
         file.write_all(text.as_bytes())?;
         file.sync_all()
     };
@@ -520,6 +609,15 @@ pub(super) fn write_config_atomically(
             "Could not write {}: {error}.{}",
             tmp.display(),
             wrong_user_hint()
+        );
+    }
+    let unchanged = std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_file() && FileIdentity::of(&meta) == read);
+    if !unchanged {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!(
+            "{} changed while it was being edited, so nothing was written. Run this again.",
+            path.display()
         );
     }
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -724,6 +822,7 @@ mod tests {
             path: PathBuf::from("/x/agent.json"),
             data_dir: PathBuf::from("/x"),
             config: serde_json::json!({}),
+            identity: FileIdentity { dev: 0, ino: 0 },
             node_id: Some(3),
             node_name: None,
         };
@@ -731,6 +830,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("TEMPS_NODE_LABELS"), "{error}");
+    }
+
+    /// ADR-091 D6: an agent known to be pinned refuses the change before
+    /// agent.json is touched.
+    #[test]
+    fn a_pinned_agents_record_refuses_the_change_before_writing() {
+        if running_as_root() {
+            // A root run refuses a temporary directory others can write.
+            eprintln!("skipped: runs as root");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        let original = r#"{"node_id":3,"labels":{"zone":"a"}}"#;
+        std::fs::write(&path, original).unwrap();
+        temps_node_agent::labels::record_accepted(
+            dir.path(),
+            &status(serde_json::json!({"zone": "a"}), LabelsOrigin::Override, 60),
+        )
+        .unwrap();
+        let args = ApplyArgs {
+            no_restart: true,
+            target: Target {
+                data_dir: Some(dir.path().to_path_buf()),
+            },
+        };
+        let error = change(&args, |labels| {
+            labels.insert("gpu".to_string(), serde_json::json!("true"));
+            Ok(Vec::new())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert!(error.contains("labels-status.json"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -831,12 +965,11 @@ mod tests {
             )
             .unwrap();
         }
-        let mut config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let file = read_agent_config(&path).unwrap();
+        let mut config = file.value.clone();
         config["labels"] = serde_json::json!({"temps.sh/role": "dedicated"});
-        write_config_atomically(&path, &config).unwrap();
-        let back: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        write_config_atomically(&path, &config, file.identity).unwrap();
+        let back = read_agent_config(&path).unwrap().value;
         assert_eq!(back["token"], "t");
         assert_eq!(back["labels"]["temps.sh/role"], "dedicated");
         assert!(!path.with_extension("json.tmp").exists());
@@ -850,24 +983,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_planted_symlink_is_never_written_through() {
+    fn a_planted_symlink_is_never_read_or_written_through() {
         let dir = tempfile::tempdir().unwrap();
-        let victim = dir.path().join("victim");
-        std::fs::write(&victim, "keep me").unwrap();
+        let victim = dir.path().join("victim.json");
+        std::fs::write(&victim, r#"{"token":"secret of another node"}"#).unwrap();
         let path = dir.path().join("agent.json");
         std::fs::write(&path, "{}").unwrap();
+        // A symlink where the temporary file goes is replaced, not followed.
         std::os::unix::fs::symlink(&victim, path.with_extension("json.tmp")).unwrap();
-        write_config_atomically(&path, &serde_json::json!({"labels": {}})).unwrap();
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        let file = read_agent_config(&path).unwrap();
+        write_config_atomically(&path, &serde_json::json!({"labels": {}}), file.identity).unwrap();
+        assert!(std::fs::read_to_string(&victim)
+            .unwrap()
+            .contains("another node"));
         assert!(std::fs::read_to_string(&path).unwrap().contains("labels"));
-
-        let linked = dir.path().join("linked.json");
+        // agent.json itself a symlink: not even read.
+        let linked = dir.path().join("linked").join("agent.json");
+        std::fs::create_dir(linked.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&victim, &linked).unwrap();
-        let error = write_config_atomically(&linked, &serde_json::json!({}))
+        let error = read_agent_config(&linked).err().unwrap().to_string();
+        assert!(error.contains("Could not read"), "{error}");
+        assert!(!error.contains("another node"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_swapped_after_it_was_read_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.json");
+        std::fs::write(&path, r#"{"labels":{}}"#).unwrap();
+        let file = read_agent_config(&path).unwrap();
+        // Someone renames another file over agent.json in between.
+        let other = dir.path().join("other.json");
+        std::fs::write(&other, r#"{"mine":true}"#).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        let error = write_config_atomically(&path, &file.value, file.identity)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("symbolic link"), "{error}");
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(
+            error.contains("changed while it was being edited"),
+            "{error}"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("mine"));
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]
@@ -875,7 +1033,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // The parent of the temp file does not exist: open fails.
         let path = dir.path().join("missing").join("agent.json");
-        let error = write_config_atomically(&path, &serde_json::json!({}))
+        let identity = FileIdentity { dev: 0, ino: 0 };
+        let error = write_config_atomically(&path, &serde_json::json!({}), identity)
             .unwrap_err()
             .to_string();
         assert!(error.contains("Could not write"), "{error}");

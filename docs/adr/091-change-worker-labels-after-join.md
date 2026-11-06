@@ -42,9 +42,11 @@ temps agent labels unset gpu
 
 `set` and `unset` rewrite only the `labels` object of `agent.json`, keeping
 every other field, through a temporary file renamed over the original, mode
-`0600` and the original owner (a `sudo` run never leaves a Mac user's file
-owned by root). `--data-dir` picks another agent directory, as for
-`temps agent ingress`.
+`0600`. `agent.json` is read as a bounded regular file, never through a
+symlink; the temporary file is created exclusively; and the rename happens
+only if `agent.json` is still the file that was read. `--data-dir` picks
+another agent directory, as for `temps agent ingress`, which uses the same
+reader and writer.
 
 ### D2. Labels are validated, the same way everywhere
 
@@ -87,11 +89,13 @@ This is how `set` and `unset` confirm the change locally: they wait (at most
 write. `list` shows it next to `agent.json`, so a pending or ignored change
 is visible.
 
-### D5. Restart only when the running agent cannot reload
+### D5. Restart only an agent that cannot reload
 
-When no confirmation arrives (an agent older than D3, or a stopped one),
-`set` and `unset` restart the Temps-managed service running from that data
-directory (the systemd unit or the `sh.temps.agent` LaunchAgent), with the
+An agent that has left a record (D4) reloads by itself, so it is never
+restarted: when its confirmation is late (the control plane is unreachable,
+say), the command says the change is pending and how to check it later. With
+no record at all (an agent older than D3), `set` and `unset` restart the
+Temps-managed service running from that data directory (the systemd unit or the `sh.temps.agent` LaunchAgent), with the
 same checks `temps join` uses before restarting it, and wait up to a minute
 for the record. `--no-restart` leaves the agent alone. When nothing confirms,
 the command says exactly what to check: the node's Labels card in Settings >
@@ -101,9 +105,9 @@ Nodes.
 
 Before writing, the command looks for an override where the agent would get
 one: the installed systemd unit's effective environment and command line
-(drop-ins included), the LaunchAgent plist, and the running agent's own
-record (D4). Any of them fails the command, naming where the override is and
-how to remove it, without touching `agent.json`. `TEMPS_NODE_LABELS` in the
+(drop-ins included), the LaunchAgent plist, and the record (D4) of the agent
+that last reported. Any of them fails the command, naming where the override
+is and how to remove it, without touching `agent.json`. `TEMPS_NODE_LABELS` in the
 caller's own shell is reported as a warning: it only affects a `temps agent`
 started from that shell.
 
@@ -113,6 +117,13 @@ No `agent.json` fails with where it looked and what to do: run `temps join`
 first, pass `--data-dir`, or run as the right user. On macOS the agent runs
 as the user who joined, so a `sudo` run is told to drop `sudo`; on Linux the
 service usually runs as root, so a permission error says to use `sudo`.
+
+Run as root, the command edits only a data directory that root alone
+controls: the directory, every directory above it and `agent.json` must be
+root's and not writable by others. Otherwise another user could swap files
+under the root process and receive a copy of a root-only config (with its
+node token) in a file they own. Such a directory belongs to a user, who runs
+the command as themselves.
 
 ## Labels from the control plane: not now
 

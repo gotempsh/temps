@@ -571,8 +571,9 @@ pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
     if uid() == 0 {
         return ServiceAfterJoin::NotRestarted {
             service: launch_agent(&home, true),
-            reason: "this join ran as root, so it saved root's agent config, and cannot reach \
-                     a LaunchAgent, which runs as you. On a Mac, run `temps join` without sudo"
+            reason: "this ran as root, so it used root's agent config, and cannot reach a \
+                     LaunchAgent, which runs as you. On a Mac, run `temps join` and `temps agent \
+                     labels` without sudo"
                 .to_string(),
             fix: None,
         };

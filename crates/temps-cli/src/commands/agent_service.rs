@@ -407,6 +407,35 @@ fn first_unsafe_component(
     Ok(None)
 }
 
+/// For a command run as root that edits the agent's files (`temps agent
+/// labels`, `temps agent ingress`): the first of `dir` (canonical) and its
+/// ancestors that someone other than root could change, and why. Whoever
+/// controls such a directory could swap files under a root process, turning
+/// its reads and writes into theirs.
+#[cfg(unix)]
+pub(super) fn not_root_controlled(dir: &Path) -> anyhow::Result<Option<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let lookup =
+        |path: &Path| std::fs::metadata(path).map(|meta| (meta.uid(), meta.gid(), meta.mode()));
+    Ok(first_unsafe_component(dir, lookup)?.map(|(path, problem)| {
+        let why = match problem {
+            UnsafeOwnership::NotOwnedByRoot { uid } => format!("is owned by uid {uid}, not root"),
+            UnsafeOwnership::WritableByGroup { gid, mode } => {
+                format!("is writable by group {gid} (mode {mode:04o})")
+            }
+            UnsafeOwnership::WritableByOthers { mode } => {
+                format!("is writable by everyone (mode {mode:04o})")
+            }
+        };
+        format!("{} {why}", path.display())
+    }))
+}
+
+#[cfg(not(unix))]
+pub(super) fn not_root_controlled(_dir: &Path) -> anyhow::Result<Option<String>> {
+    Ok(None)
+}
+
 /// The refusal for `unsafe_path`, found while checking `checked` as `role`.
 fn unsafe_path_error(
     action: ServiceAction,
@@ -700,7 +729,7 @@ fn restart_unit_after_join(data_dir: &Path) -> ServiceAfterJoin {
     // SAFETY: geteuid has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return refuse(
-            format!("this join did not run as root, and only root restarts {SERVICE_NAME}"),
+            format!("this did not run as root, and only root restarts {SERVICE_NAME}"),
             Some(service.restart.clone()),
         );
     }
