@@ -287,7 +287,9 @@ that needs it is a bug at that width, fixed by changing the layout.
 - A table gives each column a priority and shows it by the width the table has,
   with container queries (`hidden @xl:table-cell`), so the sidebar and side
   panels count. The viewport is the wrong measure: the same table is narrower
-  with the sidebar open.
+  with the sidebar open. `DataTable` is a query container already; wrap a
+  hand-built shared `Table` in `<div className="@container">` directly around
+  it, since without a container the `@` classes never match.
 - A narrow table keeps the record's name, its state and its actions. What a
   hidden column says that is needed to act moves under the name as muted text
   (a bundle's "no services" warning, a rule's credential); the rest stays on

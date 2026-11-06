@@ -209,9 +209,13 @@ opt-in, never needed to communicate success; use a text-labeled `Status`.
 
 No horizontal scrolling, anywhere. `PageHeader` actions keep their width and
 wrap to a second row; the description wraps, never under them. `Detail`'s aside
-stacks below `main` under `lg`. Tables are query containers: give each
-`DataTableColumn` a priority class (`hidden @xl:table-cell` on its head and
-cells) so a narrow table keeps the name, the state and the actions, and move
+stacks below `main` under `lg`. Tables are query containers: `DataTable`
+declares one around its table, so give each `DataTableColumn` a priority class
+(`hidden @xl:table-cell`; it applies to the head and every cell) and a narrow
+table keeps the name, the state and the actions. A hand-built shared `Table`
+is not a container by itself: wrap it in `<div className="@container">`
+directly around the table, or the `@` classes measure some ancestor instead
+(and with none, the columns never show). Move
 what a hidden column says that is needed to act under the name. Long
 identifiers break (`overflow-wrap: anywhere`). Tabs wrap. Check from 320px up.
 `DataTable`'s overflow wrapper and `ScrollableTabsList` are a safety net and a

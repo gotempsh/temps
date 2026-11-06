@@ -68,7 +68,9 @@ export function DataTable<T>({
           Loading rows…
         </p>
       ) : null}
-      <div className="rounded-md border">
+      {/* A query container: columns use `hidden @xl:table-cell` and show by
+          the width this table has, sidebar and side panels included. */}
+      <div className="@container rounded-md border">
         <Table aria-label={ariaLabel} aria-busy={isLoading}>
           <TableHeader>
             <TableRow>
