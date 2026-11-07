@@ -175,6 +175,29 @@ fn default_host() -> String {
     "localhost".to_string()
 }
 
+/// Where Temps' own connection to the server goes: the configured host,
+/// `localhost` for a service on this server. A worker's agent sets it to the
+/// node's published address, the only one the node binds service ports on.
+fn admin_host(config: &RedisConfig) -> &str {
+    match config.host.trim() {
+        "" => "localhost",
+        host => host,
+    }
+}
+
+fn redis_admin_url(config: &RedisConfig) -> String {
+    let host = admin_host(config);
+    if config.password.is_empty() {
+        format!("redis://{host}:{}", config.port)
+    } else {
+        format!(
+            "redis://:{}@{host}:{}",
+            urlencoding::encode(&config.password),
+            config.port
+        )
+    }
+}
+
 fn generate_password() -> String {
     use rand::{distr::Alphanumeric, RngExt};
     rand::rng()
@@ -323,18 +346,11 @@ impl RedisService {
             config.port
         );
 
-        let connection_url = if config.password.is_empty() {
-            format!("redis://localhost:{}", config.port)
-        } else {
-            format!(
-                "redis://:{}@localhost:{}",
-                urlencoding::encode(&config.password),
-                config.port
-            )
-        };
+        let connection_url = redis_admin_url(&config);
 
         info!(
-            "RedisService::get_connection - creating client for URL (password masked): redis://...@localhost:{}",
+            "RedisService::get_connection - creating client for URL (password masked): redis://...@{}:{}",
+            admin_host(&config),
             config.port
         );
 
@@ -5228,6 +5244,36 @@ mod tests {
         // In Docker mode, should return container name with internal port
         assert_eq!(host, "redis-test-effective-addr-docker");
         assert_eq!(port, "6379"); // Internal port
+    }
+
+    /// Temps' own connection follows the configured host, so a worker's
+    /// published address reaches it; a local service keeps `localhost`.
+    #[test]
+    fn the_admin_connection_goes_to_the_configured_host() {
+        let config = |host: &str| RedisConfig {
+            host: host.to_string(),
+            port: "6380".to_string(),
+            password: "p@ss".to_string(),
+            docker_image: "redis:8".to_string(),
+            container_name: None,
+        };
+        // A worker's agent moves the host to the node's published address.
+        assert_eq!(
+            redis_admin_url(&config("10.42.0.22")),
+            "redis://:p%40ss@10.42.0.22:6380"
+        );
+        // A service on this server keeps connecting to localhost.
+        assert_eq!(
+            redis_admin_url(&config("localhost")),
+            "redis://:p%40ss@localhost:6380"
+        );
+        assert_eq!(
+            redis_admin_url(&config(" ")),
+            "redis://:p%40ss@localhost:6380"
+        );
+        let mut open = config("localhost");
+        open.password.clear();
+        assert_eq!(redis_admin_url(&open), "redis://localhost:6380");
     }
 
     /// An imported service is refused before any Docker call. This client has

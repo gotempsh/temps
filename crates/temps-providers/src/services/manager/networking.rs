@@ -108,6 +108,36 @@ impl ExternalServiceManager {
         })?;
 
         let parameters = self.get_service_parameters(service_id).await?;
+
+        // A worker's container is out of this process's reach, and a server
+        // started with `--profile control-plane` has no Docker handle to
+        // build an engine with. The address needs only names and ports: the
+        // container name the agent reported at create time (or the engine's
+        // own), and the host port it bound, both persisted in the parameters.
+        if service.node_id.is_some() {
+            let selection = EngineSelection::for_parameter_map(
+                service_id,
+                &service.name,
+                service_type,
+                &parameters,
+            )?;
+            let stored = |key: &str| {
+                parameters
+                    .get(key)
+                    .and_then(|value| match value {
+                        serde_json::Value::String(text) => Some(text.trim().to_string()),
+                        serde_json::Value::Number(number) => Some(number.to_string()),
+                        _ => None,
+                    })
+                    .filter(|text| !text.is_empty())
+            };
+            let internal_port = selection.internal_port();
+            let container_name =
+                stored("container_name").unwrap_or_else(|| selection.container_name());
+            let host_port = stored("port").unwrap_or_else(|| internal_port.clone());
+            return Ok((container_name, internal_port, host_port));
+        }
+
         let service_instance = self.create_service_instance_for_parameters(
             service.name.clone(),
             service_type,
@@ -393,5 +423,92 @@ impl ExternalServiceManager {
             fqdn,
             dns_record_published: published,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::services::test_support::*;
+    use std::sync::Arc;
+
+    fn manager_returning(
+        service: temps_entities::external_services::Model,
+    ) -> super::ExternalServiceManager {
+        // `get_service_effective_address` reads the row, then reads it again
+        // to decrypt its parameters.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![service.clone()], vec![service]])
+            .into_connection();
+        control_plane_manager_with_db(Arc::new(db))
+    }
+
+    /// Internal DNS registration and the deployment planner's cross-node
+    /// rewrite both address a service through this. For a service on a
+    /// worker it must work on a `--profile control-plane` server, which has
+    /// no Docker handle to build an engine with.
+    #[tokio::test]
+    async fn worker_service_address_needs_no_local_docker() {
+        let mut service = encrypted_service_model(
+            5,
+            serde_json::json!({
+                "container_name": "postgres-orders",
+                "port": "55432",
+            }),
+        );
+        service.name = "orders".to_string();
+        service.node_id = Some(2);
+
+        let address = manager_returning(service)
+            .get_service_effective_address(5)
+            .await
+            .expect("a worker service is addressed without Docker");
+        assert_eq!(
+            address,
+            (
+                "postgres-orders".to_string(),
+                "5432".to_string(),
+                "55432".to_string()
+            )
+        );
+    }
+
+    /// A row from before the agent's container name and port were stored
+    /// falls back to the engine's own names and the internal port.
+    #[tokio::test]
+    async fn worker_service_address_falls_back_to_the_engine_names() {
+        let mut service = encrypted_service_model(6, serde_json::json!({ "backend": "garage" }));
+        service.name = "assets".to_string();
+        service.service_type = "s3".to_string();
+        service.node_id = Some(2);
+
+        let address = manager_returning(service)
+            .get_service_effective_address(6)
+            .await
+            .expect("a worker service is addressed without Docker");
+        assert_eq!(
+            address,
+            (
+                "garage-assets".to_string(),
+                "3900".to_string(),
+                "3900".to_string()
+            )
+        );
+    }
+
+    /// A service on this host still needs its engine, so the control-plane
+    /// profile refuses it rather than guessing.
+    #[tokio::test]
+    async fn local_service_address_still_needs_docker() {
+        let mut service = encrypted_service_model(7, serde_json::json!({}));
+        service.node_id = None;
+
+        let error = manager_returning(service)
+            .get_service_effective_address(7)
+            .await
+            .expect_err("a local service needs a Docker handle");
+        assert!(
+            error.to_string().contains("control-plane"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! Container runtime inspection, stats, resource limits and log ingestion.
 
 use crate::externalsvc::{ServiceConfig, ServiceType};
+use crate::remote_service_client::{AgentSupport, RemoteServiceClient, ServiceContainerRuntime};
 use crate::services::*;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set};
@@ -11,14 +12,123 @@ use std::collections::HashMap;
 use temps_entities::{external_services, service_members};
 use tracing::info;
 
+/// One container behind a service, and the node whose Docker runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MemberContainer {
+    /// `service_members.role` for cluster members; "standalone" otherwise.
+    pub(super) role: String,
+    pub(super) container_name: String,
+    /// The worker that runs it; `None` (or node 0) for the control plane.
+    pub(super) node_id: Option<i32>,
+}
+
+impl MemberContainer {
+    /// The worker whose agent must be asked, or `None` for this host.
+    fn worker(&self) -> Option<i32> {
+        self.node_id
+            .filter(|node_id| *node_id != ExternalServiceManager::CONTROL_PLANE_NODE_ID)
+    }
+}
+
+/// The agent clients a single runtime or stats request uses, one per
+/// worker, so a cluster with several members on one node builds one client.
+/// A node whose client cannot be built keeps the reason, for every member on
+/// it.
+#[derive(Default)]
+struct WorkerClients(HashMap<i32, Result<RemoteServiceClient, String>>);
+
+impl WorkerClients {
+    async fn get(
+        &mut self,
+        manager: &ExternalServiceManager,
+        node_id: i32,
+    ) -> Result<&RemoteServiceClient, String> {
+        let entry = match self.0.entry(node_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let client = manager
+                    .get_remote_client(node_id)
+                    .await
+                    .map_err(|error| format!("cannot reach the agent on node {node_id}: {error}"));
+                entry.insert(client)
+            }
+        };
+        match entry {
+            Ok(client) => Ok(client),
+            Err(reason) => Err(reason.clone()),
+        }
+    }
+}
+
+fn runtime_info(
+    member: &MemberContainer,
+    runtime: ServiceContainerRuntime,
+    unavailable_reason: Option<String>,
+) -> ContainerRuntimeInfo {
+    let mb = |bytes: Option<i64>| bytes.map(|bytes| bytes / (1024 * 1024));
+    ContainerRuntimeInfo {
+        role: member.role.clone(),
+        container_name: member.container_name.clone(),
+        container_id: runtime.container_id,
+        status: runtime.status,
+        restart_count: runtime.restart_count,
+        oom_killed: runtime.oom_killed,
+        exit_code: runtime.exit_code,
+        started_at: runtime.started_at,
+        finished_at: runtime.finished_at,
+        image: runtime.image,
+        resource_limits: crate::externalsvc::ServiceResourceLimits {
+            memory_mb: mb(runtime.memory_bytes),
+            memory_swap_mb: mb(runtime.memory_swap_bytes),
+            nano_cpus: runtime.nano_cpus,
+            cpu_shares: runtime.cpu_shares,
+            shm_size_mb: mb(runtime.shm_size_bytes),
+        },
+        unavailable_reason,
+    }
+}
+
+fn unavailable_runtime(member: &MemberContainer, reason: String) -> ContainerRuntimeInfo {
+    runtime_info(member, ServiceContainerRuntime::default(), Some(reason))
+}
+
+fn empty_stats(
+    member: &MemberContainer,
+    unavailable_reason: Option<String>,
+) -> ContainerStatsSample {
+    ContainerStatsSample {
+        role: member.role.clone(),
+        container_name: member.container_name.clone(),
+        cpu_percent: None,
+        memory_usage_bytes: None,
+        memory_limit_bytes: None,
+        memory_percent: None,
+        online_cpus: None,
+        unavailable_reason,
+    }
+}
+
+/// Why a local container cannot be observed on a server without Docker.
+fn no_local_docker_reason(error: &temps_core::DockerUnavailable) -> String {
+    format!("this server has no local Docker daemon to read the container from: {error}")
+}
+
+/// What to tell the operator when a worker's agent predates `what`.
+fn agent_too_old(node: &str, node_id: i32, what: &str) -> String {
+    format!(
+        "the agent on node {node} (id {node_id}) does not report {what}; update the agent on \
+         node {node} to this release"
+    )
+}
+
 impl ExternalServiceManager {
-    /// Resolve `(role, container_name)` pairs for every container that
-    /// makes up this service. Standalone services return a single entry;
-    /// cluster services return one entry per `service_members` row.
-    async fn resolve_member_containers(
+    /// Every container that makes up this service and the node it runs on.
+    /// Standalone services return a single entry; cluster services return
+    /// one entry per `service_members` row. Needs no Docker daemon.
+    pub(super) async fn resolve_member_containers(
         &self,
         service: &external_services::Model,
-    ) -> Result<Vec<(String, String)>, ExternalServiceError> {
+    ) -> Result<Vec<MemberContainer>, ExternalServiceError> {
         if service.topology == "cluster" {
             let members = service_members::Entity::find()
                 .filter(service_members::Column::ServiceId.eq(service.id))
@@ -26,11 +136,13 @@ impl ExternalServiceManager {
                 .await?;
             Ok(members
                 .into_iter()
-                .map(|m| (m.role, m.container_name))
+                .map(|m| MemberContainer {
+                    role: m.role,
+                    container_name: m.container_name,
+                    node_id: m.node_id,
+                })
                 .collect())
         } else {
-            // Build a fresh service instance just to ask for its container
-            // name — every engine knows its own naming convention.
             let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
                 ExternalServiceError::InvalidServiceType {
                     id: service.id,
@@ -38,112 +150,76 @@ impl ExternalServiceManager {
                 }
             })?;
             let parameters = self.get_service_parameters(service.id).await?;
-            let instance = self.create_service_instance_for_parameters(
-                service.name.clone(),
-                service_type,
-                &parameters,
-            )?;
-            // An imported service's real container name wins over the derived
-            // `{type}-{name}` one — see the identical pattern in `get_runtime_info`.
-            let container_name = parameters
-                .get("container_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| instance.get_docker_container_name());
-            Ok(vec![("standalone".to_string(), container_name)])
+            // Every engine knows its own naming convention, and a name
+            // recorded in the parameters (an imported container, or the one
+            // a worker's agent reported) wins. No engine is built for this,
+            // so it works on a control-plane-profile server.
+            let container_name = self
+                .service_metadata(service.id, &service.name, service_type, &parameters)?
+                .container_name();
+            Ok(vec![MemberContainer {
+                role: "standalone".to_string(),
+                container_name,
+                node_id: service.node_id,
+            }])
         }
     }
 
-    /// Inspect a single container and project the result onto
-    /// `ContainerRuntimeInfo`. Treats container-not-found as a soft
-    /// signal (returns `container_id: None`) rather than an error so
-    /// the UI can still render "container missing" instead of a 500.
-    async fn inspect_one_container(
-        &self,
-        role: String,
-        container_name: String,
-    ) -> ContainerRuntimeInfo {
-        // No local Docker daemon in this process (control-plane profile) is
-        // the same soft signal as "container not found" here — there is no
-        // separate error path for this best-effort inspection.
-        let Some(docker) = self.docker.get() else {
-            return ContainerRuntimeInfo {
-                role,
-                container_name,
-                container_id: None,
-                status: None,
-                restart_count: None,
-                oom_killed: None,
-                exit_code: None,
-                started_at: None,
-                finished_at: None,
-                image: None,
-                resource_limits: crate::externalsvc::ServiceResourceLimits::default(),
-            };
+    /// Inspect a container on this host's Docker. A missing container is a
+    /// soft signal (`container_id: None`) so the UI renders "container
+    /// missing" instead of a 500; no daemon, or a failed inspection, says why.
+    async fn inspect_local_container(&self, member: &MemberContainer) -> ContainerRuntimeInfo {
+        let docker = match self.docker.require() {
+            Ok(docker) => docker,
+            Err(error) => return unavailable_runtime(member, no_local_docker_reason(&error)),
         };
-
-        let inspected = docker
+        match docker
             .inspect_container(
-                &container_name,
+                &member.container_name,
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
-            .await;
+            .await
+        {
+            Ok(info) => runtime_info(member, ServiceContainerRuntime::from_inspect(&info), None),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => runtime_info(member, ServiceContainerRuntime::default(), None),
+            Err(error) => unavailable_runtime(
+                member,
+                format!(
+                    "failed to inspect container '{}': {error}",
+                    member.container_name
+                ),
+            ),
+        }
+    }
 
-        match inspected {
-            Ok(info) => {
-                let state = info.state.as_ref();
-                let host_config_limits = info
-                    .host_config
-                    .as_ref()
-                    .map(|hc| crate::externalsvc::ServiceResourceLimits {
-                        memory_mb: hc.memory.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
-                        memory_swap_mb: hc
-                            .memory_swap
-                            .filter(|&m| m > 0)
-                            .map(|m| m / (1024 * 1024)),
-                        nano_cpus: hc.nano_cpus.filter(|&n| n > 0),
-                        cpu_shares: hc.cpu_shares.filter(|&n| n > 0),
-                        shm_size_mb: hc.shm_size.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
-                    })
-                    .unwrap_or_default();
-
-                ContainerRuntimeInfo {
-                    role,
-                    container_name,
-                    container_id: info.id,
-                    status: state.and_then(|s| {
-                        s.status
-                            .as_ref()
-                            .map(|st| format!("{:?}", st).to_lowercase())
-                    }),
-                    restart_count: info.restart_count,
-                    oom_killed: state.and_then(|s| s.oom_killed),
-                    exit_code: state.and_then(|s| s.exit_code),
-                    started_at: state.and_then(|s| s.started_at.clone()),
-                    finished_at: state.and_then(|s| s.finished_at.clone()),
-                    image: info.image,
-                    resource_limits: host_config_limits,
-                }
-            }
-            Err(_) => ContainerRuntimeInfo {
-                role,
-                container_name,
-                container_id: None,
-                status: None,
-                restart_count: None,
-                oom_killed: None,
-                exit_code: None,
-                started_at: None,
-                finished_at: None,
-                image: None,
-                resource_limits: crate::externalsvc::ServiceResourceLimits::default(),
-            },
+    /// Ask the agent on `node_id` for a container's runtime state.
+    async fn inspect_worker_container(
+        &self,
+        clients: &mut WorkerClients,
+        member: &MemberContainer,
+        node_id: i32,
+    ) -> ContainerRuntimeInfo {
+        let client = match clients.get(self, node_id).await {
+            Ok(client) => client,
+            Err(reason) => return unavailable_runtime(member, reason),
+        };
+        match client.service_runtime(&member.container_name).await {
+            Ok(AgentSupport::Supported(runtime)) => runtime_info(member, runtime, None),
+            Ok(AgentSupport::Unsupported) => unavailable_runtime(
+                member,
+                agent_too_old(client.node_name(), node_id, "container runtime state"),
+            ),
+            Err(error) => unavailable_runtime(member, error.to_string()),
         }
     }
 
     /// Get a snapshot of every container that makes up this service:
     /// status, restart count, OOM-killed flag, exit code, and current
-    /// applied resource limits.
+    /// applied resource limits. A container on a worker node is read through
+    /// that node's agent; one that cannot be read says why in
+    /// `unavailable_reason`.
     pub async fn get_service_runtime(
         &self,
         service_id: i32,
@@ -151,9 +227,16 @@ impl ExternalServiceManager {
         let service = self.get_service(service_id).await?;
         let containers = self.resolve_member_containers(&service).await?;
 
+        let mut clients = WorkerClients::default();
         let mut members = Vec::with_capacity(containers.len());
-        for (role, name) in containers {
-            members.push(self.inspect_one_container(role, name).await);
+        for member in &containers {
+            members.push(match member.worker() {
+                Some(node_id) => {
+                    self.inspect_worker_container(&mut clients, member, node_id)
+                        .await
+                }
+                None => self.inspect_local_container(member).await,
+            });
         }
 
         Ok(ServiceRuntimeReport {
@@ -163,71 +246,97 @@ impl ExternalServiceManager {
         })
     }
 
-    /// Sample one stats snapshot from every container in this service.
-    /// Uses `one_shot=true, stream=false` so the call returns immediately
-    /// instead of holding the connection open for streaming updates.
+    /// Take `samples` one-shot stats samples of a member container, oldest
+    /// first: from this host's Docker, or through the agent of the worker
+    /// that runs it. `Err` carries why nothing could be sampled.
+    async fn sample_member(
+        &self,
+        clients: &mut WorkerClients,
+        member: &MemberContainer,
+        samples: usize,
+    ) -> Result<Vec<bollard::models::ContainerStatsResponse>, String> {
+        let stats = match member.worker() {
+            Some(node_id) => {
+                let client = clients.get(self, node_id).await?;
+                match client.service_stats(&member.container_name, samples).await {
+                    Ok(AgentSupport::Supported(stats)) => stats,
+                    Ok(AgentSupport::Unsupported) => {
+                        return Err(format!(
+                            "stats unavailable: {}",
+                            agent_too_old(client.node_name(), node_id, "resource usage")
+                        ))
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            None => {
+                let docker = self
+                    .docker
+                    .require()
+                    .map_err(|error| no_local_docker_reason(&error))?;
+                temps_service_protocol::sample_container_stats(
+                    &docker,
+                    &member.container_name,
+                    samples,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to sample container '{}': {error}",
+                        member.container_name
+                    )
+                })?
+            }
+        };
+        Ok(stats.samples)
+    }
+
+    /// Sample CPU and memory from every container in this service. Docker's
+    /// `one_shot` response zeroes `precpu_stats`, so each container is
+    /// sampled twice a second apart and the CPU percentage is the delta
+    /// between them, as `docker stats` computes it. A container on a worker
+    /// is sampled by that node's agent and computed here with the same
+    /// formula; one that cannot be sampled says why in `unavailable_reason`.
     pub async fn get_service_stats(
         &self,
         service_id: i32,
     ) -> Result<ServiceStatsReport, ExternalServiceError> {
-        // Stream consumption + sampling now lives in
-        // `sample_container_stats_twice`. This caller just iterates
-        // containers and projects the result.
         let service = self.get_service(service_id).await?;
         let containers = self.resolve_member_containers(&service).await?;
 
+        let mut clients = WorkerClients::default();
         let mut members = Vec::with_capacity(containers.len());
-        for (role, name) in containers {
-            // Docker's `one_shot` stats response carries `precpu_stats` as
-            // zeros — the CPU formula needs deltas, so a single one_shot
-            // sample produces either 0% or the "cumulative since container
-            // start" ratio (which was the pre-fix bug: a container at
-            // 108% real load read back as 0.6% because total/system over
-            // the container's full lifetime is dominated by idle history).
-            //
-            // Take two one_shot samples 1s apart and compute the delta
-            // ourselves. Matches `docker stats` exactly. The 1s window is
-            // the same default the Docker CLI uses for its "default"
-            // streaming interval.
-            let stats = match sample_container_stats_twice(
-                match self.docker.get() {
-                    Some(d) => d,
-                    None => {
-                        members.push(ContainerStatsSample {
-                            role,
-                            container_name: name,
-                            cpu_percent: None,
-                            memory_usage_bytes: None,
-                            memory_limit_bytes: None,
-                            memory_percent: None,
-                            online_cpus: None,
-                        });
-                        continue;
-                    }
-                },
-                &name,
-            )
-            .await
+        for member in &containers {
+            let sample = match self
+                .sample_member(
+                    &mut clients,
+                    member,
+                    temps_service_protocol::MAX_SERVICE_STATS_SAMPLES,
+                )
+                .await
             {
-                Some((first, second)) => {
-                    // `first` is the earlier sample, `second` is the later one.
-                    // `compute_stats_sample` wants (current=later, previous=earlier)
-                    // so the delta is positive — passing them reversed makes
-                    // `cpu_delta` negative and CPU reads back as `None` (the UI
-                    // shows "—" while memory still works from `current`).
-                    compute_stats_sample(role.clone(), name.clone(), &second, Some(&first))
-                }
-                None => ContainerStatsSample {
-                    role,
-                    container_name: name,
-                    cpu_percent: None,
-                    memory_usage_bytes: None,
-                    memory_limit_bytes: None,
-                    memory_percent: None,
-                    online_cpus: None,
+                // `compute_stats_sample` takes (current = later, previous =
+                // earlier); reversed, the CPU delta is negative and reads
+                // as `None`.
+                Ok(samples) => match samples.as_slice() {
+                    [first, second, ..] => compute_stats_sample(
+                        member.role.clone(),
+                        member.container_name.clone(),
+                        second,
+                        Some(first),
+                    ),
+                    [only] => compute_stats_sample(
+                        member.role.clone(),
+                        member.container_name.clone(),
+                        only,
+                        None,
+                    ),
+                    // Missing or stopped container.
+                    [] => empty_stats(member, None),
                 },
+                Err(reason) => empty_stats(member, Some(reason)),
             };
-            members.push(stats);
+            members.push(sample);
         }
 
         Ok(ServiceStatsReport {
@@ -245,11 +354,11 @@ impl ExternalServiceManager {
     /// `get_service_stats` no artificial 1s sleep per container is needed.
     /// The first tick for a container has no baseline, so `cpu_percent` is
     /// `None` (memory is still reported) and the baseline is seeded for the
-    /// next tick.
+    /// next tick. A container on a worker is sampled once by its agent.
     ///
     /// The baseline map is rewritten on every call: entries for containers
     /// that no longer back the service are dropped, and entries whose
-    /// sample failed this tick (container stopped / remote node) are
+    /// sample failed this tick (container stopped / agent unreachable) are
     /// carried over unchanged — cumulative counters stay valid across a
     /// longer window, and a restart in between reads back as a counter
     /// reset which `cpu_percent_from_delta` already rejects.
@@ -260,54 +369,31 @@ impl ExternalServiceManager {
     ) -> Result<ServiceStatsReport, ExternalServiceError> {
         let containers = self.resolve_member_containers(service).await?;
 
+        let mut clients = WorkerClients::default();
         let mut members = Vec::with_capacity(containers.len());
         let mut next_baselines = HashMap::with_capacity(containers.len());
 
-        for (role, name) in containers {
-            match sample_container_stats_once(
-                match self.docker.get() {
-                    Some(d) => d,
-                    None => {
-                        if let Some(prev) = baselines.remove(&name) {
-                            next_baselines.insert(name.clone(), prev);
-                        }
-                        members.push(ContainerStatsSample {
-                            role,
-                            container_name: name,
-                            cpu_percent: None,
-                            memory_usage_bytes: None,
-                            memory_limit_bytes: None,
-                            memory_percent: None,
-                            online_cpus: None,
-                        });
-                        continue;
-                    }
-                },
-                &name,
-            )
-            .await
-            {
-                Some(current) => {
-                    let previous = baselines.get(&name);
-                    members.push(compute_stats_sample(role, name.clone(), &current, previous));
-                    next_baselines.insert(name, current);
+        for member in &containers {
+            let name = &member.container_name;
+            let sampled = self.sample_member(&mut clients, member, 1).await;
+            match sampled.map(|samples| samples.into_iter().next()) {
+                Ok(Some(current)) => {
+                    let previous = baselines.get(name);
+                    members.push(compute_stats_sample(
+                        member.role.clone(),
+                        name.clone(),
+                        &current,
+                        previous,
+                    ));
+                    next_baselines.insert(name.clone(), current);
                 }
-                None => {
-                    // Container missing/stopped or on a remote node — keep
-                    // the old baseline (if any) so a later success still has
-                    // a valid delta window.
-                    if let Some(prev) = baselines.remove(&name) {
+                failed => {
+                    // Keep the old baseline (if any) so a later success
+                    // still has a valid delta window.
+                    if let Some(prev) = baselines.remove(name) {
                         next_baselines.insert(name.clone(), prev);
                     }
-                    members.push(ContainerStatsSample {
-                        role,
-                        container_name: name,
-                        cpu_percent: None,
-                        memory_usage_bytes: None,
-                        memory_limit_bytes: None,
-                        memory_percent: None,
-                        online_cpus: None,
-                    });
+                    members.push(empty_stats(member, failed.err()));
                 }
             }
         }
@@ -362,11 +448,41 @@ impl ExternalServiceManager {
 
         let mut results = Vec::with_capacity(containers.len());
 
-        let docker = match self.docker.get() {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-        for (role, container_name) in containers {
+        let docker = self.docker.get();
+        for member in containers {
+            let MemberContainer {
+                role,
+                container_name,
+                ..
+            } = member.clone();
+            // This host's Docker cannot update a worker's container, and
+            // "missing" would be wrong: it exists there.
+            if let Some(node_id) = member.worker() {
+                results.push(ResourceLimitApplyResult {
+                    role,
+                    container_name,
+                    outcome: "failed".to_string(),
+                    error: Some(format!(
+                        "the container runs on worker node {node_id}, which this server cannot \
+                         update live yet; the new caps are stored but not applied to the \
+                         running container"
+                    )),
+                });
+                continue;
+            }
+            let Some(docker) = docker else {
+                results.push(ResourceLimitApplyResult {
+                    role,
+                    container_name,
+                    outcome: "failed".to_string(),
+                    error: Some(
+                        "this server has no local Docker daemon to update the container with; \
+                         the new caps are stored but not applied to the running container"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            };
             // First check whether the container actually exists. Calling
             // update_container on a missing name returns a confusing 404;
             // distinguishing "missing" from "failed" up front gives the
@@ -872,46 +988,6 @@ fn build_container_update_body(
     }
 }
 
-/// Sample the same container twice ~1s apart so we have a delta window for
-/// the CPU formula. Returns `None` on any error or if Docker returns no
-/// frames (container missing / stopped). The 1-second pause matches the
-/// Docker CLI's default sampling interval.
-async fn sample_container_stats_twice(
-    docker: &bollard::Docker,
-    name: &str,
-) -> Option<(
-    bollard::models::ContainerStatsResponse,
-    bollard::models::ContainerStatsResponse,
-)> {
-    let first = sample_container_stats_once(docker, name).await?;
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    let second = sample_container_stats_once(docker, name).await?;
-
-    Some((first, second))
-}
-
-/// Take a single `one_shot` stats sample from a container. Returns `None`
-/// on any error or if Docker returns no frames (container missing /
-/// stopped). Note Docker zeroes `precpu_stats` on one_shot responses, so a
-/// lone sample cannot yield a CPU percent — callers must diff two samples
-/// (`sample_container_stats_twice`, or a poller holding its own baseline).
-async fn sample_container_stats_once(
-    docker: &bollard::Docker,
-    name: &str,
-) -> Option<bollard::models::ContainerStatsResponse> {
-    use futures::StreamExt;
-
-    let opts = bollard::query_parameters::StatsOptionsBuilder::default()
-        .stream(false)
-        .one_shot(true)
-        .build();
-
-    let mut stream = docker.stats(name, Some(opts));
-    stream.next().await?.ok()
-}
-
 /// Compute the docker-CLI-equivalent CPU percent from two consecutive
 /// stats samples. Returns `None` when either sample is missing the
 /// counters we need, the deltas are zero/negative (container just
@@ -1027,6 +1103,7 @@ fn compute_stats_sample(
         memory_limit_bytes,
         memory_percent,
         online_cpus,
+        unavailable_reason: None,
     }
 }
 
@@ -1401,3 +1478,6 @@ mod tests {
 
     // ── End container stats helpers ──────────────────────────────────────────
 }
+
+#[cfg(test)]
+mod remote_tests;

@@ -241,7 +241,7 @@ pub(crate) fn generate_rpc_secret() -> String {
 }
 
 /// Docker container name of a Garage service named `name`.
-pub(crate) fn garage_container_name(name: &str) -> String {
+pub fn garage_container_name(name: &str) -> String {
     format!("garage-{name}")
 }
 

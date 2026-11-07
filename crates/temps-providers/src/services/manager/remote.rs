@@ -7,7 +7,7 @@
 use crate::externalsvc::{
     mariadb::{validate_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
     rustfs::DEFAULT_RUSTFS_IMAGE,
-    ExternalService, ServiceType,
+    ServiceType,
 };
 use crate::remote_service_client::{
     RemotePortMapping, RemoteServiceClient, RemoteServiceCreateParams,
@@ -18,16 +18,15 @@ use std::collections::HashMap;
 use temps_entities::{nodes, settings};
 use tracing::warn;
 
+/// The container to address on a node that has no persisted name for it: the
+/// canonical name, unless only the legacy one (the bare instance name an
+/// earlier release used) exists there.
 fn select_remote_container_name(
-    persisted_name: Option<&str>,
     canonical_name: &str,
     canonical_exists: bool,
     legacy_name: &str,
     legacy_exists: bool,
 ) -> String {
-    if let Some(name) = persisted_name.filter(|name| !name.is_empty()) {
-        return name.to_string();
-    }
     if canonical_exists || canonical_name == legacy_name || !legacy_exists {
         canonical_name.to_string()
     } else {
@@ -149,10 +148,16 @@ impl ExternalServiceManager {
         }
     }
 
+    /// The container of a standalone service on a worker node: the name the
+    /// agent reported at create time, else the engine's canonical name, else
+    /// the bare instance name an earlier release used, whichever the node
+    /// has. Builds no engine, so it works without a local Docker handle.
     pub(super) async fn resolve_remote_container_name(
         &self,
         client: &RemoteServiceClient,
-        service_instance: &dyn ExternalService,
+        service_id: i32,
+        service_name: &str,
+        service_type: ServiceType,
         parameters: &HashMap<String, serde_json::Value>,
     ) -> Result<String, ExternalServiceError> {
         let persisted_name = parameters
@@ -163,14 +168,18 @@ impl ExternalServiceManager {
             return Ok(container_name.to_string());
         }
 
-        let canonical_name = service_instance.get_docker_container_name();
+        // The container is on the node, so the names are all that's needed.
+        // No engine is built: that would need a local Docker handle.
+        let selection =
+            EngineSelection::for_parameter_map(service_id, service_name, service_type, parameters)?;
+        let canonical_name = selection.container_name();
         let canonical_exists = client
             .service_status(&canonical_name)
             .await?
             .container_id
             .is_some();
 
-        let legacy_name = service_instance.get_name();
+        let legacy_name = selection.instance_name;
         let legacy_exists = if legacy_name != canonical_name && !canonical_exists {
             client
                 .service_status(&legacy_name)
@@ -182,7 +191,6 @@ impl ExternalServiceManager {
         };
 
         Ok(select_remote_container_name(
-            persisted_name,
             &canonical_name,
             canonical_exists,
             &legacy_name,
@@ -198,6 +206,7 @@ impl ExternalServiceManager {
     /// mislabelled RustFS image would then fail its healthcheck). New
     /// services always store `server` (see `MinioParameterStrategy`).
     fn remote_s3_server_kind_and_image(
+        service_id: i32,
         parameters: &HashMap<String, String>,
     ) -> Result<(crate::externalsvc::s3::S3ServerKind, String), ExternalServiceError> {
         use crate::externalsvc::s3::S3ServerKind;
@@ -209,7 +218,7 @@ impl ExternalServiceManager {
             .map(S3ServerKind::parse)
             .transpose()
             .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
+                service_id,
                 reason: e.to_string(),
             })?;
         let image = parameters
@@ -242,9 +251,29 @@ impl ExternalServiceManager {
     /// Docker container for a given service type and parameters.
     pub(super) fn build_remote_create_params(
         &self,
+        service_id: i32,
         service_name: &str,
         service_type: &ServiceType,
         parameters: &HashMap<String, String>,
+    ) -> Result<RemoteServiceCreateParams, ExternalServiceError> {
+        Self::remote_create_params(
+            service_id,
+            service_name,
+            service_type,
+            parameters,
+            self.local_workloads_enabled,
+        )
+    }
+
+    /// The create request a worker's agent receives for a service, built
+    /// from the service's stored parameters without any Docker access.
+    /// `local_workloads_enabled` only shapes the remedy of a refusal.
+    pub fn remote_create_params(
+        service_id: i32,
+        service_name: &str,
+        service_type: &ServiceType,
+        parameters: &HashMap<String, String>,
+        local_workloads_enabled: bool,
     ) -> Result<RemoteServiceCreateParams, ExternalServiceError> {
         #[allow(deprecated)]
         let backend_service_type = match (
@@ -256,13 +285,13 @@ impl ExternalServiceManager {
             (ServiceType::S3, Some(backend)) if backend == "minio" => ServiceType::Minio,
             (ServiceType::Blob, Some(backend)) if backend == "minio" => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
+                    service_id,
                     reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services".to_string(),
                 });
             }
             (ServiceType::Blob, Some(backend)) if backend == "garage" => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
+                    service_id,
                     reason: "managed S3 backend 'garage' is only supported for S3 services; the built-in Blob service runs on the default 'rustfs' backend".to_string(),
                 });
             }
@@ -270,12 +299,17 @@ impl ExternalServiceManager {
                 // Garage reads its configuration from a `garage.toml` that has
                 // to be written into the container before it starts; the
                 // agent's generic create request carries no files, so a worker
-                // cannot create one yet.
+                // cannot create one yet. Creating it on this server is only a
+                // remedy when this server runs local workloads.
+                let remedy = if local_workloads_enabled {
+                    "Create it on this server instead (leave node_id unset), or use the default 'rustfs' backend on the worker"
+                } else {
+                    "This server runs no local workloads (serve profile 'control-plane'), so use the default 'rustfs' backend on the worker"
+                };
                 return Err(ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
+                    service_id,
                     reason: format!(
-                        "managed S3 backend 'garage' cannot be created on a remote node for service '{}': the agent cannot yet deliver garage.toml. Create it on the control-plane host, or use the default 'rustfs' backend on the worker",
-                        service_name
+                        "managed S3 backend 'garage' cannot be created on a worker node for service '{service_name}': the worker agent cannot yet deliver garage.toml. {remedy}"
                     ),
                 });
             }
@@ -289,10 +323,7 @@ impl ExternalServiceManager {
                     .cloned()
                     .unwrap_or_else(|| MARIADB_DEFAULT_IMAGE.to_string());
                 validate_mariadb_image(&image).map_err(|reason| {
-                    ExternalServiceError::ParameterValidationFailed {
-                        service_id: 0,
-                        reason,
-                    }
+                    ExternalServiceError::ParameterValidationFailed { service_id, reason }
                 })?;
                 let size_profile = parameters
                     .get("size_profile")
@@ -442,7 +473,7 @@ impl ExternalServiceManager {
             }
             #[allow(deprecated)]
             ServiceType::Minio => {
-                let (kind, image) = Self::remote_s3_server_kind_and_image(parameters)?;
+                let (kind, image) = Self::remote_s3_server_kind_and_image(service_id, parameters)?;
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
@@ -470,9 +501,10 @@ impl ExternalServiceManager {
             .and_then(|p| p.parse().ok())
             .unwrap_or(container_port);
 
-        let container_name = self
-            .create_service_instance(service_name.to_string(), backend_service_type)?
-            .get_docker_container_name();
+        // No engine is built here: that needs a local Docker handle, which a
+        // control-plane-profile server does not have.
+        let container_name =
+            EngineSelection::for_type(service_name, backend_service_type).container_name();
         let container_name_for_volume = format!("{}-{}", backend_service_type, service_name);
         let volume_name = format!("{}_data", container_name_for_volume);
 
@@ -568,6 +600,70 @@ impl ExternalServiceManager {
             })?;
         Ok(result.exit_code)
     }
+
+    /// The worker node service `service_id` runs on, refusing one on the
+    /// control plane: its data operations take the local engines.
+    async fn worker_service_target(
+        &self,
+        service_id: i32,
+        operation: &str,
+    ) -> Result<(i32, crate::externalsvc::ServiceConfig), ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
+        else {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "service {} ('{}') runs on the control plane; its {operation} uses this \
+                     server's engines, not a worker's",
+                    service.id, service.name
+                ),
+            });
+        };
+        let config = self.get_service_config(service_id).await?;
+        Ok((node_id, config))
+    }
+
+    /// Back up service `service_id`, which runs on a worker node, on that
+    /// node: the agent runs the engine's own dump (or bucket mirror) and
+    /// writes it to `key` in `destination`. Credentials travel sealed.
+    pub async fn backup_worker_service(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        key: String,
+    ) -> Result<crate::remote_service_client::RemoteServiceBackupResponse, ExternalServiceError>
+    {
+        let (node_id, service_config) = self.worker_service_target(service_id, "backup").await?;
+        self.get_remote_client(node_id)
+            .await?
+            .backup_service(&crate::remote_service_client::RemoteServiceBackupRequest {
+                service_config,
+                destination,
+                key,
+            })
+            .await
+    }
+
+    /// Restore service `service_id`, which runs on a worker node, in place on
+    /// that node from the backup at `location` in `source`.
+    pub async fn restore_worker_service(
+        &self,
+        service_id: i32,
+        source: crate::remote_service_client::WorkerS3Destination,
+        location: String,
+    ) -> Result<crate::remote_service_client::RemoteServiceRestoreResponse, ExternalServiceError>
+    {
+        let (node_id, service_config) = self.worker_service_target(service_id, "restore").await?;
+        self.get_remote_client(node_id)
+            .await?
+            .restore_service(&crate::remote_service_client::RemoteServiceRestoreRequest {
+                service_config,
+                source,
+                location,
+            })
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -608,7 +704,7 @@ mod tests {
                 HashMap::new()
             };
             let params = manager
-                .build_remote_create_params("orders", &service_type, &parameters)
+                .build_remote_create_params(7, "orders", &service_type, &parameters)
                 .expect("default remote service parameters should be valid");
             assert_eq!(params.name, expected_name, "wrong name for {service_type}");
             if let Some(expected_image) = expected_image {
@@ -632,7 +728,7 @@ mod tests {
                 ("password".to_string(), "seeded-secret".to_string()),
             ]);
             let params = manager
-                .build_remote_create_params("orders", &service_type, &dragonfly)
+                .build_remote_create_params(7, "orders", &service_type, &dragonfly)
                 .expect("a Dragonfly image is a valid override");
             assert_eq!(
                 params.command,
@@ -647,7 +743,7 @@ mod tests {
 
             let redis = HashMap::from([("password".to_string(), "seeded-secret".to_string())]);
             let params = manager
-                .build_remote_create_params("orders", &service_type, &redis)
+                .build_remote_create_params(7, "orders", &service_type, &redis)
                 .expect("default parameters are valid");
             assert_eq!(
                 params.command,
@@ -662,37 +758,57 @@ mod tests {
     }
 
     /// A worker cannot be handed `garage.toml` by the generic agent create
-    /// request, so a remote Garage service is refused up front with the
-    /// service name rather than started without its config.
+    /// request, so a remote Garage service is refused up front, under the
+    /// service's own ID and name, rather than started without its config.
+    /// Creating it on this server is offered only when this server runs
+    /// local workloads.
     #[test]
     fn remote_garage_creation_is_refused_with_an_actionable_error() {
-        let manager = mock_service_manager(vec![]);
         let parameters = HashMap::from([("backend".to_string(), "Garage".to_string())]);
-        let err = manager
-            .build_remote_create_params("orders", &ServiceType::S3, &parameters)
-            .unwrap_err();
-        match err {
-            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+        let refusal = |manager: ExternalServiceManager| match manager.build_remote_create_params(
+            7,
+            "orders",
+            &ServiceType::S3,
+            &parameters,
+        ) {
+            Err(ExternalServiceError::ParameterValidationFailed { service_id, reason }) => {
+                assert_eq!(service_id, 7, "{reason}");
                 assert!(
-                    reason.contains("garage") && reason.contains("orders"),
+                    reason.contains("'orders'") && reason.contains("garage.toml"),
                     "{reason}"
                 );
-                assert!(reason.contains("control-plane"), "{reason}");
+                reason
             }
             other => panic!("expected a validation error, got {other:?}"),
-        }
+        };
+
+        let full = refusal(unreachable_docker_manager());
+        assert!(full.contains("leave node_id unset"), "{full}");
+        assert!(!full.contains("control-plane"), "{full}");
+
+        let control_plane = refusal(control_plane_manager());
+        assert!(
+            control_plane.contains("serve profile 'control-plane'")
+                && control_plane.contains("'rustfs' backend"),
+            "{control_plane}"
+        );
+        assert!(
+            !control_plane.contains("this server instead"),
+            "{control_plane}"
+        );
     }
 
     /// The built-in Blob service has no Garage engine, on a worker or not.
     #[test]
     fn remote_blob_creation_rejects_the_garage_backend() {
-        let manager = mock_service_manager(vec![]);
+        let manager = control_plane_manager();
         let parameters = HashMap::from([("backend".to_string(), "garage".to_string())]);
         let err = manager
-            .build_remote_create_params("assets", &ServiceType::Blob, &parameters)
+            .build_remote_create_params(7, "assets", &ServiceType::Blob, &parameters)
             .unwrap_err();
         match err {
-            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+            ExternalServiceError::ParameterValidationFailed { service_id, reason } => {
+                assert_eq!(service_id, 7, "{reason}");
                 assert!(
                     reason.contains("only supported for S3 services"),
                     "{reason}"
@@ -715,7 +831,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<HashMap<_, _>>();
-            manager.build_remote_create_params("orders", &ServiceType::Minio, &parameters)
+            manager.build_remote_create_params(7, "orders", &ServiceType::Minio, &parameters)
         };
 
         let mirror = "registry.internal:5000/mirror/object-store:1.0.0";
@@ -761,29 +877,203 @@ mod tests {
     }
 
     #[test]
-    fn remote_container_resolution_supports_persisted_canonical_and_legacy_names() {
+    fn remote_container_resolution_prefers_canonical_then_legacy_names() {
         assert_eq!(
-            select_remote_container_name(
-                Some("persisted-container"),
-                "postgres-orders",
-                true,
-                "orders",
-                true,
-            ),
-            "persisted-container"
-        );
-        assert_eq!(
-            select_remote_container_name(None, "postgres-orders", true, "orders", false),
+            select_remote_container_name("postgres-orders", true, "orders", false),
             "postgres-orders"
         );
         assert_eq!(
-            select_remote_container_name(None, "postgres-orders", false, "orders", true),
+            select_remote_container_name("postgres-orders", true, "orders", true),
+            "postgres-orders"
+        );
+        assert_eq!(
+            select_remote_container_name("postgres-orders", false, "orders", true),
             "orders"
         );
         assert_eq!(
-            select_remote_container_name(None, "postgres-orders", false, "orders", false),
+            select_remote_container_name("postgres-orders", false, "orders", false),
             "postgres-orders"
         );
+    }
+
+    /// A fake worker agent whose `status` route reports a container for each
+    /// name in `existing` and none for any other.
+    async fn agent_with_containers(existing: &'static [&'static str]) -> RemoteServiceClient {
+        use axum::{extract::Path, routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/agent/services/{name}/status",
+            get(move |Path(name): Path<String>| async move {
+                let container_id = existing
+                    .contains(&name.as_str())
+                    .then(|| format!("id-{name}"));
+                Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "container_name": name,
+                        "container_id": container_id,
+                        "running": container_id.is_some(),
+                        "health": null,
+                    },
+                    "error": null,
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+    }
+
+    /// Start, stop and delete on a worker address its container by name. A
+    /// `--profile control-plane` server has no Docker handle, so the name
+    /// must be found without building an engine.
+    #[tokio::test]
+    async fn remote_container_resolution_needs_no_local_docker() {
+        let manager = control_plane_manager();
+        assert!(
+            manager.require_docker().is_err(),
+            "the control-plane manager must have no Docker handle"
+        );
+        let no_parameters = HashMap::new();
+
+        let canonical = agent_with_containers(&["postgres-orders"]).await;
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(
+                    &canonical,
+                    7,
+                    "orders",
+                    ServiceType::Postgres,
+                    &no_parameters,
+                )
+                .await
+                .unwrap(),
+            "postgres-orders"
+        );
+
+        // A container an earlier release created under the bare name.
+        let legacy = agent_with_containers(&["orders"]).await;
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(
+                    &legacy,
+                    7,
+                    "orders",
+                    ServiceType::Postgres,
+                    &no_parameters,
+                )
+                .await
+                .unwrap(),
+            "orders"
+        );
+
+        // The stored backend picks the engine, so its container name.
+        let minio = agent_with_containers(&["minio-orders"]).await;
+        let on_minio = HashMap::from([("backend".to_string(), serde_json::json!("minio"))]);
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(&minio, 7, "orders", ServiceType::S3, &on_minio)
+                .await
+                .unwrap(),
+            "minio-orders"
+        );
+
+        // The name the agent reported at create time wins, without asking it.
+        let persisted = HashMap::from([(
+            "container_name".to_string(),
+            serde_json::json!("orders-from-agent"),
+        )]);
+        assert_eq!(
+            manager
+                .resolve_remote_container_name(
+                    &canonical,
+                    7,
+                    "orders",
+                    ServiceType::Postgres,
+                    &persisted,
+                )
+                .await
+                .unwrap(),
+            "orders-from-agent"
+        );
+
+        // A stored backend that cannot run the service is refused with the
+        // service's ID, not a Docker error.
+        let blob_on_minio = HashMap::from([("backend".to_string(), serde_json::json!("minio"))]);
+        let error = manager
+            .resolve_remote_container_name(
+                &canonical,
+                7,
+                "assets",
+                ServiceType::Blob,
+                &blob_on_minio,
+            )
+            .await
+            .expect_err("Blob cannot run on MinIO");
+        assert!(
+            matches!(
+                error,
+                ExternalServiceError::ParameterValidationFailed { service_id: 7, .. }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A `--profile control-plane` server has no Docker handle, but must
+    /// still be able to create services on worker nodes.
+    #[test]
+    #[allow(deprecated, reason = "existing MinIO services can still be recreated")]
+    fn remote_create_params_need_no_local_docker() {
+        let manager = control_plane_manager();
+        assert!(
+            manager.require_docker().is_err(),
+            "the control-plane manager must have no Docker handle"
+        );
+
+        let on_minio = HashMap::from([("backend".to_string(), "minio".to_string())]);
+        for (service_type, parameters, expected_name) in [
+            (ServiceType::Postgres, HashMap::new(), "postgres-orders"),
+            (ServiceType::Mariadb, HashMap::new(), "mariadb-orders"),
+            (ServiceType::Mongodb, HashMap::new(), "temps-mongodb-orders"),
+            (ServiceType::Redis, HashMap::new(), "redis-orders"),
+            (ServiceType::Kv, HashMap::new(), "redis-orders"),
+            (ServiceType::S3, HashMap::new(), "rustfs-orders"),
+            (ServiceType::S3, on_minio, "minio-orders"),
+            (ServiceType::Rustfs, HashMap::new(), "rustfs-orders"),
+            (ServiceType::Blob, HashMap::new(), "rustfs-orders"),
+            (ServiceType::Minio, HashMap::new(), "minio-orders"),
+        ] {
+            let params = manager
+                .build_remote_create_params(7, "orders", &service_type, &parameters)
+                .unwrap_or_else(|e| panic!("{service_type} on a worker needs no Docker: {e}"));
+            assert_eq!(
+                params.name, expected_name,
+                "wrong name for {service_type} with {parameters:?}"
+            );
+        }
+    }
+
+    /// Starting a service on a worker ends by asking for its readiness gate.
+    /// There is none for a worker service, and asking must not need Docker.
+    #[tokio::test]
+    async fn remote_service_readiness_gate_needs_no_local_docker() {
+        let manager = control_plane_manager();
+        let mut service = encrypted_service_model(1, serde_json::json!({}));
+        service.node_id = Some(2);
+
+        let gate = manager
+            .readiness_gate_for(&service)
+            .await
+            .expect("a worker service has no gate to build");
+        assert!(gate.is_none());
     }
 
     // ── repoint_continuous_archive_source ───────────────────────────────────

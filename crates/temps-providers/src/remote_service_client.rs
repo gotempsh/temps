@@ -18,8 +18,19 @@ use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
     RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse,
+    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
+    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
 };
+
+/// Whether a node's agent has a route this release added. An agent that
+/// predates it is not failing: the caller says which agent to update rather
+/// than reporting an error.
+#[derive(Debug)]
+pub enum AgentSupport<T> {
+    Supported(T),
+    Unsupported,
+}
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-node-agent).
 #[derive(Deserialize)]
@@ -32,6 +43,15 @@ struct AgentResponse<T> {
 const MAX_AGENT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEALTH_ERROR_BYTES: usize = 2 * 1024;
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Runtime and stats are read on every poll of the service page; two stats
+/// samples take a second on the agent.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The WAL probe's connect and its queries are bounded at 5s each on the
+/// agent, after a container inspection.
+const WAL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A worker backup or restore streams the whole dataset; the agent bounds
+/// its own work by the same deadline.
+pub const DATA_OPERATION_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 
 /// Lightweight client for the agent's service endpoints.
 pub struct RemoteServiceClient {
@@ -405,6 +425,48 @@ impl RemoteServiceClient {
             .map(|_| ())
     }
 
+    /// Back up a service on the worker that runs it, with the engine's own
+    /// tool, straight into the destination bucket. The destination's
+    /// credentials and the service's travel only in the sealed body.
+    pub async fn backup_service(
+        &self,
+        request: &RemoteServiceBackupRequest,
+    ) -> Result<RemoteServiceBackupResponse, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            key = %request.key,
+            "Backing up an external service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/data-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a service in place on the worker that runs it, from a backup
+    /// [`Self::backup_service`] wrote.
+    pub async fn restore_service(
+        &self,
+        request: &RemoteServiceRestoreRequest,
+    ) -> Result<RemoteServiceRestoreResponse, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            location = %request.location,
+            "Restoring an external service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/data-restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
     /// Run the provider's authenticated health probe inside the worker that
     /// owns the service. Secrets are carried only in the sealed JSON
     /// request body and are never included in URL or tracing fields.
@@ -448,6 +510,126 @@ impl RemoteServiceClient {
             WORKLOAD_SNAPSHOT_TIMEOUT,
         )
         .await
+    }
+
+    /// The lifecycle state of a service container on the remote node (status,
+    /// restarts, OOM kill, applied limits). An agent from before this route
+    /// answers [`AgentSupport::Unsupported`].
+    pub async fn service_runtime(
+        &self,
+        container_name: &str,
+    ) -> Result<AgentSupport<ServiceContainerRuntime>, ExternalServiceError> {
+        let path = format!("/agent/services/{}/runtime", container_name);
+        let request = self
+            .client
+            .get(format!("{}{}", self.agent_url, path))
+            .timeout(OBSERVE_TIMEOUT);
+        self.agent_call_if_supported(request, &path).await
+    }
+
+    /// Raw one-shot stats samples of a service container on the remote node,
+    /// oldest first, a second apart (`samples` is 1 or 2). An agent from
+    /// before this route answers [`AgentSupport::Unsupported`].
+    pub async fn service_stats(
+        &self,
+        container_name: &str,
+        samples: usize,
+    ) -> Result<AgentSupport<ServiceContainerStats>, ExternalServiceError> {
+        let path = format!("/agent/services/{}/stats", container_name);
+        let samples = samples.clamp(1, temps_service_protocol::MAX_SERVICE_STATS_SAMPLES);
+        let request = self
+            .client
+            .get(format!("{}{}?samples={}", self.agent_url, path, samples))
+            .timeout(OBSERVE_TIMEOUT);
+        self.agent_call_if_supported(request, &path).await
+    }
+
+    /// Run the Postgres WAL and archive probe on the node that owns the
+    /// service. The service config holds its password, so the body is
+    /// sealed to the node. An agent from before this route answers
+    /// [`AgentSupport::Unsupported`].
+    pub async fn probe_wal_health(
+        &self,
+        request: RemoteWalHealthRequest,
+    ) -> Result<AgentSupport<RemoteWalHealthResponse>, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            node = %self.node_name,
+            "Probing Postgres WAL health on remote node"
+        );
+        let path = "/agent/services/wal-health";
+        let builder = self
+            .client
+            .post(format!("{}{}", self.agent_url, path))
+            .timeout(WAL_PROBE_TIMEOUT);
+        let builder = self
+            .with_sealed_body(builder, path, &request)
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: error.to_string(),
+            })?;
+        let mut response: AgentSupport<RemoteWalHealthResponse> =
+            self.agent_call_if_supported(builder, path).await?;
+        if let AgentSupport::Supported(RemoteWalHealthResponse {
+            error: Some(error), ..
+        }) = &mut response
+        {
+            truncate_utf8(error, MAX_HEALTH_ERROR_BYTES);
+        }
+        Ok(response)
+    }
+
+    /// Send `builder` with this client's token. A route the agent does not
+    /// have (`404`, or `405` where the path matches another route's pattern)
+    /// is [`AgentSupport::Unsupported`]; any other failure is an error.
+    async fn agent_call_if_supported<T: for<'de> Deserialize<'de>>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        path: &str,
+    ) -> Result<AgentSupport<T>, ExternalServiceError> {
+        let url = format!("{}{}", self.agent_url, path);
+        let response = builder.bearer_auth(&self.token).send().await.map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to reach agent on node {} at {}: {}",
+                    self.node_name, url, e
+                ),
+            }
+        })?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(AgentSupport::Unsupported);
+        }
+        // Only a sealed request gets this: the agent predates sealing.
+        if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            return Err(self.older_agent_error());
+        }
+        let (status, body): (_, AgentResponse<T>) =
+            self.decode_agent_response(response, &url).await?;
+        if !body.success {
+            let mut error = body.error.unwrap_or_default();
+            truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Agent on node {} returned error ({}): {}",
+                    self.node_name, status, error
+                ),
+            });
+        }
+        body.data
+            .map(AgentSupport::Supported)
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Agent on node {} returned success but no data at {}",
+                    self.node_name, url
+                ),
+            })
+    }
+
+    /// The node this client talks to, for messages.
+    pub fn node_name(&self) -> &str {
+        &self.node_name
     }
 
     /// Create (or, with `replace_existing`, recreate) a database container
@@ -668,6 +850,18 @@ impl RemoteServiceClient {
         if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             return Err(self.older_agent_error());
         }
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "The agent on node {} has no {path} route: it predates this server. \
+                     Update the node's agent to this release",
+                    self.node_name
+                ),
+            });
+        }
         let (status, body): (_, AgentResponse<T>) =
             self.decode_agent_response(response, &url).await?;
         if !body.success {
@@ -820,6 +1014,9 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
     value.push('…');
 }
+
+#[cfg(test)]
+mod observe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1387,6 +1584,158 @@ mod tests {
             Some("postgres://app:secret@postgres-orders-db:5432/storefront_production")
         );
         server.abort();
+    }
+
+    fn worker_destination() -> WorkerS3Destination {
+        WorkerS3Destination {
+            bucket: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test".to_string()),
+            force_path_style: true,
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "destination-secret".to_string(),
+            session_token: Some("destination-session".to_string()),
+        }
+    }
+
+    /// A worker backup and restore reach the agent sealed, with the node
+    /// token, and nothing secret is readable on the wire.
+    #[tokio::test]
+    async fn worker_backups_and_restores_are_sealed_to_the_node() {
+        async fn backup(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            assert_eq!(
+                headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer node-token")
+            );
+            let wire = String::from_utf8_lossy(&sealed);
+            assert!(!wire.contains("destination-secret"));
+            assert!(!wire.contains("cache-password"));
+            let request: RemoteServiceBackupRequest =
+                open_for_test(&headers, "/agent/services/data-backup", &sealed);
+            assert_eq!(request.service_config.name, "cache");
+            assert_eq!(request.key, "redis/cache/u1/dump.rdb.gz");
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "data": { "size_bytes": 4096, "buckets": [] },
+                "error": null
+            }))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RemoteServiceRestoreRequest =
+                open_for_test(&headers, "/agent/services/data-restore", &sealed);
+            assert_eq!(request.location, "redis/cache/u1/dump.rdb.gz");
+            Json(serde_json::json!({ "success": true, "data": {}, "error": null }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/data-backup", post(backup))
+                    .route("/agent/services/data-restore", post(restore)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let config = ServiceConfig {
+            name: "cache".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "password": "cache-password"}),
+        };
+        let response = client
+            .backup_service(&RemoteServiceBackupRequest {
+                service_config: config.clone(),
+                destination: worker_destination(),
+                key: "redis/cache/u1/dump.rdb.gz".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.size_bytes, 4096);
+        client
+            .restore_service(&RemoteServiceRestoreRequest {
+                service_config: config,
+                source: worker_destination(),
+                location: "redis/cache/u1/dump.rdb.gz".to_string(),
+            })
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    /// An agent from before worker backups is named, with what to do.
+    #[tokio::test]
+    async fn an_agent_without_the_backup_route_is_told_to_update() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let error = client
+            .backup_service(&RemoteServiceBackupRequest {
+                service_config: ServiceConfig {
+                    name: "cache".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                destination: worker_destination(),
+                key: "k/dump.rdb.gz".to_string(),
+            })
+            .await
+            .expect_err("an older agent cannot back up");
+        server.abort();
+        let message = error.to_string();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("/agent/services/data-backup"), "{message}");
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A node without a sealing key never receives a backup's credentials.
+    #[tokio::test]
+    async fn a_worker_backup_is_refused_to_a_node_that_cannot_open_sealed_bodies() {
+        let client = RemoteServiceClient::new(
+            "http://127.0.0.1:9".to_string(),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap();
+        let error = client
+            .backup_service(&RemoteServiceBackupRequest {
+                service_config: ServiceConfig {
+                    name: "cache".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                destination: worker_destination(),
+                key: "k/dump.rdb.gz".to_string(),
+            })
+            .await
+            .expect_err("unsealed delivery must be refused");
+        assert!(!error.to_string().contains("destination-secret"));
     }
 
     #[tokio::test]

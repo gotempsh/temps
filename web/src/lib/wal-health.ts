@@ -17,8 +17,41 @@ export type {
   WalWarningSeverity,
 } from '@/api/client/types.gen'
 
+/** Problem type of a 404 whose last WAL check could not run. */
+export const WAL_HEALTH_NOT_CHECKED_TYPE =
+  'https://temps.sh/probs/wal-health-not-checked'
+
+/** Why the server is not checking WAL health for this database. */
+export interface WalHealthNotChecked {
+  reason: string
+  checked_at: string | null
+}
+
 export interface WalHealthResponse {
   wal_health: PostgresWalHealth | null
+  /** Set when the last check could not run, e.g. a database on a worker
+   *  whose agent predates the WAL probe. */
+  not_checked?: WalHealthNotChecked | null
+}
+
+/** The not-checked reason a 404 Problem carries, if it is one. */
+export function notCheckedFromProblem(
+  problem: unknown
+): WalHealthNotChecked | null {
+  if (!problem || typeof problem !== 'object') return null
+  const record = problem as Record<string, unknown>
+  if (record.type !== WAL_HEALTH_NOT_CHECKED_TYPE) return null
+  const reason =
+    typeof record.reason === 'string'
+      ? record.reason
+      : typeof record.detail === 'string'
+        ? record.detail
+        : null
+  if (!reason) return null
+  return {
+    reason,
+    checked_at: typeof record.checked_at === 'string' ? record.checked_at : null,
+  }
 }
 
 export async function getPostgresWalHealth(
@@ -27,7 +60,8 @@ export async function getPostgresWalHealth(
   const { data, error, response } = await getPostgresWalHealthRequest({
     path: { id },
   })
-  if (response?.status === 404) return { wal_health: null }
+  if (response?.status === 404)
+    return { wal_health: null, not_checked: notCheckedFromProblem(error) }
   if (error)
     throw new Error(
       problemDetail(error, 'Unable to check PostgreSQL WAL health.')

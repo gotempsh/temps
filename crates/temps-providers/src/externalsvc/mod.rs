@@ -21,14 +21,16 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 pub mod postgres_role_reconciler;
+pub mod worker_data;
 
 #[cfg(test)]
 mod runtime_provisioning_tests {
     use super::{
         exact_named_container, is_container_not_found, missing_required_probe_credential,
-        resolve_managed_probe_target, sanitize_probe_result, set_runtime_container_name,
-        validate_managed_probe_target, validate_runtime_target, HealthProbeResult,
-        RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError, ServiceType,
+        resolve_managed_probe_target, resolve_runtime_target, sanitize_probe_result,
+        set_runtime_container_name, validate_managed_probe_target, validate_runtime_target,
+        HealthProbeResult, RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError,
+        ServiceType,
     };
 
     #[test]
@@ -175,6 +177,73 @@ mod runtime_provisioning_tests {
             validate_runtime_target(&config),
             Err(RuntimeProvisioningError::UnsafeTarget { .. })
         ));
+    }
+
+    fn postgres_config(parameters: serde_json::Value) -> ServiceConfig {
+        ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters,
+        }
+    }
+
+    /// Provisioning a project's database on a worker connected to
+    /// `localhost:<port>` and timed out: the node publishes the port on its
+    /// bind address only. It now connects where the health and WAL probes
+    /// do.
+    #[test]
+    fn runtime_provisioning_connects_to_the_node_published_address() {
+        let published: std::net::IpAddr = "10.42.0.22".parse().unwrap();
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            let mut config = postgres_config(serde_json::json!({"host": host, "port": "5561"}));
+            resolve_runtime_target(&mut config, Some(published))
+                .unwrap_or_else(|error| panic!("host {host} should provision: {error}"));
+            assert_eq!(config.parameters["host"], "10.42.0.22", "host {host}");
+            assert_eq!(config.parameters["port"], "5561", "the port is kept");
+        }
+
+        // Same rewrite as the probe, so the two never disagree on a target.
+        let mut probed = postgres_config(serde_json::json!({"host": "localhost", "port": "5561"}));
+        resolve_managed_probe_target(&mut probed, Some(published)).unwrap();
+        let mut provisioned =
+            postgres_config(serde_json::json!({"host": "localhost", "port": "5561"}));
+        resolve_runtime_target(&mut provisioned, Some(published)).unwrap();
+        assert_eq!(probed.parameters, provisioned.parameters);
+    }
+
+    #[test]
+    fn runtime_provisioning_keeps_loopback_when_the_node_publishes_there() {
+        for published in [None, Some("127.0.0.1"), Some("0.0.0.0"), Some("::")] {
+            let mut config =
+                postgres_config(serde_json::json!({"host": "localhost", "port": "5561"}));
+            resolve_runtime_target(&mut config, published.map(|ip| ip.parse().unwrap())).unwrap();
+            assert_eq!(
+                config.parameters["host"], "localhost",
+                "published {published:?}"
+            );
+        }
+    }
+
+    /// The node's address replaces only a loopback host; any other stored
+    /// host is still refused and left as it was.
+    #[test]
+    fn runtime_provisioning_still_rejects_non_loopback_hosts() {
+        let published: std::net::IpAddr = "10.42.0.22".parse().unwrap();
+        for host in ["169.254.169.254", "db.example.com", "10.42.0.22"] {
+            let mut config = postgres_config(serde_json::json!({"host": host, "port": "5561"}));
+            assert!(
+                matches!(
+                    resolve_runtime_target(&mut config, Some(published)),
+                    Err(RuntimeProvisioningError::UnsafeTarget { host: ref rejected }) if rejected == host
+                ),
+                "host {host} must be rejected"
+            );
+            assert_eq!(
+                config.parameters["host"], host,
+                "rejected host is untouched"
+            );
+        }
     }
 
     #[test]
@@ -466,6 +535,85 @@ pub async fn probe_service_health(
     Ok(result)
 }
 
+/// Run the Postgres WAL and archive probe against a service owned by the
+/// Docker daemon supplied by the caller: the worker-side half of the health
+/// monitor's WAL check for a database on a worker node.
+///
+/// Held to the same rules as [`probe_service_health`]: the caller-supplied
+/// host must be loopback and is then pointed at `published_address` (from
+/// the node's own configuration), and the stored port must be the one the
+/// service's own container publishes, so the probe cannot be aimed at an
+/// arbitrary address or at another container. The queries are fixed in
+/// [`postgres_wal_health`]; nothing in the request is executed.
+///
+/// A probe that cannot connect or whose queries fail is not an error here:
+/// it answers no snapshot and says why, as the local probe would skip.
+pub async fn probe_postgres_wal_health(
+    mut config: ServiceConfig,
+    docker: Arc<bollard::Docker>,
+    published_address: Option<IpAddr>,
+) -> std::result::Result<temps_service_protocol::RemoteWalHealthResponse, ServiceHealthProbeError> {
+    use temps_service_protocol::RemoteWalHealthResponse;
+
+    if config.service_type != ServiceType::Postgres {
+        return Err(ServiceHealthProbeError::Configuration(
+            EngineError::invalid_value(
+                "postgres",
+                format!(
+                    "the WAL probe only runs for Postgres services; '{}' is {}",
+                    config.name, config.service_type
+                ),
+            ),
+        ));
+    }
+    resolve_managed_probe_target(&mut config, published_address)?;
+    if let Some(field) = missing_required_probe_credential(&config) {
+        return Ok(RemoteWalHealthResponse {
+            snapshot: None,
+            error: Some(format!(
+                "stored postgres configuration of '{}' is missing required credential field '{}'",
+                config.name, field
+            )),
+        });
+    }
+    let instance = PostgresService::new(config.name.clone(), docker.clone());
+    validate_owned_container_port(&config, &instance, &docker)
+        .await
+        .map_err(|error| {
+            ServiceHealthProbeError::Configuration(error.into_engine_error(&config.name))
+        })?;
+
+    let Some(conn_str) = postgres_wal_health::build_conn_str(&config.parameters) else {
+        return Ok(RemoteWalHealthResponse {
+            snapshot: None,
+            error: Some(format!(
+                "stored postgres configuration of '{}' lacks the port, username, password or \
+                 database the WAL probe connects with",
+                config.name
+            )),
+        });
+    };
+    let Some(snapshot) = postgres_wal_health::probe_wal_health(&conn_str).await else {
+        return Ok(RemoteWalHealthResponse {
+            snapshot: None,
+            error: Some(format!(
+                "the WAL probe could not connect to '{}' or its queries failed",
+                config.name
+            )),
+        });
+    };
+    let snapshot = serde_json::to_value(&snapshot).map_err(|error| {
+        ServiceHealthProbeError::Provider(EngineError::failed(
+            &config.name,
+            format!("failed to encode the WAL health snapshot: {error}"),
+        ))
+    })?;
+    Ok(RemoteWalHealthResponse {
+        snapshot: Some(snapshot),
+        error: None,
+    })
+}
+
 /// Creation-time config parsers may generate credentials for a new service.
 /// A health probe must never do that: generated credentials cannot match an
 /// already-running container. Redis is the exception because no password is
@@ -502,10 +650,27 @@ fn resolve_managed_probe_target(
     published_address: Option<IpAddr>,
 ) -> std::result::Result<(), ServiceHealthProbeError> {
     validate_managed_probe_target(config)?;
+    connect_through_published_address(config, published_address);
+    Ok(())
+}
+
+/// Point a service whose stored host has been checked to be loopback at the
+/// address its node publishes managed-service ports on.
+///
+/// A worker binds service ports to its own address only (never to all
+/// interfaces, never to loopback), so `localhost:<port>` reaches nothing
+/// there. A loopback or unspecified published address, or none, keeps the
+/// stored host: the node publishes on loopback, or on every interface.
+/// Callers validate the stored host first, so this never launders a
+/// caller-supplied target.
+fn connect_through_published_address(
+    config: &mut ServiceConfig,
+    published_address: Option<IpAddr>,
+) {
     let Some(address) =
         published_address.filter(|address| !address.is_loopback() && !address.is_unspecified())
     else {
-        return Ok(());
+        return;
     };
     if let Some(parameters) = config.parameters.as_object_mut() {
         parameters.insert(
@@ -513,6 +678,16 @@ fn resolve_managed_probe_target(
             serde_json::Value::String(address.to_string()),
         );
     }
+}
+
+/// Where runtime provisioning connects: the stored loopback host, moved to
+/// the node's published address like the health and WAL probes.
+fn resolve_runtime_target(
+    config: &mut ServiceConfig,
+    published_address: Option<IpAddr>,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    validate_runtime_target(config)?;
+    connect_through_published_address(config, published_address);
     Ok(())
 }
 
@@ -623,8 +798,13 @@ pub async fn provision_runtime_environment(
     project_slug: &str,
     environment_slug: &str,
     docker: Arc<bollard::Docker>,
+    published_address: Option<IpAddr>,
 ) -> std::result::Result<HashMap<String, String>, RuntimeProvisioningError> {
-    validate_runtime_target(&config)?;
+    // The admin connection that creates the database and user must reach the
+    // port where the node actually published it. The app's variables do not
+    // change: the engines build them from the container name and internal
+    // port, never from this host.
+    resolve_runtime_target(&mut config, published_address)?;
     let parameters = &config.parameters;
     let instance_name = match service_type {
         ServiceType::Kv | ServiceType::Blob => managed_instance_name(&name, service_type),

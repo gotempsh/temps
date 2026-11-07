@@ -221,6 +221,20 @@ pub fn build_router(
             "/agent/services/{name}/snapshot",
             get(service_handlers::service_snapshot),
         )
+        // Read-only observation for the service page: runtime state,
+        // resource samples and the Postgres WAL probe.
+        .route(
+            "/agent/services/{name}/runtime",
+            get(crate::service_observe_handlers::service_runtime),
+        )
+        .route(
+            "/agent/services/{name}/stats",
+            get(crate::service_observe_handlers::service_stats),
+        )
+        .route(
+            "/agent/services/wal-health",
+            post(crate::service_observe_handlers::wal_health),
+        )
         .route(
             "/agent/services/runtime-env",
             post(service_handlers::runtime_env),
@@ -232,6 +246,16 @@ pub fn build_router(
         .route(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
+        )
+        // Backups and in-place restores of a worker's services, with the
+        // engine's own tools on this node (sealed: they carry credentials).
+        .route(
+            "/agent/services/data-backup",
+            post(crate::service_data_handlers::data_backup),
+        )
+        .route(
+            "/agent/services/data-restore",
+            post(crate::service_data_handlers::data_restore),
         )
         .route(
             "/agent/services/backup",
@@ -1970,6 +1994,9 @@ pub(crate) mod tests {
             "/agent/services",
             "/agent/services/exec",
             "/agent/services/workload",
+            "/agent/services/wal-health",
+            "/agent/services/data-backup",
+            "/agent/services/data-restore",
             "/agent/sandboxes",
             "/agent/sandboxes/exec",
             "/agent/sandboxes/write-file",
@@ -1998,6 +2025,43 @@ pub(crate) mod tests {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "{path}"
             );
+        }
+    }
+
+    /// The service page's read-only routes take the node token like every
+    /// other `/agent/services/*` route: a container's state and usage are
+    /// not public.
+    #[tokio::test]
+    async fn service_observation_routes_require_the_node_token() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let token = test_agent_config(false).token;
+        for path in [
+            "/agent/services/postgres-orders/runtime",
+            "/agent/services/postgres-orders/stats?samples=2",
+        ] {
+            let response = sealed_test_app(None)
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            // With the token the handler answers: this test router has no
+            // Docker, so it says so instead of 401.
+            let response = sealed_test_app(None)
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         }
     }
 

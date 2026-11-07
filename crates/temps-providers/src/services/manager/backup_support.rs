@@ -252,38 +252,6 @@ impl ExternalServiceManager {
         )
     }
 
-    /// Read the Postgres WAL health snapshot from `health_metadata.postgres_wal`.
-    ///
-    /// Returns `Ok(None)` when the service exists but has no snapshot yet
-    /// (e.g., probe hasn't run, or service isn't Postgres). Returns
-    /// `ServiceNotFound` only when the row doesn't exist at all.
-    pub async fn get_postgres_wal_health(
-        &self,
-        service_id: i32,
-    ) -> Result<
-        Option<crate::externalsvc::postgres_wal_health::PostgresWalHealth>,
-        ExternalServiceError,
-    > {
-        let service = self.get_service(service_id).await?;
-        let Some(metadata) = service.health_metadata else {
-            return Ok(None);
-        };
-        let Some(snapshot) = metadata.get("postgres_wal") else {
-            return Ok(None);
-        };
-        match serde_json::from_value(snapshot.clone()) {
-            Ok(parsed) => Ok(Some(parsed)),
-            Err(e) => {
-                tracing::warn!(
-                    "health_metadata.postgres_wal for service {} did not parse: {}",
-                    service_id,
-                    e
-                );
-                Ok(None)
-            }
-        }
-    }
-
     /// Deliberately, explicitly move a service's continuous archiving to a
     /// different S3 source.
     ///
