@@ -945,7 +945,16 @@ impl ExternalServiceManager {
                 })
             })?;
 
-        Ok(env_vars.keys().cloned().collect())
+        // What a linked app also gets per environment (a storage service's
+        // `S3_BUCKET`, a database's per-environment name): listed so the
+        // preview names every variable an app receives.
+        let mut names: Vec<String> = env_vars
+            .into_keys()
+            .chain(metadata.runtime_variable_names())
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     /// Get environment variables with masked sensitive values
