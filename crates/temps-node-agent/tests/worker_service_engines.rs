@@ -1492,6 +1492,228 @@ async fn a_worker_postgres_is_restored_and_recovered_to_a_point_in_time_through_
     println!("worker WAL-G restore proof: PITR to {t}, in place, and a rolled-back failure");
 }
 
+/// ADR-092, PostgreSQL step 4: another service's WAL-G backup is restored
+/// into a worker's PostgreSQL through its agent, as a cross-service restore
+/// on the control plane: the restored data answers to the origin's login,
+/// which the control plane sends as the restored login, while the target's
+/// own login is the running server's until the swap.
+///
+/// Origin X: rows A, base backup, rows B, time T, rows C. Target Y, with its
+/// own data and password: a PITR from X's backup to T leaves Y with A and B
+/// (not C, not Y's own rows), on Y's container, answering to X's password
+/// and no longer to Y's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_services_walg_backup_is_restored_into_a_worker_postgres_through_its_agent() {
+    use temps_providers::externalsvc::postgres_walg_backup::walg_prefix;
+    use temps_service_protocol::{
+        PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
+        PostgresWalgRestoreResult, RecoveryTarget,
+    };
+
+    let Some(origin) = WalgFixture::start("wsexo", "walg-cross").await else {
+        return;
+    };
+    let Some(target) = WalgFixture::start("wsexy", "walg-cross-y").await else {
+        return;
+    };
+    let docker = &origin.docker;
+    let password = |fixture: &WalgFixture| {
+        fixture.config.parameters["password"]
+            .as_str()
+            .expect("a generated password")
+            .to_string()
+    };
+    let (origin_password, target_password) = (password(&origin), password(&target));
+    assert_ne!(origin_password, target_password);
+    let sql = |container: &str, statement: &str| {
+        let container = container.to_string();
+        let statement = statement.to_string();
+        async move {
+            let (code, out) = psql(docker, &container, &statement).await;
+            assert_eq!(code, 0, "{statement}: {out}");
+            out
+        }
+    };
+    // A login over the container's network address, as an application
+    // connects: the image trusts loopback, so only this checks the password.
+    let login = |container: &str, password: &str| {
+        let container = container.to_string();
+        let env = format!("PGPASSWORD={password}");
+        async move {
+            let output = temps_docker_util::exec_capture(
+                docker,
+                &container,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(vec![
+                        "sh",
+                        "-c",
+                        "psql -h \"$(hostname -i | cut -d' ' -f1)\" -U postgres -d postgres \
+                         -tAc 'select 1'",
+                    ]),
+                    env: Some(vec![env.as_str()]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+                temps_docker_util::ExecCaptureOptions::separate(
+                    temps_docker_util::OutputLimit::Head(4096),
+                    temps_docker_util::OutputLimit::Head(4096),
+                )
+                .exit_code(temps_docker_util::ExitCodePolicy::BestEffort),
+            )
+            .await
+            .expect("exec psql over TCP");
+            output.exit_code == Some(0)
+        }
+    };
+    assert!(login(&target.container, &target_password).await);
+    assert!(!login(&target.container, &origin_password).await);
+
+    let x = origin.container.as_str();
+    let y = target.container.as_str();
+    sql(y, "create table mine(x int); insert into mine values (7)").await;
+    sql(
+        x,
+        "create table proof(tag text); insert into proof values ('a')",
+    )
+    .await;
+    let backup = walg_backup(
+        &origin.agent,
+        &PostgresWalgBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: origin.config.clone(),
+            destination: origin.destination(),
+            bucket_path: WALG_BUCKET_PATH.to_string(),
+            backup_uuid: "cross-1".to_string(),
+            allow_restart: true,
+        },
+    )
+    .await;
+    assert!(
+        matches!(backup, PostgresWalgBackupResult::Completed { .. }),
+        "{backup:?}"
+    );
+    sql(x, "insert into proof values ('b')").await;
+    let t = sql(
+        x,
+        "select to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .await;
+    let t: chrono::DateTime<chrono::Utc> = t.parse().unwrap_or_else(|e| panic!("T '{t}': {e}"));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sql(x, "insert into proof values ('c')").await;
+    sql(x, "select pg_switch_wal()").await;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let pending = psql(
+            docker,
+            x,
+            "select count(*) from pg_ls_dir('pg_wal/archive_status') f where f like '%.ready'",
+        )
+        .await
+        .1;
+        if pending == "0" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WAL was not archived: {pending} ready"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // What the control plane sends for a cross-service restore: the
+    // target's configuration with the origin's login merged in, and the
+    // target's own as the running server's.
+    let mut restored_login = target.config.clone();
+    for key in ["password", "username", "database"] {
+        restored_login.parameters[key] = origin.config.parameters[key].clone();
+    }
+    let created = docker
+        .inspect_container(
+            y,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("inspect the target");
+    // The origin's bucket, reached from the target's container on the
+    // shared network.
+    let restored = walg_restore(
+        &target.agent,
+        &PostgresWalgRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: restored_login,
+            live_service_config: target.config.clone(),
+            source: origin.destination(),
+            walg_prefix: walg_prefix(&origin.bucket, WALG_BUCKET_PATH, &origin.name),
+            recovery_target: Some(RecoveryTarget::Time { time: t }),
+            target_user_data: Some(serde_json::json!({ "temps_backup_id": "cross-1" }).to_string()),
+        },
+    )
+    .await;
+    assert_eq!(
+        restored,
+        PostgresWalgRestoreResult::Completed,
+        "{restored:?}"
+    );
+    assert_eq!(
+        psql(
+            docker,
+            y,
+            "select string_agg(tag, ',' order by tag) from proof"
+        )
+        .await
+        .1,
+        "a,b",
+        "the target holds the origin's data to T"
+    );
+    assert_ne!(
+        psql(docker, y, "select count(*) from mine").await.0,
+        0,
+        "the target's own table is gone"
+    );
+    assert!(
+        login(y, &origin_password).await,
+        "the restored target answers to the origin's login"
+    );
+    assert!(
+        !login(y, &target_password).await,
+        "the target's previous password no longer works"
+    );
+    let replaced = docker
+        .inspect_container(
+            y,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("inspect the target");
+    let service_label = |i: &bollard::models::ContainerInspectResponse| {
+        i.config
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .and_then(|l| l.get("sh.temps.service.name").cloned())
+    };
+    assert_eq!(service_label(&replaced), service_label(&created));
+    assert_eq!(
+        restart_policy(&replaced),
+        Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED)
+    );
+    // The origin is untouched.
+    assert_eq!(
+        psql(
+            docker,
+            x,
+            "select string_agg(tag, ',' order by tag) from proof"
+        )
+        .await
+        .1,
+        "a,b,c"
+    );
+    println!("cross-service WAL-G restore proof: origin's backup recovered into the target to {t}");
+}
+
 /// The same WAL-G restore on the control plane (ADR-092: one implementation,
 /// the transport alone differs): a PostgreSQL the provider created and backs
 /// up is recovered to a point in time, restored in place, and left as it was
