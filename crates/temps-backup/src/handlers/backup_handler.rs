@@ -57,11 +57,6 @@ impl From<ResolveEngineError> for Problem {
                     .with_title("Docker Unavailable")
                     .with_detail(error.to_string())
             }
-            ResolveEngineError::WorkerNodeUnsupported { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Backup Not Supported On Worker Node")
-                    .with_detail(error.to_string())
-            }
         }
     }
 }

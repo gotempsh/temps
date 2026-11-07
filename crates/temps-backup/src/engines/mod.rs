@@ -20,6 +20,7 @@
 //! - [`mariadb_dump`]: MariaDB via `mariadb-dump` logical dump (fallback).
 //! - [`s3_mirror`]: S3-compatible object storage via `rc mirror` (RustFS CLI).
 //! - [`workload_job`]: Postgres on a worker node, as a job on that node (ADR-055).
+//! - [`worker_agent`]: MongoDB, Redis, MariaDB and storage on a worker node, by its agent.
 //! - [`dispatch`]: Engine-key resolution helper (`resolve_engine_key`).
 //!
 //! ## Adding a new engine
@@ -45,4 +46,5 @@ pub mod s3_mirror;
 pub mod sidecar;
 pub mod v2_common;
 mod walg_size;
+pub mod worker_agent;
 pub mod workload_job;

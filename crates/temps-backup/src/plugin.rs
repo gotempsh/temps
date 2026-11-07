@@ -25,6 +25,7 @@ use crate::{
         postgres_walg::{PostgresWalgDeps, PostgresWalgEngine},
         redis::{RedisDeps, RedisEngine},
         s3_mirror::{S3MirrorDeps, S3MirrorEngine},
+        worker_agent::{WorkerAgentDeps, WorkerAgentEngine},
         workload_job::{PostgresWorkloadJobDeps, PostgresWorkloadJobEngine},
     },
     handlers::{self, create_backup_app_state, BackupAppState},
@@ -326,7 +327,15 @@ impl TempsPlugin for BackupPlugin {
                         encryption_service: encryption_service.clone(),
                         plane: plane_slot.clone(),
                     },
-                )));
+                )))
+                // MongoDB, Redis, MariaDB and storage services on worker
+                // nodes, backed up by their node's agent. Needs no local
+                // Docker either (see `engines::worker_agent`).
+                .register_engine(Arc::new(WorkerAgentEngine::new(WorkerAgentDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    manager: external_service_manager.clone(),
+                })));
 
             // Every other engine drives a local Docker container end to end
             // (dump/restore inside it, snapshot its volume, etc.), so there is

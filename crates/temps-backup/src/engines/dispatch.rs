@@ -15,6 +15,7 @@
 //! | `"postgres"`   | standalone, on a worker | –       | `"postgres_workload_job"` |
 //! | `"postgres"`   | other        | yes              | `"postgres_walg"`   |
 //! | `"postgres"`   | other        | no               | `"postgres_pgdump"` |
+//! | `"redis"` / `"mongodb"` / `"mariadb"` / storage | standalone, on a worker | – | `"worker_agent"` |
 //! | `"redis"`      | any          | –                | `"redis"`           |
 //! | `"mongodb"`    | any          | –                | `"mongodb"`         |
 //! | `"mariadb"`    | any          | yes (PITR tools) | `"mariadb_physical"` |
@@ -22,8 +23,9 @@
 //! | `"s3"` / `"minio"` / `"blob"` | any | –       | `"s3_mirror"`       |
 //! | anything else  | –            | –                | `Err(Unsupported)`  |
 //!
-//! A MariaDB on a worker node is refused (`WorkerNodeUnsupported`): its
-//! engines exec into the container through this host's Docker.
+//! Every service on a worker node is backed up on that node: PostgreSQL by a
+//! job (`workload_job`), the others by the node's agent (`worker_agent`).
+//! The local engines only reach containers on this host's Docker.
 //!
 //! The WAL-G and PITR-tool probes inspect a container on this host's Docker.
 //! [`resolve_engine_key_on_this_host`] opens the daemon only for those, so a
@@ -62,19 +64,6 @@ pub enum ResolveEngineError {
         service_type: String,
         reason: String,
     },
-
-    /// The service runs on a worker node, and its engines only work on a
-    /// container on this host's Docker.
-    #[error(
-        "Backups of {service_type} service {service_id} are not supported yet: it runs on worker \
-         node {node_id}, and its backup engines only reach containers on this server's Docker. \
-         Standalone PostgreSQL databases on worker nodes are backed up by a job on their node"
-    )]
-    WorkerNodeUnsupported {
-        service_id: i32,
-        service_type: String,
-        node_id: i32,
-    },
 }
 
 /// Whether the engine choice for `service` inspects a local container, or is
@@ -102,18 +91,14 @@ fn engine_choice(
             }
             Ok(EngineChoice::ProbePostgres)
         }
+        // Every other service on a worker node is backed up by its node's
+        // agent, with the engine's own tool on that node.
+        _ if super::worker_agent::takes_agent_path(service) => {
+            Ok(EngineChoice::Known(super::worker_agent::ENGINE_KEY))
+        }
         "redis" => Ok(EngineChoice::Known("redis")),
         "mongodb" | "mongo" => Ok(EngineChoice::Known("mongodb")),
-        "mariadb" => {
-            if let Some(node_id) = super::workload_job::worker_node(service) {
-                return Err(ResolveEngineError::WorkerNodeUnsupported {
-                    service_id: service.id,
-                    service_type: service.service_type.clone(),
-                    node_id,
-                });
-            }
-            Ok(EngineChoice::ProbeMariadb)
-        }
+        "mariadb" => Ok(EngineChoice::ProbeMariadb),
         "rustfs" | "s3" | "minio" | "blob" => Ok(EngineChoice::Known("s3_mirror")),
         other => Err(ResolveEngineError::Unsupported {
             service_id: service.id,
@@ -442,24 +427,28 @@ mod tests {
         ));
     }
 
-    /// A MariaDB on a worker cannot be backed up by engines that exec into a
-    /// container on this host: refused up front, naming the node, instead of
-    /// a missing Docker socket or a backup that fails later.
+    /// Every non-PostgreSQL service on a worker is backed up by its node's
+    /// agent, resolved without this host's Docker; MariaDB is no longer
+    /// refused. The same types on the control plane keep their engines.
     #[tokio::test]
-    async fn a_mariadb_on_a_worker_is_refused_with_its_node() {
-        let mut service = make_service("mariadb", "standalone");
-        service.node_id = Some(3);
-        let error = resolve_engine_key_on_this_host(&service)
-            .await
-            .expect_err("no engine reaches a worker's MariaDB");
-        assert!(
-            matches!(
-                error,
-                ResolveEngineError::WorkerNodeUnsupported { node_id: 3, .. }
-            ),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("worker node 3"), "{error}");
+    async fn worker_services_resolve_to_the_agent_engine_without_docker() {
+        for service_type in ["mariadb", "redis", "mongodb", "s3", "rustfs", "blob"] {
+            let mut service = make_service(service_type, "standalone");
+            service.node_id = Some(3);
+            assert_eq!(
+                resolve_engine_key_on_this_host(&service).await.ok(),
+                Some(super::super::worker_agent::ENGINE_KEY),
+                "{service_type} on a worker"
+            );
+        }
+        assert!(matches!(
+            engine_choice(&make_service("mariadb", "standalone")),
+            Ok(EngineChoice::ProbeMariadb)
+        ));
+        assert!(matches!(
+            engine_choice(&make_service("redis", "standalone")),
+            Ok(EngineChoice::Known("redis"))
+        ));
     }
 
     #[test]
