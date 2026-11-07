@@ -1702,6 +1702,22 @@ impl EnvironmentService {
         )))
     }
 
+    /// The project's live preview environments that track `branch`.
+    pub async fn branch_previews(
+        &self,
+        project_id: i32,
+        branch: &str,
+    ) -> Result<Vec<environments::Model>, EnvironmentError> {
+        Ok(environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::IsPreview.eq(true))
+            .filter(environments::Column::Branch.eq(branch))
+            .filter(environments::Column::DeletedAt.is_null())
+            .order_by_asc(environments::Column::Id)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
     /// Soft-delete an environment by setting its `deleted_at` timestamp.
     ///
     /// The environment row is preserved for historical data (deployments, analytics)
@@ -2260,6 +2276,76 @@ mod tests {
 
         service.delete_environment(3, 7).await.unwrap();
         service.delete_environment(3, 7).await.unwrap();
+    }
+
+    /// Only live previews of the branch are ever torn down: a staging or
+    /// production environment tracking the same branch must not match.
+    #[tokio::test]
+    async fn branch_previews_selects_only_live_previews_of_the_branch() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<environments::Model>::new()])
+                .into_connection(),
+        );
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        let service = EnvironmentService::new(db.clone(), config_service);
+
+        assert!(service
+            .branch_previews(3, "feature/login")
+            .await
+            .unwrap()
+            .is_empty());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the service held the only other handle");
+        let columns = [
+            "id",
+            "name",
+            "slug",
+            "subdomain",
+            "last_deployment",
+            "host",
+            "upstreams",
+            "created_at",
+            "updated_at",
+            "project_id",
+            "current_deployment_id",
+            "branch",
+            "deleted_at",
+            "deployment_config",
+            "is_preview",
+            "protected",
+            "sleeping",
+            "attack_mode",
+            "shield_mode",
+            "shield_exempt_paths",
+            "force_https",
+            "last_activity_at",
+            "ingress_mode",
+            "workload_mode",
+        ]
+        .map(|column| format!(r#""environments"."{column}""#))
+        .join(", ");
+        assert_eq!(
+            db.into_transaction_log(),
+            vec![sea_orm::Transaction::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    r#"SELECT {columns} FROM "environments" WHERE "environments"."project_id" = $1 AND "environments"."is_preview" = $2 AND "environments"."branch" = $3 AND "environments"."deleted_at" IS NULL ORDER BY "environments"."id" ASC"#
+                ),
+                [3.into(), true.into(), "feature/login".into()],
+            )]
+        );
     }
 
     #[test]

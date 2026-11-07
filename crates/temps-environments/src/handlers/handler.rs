@@ -36,6 +36,7 @@ use super::types::{
     UpdateEnvironmentSettingsRequest, UpdateEnvironmentSubdomainRequest,
     UpdateEnvironmentVariableRequest, UpdateProjectSecretRequest,
 };
+use crate::services::EnvironmentTeardownError;
 use temps_core::problemdetails::Problem;
 
 impl From<crate::services::env_var_service::EnvVarError> for Problem {
@@ -2248,67 +2249,18 @@ pub async fn delete_environment(
 
     let project = state.environment_service.get_project(project_id).await?;
 
-    // Persist the deletion fence before cancelling workflows or touching
-    // Docker. Deployment workers already reject soft-deleted environments.
     state
-        .environment_service
-        .delete_environment(project_id, env_id)
-        .await?;
-
-    // Cancel all active deployments for this environment
-    match state
-        .deployment_service
-        .cancel_all_environment_deployments(env_id)
-        .await
-    {
-        Ok(count) => {
-            if count > 0 {
-                info!(
-                    "Cancelled {} active deployment(s) before deleting environment {}",
-                    count, env_id
-                );
-            }
-        }
-        Err(error) => {
-            error!(
-                project_id,
-                environment_id = env_id,
-                %error,
-                "Failed to cancel environment deployments"
-            );
-            return Err(
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Environment Deployment Cancellation Failed")
-                    .with_detail(format!(
-                        "Failed to cancel active deployments for environment {env_id}: {error}"
-                    )),
-            );
-        }
-    }
-
-    state
-        .deployment_container_cleaner
-        .cleanup_environment_containers(project_id, env_id)
+        .environment_teardown
+        .tear_down(project_id, env_id)
         .await
         .map_err(|error| {
             error!(
                 project_id,
                 environment_id = env_id,
                 %error,
-                "Failed to clean up environment containers"
+                "Failed to tear down environment"
             );
-            // An unreachable worker is a state to wait out, and a retry finishes.
-            let status = if matches!(
-                error,
-                temps_core::ContainerCleanupError::NodeUnreachable { .. }
-            ) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            temps_core::problemdetails::new(status)
-                .with_title("Environment Container Cleanup Failed")
-                .with_detail(error.to_string())
+            Problem::from(error)
         })?;
 
     // Create audit event
@@ -2333,6 +2285,30 @@ pub async fn delete_environment(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+impl From<EnvironmentTeardownError> for Problem {
+    fn from(error: EnvironmentTeardownError) -> Self {
+        match error {
+            EnvironmentTeardownError::Environment(error) => Problem::from(error),
+            EnvironmentTeardownError::Cancel { .. } => {
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Deployment Cancellation Failed")
+                    .with_detail(error.to_string())
+            }
+            // An unreachable worker is a state to wait out, and a retry finishes.
+            EnvironmentTeardownError::Cleanup(
+                temps_core::ContainerCleanupError::NodeUnreachable { .. },
+            ) => temps_core::problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Environment Container Cleanup Failed")
+                .with_detail(error.to_string()),
+            EnvironmentTeardownError::Cleanup(_) => {
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Environment Container Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
 }
 
 async fn require_environment_deletion_authorization(
@@ -2924,6 +2900,53 @@ pub struct ApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreachable worker is a 409 the caller can retry; any other
+    /// teardown failure is a 500 naming the environment.
+    #[test]
+    fn teardown_failures_map_to_retryable_or_internal_problems() {
+        let unreachable =
+            EnvironmentTeardownError::Cleanup(temps_core::ContainerCleanupError::NodeUnreachable {
+                project_id: 3,
+                environment_id: 7,
+                container_id: "container-1".to_string(),
+                node_id: Some(2),
+                reason: "connection refused".to_string(),
+            });
+        assert_eq!(Problem::from(unreachable).status_code, StatusCode::CONFLICT);
+
+        let removal =
+            EnvironmentTeardownError::Cleanup(temps_core::ContainerCleanupError::Removal {
+                project_id: 3,
+                environment_id: 7,
+                container_id: "container-1".to_string(),
+                node_id: None,
+                reason: "device busy".to_string(),
+            });
+        assert_eq!(
+            Problem::from(removal).status_code,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let cancel = EnvironmentTeardownError::Cancel {
+            environment_id: 7,
+            reason: "workflow store unavailable".to_string(),
+        };
+        let problem = Problem::from(cancel);
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("environment 7"), "{detail}");
+
+        let refused =
+            EnvironmentTeardownError::Environment(crate::services::EnvironmentError::InvalidInput(
+                "Cannot delete production environment".to_string(),
+            ));
+        assert_eq!(Problem::from(refused).status_code, StatusCode::BAD_REQUEST);
+    }
     use std::sync::Mutex;
     use temps_core::{AuditLogger, AuditOperation};
 
@@ -3747,18 +3770,19 @@ mod tests {
                 ),
                 db.clone(),
             ));
+            let environment_service = Arc::new(
+                crate::services::environment_service::EnvironmentService::new(db.clone(), config),
+            );
             let state = Arc::new(AppState {
-                environment_service: Arc::new(
-                    crate::services::environment_service::EnvironmentService::new(
-                        db.clone(),
-                        config,
-                    ),
-                ),
+                environment_service: environment_service.clone(),
                 env_var_service: Arc::new(EnvVarService::new(db.clone(), encryption.clone())),
                 secret_service: Arc::new(crate::services::SecretService::new(db, encryption)),
                 audit_service: audit,
-                deployment_service: Arc::new(NoDeployments),
-                deployment_container_cleaner: Arc::new(NoDeployments),
+                environment_teardown: Arc::new(crate::services::EnvironmentTeardownService::new(
+                    environment_service.clone(),
+                    Arc::new(NoDeployments),
+                    Arc::new(NoDeployments),
+                )),
                 on_demand_waker: None,
                 integration_env_provider: None,
                 telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),

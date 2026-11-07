@@ -254,7 +254,7 @@ impl GitLabWebhookClient {
             push_events: true,
             tag_push_events: true,
             enable_ssl_verification: true,
-            merge_requests_events: false,
+            merge_requests_events: true,
         };
 
         let (header_name, header_value) = self.auth_header();
@@ -753,6 +753,32 @@ mod tests {
             .install_webhook("myorg", "myrepo", "https://example.com/wh", "secret")
             .await
             .expect("install should succeed with PAT");
+
+        mock.assert_async().await;
+    }
+
+    /// Merge request events carry closes and merges, which retire the
+    /// branch's preview; pushes and tag pushes still deploy.
+    #[tokio::test]
+    async fn installed_webhook_subscribes_to_pushes_and_merge_requests() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/v4/projects/myorg%2Fmyrepo/hooks")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "push_events": true,
+                "tag_push_events": true,
+                "merge_requests_events": true
+            })))
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id": 30}"#)
+            .create_async()
+            .await;
+
+        GitLabWebhookClient::new(server.url(), "token".to_string(), WebhookAuthMethod::Pat)
+            .install_webhook("myorg", "myrepo", "https://example.com/wh", "secret")
+            .await
+            .expect("install should succeed");
 
         mock.assert_async().await;
     }

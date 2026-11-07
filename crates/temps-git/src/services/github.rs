@@ -7,7 +7,9 @@ use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{self, repositories};
@@ -267,6 +269,81 @@ pub struct GithubAppService {
     db: Arc<DbConnection>,
     queue_service: Arc<dyn temps_core::jobs::JobQueue>,
     git_provider_manager: Arc<crate::services::git_provider_manager::GitProviderManager>,
+    shared_secret_warning: Arc<SharedSecretWarning>,
+}
+
+/// One warning per five minutes across all matching App groups and service
+/// clones. Constant memory; concurrent webhook deliveries cannot flood logs.
+struct SharedSecretWarning {
+    started_at: Instant,
+    next_warning_second: AtomicU64,
+}
+
+impl SharedSecretWarning {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            next_warning_second: AtomicU64::new(0),
+        }
+    }
+
+    fn should_warn(&self, matching_apps: usize, elapsed_seconds: u64) -> bool {
+        matching_apps > 1
+            && self
+                .next_warning_second
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    (elapsed_seconds >= next).then(|| elapsed_seconds.saturating_add(300))
+                })
+                .is_ok()
+    }
+
+    fn warn_if_shared(&self, signing: &[WebhookSigningApp]) {
+        if self.should_warn(signing.len(), self.started_at.elapsed().as_secs()) {
+            let app_ids: Vec<i32> = signing.iter().map(|app| app.app_id).collect();
+            warn!(
+                app_ids = ?app_ids,
+                "GitHub Apps share a webhook secret; configure distinct secrets for App isolation. Installation ownership checks and delivery processing continue. This warning is limited to once every five minutes."
+            );
+        }
+    }
+}
+
+/// Identity authenticated by a GitHub App webhook secret.
+#[derive(Debug, Clone, Copy)]
+pub struct WebhookSigningApp {
+    pub app_id: i32,
+    pub provider_id: i32,
+}
+
+#[derive(Debug, Error)]
+pub enum WebhookInstallationError {
+    #[error("Cannot look up installation {installation_id} for signing App {app_id}: {source}")]
+    Database {
+        app_id: i32,
+        installation_id: i32,
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "Cannot create client for signing App {app_id}, installation {installation_id}: {source}"
+    )]
+    Client {
+        app_id: i32,
+        installation_id: i32,
+        source: GithubAppServiceError,
+    },
+    #[error("GitHub ownership lookup timed out for signing App {app_id}, installation {installation_id}")]
+    Timeout { app_id: i32, installation_id: i32 },
+    #[error("GitHub ownership lookup failed for signing App {app_id}, installation {installation_id}: {source}")]
+    Lookup {
+        app_id: i32,
+        installation_id: i32,
+        source: octocrab::Error,
+    },
+    #[error("Installation {installation_id} does not belong to any signing App {app_ids:?}")]
+    NotOwned {
+        app_ids: Vec<i32>,
+        installation_id: i32,
+    },
 }
 
 // Helper struct to represent GitHub App data from git_providers
@@ -317,6 +394,7 @@ impl GithubAppService {
             db,
             queue_service,
             git_provider_manager,
+            shared_secret_warning: Arc::new(SharedSecretWarning::new()),
         }
     }
     // Helper method to extract GitHub App data from a git_provider
@@ -1505,9 +1583,9 @@ impl GithubAppService {
         &self,
         signature: Option<&str>,
         body: &[u8],
-    ) -> Result<(), GithubAppServiceError> {
-        // Try to validate with each GitHub App until one succeeds
-        // This is necessary because we don't know which app the webhook is from
+    ) -> Result<Vec<WebhookSigningApp>, GithubAppServiceError> {
+        // Every App whose secret matches is a candidate: Apps may share a
+        // secret, so the installation decides which one sent the delivery.
         let github_apps = self.get_all_github_apps().await?;
 
         if github_apps.is_empty() {
@@ -1525,6 +1603,7 @@ impl GithubAppService {
         // Try each GitHub App's webhook secret. `webhook_secret` is already
         // decrypted in GitHubAppData. The comparison is constant-time and an
         // app with no secret never matches (see the helper).
+        let mut signing = Vec::new();
         for github_app in github_apps {
             if let Ok(true) = github_webhook_signature_matches(
                 body,
@@ -1532,13 +1611,104 @@ impl GithubAppService {
                 &github_app.webhook_secret,
             ) {
                 debug!("Valid signature for GitHub App: {}", github_app.name);
-                return Ok(());
+                signing.push(WebhookSigningApp {
+                    app_id: github_app.app_id,
+                    provider_id: github_app.provider_id,
+                });
             }
         }
 
-        // If no app's webhook secret matched, return error
-        debug!("No GitHub App webhook secret matched the signature");
-        Err(GithubAppServiceError::InvalidWebhookSignature)
+        if signing.is_empty() {
+            debug!("No GitHub App webhook secret matched the signature");
+            return Err(GithubAppServiceError::InvalidWebhookSignature);
+        }
+        self.shared_secret_warning.warn_if_shared(&signing);
+        Ok(signing)
+    }
+
+    /// Return the signing App that owns the installation, checking stored
+    /// ownership before any dispatch. New installations are confirmed through
+    /// GitHub with only the signing Apps' credentials.
+    pub async fn authorize_webhook_installation(
+        &self,
+        signing: &[WebhookSigningApp],
+        installation_id: i32,
+    ) -> Result<WebhookSigningApp, WebhookInstallationError> {
+        let not_owned = || WebhookInstallationError::NotOwned {
+            app_ids: signing.iter().map(|app| app.app_id).collect(),
+            installation_id,
+        };
+        let Some(first) = signing.first() else {
+            return Err(not_owned());
+        };
+
+        let connection = git_provider_connections::Entity::find()
+            .filter(
+                git_provider_connections::Column::InstallationId.eq(installation_id.to_string()),
+            )
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| WebhookInstallationError::Database {
+                app_id: first.app_id,
+                installation_id,
+                source,
+            })?;
+        if let Some(connection) = connection {
+            return signing
+                .iter()
+                .find(|app| app.provider_id == connection.provider_id)
+                .copied()
+                .ok_or_else(not_owned);
+        }
+
+        // An App can only read its own installations, so the first App that
+        // confirms ownership is the sender; a failed lookup is reported only
+        // when no other App confirms.
+        let mut failure = None;
+        for app in signing {
+            match self.github_installation_owner(*app, installation_id).await {
+                Ok(true) => return Ok(*app),
+                Ok(false) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        Err(failure.unwrap_or_else(not_owned))
+    }
+
+    /// Whether GitHub reports the installation as belonging to `app`.
+    async fn github_installation_owner(
+        &self,
+        app: WebhookSigningApp,
+        installation_id: i32,
+    ) -> Result<bool, WebhookInstallationError> {
+        let app_id = app.app_id;
+        let (client, _) = self
+            .get_github_app_client_by_app_id(app_id)
+            .await
+            .map_err(|source| WebhookInstallationError::Client {
+                app_id,
+                installation_id,
+                source,
+            })?;
+        let installation = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .apps()
+                .installation(InstallationId(installation_id as u64)),
+        )
+        .await
+        .map_err(|_| WebhookInstallationError::Timeout {
+            app_id,
+            installation_id,
+        })?
+        .map_err(|source| WebhookInstallationError::Lookup {
+            app_id,
+            installation_id,
+            source,
+        })?;
+        Ok(installation.app_id.map(|id| id.into_inner()) == Some(app_id as u64))
     }
 
     pub async fn delete_installation(

@@ -118,7 +118,26 @@ Alternatively, on the **Deployments** page, each deployment entry shows its envi
 
 ## Clean up stale previews {{ anchor: true, id: 'clean-up-stale-previews' }}
 
-Preview environments accumulate over time as branches are created. To clean them up:
+Temps retires a preview environment on its own once the work it showed is done:
+
+- **The branch is deleted** (on every provider), including when the pull request is merged and the provider deletes the head branch.
+- **The pull request is merged or closed**, on GitHub, GitLab, Gitea and Bitbucket. A pull request from a fork never retires a preview, since its branch lives in another repository.
+
+<Warning>
+A preview belongs to its branch, not to one pull request. If several open pull requests share a branch, closing any one of them retires the preview the others use; the next push to the branch creates it again.
+</Warning>
+
+Retiring stops and removes the preview's containers and soft-deletes the environment, exactly like deleting it by hand, and records a **Preview environment retired** entry in the audit log naming the branch and the reason. Pushing to the branch again creates a fresh preview.
+
+<Note>
+Repository webhooks registered before this behaviour existed only send push events, so they report deleted branches but not closed pull requests. Gitea is the exception: it reports a deleted branch as a separate **Delete** event, so its older hooks report neither. To receive them, reinstall the webhook from the project's Git settings (GitHub personal access token or OAuth connections, and GitLab), or add the pull request / merge request event (and, on Gitea, the delete event) to the existing hook in your provider. GitHub App connections already receive pull request events.
+</Note>
+
+<Warning>
+Gitea webhooks now trigger only projects whose own webhook secret authenticates the delivery. If multiple Temps projects share a repository, ensure each project has its own working webhook. Projects previously relying on another project's hook will stop auto-deploying. Temps creates a separate hook for each project; check shared or manually consolidated hooks when upgrading.
+</Warning>
+
+To remove a preview yourself:
 
 1. Go to **Environments** in your project
 2. Find the preview environment you want to remove
