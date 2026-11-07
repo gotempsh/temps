@@ -14,9 +14,16 @@ repo screenshots and media live in [`assets/`](../assets/).
 | `mongodb-walg/` | `ghcr.io/gotempsh/mongodb-walg` | MongoDB with WAL-G-based backups |
 | `mariadb-walg/` | `ghcr.io/gotempsh/mariadb-walg` | MariaDB physical streaming backups through WAL-G |
 
-The default image tags used by the platform are set in
-`crates/temps-providers/src/externalsvc/`. Those defaults still reference the
-Docker Hub `gotempsh/*` copies, which are pushed by hand.
+The default image tags used by the platform are set in the provider crates
+(`crates/temps-providers-*/`). Redis and MariaDB default to the GHCR images
+built here; the other defaults still reference the Docker Hub `gotempsh/*`
+copies, which are pushed by hand and are not rebuilt by this workflow.
+
+Redis is built on Debian **trixie** (`redis-walg:8-trixie`): upstream Redis
+publishes no release after 8.4.0 for bookworm, so the old `8-bookworm` tag
+(Docker Hub and GHCR) is no longer rebuilt and carries an unpatched server.
+Existing services keep the image they were created with; move them with
+`temps services upgrade` or the console's Upgrade dialog.
 
 ## Publishing
 
@@ -27,15 +34,18 @@ majors per image.
 
 | Tag kind | Example | When it is built |
 |---|---|---|
-| Floating major | `postgres-walg:18-bookworm`, `pgvector-walg:pg18`, `mongodb-walg:8.0` | Every run, so upstream base-image security rebuilds are picked up |
-| Pinned PostgreSQL minor | `postgres-walg:18.3-bookworm`, `postgres-ha:18.3-bookworm` | The newest 4 upstream minors per major, discovered from `docker.io/library/postgres`. The newest is rebuilt every run; older ones only when missing or when their build context changes |
+| Floating major | `postgres-walg:18-bookworm`, `redis-walg:8-trixie`, `pgvector-walg:pg18`, `mongodb-walg:8.0` | Every run, so upstream base-image security rebuilds are picked up |
+| Pinned release | `postgres-walg:18.3-bookworm`, `postgres-ha:18.3-bookworm`, `redis-walg:8.10.3-trixie` | The newest 4 upstream releases per major, discovered from `docker.io/library/postgres` and `docker.io/library/redis`. The newest is rebuilt every run; older ones only when missing or when their build context changes |
 
 The workflow runs on every push to `main` that touches an image, weekly on a
 schedule, and on demand (`workflow_dispatch`, with `rebuild_all` to rebuild
-frozen minors too). Pull requests that touch an image build and verify it
+frozen pinned releases too). Pull requests that touch an image build and verify it
 without publishing. Before anything is pushed, each image must report a
-working `wal-g --version`, and PostgreSQL images must report the exact server
-version their tag claims.
+working `wal-g --version`, and PostgreSQL and Redis images must report the
+exact server version their tag claims. A floating tag must report the newest
+upstream release of its major in any Debian variant, so a base variant that
+upstream stopped publishing (as happened to `redis:8-bookworm`) fails the build
+instead of being republished unpatched every week.
 
 Releases call the same workflow from `release.yml` in "ensure" mode: it
 publishes only tags that are missing (a release never moves a tag under a

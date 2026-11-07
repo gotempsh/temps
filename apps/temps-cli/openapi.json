@@ -26183,7 +26183,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image to use (optional, uses default if not provided)",
-            "example": "gotempsh/redis-walg:8-bookworm",
+            "example": "ghcr.io/gotempsh/redis-walg:8-trixie",
             "type": [
               "string",
               "null"
@@ -39243,7 +39243,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image being used",
-            "example": "gotempsh/redis-walg:8-bookworm",
+            "example": "ghcr.io/gotempsh/redis-walg:8-trixie",
             "type": [
               "string",
               "null"
@@ -75009,8 +75009,8 @@
         "description": "Request to update KV service configuration",
         "properties": {
           "docker_image": {
-            "description": "Docker image to use (e.g., \"gotempsh/redis-walg:8-bookworm\")",
-            "example": "gotempsh/redis-walg:8-bookworm",
+            "description": "Docker image to use (e.g., \"ghcr.io/gotempsh/redis-walg:8-trixie\")",
+            "example": "ghcr.io/gotempsh/redis-walg:8-trixie",
             "type": [
               "string",
               "null"

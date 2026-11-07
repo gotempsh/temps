@@ -375,7 +375,9 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
+                    .unwrap_or_else(|| {
+                        crate::externalsvc::redis::DEFAULT_REDIS_IMAGE.to_string()
+                    });
                 let password = parameters.get("password").cloned().unwrap_or_default();
                 let env = HashMap::new();
                 let cmd =
@@ -433,7 +435,9 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
+                    .unwrap_or_else(|| {
+                        crate::externalsvc::redis::DEFAULT_REDIS_IMAGE.to_string()
+                    });
                 let password = parameters.get("password").cloned().unwrap_or_default();
                 let env = HashMap::new();
                 let cmd =

@@ -296,7 +296,7 @@ fn classify_capability(
                 "redis_rdb",
                 "Redis WAL-G streaming is not installed; standalone RDB backups remain local-only.",
                 "Upgrade to the Redis WAL-G image, restart the service, and run a new backup.",
-                "gotempsh/redis-walg:8-bookworm",
+                "ghcr.io/gotempsh/redis-walg:8-trixie",
             ),
         },
         "rustfs" | "s3" | "minio" | "blob" => compatible("s3_mirror", "object_set", false),
@@ -394,7 +394,7 @@ fn recommended_image(service_type: &str) -> Option<&'static str> {
         }
         "mariadb" => Some("ghcr.io/gotempsh/mariadb-walg:11.4"),
         "mongodb" | "mongo" => Some("gotempsh/mongodb-walg:8.0"),
-        "redis" => Some("gotempsh/redis-walg:8-bookworm"),
+        "redis" => Some("ghcr.io/gotempsh/redis-walg:8-trixie"),
         _ => None,
     }
 }

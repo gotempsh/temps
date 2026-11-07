@@ -8,11 +8,18 @@ Every image Temps runs for a managed database service (`images/*-walg`,
 
 * floating -- one per supported major (`18-bookworm`, `pg18`, `8.0`). Rebuilt
   on every run so the image picks up upstream security rebuilds of the base.
-* pinned -- one per upstream PostgreSQL minor (`18.3-bookworm`), discovered
-  from the upstream registry so a new minor is published without a code
-  change. The newest minor of each major is still refreshed upstream, so it is
-  rebuilt every run; older minors are frozen upstream and are only built when
-  missing from GHCR or when their build context changed.
+* pinned -- one per upstream release (`18.3-bookworm`, `8.10.3-trixie`),
+  discovered from the upstream registry so a new release is published without
+  a code change. The newest release of each major is still refreshed
+  upstream, so it is rebuilt every run; older releases are frozen upstream and
+  are only built when missing from GHCR or when their build context changed.
+
+For images with an upstream, every tag carries the exact server version its
+build must report. A floating tag must report the newest upstream release of
+its major in *any* variant: when upstream stops publishing the Debian variant
+an image is built from (Redis did, after 8.4.0-bookworm), the floating base
+tag silently freezes on an old release, and this check turns that into a
+failed build instead of a weekly republish of an unpatched server.
 
 Usage (from the workflow):
     database_image_matrix.py --owner gotempsh [--force postgres-walg,...] [--force-all]
@@ -42,11 +49,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-# How many of the newest upstream minors to publish per PostgreSQL major.
+# How many of the newest upstream releases to publish per major.
 PINNED_MINORS_PER_MAJOR = 4
 
 POSTGRES_UPSTREAM = "library/postgres"
-POSTGRES_MINOR_TAG = re.compile(r"^(\d+)\.(\d+)-bookworm$")
+# PostgreSQL releases are `major.minor`; Redis releases are `major.minor.patch`.
+POSTGRES_RELEASE = r"(\d+)\.(\d+)"
+REDIS_UPSTREAM = "library/redis"
+REDIS_RELEASE = r"(\d+)\.(\d+)\.(\d+)"
+POSTGRES_MINOR_TAG = re.compile(rf"^{POSTGRES_RELEASE}-bookworm$")
 
 # One entry per published repository. `majors` must cover every tag the
 # runtime defaults and `ALLOWED_POSTGRES_DOCKER_IMAGES` reference.
@@ -58,7 +69,8 @@ CATALOG = [
         "floating_tag": "{major}-bookworm",
         "pinned_tag": "{version}-bookworm",
         "pinned_upstream": POSTGRES_UPSTREAM,
-        "postgres_binary": True,
+        "release": POSTGRES_RELEASE,
+        "version_command": "postgres",
     },
     {
         "image": "postgres-ha",
@@ -71,7 +83,8 @@ CATALOG = [
         "floating_aliases": ["{major}-bookworm-walg"],
         "pinned_tag": "{version}-bookworm",
         "pinned_upstream": POSTGRES_UPSTREAM,
-        "postgres_binary": True,
+        "release": POSTGRES_RELEASE,
+        "version_command": "postgres",
     },
     {
         "image": "pgvector-walg",
@@ -86,10 +99,16 @@ CATALOG = [
         "floating_tag": "pg{major}",
     },
     {
+        # Trixie, not bookworm: upstream publishes no Redis release after
+        # 8.4.0 for bookworm, so `redis:8-bookworm` stopped receiving fixes.
         "image": "redis-walg",
         "build_arg": "REDIS_VERSION",
         "majors": ["8"],
-        "floating_tag": "{major}-bookworm",
+        "floating_tag": "{major}-trixie",
+        "pinned_tag": "{version}-trixie",
+        "pinned_upstream": REDIS_UPSTREAM,
+        "release": REDIS_RELEASE,
+        "version_command": "redis-server",
     },
     {
         "image": "mongodb-walg",
@@ -136,17 +155,49 @@ def upstream_tags(repository):
         ) from error
 
 
-def pinned_minors(tags, majors, keep):
-    """Newest `keep` upstream minors per major, newest first: {major: [version]}."""
+def pinned_minors(tags, majors, keep, pattern=POSTGRES_MINOR_TAG):
+    """Newest `keep` upstream releases per major, newest first: {major: [version]}.
+
+    `pattern` matches one release tag; its first group is the major and the
+    rest are the numeric components that order releases within it."""
     found = {major: set() for major in majors}
     for tag in tags:
-        match = POSTGRES_MINOR_TAG.match(tag)
+        match = pattern.match(tag)
         if match and match.group(1) in found:
-            found[match.group(1)].add(int(match.group(2)))
+            found[match.group(1)].add(tuple(int(part) for part in match.groups()[1:]))
     return {
-        major: [f"{major}.{minor}" for minor in sorted(minors, reverse=True)[:keep]]
-        for major, minors in found.items()
+        major: [
+            ".".join([major, *map(str, release)])
+            for release in sorted(releases, reverse=True)[:keep]
+        ]
+        for major, releases in found.items()
     }
+
+
+def _variant_pattern(spec):
+    """Release tags of the variant `spec` builds from, e.g. `18.3-bookworm`."""
+    suffix = spec["pinned_tag"].format(version="")
+    return re.compile(rf"^{spec['release']}{re.escape(suffix)}$")
+
+
+def newest_release(tags, spec, major):
+    """Newest upstream release of `major` in any variant, from the plain
+    release tags (`8.10.3`, `18.6`). Raises when there is none: a supported
+    major upstream no longer publishes cannot be built or verified."""
+    newest = pinned_minors(tags, [major], 1, re.compile(rf"^{spec['release']}$"))[major]
+    if not newest:
+        raise RuntimeError(
+            f"No upstream release of {spec['image']} major {major} found in "
+            f"docker.io/{spec['pinned_upstream']}; check `majors` in CATALOG"
+        )
+    return newest[0]
+
+
+def _expect_version(spec, version):
+    """Regex the image's `<version_command> --version` must match for `version`."""
+    if spec["version_command"] == "postgres":
+        return rf"\(PostgreSQL\) {re.escape(version)}(\s|$)"
+    return rf"v={re.escape(version)}(\s|$)"
 
 
 class RegistryLookupError(RuntimeError):
@@ -234,7 +285,7 @@ class GhcrRegistry:
         return _ghcr(request, f"{self.owner}/{image}:{tag}") is not None
 
 
-def _entry(spec, owner, version, tag, expect_postgres, aliases=()):
+def _entry(spec, owner, version, tag, expect_version, aliases=()):
     repository = f"ghcr.io/{owner}/{spec['image']}"
     tags = [tag, *aliases]
     return {
@@ -247,8 +298,10 @@ def _entry(spec, owner, version, tag, expect_postgres, aliases=()):
         # Newline-separated full references, the format build-push-action takes.
         "refs": "\n".join(f"{repository}:{t}" for t in tags),
         "version": version,
-        # Regex the built image's `postgres --version` must match, or "" to skip.
-        "expect_postgres": expect_postgres,
+        # Binary whose `--version` the built image is checked with, or "" to skip.
+        "version_command": spec.get("version_command", ""),
+        # Regex that output must match, or "" to skip.
+        "expect_version": expect_version,
     }
 
 
@@ -257,25 +310,29 @@ def candidates(owner, minors_by_upstream, catalog=CATALOG):
     true for tags whose upstream base still moves (floating majors and the
     newest minor of each major), which a regular run rebuilds unconditionally."""
     for spec in catalog:
+        upstream = spec.get("pinned_upstream")
+        released = minors_by_upstream[upstream] if upstream else []
         for major in spec["majors"]:
+            # A floating tag must carry the newest release of its major, not
+            # merely some release of it: see the module docstring.
             expect = (
-                rf"\(PostgreSQL\) {re.escape(major)}\." if spec.get("postgres_binary") else ""
+                _expect_version(spec, newest_release(released, spec, major))
+                if upstream
+                else ""
             )
             tag = spec["floating_tag"].format(major=major)
             aliases = [alias.format(major=major) for alias in spec.get("floating_aliases", [])]
             yield _entry(spec, owner, major, tag, expect, aliases), True
 
-        upstream = spec.get("pinned_upstream")
         if not upstream:
             continue
         minors = pinned_minors(
-            minors_by_upstream[upstream], spec["majors"], PINNED_MINORS_PER_MAJOR
+            released, spec["majors"], PINNED_MINORS_PER_MAJOR, _variant_pattern(spec)
         )
         for versions in minors.values():
             for index, version in enumerate(versions):
                 tag = spec["pinned_tag"].format(version=version)
-                expect = rf"\(PostgreSQL\) {re.escape(version)}(\s|$)"
-                yield _entry(spec, owner, version, tag, expect), index == 0
+                yield _entry(spec, owner, version, tag, _expect_version(spec, version)), index == 0
 
 
 def _published(registry, entry):

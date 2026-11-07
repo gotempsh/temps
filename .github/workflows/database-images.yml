@@ -5,14 +5,16 @@
 # images/postgres-ha) to GHCR. What gets built is decided by
 # .github/scripts/database_image_matrix.py:
 #
-# * floating tags (18-bookworm, pg18, 8.0) are rebuilt on every run, so the
+# * floating tags (18-bookworm, 8-trixie, pg18, 8.0) are rebuilt on every run, so the
 #   weekly schedule picks up upstream security rebuilds of the base images;
-# * pinned PostgreSQL minors (18.3-bookworm, ...) are discovered from the
-#   upstream registry, so a new minor is published by the next scheduled run
-#   without a code change. Frozen older minors are only built when missing.
+# * pinned releases (18.3-bookworm, 8.10.3-trixie, ...) are discovered from
+#   the upstream registry, so a new release is published by the next scheduled
+#   run without a code change. Frozen older releases are only built when missing.
 #
 # Every image is verified before it is pushed: `wal-g --version`, and for
-# PostgreSQL-based images that `postgres --version` reports the tagged version.
+# images with an upstream (PostgreSQL, Redis) that the server reports the
+# tagged version -- for a floating tag, the newest upstream release of its
+# major, so a base variant that stopped receiving releases fails the build.
 #
 # release.yml calls this with `ensure: true`: it publishes only tags that are
 # absent (a release never moves a tag under a running database), then fails
@@ -61,7 +63,7 @@ on:
   workflow_dispatch:
     inputs:
       rebuild_all:
-        description: 'Rebuild every tag, including frozen PostgreSQL minors already on GHCR'
+        description: 'Rebuild every tag, including frozen pinned releases already on GHCR'
         type: boolean
         default: false
 
@@ -223,16 +225,17 @@ jobs:
 
       - name: Verify image contents
         env:
-          EXPECT_POSTGRES: ${{ matrix.expect_postgres }}
+          VERSION_COMMAND: ${{ matrix.version_command }}
+          EXPECT_VERSION: ${{ matrix.expect_version }}
           IMAGE_REF: ${{ matrix.repository }}:${{ matrix.tag }}
         run: |
           set -euo pipefail
           docker run --rm --entrypoint wal-g database-image-verify:ci --version
-          if [[ -n "$EXPECT_POSTGRES" ]]; then
-            reported=$(docker run --rm --entrypoint postgres database-image-verify:ci --version)
+          if [[ -n "$EXPECT_VERSION" ]]; then
+            reported=$(docker run --rm --entrypoint "$VERSION_COMMAND" database-image-verify:ci --version)
             echo "$IMAGE_REF reports: $reported"
-            if ! grep -Eq "$EXPECT_POSTGRES" <<<"$reported"; then
-              echo "::error title=PostgreSQL version mismatch::$IMAGE_REF reports '$reported', expected /$EXPECT_POSTGRES/. The build likely pulled a different server package than the base image tag; refusing to publish a mislabeled image."
+            if ! grep -Eq "$EXPECT_VERSION" <<<"$reported"; then
+              echo "::error title=Server version mismatch::$IMAGE_REF reports '$reported', expected /$EXPECT_VERSION/. Either the build pulled a different server package than the base image tag, or the base image's variant no longer receives the newest upstream release (as redis:8-bookworm stopped at 8.4.0); refusing to publish a mislabeled or stale image."
               exit 1
             fi
           fi

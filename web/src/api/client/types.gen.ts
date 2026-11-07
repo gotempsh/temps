@@ -35484,7 +35484,7 @@ export type UpdateIpAccessControlRequest = {
  */
 export type UpdateKvRequest = {
     /**
-     * Docker image to use (e.g., "gotempsh/redis-walg:8-bookworm")
+     * Docker image to use (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie")
      */
     docker_image?: string | null;
 };
