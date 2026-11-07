@@ -13,6 +13,32 @@ export function githubManifestAction(state: string): string {
   return `https://github.com/settings/apps/new?state=${encodeURIComponent(state)}`
 }
 
+/**
+ * Tells a setup attempt whether it is still the current one. The state is
+ * requested from the server before the manifest is posted, so the operator can
+ * go Back (or leave) while that request is in flight; the attempt must then
+ * stop instead of posting the manifest and starting to watch for an app.
+ */
+export function createAttemptGate() {
+  let current = 0
+  return {
+    /** Start an attempt; any earlier one is no longer current. */
+    begin: (): number => ++current,
+    /** Make every attempt in flight stale. */
+    invalidate: (): void => {
+      current += 1
+    },
+    isCurrent: (attempt: number): boolean => attempt === current,
+  }
+}
+
+/** Whether a window returned by `window.open` can still receive the manifest. */
+export function githubWindowUsable(
+  githubWindow: { closed: boolean } | null
+): boolean {
+  return githubWindow !== null && !githubWindow.closed
+}
+
 /** Post the manifest to GitHub, into the browser window named `target`. */
 export function submitGitHubManifest(
   manifest: unknown,

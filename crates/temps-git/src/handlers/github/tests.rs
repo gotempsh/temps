@@ -178,7 +178,7 @@ fn every_other_failure_stays_a_500() {
 fn pending_state(user_id: i32) -> temps_entities::github_manifest_states::Model {
     temps_entities::github_manifest_states::Model {
         id: 1,
-        state: "issued-state".to_string(),
+        state_hash: "hash-of-issued-state".to_string(),
         user_id,
         expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
         created_at: chrono::Utc::now(),
@@ -523,4 +523,84 @@ async fn shared_secret_still_rejects_an_installation_no_signer_owns() {
 async fn signing_app_pairing_dispatches_branch_deletion() {
     // The matching App reaches the installation and project dispatch queries.
     assert_eq!(signed_installation_delivery(10, false).await, (true, 4));
+}
+
+/// Collects the fields of every tracing event, so a test can read what was
+/// logged.
+struct CaptureLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+struct EventText(String);
+
+impl tracing::field::Visit for EventText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for CaptureLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut text = EventText(String::new());
+        event.record(&mut text);
+        self.0.lock().unwrap().push(text.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+async fn the_callback_never_logs_the_state_or_the_code() {
+    let secret_state = "state-that-must-stay-out-of-the-logs";
+    let secret_code = "code-that-must-stay-out-of-the-logs";
+    let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let guard = tracing::subscriber::set_default(CaptureLogs(logs.clone()));
+
+    // The callback reads the operator's external URL first, then looks the
+    // state up: queue one settings row and no pending state.
+    let settings = temps_entities::settings::Model {
+        id: 1,
+        data: temps_config::AppSettings {
+            external_url: Some("https://temps.example.test".to_string()),
+            ..temps_config::AppSettings::default()
+        }
+        .to_json(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let state = super::super::public_route_tests::state_over(
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![settings]])
+            .append_query_results([Vec::<temps_entities::github_manifest_states::Model>::new()]),
+    );
+    let params = HashMap::from([
+        ("code".to_string(), secret_code.to_string()),
+        ("state".to_string(), secret_state.to_string()),
+    ]);
+    let result = github_app_auth_callback(State(state), Query(params)).await;
+    drop(guard);
+
+    assert_eq!(
+        result.expect_err("an unknown state is refused").status_code,
+        StatusCode::BAD_REQUEST
+    );
+    let logged = logs.lock().unwrap().join("\n");
+    assert!(
+        logged.contains("Detected manifest conversion flow"),
+        "the test sees the callback's log line: {logged}"
+    );
+    assert!(
+        !logged.contains(secret_state),
+        "the state was logged: {logged}"
+    );
+    assert!(
+        !logged.contains(secret_code),
+        "the code was logged: {logged}"
+    );
 }

@@ -14,8 +14,9 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
+    /// SHA-256 (hex) of the state. The state itself is never stored.
     #[sea_orm(unique)]
-    pub state: String,
+    pub state_hash: String,
     /// The operator who started the flow.
     pub user_id: i32,
     pub expires_at: DBDateTime,

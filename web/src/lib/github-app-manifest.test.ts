@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import { installBrowserWindow } from '@/test/dom'
 import {
+  createAttemptGate,
   githubManifestAction,
+  githubWindowUsable,
   submitGitHubManifest,
 } from './github-app-manifest'
 
@@ -71,5 +73,48 @@ describe('submitGitHubManifest', () => {
       submitGitHubManifest({}, 'issued-state', 'temps-github-app')
     ).toThrow('blocked')
     expect(document.querySelectorAll('form')).toHaveLength(0)
+  })
+})
+
+describe('createAttemptGate', () => {
+  test('an attempt is current until another begins or the gate is invalidated', () => {
+    const gate = createAttemptGate()
+    const first = gate.begin()
+    expect(gate.isCurrent(first)).toBe(true)
+
+    const second = gate.begin()
+    expect(gate.isCurrent(first)).toBe(false)
+    expect(gate.isCurrent(second)).toBe(true)
+  })
+
+  test('going Back or leaving makes the attempt in flight stale', () => {
+    const gate = createAttemptGate()
+    const attempt = gate.begin()
+
+    gate.invalidate()
+
+    expect(gate.isCurrent(attempt)).toBe(false)
+  })
+
+  test('an attempt started after Back is current again', () => {
+    const gate = createAttemptGate()
+    gate.begin()
+    gate.invalidate()
+
+    expect(gate.isCurrent(gate.begin())).toBe(true)
+  })
+})
+
+describe('githubWindowUsable', () => {
+  test('a blocked popup (null) cannot receive the manifest', () => {
+    expect(githubWindowUsable(null)).toBe(false)
+  })
+
+  test('a window the operator closed cannot receive the manifest', () => {
+    expect(githubWindowUsable({ closed: true })).toBe(false)
+  })
+
+  test('an open window can', () => {
+    expect(githubWindowUsable({ closed: false })).toBe(true)
   })
 })

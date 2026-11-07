@@ -9,8 +9,19 @@
 //! the flow. It is issued by an authenticated endpoint, stored here, and
 //! consumed (deleted) by the callback before it contacts GitHub, as the GitLab
 //! callback does with `oauth_states`.
+//!
+//! The state is a credential for as long as it is pending, so only its SHA-256
+//! is stored. The callback hashes what it receives before it looks it up, and
+//! nobody who can read the table can recover a state that is still valid. The
+//! state is random (a UUID v4), so an unsalted hash is enough.
 
 use super::*;
+use sha2::{Digest, Sha256};
+
+/// The value stored for a state and used to look it up.
+fn state_hash(state: &str) -> String {
+    hex::encode(Sha256::digest(state.as_bytes()))
+}
 
 /// How long an operator has to finish creating the app on GitHub.
 const MANIFEST_STATE_TTL_MINUTES: i64 = 15;
@@ -34,7 +45,7 @@ impl GitProviderManager {
 
         let state = uuid::Uuid::new_v4().to_string();
         github_manifest_states::ActiveModel {
-            state: Set(state.clone()),
+            state_hash: Set(state_hash(&state)),
             user_id: Set(user_id),
             expires_at: Set(now + chrono::Duration::minutes(MANIFEST_STATE_TTL_MINUTES)),
             ..Default::default()
@@ -55,8 +66,16 @@ impl GitProviderManager {
     ) -> Result<i32, GitProviderManagerError> {
         use temps_entities::github_manifest_states;
 
+        // A user who was soft-deleted since they started the flow no longer
+        // owns it: their pending state is not claimed.
+        let active_users = sea_orm::sea_query::Query::select()
+            .column(temps_entities::users::Column::Id)
+            .from(temps_entities::users::Entity)
+            .and_where(temps_entities::users::Column::DeletedAt.is_null())
+            .to_owned();
         let row = github_manifest_states::Entity::delete_many()
-            .filter(github_manifest_states::Column::State.eq(state))
+            .filter(github_manifest_states::Column::StateHash.eq(state_hash(state)))
+            .filter(github_manifest_states::Column::UserId.in_subquery(active_users))
             .exec_with_returning(self.db.as_ref())
             .await?
             .into_iter()
@@ -84,7 +103,10 @@ mod tests {
     use temps_entities::github_manifest_states;
 
     fn manager(db: MockDatabase) -> GitProviderManager {
-        let db = Arc::new(db.into_connection());
+        manager_over(Arc::new(db.into_connection()))
+    }
+
+    fn manager_over(db: Arc<temps_database::DbConnection>) -> GitProviderManager {
         GitProviderManager::new(
             db.clone(),
             Arc::new(
@@ -123,7 +145,7 @@ mod tests {
     ) -> github_manifest_states::Model {
         github_manifest_states::Model {
             id: 1,
-            state: state.to_string(),
+            state_hash: state_hash(state),
             user_id,
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(minutes_from_now),
             created_at: chrono::Utc::now(),
@@ -156,6 +178,22 @@ mod tests {
             "{sql:?}"
         );
         assert!(sql[0].contains("RETURNING"), "{sql:?}");
+        // Only a user who has not been deleted can redeem their state.
+        assert!(
+            sql[0].contains("\"deleted_at\" IS NULL"),
+            "the claim excludes deleted users: {sql:?}"
+        );
+        // Looked up by the hash, never by the value the callback received.
+        assert!(
+            statements[0].1.contains(&state_hash("pending-state")),
+            "{:?}",
+            statements[0].1
+        );
+        assert!(
+            !statements[0].1.contains("pending-state\""),
+            "the plain state is not sent to the database: {:?}",
+            statements[0].1
+        );
     }
 
     #[tokio::test]
@@ -228,9 +266,92 @@ mod tests {
             "then the new state is stored: {sql:?}"
         );
         assert!(
-            statements[1].1.contains(&state),
-            "the state that is returned is the one that is stored"
+            statements[1].1.contains(&state_hash(&state)),
+            "the hash of the returned state is what is stored"
         );
+        assert!(
+            !statements[1].1.contains(&state),
+            "the state itself is never stored: {:?}",
+            statements[1].1
+        );
+    }
+
+    /// The real SQL, on a migrated Postgres: the mock tests above only see
+    /// its text.
+    #[tokio::test]
+    async fn a_state_round_trips_on_a_real_database() {
+        use sea_orm::{ActiveModelTrait, EntityTrait};
+        use temps_entities::users;
+        use temps_test_utils::TestDatabase;
+
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let user = users::ActiveModel {
+            email: Set("manifest-state@example.test".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set("Manifest State".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let manager = manager_over(db.clone());
+
+        // An issued state is redeemed once, by the user it was issued to.
+        let state = manager.issue_github_manifest_state(user.id).await.unwrap();
+        let stored = github_manifest_states::Entity::find()
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state_hash, state_hash(&state));
+        assert_ne!(stored[0].state_hash, state, "only the hash is stored");
+        assert_eq!(
+            manager.consume_github_manifest_state(&state).await.unwrap(),
+            user.id
+        );
+        assert!(
+            manager.consume_github_manifest_state(&state).await.is_err(),
+            "a state works once"
+        );
+
+        // A state that has expired is refused.
+        github_manifest_states::ActiveModel {
+            state_hash: Set(state_hash("expired")),
+            user_id: Set(user.id),
+            expires_at: Set(now - chrono::Duration::minutes(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        assert!(manager
+            .consume_github_manifest_state("expired")
+            .await
+            .is_err());
+
+        // A user who was soft-deleted since cannot redeem their state.
+        let state = manager.issue_github_manifest_state(user.id).await.unwrap();
+        let mut deleted: users::ActiveModel = user.into();
+        deleted.deleted_at = Set(Some(chrono::Utc::now()));
+        deleted.update(db.as_ref()).await.unwrap();
+        assert!(
+            manager.consume_github_manifest_state(&state).await.is_err(),
+            "a deleted user's state is refused"
+        );
+    }
+
+    #[test]
+    fn a_state_is_stored_as_the_hex_sha256_of_its_value() {
+        // The SHA-256 test vector for "abc".
+        assert_eq!(
+            state_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(state_hash("abc"), state_hash("abd"));
     }
 
     #[tokio::test]

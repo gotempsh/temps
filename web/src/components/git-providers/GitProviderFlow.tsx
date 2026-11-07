@@ -31,7 +31,9 @@ import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
 import {
+  createAttemptGate,
   GITHUB_APP_WINDOW,
+  githubWindowUsable,
   submitGitHubManifest,
 } from '@/lib/github-app-manifest'
 import { isGitHubApp } from '@/lib/provider'
@@ -123,6 +125,10 @@ export function GitProviderFlow({
   const [providerName, setProviderName] = useState('')
   const [gitlabBaseUrl, setGitlabBaseUrl] = useState('https://gitlab.com')
   const [isCreatingApp, setIsCreatingApp] = useState(false)
+  const [manifestAttempts] = useState(createAttemptGate)
+  const githubWindowRef = useRef<Window | null>(null)
+  // Leaving the flow makes an attempt that is still waiting for its state stale.
+  useEffect(() => () => manifestAttempts.invalidate(), [manifestAttempts])
   const [copiedCallback, setCopiedCallback] = useState(false)
   const [gitlabClientId, setGitlabClientId] = useState('')
   const [gitlabClientSecret, setGitlabClientSecret] = useState('')
@@ -475,18 +481,42 @@ export function GitProviderFlow({
       }
 
       setIsCreatingApp(true)
+      const attempt = manifestAttempts.begin()
 
       // Open GitHub's window now, inside the click, so a popup blocker lets it
       // through. The manifest is posted into it once the server has issued the
       // state that GitHub has to hand back to the callback.
+      // A window an earlier attempt left open is reused by name; it is not
+      // this attempt's to close.
+      const earlierWindow = githubWindowRef.current
+      const reusesWindow = earlierWindow !== null && !earlierWindow.closed
       const githubWindow = window.open('', GITHUB_APP_WINDOW)
+      githubWindowRef.current = githubWindow
+      const closeOwnWindow = () => {
+        if (!reusesWindow) githubWindow?.close()
+      }
       let manifestState: string
       try {
         manifestState = (await startManifestFlow.mutateAsync({})).state
       } catch {
         // The mutation reports why (see `meta.errorTitle`).
-        githubWindow?.close()
+        closeOwnWindow()
         setIsCreatingApp(false)
+        return
+      }
+
+      // The operator went Back (or left) while the state was being issued:
+      // post nothing and watch for nothing.
+      if (!manifestAttempts.isCurrent(attempt)) {
+        closeOwnWindow()
+        return
+      }
+      if (!githubWindowUsable(githubWindow)) {
+        setIsCreatingApp(false)
+        toast.error('Could not open the GitHub window', {
+          description:
+            'The window was blocked or closed. Allow popups for this site and try again.',
+        })
         return
       }
 
@@ -523,11 +553,7 @@ export function GitProviderFlow({
         default_events: ['push', 'pull_request'],
       }
 
-      submitGitHubManifest(
-        manifestData,
-        manifestState,
-        githubWindow ? GITHUB_APP_WINDOW : '_blank'
-      )
+      submitGitHubManifest(manifestData, manifestState, GITHUB_APP_WINDOW)
       toast.success('Opening GitHub App creation page...', {
         description: 'Complete the setup in the new tab, then return here',
         duration: 5000,
@@ -771,6 +797,9 @@ export function GitProviderFlow({
   }
 
   const handleBack = () => {
+    // A GitHub App setup still waiting for its state must not carry on.
+    manifestAttempts.invalidate()
+    setIsCreatingApp(false)
     if (currentStep === 'provider') {
       onCancel?.()
     } else if (currentStep === 'method') {

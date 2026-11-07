@@ -1254,9 +1254,11 @@ async fn github_app_auth_callback(
         params.len() == 2 && params.contains_key("code") && params.contains_key("state");
 
     if is_manifest_flow {
+        // The state is a credential for this flow: record that one arrived,
+        // never its value.
         info!(
-            "Detected manifest conversion flow with state: {:?}",
-            state_param
+            has_state = state_param.is_some(),
+            "Detected manifest conversion flow"
         );
         // This is a manifest conversion - the code needs to be exchanged for a GitHub App
         return handle_manifest_conversion_with_source(&state, code, state_param).await;

@@ -7507,14 +7507,14 @@ async fn test_github_manifest_states_migration_is_single_use_and_reversible() ->
     assert_eq!(table_exists().await?.len(), 1, "the table exists after up");
 
     db.execute_unprepared(&format!(
-        "INSERT INTO github_manifest_states (state, user_id, expires_at) \
+        "INSERT INTO github_manifest_states (state_hash, user_id, expires_at) \
          VALUES ('pending', {user_id}, now() + interval '15 minutes')"
     ))
     .await?;
     // A state is unique: a second row cannot carry the same value.
     assert!(
         db.execute_unprepared(&format!(
-            "INSERT INTO github_manifest_states (state, user_id, expires_at) \
+            "INSERT INTO github_manifest_states (state_hash, user_id, expires_at) \
              VALUES ('pending', {user_id}, now() + interval '15 minutes')"
         ))
         .await
@@ -7527,7 +7527,7 @@ async fn test_github_manifest_states_migration_is_single_use_and_reversible() ->
     let claim = || {
         db.query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM github_manifest_states WHERE state = 'pending' RETURNING user_id"
+            "DELETE FROM github_manifest_states WHERE state_hash = 'pending' RETURNING user_id"
                 .to_string(),
         ))
     };
@@ -7538,7 +7538,7 @@ async fn test_github_manifest_states_migration_is_single_use_and_reversible() ->
 
     // Removing the operator removes their pending states.
     db.execute_unprepared(&format!(
-        "INSERT INTO github_manifest_states (state, user_id, expires_at) \
+        "INSERT INTO github_manifest_states (state_hash, user_id, expires_at) \
          VALUES ('orphan', {user_id}, now() + interval '15 minutes')"
     ))
     .await?;
@@ -7552,6 +7552,8 @@ async fn test_github_manifest_states_migration_is_single_use_and_reversible() ->
         .await?;
     assert!(left.is_empty(), "states follow their operator on delete");
 
+    // The target is the last migration applied here (`up` above stopped at
+    // it), so one step back reverts it and nothing else.
     Migrator::down(&db, Some(1)).await?;
     assert!(
         table_exists().await?.is_empty(),

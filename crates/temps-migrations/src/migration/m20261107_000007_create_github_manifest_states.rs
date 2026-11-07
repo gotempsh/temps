@@ -8,6 +8,9 @@
 //! the manifest `code`. The callback accepts a code only together with a state
 //! the server issued and has not yet consumed, as the GitLab callback does.
 //!
+//! Only a SHA-256 of each state is stored (`state_hash`), so a pending state
+//! cannot be read back from the table.
+//!
 //! This is a separate table from `oauth_states`: that table requires a
 //! `provider_id`, and in this flow the provider does not exist yet. Keeping the
 //! two apart also means a manifest state can never be accepted by an OAuth
@@ -28,7 +31,7 @@ impl MigrationTrait for Migration {
         db.execute_unprepared(
             "CREATE TABLE IF NOT EXISTS github_manifest_states (
                 id serial PRIMARY KEY,
-                state varchar(128) NOT NULL UNIQUE,
+                state_hash varchar(64) NOT NULL UNIQUE,
                 user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 expires_at timestamptz NOT NULL,
                 created_at timestamptz NOT NULL DEFAULT now()
