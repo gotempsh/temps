@@ -49,6 +49,7 @@ import {
   indexSettingsNavigationGroups,
   mergeNavigationItems,
   platformToolNavigationItems,
+  platformSettingNavigationItems,
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
@@ -837,7 +838,8 @@ const observeNavItems: NavigationItem[] = [
 
 const indexedSettingsNavItems = mergeNavigationItems(
   settingsNavItems.filter((item) => isSettingsNavigationUrl(item.url)),
-  settingsPageNavigationItems
+  settingsPageNavigationItems,
+  platformSettingNavigationItems
 )
 const secondaryNavigationUrls = new Set([
   ...observeNavItems.map((item) => item.url),

@@ -14,6 +14,10 @@ import {
   indexedMainNavItems,
   projectNavItems,
 } from './CommandPalette'
+import {
+  platformSettingNavigationItems,
+  settingsPageNavigationItems,
+} from '@/lib/command-navigation-catalog'
 import { NAV_FUSE_OPTIONS } from './nav-search'
 
 describe('CommandPaletteSuggestions', () => {
@@ -38,6 +42,24 @@ describe('CommandPaletteSuggestions', () => {
 })
 
 describe('navigation search', () => {
+  test('branding searches open the platform response privacy setting', () => {
+    const fuse = new Fuse(
+      [...settingsPageNavigationItems, ...platformSettingNavigationItems],
+      NAV_FUSE_OPTIONS
+    )
+    for (const query of ['branding', 'response privacy', 'fingerprinting']) {
+      const [first] = fuse.search(query)
+      expect(first?.item.url).toBe(
+        '/settings/security#setting-response-branding'
+      )
+    }
+    expect(
+      projectNavItems.some((item) =>
+        item.url.includes('setting-response-branding')
+      )
+    ).toBe(false)
+  })
+
   test('typing "Cluster DNS" finds the Cluster DNS card first', () => {
     const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
     const [first] = fuse.search('Cluster DNS')

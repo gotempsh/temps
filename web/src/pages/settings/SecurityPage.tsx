@@ -194,7 +194,11 @@ export function SecurityPage() {
         onSubmit={handleSubmit(onSubmit)}
         className="space-y-6 border-t pt-8"
       >
-        <SettingsSection title="Response privacy" icon={Shield}>
+        <SettingsSection
+          id="setting-response-branding"
+          title="Response privacy"
+          icon={Shield}
+        >
           <div className="flex items-center justify-between gap-4">
             <Label htmlFor="expose-platform-identity">
               Show Temps branding in responses

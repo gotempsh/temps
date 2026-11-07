@@ -72,6 +72,25 @@ export function settingAnchor(id: string): string {
   return `setting-${id}`
 }
 
+/** Instance-wide settings use absolute pages, never a service URL prefix. */
+export const PLATFORM_SETTINGS_INDEX: readonly Pick<
+  ProjectSettingEntry,
+  'anchor' | 'title' | 'page' | 'keywords'
+>[] = [
+  {
+    anchor: settingAnchor('response-branding'),
+    title: 'Show Temps branding in responses',
+    page: '/settings/security',
+    keywords: [
+      'branding',
+      'response privacy',
+      'fingerprinting',
+      'headers',
+      'platform identity',
+    ],
+  },
+]
+
 const GENERAL = 'settings/general'
 const DELIVERY = 'settings/delivery'
 const PROTECTION = 'settings/security'
