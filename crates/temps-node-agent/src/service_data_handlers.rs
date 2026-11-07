@@ -21,9 +21,10 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecreateHook, RemoteServiceBackupRequest,
-    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
+    PostgresWalgBackupResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook,
+    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
+    RemoteServiceRestoreResponse,
 };
 use tokio::sync::Semaphore;
 
@@ -363,6 +364,107 @@ async fn reroute_recreated_postgres(state: &AgentState, docker: &bollard::Docker
     }
 }
 
+/// `POST /agent/services/postgres/walg-archive`: point a PostgreSQL
+/// service's continuous WAL-G archiving at the request's S3 source, without
+/// a base backup: the control plane's own `enable_continuous_archiving`, run
+/// on this node. Sent for an operator's explicit re-point of the archive
+/// source, which accepts the restart turning `archive_mode` on needs (the
+/// running container's own specification recreated with archiving on,
+/// under the recreate guard). Outcomes come back as 200 with `completed`,
+/// `refused` (nothing was changed) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/postgres/walg-archive",
+    request_body = PostgresWalgArchiveRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<PostgresWalgArchiveResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn postgres_walg_archive(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<PostgresWalgArchiveRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("re-point the archiving of", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("re-point the archiving of", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.destination.bucket,
+        "Pointing WAL-G archiving of a service on this node at an S3 source"
+    );
+    let node = crate::service_handlers::node_attachment(
+        &state,
+        Some(temps_core::NETWORK_NAME.to_string()),
+    );
+    let after_create = overlay_hook(docker);
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .postgres_walg_archive(
+                request,
+                engine_docker,
+                node,
+                after_create,
+                published_address,
+            )
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "WAL-G archiving could not be re-pointed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAL-G archiving of service '{service}' could not be re-pointed: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "WAL-G archiving re-point panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "WAL-G archiving of service '{service}' stopped unexpectedly while being \
+                     re-pointed: {error}"
+                ),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("WAL-G archive re-point", &service),
+    };
+    match &outcome {
+        PostgresWalgArchiveResult::Completed { restarted } => {
+            if *restarted {
+                reroute_recreated_postgres(&state, docker, &service).await;
+            }
+            tracing::info!(service = %service, restarted, "WAL-G archiving re-pointed");
+        }
+        PostgresWalgArchiveResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "WAL-G archive re-point refused");
+        }
+        PostgresWalgArchiveResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "WAL-G archive re-point failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
 /// `POST /agent/services/postgres/walg-restore`: the control plane's WAL-G
 /// restore (in place, or to a point in time) of a PostgreSQL service on
 /// this node, run by the same engine as on the control plane.
@@ -487,6 +589,10 @@ mod tests {
             .route(
                 "/agent/services/postgres/walg-restore",
                 post(postgres_walg_restore),
+            )
+            .route(
+                "/agent/services/postgres/walg-archive",
+                post(postgres_walg_archive),
             )
             .with_state(state)
     }
@@ -644,6 +750,51 @@ mod tests {
             node.network.as_deref(),
             Some(temps_core::NETWORK_NAME.as_str())
         );
+    }
+
+    /// Re-pointing archiving takes a service and a destination only, and
+    /// runs the engine on this node with this node's attachment.
+    #[tokio::test]
+    async fn a_walg_archive_repoint_runs_the_engine_with_this_nodes_attachment() {
+        let body = || {
+            let mut body = walg_body();
+            let object = body.as_object_mut().expect("an object");
+            object.remove("backup_uuid");
+            object.remove("allow_restart");
+            body
+        };
+        for field in ["command", "walg_prefix", "allow_restart", "host_ip"] {
+            let mut body = body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/postgres/walg-archive",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state.clone()),
+            "/agent/services/postgres/walg-archive",
+            body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("WAL-G archiving of service 'orders' could not be re-pointed"),
+            "{error}"
+        );
+        let asked = runtime.walg_archives.lock().expect("walg_archives");
+        let [(request, node)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.service_id, 8);
+        assert_eq!(request.bucket_path, "base");
+        assert_eq!(node.host_ip, state.host_bind_address());
     }
 
     fn walg_restore_body() -> serde_json::Value {

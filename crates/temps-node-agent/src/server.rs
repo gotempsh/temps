@@ -270,6 +270,10 @@ pub fn build_router(
             post(crate::service_data_handlers::postgres_walg_restore),
         )
         .route(
+            "/agent/services/postgres/walg-archive",
+            post(crate::service_data_handlers::postgres_walg_archive),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )

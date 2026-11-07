@@ -26,7 +26,10 @@ use temps_docker_util::{
     exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OutputLimit,
     StreamErrorPolicy,
 };
-use temps_service_protocol::{PostgresWalgBackupRequest, PostgresWalgBackupResult};
+use temps_service_protocol::{
+    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
+    PostgresWalgBackupResult, WorkerS3Destination,
+};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -483,6 +486,107 @@ async fn current_wal_lsn(
     Ok(output.stdout.trim().to_string())
 }
 
+/// A worker service's configuration as the node's checks and recreate need
+/// it: the stored loopback host retargeted to where the node publishes its
+/// ports, and the managed container's recorded name dropped (kept, the
+/// provider would treat the container as imported and never turn archiving
+/// on). `Err` names why the service cannot be handled on this node.
+fn node_service_config(
+    service_id: i32,
+    mut service_config: ServiceConfig,
+    published_address: Option<IpAddr>,
+    operation: &str,
+) -> Result<(ServiceConfig, String), String> {
+    if service_config.service_type != ServiceType::Postgres {
+        return Err(format!(
+            "{operation} is for PostgreSQL services; service {service_id} ('{}') is {}",
+            service_config.name, service_config.service_type
+        ));
+    }
+    if let Err(error) = super::resolve_managed_probe_target(&mut service_config, published_address)
+    {
+        return Err(format!(
+            "PostgreSQL service {service_id} ('{}') cannot be handled on this node: {error}",
+            service_config.name
+        ));
+    }
+    let container_name = super::naming::postgres_container_name(&service_config.name);
+    if let Some(parameters) = service_config.parameters.as_object_mut() {
+        if parameters.get("container_name").and_then(|v| v.as_str())
+            == Some(container_name.as_str())
+        {
+            parameters.remove("container_name");
+        }
+    }
+    Ok((service_config, container_name))
+}
+
+fn node_s3(destination: WorkerS3Destination, bucket_path: String) -> S3Credentials {
+    S3Credentials {
+        access_key_id: destination.access_key_id,
+        secret_key: destination.secret_access_key,
+        session_token: destination.session_token,
+        region: destination.region,
+        endpoint: destination.endpoint,
+        bucket_name: destination.bucket,
+        bucket_path,
+        force_path_style: destination.force_path_style,
+    }
+}
+
+/// The agent's side of `POST /agent/services/postgres/walg-archive`: point
+/// continuous archiving at the request's destination, with the control
+/// plane's own `enable_continuous_archiving` and this node's recreate. The
+/// re-point is an operator's explicit decision, which accepts the restart
+/// turning archiving on needs, as on the control plane.
+pub async fn walg_archive_on_node(
+    request: PostgresWalgArchiveRequest,
+    docker: Arc<Docker>,
+    node: NodeRecreate,
+    published_address: Option<IpAddr>,
+) -> PostgresWalgArchiveResult {
+    let PostgresWalgArchiveRequest {
+        service_id,
+        node_id: _,
+        service_config,
+        destination,
+        bucket_path,
+    } = request;
+    let (service_config, _container) = match node_service_config(
+        service_id,
+        service_config,
+        published_address,
+        "WAL-G archiving",
+    ) {
+        Ok(target) => target,
+        Err(reason) => return PostgresWalgArchiveResult::Refused { reason },
+    };
+    let service = service_config.name.clone();
+    let s3 = node_s3(destination, bucket_path);
+    let prefix = walg_prefix(&s3.bucket_name, &s3.bucket_path, &service);
+    info!(service_id, service = %service, prefix = %prefix, "Pointing WAL-G archiving at a destination");
+    match PostgresService::new(service.clone(), docker)
+        .on_node(node)
+        .enable_continuous_archiving_reporting(service_config, &s3, &prefix, true)
+        .await
+    {
+        Ok(outcome) => PostgresWalgArchiveResult::Completed {
+            restarted: outcome.restarted,
+        },
+        Err(EngineError::RecreateGuard(guard)) if guard.is_refusal() => {
+            PostgresWalgArchiveResult::Refused {
+                reason: guard.to_string(),
+            }
+        }
+        Err(error) => PostgresWalgArchiveResult::Failed {
+            reason: format!(
+                "WAL-G archiving of service {service_id} ('{service}') could not be pointed at \
+                 {prefix}: {error}"
+            ),
+        },
+    }
+}
+
 /// The agent's side of `POST /agent/services/postgres/walg-backup`: the
 /// request as [`walg_base_backup`] takes it, run against this node's Docker,
 /// recreating with `node`.
@@ -499,51 +603,22 @@ pub async fn walg_base_backup_on_node(
     let PostgresWalgBackupRequest {
         service_id,
         node_id: _,
-        mut service_config,
+        service_config,
         destination,
         bucket_path,
         backup_uuid,
         allow_restart,
     } = request;
-    if service_config.service_type != ServiceType::Postgres {
-        return PostgresWalgBackupResult::Refused {
-            reason: format!(
-                "WAL-G base backups are for PostgreSQL services; service {service_id} ('{}') is \
-                 {}",
-                service_config.name, service_config.service_type
-            ),
-        };
-    }
-    if let Err(error) = super::resolve_managed_probe_target(&mut service_config, published_address)
-    {
-        return PostgresWalgBackupResult::Refused {
-            reason: format!(
-                "PostgreSQL service {service_id} ('{}') cannot be backed up on this node: {error}",
-                service_config.name
-            ),
-        };
-    }
-    let container_name = super::naming::postgres_container_name(&service_config.name);
-    // A worker service records its container's name, which is the managed
-    // name; only an imported database's differs. Kept, the provider would
-    // treat this managed container as imported and never turn archiving on.
-    if let Some(parameters) = service_config.parameters.as_object_mut() {
-        if parameters.get("container_name").and_then(|v| v.as_str())
-            == Some(container_name.as_str())
-        {
-            parameters.remove("container_name");
-        }
-    }
-    let s3 = S3Credentials {
-        access_key_id: destination.access_key_id,
-        secret_key: destination.secret_access_key,
-        session_token: destination.session_token,
-        region: destination.region,
-        endpoint: destination.endpoint,
-        bucket_name: destination.bucket,
-        bucket_path,
-        force_path_style: destination.force_path_style,
+    let (service_config, container_name) = match node_service_config(
+        service_id,
+        service_config,
+        published_address,
+        "WAL-G base backups",
+    ) {
+        Ok(target) => target,
+        Err(reason) => return PostgresWalgBackupResult::Refused { reason },
     };
+    let s3 = node_s3(destination, bucket_path);
     // Dropping the request (the control plane gave up) drops this future,
     // and the exec with it; the token only serves the shared signature.
     let cancel = CancellationToken::new();
@@ -762,8 +837,8 @@ mod tests {
         );
         let elsewhere = walg_base_backup_on_node(
             request(ServiceType::Postgres, "10.9.8.7"),
-            docker,
-            node,
+            docker.clone(),
+            node.clone(),
             None,
         )
         .await;
@@ -771,5 +846,27 @@ mod tests {
             matches!(&elsewhere, PostgresWalgBackupResult::Refused { reason } if reason.contains("10.9.8.7")),
             "{elsewhere:?}"
         );
+
+        // Re-pointing archiving checks the same before anything runs.
+        let archive = |service_type, host: &str| {
+            let backup = request(service_type, host);
+            PostgresWalgArchiveRequest {
+                service_id: backup.service_id,
+                node_id: backup.node_id,
+                service_config: backup.service_config,
+                destination: backup.destination,
+                bucket_path: backup.bucket_path,
+            }
+        };
+        for (request, expected) in [
+            (archive(ServiceType::Redis, "localhost"), "is redis"),
+            (archive(ServiceType::Postgres, "10.9.8.7"), "10.9.8.7"),
+        ] {
+            let result = walg_archive_on_node(request, docker.clone(), node.clone(), None).await;
+            assert!(
+                matches!(&result, PostgresWalgArchiveResult::Refused { reason } if reason.contains(expected)),
+                "{expected}: {result:?}"
+            );
+        }
     }
 }

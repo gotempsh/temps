@@ -1134,6 +1134,149 @@ async fn a_worker_postgres_is_backed_up_by_the_control_plane_walg_engine_through
     );
 }
 
+/// ADR-092, PostgreSQL step 2: a worker's archiving is turned on, then
+/// pointed at another S3 source, without a base backup, by the control
+/// plane's own `enable_continuous_archiving` through the agent.
+///
+/// 1. Archiving off: the running container is recreated with archiving on
+///    (its labels, port, network and restart policy kept), and WAL lands
+///    under the first source's prefix. No base backup is taken.
+/// 2. Re-pointed: nothing restarts, `walg.env` names the second prefix, and
+///    the next WAL lands there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_postgres_archive_is_turned_on_and_repointed_through_its_agent() {
+    use temps_providers::externalsvc::postgres_walg_backup::{walg_key_prefix, walg_prefix};
+    use temps_service_protocol::{PostgresWalgArchiveRequest, PostgresWalgArchiveResult};
+
+    let Some(fixture) = WalgFixture::start("wsearch", "walg-archive").await else {
+        return;
+    };
+    let fixture = &fixture;
+    let docker = &fixture.docker;
+    let container = fixture.container.as_str();
+    let archive = |bucket_path: &str| PostgresWalgArchiveRequest {
+        service_id: 8,
+        node_id: 2,
+        service_config: fixture.config.clone(),
+        destination: fixture.destination(),
+        bucket_path: bucket_path.to_string(),
+    };
+    let repoint = |request: PostgresWalgArchiveRequest| async move {
+        let (status, body) = envelope(
+            temps_node_agent::service_data_handlers::postgres_walg_archive(
+                State(fixture.agent.clone()),
+                Json(request),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200, "the re-point did not run: {body}");
+        serde_json::from_value::<PostgresWalgArchiveResult>(body["data"].clone())
+            .expect("an archive result")
+    };
+    let inspect = || async {
+        docker
+            .inspect_container(
+                container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("inspect the service container")
+    };
+    // WAL under `bucket_path`'s prefix once a segment is switched out.
+    let wal_lands_under = |bucket_path: &'static str| async move {
+        let key_prefix = format!("{}wal_005/", walg_key_prefix(bucket_path, &fixture.name));
+        let before = keys(&fixture.s3, &fixture.bucket, &key_prefix).await.len();
+        let (code, out) = psql(
+            docker,
+            container,
+            "create table if not exists t(x int); insert into t values (1); select pg_switch_wal()",
+        )
+        .await;
+        assert_eq!(code, 0, "{out}");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let now = keys(&fixture.s3, &fixture.bucket, &key_prefix).await.len();
+            if now > before {
+                return now;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no WAL arrived under {key_prefix}"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+    let created = inspect().await;
+    assert_eq!(psql(docker, container, "show archive_mode").await.1, "off");
+
+    // 1. On, to the first source.
+    let first = repoint(archive("fleet-a")).await;
+    assert_eq!(
+        first,
+        PostgresWalgArchiveResult::Completed { restarted: true }
+    );
+    let recreated = inspect().await;
+    assert_ne!(recreated.id, created.id, "archive_mode was off: a recreate");
+    assert_eq!(
+        restart_policy(&recreated),
+        Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED)
+    );
+    let label = |i: &bollard::models::ContainerInspectResponse| {
+        i.config
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .and_then(|l| l.get("sh.temps.service.name").cloned())
+    };
+    assert_eq!(label(&recreated), label(&created));
+    assert_eq!(psql(docker, container, "show archive_mode").await.1, "on");
+    let walg_env = || async {
+        exec(docker, container, &["cat", "/var/lib/postgresql/walg.env"])
+            .await
+            .1
+    };
+    assert!(
+        walg_env()
+            .await
+            .contains(&walg_prefix(&fixture.bucket, "fleet-a", &fixture.name)),
+        "walg.env names the first prefix"
+    );
+    wal_lands_under("fleet-a").await;
+    let base_backups = keys(
+        &fixture.s3,
+        &fixture.bucket,
+        &format!(
+            "{}basebackups_005/",
+            walg_key_prefix("fleet-a", &fixture.name)
+        ),
+    )
+    .await;
+    assert!(
+        base_backups.is_empty(),
+        "a re-point takes no base backup: {base_backups:?}"
+    );
+
+    // 2. Re-pointed to the second source: no restart, WAL moves.
+    let second = repoint(archive("fleet-b")).await;
+    assert_eq!(
+        second,
+        PostgresWalgArchiveResult::Completed { restarted: false }
+    );
+    assert_eq!(
+        inspect().await.id,
+        recreated.id,
+        "a re-point with archiving on restarted PostgreSQL"
+    );
+    let env = walg_env().await;
+    assert!(
+        env.contains(&walg_prefix(&fixture.bucket, "fleet-b", &fixture.name)),
+        "walg.env names the second prefix"
+    );
+    let landed = wal_lands_under("fleet-b").await;
+    println!("worker WAL-G archive proof: on with a recreate, re-pointed, {landed} WAL objects under the second prefix");
+}
+
 /// ADR-092, PostgreSQL step 3: a worker's WAL-G PostgreSQL is restored in
 /// place, and to a point in time, by the control plane's own WAL-G restore
 /// through the agent's sealed operation, and a restore that fails leaves the

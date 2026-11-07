@@ -693,6 +693,58 @@ impl ExternalServiceManager {
         Ok(result)
     }
 
+    /// Point the continuous WAL-G archiving of PostgreSQL service
+    /// `service_id`, which runs on a worker node, at `destination`, through
+    /// the node's agent (see `repoint_continuous_archive_source`). A refusal
+    /// or failure on the node is an error naming the service and node.
+    pub async fn walg_archive_worker_postgres(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+    ) -> Result<bool, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "WAL archive re-point")
+            .await?;
+        if let Some(endpoint) = destination
+            .endpoint
+            .as_deref()
+            .filter(|endpoint| is_loopback_endpoint(endpoint))
+        {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "the S3 source's endpoint {endpoint} is this server's loopback address, \
+                     which worker node {node_id} cannot reach; use an address the node can reach"
+                ),
+            });
+        }
+        let result = self
+            .get_remote_client(node_id)
+            .await?
+            .postgres_walg_archive(&crate::remote_service_client::PostgresWalgArchiveRequest {
+                service_id,
+                node_id,
+                service_config,
+                destination,
+                bucket_path,
+            })
+            .await?;
+        let restarted = worker_archive_outcome(service_id, node_id, result)?;
+        if restarted {
+            if let Err(error) = self.register_standalone_service_dns(service_id).await {
+                warn!(
+                    service_id,
+                    node_id,
+                    error = %error,
+                    "PostgreSQL was recreated on its node to turn WAL archiving on, but its \
+                     internal DNS record could not be republished"
+                );
+            }
+        }
+        Ok(restarted)
+    }
+
     /// Restore PostgreSQL service `service_id`, which runs on a worker node,
     /// from the WAL-G repository `walg_prefix` in `source`, in place or to
     /// `recovery_target`, with the control plane's own restore run by the
@@ -777,12 +829,121 @@ impl ExternalServiceManager {
     }
 }
 
+/// Whether an S3 endpoint names this server's loopback, which a worker node
+/// cannot reach.
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let with_scheme = if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let Some(host) = reqwest::Url::parse(&with_scheme)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a worker's archive re-point restarted PostgreSQL, or why it did
+/// not happen.
+fn worker_archive_outcome(
+    service_id: i32,
+    node_id: i32,
+    result: crate::remote_service_client::PostgresWalgArchiveResult,
+) -> Result<bool, ExternalServiceError> {
+    use crate::remote_service_client::PostgresWalgArchiveResult;
+    match result {
+        PostgresWalgArchiveResult::Completed { restarted } => Ok(restarted),
+        PostgresWalgArchiveResult::Refused { reason } => {
+            Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "worker node {node_id} refused to re-point WAL archiving: {reason}"
+                ),
+            })
+        }
+        PostgresWalgArchiveResult::Failed { reason } => Err(ExternalServiceError::DockerError {
+            id: service_id,
+            reason: format!("failed to repoint WAL archiving on worker node {node_id}: {reason}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::externalsvc::{rustfs::DEFAULT_RUSTFS_IMAGE, ServiceType};
     use crate::services::test_support::*;
     use std::collections::HashMap;
+
+    /// A worker reaches an S3 source by an address of its own: the plane's
+    /// loopback is refused before the node is asked.
+    #[test]
+    fn a_loopback_s3_endpoint_is_not_reachable_from_a_worker() {
+        for endpoint in [
+            "http://localhost:9000",
+            "127.0.0.1:9000",
+            "https://[::1]:9000",
+            "http://LOCALHOST",
+        ] {
+            assert!(is_loopback_endpoint(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "http://10.0.0.5:9000",
+            "s3.example.com",
+            "https://rustfs:9000",
+        ] {
+            assert!(!is_loopback_endpoint(endpoint), "{endpoint}");
+        }
+    }
+
+    /// A refusal on the node is a validation error, a failure a Docker
+    /// error; both name the service and node, as the local re-point does.
+    #[test]
+    fn a_worker_archive_outcome_names_the_node() {
+        use crate::remote_service_client::PostgresWalgArchiveResult;
+        assert!(matches!(
+            worker_archive_outcome(
+                4,
+                2,
+                PostgresWalgArchiveResult::Completed { restarted: true }
+            ),
+            Ok(true)
+        ));
+        match worker_archive_outcome(
+            4,
+            2,
+            PostgresWalgArchiveResult::Refused {
+                reason: "the replacement would not mount the data".into(),
+            },
+        ) {
+            Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: 4,
+                reason,
+            }) => {
+                assert!(reason.contains("worker node 2") && reason.contains("mount the data"))
+            }
+            other => panic!("{other:?}"),
+        }
+        match worker_archive_outcome(
+            4,
+            2,
+            PostgresWalgArchiveResult::Failed {
+                reason: "wal-g missing".into(),
+            },
+        ) {
+            Err(ExternalServiceError::DockerError { id: 4, reason }) => {
+                assert!(reason.contains("repoint WAL archiving on worker node 2"))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn remote_create_uses_provider_canonical_container_names() {
