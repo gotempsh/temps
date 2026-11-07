@@ -8916,6 +8916,12 @@ export const getPostgresWalHealthOptions = (options: Options<GetPostgresWalHealt
 
 export const getWorkloadModeQueryKey = (options: Options<GetWorkloadModeData>) => createQueryKey('getWorkloadMode', options);
 
+/**
+ * Get a database's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const getWorkloadModeOptions = (options: Options<GetWorkloadModeData>) => queryOptions<GetWorkloadModeResponse, GetWorkloadModeError, GetWorkloadModeResponse, ReturnType<typeof getWorkloadModeQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await getWorkloadMode({
@@ -8929,6 +8935,12 @@ export const getWorkloadModeOptions = (options: Options<GetWorkloadModeData>) =>
     queryKey: getWorkloadModeQueryKey(options)
 });
 
+/**
+ * Change a database's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const updateWorkloadModeMutation = (options?: Partial<Options<UpdateWorkloadModeData>>): UseMutationOptions<UpdateWorkloadModeResponse, UpdateWorkloadModeError, Options<UpdateWorkloadModeData>> => {
     const mutationOptions: UseMutationOptions<UpdateWorkloadModeResponse, UpdateWorkloadModeError, Options<UpdateWorkloadModeData>> = {
         mutationFn: async (fnOptions) => {
@@ -8945,6 +8957,12 @@ export const updateWorkloadModeMutation = (options?: Partial<Options<UpdateWorkl
 
 export const getWorkloadPendingChangesQueryKey = (options: Options<GetWorkloadPendingChangesData>) => createQueryKey('getWorkloadPendingChanges', options);
 
+/**
+ * List what a recreate from the workload spec would change (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const getWorkloadPendingChangesOptions = (options: Options<GetWorkloadPendingChangesData>) => queryOptions<GetWorkloadPendingChangesResponse, GetWorkloadPendingChangesError, GetWorkloadPendingChangesResponse, ReturnType<typeof getWorkloadPendingChangesQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await getWorkloadPendingChanges({
@@ -8958,6 +8976,12 @@ export const getWorkloadPendingChangesOptions = (options: Options<GetWorkloadPen
     queryKey: getWorkloadPendingChangesQueryKey(options)
 });
 
+/**
+ * Recreate a database's container from its workload spec (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const recreateFromWorkloadSpecMutation = (options?: Partial<Options<RecreateFromWorkloadSpecData>>): UseMutationOptions<RecreateFromWorkloadSpecResponse2, RecreateFromWorkloadSpecError, Options<RecreateFromWorkloadSpecData>> => {
     const mutationOptions: UseMutationOptions<RecreateFromWorkloadSpecResponse2, RecreateFromWorkloadSpecError, Options<RecreateFromWorkloadSpecData>> = {
         mutationFn: async (fnOptions) => {
@@ -11092,6 +11116,12 @@ export const completeCiBuildMutation = (options?: Partial<Options<CompleteCiBuil
 
 export const adminExplainEnvironmentPlacementQueryKey = (options: Options<AdminExplainEnvironmentPlacementData>) => createQueryKey('adminExplainEnvironmentPlacement', options);
 
+/**
+ * Explain where the workload plane would place an environment (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminExplainEnvironmentPlacementOptions = (options: Options<AdminExplainEnvironmentPlacementData>) => queryOptions<AdminExplainEnvironmentPlacementResponse, AdminExplainEnvironmentPlacementError, AdminExplainEnvironmentPlacementResponse, ReturnType<typeof adminExplainEnvironmentPlacementQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await adminExplainEnvironmentPlacement({
@@ -11107,6 +11137,12 @@ export const adminExplainEnvironmentPlacementOptions = (options: Options<AdminEx
 
 export const adminEnvironmentPinningRecommendationQueryKey = (options: Options<AdminEnvironmentPinningRecommendationData>) => createQueryKey('adminEnvironmentPinningRecommendation', options);
 
+/**
+ * Recommend node pinning for an environment (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminEnvironmentPinningRecommendationOptions = (options: Options<AdminEnvironmentPinningRecommendationData>) => queryOptions<AdminEnvironmentPinningRecommendationResponse, AdminEnvironmentPinningRecommendationError, AdminEnvironmentPinningRecommendationResponse, ReturnType<typeof adminEnvironmentPinningRecommendationQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await adminEnvironmentPinningRecommendation({
@@ -11235,6 +11271,12 @@ export const adminAttachEnvironmentVolumeMutation = (options?: Partial<Options<A
 
 export const adminGetEnvironmentWorkloadIsolationQueryKey = (options: Options<AdminGetEnvironmentWorkloadIsolationData>) => createQueryKey('adminGetEnvironmentWorkloadIsolation', options);
 
+/**
+ * Get an environment's workload isolation (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminGetEnvironmentWorkloadIsolationOptions = (options: Options<AdminGetEnvironmentWorkloadIsolationData>) => queryOptions<AdminGetEnvironmentWorkloadIsolationResponse, AdminGetEnvironmentWorkloadIsolationError, AdminGetEnvironmentWorkloadIsolationResponse, ReturnType<typeof adminGetEnvironmentWorkloadIsolationQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await adminGetEnvironmentWorkloadIsolation({
@@ -11248,6 +11290,12 @@ export const adminGetEnvironmentWorkloadIsolationOptions = (options: Options<Adm
     queryKey: adminGetEnvironmentWorkloadIsolationQueryKey(options)
 });
 
+/**
+ * Change an environment's workload isolation (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminSetEnvironmentWorkloadIsolationMutation = (options?: Partial<Options<AdminSetEnvironmentWorkloadIsolationData>>): UseMutationOptions<AdminSetEnvironmentWorkloadIsolationResponse, AdminSetEnvironmentWorkloadIsolationError, Options<AdminSetEnvironmentWorkloadIsolationData>> => {
     const mutationOptions: UseMutationOptions<AdminSetEnvironmentWorkloadIsolationResponse, AdminSetEnvironmentWorkloadIsolationError, Options<AdminSetEnvironmentWorkloadIsolationData>> = {
         mutationFn: async (fnOptions) => {
@@ -11264,6 +11312,12 @@ export const adminSetEnvironmentWorkloadIsolationMutation = (options?: Partial<O
 
 export const adminGetEnvironmentWorkloadModeQueryKey = (options: Options<AdminGetEnvironmentWorkloadModeData>) => createQueryKey('adminGetEnvironmentWorkloadMode', options);
 
+/**
+ * Get an environment's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminGetEnvironmentWorkloadModeOptions = (options: Options<AdminGetEnvironmentWorkloadModeData>) => queryOptions<AdminGetEnvironmentWorkloadModeResponse, AdminGetEnvironmentWorkloadModeError, AdminGetEnvironmentWorkloadModeResponse, ReturnType<typeof adminGetEnvironmentWorkloadModeQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
         const { data } = await adminGetEnvironmentWorkloadMode({
@@ -11277,6 +11331,12 @@ export const adminGetEnvironmentWorkloadModeOptions = (options: Options<AdminGet
     queryKey: adminGetEnvironmentWorkloadModeQueryKey(options)
 });
 
+/**
+ * Change an environment's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminSetEnvironmentWorkloadModeMutation = (options?: Partial<Options<AdminSetEnvironmentWorkloadModeData>>): UseMutationOptions<AdminSetEnvironmentWorkloadModeResponse, AdminSetEnvironmentWorkloadModeError, Options<AdminSetEnvironmentWorkloadModeData>> => {
     const mutationOptions: UseMutationOptions<AdminSetEnvironmentWorkloadModeResponse, AdminSetEnvironmentWorkloadModeError, Options<AdminSetEnvironmentWorkloadModeData>> = {
         mutationFn: async (fnOptions) => {
