@@ -319,6 +319,25 @@ jobs:
                 echo "- \`$target\` → same image as \`$source\`" >> "$GITHUB_STEP_SUMMARY"
               done
 
+  new-majors:
+    # A new upstream major (PostgreSQL 19, Redis 9, MongoDB 9.0) is never
+    # published automatically: supporting one is a product decision. This
+    # fails the weekly run so it gets noticed, without holding back any image
+    # build. Add the major to `majors` in the planner's CATALOG, or to
+    # `deferred_majors` to acknowledge it. Never part of a release or a PR.
+    name: Upstream majors
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && inputs.ensure != true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check for upstream majors no image supports yet
+        run: python3 .github/scripts/database_image_matrix.py --owner gotempsh --new-majors
+
   verify-published:
     name: Required tags are publicly pullable
     needs: [plan, build, retag]

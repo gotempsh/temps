@@ -21,9 +21,15 @@ an image is built from (Redis did, after 8.4.0-bookworm), the floating base
 tag silently freezes on an old release, and this check turns that into a
 failed build instead of a weekly republish of an unpatched server.
 
+New majors are not published automatically: supporting one is a product
+decision (runtime defaults, allowlists, upgrade paths). `--new-majors` lists
+every upstream major newer than the newest one an image supports, so the
+weekly run fails visibly instead of nobody noticing. Add the major to
+`majors`, or record it in `deferred_majors` to acknowledge it for now.
+
 Usage (from the workflow):
     database_image_matrix.py --owner gotempsh [--force postgres-walg,...] [--force-all]
-                             [--only redis-walg,...] [--missing-only | --check]
+                             [--only redis-walg,...] [--missing-only | --check | --new-majors]
 
 Releases run it with --missing-only (publish what is absent, move nothing
 else) and then --check, which fails the release unless every required tag is
@@ -61,6 +67,11 @@ POSTGRES_MINOR_TAG = re.compile(rf"^{POSTGRES_RELEASE}-bookworm$")
 
 # One entry per published repository. `majors` must cover every tag the
 # runtime defaults and `ALLOWED_POSTGRES_DOCKER_IMAGES` reference.
+#
+# New upstream majors are watched in `majors_upstream` (default:
+# `pinned_upstream`), whose tags matching `major_tag` (default: a plain
+# `release` tag) name a major in their first group. `deferred_majors` are
+# newer majors seen upstream and deliberately not supported yet.
 CATALOG = [
     {
         "image": "postgres-walg",
@@ -91,12 +102,16 @@ CATALOG = [
         "build_arg": "PG_VERSION",
         "majors": ["17", "18"],
         "floating_tag": "pg{major}",
+        "majors_upstream": "pgvector/pgvector",
+        "major_tag": r"^pg(\d+)$",
     },
     {
         "image": "timescaledb-walg",
         "build_arg": "PG_VERSION",
         "majors": ["17", "18"],
         "floating_tag": "pg{major}",
+        "majors_upstream": "timescale/timescaledb-ha",
+        "major_tag": r"^pg(\d+)$",
     },
     {
         # Trixie, not bookworm: upstream publishes no Redis release after
@@ -115,6 +130,10 @@ CATALOG = [
         "build_arg": "MONGO_VERSION",
         "majors": ["7.0", "8.0"],
         "floating_tag": "{major}",
+        "majors_upstream": "library/mongo",
+        # Only `X.0` lines: since 5.0 the x.1-x.3 lines are rapid releases.
+        "major_tag": r"^(\d+\.0)\.\d+$",
+        "deferred_majors": ["9.0"],
     },
 ]
 
@@ -191,6 +210,33 @@ def newest_release(tags, spec, major):
             f"docker.io/{spec['pinned_upstream']}; check `majors` in CATALOG"
         )
     return newest[0]
+
+
+def _major_key(major):
+    return tuple(int(part) for part in major.split("."))
+
+
+def majors_upstream(spec):
+    """Docker Hub repository watched for new majors of `spec`, or None."""
+    return spec.get("majors_upstream") or spec.get("pinned_upstream")
+
+
+def new_majors(spec, tags):
+    """Upstream majors newer than the newest one `spec` supports and not in
+    its `deferred_majors`, oldest first. Older majors upstream still ships
+    (PostgreSQL 14) are unsupported on purpose and never reported."""
+    pattern = re.compile(spec.get("major_tag") or rf"^{spec['release']}$")
+    newest_supported = max(_major_key(major) for major in spec["majors"])
+    deferred = set(spec.get("deferred_majors", []))
+    found = {match.group(1) for tag in tags for match in [pattern.match(tag)] if match}
+    return sorted(
+        (
+            major
+            for major in found
+            if _major_key(major) > newest_supported and major not in deferred
+        ),
+        key=_major_key,
+    )
 
 
 def _expect_version(spec, version):
@@ -407,6 +453,11 @@ def main(argv=None):
         action="store_true",
         help="Exit 1 unless every required tag is anonymously pullable from GHCR",
     )
+    mode.add_argument(
+        "--new-majors",
+        action="store_true",
+        help="Exit 1 if upstream released a major newer than an image supports",
+    )
     args = parser.parse_args(argv)
 
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.owner):
@@ -423,6 +474,9 @@ def main(argv=None):
         forced = {"*"}
     catalog = [spec for spec in CATALOG if not only or spec["image"] in only]
 
+    if args.new_majors:
+        return report_new_majors(catalog)
+
     upstreams = {spec["pinned_upstream"] for spec in catalog if spec.get("pinned_upstream")}
     minors_by_upstream = {upstream: upstream_tags(upstream) for upstream in upstreams}
 
@@ -435,6 +489,38 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 1
+
+
+def report_new_majors(catalog):
+    """Print every unsupported newer upstream major; 1 when there is any."""
+    watched = {majors_upstream(spec) for spec in catalog} - {None}
+    tags = {repository: upstream_tags(repository) for repository in sorted(watched)}
+    lines = []
+    for spec in catalog:
+        repository = majors_upstream(spec)
+        if not repository:
+            continue
+        for major in new_majors(spec, tags[repository]):
+            lines.append(
+                f"- `{spec['image']}`: docker.io/{repository} released {major}; "
+                f"supported majors are {', '.join(spec['majors'])}"
+            )
+    if not lines:
+        print("No upstream major newer than the supported ones")
+        return 0
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write("### New upstream majors not supported yet\n\n")
+            handle.write("\n".join(lines) + "\n")
+    print(
+        "error: upstream released major version(s) no managed-database image "
+        "supports yet. Add each to `majors` in CATALOG (and the runtime "
+        "defaults, allowlists and console upgrade options), or to "
+        "`deferred_majors` to acknowledge it:\n" + "\n".join(lines),
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _run(args, catalog, forced, minors_by_upstream):

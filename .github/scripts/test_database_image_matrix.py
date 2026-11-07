@@ -15,6 +15,8 @@ from database_image_matrix import (
     RegistryLookupError,
     candidates,
     main,
+    majors_upstream,
+    new_majors,
     newest_release,
     pinned_minors,
     plan,
@@ -146,6 +148,86 @@ class RedisTests(unittest.TestCase):
         spec = next(s for s in CATALOG if s["image"] == "redis-walg")
         with self.assertRaisesRegex(RuntimeError, "redis-walg major 9"):
             newest_release(REDIS_UPSTREAM_TAGS, spec, "9")
+
+
+def spec(image):
+    return next(s for s in CATALOG if s["image"] == image)
+
+
+class NewMajorTests(unittest.TestCase):
+    """A new upstream major must be noticed: the weekly run fails until it is
+    supported or explicitly deferred."""
+
+    def test_newer_postgres_major_is_reported_and_prereleases_are_not(self):
+        tags = UPSTREAM_TAGS + ["19beta1", "19beta1-bookworm", "19rc1"]
+        self.assertEqual(new_majors(spec("postgres-walg"), tags), [])
+        self.assertEqual(new_majors(spec("postgres-walg"), tags + ["19.0"]), ["19"])
+        self.assertEqual(new_majors(spec("postgres-ha"), tags + ["19.0", "20.1"]), ["19", "20"])
+
+    def test_older_unsupported_majors_are_not_reported(self):
+        # PostgreSQL 14 is still published upstream and unsupported on purpose.
+        self.assertEqual(new_majors(spec("postgres-walg"), ["14.20", "14.20-bookworm"]), [])
+
+    def test_newer_redis_major_is_reported(self):
+        self.assertEqual(new_majors(spec("redis-walg"), REDIS_UPSTREAM_TAGS), [])
+        tags = REDIS_UPSTREAM_TAGS + ["9.0.0", "9.0.0-trixie", "9.2-rc1-trixie"]
+        self.assertEqual(new_majors(spec("redis-walg"), tags), ["9"])
+
+    def test_mongodb_watches_x0_lines_only_and_honours_deferred_majors(self):
+        mongo = spec("mongodb-walg")
+        self.assertIn("9.0", mongo["deferred_majors"])
+        tags = ["8.0.12", "8.2.1", "8.3.0", "9.0.4", "9.0.4-noble", "10.0.0-rc0"]
+        # 8.2 and 8.3 are rapid releases; 9.0 is acknowledged as deferred.
+        self.assertEqual(new_majors(mongo, tags), [])
+        self.assertEqual(new_majors(mongo, tags + ["10.0.1"]), ["10.0"])
+        undeferred = dict(mongo, deferred_majors=[])
+        self.assertEqual(new_majors(undeferred, tags), ["9.0"])
+
+    def test_pgvector_and_timescaledb_watch_their_own_upstreams(self):
+        for image in ("pgvector-walg", "timescaledb-walg"):
+            self.assertEqual(new_majors(spec(image), ["pg17", "pg18", "0.8.1-pg18"]), [])
+            self.assertEqual(new_majors(spec(image), ["pg18", "pg19", "pg19-ts2.22"]), ["19"])
+
+    def test_majors_sort_numerically(self):
+        tags = ["10.0.0", "9.0.1", "11.0.0"]
+        self.assertEqual(new_majors(spec("redis-walg"), tags), ["9", "10", "11"])
+
+    def test_every_image_watches_an_upstream(self):
+        for entry in CATALOG:
+            self.assertIsNotNone(majors_upstream(entry), entry["image"])
+
+    def run_main(self, tags_by_repository):
+        upstream = mock.patch.object(
+            database_image_matrix, "upstream_tags", side_effect=tags_by_repository.__getitem__
+        )
+        with upstream, mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, mock.patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            return main(["--owner", "gotempsh", "--new-majors"]), stderr.getvalue()
+
+    def current_upstreams(self):
+        return {
+            "library/postgres": UPSTREAM_TAGS,
+            "library/redis": REDIS_UPSTREAM_TAGS,
+            "library/mongo": ["8.0.12", "8.2.1", "9.0.4"],
+            "pgvector/pgvector": ["pg17", "pg18"],
+            "timescale/timescaledb-ha": ["pg17", "pg18"],
+        }
+
+    def test_main_passes_when_every_major_is_supported_or_deferred(self):
+        self.assertEqual(self.run_main(self.current_upstreams()), (0, ""))
+
+    def test_main_fails_naming_the_image_and_the_new_major(self):
+        tags = self.current_upstreams()
+        tags["library/redis"] = REDIS_UPSTREAM_TAGS + ["9.0.0"]
+        code, stderr = self.run_main(tags)
+        self.assertEqual(code, 1)
+        self.assertIn("`redis-walg`: docker.io/library/redis released 9", stderr)
+        self.assertIn("deferred_majors", stderr)
+
+    def test_new_majors_excludes_the_other_modes(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            main(["--owner", "gotempsh", "--new-majors", "--check"])
 
 
 class PlanTests(unittest.TestCase):

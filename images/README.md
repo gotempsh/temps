@@ -63,7 +63,13 @@ All publishing runs (release, weekly, push) share one concurrency group, so a
 run plans against what the previous one left behind and an alias copy can never
 write an older image over a newer one.
 
-To support a new major, add it to `CATALOG` in the planner script.
+New releases within a supported major need no change. A new **major** (PostgreSQL
+19, Redis 9, MongoDB 9.0) is never published on its own: the weekly run's
+"Upstream majors" job fails while upstream has released a major newer than an
+image supports. To support it, add it to `majors` in the planner's `CATALOG`
+and to the runtime defaults, allowlists and console upgrade options. To
+acknowledge it without supporting it yet, add it to that image's
+`deferred_majors`. MongoDB 9.0 is deferred this way.
 
 The MariaDB image is published by `.github/workflows/mariadb-walg-image.yml`.
 
