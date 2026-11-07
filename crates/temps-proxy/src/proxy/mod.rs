@@ -4026,9 +4026,7 @@ impl ProxyHttp for LoadBalancer {
 
         // `X-Temps-Shield` says what Shield did (ADR 066, D11): only Shield
         // sets it, and only when it acted.
-        if self.expose_platform_identity() {
-            let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
-        }
+        let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
         if let Some(verdict) = ctx
             .shield_header
             .filter(|_| self.expose_platform_identity())

@@ -1872,3 +1872,42 @@ async fn probe_authentication_uses_the_routed_authority() {
         );
     }
 }
+
+#[tokio::test]
+async fn upstream_cannot_supply_a_shield_verdict_in_either_branding_mode() {
+    for expose in [false, true] {
+        for verdict in [None, Some("challenge")] {
+            let f = fixture();
+            f.lb.expose_platform_identity
+                .store(expose, Ordering::Relaxed);
+            let (mut client, server) = tokio::io::duplex(4096);
+            client.write_all(get("/").as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = f.lb.new_ctx();
+            ctx.shield_header = verdict;
+            let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+            response
+                .insert_header(temps_shield::RESPONSE_HEADER, "fabricated-verdict")
+                .unwrap();
+            response.insert_header("X-App-Header", "preserved").unwrap();
+            f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+                .await
+                .unwrap();
+            f.lb.response_filter(&mut session, &mut response, &mut ctx)
+                .await
+                .unwrap();
+            let expected = verdict
+                .filter(|_| expose)
+                .map(|verdict| temps_shield::response_header_value(verdict, &ctx.request_id));
+            assert_eq!(
+                response
+                    .headers
+                    .get(temps_shield::RESPONSE_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                expected.as_deref()
+            );
+            assert_eq!(response.headers.get("X-App-Header").unwrap(), "preserved");
+        }
+    }
+}
