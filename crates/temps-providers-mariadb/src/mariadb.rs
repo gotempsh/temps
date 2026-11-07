@@ -29,16 +29,25 @@ const MARIADB_INTERNAL_PORT: &str = "3306";
 const MARIADB_IMAGE_REFERENCE_EXAMPLE: &str =
     "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Default image for a MariaDB service that doesn't request a specific one.
-/// A plain, mutable upstream tag rather than the digest-pinned WAL-G image:
-/// `mariadb_dump` (logical backups) works against any MariaDB, so a service
-/// created without WAL-G is still fully backup-capable -- it just can't run
-/// `mariadb_physical`/continuous archiving until its `docker_image` is
-/// updated to a real `repository@sha256:...` reference (`docker_image` is
-/// declared updateable for exactly this reason). Pinning a MariaDB WAL-G
-/// image is only required once one is actually named -- see
-/// `validate_immutable_mariadb_image` -- not for creation in general.
-pub const MARIADB_DEFAULT_IMAGE: &str = "mariadb:lts";
+/// The managed MariaDB image: MariaDB 11.4 with WAL-G, pinned by digest to
+/// the image `.github/workflows/mariadb-walg-image.yml` published, the same
+/// one the console's "Managed + WAL-G" preset names.
+pub const MARIADB_WALG_IMAGE: &str =
+    "ghcr.io/gotempsh/mariadb-walg@sha256:fa4c9247f82c47ace7c1aa9b77010870f4905bbae57c4f0aa24ae6ba3b6cdbf3";
+
+/// Default image for a MariaDB service that doesn't request a specific one:
+/// the managed WAL-G image, so a service created without naming one passes
+/// the immutable-digest rule (`validate_immutable_mariadb_image`) and can use
+/// every backup engine, `mariadb_dump` as well as `mariadb_physical` and
+/// continuous archiving. It is also the schema's advertised default, which a
+/// client may fill in and send back as if the user had chosen it.
+pub const MARIADB_DEFAULT_IMAGE: &str = MARIADB_WALG_IMAGE;
+
+/// The default before [`MARIADB_DEFAULT_IMAGE`] was pinned: a mutable
+/// upstream tag. Services created with it keep it, and it stays valid for
+/// them (logical backups only) until their `docker_image` is updated; a new
+/// request naming it is held to the immutable-digest rule like any other.
+pub const LEGACY_MARIADB_DEFAULT_IMAGE: &str = "mariadb:lts";
 
 /// Repositories a restore-time `docker_image` override may name, in addition
 /// to whatever repository the source service already runs. See
@@ -571,13 +580,11 @@ pub fn validate_immutable_mariadb_image(image: &str) -> std::result::Result<(), 
     Ok(())
 }
 
-/// Enforces the immutable-digest requirement for any `docker_image` other
-/// than [`MARIADB_DEFAULT_IMAGE`]. The default is our own vetted logical-backup
-/// image and is exempt so a service with no `docker_image` supplied (the
-/// common case) doesn't get rejected by the pinning rule meant for opt-in
-/// WAL-G images.
+/// Enforces the immutable-digest requirement for a stored `docker_image`,
+/// except [`LEGACY_MARIADB_DEFAULT_IMAGE`], which services created before
+/// the default was pinned still run.
 pub fn validate_mariadb_image(image: &str) -> std::result::Result<(), String> {
-    if image == MARIADB_DEFAULT_IMAGE {
+    if image == LEGACY_MARIADB_DEFAULT_IMAGE {
         return Ok(());
     }
     validate_immutable_mariadb_image(image)
@@ -6761,6 +6768,21 @@ mod tests {
             !schema.to_string().contains("container_name"),
             "container_name leaked into the MariaDB create schema"
         );
+    }
+
+    /// The default is the pinned managed WAL-G image, so a service created
+    /// with it (named or filled in from the schema's default) passes the
+    /// immutable-digest rule; services that run the old mutable default keep
+    /// running it.
+    #[test]
+    fn the_default_image_is_the_pinned_walg_image() {
+        assert_eq!(MARIADB_DEFAULT_IMAGE, MARIADB_WALG_IMAGE);
+        assert!(MARIADB_DEFAULT_IMAGE.starts_with("ghcr.io/gotempsh/mariadb-walg@sha256:"));
+        assert!(validate_immutable_mariadb_image(MARIADB_DEFAULT_IMAGE).is_ok());
+        assert!(validate_mariadb_image(MARIADB_DEFAULT_IMAGE).is_ok());
+        assert!(validate_mariadb_image(LEGACY_MARIADB_DEFAULT_IMAGE).is_ok());
+        assert!(validate_immutable_mariadb_image(LEGACY_MARIADB_DEFAULT_IMAGE).is_err());
+        assert!(validate_mariadb_image("mariadb:11.4").is_err());
     }
 
     /// Regression guard: `docker_image` was schema-required with no default,
