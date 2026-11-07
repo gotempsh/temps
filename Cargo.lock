@@ -14603,6 +14603,7 @@ version = "0.1.0-beta.61"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "aws-sdk-s3",
  "axum",
  "base64 0.23.1",
  "bollard",
@@ -14655,6 +14656,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tracing",
  "utoipa",
@@ -15016,6 +15018,7 @@ dependencies = [
  "bollard",
  "bytes",
  "chrono",
+ "flate2",
  "futures",
  "hex",
  "hmac 0.13.0",
@@ -15058,6 +15061,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "urlencoding",
@@ -15609,9 +15613,12 @@ version = "0.1.0-beta.61"
 dependencies = [
  "async-trait",
  "bollard",
+ "chrono",
+ "futures",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "utoipa",
 ]
 

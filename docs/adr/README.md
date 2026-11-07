@@ -74,7 +74,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md) |
 | [053](./053-distributed-runtime-health-and-worker-uptime.md) | Distributed Runtime Health and Worker Uptime | Implemented for process/HTTP/TCP |  |
 | [054](./054-plugin-builds-on-worker-nodes.md) | Plugin builds run on a worker node when the control plane has no Docker | Proposed |  |
-| [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md) |
+| [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [092](./092-worker-backups-run-the-local-engines.md) |
 | [056](./056-compute-pool-that-avoids-collisions.md) | A Compute Pool That Avoids Collisions and Can Be Changed | Accepted |  |
 | [057](./057-removing-a-node-that-is-gone.md) | Removing a worker node that is gone | Accepted |  |
 | [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed |  |
@@ -109,6 +109,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [089](./089-project-edge-rules.md) | Project Edge Rules — the Engine for the Request-Level Firewall | Accepted |  |
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
 | [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
+| [092](./092-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md) |
 
 ## Supporting documents
 

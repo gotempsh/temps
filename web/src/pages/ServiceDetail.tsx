@@ -1062,7 +1062,13 @@ export function ServiceDetail() {
               <WalHealthPanel
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
-                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                // A service on a worker node cannot change its image here
+                // (the server refuses it), so it gets no upgrade action.
+                onUpgrade={
+                  service.service.node_id
+                    ? undefined
+                    : () => setIsUpgradeDialogOpen(true)
+                }
                 onBackup={() => setIsBackupDialogOpen(true)}
                 isImported={!!service.current_parameters?.container_name}
               />

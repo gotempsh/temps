@@ -378,6 +378,41 @@ pub(super) fn environment_preview_project(id: i32) -> projects::Model {
     }
 }
 
+/// Environment `slug` (row `id`) of project `project_id`, live.
+pub(super) fn environment_model(
+    id: i32,
+    project_id: i32,
+    slug: &str,
+) -> temps_entities::environments::Model {
+    let now = Utc::now();
+    temps_entities::environments::Model {
+        id,
+        name: slug.to_string(),
+        slug: slug.to_string(),
+        subdomain: format!("{slug}-{project_id}"),
+        last_deployment: None,
+        host: String::new(),
+        upstreams: Default::default(),
+        created_at: now,
+        updated_at: now,
+        project_id,
+        current_deployment_id: None,
+        branch: None,
+        deleted_at: None,
+        deployment_config: None,
+        is_preview: false,
+        protected: false,
+        sleeping: false,
+        attack_mode: None,
+        shield_mode: None,
+        shield_exempt_paths: Default::default(),
+        force_https: None,
+        last_activity_at: None,
+        ingress_mode: Default::default(),
+        workload_mode: Default::default(),
+    }
+}
+
 #[cfg(feature = "docker-tests")]
 pub(super) async fn insert_test_service(
     db: &DatabaseConnection,
@@ -468,6 +503,38 @@ pub(super) fn control_plane_manager() -> ExternalServiceManager {
         temps_core::CONTROL_PLANE_DOCKER_REASON,
     ));
 
+    ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
+}
+
+/// A full-profile manager whose engines can be built but never reach a
+/// daemon: the HTTP Docker client only connects when a request is made, so
+/// tests using it run without Docker installed.
+pub(super) fn unreachable_docker_manager() -> ExternalServiceManager {
+    let db =
+        Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection());
+    let docker = Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+        .expect("an HTTP Docker client is built without connecting");
+    ExternalServiceManager::new(
+        db.clone(),
+        Arc::new(EncryptionService::new_from_password(
+            "unreachable-docker-test",
+        )),
+        Arc::new(docker),
+        Arc::new(temps_dns::DnsRegistry::new(db)),
+    )
+}
+
+/// A control-plane-profile manager (no Docker handle) over `db`, holding the
+/// key [`encrypted_service_model`] encrypts parameters with.
+pub(super) fn control_plane_manager_with_db(db: Arc<DatabaseConnection>) -> ExternalServiceManager {
+    let enc = Arc::new(EncryptionService::new_from_password(
+        "service-parameter-reveal-test",
+    ));
+    let dns = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+    let handle = Arc::new(DockerHandle::disabled(
+        temps_core::PROFILE_CONTROL_PLANE,
+        temps_core::CONTROL_PLANE_DOCKER_REASON,
+    ));
     ExternalServiceManager::new_with_handle(db, enc, handle, false, dns)
 }
 

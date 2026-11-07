@@ -22,3 +22,7 @@ mod project_links;
 mod readiness;
 mod remote;
 mod runtime_limits;
+mod wal_health;
+
+pub(crate) use wal_health::record_wal_outcome;
+pub use wal_health::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};

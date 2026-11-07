@@ -4,7 +4,7 @@
 //! Restoring managed PostgreSQL from WAL-G and pg_dump backups.
 
 use super::*;
-use crate::externalsvc::{ExternalService, ServiceConfig, ServiceResourceLimits};
+use crate::externalsvc::{ExternalService, ServiceConfig};
 use bollard::Docker;
 use futures::StreamExt;
 use std::time::Duration;
@@ -217,7 +217,7 @@ impl PostgresService {
         Ok(())
     }
 
-    async fn wait_for_restored_database(
+    pub(super) async fn wait_for_restored_database(
         &self,
         config: &PostgresConfig,
     ) -> std::result::Result<(), PostgresArchiveVerificationError> {
@@ -414,6 +414,34 @@ impl PostgresService {
         Ok(())
     }
 
+    /// The WAL-G restore a worker's agent runs for the control plane: the
+    /// same [`Self::restore_from_walg`] as on the control plane, in place,
+    /// with nothing to cancel it but the request that started it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the restore's inputs, as restore_from_walg"
+    )]
+    pub async fn restore_walg_in_place(
+        &self,
+        s3_credentials: &crate::externalsvc::S3Credentials,
+        walg_s3_prefix: &str,
+        service_config: ServiceConfig,
+        live_target_config: &ServiceConfig,
+        recovery_target: Option<&crate::externalsvc::RecoveryTarget>,
+        target_user_data: Option<&str>,
+    ) -> Result<()> {
+        self.restore_from_walg(
+            s3_credentials,
+            walg_s3_prefix,
+            service_config,
+            Some(live_target_config),
+            recovery_target,
+            target_user_data,
+            &crate::externalsvc::NoopRestoreGate,
+        )
+        .await
+    }
+
     /// Restore from a WAL-G backup stored in S3.
     ///
     /// WAL-G restore requires stopping PostgreSQL, clearing PGDATA, fetching the backup,
@@ -479,8 +507,9 @@ impl PostgresService {
         // service's specification. Refuse up front, before fetching or
         // touching anything, when that container would not mount the storage
         // the current one uses: the restored data would land where the new
-        // container never looks (#1415).
-        if postgres_config.container_name.is_none() {
+        // container never looks (#1415). A worker's container is rebuilt
+        // from its own specification, which mounts what it mounts.
+        if postgres_config.container_name.is_none() && self.node.is_none() {
             let replacement = self.replacement_storage(&postgres_config)?;
             crate::externalsvc::recreate_guard::preflight(
                 &self.docker,
@@ -492,6 +521,25 @@ impl PostgresService {
             )
             .await?;
         }
+
+        // How the container comes back after the swap, and the volume it
+        // mounts, read while it still runs as it did. The swap keeps the
+        // original aside until the restored server has promoted, and an
+        // original an earlier restore kept is never touched.
+        let live_service_config = live_target_config
+            .cloned()
+            .unwrap_or_else(|| service_config.clone());
+        let live_config = self.get_postgres_config(live_service_config.clone())?;
+        let (swap_recreate, volume_binds) = self
+            .plan_swap_recreate(
+                &container_name,
+                &service_config,
+                &postgres_config,
+                &live_config,
+                &live_service_config,
+            )
+            .await?;
+        self.ensure_no_kept_original(&container_name).await?;
 
         info!(
             "Restoring PostgreSQL from WAL-G backup (prefix: {}) in container '{}'",
@@ -742,23 +790,13 @@ impl PostgresService {
         }
 
         // Step 3: Stop the container. This cleanly shuts down PostgreSQL (the container's main process)
-        // and releases all shared memory. The container's writable layer is preserved.
+        // and releases all shared memory.
         //
         // IMPORTANT: Disable the restart policy first. The container has
         // restart_policy=always, so Docker would immediately restart it after stop,
         // preventing the helper container from accessing the shared volume exclusively.
         info!("Disabling restart policy and stopping container for PGDATA swap");
-        self.docker
-            .update_container(
-                &container_name,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
-                        maximum_retry_count: None,
-                    }),
-                    ..Default::default()
-                },
-            )
+        self.set_restart_policy(&container_name, bollard::models::RestartPolicyNameEnum::NO)
             .await
             .map_err(|e| {
                 EngineError::failed(
@@ -783,176 +821,69 @@ impl PostgresService {
                 )
             })?;
 
-        // Step 4: Start a temporary container sharing the same volumes to swap PGDATA.
-        // We can't exec into a stopped container, so we create an ephemeral container
-        // that mounts the same data and performs the file swap.
-        info!("Swapping PGDATA via ephemeral container");
+        // Step 4: Swap PGDATA in a helper container mounting the same volume:
+        // the restored data moves in, the original moves aside.
+        info!("Swapping PGDATA via ephemeral container, keeping the original");
         let pgdata_path = Self::get_pgdata_path(&postgres_config.docker_image)?;
-        let swap_script = format!(
-            "rm -rf {pgdata}/* && cp -a {restore_temp}/* {pgdata}/ && rm -rf {restore_temp} && rm -f /var/lib/postgresql/walg.env",
-            pgdata = pgdata_path,
-            restore_temp = restore_temp,
-        );
-
-        // Use `docker commit` approach: start the same container with a swap command.
-        // Since the container is stopped, we need to change its command to do the swap.
-        // Simpler: just start the original container — the entrypoint will start PostgreSQL
-        // using the PGDATA that's already there. We need to replace it BEFORE starting.
-        //
-        // The simplest reliable approach: use docker cp or a helper container.
-        // Let's use a helper container that shares the original container's volumes.
-        use bollard::models::{ContainerCreateBody, HostConfig};
-        let helper_name = format!("{}-restore-helper", container_name);
-        let helper_config = ContainerCreateBody {
-            image: Some(postgres_config.docker_image.clone()),
-            cmd: Some(vec!["sh".to_string(), "-c".to_string(), swap_script]),
-            host_config: Some(HostConfig {
-                volumes_from: Some(vec![container_name.clone()]),
-                ..Default::default()
-            }),
-            user: Some("postgres".to_string()),
-            labels: Some(crate::externalsvc::restore_helper::restore_helper_labels(
+        let image = postgres_config.docker_image.clone();
+        let failure = match self
+            .swap_in_restored(
                 &container_name,
-            )),
-            ..Default::default()
+                &image,
+                &volume_binds,
+                &pgdata_path,
+                restore_temp,
+            )
+            .await
+        {
+            Err(swap) => Some((swap.moved, swap.reason)),
+            // Step 5: start the restored data and verify it. Restored PGDATA
+            // deliberately suspends continuous archiving: the swap moved the
+            // target's write credential aside, recovery uses its separate
+            // read-only source credentials, and the container is recreated
+            // with archive_mode=off so that survives restarts. A later full
+            // backup explicitly restores the pinned write destination and
+            // verifies active archiving before it can succeed.
+            Ok(()) => match self
+                .start_restored(&container_name, &swap_recreate, &postgres_config)
+                .await
+            {
+                Ok(()) => None,
+                Err(error) => Some((true, error.to_string())),
+            },
         };
-
-        let helper = self
-            .docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&helper_name)
-                        .build(),
-                ),
-                helper_config,
-            )
-            .await
-            .map_err(|e| {
-                EngineError::failed(
-                    &self.name,
-                    format!("Failed to create restore helper container: {}", e),
-                )
-            })?;
-
-        self.docker
-            .start_container(
-                &helper.id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| {
-                EngineError::failed(
-                    &self.name,
-                    format!("Failed to start restore helper container: {}", e),
-                )
-            })?;
-
-        // Wait for helper to finish
-        let wait_result = self
-            .docker
-            .wait_container(
-                &helper.id,
-                None::<bollard::query_parameters::WaitContainerOptions>,
-            )
-            .next()
-            .await;
-
-        // Clean up helper container
-        let _ = self
-            .docker
-            .remove_container(
-                &helper.id,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    v: false,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        if let Some(Ok(wait_response)) = wait_result {
-            if wait_response.status_code != 0 {
-                return Err(EngineError::failed(
-                    &self.name,
-                    format!(
-                        "PGDATA swap helper exited with code {} in container '{}'",
-                        wait_response.status_code, container_name
-                    ),
-                ));
-            }
-        }
-
-        // Restored PGDATA deliberately suspends continuous archiving. The
-        // committed swap removes only the target's write credential marker;
-        // recovery still uses its separate read-only source credentials.
-        // Reconcile the managed container CMD now so archive_mode=off survives
-        // restarts. A later full backup explicitly restores the pinned write
-        // destination and verifies active archiving before it can succeed.
-        if postgres_config.container_name.is_some() {
-            // Imported containers keep their external lifecycle; start() will
-            // not recreate them, so restore the policy disabled for the swap.
-            self.docker
-                .update_container(
+        if let Some((moved, reason)) = failure {
+            warn!(
+                container = %container_name,
+                %reason,
+                "WAL-G restore failed after the server was stopped; putting the original back"
+            );
+            let rollback = self
+                .roll_back_swap(
                     &container_name,
-                    bollard::models::ContainerUpdateBody {
-                        restart_policy: Some(bollard::models::RestartPolicy {
-                            name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
-                            maximum_retry_count: None,
-                        }),
-                        ..Default::default()
-                    },
+                    &image,
+                    &volume_binds,
+                    &pgdata_path,
+                    &swap_recreate,
+                    moved,
+                    &live_config,
                 )
-                .await
-                .map_err(|error| PostgresArchiveVerificationError {
-                    service_name: self.name.clone(),
-                    reason: format!(
-                        "could not restore the imported container's restart policy: {error}"
+                .await;
+            return Err(EngineError::failed(
+                &self.name,
+                match rollback {
+                    Ok(()) => format!(
+                        "the restore into '{container_name}' failed and the original database \
+                         was put back unchanged: {reason}"
                     ),
-                })?;
+                    Err(rollback) => format!(
+                        "the restore into '{container_name}' failed ({reason}), and so did \
+                         putting the original back: {rollback}"
+                    ),
+                },
+            ));
         }
-        if postgres_config.container_name.is_some() {
-            self.force_recreate(service_config).await?;
-        } else {
-            // Restore orchestration does not persist a replacement host port.
-            // Recreate at the registered endpoint, retaining PGDATA if that
-            // endpoint cannot bind, instead of silently changing its address.
-            let limits = ServiceResourceLimits::from_parameters(&service_config.parameters);
-            limits
-                .validate()
-                .map_err(|reason| PostgresArchiveVerificationError {
-                    service_name: self.name.clone(),
-                    reason: format!("invalid restored service resource limits: {reason}"),
-                })?;
-            self.docker
-                .remove_container(
-                    &container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|error| PostgresArchiveVerificationError {
-                    service_name: self.name.clone(),
-                    reason: format!("could not recreate the restored managed container: {error}"),
-                })?;
-            self.create_container_once(&self.docker, &postgres_config, &limits, false)
-                .await?;
-        }
-        // Docker's running state alone is not SQL readiness for an imported
-        // container without a healthcheck. Authenticate with the restored login
-        // and wait for recovery before checking policy or reporting success.
-        self.wait_for_restored_database(&postgres_config).await?;
-        let (mode, _) = self
-            .active_archive_settings(&postgres_config, "/bin/true")
-            .await?;
-        if mode != "off" {
-            return Err(PostgresArchiveVerificationError {
-                service_name: self.name.clone(),
-                reason: "the restored database did not suspend WAL archiving. Check the container's startup command and PostgreSQL configuration before retrying; restore into a new managed service if the imported container's policy cannot be changed safely".to_string(),
-            }.into());
-        }
+        self.drop_kept_original(&container_name).await;
 
         info!("PostgreSQL WAL-G restore completed successfully");
         Ok(())

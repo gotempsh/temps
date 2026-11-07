@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::engines::dispatch::{resolve_engine_key, ResolveEngineError};
+use crate::engines::dispatch::ResolveEngineError;
 use crate::handlers::audit::{
     AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,
     BackupScheduleStatusChangedAudit, BackupScheduleUpdatedAudit, ExternalServiceBackupRunAudit,
@@ -50,6 +50,11 @@ impl From<ResolveEngineError> for Problem {
             ResolveEngineError::WalgProbeFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Engine Detection Failed")
+                    .with_detail(error.to_string())
+            }
+            ResolveEngineError::LocalDockerUnavailable { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Docker Unavailable")
                     .with_detail(error.to_string())
             }
         }
@@ -3249,14 +3254,12 @@ async fn run_external_service_backup(
     // 3. Return 202 immediately — the runner executes the backup asynchronously.
     // All three inserts are atomic: if any fails, the entire operation is rolled
     // back and the handler returns an error. No orphan rows are created.
-    let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
-        error!(service_id = id, error = %e, "run_external_service_backup: failed to connect to Docker for engine resolution");
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Docker Unavailable")
-            .with_detail(format!("Could not connect to Docker to determine backup engine: {}", e))
-    })?;
-
-    let engine_key = resolve_engine_key(&service, &docker)
+    // Opens this host's Docker only when the choice inspects a local
+    // container: a database on a worker node is checked by its node's
+    // agent, and needs none.
+    let engine_key = app_state
+        .backup_service
+        .resolve_engine_key(&service)
         .await
         .map_err(|e| {
             error!(service_id = id, error = %e, "run_external_service_backup: engine resolution failed");
@@ -3392,15 +3395,9 @@ async fn external_service_backup_preflight(
         .get_external_service(id)
         .await
         .map_err(Problem::from)?;
-    let docker = bollard::Docker::connect_with_local_defaults().map_err(|e| {
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Docker Unavailable")
-            .with_detail(format!(
-                "Could not connect to Docker to determine the backup engine of service {}: {}",
-                id, e
-            ))
-    })?;
-    let engine_key = resolve_engine_key(&service, &docker)
+    let engine_key = app_state
+        .backup_service
+        .resolve_engine_key(&service)
         .await
         .map_err(Problem::from)?;
     let reason = app_state

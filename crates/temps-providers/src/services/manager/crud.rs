@@ -38,6 +38,16 @@ fn imported_container_name(
         .filter(|name| !name.is_empty())
 }
 
+/// Why an image change of a service on a worker node is refused: the
+/// engines replace containers on this server's Docker only.
+fn worker_image_change_refusal(service_name: &str, node_id: i32) -> String {
+    format!(
+        "Service '{service_name}' runs on worker node {node_id}, and an image change replaces \
+         its container on this server's Docker, where it has none. Nothing was changed; take a \
+         backup, create a service with the new image on the node and restore into it"
+    )
+}
+
 impl ExternalServiceManager {
     pub async fn get_service_by_name(
         &self,
@@ -362,16 +372,30 @@ impl ExternalServiceManager {
                     );
                 }
 
-                if matches!(e, ExternalServiceError::ServiceResourceConflict { .. }) {
-                    return Err(e);
-                }
-                return Err(ExternalServiceError::InitializationFailed {
-                    id: service.id,
-                    reason: e.to_string(),
-                });
+                return Err(Self::initialization_failure(service.id, e));
             }
 
             self.get_service_info(service.id).await
+        }
+    }
+
+    /// The error to return when a new service failed to initialize and its
+    /// record was rolled back. A resource conflict keeps its own variant, and
+    /// a parameter validation failure stays one, under this service's ID:
+    /// the caller has a value to fix, not a failed start to retry.
+    fn initialization_failure(
+        service_id: i32,
+        error: ExternalServiceError,
+    ) -> ExternalServiceError {
+        match error {
+            ExternalServiceError::ServiceResourceConflict { .. } => error,
+            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+                ExternalServiceError::ParameterValidationFailed { service_id, reason }
+            }
+            other => ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: other.to_string(),
+            },
         }
     }
 
@@ -681,6 +705,15 @@ impl ExternalServiceManager {
         self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
+        // The engines replace the container on this server's Docker. A
+        // service on a worker node has none here, and an engine that finds
+        // no container creates one: an empty server beside the real one.
+        if let Some(node_id) = service.node_id {
+            return Err(ExternalServiceError::UpgradeRejected {
+                id: service_id,
+                reason: worker_image_change_refusal(&service.name, node_id),
+            });
+        }
         self.ensure_unambiguous_service_name(&service).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
 
@@ -965,6 +998,10 @@ impl ExternalServiceManager {
         self.get_service_info(service_id).await
     }
 
+    /// Delete a service that no project links to: its record first, then its
+    /// containers and volumes, through the node's agent for a service on a
+    /// worker. An imported service is only forgotten; its container is the
+    /// operator's.
     pub async fn delete_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         // Get service to check if it exists
         let service = self.get_service(service_id).await?;
@@ -1245,13 +1282,14 @@ impl ExternalServiceManager {
                 );
             } else if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
-                let service_instance = self.create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?;
                 let container_name = self
-                    .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                    .resolve_remote_container_name(
+                        &client,
+                        service_id,
+                        &service.name,
+                        service_type_enum,
+                        &parameters,
+                    )
                     .await?;
                 client.remove_service(&container_name).await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {

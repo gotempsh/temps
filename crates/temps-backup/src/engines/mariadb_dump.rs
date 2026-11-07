@@ -48,11 +48,17 @@ const MAX_STDERR_IN_ERROR: usize = 4_000;
 /// In-container shell that dumps all user databases and gzips the result.
 /// Credentials are NOT present here — `-uroot` relies on `MYSQL_PWD` from the
 /// exec env. Keep it that way (PR #149).
+///
+/// Schema names are data a database user controls: each is one argument
+/// (split on newlines only, never globbed) after `--`, so a schema named
+/// like an option (`--host=...`) cannot redirect the dump, and the root
+/// password with it.
 const DUMP_SHELL: &str = "if command -v mariadb-dump >/dev/null 2>&1; then dump=mariadb-dump; else dump=mysqldump; fi; \
      if command -v mariadb >/dev/null 2>&1; then client=mariadb; else client=mysql; fi; \
      dbs=$($client -N -B -uroot -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys') ORDER BY SCHEMA_NAME\"); \
      if [ -z \"$dbs\" ]; then echo '-- No user databases to dump'; exit 0; fi; \
-     $dump --databases $dbs --single-transaction --quick -uroot | gzip";
+     set -f; IFS='\n'; set -- $dbs; unset IFS; \
+     $dump --single-transaction --quick -uroot --databases -- \"$@\" | gzip";
 
 pub struct MariadbDumpDeps {
     pub db: Arc<DatabaseConnection>,
@@ -299,6 +305,9 @@ mod tests {
         // Connects as root via env-provided password, no password flag.
         assert!(DUMP_SHELL.contains("-uroot"));
         assert!(!DUMP_SHELL.contains("--password"));
+        // Schema names are arguments after `--`, never options.
+        assert!(DUMP_SHELL.contains("--databases -- \"$@\""));
+        assert!(DUMP_SHELL.contains("set -f"));
         assert!(!DUMP_SHELL.contains("-p'"));
         assert!(!DUMP_SHELL.contains("-p\""));
     }
@@ -666,6 +675,63 @@ mod tests {
         drop(second);
         assert_eq!(std::fs::read(&legacy).expect("legacy kept"), b"stale");
         let _ = std::fs::remove_file(&legacy);
+    }
+
+    /// A database user can name a schema like an option. The dump reads
+    /// it as a database name, never as `--host`, so the root password in
+    /// the exec's environment never leaves for another server, and the
+    /// schema, with a space in its name, is in the dump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_schema_named_like_an_option_is_dumped_as_a_database() {
+        let Some(docker) =
+            docker_or_skip("a_schema_named_like_an_option_is_dumped_as_a_database").await
+        else {
+            return;
+        };
+        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let mariadb = seeded_mariadb(&docker, &run_id).await;
+        let password_flag = format!("-p{TEST_ROOT_PASSWORD}");
+        let (code, output) = exec_in(
+            &docker,
+            &mariadb.name,
+            &[
+                "mariadb",
+                "-h",
+                "127.0.0.1",
+                "-uroot",
+                &password_flag,
+                "-e",
+                "CREATE DATABASE `--host=192.0.2.1`; \
+                 CREATE TABLE `--host=192.0.2.1`.t (v TEXT); \
+                 INSERT INTO `--host=192.0.2.1`.t VALUES ('option-named-row'); \
+                 CREATE DATABASE `two words`; \
+                 CREATE TABLE `two words`.t (v TEXT); \
+                 INSERT INTO `two words`.t VALUES ('spaced-row');",
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "seeding the hostile schemas failed: {output}");
+
+        let attempt = DumpAttempt::new(MARIADB_TOOL, ENGINE_KEY, &format!("names-{run_id}"))
+            .expect("attempt");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        dump_into_attempt(
+            &docker,
+            &mariadb.name,
+            DUMP_SHELL,
+            &root_env(),
+            &attempt,
+            &cancel,
+        )
+        .await
+        .expect("the dump reaches this server and succeeds");
+        let sql = gunzip_to_string(&attempt.host_path(HOST_DUMP_FILE));
+        assert!(
+            sql.contains("option-named-row"),
+            "option-like schema missing"
+        );
+        assert!(sql.contains("spaced-row"), "schema with a space missing");
+        assert!(sql.contains("seeded-order-row"), "the other databases too");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

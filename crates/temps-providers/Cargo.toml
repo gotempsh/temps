@@ -33,6 +33,7 @@ temps-alarms = { path = "../temps-alarms" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 serde = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
@@ -73,6 +74,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
 testcontainers = { workspace = true }
+flate2 = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 temps-migrations = { path = "../temps-migrations" }
 

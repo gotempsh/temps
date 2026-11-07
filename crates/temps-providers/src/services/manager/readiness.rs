@@ -24,10 +24,16 @@ impl ExternalServiceManager {
         instance: &dyn ExternalService,
         config: &ServiceConfig,
     ) -> Option<Box<dyn ReadinessTarget>> {
-        if service.node_id.is_some() || service.topology != "standalone" {
+        if !Self::has_local_readiness_gate(service) {
             return None;
         }
         instance.readiness_target(config)
+    }
+
+    /// Only a standalone service on this host has a readiness gate; a
+    /// service on a worker node or a cluster is confirmed elsewhere.
+    fn has_local_readiness_gate(service: &external_services::Model) -> bool {
+        service.node_id.is_none() && service.topology == "standalone"
     }
 
     /// Set the post-start lifecycle status on `update`: `running`, or
@@ -159,6 +165,12 @@ impl ExternalServiceManager {
         &self,
         service: &external_services::Model,
     ) -> Result<Option<Box<dyn ReadinessTarget>>, ExternalServiceError> {
+        // Same rule as `readiness_gate`, checked before an engine is built:
+        // building one needs a local Docker handle, which a server started
+        // with `--profile control-plane` does not have.
+        if !Self::has_local_readiness_gate(service) {
+            return Ok(None);
+        }
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
             ExternalServiceError::InvalidServiceType {
                 id: service.id,
