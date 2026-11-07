@@ -2078,6 +2078,10 @@ export type AppSettings = {
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
+    /**
+     * Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+     */
+    expose_platform_identity?: boolean | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -2341,6 +2345,10 @@ export type AppSettingsResponse = {
      * connection is configured; they do not use the monitoring store toggle.
      */
     effective_observability_store: MetricsStoreKind;
+    /**
+     * Opt in to proxy-added platform branding in public application responses.
+     */
+    expose_platform_identity: boolean;
     external_url?: string | null;
     /**
      * Geolocation refresh policy and freshness, with the MaxMind license key
@@ -37833,6 +37841,10 @@ export type AppSettingsWritable = {
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
+    /**
+     * Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+     */
+    expose_platform_identity?: boolean | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at

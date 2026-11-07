@@ -4480,12 +4480,24 @@ export const upgradeService = <ThrowOnError extends boolean = false>(options: Op
  */
 export const getPostgresWalHealth = <ThrowOnError extends boolean = false>(options: Options<GetPostgresWalHealthData, ThrowOnError>): RequestResult<GetPostgresWalHealthResponses, GetPostgresWalHealthErrors, ThrowOnError> => (options.client ?? client).get<GetPostgresWalHealthResponses, GetPostgresWalHealthErrors, ThrowOnError>({ url: '/external-services/{id}/wal-health', ...options });
 
+/**
+ * Get a database's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const getWorkloadMode = <ThrowOnError extends boolean = false>(options: Options<GetWorkloadModeData, ThrowOnError>): RequestResult<GetWorkloadModeResponses, GetWorkloadModeErrors, ThrowOnError> => (options.client ?? client).get<GetWorkloadModeResponses, GetWorkloadModeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/external-services/{id}/workload-mode',
     ...options
 });
 
+/**
+ * Change a database's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const updateWorkloadMode = <ThrowOnError extends boolean = false>(options: Options<UpdateWorkloadModeData, ThrowOnError>): RequestResult<UpdateWorkloadModeResponses, UpdateWorkloadModeErrors, ThrowOnError> => (options.client ?? client).put<UpdateWorkloadModeResponses, UpdateWorkloadModeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/external-services/{id}/workload-mode',
@@ -4496,12 +4508,24 @@ export const updateWorkloadMode = <ThrowOnError extends boolean = false>(options
     }
 });
 
+/**
+ * List what a recreate from the workload spec would change (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const getWorkloadPendingChanges = <ThrowOnError extends boolean = false>(options: Options<GetWorkloadPendingChangesData, ThrowOnError>): RequestResult<GetWorkloadPendingChangesResponses, GetWorkloadPendingChangesErrors, ThrowOnError> => (options.client ?? client).get<GetWorkloadPendingChangesResponses, GetWorkloadPendingChangesErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/external-services/{id}/workload-mode/pending-changes',
     ...options
 });
 
+/**
+ * Recreate a database's container from its workload spec (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const recreateFromWorkloadSpec = <ThrowOnError extends boolean = false>(options: Options<RecreateFromWorkloadSpecData, ThrowOnError>): RequestResult<RecreateFromWorkloadSpecResponses, RecreateFromWorkloadSpecErrors, ThrowOnError> => (options.client ?? client).post<RecreateFromWorkloadSpecResponses, RecreateFromWorkloadSpecErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/external-services/{id}/workload-mode/recreate',
