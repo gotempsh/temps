@@ -1797,6 +1797,10 @@ pub async fn runtime_env(
         }
     };
 
+    // Service ports are published on this node's bind address only, so the
+    // admin connection goes there, as the health probe's does.
+    let published_address = published_probe_address(&state.host_bind_address());
+
     match state
         .service_runtime
         .provision_runtime_environment(
@@ -1806,6 +1810,7 @@ pub async fn runtime_env(
             &request.project_slug,
             &request.environment_slug,
             docker,
+            published_address,
         )
         .await
     {
@@ -1955,7 +1960,7 @@ pub async fn health_probe(
 
 /// The address this node publishes service ports on, when it is an IP.
 /// The provider validates the caller-supplied host before substituting it.
-fn published_probe_address(bind_address: &str) -> Option<std::net::IpAddr> {
+pub(crate) fn published_probe_address(bind_address: &str) -> Option<std::net::IpAddr> {
     bind_address.trim().parse().ok()
 }
 
@@ -3179,6 +3184,46 @@ mod injected_engine_tests {
         assert!(body_text(response)
             .await
             .contains("snapshot failed in the test engine"));
+    }
+
+    /// The live failure: a deployment linked to a worker's Postgres never
+    /// started, because provisioning its database connected to
+    /// `localhost:<port>` while the node publishes the port on its bind
+    /// address only. Provisioning now gets that address, as the health and
+    /// WAL probes do.
+    #[tokio::test]
+    async fn runtime_provisioning_connects_through_the_node_bind_address() {
+        let runtime = Arc::new(StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        *state.host_bind_address.write().expect("bind address") = "10.42.0.22".to_string();
+        let request = temps_service_protocol::RemoteRuntimeEnvRequest {
+            service_config: temps_service_protocol::ServiceConfig {
+                name: "orders".to_string(),
+                service_type: temps_service_protocol::ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "port": "5561"}),
+            },
+            project_slug: "shop".to_string(),
+            environment_slug: "production".to_string(),
+        };
+
+        let response = runtime_env(State(state), Json(request))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            runtime
+                .provisioned_through
+                .lock()
+                .expect("provisioned_through")
+                .as_slice(),
+            [Some(
+                "10.42.0.22"
+                    .parse::<std::net::IpAddr>()
+                    .expect("an address")
+            )]
+        );
     }
 }
 

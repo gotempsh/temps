@@ -65,6 +65,7 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         project_slug: &str,
         environment_slug: &str,
         docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
     ) -> Result<HashMap<String, String>, NodeServiceError> {
         externalsvc::provision_runtime_environment(
             name,
@@ -73,6 +74,7 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             project_slug,
             environment_slug,
             docker,
+            published_address,
         )
         .await
         .map_err(engine_error)

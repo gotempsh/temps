@@ -509,6 +509,15 @@ pub trait NodeServiceRuntime: Send + Sync {
 
     /// Initialize a service and provision one project's logical resource,
     /// returning its runtime environment.
+    ///
+    /// `published_address` is the address this node publishes managed-service
+    /// ports on. The stored host of a service is loopback, but the node binds
+    /// its ports to that address only, so provisioning connects there, the
+    /// same way the health and WAL probes do.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per input of the provisioning call; a struct would only rename them"
+    )]
     async fn provision_runtime_environment(
         &self,
         name: String,
@@ -517,6 +526,7 @@ pub trait NodeServiceRuntime: Send + Sync {
         project_slug: &str,
         environment_slug: &str,
         docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
     ) -> Result<HashMap<String, String>, NodeServiceError>;
 
     /// Revoke a project environment's managed S3 credentials.

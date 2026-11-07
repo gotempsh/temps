@@ -201,7 +201,8 @@ pub async fn wal_health(
         return docker_missing("probe the WAL of", &service_name);
     };
     // Where this node publishes service ports, from its own configuration.
-    let published_address = state.host_bind_address().trim().parse().ok();
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
     match state
         .service_runtime
         .probe_postgres_wal(

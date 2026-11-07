@@ -32,6 +32,8 @@ pub(crate) struct StubRuntime {
     pub(crate) admission: Admission,
     /// The plans handed to admission.
     pub(crate) admitted: Mutex<Vec<serde_json::Value>>,
+    /// The published address each runtime provisioning was given.
+    pub(crate) provisioned_through: Mutex<Vec<Option<std::net::IpAddr>>>,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -74,7 +76,12 @@ impl NodeServiceRuntime for StubRuntime {
         _project_slug: &str,
         _environment_slug: &str,
         _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
     ) -> Result<HashMap<String, String>, NodeServiceError> {
+        self.provisioned_through
+            .lock()
+            .expect("provisioned_through")
+            .push(published_address);
         Err(not_available("provision"))
     }
 

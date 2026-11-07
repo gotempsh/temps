@@ -26,9 +26,10 @@ pub mod postgres_role_reconciler;
 mod runtime_provisioning_tests {
     use super::{
         exact_named_container, is_container_not_found, missing_required_probe_credential,
-        resolve_managed_probe_target, sanitize_probe_result, set_runtime_container_name,
-        validate_managed_probe_target, validate_runtime_target, HealthProbeResult,
-        RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError, ServiceType,
+        resolve_managed_probe_target, resolve_runtime_target, sanitize_probe_result,
+        set_runtime_container_name, validate_managed_probe_target, validate_runtime_target,
+        HealthProbeResult, RuntimeProvisioningError, ServiceConfig, ServiceHealthProbeError,
+        ServiceType,
     };
 
     #[test]
@@ -175,6 +176,73 @@ mod runtime_provisioning_tests {
             validate_runtime_target(&config),
             Err(RuntimeProvisioningError::UnsafeTarget { .. })
         ));
+    }
+
+    fn postgres_config(parameters: serde_json::Value) -> ServiceConfig {
+        ServiceConfig {
+            name: "orders-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters,
+        }
+    }
+
+    /// Provisioning a project's database on a worker connected to
+    /// `localhost:<port>` and timed out: the node publishes the port on its
+    /// bind address only. It now connects where the health and WAL probes
+    /// do.
+    #[test]
+    fn runtime_provisioning_connects_to_the_node_published_address() {
+        let published: std::net::IpAddr = "10.42.0.22".parse().unwrap();
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            let mut config = postgres_config(serde_json::json!({"host": host, "port": "5561"}));
+            resolve_runtime_target(&mut config, Some(published))
+                .unwrap_or_else(|error| panic!("host {host} should provision: {error}"));
+            assert_eq!(config.parameters["host"], "10.42.0.22", "host {host}");
+            assert_eq!(config.parameters["port"], "5561", "the port is kept");
+        }
+
+        // Same rewrite as the probe, so the two never disagree on a target.
+        let mut probed = postgres_config(serde_json::json!({"host": "localhost", "port": "5561"}));
+        resolve_managed_probe_target(&mut probed, Some(published)).unwrap();
+        let mut provisioned =
+            postgres_config(serde_json::json!({"host": "localhost", "port": "5561"}));
+        resolve_runtime_target(&mut provisioned, Some(published)).unwrap();
+        assert_eq!(probed.parameters, provisioned.parameters);
+    }
+
+    #[test]
+    fn runtime_provisioning_keeps_loopback_when_the_node_publishes_there() {
+        for published in [None, Some("127.0.0.1"), Some("0.0.0.0"), Some("::")] {
+            let mut config =
+                postgres_config(serde_json::json!({"host": "localhost", "port": "5561"}));
+            resolve_runtime_target(&mut config, published.map(|ip| ip.parse().unwrap())).unwrap();
+            assert_eq!(
+                config.parameters["host"], "localhost",
+                "published {published:?}"
+            );
+        }
+    }
+
+    /// The node's address replaces only a loopback host; any other stored
+    /// host is still refused and left as it was.
+    #[test]
+    fn runtime_provisioning_still_rejects_non_loopback_hosts() {
+        let published: std::net::IpAddr = "10.42.0.22".parse().unwrap();
+        for host in ["169.254.169.254", "db.example.com", "10.42.0.22"] {
+            let mut config = postgres_config(serde_json::json!({"host": host, "port": "5561"}));
+            assert!(
+                matches!(
+                    resolve_runtime_target(&mut config, Some(published)),
+                    Err(RuntimeProvisioningError::UnsafeTarget { host: ref rejected }) if rejected == host
+                ),
+                "host {host} must be rejected"
+            );
+            assert_eq!(
+                config.parameters["host"], host,
+                "rejected host is untouched"
+            );
+        }
     }
 
     #[test]
@@ -581,10 +649,27 @@ fn resolve_managed_probe_target(
     published_address: Option<IpAddr>,
 ) -> std::result::Result<(), ServiceHealthProbeError> {
     validate_managed_probe_target(config)?;
+    connect_through_published_address(config, published_address);
+    Ok(())
+}
+
+/// Point a service whose stored host has been checked to be loopback at the
+/// address its node publishes managed-service ports on.
+///
+/// A worker binds service ports to its own address only (never to all
+/// interfaces, never to loopback), so `localhost:<port>` reaches nothing
+/// there. A loopback or unspecified published address, or none, keeps the
+/// stored host: the node publishes on loopback, or on every interface.
+/// Callers validate the stored host first, so this never launders a
+/// caller-supplied target.
+fn connect_through_published_address(
+    config: &mut ServiceConfig,
+    published_address: Option<IpAddr>,
+) {
     let Some(address) =
         published_address.filter(|address| !address.is_loopback() && !address.is_unspecified())
     else {
-        return Ok(());
+        return;
     };
     if let Some(parameters) = config.parameters.as_object_mut() {
         parameters.insert(
@@ -592,6 +677,16 @@ fn resolve_managed_probe_target(
             serde_json::Value::String(address.to_string()),
         );
     }
+}
+
+/// Where runtime provisioning connects: the stored loopback host, moved to
+/// the node's published address like the health and WAL probes.
+fn resolve_runtime_target(
+    config: &mut ServiceConfig,
+    published_address: Option<IpAddr>,
+) -> std::result::Result<(), RuntimeProvisioningError> {
+    validate_runtime_target(config)?;
+    connect_through_published_address(config, published_address);
     Ok(())
 }
 
@@ -702,8 +797,13 @@ pub async fn provision_runtime_environment(
     project_slug: &str,
     environment_slug: &str,
     docker: Arc<bollard::Docker>,
+    published_address: Option<IpAddr>,
 ) -> std::result::Result<HashMap<String, String>, RuntimeProvisioningError> {
-    validate_runtime_target(&config)?;
+    // The admin connection that creates the database and user must reach the
+    // port where the node actually published it. The app's variables do not
+    // change: the engines build them from the container name and internal
+    // port, never from this host.
+    resolve_runtime_target(&mut config, published_address)?;
     let parameters = &config.parameters;
     let instance_name = match service_type {
         ServiceType::Kv | ServiceType::Blob => managed_instance_name(&name, service_type),
