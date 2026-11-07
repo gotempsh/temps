@@ -1681,7 +1681,10 @@ async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app
             let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
             assert!(session.read_request().await.unwrap());
             let mut ctx = f.lb.new_ctx();
-            let mut request = pingora_http::RequestHeader::build(method, b"/asset", None).unwrap();
+            ctx.project = Some(Arc::new(project(PROJECT)));
+            ctx.upstream_host = Some("127.0.0.1:9000".into());
+            let mut request =
+                pingora_http::RequestHeader::build(method, b"/api/asset", None).unwrap();
             request.insert_header("If-None-Match", "\"v1\"").unwrap();
             request
                 .insert_header("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
@@ -1726,6 +1729,72 @@ async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app
                     "public, max-age=0"
                 );
                 assert_eq!(response.headers.get("Server").unwrap(), "application");
+                assert_eq!(
+                    response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+                    !hide
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn hidden_identity_preserves_console_and_public_api_conditional_reads() {
+    for hide in [false, true] {
+        for public_surface in [false, true] {
+            for method in ["GET", "HEAD"] {
+                let f = fixture_with(ProxyConfig {
+                    console_ingress_address: Some("127.0.0.1:3001".into()),
+                    ..ProxyConfig::default()
+                });
+                f.lb.hide_platform_identity.store(hide, Ordering::Relaxed);
+                let (mut client, server) = tokio::io::duplex(4096);
+                client
+                    .write_all(get("/api/flags/snapshot").as_bytes())
+                    .await
+                    .unwrap();
+                let mut session =
+                    Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+                assert!(session.read_request().await.unwrap());
+                let mut ctx = f.lb.new_ctx();
+                ctx.public_surface_only = public_surface;
+                // Resolve the real console peer, as Pingora does before filtering
+                // its request. Cover both the full and public-only listeners.
+                let _peer = f.lb.upstream_peer(&mut session, &mut ctx).await.unwrap();
+                assert_eq!(
+                    ctx.upstream_host.as_deref(),
+                    Some(if public_surface {
+                        "127.0.0.1:3001"
+                    } else {
+                        "127.0.0.1:3000"
+                    })
+                );
+                let mut request =
+                    RequestHeader::build(method, b"/api/flags/snapshot", None).unwrap();
+                request
+                    .insert_header("If-None-Match", "\"snapshot-v1\"")
+                    .unwrap();
+                request
+                    .insert_header("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .unwrap();
+                f.lb.upstream_request_filter(&mut session, &mut request, &mut ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    request.headers.get("If-None-Match").unwrap(),
+                    "\"snapshot-v1\""
+                );
+                assert_eq!(
+                    request.headers.get("If-Modified-Since").unwrap(),
+                    "Wed, 21 Oct 2015 07:28:00 GMT"
+                );
+                let mut response = pingora_http::ResponseHeader::build(304, None).unwrap();
+                response.insert_header("ETag", "\"snapshot-v1\"").unwrap();
+                f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status.as_u16(), 304);
+                assert_eq!(response.headers.get("ETag").unwrap(), "\"snapshot-v1\"");
                 assert_eq!(
                     response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
                     !hide

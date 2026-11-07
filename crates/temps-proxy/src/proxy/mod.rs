@@ -4181,7 +4181,20 @@ impl ProxyHttp for LoadBalancer {
         // diagnostics. Request a full representation while hiding identity;
         // leave app response validators and write preconditions untouched.
         // This deliberately trades conditional GET/HEAD bandwidth for privacy.
+        // Console APIs (including flag snapshots) depend on conditional reads.
+        // Exempt only their resolved listener, never a client-selected path:
+        // an app's /api routes still need the privacy refresh.
+        let console_bound = ctx.upstream_host.as_deref().is_some_and(|peer| {
+            !peer.is_empty()
+                && peer
+                    == control_plane_address(
+                        peer,
+                        self.upstream_resolver.console_address(),
+                        self.upstream_resolver.console_ingress_address(),
+                    )
+        });
         if self.hide_platform_identity()
+            && !console_bound
             && matches!(
                 upstream_request.method,
                 axum::http::Method::GET | axum::http::Method::HEAD
