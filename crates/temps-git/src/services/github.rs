@@ -291,7 +291,7 @@ impl SharedSecretWarning {
         matching_apps > 1
             && self
                 .next_warning_second
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     (elapsed_seconds >= next).then(|| elapsed_seconds.saturating_add(300))
                 })
                 .is_ok()
