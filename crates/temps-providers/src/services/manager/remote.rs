@@ -256,6 +256,25 @@ impl ExternalServiceManager {
         service_type: &ServiceType,
         parameters: &HashMap<String, String>,
     ) -> Result<RemoteServiceCreateParams, ExternalServiceError> {
+        Self::remote_create_params(
+            service_id,
+            service_name,
+            service_type,
+            parameters,
+            self.local_workloads_enabled,
+        )
+    }
+
+    /// The create request a worker's agent receives for a service, built
+    /// from the service's stored parameters without any Docker access.
+    /// `local_workloads_enabled` only shapes the remedy of a refusal.
+    pub fn remote_create_params(
+        service_id: i32,
+        service_name: &str,
+        service_type: &ServiceType,
+        parameters: &HashMap<String, String>,
+        local_workloads_enabled: bool,
+    ) -> Result<RemoteServiceCreateParams, ExternalServiceError> {
         #[allow(deprecated)]
         let backend_service_type = match (
             *service_type,
@@ -282,7 +301,7 @@ impl ExternalServiceManager {
                 // agent's generic create request carries no files, so a worker
                 // cannot create one yet. Creating it on this server is only a
                 // remedy when this server runs local workloads.
-                let remedy = if self.local_workloads_enabled {
+                let remedy = if local_workloads_enabled {
                     "Create it on this server instead (leave node_id unset), or use the default 'rustfs' backend on the worker"
                 } else {
                     "This server runs no local workloads (serve profile 'control-plane'), so use the default 'rustfs' backend on the worker"

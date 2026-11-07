@@ -11,7 +11,41 @@ use std::collections::HashMap;
 use temps_entities::external_services;
 use tracing::{info, warn};
 
+/// Secrets a local engine's `init` generates when the request has none, and
+/// a worker cannot: its agent creates the container from the request alone.
+/// Generated here, before the create, and stored like the local engine's.
+/// Redis is the one engine whose strategy leaves its password to `init`; a
+/// worker Redis without one ran without `requirepass`, and provisioning a
+/// linked app then authenticated with a password the server never had.
+pub(crate) fn remote_generated_secrets(
+    service_type: &ServiceType,
+    parameters: &HashMap<String, String>,
+) -> Vec<(&'static str, String)> {
+    let missing = |key: &str| parameters.get(key).is_none_or(|value| value.is_empty());
+    match service_type {
+        ServiceType::Redis | ServiceType::Kv if missing("password") => {
+            use rand::{distr::Alphanumeric, RngExt};
+            let password: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect();
+            vec![("password", password)]
+        }
+        _ => Vec::new(),
+    }
+}
+
 impl ExternalServiceManager {
+    /// [`remote_generated_secrets`]: what a worker create adds to a
+    /// service's parameters and stores, because the node's engine cannot.
+    pub fn worker_generated_secrets(
+        service_type: &ServiceType,
+        parameters: &HashMap<String, String>,
+    ) -> Vec<(&'static str, String)> {
+        remote_generated_secrets(service_type, parameters)
+    }
+
     pub(super) async fn initialize_service(
         &self,
         service_id: i32,
@@ -154,7 +188,7 @@ impl ExternalServiceManager {
         let client = self.get_remote_client(node_id).await?;
 
         // Flatten serde_json::Value parameters to strings for the builder
-        let string_params: HashMap<String, String> = parameters
+        let mut string_params: HashMap<String, String> = parameters
             .iter()
             .map(|(k, v)| {
                 let s = match v {
@@ -165,6 +199,10 @@ impl ExternalServiceManager {
             })
             .collect();
 
+        let generated = remote_generated_secrets(service_type, &string_params);
+        for (key, value) in &generated {
+            string_params.insert((*key).to_string(), value.clone());
+        }
         let create_params = self.build_remote_create_params(
             service_id,
             &service.name,
@@ -226,6 +264,11 @@ impl ExternalServiceManager {
             "container_name".to_string(),
             response.container_name.clone(),
         );
+        // The container now runs with these: store them as the local
+        // engine's `init` would.
+        for (key, value) in generated {
+            inferred.insert(key.to_string(), value);
+        }
 
         // Persist inferred parameters
         let mut current_params = self.get_service_parameters(service_id).await?;
@@ -750,6 +793,49 @@ mod tests {
             original_in_place: restored,
         }
         .into()
+    }
+
+    #[test]
+    fn a_worker_redis_gets_the_password_a_local_one_would_generate() {
+        for service_type in [ServiceType::Redis, ServiceType::Kv] {
+            let generated = remote_generated_secrets(&service_type, &HashMap::new());
+            assert_eq!(generated.len(), 1, "{service_type}");
+            let (key, password) = &generated[0];
+            assert_eq!(*key, "password");
+            assert_eq!(password.len(), 16);
+            assert!(password.chars().all(|c| c.is_ascii_alphanumeric()));
+
+            // The container is created with it.
+            let mut parameters = HashMap::from([(key.to_string(), password.clone())]);
+            parameters.insert(
+                "docker_image".into(),
+                "gotempsh/redis-walg:8-bookworm".into(),
+            );
+            let request = ExternalServiceManager::remote_create_params(
+                7,
+                "cache",
+                &service_type,
+                &parameters,
+                false,
+            )
+            .expect("a create request");
+            let command = request.command.unwrap_or_default();
+            let at = command
+                .iter()
+                .position(|arg| arg == "--requirepass")
+                .expect("the server requires the password");
+            assert_eq!(command.get(at + 1), Some(password));
+        }
+        // A given password is kept, and other engines generate nothing here.
+        let given = HashMap::from([("password".to_string(), "chosen".to_string())]);
+        assert!(remote_generated_secrets(&ServiceType::Redis, &given).is_empty());
+        for service_type in [
+            ServiceType::Postgres,
+            ServiceType::Mongodb,
+            ServiceType::Mariadb,
+        ] {
+            assert!(remote_generated_secrets(&service_type, &HashMap::new()).is_empty());
+        }
     }
 
     #[test]
