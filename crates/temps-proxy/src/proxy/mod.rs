@@ -973,15 +973,14 @@ impl LoadBalancer {
         else {
             return false;
         };
-        let host = headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        // Probe URLs use DNS hosts; discard the optional listener port.
-        let host = host.split(':').next().unwrap_or_default();
+        // Authenticate against the same host routing uses, including HTTP/2
+        // :authority without Host. Invalid routing authorities fail closed.
+        let Ok(authority) = self.request_authority(session) else {
+            return false;
+        };
         temps_core::probe_auth::verify(
             &self.config_service.get_server_config().encryption_key,
-            host,
+            &authority.host,
             token,
             temps_core::probe_auth::now(),
         )

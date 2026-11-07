@@ -1805,3 +1805,70 @@ async fn platform_identity_exposure_preserves_console_and_public_api_conditional
         }
     }
 }
+
+#[tokio::test]
+async fn probe_authentication_uses_the_routed_authority() {
+    let f = fixture();
+    f.lb.expose_platform_identity
+        .store(false, Ordering::Relaxed);
+    let token = temps_core::probe_auth::sign(
+        &f.lb.config_service.get_server_config().encryption_key,
+        HOST,
+        temps_core::probe_auth::now(),
+    );
+    for (host, uri, authenticated) in [
+        (None, "https://app.example.test/", true),
+        (None, "https://APP.example.test:8443/", true),
+        (Some("APP.example.test:8443"), "/", true),
+        (None, "https://other.example.test/", false),
+        (None, "/", false),
+        (Some("bad@host"), "https://app.example.test/", false),
+        (
+            Some("other.example.test"),
+            "https://app.example.test/",
+            false,
+        ),
+        (Some(HOST), "https://other.example.test/", true),
+    ] {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(get("/").as_bytes()).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        // Model Pingora's parsed HTTP/2 header shape: :authority is carried
+        // by the URI and Host may be absent. The hook uses the same header
+        // representation for both downstream protocols.
+        session.req_header_mut().remove_header("Host");
+        session.req_header_mut().set_uri(uri.parse().unwrap());
+        if let Some(host) = host {
+            session
+                .req_header_mut()
+                .insert_header("Host", host)
+                .unwrap();
+        }
+        session
+            .req_header_mut()
+            .insert_header(temps_core::probe_auth::HEADER, token.clone())
+            .unwrap();
+        assert_eq!(
+            f.lb.authenticated_probe(&session),
+            authenticated,
+            "host={host:?} uri={uri}"
+        );
+        let mut ctx = f.lb.new_ctx();
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+            authenticated
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("Cache-Control")
+                .map(|v| v.to_str().unwrap()),
+            authenticated.then_some("private, no-store")
+        );
+    }
+}
