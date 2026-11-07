@@ -102,7 +102,7 @@ impl LoadBalancer {
                         ctx.query_string.as_deref(),
                     )
                     .as_deref(),
-                    self.hide_platform_identity(),
+                    !self.expose_platform_identity(),
                 );
                 let html_bytes = Bytes::from(html);
 
@@ -251,7 +251,7 @@ impl LoadBalancer {
                     ctx.query_string.as_deref(),
                 )
                 .as_deref(),
-                self.hide_platform_identity(),
+                !self.expose_platform_identity(),
             );
             let html_bytes = Bytes::from(html);
 

@@ -31,7 +31,7 @@ import type {
 interface SecurityFormData {
   security_headers: SecurityHeadersType
   rate_limiting: RateLimitType
-  hide_platform_identity: boolean
+  expose_platform_identity: boolean
   trust_loopback_forwarded_ip: boolean
   /** Blank means none; sent as null. */
   loopback_ja4_header: string
@@ -72,16 +72,16 @@ export function SecurityPage() {
         permissions_policy: null,
       },
       rate_limiting: DEFAULT_RATE_LIMITING,
-      hide_platform_identity: true,
+      expose_platform_identity: false,
       trust_loopback_forwarded_ip: false,
       loopback_ja4_header: '',
       trusted_private_networks_text: '',
     },
   })
 
-  const hidePlatformIdentity = useWatch({
+  const exposePlatformIdentity = useWatch({
     control,
-    name: 'hide_platform_identity',
+    name: 'expose_platform_identity',
   })
   const securityHeaders = useWatch({ control, name: 'security_headers' })
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
@@ -117,7 +117,7 @@ export function SecurityPage() {
             permissions_policy: null,
           },
           rate_limiting: settings.rate_limiting || DEFAULT_RATE_LIMITING,
-          hide_platform_identity: settings.hide_platform_identity,
+          expose_platform_identity: settings.expose_platform_identity,
           trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
           loopback_ja4_header: settings.loopback_ja4_header ?? '',
           trusted_private_networks_text: (
@@ -196,22 +196,22 @@ export function SecurityPage() {
       >
         <SettingsSection title="Response privacy" icon={Shield}>
           <div className="flex items-center justify-between gap-4">
-            <Label htmlFor="hide-platform-identity">
-              Hide Temps branding in responses
+            <Label htmlFor="expose-platform-identity">
+              Show Temps branding in responses
             </Label>
             <Switch
-              id="hide-platform-identity"
-              checked={hidePlatformIdentity}
+              id="expose-platform-identity"
+              checked={exposePlatformIdentity}
               onCheckedChange={(checked) =>
-                setValue('hide_platform_identity', checked, {
+                setValue('expose_platform_identity', checked, {
                   shouldDirty: true,
                 })
               }
             />
           </div>
           <p className="text-sm text-muted-foreground">
-            Omit platform headers and branding from proxy pages; application
-            headers and local health checks are preserved.
+            When on, adds Temps headers (Server, timing, served-by) and branded
+            error pages; when off, responses don’t reveal Temps.
           </p>
         </SettingsSection>
         <SettingsSection

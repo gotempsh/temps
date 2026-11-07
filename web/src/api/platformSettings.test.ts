@@ -7,11 +7,11 @@ import type { PlatformSettings } from './platformSettings'
 
 describe('buildPlatformSettingsUpdateBody', () => {
   test('round-trips both platform identity choices', () => {
-    for (const hide_platform_identity of [true, false]) {
+    for (const expose_platform_identity of [true, false]) {
       const body = buildPlatformSettingsUpdateBody({
-        hide_platform_identity,
+        expose_platform_identity,
       } as PlatformSettings)
-      expect(body.hide_platform_identity).toBe(hide_platform_identity)
+      expect(body.expose_platform_identity).toBe(expose_platform_identity)
     }
   })
 

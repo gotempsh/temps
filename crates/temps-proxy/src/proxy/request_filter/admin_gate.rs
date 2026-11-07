@@ -73,7 +73,7 @@ impl LoadBalancer {
                             let body = Bytes::from(crate::branded_404::render_with_identity(
                                 &ctx.host,
                                 &ctx.request_id,
-                                self.hide_platform_identity(),
+                                !self.expose_platform_identity(),
                             ));
                             response.insert_header("Content-Length", body.len().to_string())?;
                             session

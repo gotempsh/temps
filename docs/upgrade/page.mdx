@@ -13,6 +13,14 @@ An upgrade replaces the `temps` binary and then applies the new release's databa
 
 ---
 
+## Response branding is now opt-in
+
+After upgrading, Temps no longer adds identifying headers or branding to its
+proxy responses by default, including on existing installations. To restore
+branded responses, enable **Settings → Security → Show Temps branding in
+responses** (`expose_platform_identity: true`). The switch defaults to off;
+application headers and `X-Request-ID` are preserved.
+
 ## Before you upgrade
 
 Check what you are running:

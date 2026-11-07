@@ -2631,8 +2631,8 @@ mod shield_enforcement_tests {
             return Ok(());
         };
         s.h.lb
-            .hide_platform_identity
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), BLOCKED, true).await?);
@@ -2665,8 +2665,8 @@ mod shield_enforcement_tests {
             return Ok(());
         };
         s.h.lb
-            .hide_platform_identity
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
@@ -2712,8 +2712,8 @@ mod shield_enforcement_tests {
             return Ok(());
         };
         s.h.lb
-            .hide_platform_identity
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
         let (head, _, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, false).await?);
         assert!(head.starts_with("HTTP/1.1 426"), "{head}");

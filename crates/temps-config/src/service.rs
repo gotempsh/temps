@@ -932,7 +932,7 @@ pub struct ConfigService {
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
     settings_cache: tokio::sync::RwLock<SettingsCacheState>,
-    hide_platform_identity: std::sync::atomic::AtomicBool,
+    expose_platform_identity: std::sync::atomic::AtomicBool,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -998,7 +998,7 @@ impl ConfigService {
             config,
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
-            hide_platform_identity: std::sync::atomic::AtomicBool::new(true),
+            expose_platform_identity: std::sync::atomic::AtomicBool::new(false),
             listener_handle: std::sync::Mutex::new(None),
             build_limits: tokio::sync::watch::channel(None).0,
             clickhouse_compression: ClickHouseCompression::default(),
@@ -1493,8 +1493,8 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     }
 
     /// Lock-free view for console ingress error pages, updated with the settings cache.
-    pub fn hide_platform_identity(&self) -> bool {
-        self.hide_platform_identity
+    pub fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1650,8 +1650,8 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // guard as the settings snapshot. A DB read started before an
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
-        self.hide_platform_identity.store(
-            settings.hide_platform_identity(),
+        self.expose_platform_identity.store(
+            settings.expose_platform_identity(),
             std::sync::atomic::Ordering::Relaxed,
         );
         publish_process_wide_settings(&settings);
@@ -1672,8 +1672,8 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return false;
         }
         cache.generation = cache.generation.wrapping_add(1);
-        self.hide_platform_identity.store(
-            settings.hide_platform_identity(),
+        self.expose_platform_identity.store(
+            settings.expose_platform_identity(),
             std::sync::atomic::Ordering::Relaxed,
         );
         publish_process_wide_settings(&settings);
@@ -6201,7 +6201,7 @@ mod tests {
     #[tokio::test]
     async fn settings_snapshot_refresh_recovers_without_an_http_request() {
         let mut row = settings_row("privacy");
-        row.data["hide_platform_identity"] = serde_json::json!(false);
+        row.data["expose_platform_identity"] = serde_json::json!(true);
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_errors(vec![sea_orm::DbErr::Custom(
                 "temporary database outage".into(),
@@ -6210,9 +6210,9 @@ mod tests {
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
         svc.refresh_settings_snapshot().await;
-        assert!(svc.hide_platform_identity());
+        assert!(!svc.expose_platform_identity());
         svc.refresh_settings_snapshot().await;
-        assert!(!svc.hide_platform_identity());
+        assert!(svc.expose_platform_identity());
     }
 
     #[test]

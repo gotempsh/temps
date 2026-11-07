@@ -116,9 +116,9 @@ pub struct AppSettings {
     /// This is the sole control surface — there is no CLI/env override.
     #[serde(default)]
     pub trust_loopback_forwarded_ip: Option<bool>,
-    /// Omit platform identity from proxy responses. Missing values preserve the stored choice.
+    /// Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
     #[serde(default)]
-    pub hide_platform_identity: Option<bool>,
+    pub expose_platform_identity: Option<bool>,
     /// The header a trusted loopback proxy puts the visitor's JA4 TLS
     /// fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
     /// `trust_loopback_forwarded_ip` trusts, and removed from every request
@@ -2474,7 +2474,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             trust_loopback_forwarded_ip: None,
-            hide_platform_identity: None,
+            expose_platform_identity: None,
             loopback_ja4_header: None,
             docker_registry: DockerRegistrySettings::default(),
             registry_mirror_prefix: None,
@@ -2526,9 +2526,9 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    /// Hide identity by default, including settings saved before this field existed.
-    pub fn hide_platform_identity(&self) -> bool {
-        self.hide_platform_identity.unwrap_or(true)
+    /// Expose identity only when enabled, including settings saved before this field existed.
+    pub fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity.unwrap_or(false)
     }
 
     /// The database-backed opt-in, disabled until explicitly set by an admin.
@@ -2741,8 +2741,8 @@ impl AppSettings {
             };
             // Preserve an explicit branding choice when another section is malformed.
             // An absent or invalid flag keeps the privacy-preserving default.
-            let hide_platform_identity = value
-                .get("hide_platform_identity")
+            let expose_platform_identity = value
+                .get("expose_platform_identity")
                 .and_then(serde_json::Value::as_bool);
             // Same for the ClickHouse wire-compression mode: resetting a saved
             // `none` to the LZ4 default would silently re-break a deployment
@@ -2773,7 +2773,7 @@ impl AppSettings {
             };
             Self {
                 anonymous_telemetry_enabled,
-                hide_platform_identity,
+                expose_platform_identity,
                 clickhouse,
                 on_demand_tls,
                 shield,

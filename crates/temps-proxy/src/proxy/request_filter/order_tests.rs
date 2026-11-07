@@ -1425,13 +1425,13 @@ async fn the_admin_gate_hands_a_denied_client_to_the_public_only_listener() {
 }
 
 #[tokio::test]
-async fn hidden_platform_identity_preserves_application_headers() {
-    for hide in [false, true] {
+async fn platform_identity_exposure_preserves_application_headers() {
+    for expose in [false, true] {
         let fixture = fixture_with(ProxyConfig::default());
         fixture
             .lb
-            .hide_platform_identity
-            .store(hide, Ordering::Relaxed);
+            .expose_platform_identity
+            .store(expose, Ordering::Relaxed);
         let (mut client, server) = tokio::io::duplex(4096);
         client.write_all(get("/").as_bytes()).await.unwrap();
         let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
@@ -1461,26 +1461,26 @@ async fn hidden_platform_identity_preserves_application_headers() {
         }
         assert_eq!(
             response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
-            !hide
+            expose
         );
         ctx.upstream_write_pending_time_ms = Some(12);
         fixture.lb.add_response_timing(&mut response, &ctx).unwrap();
         assert_eq!(
             response.headers.contains_key("X-Upstream-Write-Pending"),
-            !hide
+            expose
         );
-        assert_eq!(response.headers.contains_key("X-Response-Time"), !hide);
+        assert_eq!(response.headers.contains_key("X-Response-Time"), expose);
     }
 }
 
 #[tokio::test]
-async fn hidden_platform_identity_keeps_app_timing_headers() {
-    for hide in [false, true] {
+async fn platform_identity_exposure_keeps_app_timing_headers() {
+    for expose in [false, true] {
         let fixture = fixture_with(ProxyConfig::default());
         fixture
             .lb
-            .hide_platform_identity
-            .store(hide, Ordering::Relaxed);
+            .expose_platform_identity
+            .store(expose, Ordering::Relaxed);
         let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
         response
             .insert_header("X-Upstream-Write-Pending", "app-owned")
@@ -1509,8 +1509,8 @@ async fn hidden_platform_identity_requires_authentication_even_on_loopback() {
     let fixture = fixture_with(ProxyConfig::default());
     fixture
         .lb
-        .hide_platform_identity
-        .store(true, Ordering::Relaxed);
+        .expose_platform_identity
+        .store(false, Ordering::Relaxed);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
         .await
@@ -1615,7 +1615,7 @@ async fn hidden_platform_identity_requires_authentication_even_on_loopback() {
 
 #[tokio::test]
 async fn platform_identity_controls_error_and_challenge_responses() {
-    for hide in [false, true] {
+    for expose in [false, true] {
         for outcome in [
             None,
             Some(temps_shield::Outcome::HttpsRequired),
@@ -1629,8 +1629,8 @@ async fn platform_identity_controls_error_and_challenge_responses() {
             let fixture = fixture_with(ProxyConfig::default());
             fixture
                 .lb
-                .hide_platform_identity
-                .store(hide, Ordering::Relaxed);
+                .expose_platform_identity
+                .store(expose, Ordering::Relaxed);
             let (mut client, server) = tokio::io::duplex(65536);
             client.write_all(get("/").as_bytes()).await.unwrap();
             let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
@@ -1661,7 +1661,7 @@ async fn platform_identity_controls_error_and_challenge_responses() {
             assert!(response
                 .to_lowercase()
                 .contains(&format!("x-request-id: {}", ctx.request_id)));
-            if hide {
+            if !expose {
                 assert!(!response.to_lowercase().contains("temps"), "{response}");
             } else if failed_upstream {
                 assert!(response.contains("Temps"));
@@ -1672,10 +1672,11 @@ async fn platform_identity_controls_error_and_challenge_responses() {
 
 #[tokio::test]
 async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app_headers() {
-    for hide in [false, true] {
+    for expose in [false, true] {
         for method in ["GET", "HEAD", "PUT"] {
             let f = fixture();
-            f.lb.hide_platform_identity.store(hide, Ordering::Relaxed);
+            f.lb.expose_platform_identity
+                .store(expose, Ordering::Relaxed);
             let (mut client, server) = tokio::io::duplex(4096);
             client.write_all(get("/").as_bytes()).await.unwrap();
             let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
@@ -1698,7 +1699,7 @@ async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app
             f.lb.upstream_request_filter(&mut session, &mut request, &mut ctx)
                 .await
                 .unwrap();
-            let refresh = hide && method != "PUT";
+            let refresh = !expose && method != "PUT";
             assert_eq!(request.headers.contains_key("If-None-Match"), !refresh);
             assert_eq!(request.headers.contains_key("If-Modified-Since"), !refresh);
             assert!(request.headers.contains_key("If-Match"));
@@ -1722,7 +1723,7 @@ async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app
                 f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
                     .await
                     .unwrap();
-                assert_eq!(response.status.as_u16(), if hide { 200 } else { 304 });
+                assert_eq!(response.status.as_u16(), if !expose { 200 } else { 304 });
                 assert_eq!(response.headers.get("ETag").unwrap(), "\"v1\"");
                 assert_eq!(
                     response.headers.get("Cache-Control").unwrap(),
@@ -1731,7 +1732,7 @@ async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app
                 assert_eq!(response.headers.get("Server").unwrap(), "application");
                 assert_eq!(
                     response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
-                    !hide
+                    expose
                 );
             }
         }
@@ -1739,15 +1740,16 @@ async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app
 }
 
 #[tokio::test]
-async fn hidden_identity_preserves_console_and_public_api_conditional_reads() {
-    for hide in [false, true] {
+async fn platform_identity_exposure_preserves_console_and_public_api_conditional_reads() {
+    for expose in [false, true] {
         for public_surface in [false, true] {
             for method in ["GET", "HEAD"] {
                 let f = fixture_with(ProxyConfig {
                     console_ingress_address: Some("127.0.0.1:3001".into()),
                     ..ProxyConfig::default()
                 });
-                f.lb.hide_platform_identity.store(hide, Ordering::Relaxed);
+                f.lb.expose_platform_identity
+                    .store(expose, Ordering::Relaxed);
                 let (mut client, server) = tokio::io::duplex(4096);
                 client
                     .write_all(get("/api/flags/snapshot").as_bytes())
@@ -1797,7 +1799,7 @@ async fn hidden_identity_preserves_console_and_public_api_conditional_reads() {
                 assert_eq!(response.headers.get("ETag").unwrap(), "\"snapshot-v1\"");
                 assert_eq!(
                     response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
-                    !hide
+                    expose
                 );
             }
         }

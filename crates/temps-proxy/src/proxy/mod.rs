@@ -533,7 +533,7 @@ pub struct LoadBalancer {
     cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
     trust_loopback_forwarded_ip: Arc<AtomicBool>,
-    hide_platform_identity: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
     /// The header a trusted loopback proxy sends the visitor's JA4 in
     /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
     loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
@@ -824,7 +824,7 @@ impl LoadBalancer {
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
-            hide_platform_identity: Arc::new(AtomicBool::new(true)),
+            expose_platform_identity: Arc::new(AtomicBool::new(false)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
             on_demand_manager: None,
             on_demand_cert_manager: None,
@@ -956,13 +956,13 @@ impl LoadBalancer {
     }
 
     /// Wire the refreshed instance-wide response privacy setting.
-    pub fn with_hide_platform_identity(mut self, enabled: Arc<AtomicBool>) -> Self {
-        self.hide_platform_identity = enabled;
+    pub fn with_expose_platform_identity(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.expose_platform_identity = enabled;
         self
     }
 
-    fn hide_platform_identity(&self) -> bool {
-        self.hide_platform_identity.load(Ordering::Relaxed)
+    fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity.load(Ordering::Relaxed)
     }
 
     fn authenticated_probe(&self, session: &PingoraSession) -> bool {
@@ -988,7 +988,7 @@ impl LoadBalancer {
     }
 
     fn expose_probe_markers(&self, session: &PingoraSession) -> bool {
-        !self.hide_platform_identity() || self.authenticated_probe(session)
+        self.expose_platform_identity() || self.authenticated_probe(session)
     }
 
     fn protect_probe_response(
@@ -1153,7 +1153,7 @@ impl LoadBalancer {
             ConsolePhase::Starting | ConsolePhase::Running => return None,
         };
 
-        let body = if self.hide_platform_identity() {
+        let body = if !self.expose_platform_identity() {
             match format {
                 crate::console_unavailable::ResponseFormat::Html => Bytes::from_static(b"<!doctype html><title>Service unavailable</title><h1>Service unavailable</h1><p>Please retry shortly.</p>"),
                 crate::console_unavailable::ResponseFormat::Json => Bytes::from_static(b"{\"type\":\"about:blank\",\"title\":\"Service unavailable\",\"status\":503}"),
@@ -1177,7 +1177,7 @@ impl LoadBalancer {
         let error_code = 503;
         let written = async {
             let mut header = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-            if !self.hide_platform_identity() {
+            if self.expose_platform_identity() {
                 header.insert_header(header::SERVER, &SERVER_NAME[..])?;
             }
             header.insert_header(header::CACHE_CONTROL, "no-store")?;
@@ -1845,7 +1845,7 @@ impl LoadBalancer {
             duration.as_millis(),
             ctx.ip_address.clone().unwrap_or_default()
         );
-        if self.hide_platform_identity() {
+        if !self.expose_platform_identity() {
             return Ok(());
         }
         if !upstream_response.headers.contains_key("X-Response-Time") {
@@ -2000,7 +2000,7 @@ impl LoadBalancer {
                     &token,
                     difficulty,
                     ctx.ip_address.as_deref().unwrap_or("unknown"),
-                    self.hide_platform_identity(),
+                    !self.expose_platform_identity(),
                 )),
                 "shield_challenge",
             ),
@@ -2028,7 +2028,10 @@ impl LoadBalancer {
         response.insert_header("Content-Length", body.len().to_string())?;
         response.insert_header("Cache-Control", "no-store")?;
         response.insert_header("X-Request-ID", &ctx.request_id)?;
-        if let Some(verdict) = ctx.shield_header.filter(|_| !self.hide_platform_identity()) {
+        if let Some(verdict) = ctx
+            .shield_header
+            .filter(|_| self.expose_platform_identity())
+        {
             response.insert_header(
                 temps_shield::RESPONSE_HEADER,
                 temps_shield::response_header_value(verdict, &ctx.request_id),
@@ -2667,7 +2670,7 @@ impl LoadBalancer {
                     session,
                     ctx,
                     StatusCode::FORBIDDEN,
-                    if self.hide_platform_identity() {
+                    if !self.expose_platform_identity() {
                         crate::branded_404::neutralize_access_response(
                             crate::preview_auth::ip_denied_message(&host.hex, client_ip),
                         )
@@ -2687,7 +2690,7 @@ impl LoadBalancer {
                     session,
                     ctx,
                     StatusCode::FORBIDDEN,
-                    if self.hide_platform_identity() {
+                    if !self.expose_platform_identity() {
                         crate::branded_404::neutralize_access_response(
                             crate::preview_auth::password_missing_message(&host.hex),
                         )
@@ -2717,7 +2720,7 @@ impl LoadBalancer {
                         session,
                         ctx,
                         StatusCode::UNAUTHORIZED,
-                        if self.hide_platform_identity() {
+                        if !self.expose_platform_identity() {
                             "Sign in to open this preview. Open it in a browser to continue.\n"
                                 .to_string()
                         } else {
@@ -2781,7 +2784,7 @@ impl LoadBalancer {
                             session,
                             ctx,
                             StatusCode::FORBIDDEN,
-                            if self.hide_platform_identity() {
+                            if !self.expose_platform_identity() {
                                 "Sign-in is unavailable. Contact the administrator.\n".to_string()
                             } else {
                                 crate::preview_auth::temps_login_unconfigured_message(&host.hex)
@@ -2817,7 +2820,7 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                if self.hide_platform_identity() {
+                if !self.expose_platform_identity() {
                     crate::branded_404::neutralize_access_response(
                         crate::preview_auth::ip_denied_message(hex, client_ip),
                     )
@@ -2857,7 +2860,7 @@ impl LoadBalancer {
                 &next,
                 false,
                 settings.external_url.as_deref(),
-                self.hide_platform_identity(),
+                !self.expose_platform_identity(),
             )
         };
         let mut response = ResponseHeader::build(StatusCode::OK, None)?;
@@ -2902,7 +2905,7 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                if self.hide_platform_identity() {
+                if !self.expose_platform_identity() {
                     crate::branded_404::neutralize_access_response(
                         crate::preview_auth::ip_denied_message(hex, client_ip),
                     )
@@ -3014,7 +3017,7 @@ impl LoadBalancer {
                 &next,
                 true,
                 settings.external_url.as_deref(),
-                self.hide_platform_identity(),
+                !self.expose_platform_identity(),
             );
             let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
             response.insert_header("Content-Type", "text/html; charset=utf-8")?;
@@ -3144,7 +3147,7 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                if self.hide_platform_identity() {
+                if !self.expose_platform_identity() {
                     crate::branded_404::neutralize_access_response(
                         crate::preview_auth::ip_denied_message(hex, client_ip),
                     )
@@ -3939,7 +3942,7 @@ impl ProxyHttp for LoadBalancer {
         if let Some(name) = ctx
             .container_name
             .as_ref()
-            .filter(|_| !self.hide_platform_identity())
+            .filter(|_| self.expose_platform_identity())
         {
             if !upstream_response.headers.contains_key("X-Served-By") {
                 upstream_response.insert_header("X-Served-By", name).ok();
@@ -4024,10 +4027,13 @@ impl ProxyHttp for LoadBalancer {
 
         // `X-Temps-Shield` says what Shield did (ADR 066, D11): only Shield
         // sets it, and only when it acted.
-        if !self.hide_platform_identity() {
+        if self.expose_platform_identity() {
             let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
         }
-        if let Some(verdict) = ctx.shield_header.filter(|_| !self.hide_platform_identity()) {
+        if let Some(verdict) = ctx
+            .shield_header
+            .filter(|_| self.expose_platform_identity())
+        {
             upstream_response.insert_header(
                 temps_shield::RESPONSE_HEADER,
                 temps_shield::response_header_value(verdict, &ctx.request_id),
@@ -4193,7 +4199,7 @@ impl ProxyHttp for LoadBalancer {
                         self.upstream_resolver.console_ingress_address(),
                     )
         });
-        if self.hide_platform_identity()
+        if !self.expose_platform_identity()
             && !console_bound
             && matches!(
                 upstream_request.method,
@@ -4611,7 +4617,7 @@ impl ProxyHttp for LoadBalancer {
             }
         };
 
-        if !self.hide_platform_identity() {
+        if self.expose_platform_identity() {
             if let Err(e) = header.insert_header(header::SERVER, &SERVER_NAME[..]) {
                 error!("Failed to insert SERVER header: {:?}", e);
             }
@@ -4637,7 +4643,7 @@ impl ProxyHttp for LoadBalancer {
             };
         }
 
-        let page = unavailable_page(ctx.preview_route.is_some() && !self.hide_platform_identity());
+        let page = unavailable_page(ctx.preview_route.is_some() && self.expose_platform_identity());
         if let Err(e) = session
             .write_response_body(Some(Bytes::from(page)), true)
             .await

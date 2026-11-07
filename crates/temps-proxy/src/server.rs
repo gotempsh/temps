@@ -80,7 +80,7 @@ async fn load_initial_forwarded_ip_trust(
     Ok((
         settings.trust_loopback_forwarded_ip(),
         loopback_ja4_header(&settings),
-        settings.hide_platform_identity(),
+        settings.expose_platform_identity(),
     ))
 }
 
@@ -89,7 +89,7 @@ async fn load_initial_forwarded_ip_trust(
 #[derive(Debug)]
 struct LoopbackTrust {
     forwarded_ip: Arc<AtomicBool>,
-    hide_platform_identity: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
     /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
     ja4_header: Arc<ArcSwapOption<HeaderName>>,
 }
@@ -140,11 +140,11 @@ fn start_forwarded_ip_trust_refresh(
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
     let trust = LoopbackTrust {
-        hide_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
+        expose_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
         forwarded_ip: Arc::new(AtomicBool::new(initial)),
         ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
     };
-    let identity = Arc::downgrade(&trust.hide_platform_identity);
+    let identity = Arc::downgrade(&trust.expose_platform_identity);
     let snapshot = Arc::downgrade(&trust.forwarded_ip);
     let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
@@ -164,7 +164,7 @@ fn start_forwarded_ip_trust_refresh(
             }
             if let Some(settings) = &settings {
                 if let Some(identity) = identity.upgrade() {
-                    identity.store(settings.hide_platform_identity(), Ordering::Relaxed);
+                    identity.store(settings.expose_platform_identity(), Ordering::Relaxed);
                 }
                 let header = loopback_ja4_header(settings);
                 let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
@@ -747,7 +747,7 @@ pub fn setup_proxy_server(
         cert_host_cache,
         disable_https_redirect,
     )
-    .with_hide_platform_identity(loopback_trust.hide_platform_identity)
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
@@ -1183,7 +1183,7 @@ pub fn create_proxy_service(
         cert_host_cache,
         disable_https_redirect,
     )
-    .with_hide_platform_identity(loopback_trust.hide_platform_identity)
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)
@@ -1306,7 +1306,7 @@ mod preflight_bind_tests {
     fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
         let settings = AppSettings {
             trust_loopback_forwarded_ip: Some(true),
-            hide_platform_identity: Some(false),
+            expose_platform_identity: Some(true),
             ..AppSettings::default()
         };
         let row = settings::Model {
@@ -1326,7 +1326,7 @@ mod preflight_bind_tests {
         let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
         assert!(trust.forwarded_ip.load(Ordering::Relaxed));
-        assert!(!trust.hide_platform_identity.load(Ordering::Relaxed));
+        assert!(trust.expose_platform_identity.load(Ordering::Relaxed));
         assert!(
             trust.ja4_header.load().is_none(),
             "no JA4 header configured"

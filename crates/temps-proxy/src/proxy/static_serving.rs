@@ -1080,8 +1080,8 @@ pub(super) mod static_path_route_redirect_tests {
         let data_dir = TempDir::new()?;
         write_deployment(data_dir.path())?;
         let lb = load_balancer(data_dir.path())?;
-        lb.hide_platform_identity
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        lb.expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let (_, branded, _) = serve(&lb, None, "/").await?;
         let etag = |head: &str| {
             head.lines()
@@ -1096,8 +1096,8 @@ pub(super) mod static_path_route_redirect_tests {
         assert!(branded
             .to_ascii_lowercase()
             .contains("x-temps-proxy-probe-capable: 1"));
-        lb.hide_platform_identity
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        lb.expose_platform_identity
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         for old_validator in [old.as_str(), "*"] {
             let (_, neutral, _) = serve_conditional(&lb, None, "/", Some(old_validator)).await?;
             assert!(neutral.starts_with("HTTP/1.1 200"), "{neutral}");
@@ -1153,8 +1153,8 @@ pub(super) mod static_path_route_redirect_tests {
         write_deployment(data_dir.path())?;
         let lb = load_balancer(data_dir.path())?;
 
-        lb.hide_platform_identity
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        lb.expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         for requested in ["/docs/", "/docs/guide/"] {
             let (_, head, _) = serve(&lb, Some(route("/docs", true)), requested).await?;
             assert!(
