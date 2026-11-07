@@ -112,6 +112,7 @@ pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;
 pub mod git_providers;
+pub mod github_manifest_states;
 pub mod ingress_connector_nodes;
 pub mod ingress_connectors;
 pub mod ingress_hostname_choices;
