@@ -60,9 +60,17 @@ pub async fn probe_external_service_backup_capability(
     service: &external_services::Model,
     manager: &temps_providers::ExternalServiceManager,
 ) -> ExternalServiceBackupCapability {
-    // A standalone service on a worker node is backed up on that node, by a
-    // job (PostgreSQL) or its agent (the rest): what that writes does not
-    // depend on the tools in its image.
+    // A standalone PostgreSQL on a worker takes the control plane's WAL-G
+    // engine when its image has WAL-G (ADR-091): the same check, run by its
+    // node's agent.
+    if crate::engines::workload_job::takes_job_path(service) {
+        if let Some(node_id) = worker_node(service) {
+            let probe = probe_on_worker(service, "postgres", node_id, manager).await;
+            return worker_postgres_capability(service, node_id, probe);
+        }
+    }
+    // The other services on a worker node are backed up by its agent: what
+    // that writes does not depend on the tools in its image.
     if let Some(capability) = worker_capability(service) {
         return capability;
     }
@@ -334,12 +342,7 @@ fn worker_capability(
     use crate::engines::worker_agent::{self, WorkerServiceKind};
     use temps_providers::externalsvc::worker_data::DumpEngine;
     let node = worker_node(service)?;
-    let (engine, artifact) = if crate::engines::workload_job::takes_job_path(service) {
-        (
-            crate::engines::workload_job::ENGINE_KEY,
-            "logical_pg_dumpall",
-        )
-    } else if worker_agent::takes_agent_path(service) {
+    let (engine, artifact) = if worker_agent::takes_agent_path(service) {
         match worker_agent::worker_service_kind(&service.service_type)? {
             WorkerServiceKind::Storage => {
                 return Some(compatible(worker_agent::ENGINE_KEY, "object_set", false))
@@ -368,12 +371,69 @@ fn worker_capability(
             service.id
         )),
         remediation: Some(
-            "Backups and in-place restores work as they are. For WAL-G point-in-time recovery, \
-             run the service on a node that keeps its WAL-G archive (the control plane)."
-                .to_string(),
+            "Backups and in-place restores work as they are; nothing needs to change.".to_string(),
         ),
         recommended_image: None,
     })
+}
+
+/// What a backup of a standalone PostgreSQL on worker `node` writes, given
+/// its agent's WAL-G check: the control plane's WAL-G repository when its
+/// image has WAL-G, else a dump taken on the node.
+fn worker_postgres_capability(
+    service: &external_services::Model,
+    node: i32,
+    probe: ToolProbe,
+) -> ExternalServiceBackupCapability {
+    let dump =
+        |verified: bool, reason: String, remediation: String| ExternalServiceBackupCapability {
+            cloud_backup_compatible: false,
+            verified,
+            wal_g_installed: false,
+            engine: crate::engines::workload_job::ENGINE_KEY.to_string(),
+            artifact: "logical_pg_dumpall".to_string(),
+            reason: Some(reason),
+            remediation: Some(remediation),
+            recommended_image: None,
+        };
+    match probe {
+        ToolProbe::Available => compatible("postgres_walg", "walg_repository", true),
+        ToolProbe::Missing => dump(
+            true,
+            format!(
+                "Service {} on worker node {node} runs a PostgreSQL image without WAL-G, so its \
+                 backups are logical dumps taken on the node; WAL-G repositories and \
+                 point-in-time recovery need WAL-G in the image.",
+                service.id
+            ),
+            format!(
+                "Backups and in-place restores work as they are. For WAL-G and point-in-time \
+                 recovery, switch the service to a WAL-G PostgreSQL image (for example {}) and \
+                 run a new backup.",
+                recommended_image("postgres").unwrap_or("a gotempsh/postgres-walg image")
+            ),
+        ),
+        ToolProbe::Unverified(cause) => dump(
+            false,
+            match cause {
+                UnverifiedCause::Unavailable => format!(
+                    "Backup compatibility for service {} could not be verified because its \
+                     container on worker node {node} is unavailable, not running, or its agent \
+                     could not be reached.",
+                    service.id
+                ),
+                UnverifiedCause::TimedOut { stage } => format!(
+                    "Backup compatibility for service {} could not be verified because the \
+                     {stage} timed out.",
+                    service.id
+                ),
+            },
+            format!(
+                "Check that worker node {node} and its agent are online and the service is \
+                 running, then check capability again."
+            ),
+        ),
+    }
 }
 
 fn compatible(
@@ -475,11 +535,18 @@ mod tests {
             .unwrap_or_default()
             .contains("worker node 3"));
 
+        // Never advice this server cannot follow: a control-plane profile
+        // runs no databases at all.
+        assert!(!capability
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("control plane"));
+
+        // A worker PostgreSQL is probed, not described here.
         let mut postgres = service("postgres", "standalone");
         postgres.node_id = Some(3);
-        let capability = worker_capability(&postgres).expect("a worker database");
-        assert_eq!(capability.engine, "postgres_workload_job");
-        assert_eq!(capability.artifact, "logical_pg_dumpall");
+        assert!(worker_capability(&postgres).is_none());
 
         let mut storage = service("rustfs", "standalone");
         storage.node_id = Some(3);
@@ -488,6 +555,48 @@ mod tests {
         assert_eq!(capability.artifact, "object_set");
 
         assert!(worker_capability(&service("redis", "standalone")).is_none());
+    }
+
+    /// Parity (ADR-091): a worker PostgreSQL whose agent finds WAL-G reports
+    /// exactly what a local one does, so the console's "not available"
+    /// notice goes away; without WAL-G it says what to change on the worker,
+    /// never to move the service.
+    #[test]
+    fn a_worker_postgres_reports_the_local_engine_when_its_agent_finds_walg() {
+        let mut worker = service("postgres", "standalone");
+        worker.node_id = Some(3);
+        let local = service("postgres", "standalone");
+        assert_eq!(
+            worker_postgres_capability(&worker, 3, ToolProbe::Available),
+            classify_capability(&local, ToolProbe::Available)
+        );
+
+        let missing = worker_postgres_capability(&worker, 3, ToolProbe::Missing);
+        assert!(!missing.cloud_backup_compatible);
+        assert!(missing.verified);
+        assert_eq!(missing.engine, "postgres_workload_job");
+        let remediation = missing.remediation.unwrap_or_default();
+        assert!(
+            remediation.contains("WAL-G PostgreSQL image"),
+            "{remediation}"
+        );
+        assert!(!remediation.contains("control plane"), "{remediation}");
+        assert_eq!(missing.recommended_image, None);
+
+        let unverified = worker_postgres_capability(
+            &worker,
+            3,
+            ToolProbe::Unverified(UnverifiedCause::Unavailable),
+        );
+        assert!(!unverified.verified);
+        assert!(unverified
+            .reason
+            .unwrap_or_default()
+            .contains("worker node 3"));
+        assert!(!unverified
+            .remediation
+            .unwrap_or_default()
+            .contains("control plane"));
     }
 
     #[test]

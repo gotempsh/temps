@@ -478,6 +478,61 @@ pub struct RemoteServiceRestoreResponse {
     pub buckets: Vec<String>,
 }
 
+/// `POST /agent/services/postgres/walg-backup`: a WAL-G base backup of a
+/// PostgreSQL service on the node that runs it, by the control plane's own
+/// engine (ADR-091). Continuous archiving is turned on (or its settings file
+/// refreshed) first, exactly as on the control plane.
+///
+/// Names no command, image, host or path: the container follows from the
+/// service's name, the WAL-G prefix from the bucket, `bucket_path` and the
+/// service's name, the commands are fixed in the engine.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresWalgBackupRequest {
+    pub service_id: i32,
+    /// The node the service runs on, recorded on a recreated container's
+    /// placement.
+    pub node_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+    /// The backup's id, recorded in WAL-G's sentinel to find it again.
+    pub backup_uuid: String,
+    /// Whether the caller confirmed restarting PostgreSQL, which turning
+    /// archiving on needs while `archive_mode` is off.
+    pub allow_restart: bool,
+}
+
+/// What a [`PostgresWalgBackupRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PostgresWalgBackupResult {
+    /// The base backup was pushed.
+    Completed {
+        /// PostgreSQL was restarted in a recreated container to turn
+        /// archiving on; its data was verified to be the same cluster first.
+        restarted: bool,
+        /// The end of `wal-g backup-push`'s output, where it names the backup.
+        stdout: String,
+        stderr: String,
+        /// `pg_current_wal_lsn()` after the backup, when it could be read.
+        lsn: Option<String>,
+    },
+    /// Nothing was changed and retrying cannot change that: a restart was
+    /// needed and not confirmed, or the recreate guard refused.
+    Refused { reason: String },
+    /// The backup failed; a retry may succeed.
+    Failed { reason: String },
+}
+
+/// Runs once between creating a replacement container and starting it, with
+/// its id (the agent joins it to the overlay there). Shared, unlike
+/// [`AfterCreate`], because an engine may recreate more than once.
+pub type RecreateHook =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Where on its node an instance is attached. The only part of a database
 /// request that differs by node, on purpose.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -683,6 +738,19 @@ pub trait NodeServiceRuntime: Send + Sync {
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
     ) -> Result<RemoteServiceRestoreResponse, NodeServiceError>;
+
+    /// Run the control plane's WAL-G base backup on this node (see
+    /// [`PostgresWalgBackupRequest`]). A recreate that turns archiving on
+    /// rebuilds the running container's own specification, attached as
+    /// `node` says, with `after_create` between create and start.
+    async fn postgres_walg_backup(
+        &self,
+        request: PostgresWalgBackupRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgBackupResult, NodeServiceError>;
 }
 
 #[cfg(test)]

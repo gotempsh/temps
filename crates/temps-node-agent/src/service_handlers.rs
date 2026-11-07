@@ -895,6 +895,21 @@ async fn pull_service_image(docker: &bollard::Docker, image: &str) -> Result<(),
     Ok(())
 }
 
+/// Where a database container this agent creates or recreates is attached:
+/// ports on this node's bind address, the overlay's resolver when it is up.
+pub(crate) fn node_attachment(state: &AgentState, network: Option<String>) -> NodeAttachment {
+    NodeAttachment {
+        host_ip: state.host_bind_address(),
+        network,
+        dns: state
+            .overlay_bridge_address
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]))
+            .map(temps_deployer::docker::dns_with_fallback),
+    }
+}
+
 /// Create (or recreate) a database container from its admitted workload
 /// spec (ADR-055 Phase 4, `enforce` mode).
 ///
@@ -997,16 +1012,7 @@ pub async fn create_service_workload(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
 
-    let node = NodeAttachment {
-        host_ip: state.host_bind_address(),
-        network: request.network.clone(),
-        dns: state
-            .overlay_bridge_address
-            .read()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]))
-            .map(temps_deployer::docker::dns_with_fallback),
-    };
+    let node = node_attachment(&state, request.network.clone());
     let attach_overlay: temps_service_protocol::AfterCreate<'_> = Box::new(|id: String| {
         Box::pin(async move {
             if let Err(e) = attach_to_overlay_if_present(docker, &id).await {
@@ -2757,7 +2763,7 @@ fn build_s3_restore_env(request: &ServiceRestoreRequest) -> HashMap<String, Stri
 /// `temps-app-network` (so existing single-host code paths keep working)
 /// AND `temps-overlay` (so cross-node DNS records can be written and
 /// apps anywhere on the overlay can reach the container by FQDN VIP).
-async fn attach_to_overlay_if_present(
+pub(crate) async fn attach_to_overlay_if_present(
     docker: &bollard::Docker,
     container_id: &str,
 ) -> std::result::Result<(), bollard::errors::Error> {
@@ -2806,7 +2812,7 @@ async fn attach_to_overlay_if_present(
 /// needs that PID to enter the netns.
 ///
 /// Best-effort: any failure is logged and swallowed.
-async fn install_overlay_peer_routes_after_start(
+pub(crate) async fn install_overlay_peer_routes_after_start(
     docker: &bollard::Docker,
     container_id: &str,
     shared_peers: &crate::network_sync::SharedPeers,

@@ -12,7 +12,8 @@
 //! | `service_type` | `topology`   | WAL-G available? | engine key          |
 //! |----------------|--------------|------------------|---------------------|
 //! | `"postgres"`   | `"cluster"`  | (always WAL-G)   | `"postgres_cluster"` |
-//! | `"postgres"`   | standalone, on a worker | –       | `"postgres_workload_job"` |
+//! | `"postgres"`   | standalone, on a worker | yes (asked of its agent) | `"postgres_walg"` |
+//! | `"postgres"`   | standalone, on a worker | no      | `"postgres_workload_job"` |
 //! | `"postgres"`   | other        | yes              | `"postgres_walg"`   |
 //! | `"postgres"`   | other        | no               | `"postgres_pgdump"` |
 //! | `"redis"` / `"mongodb"` / `"mariadb"` / storage | standalone, on a worker | – | `"worker_agent"` |
@@ -23,16 +24,63 @@
 //! | `"s3"` / `"minio"` / `"blob"` | any | –       | `"s3_mirror"`       |
 //! | anything else  | –            | –                | `Err(Unsupported)`  |
 //!
-//! Every service on a worker node is backed up on that node: PostgreSQL by a
-//! job (`workload_job`), the others by the node's agent (`worker_agent`).
-//! The local engines only reach containers on this host's Docker.
+//! Every service on a worker node is backed up on that node. A PostgreSQL
+//! service on a WAL-G image takes the same engine as on the control plane,
+//! whose container steps its node's agent runs (ADR-091); without WAL-G it
+//! takes a dump job (`workload_job`). The others are backed up by the node's
+//! agent (`worker_agent`).
 //!
-//! The WAL-G and PITR-tool probes inspect a container on this host's Docker.
-//! [`resolve_engine_key_on_this_host`] opens the daemon only for those, so a
-//! server without one (`--profile control-plane`) still resolves every engine
-//! that needs no local probe, including a worker database's job.
+//! The WAL-G and PITR-tool probes inspect a container on this host's Docker,
+//! or, for a worker's PostgreSQL, ask its node's agent.
+//! [`resolve_engine_key_on_this_host`] opens the local daemon only for a
+//! local probe, so a server without one (`--profile control-plane`) still
+//! resolves every worker service.
 
+use async_trait::async_trait;
 use thiserror::Error;
+
+/// Asks a worker node whether a tool exists in one of its containers.
+#[async_trait]
+pub trait WorkerToolProbe: Send + Sync {
+    /// Whether `wal-g` runs in `container_name` on worker `node_id`: the
+    /// check [`container_has_walg`] runs on this host. `false` on any error,
+    /// like that one.
+    async fn worker_has_walg(&self, node_id: i32, container_name: &str) -> bool;
+}
+
+/// How long the agent's WAL-G check may take, as the local one.
+const WORKER_WALG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[async_trait]
+impl WorkerToolProbe for temps_providers::ExternalServiceManager {
+    async fn worker_has_walg(&self, node_id: i32, container_name: &str) -> bool {
+        let probe = self.exec_in_worker_service(
+            node_id,
+            container_name,
+            vec!["which".to_string(), "wal-g".to_string()],
+        );
+        match tokio::time::timeout(WORKER_WALG_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(exit_code)) => exit_code == 0,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    node_id,
+                    container = container_name,
+                    %error,
+                    "Could not ask the node's agent whether WAL-G is installed"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    node_id,
+                    container = container_name,
+                    "The node's agent did not answer whether WAL-G is installed in time"
+                );
+                false
+            }
+        }
+    }
+}
 
 /// Error returned by [`resolve_engine_key`] when no engine can be selected.
 #[derive(Error, Debug)]
@@ -71,6 +119,10 @@ pub enum ResolveEngineError {
 enum EngineChoice {
     Known(&'static str),
     ProbePostgres,
+    /// A standalone PostgreSQL on worker `node_id`: its agent is asked.
+    ProbeWorkerPostgres {
+        node_id: i32,
+    },
     ProbeMariadb,
 }
 
@@ -82,12 +134,13 @@ fn engine_choice(
             if service.topology.as_str() == "cluster" {
                 return Ok(EngineChoice::Known("postgres_cluster"));
             }
-            // ADR-055 Phase 9: a standalone database on a worker node is
-            // backed up by a job on that node, through its agent. Its
-            // container is not on this host's Docker, so probing it here
-            // could only miss.
+            // A standalone database on a worker node is backed up on that
+            // node. Its container is not on this host's Docker, so the
+            // WAL-G check asks the node's agent.
             if super::workload_job::takes_job_path(service) {
-                return Ok(EngineChoice::Known(super::workload_job::ENGINE_KEY));
+                if let Some(node_id) = super::workload_job::worker_node(service) {
+                    return Ok(EngineChoice::ProbeWorkerPostgres { node_id });
+                }
             }
             Ok(EngineChoice::ProbePostgres)
         }
@@ -113,9 +166,14 @@ fn engine_choice(
 /// when it cannot.
 pub async fn resolve_engine_key_on_this_host(
     service: &temps_entities::external_services::Model,
+    workers: &dyn WorkerToolProbe,
 ) -> Result<&'static str, ResolveEngineError> {
-    if let EngineChoice::Known(key) = engine_choice(service)? {
-        return Ok(key);
+    match engine_choice(service)? {
+        EngineChoice::Known(key) => return Ok(key),
+        EngineChoice::ProbeWorkerPostgres { node_id } => {
+            return Ok(worker_postgres_engine(service, node_id, workers).await)
+        }
+        EngineChoice::ProbePostgres | EngineChoice::ProbeMariadb => {}
     }
     let docker = bollard::Docker::connect_with_local_defaults().map_err(|error| {
         ResolveEngineError::LocalDockerUnavailable {
@@ -124,7 +182,24 @@ pub async fn resolve_engine_key_on_this_host(
             reason: error.to_string(),
         }
     })?;
-    resolve_engine_key(service, &docker).await
+    resolve_engine_key(service, &docker, workers).await
+}
+
+/// The engine of a standalone PostgreSQL on a worker: WAL-G as on the
+/// control plane when its image has it, else the node's dump job.
+async fn worker_postgres_engine(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    workers: &dyn WorkerToolProbe,
+) -> &'static str {
+    if workers
+        .worker_has_walg(node_id, &service_container_name(service))
+        .await
+    {
+        super::postgres_walg::ENGINE_KEY
+    } else {
+        super::workload_job::ENGINE_KEY
+    }
 }
 
 /// Resolve the engine key for a given external service.
@@ -138,9 +213,13 @@ pub async fn resolve_engine_key_on_this_host(
 pub async fn resolve_engine_key(
     service: &temps_entities::external_services::Model,
     docker: &bollard::Docker,
+    workers: &dyn WorkerToolProbe,
 ) -> Result<&'static str, ResolveEngineError> {
     match engine_choice(service)? {
         EngineChoice::Known(key) => Ok(key),
+        EngineChoice::ProbeWorkerPostgres { node_id } => {
+            Ok(worker_postgres_engine(service, node_id, workers).await)
+        }
         // Probe for WAL-G in the running container. Container naming must
         // match the legacy provider's `get_container_name()` —
         // `postgres-{name}` for standalone Postgres. Using a different
@@ -319,6 +398,69 @@ pub(crate) async fn container_has_mariadb_pitr_tools(
 mod tests {
     use super::*;
 
+    /// A fleet whose agents find no WAL-G, or cannot be asked.
+    struct NoWorkers;
+
+    #[async_trait]
+    impl WorkerToolProbe for NoWorkers {
+        async fn worker_has_walg(&self, _node_id: i32, _container_name: &str) -> bool {
+            false
+        }
+    }
+
+    /// A fleet whose agents find WAL-G, recording what they were asked.
+    #[derive(Default)]
+    struct WalgWorkers(std::sync::Mutex<Vec<(i32, String)>>);
+
+    #[async_trait]
+    impl WorkerToolProbe for WalgWorkers {
+        async fn worker_has_walg(&self, node_id: i32, container_name: &str) -> bool {
+            self.0
+                .lock()
+                .expect("asked")
+                .push((node_id, container_name.to_string()));
+            true
+        }
+    }
+
+    /// Parity (ADR-091): a PostgreSQL on a WAL-G image takes the same engine
+    /// on a worker as on the control plane, decided by the same check run by
+    /// its node's agent in the service's container; without WAL-G, the
+    /// worker's dump job. No local Docker is opened either way.
+    #[tokio::test]
+    async fn a_worker_postgres_with_walg_takes_the_control_plane_engine() {
+        let mut service = make_service("postgres", "standalone");
+        service.node_id = Some(3);
+        let workers = WalgWorkers::default();
+        assert_eq!(
+            resolve_engine_key_on_this_host(&service, &workers)
+                .await
+                .ok(),
+            Some(super::super::postgres_walg::ENGINE_KEY)
+        );
+        assert_eq!(
+            *workers.0.lock().expect("asked"),
+            vec![(3, "postgres-test-svc".to_string())]
+        );
+        assert_eq!(
+            resolve_engine_key_on_this_host(&service, &NoWorkers)
+                .await
+                .ok(),
+            Some(super::super::workload_job::ENGINE_KEY)
+        );
+        // A cluster member is never asked: clusters keep their engine.
+        let mut cluster = make_service("postgres", "cluster");
+        cluster.node_id = Some(3);
+        let workers = WalgWorkers::default();
+        assert_eq!(
+            resolve_engine_key_on_this_host(&cluster, &workers)
+                .await
+                .ok(),
+            Some("postgres_cluster")
+        );
+        assert!(workers.0.lock().expect("asked").is_empty());
+    }
+
     fn make_service(
         service_type: &str,
         topology: &str,
@@ -368,7 +510,7 @@ mod tests {
                 let mut svc = make_service("postgres", "standalone");
                 svc.node_id = Some(3);
                 svc.workload_mode = ServiceWorkloadMode::Enforce;
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(
                     matches!(result, Ok("postgres_workload_job")),
                     "got: {:?}",
@@ -377,7 +519,7 @@ mod tests {
                 // So is one in the default mode: its container is on the
                 // worker, never on this host's Docker.
                 svc.workload_mode = ServiceWorkloadMode::Legacy;
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(
                     matches!(result, Ok("postgres_workload_job")),
                     "got: {:?}",
@@ -396,8 +538,17 @@ mod tests {
         worker_postgres.node_id = Some(3);
         let mut cluster = make_service("postgres", "cluster");
         cluster.node_id = Some(3);
+        assert!(matches!(
+            engine_choice(&worker_postgres),
+            Ok(EngineChoice::ProbeWorkerPostgres { node_id: 3 })
+        ));
+        assert_eq!(
+            resolve_engine_key_on_this_host(&worker_postgres, &NoWorkers)
+                .await
+                .ok(),
+            Some("postgres_workload_job")
+        );
         for (service, expected) in [
-            (worker_postgres, "postgres_workload_job"),
             (cluster, "postgres_cluster"),
             (make_service("redis", "standalone"), "redis"),
             (make_service("mongodb", "standalone"), "mongodb"),
@@ -411,7 +562,9 @@ mod tests {
                 service.node_id
             );
             assert_eq!(
-                resolve_engine_key_on_this_host(&service).await.ok(),
+                resolve_engine_key_on_this_host(&service, &NoWorkers)
+                    .await
+                    .ok(),
                 Some(expected)
             );
         }
@@ -436,7 +589,9 @@ mod tests {
             let mut service = make_service(service_type, "standalone");
             service.node_id = Some(3);
             assert_eq!(
-                resolve_engine_key_on_this_host(&service).await.ok(),
+                resolve_engine_key_on_this_host(&service, &NoWorkers)
+                    .await
+                    .ok(),
                 Some(super::super::worker_agent::ENGINE_KEY),
                 "{service_type} on a worker"
             );
@@ -464,7 +619,7 @@ mod tests {
                     return; // no Docker available in test env, skip
                 }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(matches!(result, Ok("redis")), "got: {:?}", result);
             });
     }
@@ -482,7 +637,7 @@ mod tests {
                     return;
                 }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(matches!(result, Ok("mongodb")), "got: {:?}", result);
             });
     }
@@ -500,7 +655,7 @@ mod tests {
                     return;
                 }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(matches!(result, Ok("s3_mirror")), "got: {:?}", result);
             });
     }
@@ -518,7 +673,7 @@ mod tests {
                     return;
                 }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(matches!(result, Ok("s3_mirror")), "got: {:?}", result);
             });
     }
@@ -536,7 +691,7 @@ mod tests {
                     return;
                 }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(
                     matches!(result, Ok("postgres_cluster")),
                     "got: {:?}",
@@ -560,7 +715,7 @@ mod tests {
                     return;
                 }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(matches!(result, Ok("mariadb_dump")), "got: {:?}", result);
             });
     }
@@ -576,7 +731,7 @@ mod tests {
                 let docker = bollard::Docker::connect_with_local_defaults();
                 if docker.is_err() { return; }
                 let docker = docker.unwrap();
-                let result = resolve_engine_key(&svc, &docker).await;
+                let result = resolve_engine_key(&svc, &docker, &NoWorkers).await;
                 assert!(matches!(result, Err(ResolveEngineError::Unsupported { service_type, .. }) if service_type == "elasticsearch"));
             });
     }

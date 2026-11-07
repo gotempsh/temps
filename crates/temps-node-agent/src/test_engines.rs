@@ -34,6 +34,15 @@ pub(crate) struct StubRuntime {
     pub(crate) admitted: Mutex<Vec<serde_json::Value>>,
     /// The published address each runtime provisioning was given.
     pub(crate) provisioned_through: Mutex<Vec<Option<std::net::IpAddr>>>,
+    /// The WAL-G base backups asked for, with the attachment a recreate
+    /// would use and the published address.
+    pub(crate) walg_backups: Mutex<
+        Vec<(
+            temps_service_protocol::PostgresWalgBackupRequest,
+            temps_service_protocol::NodeAttachment,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -148,6 +157,21 @@ impl NodeServiceRuntime for StubRuntime {
         _published_address: Option<std::net::IpAddr>,
     ) -> Result<temps_service_protocol::RemoteServiceRestoreResponse, NodeServiceError> {
         Err(not_available("restore_service"))
+    }
+
+    async fn postgres_walg_backup(
+        &self,
+        request: temps_service_protocol::PostgresWalgBackupRequest,
+        _docker: Arc<Docker>,
+        node: temps_service_protocol::NodeAttachment,
+        _after_create: temps_service_protocol::RecreateHook,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgBackupResult, NodeServiceError> {
+        self.walg_backups
+            .lock()
+            .expect("walg_backups")
+            .push((request, node, published_address));
+        Err(not_available("postgres_walg_backup"))
     }
 }
 

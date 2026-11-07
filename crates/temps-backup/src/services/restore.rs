@@ -3349,8 +3349,8 @@ fn job_restore_supported(
         return Err(RestoreError::Validation {
             message: format!(
                 "Database {} ('{}') runs on worker node {node}, where restores run as a job that \
-                 applies a dump in place; restore mode '{}' is not available there. Restore in \
-                 place, or move the database to the control plane first",
+                 applies a dump in place; restore mode '{}' is not available there yet. Restore \
+                 in place",
                 target.id,
                 target.name,
                 mode.as_str()
@@ -3361,7 +3361,8 @@ fn job_restore_supported(
         return Err(RestoreError::Validation {
             message: format!(
                 "Database {} ('{}') runs on worker node {node}, where restores apply a pg_dumpall \
-                 dump (`.sql.gz`); backup '{backup_location}' is not one",
+                 dump (`.sql.gz`) for now; backup '{backup_location}' is not one (restoring a \
+                 WAL-G backup on a worker node is not available yet)",
                 target.id, target.name
             ),
         });
@@ -3396,7 +3397,7 @@ fn agent_restore_supported(
             message: format!(
                 "Service {} ('{}') runs on worker node {node}, where restores run on the node and \
                  apply a backup in place; restore mode '{}' is not available there yet. Restore \
-                 in place, or restore into a new service on the control plane",
+                 in place",
                 target.id,
                 target.name,
                 mode.as_str()

@@ -645,6 +645,54 @@ impl ExternalServiceManager {
             .await
     }
 
+    /// Take a WAL-G base backup of PostgreSQL service `service_id`, which runs
+    /// on a worker node, with the control plane's own engine on that node
+    /// (ADR-091). Credentials travel sealed.
+    pub async fn walg_backup_worker_postgres(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+        allow_restart: bool,
+    ) -> Result<crate::remote_service_client::PostgresWalgBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "WAL-G backup")
+            .await?;
+        let result = self
+            .get_remote_client(node_id)
+            .await?
+            .postgres_walg_backup(&crate::remote_service_client::PostgresWalgBackupRequest {
+                service_id,
+                node_id,
+                service_config,
+                destination,
+                bucket_path,
+                backup_uuid,
+                allow_restart,
+            })
+            .await?;
+        // A recreated container has a new address on the node's networks.
+        if matches!(
+            result,
+            crate::remote_service_client::PostgresWalgBackupResult::Completed {
+                restarted: true,
+                ..
+            }
+        ) {
+            if let Err(error) = self.register_standalone_service_dns(service_id).await {
+                warn!(
+                    service_id,
+                    node_id,
+                    error = %error,
+                    "PostgreSQL was recreated on its node to turn WAL archiving on, but its \
+                     internal DNS record could not be republished"
+                );
+            }
+        }
+        Ok(result)
+    }
+
     /// Restore service `service_id`, which runs on a worker node, in place on
     /// that node from the backup at `location` in `source`.
     pub async fn restore_worker_service(

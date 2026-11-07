@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
     AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, NodeAttachment,
-    NodeServiceError, NodeServiceRuntime, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    NodeServiceError, NodeServiceRuntime, PostgresWalgBackupRequest, PostgresWalgBackupResult,
+    RecreateHook, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
     RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthResponse,
     ServiceConfig, ServiceType,
 };
@@ -168,6 +169,29 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         externalsvc::worker_data::restore_service_on_node(request, docker, published_address)
             .await
             .map_err(engine_error)
+    }
+
+    async fn postgres_walg_backup(
+        &self,
+        request: PostgresWalgBackupRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgBackupResult, NodeServiceError> {
+        let recreate = externalsvc::postgres::NodeRecreate {
+            service_id: request.service_id,
+            node_id: request.node_id,
+            attachment: node,
+            after_create,
+        };
+        Ok(externalsvc::postgres_walg_backup::walg_base_backup_on_node(
+            request,
+            docker,
+            recreate,
+            published_address,
+        )
+        .await)
     }
 }
 

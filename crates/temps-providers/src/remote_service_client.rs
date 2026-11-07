@@ -17,10 +17,11 @@ pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCr
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
-    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
-    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, RemoteHealthProbeRequest,
+    RemoteHealthProbeResponse, RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse,
+    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
+    RemoteServiceRestoreResponse, RemoteWalHealthRequest, RemoteWalHealthResponse,
+    ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -472,6 +473,30 @@ impl RemoteServiceClient {
         );
         self.agent_post_with_timeout(
             "/agent/services/data-restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Take a WAL-G base backup of a PostgreSQL service on the worker that
+    /// runs it, with the control plane's own engine (ADR-091). The
+    /// destination's credentials and the service's travel only in the
+    /// sealed body.
+    pub async fn postgres_walg_backup(
+        &self,
+        request: &PostgresWalgBackupRequest,
+    ) -> Result<PostgresWalgBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            allow_restart = request.allow_restart,
+            "Taking a WAL-G base backup of a PostgreSQL service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-backup",
             request,
             DATA_OPERATION_TIMEOUT,
         )
@@ -1755,6 +1780,100 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("worker-1"), "{message}");
         assert!(message.contains("/agent/services/data-backup"), "{message}");
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A WAL-G base backup reaches the node sealed, with the destination's
+    /// credentials and nothing the node could run, and the engine's outcome
+    /// comes back as it is. An agent without the route is told to update.
+    #[tokio::test]
+    async fn a_walg_backup_is_sealed_to_the_node_and_its_outcome_returned() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgBackupRequest =
+                open_for_test(&headers, "/agent/services/postgres/walg-backup", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(request.node_id, 2);
+            assert_eq!(request.bucket_path, "base");
+            assert!(!request.allow_restart);
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "data": {
+                    "status": "completed",
+                    "restarted": false,
+                    "stdout": "",
+                    "stderr": "INFO: Wrote backup with name base_000000010000000000000003",
+                    "lsn": "0/3000060"
+                },
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/walg-backup", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let request = PostgresWalgBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: ServiceConfig {
+                name: "orders".to_string(),
+                service_type: ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "password": "db-password"}),
+            },
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-1".to_string(),
+            allow_restart: false,
+        };
+        let outcome = client(address)
+            .postgres_walg_backup(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgBackupResult::Completed {
+                restarted: false,
+                stdout: String::new(),
+                stderr: "INFO: Wrote backup with name base_000000010000000000000003".to_string(),
+                lsn: Some("0/3000060".to_string()),
+            }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_walg_backup(&request)
+            .await
+            .expect_err("an older agent cannot take a WAL-G backup");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/walg-backup"),
+            "{message}"
+        );
         assert!(message.contains("Update the node's agent"), "{message}");
     }
 

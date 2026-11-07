@@ -33,6 +33,7 @@ temps-alarms = { path = "../temps-alarms" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 serde = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }

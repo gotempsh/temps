@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::engines::dispatch::{resolve_engine_key_on_this_host, ResolveEngineError};
+use crate::engines::dispatch::ResolveEngineError;
 use crate::handlers::audit::{
     AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,
     BackupScheduleStatusChangedAudit, BackupScheduleUpdatedAudit, ExternalServiceBackupRunAudit,
@@ -3255,9 +3255,11 @@ async fn run_external_service_backup(
     // All three inserts are atomic: if any fails, the entire operation is rolled
     // back and the handler returns an error. No orphan rows are created.
     // Opens this host's Docker only when the choice inspects a local
-    // container: a database on a worker node is backed up by a job on its
-    // node, and needs none.
-    let engine_key = resolve_engine_key_on_this_host(&service)
+    // container: a database on a worker node is checked by its node's
+    // agent, and needs none.
+    let engine_key = app_state
+        .backup_service
+        .resolve_engine_key(&service)
         .await
         .map_err(|e| {
             error!(service_id = id, error = %e, "run_external_service_backup: engine resolution failed");
@@ -3393,7 +3395,9 @@ async fn external_service_backup_preflight(
         .get_external_service(id)
         .await
         .map_err(Problem::from)?;
-    let engine_key = resolve_engine_key_on_this_host(&service)
+    let engine_key = app_state
+        .backup_service
+        .resolve_engine_key(&service)
         .await
         .map_err(Problem::from)?;
     let reason = app_state

@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
-    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
-    RemoteServiceRestoreResponse,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, RecreateHook, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
 };
 use tokio::sync::Semaphore;
 
@@ -189,6 +189,128 @@ pub async fn data_restore(
     }
 }
 
+/// Take a WAL-G base backup of a PostgreSQL service this node runs, with the
+/// control plane's own engine (ADR-091): continuous archiving is turned on
+/// or refreshed first, then `wal-g backup-push` runs in the container.
+///
+/// Turning archiving on while `archive_mode` is off restarts PostgreSQL in a
+/// recreated container, only when the request says the restart was
+/// confirmed. The replacement is the running container's own specification
+/// with `archive_mode` on, attached to this node as every container this
+/// agent creates, under the recreate guard. Engine outcomes come back as
+/// 200 with `completed`, `refused` (retrying cannot help) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/postgres/walg-backup",
+    request_body = PostgresWalgBackupRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<PostgresWalgBackupResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Backup deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn postgres_walg_backup(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<PostgresWalgBackupRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(_permit) = admit(&DATA_OPERATIONS) else {
+        return busy("back up", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("back up", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.destination.bucket,
+        allow_restart = request.allow_restart,
+        "Taking a WAL-G base backup of a service on this node"
+    );
+    let node = crate::service_handlers::node_attachment(
+        &state,
+        Some(temps_core::NETWORK_NAME.to_string()),
+    );
+    let overlay_docker = docker.clone();
+    let after_create: RecreateHook = Arc::new(move |id: String| {
+        let docker = overlay_docker.clone();
+        Box::pin(async move {
+            if let Err(error) =
+                crate::service_handlers::attach_to_overlay_if_present(&docker, &id).await
+            {
+                tracing::warn!(
+                    container = %id,
+                    %error,
+                    "Failed to attach a recreated service container to the overlay; continuing \
+                     single-host"
+                );
+            }
+        })
+    });
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let outcome = match tokio::time::timeout(
+        DATA_OPERATION_DEADLINE,
+        state.service_runtime.postgres_walg_backup(
+            request,
+            Arc::new(docker.clone()),
+            node,
+            after_create,
+            published_address,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            tracing::error!(service = %service, %error, "WAL-G base backup could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAL-G base backup of service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Err(_) => return deadline_exceeded("WAL-G base backup", &service),
+    };
+    match &outcome {
+        PostgresWalgBackupResult::Completed { restarted, .. } => {
+            if *restarted {
+                // A recreated container starts without the routes to the
+                // other workers' overlay ranges. Its name is the managed
+                // `postgres-<service>`, the only one the engine backs up here.
+                let container = format!("postgres-{service}");
+                if let Err(error) =
+                    crate::service_handlers::install_overlay_peer_routes_after_start(
+                        docker,
+                        &container,
+                        &state.overlay_peers,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        container = %container,
+                        %error,
+                        "Failed to install overlay peer routes after recreating a service"
+                    );
+                }
+            }
+            tracing::info!(service = %service, restarted, "WAL-G base backup completed");
+        }
+        PostgresWalgBackupResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "WAL-G base backup refused");
+        }
+        PostgresWalgBackupResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "WAL-G base backup failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +325,10 @@ mod tests {
         Router::new()
             .route("/agent/services/data-backup", post(data_backup))
             .route("/agent/services/data-restore", post(data_restore))
+            .route(
+                "/agent/services/postgres/walg-backup",
+                post(postgres_walg_backup),
+            )
             .with_state(state)
     }
 
@@ -298,6 +424,67 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("Restore of service 'cache'"));
+    }
+
+    fn walg_body() -> serde_json::Value {
+        serde_json::json!({
+            "service_id": 8,
+            "node_id": 2,
+            "service_config": {
+                "name": "orders",
+                "service_type": "postgres",
+                "version": null,
+                "parameters": {"host": "localhost", "port": "5432"}
+            },
+            "destination": backup_body(None)["destination"].clone(),
+            "bucket_path": "base",
+            "backup_uuid": "u-1",
+            "allow_restart": false
+        })
+    }
+
+    /// A WAL-G base backup names no command, image, path or attachment: the
+    /// engine runs on this node with the attachment every container this
+    /// agent creates gets, and a failure to run names the service.
+    #[tokio::test]
+    async fn a_walg_backup_runs_the_engine_with_this_nodes_attachment() {
+        for field in ["command", "image", "walg_prefix", "host_ip"] {
+            let mut body = walg_body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/postgres/walg-backup",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state.clone()),
+            "/agent/services/postgres/walg-backup",
+            walg_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("WAL-G base backup of service 'orders' could not run"),
+            "{error}"
+        );
+        let asked = runtime.walg_backups.lock().expect("walg_backups");
+        let [(request, node, _)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.service_id, 8);
+        assert!(!request.allow_restart);
+        assert_eq!(node.host_ip, state.host_bind_address());
+        assert_eq!(
+            node.network.as_deref(),
+            Some(temps_core::NETWORK_NAME.as_str())
+        );
     }
 
     /// A node runs a bounded number of backups and restores at once; one

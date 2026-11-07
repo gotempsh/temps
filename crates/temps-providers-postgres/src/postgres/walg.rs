@@ -356,16 +356,20 @@ impl PostgresService {
                     }
                     .into());
                 }
-                let replacement = self.replacement_storage(postgres_config)?;
-                crate::externalsvc::recreate_guard::preflight(
-                    &self.docker,
-                    crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
-                    &self.name,
-                    &self.get_container_name(),
-                    &replacement,
-                    "enabling WAL archiving",
-                )
-                .await?;
+                if let Some(node) = &self.node {
+                    self.node_archive_preflight(node, container_name).await?;
+                } else {
+                    let replacement = self.replacement_storage(postgres_config)?;
+                    crate::externalsvc::recreate_guard::preflight(
+                        &self.docker,
+                        crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
+                        &self.name,
+                        &self.get_container_name(),
+                        &replacement,
+                        "enabling WAL archiving",
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -494,16 +498,22 @@ impl PostgresService {
         // A backup's provider has no persistence path for a new published
         // port. Preserve this registered endpoint instead of silently choosing
         // a different port on a bind conflict; its data volume remains intact.
-        if let Err(e) = self
-            .recreate_container_guarded(
-                &self.docker,
-                postgres_config,
-                &limits,
-                true,
-                "enabling WAL archiving",
-            )
-            .await
-        {
+        // On a worker the replacement is the running container's own
+        // specification with archive_mode on (see `node_recreate`).
+        let recreated = match &self.node {
+            Some(node) => self.node_archive_recreate(node, container_name).await,
+            None => self
+                .recreate_container_guarded(
+                    &self.docker,
+                    postgres_config,
+                    &limits,
+                    true,
+                    "enabling WAL archiving",
+                )
+                .await
+                .map(|_| ()),
+        };
+        if let Err(e) = recreated {
             // The original container is back (or was never touched). Take
             // walg.env away again, or every later start would see "archiving
             // configured" and try the same recreate.
@@ -904,6 +914,14 @@ impl PostgresService {
         let postgres_config = self.get_postgres_config(service_config)?;
         if postgres_config.container_name.is_some() {
             return Ok(None);
+        }
+        if let Some(node) = &self.node {
+            let container_name = self.get_live_container_name(&postgres_config);
+            return match self.node_archive_preflight(node, &container_name).await {
+                Ok(()) => Ok(None),
+                Err(EngineError::RecreateGuard(e)) if e.is_refusal() => Ok(Some(e.to_string())),
+                Err(e) => Err(e),
+            };
         }
         let replacement = self.replacement_storage(&postgres_config)?;
         match crate::externalsvc::recreate_guard::preflight(

@@ -6,18 +6,18 @@
 //!
 //! ## Flow
 //!
-//! 1. Validate the external service + S3 source.
-//! 2. `docker exec wal-g backup-push $PGDATA` against the target Postgres
-//!    container. WAL-G uploads the base backup directly to S3 — no host
-//!    file involved.
+//! 1. Validate the external service + S3 source and its archive pin.
+//! 2. The node half
+//!    (`temps_providers::externalsvc::postgres_walg_backup`): turn
+//!    continuous archiving on (or refresh it), `wal-g backup-push $PGDATA`
+//!    in the container, read the WAL LSN. WAL-G uploads straight to S3.
 //! 3. Read the new backup's WAL-G stop-sentinel to obtain its compressed size.
-//! 4. Record the current WAL LSN via `pg_current_wal_lsn()` so PITR
-//!    restores have an anchor.
-//! 5. Write the `metadata.json` companion.
+//! 4. Write the `metadata.json` companion and record the WAL-G identity.
 //!
-//! Unlike the dump-and-upload engines, wal-g runs **inside** the target
-//! container (which has wal-g pre-installed). We can't use the one-shot
-//! Docker helper here — the work is `docker exec`, not `docker run`.
+//! The node half is one function. For a service on this host it runs here
+//! with this host's Docker; for a service on a worker node, that node's
+//! agent runs it with the node's Docker (ADR-091). Everything else, and so
+//! every artifact, is the same for both.
 
 use std::sync::Arc;
 
@@ -28,7 +28,11 @@ use temps_docker_util::{
     exec_capture, DockerUtilError, ExecCaptureOptions, ExitCodePolicy, OutputLimit,
     StreamErrorPolicy,
 };
-use tracing::{error, info, warn};
+use temps_providers::externalsvc::postgres_walg_backup::{
+    self as node_half, ArchiveRecreate, WalgBaseBackup, WalgBaseBackupError, WalgBaseBackupOutcome,
+};
+use temps_providers::remote_service_client::PostgresWalgBackupResult;
+use tracing::{info, warn};
 
 use super::dispatch::service_container_name;
 use super::v2_common;
@@ -40,7 +44,12 @@ pub(crate) const ENGINE_KEY: &str = "postgres_walg";
 pub struct PostgresWalgDeps {
     pub db: Arc<DatabaseConnection>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
-    pub docker: bollard::Docker,
+    /// This host's Docker, for services on this host. `None` on a server
+    /// without one (`--profile control-plane`), which backs up only
+    /// services on worker nodes.
+    pub docker: Option<bollard::Docker>,
+    /// Reaches a worker service's node through its agent.
+    pub manager: Arc<temps_providers::ExternalServiceManager>,
 }
 
 pub struct PostgresWalgEngine {
@@ -108,104 +117,15 @@ impl BackupEngine for PostgresWalgEngine {
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
 
         // WAL-G layout: <bucket_path>/external_services/postgres/<svc>/walg
-        let subpath_root = format!("external_services/postgres/{}", service.name);
-        let bucket_path_clean = s3_source.bucket_path.trim_matches('/');
-        let walg_prefix = if bucket_path_clean.is_empty() {
-            format!(
-                "s3://{}/{}/walg",
-                s3_source.bucket_name,
-                subpath_root.trim_matches('/'),
-            )
-        } else {
-            format!(
-                "s3://{}/{}/{}/walg",
-                s3_source.bucket_name,
-                bucket_path_clean,
-                subpath_root.trim_matches('/'),
-            )
-        };
-        let s3_list_prefix = if bucket_path_clean.is_empty() {
-            format!("{}/walg/", subpath_root.trim_matches('/'))
-        } else {
-            format!(
-                "{}/{}/walg/",
-                bucket_path_clean,
-                subpath_root.trim_matches('/'),
-            )
-        };
+        let walg_prefix = node_half::walg_prefix(
+            &s3_source.bucket_name,
+            &s3_source.bucket_path,
+            &service.name,
+        );
+        let s3_list_prefix = node_half::walg_key_prefix(&s3_source.bucket_path, &service.name);
 
         info!(backup_id, %walg_prefix, "PostgresWalgEngine: starting wal-g backup-push");
 
-        // ── Decrypt service config + S3 credentials ──────────────────────────
-        let config_json = deps
-            .encryption_service
-            .decrypt_string(service.config.as_deref().unwrap_or("{}"))
-            .unwrap_or_else(|_| "{}".to_string());
-        let pg = load_postgres_params(&config_json);
-
-        let access_key = deps
-            .encryption_service
-            .decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| BackupError::PermanentFailure {
-                reason: format!("decrypt access key: {}", e),
-            })?;
-        let secret_key = deps
-            .encryption_service
-            .decrypt_string(&s3_source.secret_key)
-            .map_err(|e| BackupError::PermanentFailure {
-                reason: format!("decrypt secret key: {}", e),
-            })?;
-
-        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
-
-        let container_name = service_container_name(&service);
-        let s3_credentials = temps_providers::externalsvc::S3Credentials {
-            access_key_id: access_key.clone(),
-            secret_key: secret_key.clone(),
-            session_token: session_token.clone(),
-            region: s3_source.region.clone(),
-            endpoint: s3_source.endpoint.clone(),
-            bucket_name: s3_source.bucket_name.clone(),
-            bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(true),
-        };
-        let container_endpoint = s3_credentials
-            .resolve_endpoint_for_container(&deps.docker, &container_name)
-            .await;
-
-        // ── Enable continuous WAL archiving BEFORE the base backup ──────────
-        // Must happen first, not after: `wal-g backup-push` ends with
-        // `pg_stop_backup()`, which force-completes the current WAL segment
-        // so the backup's checkpoint is recoverable -- but Postgres only
-        // marks a completed segment `.ready` for archiving if `archive_mode`
-        // is already on at that moment. Enabling archiving *after* the base
-        // backup doesn't retroactively archive that already-completed
-        // segment (no `.ready` marker was ever written for it), so a
-        // restore's `wal-g wal-fetch` finds nothing and Postgres fails to
-        // start with "could not locate required checkpoint record". Refuse
-        // backup-push if archiving cannot be enabled and verified rather than
-        // reporting an unrestorable base backup as completed.
-        //
-        // No-op after the first backup on a given service: `enable_continuous_archiving`
-        // checks whether archiving is already active before doing the
-        // (container-recreating) enable dance again.
-        let postgres_service = temps_providers::externalsvc::postgres::PostgresService::new(
-            service.name.clone(),
-            std::sync::Arc::new(deps.docker.clone()),
-        );
-        let service_config = temps_providers::externalsvc::ServiceConfig {
-            name: service.name.clone(),
-            service_type: temps_providers::externalsvc::ServiceType::Postgres,
-            version: None,
-            parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
-        };
-        // When archive_mode is off this restarts PostgreSQL in a recreated
-        // container. The provider refuses unless the new container mounts
-        // the same data and only reports success once it has verified the
-        // same cluster (system identifier, databases, roles) came back, so a
-        // base backup is never pushed from a freshly initialised, empty
-        // cluster (#1415).
-        //
         // A manual run records whether its caller confirmed a restart;
         // scheduled runs (no caller to ask) do not set it and may restart.
         let allow_restart = ctx
@@ -213,45 +133,34 @@ impl BackupEngine for PostgresWalgEngine {
             .get("allow_restart")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        if !allow_restart {
-            let probe = postgres_service
-                .backup_requires_restart(service_config.clone())
-                .await
-                .map_err(|error| error.to_string());
-            unconfirmed_restart_gate(service.id, &service.name, probe)?;
-        }
-        let archiving = postgres_service
-            .enable_continuous_archiving_reporting(
-                service_config,
-                &s3_credentials,
-                &walg_prefix,
-                // Enforced where the restart is decided, not only probed
-                // above: archiving can be turned off in between (an in-place
-                // restore finishing).
-                allow_restart,
-            )
-            .await
-            .map_err(|error| {
-                let reason = format!(
-                    "Cannot create a recoverable WAL-G backup for service {} ('{}'): continuous archiving could not be enabled and verified: {}",
-                    service.id, service.name, error
-                );
-                // A refusal is decided by the container's storage layout;
-                // retrying cannot change it, only repeat the refusal.
-                let refused = match &error {
-                    temps_providers::externalsvc::EngineError::RecreateGuard(guard) => {
-                        guard.is_refusal()
-                    }
-                    temps_providers::externalsvc::EngineError::RestartNotConfirmed(_) => true,
-                    _ => false,
-                };
-                if refused {
-                    BackupError::PermanentFailure { reason }
-                } else {
-                    BackupError::Failed { reason }
-                }
-            })?;
-        if archiving.restarted {
+
+        let outcome = match super::workload_job::worker_node(&service) {
+            Some(node_id) => {
+                backup_on_worker(
+                    &deps,
+                    ctx,
+                    &service,
+                    node_id,
+                    s3_source_id,
+                    &s3_source.bucket_path,
+                    &backup_uuid,
+                    allow_restart,
+                )
+                .await?
+            }
+            None => {
+                backup_on_this_host(
+                    &deps,
+                    ctx,
+                    &service,
+                    &s3_source,
+                    &backup_uuid,
+                    allow_restart,
+                )
+                .await?
+            }
+        };
+        if outcome.restarted {
             warn!(
                 backup_id,
                 service_id,
@@ -261,86 +170,13 @@ impl BackupEngine for PostgresWalgEngine {
             );
         }
 
-        // WAL-G memory tuning — see v1 notes. Defaults can OOM small containers
-        // because each in-flight tar buffer is held fully in RAM. These values
-        // cap peak RSS at roughly 4 × 128 MiB = 512 MiB which fits comfortably
-        // inside the default 1 GiB cgroup limit.
-        let mut walg_env: Vec<String> = vec![
-            format!("WALG_S3_PREFIX={}", walg_prefix),
-            format!("AWS_ACCESS_KEY_ID={}", access_key),
-            format!("AWS_SECRET_ACCESS_KEY={}", secret_key),
-            format!("AWS_REGION={}", s3_source.region),
-            format!("PGUSER={}", pg.username),
-            format!("PGPASSWORD={}", pg.password),
-            format!("PGDATABASE={}", pg.database),
-            "PGHOST=localhost".to_string(),
-            "PGPORT=5432".to_string(),
-            "WALG_UPLOAD_CONCURRENCY=4".to_string(),
-            "WALG_UPLOAD_DISK_CONCURRENCY=1".to_string(),
-            "WALG_UPLOAD_QUEUE=2".to_string(),
-            "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
-        ];
-        // Absent unless this source holds a temporary credential, so a
-        // long-lived one produces exactly the environment it did before.
-        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
-            session_token.as_deref(),
-        ));
-        walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
-        if let Some(ep) = container_endpoint {
-            let url = if ep.starts_with("http") {
-                ep
-            } else {
-                format!("http://{}", ep)
-            };
-            walg_env.push(format!("AWS_ENDPOINT={}", url));
-        }
-        if s3_source.force_path_style.unwrap_or(true) {
-            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
-        }
-
-        // ── docker exec wal-g backup-push ────────────────────────────────────
-        let exec_result = run_walg_exec(
-            &deps.docker,
-            &container_name,
-            "wal-g backup-push $PGDATA",
-            &walg_env,
-            &ctx.cancel,
-        )
-        .await?;
-        if exec_result.exit_code != 0 {
-            return Err(BackupError::Failed {
-                reason: format!(
-                    "wal-g backup-push exited with code {}. stderr: {}. stdout: {}",
-                    exec_result.exit_code,
-                    if exec_result.stderr.trim().is_empty() {
-                        "<empty>"
-                    } else {
-                        exec_result.stderr.trim()
-                    },
-                    if exec_result.stdout.trim().is_empty() {
-                        "<empty>"
-                    } else {
-                        exec_result.stdout.trim()
-                    },
-                ),
-            });
-        }
-        if !exec_result.stderr.trim().is_empty() {
-            info!(
-                backup_id,
-                container = %container_name,
-                "wal-g stderr (warnings): {}",
-                exec_result.stderr.trim(),
-            );
-        }
-
-        // ── Compute size + LSN ───────────────────────────────────────────────
+        // ── Compute size ─────────────────────────────────────────────────────
         let size_bytes = match load_backup_size_bytes(
             &s3_client,
             &s3_source.bucket_name,
             &s3_list_prefix,
-            &exec_result.stdout,
-            &exec_result.stderr,
+            &outcome.stdout,
+            &outcome.stderr,
             &backup_uuid,
         )
         .await
@@ -351,12 +187,6 @@ impl BackupEngine for PostgresWalgEngine {
                 None
             }
         };
-        let lsn = query_current_wal_lsn(&deps.docker, &container_name, &pg)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(backup_id, error = %e, "walg: could not query LSN");
-                String::new()
-            });
 
         // ── Metadata ─────────────────────────────────────────────────────────
         let metadata_key = format!("{}metadata.json", s3_list_prefix);
@@ -372,8 +202,8 @@ impl BackupEngine for PostgresWalgEngine {
             "lz4",
             Some(json!({
                 "backup_tool": "wal-g",
-                "database_restarted_to_enable_archiving": archiving.restarted,
-                "lsn": lsn,
+                "database_restarted_to_enable_archiving": outcome.restarted,
+                "lsn": outcome.lsn.unwrap_or_default(),
                 "service": { "id": service_id, "name": service.name },
             })),
         )
@@ -395,61 +225,159 @@ impl BackupEngine for PostgresWalgEngine {
     }
 }
 
-// ── Local helpers ────────────────────────────────────────────────────────────
-
-/// What to do with a run whose caller did not confirm a restart, given the
-/// probe of whether one is needed now. Only a probe that answered "restart
-/// needed" is final (the run would restart PostgreSQL unconfirmed). A probe
-/// that could not reach PostgreSQL (restarting, at its connection limit) is
-/// a transient outage and retries like any other.
-fn unconfirmed_restart_gate(
-    service_id: i32,
-    service_name: &str,
-    probe: Result<bool, String>,
-) -> Result<(), BackupError> {
-    match probe {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(BackupError::PermanentFailure {
+/// The node half, here, against this host's Docker.
+async fn backup_on_this_host(
+    deps: &PostgresWalgDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    s3_source: &temps_entities::s3_sources::Model,
+    backup_uuid: &str,
+    allow_restart: bool,
+) -> Result<WalgBaseBackupOutcome, BackupError> {
+    let Some(docker) = deps.docker.clone() else {
+        return Err(BackupError::PermanentFailure {
             reason: format!(
-                "Backup of service {service_id} ('{service_name}') would restart PostgreSQL to \
-                 turn WAL archiving on, and that was not confirmed when the backup was requested \
-                 (archiving was on then). Nothing was changed. Run the backup again and confirm \
-                 the restart"
+                "Service {} ('{}') runs on this server, which has no Docker daemon to run its \
+                 WAL-G backup in",
+                service.id, service.name
+            ),
+        });
+    };
+    let decrypt = |field: &str, value: &str| {
+        deps.encryption_service
+            .decrypt_string(value)
+            .map_err(|e| BackupError::PermanentFailure {
+                reason: format!("decrypt {field} of S3 source {}: {e}", s3_source.id),
+            })
+    };
+    let s3 = temps_providers::externalsvc::S3Credentials {
+        access_key_id: decrypt("access key", &s3_source.access_key_id)?,
+        secret_key: decrypt("secret key", &s3_source.secret_key)?,
+        session_token: v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?,
+        region: s3_source.region.clone(),
+        endpoint: s3_source.endpoint.clone(),
+        bucket_name: s3_source.bucket_name.clone(),
+        bucket_path: s3_source.bucket_path.clone(),
+        force_path_style: s3_source.force_path_style.unwrap_or(true),
+    };
+    let config_json = deps
+        .encryption_service
+        .decrypt_string(service.config.as_deref().unwrap_or("{}"))
+        .unwrap_or_else(|_| "{}".to_string());
+    let service_config = temps_providers::externalsvc::ServiceConfig {
+        name: service.name.clone(),
+        service_type: temps_providers::externalsvc::ServiceType::Postgres,
+        version: None,
+        parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
+    };
+    node_half::walg_base_backup(
+        Arc::new(docker),
+        WalgBaseBackup {
+            service_id: service.id,
+            container_name: service_container_name(service),
+            service_config,
+            s3,
+            backup_uuid: backup_uuid.to_string(),
+            allow_restart,
+        },
+        ArchiveRecreate::Provider,
+        &ctx.cancel,
+    )
+    .await
+    .map_err(backup_error)
+}
+
+/// The node half, on the worker that runs the service, by its agent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per input of the worker's request; a struct would only rename them"
+)]
+async fn backup_on_worker(
+    deps: &PostgresWalgDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    s3_source_id: i32,
+    bucket_path: &str,
+    backup_uuid: &str,
+    allow_restart: bool,
+) -> Result<WalgBaseBackupOutcome, BackupError> {
+    // Refuses an endpoint on this host's loopback, which the node cannot
+    // reach.
+    let target = super::workload_job::s3_target(
+        deps.db.as_ref(),
+        &deps.encryption_service,
+        s3_source_id,
+        service.id,
+        node_id,
+        "backup",
+    )
+    .await?;
+    let request = deps.manager.walg_backup_worker_postgres(
+        service.id,
+        super::worker_agent::destination(&target),
+        bucket_path.to_string(),
+        backup_uuid.to_string(),
+        allow_restart,
+    );
+    let result = tokio::select! {
+        // Dropping the request ends it on the node too.
+        _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
+        result = request => result,
+    }
+    .map_err(|e| BackupError::Failed {
+        reason: format!(
+            "WAL-G backup of service {} ('{}') on node {node_id}: {e}",
+            service.id, service.name
+        ),
+    })?;
+    worker_outcome(service, node_id, result)
+}
+
+/// A worker's answer, as the outcome or error of the same run here.
+fn worker_outcome(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    result: PostgresWalgBackupResult,
+) -> Result<WalgBaseBackupOutcome, BackupError> {
+    match result {
+        PostgresWalgBackupResult::Completed {
+            restarted,
+            stdout,
+            stderr,
+            lsn,
+        } => Ok(WalgBaseBackupOutcome {
+            restarted,
+            stdout,
+            stderr,
+            lsn,
+        }),
+        PostgresWalgBackupResult::Refused { reason } => Err(BackupError::PermanentFailure {
+            reason: format!(
+                "WAL-G backup of service {} ('{}') on node {node_id}: {reason}",
+                service.id, service.name
             ),
         }),
-        Err(error) => Err(BackupError::Failed {
+        PostgresWalgBackupResult::Failed { reason } => Err(BackupError::Failed {
             reason: format!(
-                "Could not check whether backing up service {service_id} ('{service_name}') \
-                 would restart PostgreSQL: {error}"
+                "WAL-G backup of service {} ('{}') on node {node_id}: {reason}",
+                service.id, service.name
             ),
         }),
     }
 }
-struct PgParams {
-    username: String,
-    password: String,
-    database: String,
-}
 
-fn load_postgres_params(config_json: &str) -> PgParams {
-    let params: Value = serde_json::from_str(config_json).unwrap_or_else(|_| json!({}));
-    PgParams {
-        username: params
-            .get("username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("postgres")
-            .to_string(),
-        password: params
-            .get("password")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        database: params
-            .get("database")
-            .or_else(|| params.get("db_name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("postgres")
-            .to_string(),
+/// The node half's error as the executor's: a refusal is final, a
+/// cancellation is a cancellation, the rest may succeed on a retry.
+fn backup_error(error: WalgBaseBackupError) -> BackupError {
+    match error {
+        WalgBaseBackupError::Cancelled { .. } => BackupError::Cancelled,
+        error if error.is_refusal() => BackupError::PermanentFailure {
+            reason: error.to_string(),
+        },
+        error => BackupError::Failed {
+            reason: error.to_string(),
+        },
     }
 }
 
@@ -459,13 +387,9 @@ pub(crate) struct ExecResult {
     pub(crate) stderr: String,
 }
 
-/// How much of each output stream a WAL-G exec keeps: the end, where a failure
-/// explains itself.
-const WALG_EXEC_CAPTURE_BYTES: usize = 64 * 1024;
-
-/// Run `sh -c <cmd>` inside `container_name` with the given env, capturing
-/// stdout+stderr into ring buffers. Bails early on cancel. Used by both
-/// walg engines (this file and `postgres_cluster.rs`).
+/// Run `sh -c <cmd>` inside `container_name` with the given env, keeping the
+/// last 64 KiB of stdout and stderr. Bails early on cancel. The node half's
+/// exec, for the other WAL-G engines on this host.
 pub(crate) async fn run_walg_exec(
     docker: &bollard::Docker,
     container_name: &str,
@@ -473,50 +397,21 @@ pub(crate) async fn run_walg_exec(
     env: &[String],
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<ExecResult, BackupError> {
-    let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
-    let output = exec_capture(
-        docker,
-        container_name,
-        bollard::exec::CreateExecOptions {
-            cmd: Some(vec!["sh", "-c", cmd]),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            env: Some(env_refs),
-            ..Default::default()
-        },
-        ExecCaptureOptions::separate(
-            OutputLimit::Tail(WALG_EXEC_CAPTURE_BYTES),
-            OutputLimit::Tail(WALG_EXEC_CAPTURE_BYTES),
-        )
-        .stream_errors(StreamErrorPolicy::Stop)
-        .exit_code(ExitCodePolicy::BestEffort)
-        .cancel(cancel),
-    )
-    .await
-    .map_err(|error| match error {
-        DockerUtilError::ExecCancelled { .. } => BackupError::Cancelled,
-        DockerUtilError::ExecCreate { source, .. } => BackupError::Failed {
-            reason: format!("create exec on {}: {}", container_name, source),
-        },
-        other => BackupError::Failed {
-            reason: format!("start exec on {}: {}", container_name, other.cause_text()),
-        },
-    })?;
-
-    if let Some(e) = output.stream_error {
-        error!(container = container_name, "exec stream error: {}", e);
+    match node_half::run_walg_exec(docker, container_name, cmd, env, cancel).await {
+        Ok(output) => Ok(ExecResult {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }),
+        Err(WalgBaseBackupError::Exec {
+            container,
+            operation,
+            reason,
+        }) => Err(BackupError::Failed {
+            reason: format!("{operation} on {container}: {reason}"),
+        }),
+        Err(error) => Err(backup_error(error)),
     }
-    if let Some(e) = output.inspect_error {
-        return Err(BackupError::Failed {
-            reason: format!("inspect exec: {}", e),
-        });
-    }
-
-    Ok(ExecResult {
-        exit_code: output.exit_code.unwrap_or(-1),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
 }
 
 /// Run a read-only probe and return its trimmed stdout. Stops at the first
@@ -554,36 +449,6 @@ pub(crate) async fn exec_stdout_probe(
         },
     })?;
     Ok(output.stdout.trim().to_string())
-}
-
-/// Build the (cmd, env) pair for the `pg_current_wal_lsn()` probe.
-///
-/// Critically: **credentials never appear in `cmd`**. They go through env
-/// (`PGUSER`, `PGPASSWORD`, `PGDATABASE`) so a password containing
-/// `'; rm -rf /; #` can't break out of the shell. Tests below assert this
-/// invariant — do not regress it.
-fn build_lsn_exec_args(pg: &PgParams) -> (Vec<String>, Vec<String>) {
-    let cmd = vec![
-        "psql".to_string(),
-        "-t".to_string(),
-        "-c".to_string(),
-        "SELECT pg_current_wal_lsn()".to_string(),
-    ];
-    let env = vec![
-        format!("PGUSER={}", pg.username),
-        format!("PGPASSWORD={}", pg.password),
-        format!("PGDATABASE={}", pg.database),
-    ];
-    (cmd, env)
-}
-
-async fn query_current_wal_lsn(
-    docker: &bollard::Docker,
-    container_name: &str,
-    pg: &PgParams,
-) -> Result<String, BackupError> {
-    let (cmd, env) = build_lsn_exec_args(pg);
-    exec_stdout_probe(docker, container_name, &cmd, &env).await
 }
 
 #[cfg(test)]
@@ -734,110 +599,102 @@ mod tests {
         assert_eq!(answer, "0/16B6C50");
     }
 
-    /// Regression test for the 0.1.0 hardening pass.
-    ///
-    /// The pre-fix code interpolated `pg.password` directly into a `sh -c`
-    /// command string, which let a password containing `'; rm -rf /; #`
-    /// inject arbitrary shell commands inside the Postgres container.
-    ///
-    /// The fix is: credentials NEVER appear in the cmd vector — they
-    /// travel via the `env` field on `CreateExecOptions`. These tests
-    /// pin that invariant so a future refactor can't reintroduce the
-    /// injection vector.
-    #[test]
-    fn build_lsn_exec_args_keeps_credentials_out_of_cmd() {
-        let pg = PgParams {
-            username: "alice".to_string(),
-            // Adversarial payload that would break out of `sh -c '...'`
-            // wrapping if it ever reached the shell.
-            password: "p4ss'; rm -rf /; #".to_string(),
-            database: "production".to_string(),
-        };
-
-        let (cmd, _env) = build_lsn_exec_args(&pg);
-
-        // Every cmd argument must be free of credentials.
-        for arg in &cmd {
-            assert!(
-                !arg.contains("alice"),
-                "username leaked into cmd arg: {}",
-                arg
-            );
-            assert!(
-                !arg.contains("p4ss"),
-                "password leaked into cmd arg: {}",
-                arg
-            );
-            assert!(
-                !arg.contains("production"),
-                "database leaked into cmd arg: {}",
-                arg
-            );
+    fn worker_service(node_id: i32) -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: 8,
+            name: "orders".to_string(),
+            service_type: "postgres".to_string(),
+            topology: "standalone".to_string(),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            node_id: Some(node_id),
+            version: None,
+            slug: None,
+            config: None,
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
-        // No `sh` wrapper — that wrapper plus shell-interpolated creds
-        // was the vulnerable shape. (`-c` is fine here: it's `psql -c
-        // <query>`, NOT `sh -c <shellstring>`.)
-        assert!(!cmd.iter().any(|a| a == "sh"));
-        assert!(!cmd.iter().any(|a| a == "bash"));
-        assert_eq!(cmd.first().map(|s| s.as_str()), Some("psql"));
     }
 
+    /// A worker's answer becomes the same outcome or error the run here
+    /// would have produced: a refusal is final, a failure retries.
     #[test]
-    fn build_lsn_exec_args_passes_credentials_via_env_verbatim() {
-        let pg = PgParams {
-            username: "alice".to_string(),
-            password: "p4ss'; rm -rf /; #".to_string(),
-            database: "production".to_string(),
-        };
-
-        let (_cmd, env) = build_lsn_exec_args(&pg);
-
-        // Each credential is in env exactly once, byte-for-byte, with no
-        // escaping (env vars don't need shell-escaping — only shell
-        // command strings do).
-        assert!(env.contains(&"PGUSER=alice".to_string()));
-        assert!(env.contains(&"PGPASSWORD=p4ss'; rm -rf /; #".to_string()));
-        assert!(env.contains(&"PGDATABASE=production".to_string()));
-        assert_eq!(env.len(), 3, "unexpected env entries: {:?}", env);
-    }
-
-    #[test]
-    fn build_lsn_exec_args_handles_empty_strings() {
-        // Even degenerate inputs must not crash or splice anything weird
-        // into the cmd vector.
-        let pg = PgParams {
-            username: String::new(),
-            password: String::new(),
-            database: String::new(),
-        };
-        let (cmd, env) = build_lsn_exec_args(&pg);
-        assert_eq!(cmd.len(), 4);
-        assert_eq!(env.len(), 3);
-    }
-
-    #[test]
-    fn an_unreachable_restart_probe_is_retried_not_final() {
-        let err = unconfirmed_restart_gate(7, "app", Err("connection refused".into()))
-            .expect_err("unknown is not a pass");
-        assert!(
-            matches!(err, BackupError::Failed { ref reason } if reason.contains("connection refused")),
-            "{err:?}"
+    fn a_worker_answer_is_the_outcome_of_the_same_run() {
+        let service = worker_service(2);
+        let completed = worker_outcome(
+            &service,
+            2,
+            PostgresWalgBackupResult::Completed {
+                restarted: true,
+                stdout: "out".to_string(),
+                stderr: "err".to_string(),
+                lsn: Some("0/3000060".to_string()),
+            },
         );
-        assert!(!err.is_permanent());
-    }
-
-    #[test]
-    fn a_needed_unconfirmed_restart_is_refused_for_good() {
-        let err = unconfirmed_restart_gate(7, "app", Ok(true)).expect_err("restart needed");
-        assert!(
-            matches!(err, BackupError::PermanentFailure { ref reason } if reason.contains("not confirmed")),
-            "{err:?}"
+        assert_eq!(
+            completed.ok(),
+            Some(WalgBaseBackupOutcome {
+                restarted: true,
+                stdout: "out".to_string(),
+                stderr: "err".to_string(),
+                lsn: Some("0/3000060".to_string()),
+            })
         );
-        assert!(err.is_permanent());
+        let refused = worker_outcome(
+            &service,
+            2,
+            PostgresWalgBackupResult::Refused {
+                reason: "not confirmed".to_string(),
+            },
+        )
+        .expect_err("refused");
+        assert!(refused.is_permanent(), "{refused:?}");
+        assert!(refused.to_string().contains("on node 2"), "{refused}");
+        let failed = worker_outcome(
+            &service,
+            2,
+            PostgresWalgBackupResult::Failed {
+                reason: "exit 1".to_string(),
+            },
+        )
+        .expect_err("failed");
+        assert!(!failed.is_permanent(), "{failed:?}");
     }
 
     #[test]
-    fn no_restart_needed_lets_the_backup_run() {
-        assert!(unconfirmed_restart_gate(7, "app", Ok(false)).is_ok());
+    fn only_a_refusal_of_the_node_half_is_final() {
+        let not_confirmed = backup_error(WalgBaseBackupError::RestartNotConfirmed {
+            service_id: 7,
+            service: "app".to_string(),
+        });
+        assert!(not_confirmed.is_permanent());
+        assert!(not_confirmed.to_string().contains("not confirmed"));
+        let probe = backup_error(WalgBaseBackupError::RestartProbe {
+            service_id: 7,
+            service: "app".to_string(),
+            reason: "connection refused".to_string(),
+        });
+        assert!(!probe.is_permanent());
+        assert!(probe.to_string().contains("connection refused"));
+        assert!(matches!(
+            backup_error(WalgBaseBackupError::Cancelled {
+                container: "postgres-app".to_string()
+            }),
+            BackupError::Cancelled
+        ));
     }
 }

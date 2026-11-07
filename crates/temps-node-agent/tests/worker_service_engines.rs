@@ -563,6 +563,478 @@ async fn every_engine_on_a_worker_is_created_probed_provisioned_and_controlled_b
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// `sh -c`-free exec in `container`: exit code and stdout.
+async fn exec(docker: &Docker, container: &str, cmd: &[&str]) -> (i64, String) {
+    let output = temps_docker_util::exec_capture(
+        docker,
+        container,
+        bollard::exec::CreateExecOptions {
+            cmd: Some(cmd.to_vec()),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        },
+        temps_docker_util::ExecCaptureOptions::separate(
+            temps_docker_util::OutputLimit::Head(64 * 1024),
+            temps_docker_util::OutputLimit::Head(64 * 1024),
+        )
+        .exit_code(temps_docker_util::ExitCodePolicy::BestEffort),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("exec {cmd:?} in {container}: {e}"));
+    (
+        output.exit_code.unwrap_or(-1),
+        output.stdout.trim().to_string(),
+    )
+}
+
+async fn psql(docker: &Docker, container: &str, sql: &str) -> (i64, String) {
+    exec(
+        docker,
+        container,
+        &["psql", "-U", "postgres", "-d", "postgres", "-tAc", sql],
+    )
+    .await
+}
+
+/// The keys under `prefix` in `bucket`.
+async fn keys(s3: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut token = None;
+    loop {
+        let page = s3
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .set_continuation_token(token)
+            .send()
+            .await
+            .expect("list the bucket");
+        keys.extend(
+            page.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string)),
+        );
+        match page.next_continuation_token() {
+            Some(next) => token = Some(next.to_string()),
+            None => return keys,
+        }
+    }
+}
+
+async fn walg_backup(
+    agent: &Arc<AgentState>,
+    request: &temps_service_protocol::PostgresWalgBackupRequest,
+) -> temps_service_protocol::PostgresWalgBackupResult {
+    let (status, body) = envelope(
+        temps_node_agent::service_data_handlers::postgres_walg_backup(
+            State(agent.clone()),
+            Json(request.clone()),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "the WAL-G backup did not run: {body}");
+    serde_json::from_value(body["data"].clone()).expect("a WAL-G backup result")
+}
+
+/// ADR-091, PostgreSQL step 1: a worker's WAL-G PostgreSQL, created by the
+/// agent as a control-plane-profile server asks, is backed up by the control
+/// plane's own WAL-G engine through the agent's sealed operation.
+///
+/// 1. Without a confirmed restart, a service whose `archive_mode` is off is
+///    refused and left exactly as it was: same container, no `walg.env`,
+///    archiving still off.
+/// 2. Confirmed, archiving is turned on through the recreate guard: the
+///    replacement is the agent's container (its labels, port binding and
+///    network) with only `archive_mode` changed, on the same data, and the
+///    base backup lands under the WAL-G prefix the control plane uses.
+/// 3. A second backup restarts nothing, refreshes `walg.env`, and WAL is
+///    archived continuously to the same prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_postgres_is_backed_up_by_the_control_plane_walg_engine_through_its_agent() {
+    use temps_providers::externalsvc::postgres_walg_backup::{walg_key_prefix, walg_prefix};
+    use temps_service_protocol::{
+        PostgresWalgBackupRequest, PostgresWalgBackupResult, WorkerS3Destination,
+    };
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!("Docker not available (set DOCKER_HOST), skipping the worker WAL-G proof");
+            return;
+        }
+    };
+    const RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0";
+    const S3_KEY: &str = "walgproofkey";
+    const BUCKET: &str = "walg-proof";
+    const BUCKET_PATH: &str = "fleet";
+    let agent = agent_state(docker.clone());
+    let suffix = std::process::id();
+    let name = format!("wsewalg{suffix}");
+    let s3_name = format!("wsewalgs3{suffix}");
+
+    let mut parameters = control_plane_parameters(&Engine {
+        label: "postgres",
+        service_type: ServiceType::Postgres,
+        strategy: "postgres",
+        parameters: json!({ "database": "postgres", "username": "postgres" }),
+        expected_env: &[],
+    });
+    parameters.insert("port".into(), json!(free_port().to_string()));
+    let params = ExternalServiceManager::remote_create_params(
+        8,
+        &name,
+        &ServiceType::Postgres,
+        &as_strings(&parameters),
+        false,
+    )
+    .expect("the create request");
+    for image in [params.image.as_str(), RUSTFS_IMAGE] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the worker WAL-G proof");
+            return;
+        }
+    }
+    let network = params
+        .network
+        .clone()
+        .expect("worker services join a network");
+    let _cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![params.name.clone(), s3_name.clone()],
+        volumes: params.volumes.keys().cloned().collect(),
+    };
+
+    // The bucket, on the service's network as a remote endpoint would be
+    // reachable from it; this test reaches it through a published port.
+    let s3_port = free_port();
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(&s3_name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(RUSTFS_IMAGE.to_string()),
+                env: Some(vec![
+                    format!("RUSTFS_ACCESS_KEY={S3_KEY}"),
+                    format!("RUSTFS_SECRET_KEY={S3_KEY}"),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.clone()),
+                    port_bindings: Some(HashMap::from([(
+                        "9000/tcp".to_string(),
+                        Some(vec![bollard::models::PortBinding {
+                            host_ip: Some("127.0.0.1".to_string()),
+                            host_port: Some(s3_port.to_string()),
+                        }]),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the bucket container");
+
+    // The agent creates the service; creating it also creates the network
+    // on a fresh node, so the bucket starts after it.
+    let (status, created) = envelope(
+        create_service(
+            State(agent.clone()),
+            Json(ServiceCreateRequest {
+                name: params.name.clone(),
+                service_type: params.service_type.clone(),
+                image: params.image.clone(),
+                environment: params.environment.clone(),
+                port_mappings: params
+                    .port_mappings
+                    .iter()
+                    .map(|p| ServicePortMapping {
+                        host_port: p.host_port,
+                        container_port: p.container_port,
+                    })
+                    .collect(),
+                volumes: params.volumes.clone(),
+                network: params.network.clone(),
+                command: params.command.clone(),
+                resource_limits: None,
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "create failed: {created}");
+    let container = created["data"]["container_name"]
+        .as_str()
+        .expect("the created container's name")
+        .to_string();
+    let host_port = created["data"]["host_port"]
+        .as_u64()
+        .expect("the published host port");
+    docker
+        .start_container(
+            &s3_name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("start the bucket");
+
+    let mut stored = parameters.clone();
+    stored.insert("port".into(), json!(host_port.to_string()));
+    stored.insert("container_name".into(), json!(container.clone()));
+    let config = ServiceConfig {
+        name: name.clone(),
+        service_type: ServiceType::Postgres,
+        version: None,
+        parameters: serde_json::to_value(&stored).expect("stored parameters"),
+    };
+    wait_healthy(&agent, &config, "postgres").await;
+    assert_eq!(
+        psql(
+            &docker,
+            &container,
+            "create table proof(x int); insert into proof values (42)"
+        )
+        .await
+        .0,
+        0
+    );
+
+    let s3 = temps_providers::externalsvc::S3Credentials {
+        access_key_id: S3_KEY.to_string(),
+        secret_key: S3_KEY.to_string(),
+        session_token: None,
+        region: "us-east-1".to_string(),
+        endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
+        bucket_name: BUCKET.to_string(),
+        bucket_path: BUCKET_PATH.to_string(),
+        force_path_style: true,
+    }
+    .build_s3_client()
+    .await;
+    let mut bucket = Err(String::new());
+    for _ in 0..60 {
+        bucket = s3
+            .create_bucket()
+            .bucket(BUCKET)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"));
+        if bucket.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    bucket.expect("creating the bucket");
+
+    let request = |allow_restart: bool, backup_uuid: &str| PostgresWalgBackupRequest {
+        service_id: 8,
+        node_id: 2,
+        service_config: config.clone(),
+        destination: WorkerS3Destination {
+            bucket: BUCKET.to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://{s3_name}:9000")),
+            force_path_style: true,
+            access_key_id: S3_KEY.to_string(),
+            secret_access_key: S3_KEY.to_string(),
+            session_token: None,
+        },
+        bucket_path: BUCKET_PATH.to_string(),
+        backup_uuid: backup_uuid.to_string(),
+        allow_restart,
+    };
+    let inspect = |docker: Docker, container: String| async move {
+        docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("inspect the service container")
+    };
+    let walg_env_mode = || {
+        exec(
+            &docker,
+            &container,
+            &["stat", "-c", "%a", "/var/lib/postgresql/walg.env"],
+        )
+    };
+    let original = inspect(docker.clone(), container.clone()).await;
+
+    // 1. Unconfirmed: refused, nothing changed.
+    let refused = walg_backup(&agent, &request(false, "proof-0")).await;
+    assert!(
+        matches!(&refused, PostgresWalgBackupResult::Refused { reason } if reason.contains("not confirmed")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        inspect(docker.clone(), container.clone()).await.id,
+        original.id,
+        "an unconfirmed backup replaced the container"
+    );
+    assert_ne!(
+        walg_env_mode().await.0,
+        0,
+        "an unconfirmed backup wrote walg.env"
+    );
+    assert_eq!(
+        psql(&docker, &container, "show archive_mode").await.1,
+        "off"
+    );
+
+    // 2. Confirmed: archiving on through the guarded recreate, then the
+    //    base backup.
+    let first = walg_backup(&agent, &request(true, "proof-1")).await;
+    let PostgresWalgBackupResult::Completed { restarted, lsn, .. } = &first else {
+        panic!("the confirmed backup failed: {first:?}");
+    };
+    assert!(
+        *restarted,
+        "archive_mode was off: the container must have been recreated"
+    );
+    assert!(
+        lsn.as_deref().is_some_and(|lsn| lsn.contains('/')),
+        "{lsn:?}"
+    );
+    let replaced = inspect(docker.clone(), container.clone()).await;
+    assert_ne!(
+        replaced.id, original.id,
+        "archiving was turned on without a recreate"
+    );
+    let labels = |i: &bollard::models::ContainerInspectResponse| {
+        i.config
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .unwrap_or_default()
+    };
+    for label in [
+        "sh.temps.service.name",
+        "sh.temps.service.type",
+        "sh.temps.managed",
+    ] {
+        assert_eq!(
+            labels(&replaced).get(label),
+            labels(&original).get(label),
+            "the recreate changed the agent's label {label}"
+        );
+    }
+    let binding = |i: &bollard::models::ContainerInspectResponse| {
+        i.host_config
+            .as_ref()
+            .and_then(|h| h.port_bindings.clone())
+            .and_then(|b| b.get("5432/tcp").cloned().flatten())
+    };
+    assert_eq!(
+        binding(&replaced),
+        binding(&original),
+        "the recreate moved the service's port"
+    );
+    let networks = |i: &bollard::models::ContainerInspectResponse| {
+        i.network_settings
+            .as_ref()
+            .and_then(|n| n.networks.as_ref())
+            .map(|n| n.keys().cloned().collect::<std::collections::BTreeSet<_>>())
+            .unwrap_or_default()
+    };
+    assert!(
+        networks(&replaced).contains(&network),
+        "{:?}",
+        networks(&replaced)
+    );
+    let cmd = replaced
+        .config
+        .as_ref()
+        .and_then(|c| c.cmd.clone())
+        .unwrap_or_default();
+    assert!(cmd.contains(&"archive_mode=on".to_string()), "{cmd:?}");
+    assert!(!cmd.contains(&"archive_mode=off".to_string()), "{cmd:?}");
+    assert_eq!(psql(&docker, &container, "show archive_mode").await.1, "on");
+    assert_eq!(
+        psql(&docker, &container, "select x from proof").await.1,
+        "42"
+    );
+    assert_eq!(walg_env_mode().await, (0, "600".to_string()));
+    assert_eq!(
+        psql(&docker, &container, "show archive_command").await.1,
+        ". /var/lib/postgresql/walg.env && wal-g wal-push %p"
+    );
+
+    // The control plane's layout, derived the same way on both sides.
+    let key_prefix = walg_key_prefix(BUCKET_PATH, &name);
+    assert_eq!(
+        walg_prefix(BUCKET, BUCKET_PATH, &name),
+        format!("s3://{BUCKET}/{}", key_prefix.trim_end_matches('/'))
+    );
+    let sentinels = |keys: &[String]| {
+        keys.iter()
+            .filter(|k| k.starts_with(&format!("{key_prefix}basebackups_005/")))
+            .filter(|k| k.ends_with("_backup_stop_sentinel.json"))
+            .count()
+    };
+    assert_eq!(sentinels(&keys(&s3, BUCKET, &key_prefix).await), 1);
+
+    // 3. Again: nothing restarts, WAL keeps arriving.
+    let second = walg_backup(&agent, &request(false, "proof-2")).await;
+    assert!(
+        matches!(
+            &second,
+            PostgresWalgBackupResult::Completed {
+                restarted: false,
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+    assert_eq!(
+        inspect(docker.clone(), container.clone()).await.id,
+        replaced.id,
+        "a backup with archiving on restarted PostgreSQL"
+    );
+    assert_eq!(
+        psql(&docker, &container, "select pg_switch_wal()").await.0,
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let all = keys(&s3, BUCKET, &key_prefix).await;
+        let wal = all
+            .iter()
+            .filter(|k| k.starts_with(&format!("{key_prefix}wal_005/")))
+            .count();
+        if sentinels(&all) == 2 && wal > 0 {
+            println!("worker WAL-G proof: 2 base backups, {wal} archived WAL objects");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected 2 base backups and archived WAL under {key_prefix}: {all:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let (archived, failed) = {
+        let row = psql(
+            &docker,
+            &container,
+            "select archived_count, failed_count from pg_stat_archiver",
+        )
+        .await
+        .1;
+        let mut parts = row.split('|').map(|p| p.parse::<i64>().unwrap_or(-1));
+        (parts.next().unwrap_or(-1), parts.next().unwrap_or(-1))
+    };
+    assert!(
+        archived > 0 && failed == 0,
+        "archiver: {archived} archived, {failed} failed"
+    );
+}
+
 /// Garage reads a `garage.toml` the agent's create request cannot carry, so
 /// a worker Garage is refused when the request is built, before any node is
 /// contacted, with the remedy for a control-plane-profile server.

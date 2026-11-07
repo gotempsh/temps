@@ -511,7 +511,7 @@ OFFSET $3
     /// 3. Insert a control-plane `backups` row with `schedule_run_id = run_id`.
     ///    Enqueue a `backup_jobs` row for `engine = "control_plane"`.
     /// 4. Load every `external_services` row and attempt to resolve its engine
-    ///    key via [`resolve_engine_key_on_this_host`]. Skip rows where resolution returns
+    ///    key via [`BackupService::resolve_engine_key`]. Skip rows where resolution returns
     ///    `Err` (unsupported type) — log at `warn` with the service id and type.
     /// 5. For each supported service, insert an `external_service_backups` row +
     ///    parent `backups` row (`schedule_run_id = run_id`), then enqueue a
@@ -666,7 +666,7 @@ UPDATE schedule_runs sr
             Vec::with_capacity(external_services.len());
 
         for svc in external_services {
-            match crate::engines::dispatch::resolve_engine_key_on_this_host(&svc).await {
+            match self.resolve_engine_key(&svc).await {
                 Ok(engine_key) => {
                     resolved_services.push((svc, engine_key));
                 }
