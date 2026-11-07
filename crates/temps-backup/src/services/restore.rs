@@ -6541,17 +6541,19 @@ mod tests {
         }
     }
 
-    /// A database on the control plane, or in legacy mode, never takes the
-    /// job path: its restore is unchanged.
+    /// A database on the control plane never takes the job path: its
+    /// restore is unchanged. One on a worker restores by a job in every
+    /// workload mode, since the local restore drives this host's Docker,
+    /// where its container is not.
     #[test]
-    fn a_control_plane_or_legacy_database_keeps_the_local_restore() {
+    fn a_control_plane_database_keeps_the_local_restore() {
         use crate::engines::workload_job::takes_job_path;
         let mut local = worker_postgres();
         local.node_id = None;
         assert!(!takes_job_path(&local));
         let mut legacy = worker_postgres();
         legacy.workload_mode = Default::default();
-        assert!(!takes_job_path(&legacy));
+        assert!(takes_job_path(&legacy));
         assert!(takes_job_path(&worker_postgres()));
     }
 

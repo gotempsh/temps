@@ -317,8 +317,9 @@ impl TempsPlugin for BackupPlugin {
                 })))
                 // ADR-055 Phase 9: databases on worker nodes, backed up by a
                 // job on their node through the workload plane. Needs no
-                // local Docker; it is only selected for an `enforce`
-                // database on a worker (see `engines::workload_job`).
+                // local Docker; it is selected for every standalone
+                // PostgreSQL database on a worker (see
+                // `engines::workload_job`).
                 .register_engine(Arc::new(PostgresWorkloadJobEngine::new(
                     PostgresWorkloadJobDeps {
                         db: db.clone(),

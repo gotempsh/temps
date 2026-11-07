@@ -21,15 +21,15 @@
 //!
 //! ## The gate
 //!
-//! [`takes_job_path`] selects this path only for a standalone PostgreSQL
-//! database whose `external_services.workload_mode` is `enforce` **and**
-//! that lives on a worker node. Every other database resolves exactly the
-//! engine it did before (the default mode is `legacy`), control-plane
-//! databases keep their local WAL-G/pg_dump chain, and the databases this
-//! path serves are precisely the ones whose backups could not run at all
-//! (the engines drive the control plane's local Docker). Rolling back is
-//! setting the database's mode back to `legacy` through the existing audited
-//! API: backup jobs stop being scheduled and the local path is unchanged.
+//! [`takes_job_path`] selects this path for a standalone PostgreSQL database
+//! that lives on a worker node, whatever its `workload_mode`. Control-plane
+//! databases keep their local WAL-G/pg_dump chain unchanged, and the
+//! databases this path serves are precisely the ones whose backups could not
+//! run at all: the other engines drive the control plane's local Docker,
+//! where a worker's container is not (and a `--profile control-plane` server
+//! has no Docker to try). The job needs nothing the mode changes: it runs the
+//! database's image on the app network the worker's agent attached the
+//! database to, and reaches it by its container name.
 //!
 //! ## Secrets
 //!
@@ -50,7 +50,6 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
-use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 use temps_workload::{
     Artifact, ConditionKind, EnvSpec, Isolation, Lifetime, PlacementSpec, Process, WorkloadKind,
     WorkloadPhase, WorkloadRef, WorkloadSpec,
@@ -99,7 +98,6 @@ pub mod exit {
 pub fn takes_job_path(service: &temps_entities::external_services::Model) -> bool {
     is_postgres(&service.service_type)
         && service.topology.as_str() != "cluster"
-        && service.workload_mode == ServiceWorkloadMode::Enforce
         && worker_node(service).is_some()
 }
 
@@ -1528,6 +1526,7 @@ pub async fn backup_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 
     fn service(
         node_id: Option<i32>,
@@ -1577,20 +1576,18 @@ mod tests {
     }
 
     #[test]
-    fn only_enforce_databases_on_a_worker_take_the_job_path() {
-        assert!(takes_job_path(&service(
-            Some(3),
-            ServiceWorkloadMode::Enforce
-        )));
-        // The default, and shadow, keep today's engine.
-        assert!(!takes_job_path(&service(
-            Some(3),
-            ServiceWorkloadMode::Legacy
-        )));
-        assert!(!takes_job_path(&service(
-            Some(3),
-            ServiceWorkloadMode::Shadow
-        )));
+    fn postgres_databases_on_a_worker_take_the_job_path_in_every_mode() {
+        // The live failure: a `legacy` database on a worker (the default
+        // mode, and what the worker's agent creates) resolved the local
+        // engines, which inspect this host's Docker, where its container is
+        // not. Every mode takes the job path now.
+        for mode in [
+            ServiceWorkloadMode::Legacy,
+            ServiceWorkloadMode::Shadow,
+            ServiceWorkloadMode::Enforce,
+        ] {
+            assert!(takes_job_path(&service(Some(3), mode)), "{mode:?}");
+        }
         // A control-plane database keeps its local chain, in every mode.
         assert!(!takes_job_path(&service(
             None,
