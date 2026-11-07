@@ -152,6 +152,10 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       },
       { value: 'ENVIRONMENT_DELETED', label: 'Environment deleted' },
       {
+        value: 'PREVIEW_ENVIRONMENT_RETIRED',
+        label: 'Preview environment retired',
+      },
+      {
         value: 'ENVIRONMENT_SETTINGS_UPDATED',
         label: 'Environment settings updated',
       },

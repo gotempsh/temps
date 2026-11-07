@@ -248,16 +248,16 @@ async fn github_webhook_events(
         .get("X-Hub-Signature-256")
         .and_then(|v| v.to_str().ok());
 
-    if let Err(e) = state
+    let signing = state
         .github_service
         .validate_webhook_signature(signature, &body)
         .await
-    {
-        error!("Invalid webhook signature: {:?}", e);
-        return Err(problem_new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Webhook Signature")
-            .with_detail("The webhook signature validation failed"));
-    }
+        .map_err(|e| {
+            warn!(error = %e, "Invalid GitHub App webhook signature");
+            problem_new(StatusCode::UNAUTHORIZED)
+                .with_title("Invalid Webhook Signature")
+                .with_detail("The webhook signature validation failed")
+        })?;
 
     // Get the X-Github-Event header
     let event_type = headers
@@ -330,21 +330,39 @@ async fn github_webhook_events(
         }
     };
 
-    // Process the webhook event based on type
-    let installation_res = webhook_event.installation.clone();
-    let mut installation_id: i32 = 0;
+    let installation_id = match &webhook_event.installation {
+        Some(EventInstallation::Full(installation)) => Some(installation.id.into_inner()),
+        Some(EventInstallation::Minimal(installation)) => Some(installation.id.into_inner()),
+        None => None,
+    }
+    .map(i32::try_from)
+    .transpose()
+    .map_err(|_| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Webhook Installation")
+            .with_detail("GitHub installation ID is out of range")
+    })?
+    .unwrap_or(0);
 
-    match installation_res {
-        Some(EventInstallation::Full(install)) => {
-            installation_id = install.id.into_inner() as i32;
-        }
-        Some(EventInstallation::Minimal(installation_)) => {
-            installation_id = installation_.id.into_inner() as i32;
-        }
-        None => {
-            warn!("No installation information in webhook event");
-        }
-    };
+    let mut sender = None;
+    if installation_id != 0 {
+        let app = state
+            .github_service
+            .authorize_webhook_installation(&signing, installation_id)
+            .await
+            .map_err(|e| {
+                warn!(installation_id, error = %e,
+                    "Ignoring GitHub App webhook: installation ownership not confirmed");
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Webhook Installation Not Authorized")
+                    .with_detail("The installation could not be bound to the signing App")
+            })?;
+        sender = Some(app.app_id);
+    } else if !matches!(webhook_event.specific, WebhookEventPayload::Ping(_)) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Missing Webhook Installation")
+            .with_detail("GitHub App webhook requires an installation"));
+    }
 
     // Handle specific webhook events
     let webhook_event_clone = webhook_event.clone();
@@ -353,16 +371,23 @@ async fn github_webhook_events(
             info!("Push event received");
             handle_push_event(&state, webhook_event_clone, push_event, installation_id).await;
         }
+        WebhookEventPayload::PullRequest(_) => {
+            handle_pull_request_event(&state, webhook_event_clone, &body, installation_id).await;
+        }
         WebhookEventPayload::InstallationRepositories(installation_repos) => {
             info!("Installation repositories event received");
             handle_installation_repositories(&state, installation_repos, installation_id).await;
         }
         WebhookEventPayload::Installation(installation_event) => {
             info!("Installation event received");
-            handle_installation_event(&state, installation_event, installation_id).await;
+            handle_installation_event(&state, installation_event, installation_id, sender).await;
         }
         WebhookEventPayload::Ping(ping_event) => {
-            if let Some(app_id) = ping_event.hook.and_then(|h| h.app_id) {
+            if let Some(app_id) = ping_event.hook.and_then(|h| h.app_id).filter(|id| {
+                signing
+                    .iter()
+                    .any(|app| id.into_inner() == app.app_id as u64)
+            }) {
                 info!("Ping event app_id: {:?}", app_id);
                 let _ = state
                     .github_service
@@ -401,16 +426,41 @@ async fn handle_push_event(
     let repo_name = repo.name;
 
     // Check if installation exists
-    if state
+    let Ok(installation) = state
         .github_service
         .get_installation_by_id(installation_id)
         .await
-        .is_err()
-    {
+    else {
         return;
-    }
+    };
 
     let (branch, tag) = push_target(&push_event.r#ref, push_event.base_ref.as_deref());
+
+    // A deleted branch retires previews only on the projects this
+    // installation connects, never on a same-named repository elsewhere.
+    if crate::services::git_provider_manager::GitProviderManager::is_ref_deletion(&push_event.after)
+    {
+        let result = match state
+            .git_provider_manager
+            .connection_projects(installation.connection_id, &repo_owner, &repo_name)
+            .await
+        {
+            Ok(projects) => {
+                state
+                    .git_provider_manager
+                    .handle_push_event_for_projects(branch, tag, push_event.after.clone(), projects)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            error!(
+                "Failed to handle branch deletion on {}/{}: {:?}",
+                repo_owner, repo_name, e
+            );
+        }
+        return;
+    }
 
     // A project that also has its own repository webhook (a non-App
     // connection on a repository where the App is installed) receives this
@@ -423,6 +473,57 @@ async fn handle_push_event(
         error!(
             "Failed to handle push event via git provider manager: {:?}",
             e
+        );
+    }
+}
+
+/// Retire the preview of a pull request's branch once the pull request is
+/// closed or merged.
+async fn handle_pull_request_event(
+    state: &Arc<AppState>,
+    webhook_event: WebhookEvent,
+    body: &[u8],
+    installation_id: i32,
+) {
+    let Some((branch, reason)) = super::pull_request::closed_pull_request(body) else {
+        return;
+    };
+    let Some(repo) = webhook_event.repository else {
+        error!("Pull request webhook event missing repository field, skipping");
+        return;
+    };
+    let Some(repo_owner) = repo.owner.map(|owner| owner.login) else {
+        error!("Pull request webhook event repository missing owner field, skipping");
+        return;
+    };
+
+    let Ok(installation) = state
+        .github_service
+        .get_installation_by_id(installation_id)
+        .await
+    else {
+        return;
+    };
+
+    // Only the projects this installation connects: a same-named repository
+    // on another connection is not the one whose pull request closed.
+    let result = match state
+        .git_provider_manager
+        .connection_projects(installation.connection_id, &repo_owner, &repo.name)
+        .await
+    {
+        Ok(projects) => {
+            state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, projects)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        error!(
+            "Failed to queue preview teardown for {}/{} ({}): {:?}",
+            repo_owner, repo.name, reason, e
         );
     }
 }
@@ -562,6 +663,34 @@ async fn github_repo_webhook_events(
 
     let project_ids: Vec<i32> = projects.iter().map(|p| p.id).collect();
 
+    if event_type == "pull_request" {
+        let queued = match super::pull_request::closed_pull_request(&body) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, projects)
+                .await
+                .map_err(|e| {
+                    error!(
+                        delivery_id = delivery_id,
+                        "Failed to queue preview teardown for GitHub repository webhook on {}/{} (projects {:?}): {}",
+                        owner,
+                        repo,
+                        project_ids,
+                        e
+                    );
+                    problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .with_title("Webhook Processing Failed")
+                        .with_detail(format!(
+                            "Failed to queue preview teardown for GitHub pull request delivery {delivery_id} on {owner}/{repo}"
+                        ))
+                })?,
+            None => 0,
+        };
+        return Ok(Json(EventResponse {
+            message: format!("Queued preview teardown for {queued} project(s)"),
+        }));
+    }
+
     if event_type != "push" {
         info!(
             delivery_id = delivery_id,
@@ -661,6 +790,7 @@ async fn handle_installation_event(
     state: &Arc<AppState>,
     event: Box<octocrab::models::webhook_events::payload::InstallationWebhookEventPayload>,
     installation_id: i32,
+    signing_app_id: Option<i32>,
 ) {
     use octocrab::models::webhook_events::payload::InstallationWebhookEventAction;
 
@@ -686,7 +816,7 @@ async fn handle_installation_event(
 
             match state
                 .github_service
-                .process_installation(installation_id, None)
+                .process_installation(installation_id, signing_app_id)
                 .await
             {
                 Ok(result) => {
@@ -1138,6 +1268,118 @@ async fn github_app_installation_callback(
 
 #[cfg(test)]
 mod tests {
+    /// Deliver a push signed by App 10, whose secret App 20 shares when
+    /// `shared` is set, for an installation owned by `provider_id`.
+    async fn signed_installation_delivery(provider_id: i32, shared: bool) -> (bool, usize) {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::{git_provider_connections, git_providers, projects};
+        let now = chrono::Utc::now();
+        let app = git_providers::Model {
+            id: 10,
+            name: "example-app".into(),
+            provider_type: "github".into(),
+            base_url: None,
+            api_url: None,
+            auth_method: "app".into(),
+            auth_config: serde_json::json!({
+                "app_id": 100, "client_id": "example", "client_secret": "example",
+                "private_key": "unused", "webhook_secret": "test-signing-secret"
+            }),
+            webhook_secret: None,
+            is_active: true,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut other_app = app.clone();
+        other_app.id = 20;
+        other_app.auth_config["app_id"] = serde_json::json!(101);
+        if !shared {
+            other_app.auth_config["webhook_secret"] = serde_json::json!("other-test-secret");
+        }
+        let connection: git_provider_connections::Model =
+            serde_json::from_value(serde_json::json!({
+                "id": 30, "provider_id": provider_id, "account_name": "example",
+                "account_type": "Organization", "installation_id": "200",
+                "is_active": true, "is_expired": false, "syncing": false,
+                "synced_repository_count": 0, "health_status": "unknown",
+                "consecutive_health_failures": 0, "created_at": now, "updated_at": now
+            }))
+            .unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![other_app, app]])
+                .append_query_results([vec![connection.clone()], vec![connection]])
+                .append_query_results([Vec::<projects::Model>::new()])
+                .into_connection(),
+        );
+        let state = super::super::public_route_tests::state_with_db(db.clone());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "installation": {"id": 200, "node_id": "example-installation"},
+            "repository": {"id": 1, "name": "demo", "owner": {
+                "login": "example", "id": 1, "node_id": "example",
+                "avatar_url": "https://example.com/avatar", "gravatar_id": "",
+                "url": "https://example.com/user", "html_url": "https://example.com/user",
+                "followers_url": "https://example.com/followers",
+                "following_url": "https://example.com/following",
+                "gists_url": "https://example.com/gists", "starred_url": "https://example.com/starred",
+                "subscriptions_url": "https://example.com/subscriptions",
+                "organizations_url": "https://example.com/orgs",
+                "repos_url": "https://example.com/repos", "events_url": "https://example.com/events",
+                "received_events_url": "https://example.com/received", "type": "Organization",
+                "site_admin": false
+            }, "url": "https://example.com/repo"},
+            "ref": "refs/heads/topic", "after": "0000000000000000000000000000000000000000",
+            "before": "1111111111111111111111111111111111111111",
+            "commits": [], "compare": "https://example.com/compare",
+            "created": false, "deleted": true, "forced": false,
+            "pusher": {"name": "example", "email": "example@example.com"}
+        })).unwrap();
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"test-signing-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Hub-Signature-256", signature.parse().unwrap());
+        headers.insert("X-GitHub-Event", "push".parse().unwrap());
+        let result = github_webhook_events(headers, State(state.clone()), Bytes::from(body)).await;
+        let owned = provider_id == 10 || (shared && provider_id == 20);
+        if !owned {
+            assert_eq!(
+                result.as_ref().err().unwrap().status_code,
+                StatusCode::UNAUTHORIZED
+            );
+        } else {
+            assert!(result.is_ok(), "{:?}", result.as_ref().err());
+        }
+        drop(state);
+        let queries = Arc::try_unwrap(db).unwrap().into_transaction_log().len();
+        (result.is_ok(), queries)
+    }
+
+    #[tokio::test]
+    async fn signing_app_mismatch_dispatches_nothing() {
+        // Only signature and ownership queries run; no dispatch queries or jobs.
+        assert_eq!(signed_installation_delivery(20, false).await, (false, 2));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_binds_the_app_that_owns_the_installation() {
+        // App 20 is checked first and shares the secret, but App 10 owns it.
+        assert_eq!(signed_installation_delivery(10, true).await, (true, 4));
+    }
+
+    #[tokio::test]
+    async fn shared_secret_still_rejects_an_installation_no_signer_owns() {
+        assert_eq!(signed_installation_delivery(30, true).await, (false, 2));
+    }
+
+    #[tokio::test]
+    async fn signing_app_pairing_dispatches_branch_deletion() {
+        // The matching App reaches the installation and project dispatch queries.
+        assert_eq!(signed_installation_delivery(10, false).await, (true, 4));
+    }
+
     use super::*;
 
     #[test]

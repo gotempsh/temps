@@ -256,31 +256,11 @@ async fn gitlab_webhook_events(
 
     let git_ref = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
 
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else {
-        None
-    };
+    let branch = super::branch_from_ref(git_ref, false);
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
 
-    let commit = payload
-        .get("checkout_sha")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            payload
-                .get("commits")
-                .and_then(|cs| cs.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|c| c.get("id"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
+    let commit = pushed_commit(&payload);
 
     // Find all Temps projects matching this repo.
     let matching_projects = match projects::Entity::find()
@@ -348,6 +328,26 @@ async fn gitlab_webhook_events(
     }
 
     let authorized_ids: Vec<i32> = authorized_projects.iter().map(|p| p.id).collect();
+
+    if event_type == "Merge Request Hook" {
+        let queued = match closed_merge_request(&payload) {
+            Some((branch, reason)) => state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, authorized_projects)
+                .await
+                .unwrap_or_else(|e| {
+                    error!(
+                        "Failed to queue preview teardown for GitLab merge request on {}/{} (projects {:?}): {:?}",
+                        repo_owner, repo_name, authorized_ids, e
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        return Ok(axum::Json(GitLabWebhookResponse {
+            message: format!("Queued preview teardown for {queued} project(s)"),
+        }));
+    }
 
     // Dispatch only to the projects that authenticated this delivery. Do NOT
     // use `handle_push_event(owner, repo, ..)`, which re-queries and deploys
@@ -460,10 +460,81 @@ async fn gitlab_oauth_callback(
     Ok(Redirect::to(&redirect_url))
 }
 
+/// The commit a push delivery names. A deleted branch or tag has a null
+/// `checkout_sha` and no commits; its `after` is then the all-zeros SHA,
+/// which marks the deletion downstream. Any other `after` is not used: a tag
+/// whose target is not a commit also has a null `checkout_sha`, and its
+/// non-zero `after` names nothing to deploy.
+fn pushed_commit(payload: &serde_json::Value) -> String {
+    let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
+    field("checkout_sha")
+        .or_else(|| {
+            payload
+                .get("commits")
+                .and_then(|cs| cs.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|c| c.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            field("after").filter(|sha| {
+                crate::services::git_provider_manager::GitProviderManager::is_ref_deletion(sha)
+            })
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The source branch of a merge request this delivery reports as closed or
+/// merged, and which of the two. `None` for any other event, and for a merge
+/// request from a fork: its branch lives in another project, so a same-named
+/// preview here belongs to a branch of this project, not to it.
+fn closed_merge_request(
+    payload: &serde_json::Value,
+) -> Option<(String, temps_core::PreviewBranchCloseReason)> {
+    let attributes = payload.get("object_attributes")?;
+    let source_project = attributes.get("source_project_id")?.as_i64()?;
+    let target_project = attributes.get("target_project_id")?.as_i64()?;
+    if source_project != target_project {
+        return None;
+    }
+
+    let number = attributes.get("iid")?.as_i64()?;
+    let reason = match attributes.get("action")?.as_str()? {
+        "close" => temps_core::PreviewBranchCloseReason::PullRequestClosed { number },
+        "merge" => temps_core::PreviewBranchCloseReason::PullRequestMerged { number },
+        _ => return None,
+    };
+    let branch = attributes.get("source_branch")?.as_str()?;
+    Some((branch.to_string(), reason))
+}
+
 #[cfg(test)]
 mod tests {
-    //! Smoke-tests for the helpers from the handler perspective. Detailed
-    //! crypto edge-cases live in `services::gitlab_webhook::tests`.
+    #[test]
+    fn branch_refs_preserve_embedded_prefixes() {
+        for (input, expected) in [
+            (
+                "refs/heads/feat/refs/heads/victim",
+                Some("feat/refs/heads/victim"),
+            ),
+            ("refs/heads/x", Some("x")),
+            ("refs/heads/feat/topic", Some("feat/topic")),
+            ("refs/tags/release", None),
+        ] {
+            assert_eq!(
+                super::super::branch_from_ref(input, false).as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::branch_from_ref("feat/topic", false).as_deref(),
+            None
+        );
+    }
+
+    // Smoke-tests for the helpers from the handler perspective. Detailed
+    // crypto edge-cases live in `services::gitlab_webhook::tests`.
 
     use super::{project_has_signing_token, stored_signing_token};
 
@@ -571,5 +642,84 @@ mod tests {
             .decode(tok.strip_prefix("whsec_").unwrap())
             .expect("valid base64");
         assert_eq!(decoded.len(), 32);
+    }
+
+    fn merge_request_hook(action: &str, source_project_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "iid": 8,
+                "action": action,
+                "source_branch": "feature/login",
+                "target_branch": "main",
+                "source_project_id": source_project_id,
+                "target_project_id": 100
+            }
+        })
+    }
+
+    #[test]
+    fn closed_and_merged_merge_requests_retire_their_branch() {
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("close", 100)),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestClosed { number: 8 }
+            ))
+        );
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("merge", 100)),
+            Some((
+                "feature/login".to_string(),
+                temps_core::PreviewBranchCloseReason::PullRequestMerged { number: 8 }
+            ))
+        );
+    }
+
+    #[test]
+    fn other_merge_request_actions_and_forks_retire_nothing() {
+        for action in ["open", "update", "reopen", "approved"] {
+            assert_eq!(
+                super::closed_merge_request(&merge_request_hook(action, 100)),
+                None
+            );
+        }
+        assert_eq!(
+            super::closed_merge_request(&merge_request_hook("merge", 200)),
+            None
+        );
+        assert_eq!(super::closed_merge_request(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn a_deleted_branch_push_reports_the_null_sha() {
+        let deletion = serde_json::json!({
+            "ref": "refs/heads/feature/login",
+            "before": "abc123",
+            "after": "0000000000000000000000000000000000000000",
+            "checkout_sha": null,
+            "commits": []
+        });
+        assert_eq!(
+            super::pushed_commit(&deletion),
+            "0000000000000000000000000000000000000000"
+        );
+
+        let push = serde_json::json!({
+            "after": "def456",
+            "checkout_sha": "def456",
+            "commits": [{ "id": "def456" }]
+        });
+        assert_eq!(super::pushed_commit(&push), "def456");
+
+        // A tag on a non-commit object: no checkout_sha, a non-zero `after`.
+        let annotated = serde_json::json!({
+            "ref": "refs/tags/v1.0.0",
+            "after": "abc999",
+            "checkout_sha": null,
+            "commits": []
+        });
+        assert_eq!(super::pushed_commit(&annotated), "");
+        assert_eq!(super::pushed_commit(&serde_json::json!({})), "");
     }
 }
