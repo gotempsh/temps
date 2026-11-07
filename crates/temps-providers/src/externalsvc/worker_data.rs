@@ -63,6 +63,24 @@ const PART_SIZE: usize = 16 * 1024 * 1024;
 const MAX_PARTS: i32 = 10_000;
 /// How much of a failed dump's stderr is kept for its error.
 const STDERR_TAIL_BYTES: usize = 4 * 1024;
+/// Memory of one dump helper, swap included: the dump tools stream, so this
+/// bounds a misbehaving one rather than sizing a normal dump.
+const HELPER_MEMORY_BYTES: i64 = 1024 * 1024 * 1024;
+/// Processes in one dump helper: a shell, the client, the dump tool, gzip.
+const HELPER_PIDS_LIMIT: i64 = 64;
+
+/// The dump helper's host settings: on the service network, bounded in
+/// memory and processes, without new privileges.
+fn helper_host_config() -> HostConfig {
+    HostConfig {
+        network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+        memory: Some(HELPER_MEMORY_BYTES),
+        memory_swap: Some(HELPER_MEMORY_BYTES),
+        pids_limit: Some(HELPER_PIDS_LIMIT),
+        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        ..Default::default()
+    }
+}
 
 /// The engines whose services are backed up as a dump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -640,8 +658,10 @@ pub(crate) fn dump_plan(engine: DumpEngine, host: &str, credentials: &DumpCreden
         },
         // The local engine's dump (every user database, one transaction),
         // over the network. POSIX `sh` has no `pipefail`, so the dump's own
-        // status is carried out of the pipeline in a file. `set -f`: the
-        // database names are split into arguments but never globbed.
+        // status is carried out of the pipeline in a file. Schema names are
+        // data a database user controls: each is one argument (split on
+        // newlines only, `set -f`: never globbed) after `--`, so one named
+        // like an option cannot redirect the dump and the password with it.
         DumpEngine::Mariadb => DumpPlan {
             script: format!(
                 "set -f\n\
@@ -649,8 +669,9 @@ pub(crate) fn dump_plan(engine: DumpEngine, host: &str, credentials: &DumpCreden
                  if command -v mariadb >/dev/null 2>&1; then client=mariadb; else client=mysql; fi\n\
                  dbs=$($client -h {quoted_host} -P {port} -N -B -u{user} -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys') ORDER BY SCHEMA_NAME\") || exit 3\n\
                  if [ -z \"$dbs\" ]; then echo '-- No user databases to dump' | gzip; exit 0; fi\n\
+                 IFS='\n'; set -- $dbs; unset IFS\n\
                  rc=\"${{TMPDIR:-/tmp}}/temps-backup.rc\"\n\
-                 {{ $dump -h {quoted_host} -P {port} --databases $dbs --single-transaction --quick -u{user}; echo $? > \"$rc\"; }} | gzip\n\
+                 {{ $dump -h {quoted_host} -P {port} --single-transaction --quick -u{user} --databases -- \"$@\"; echo $? > \"$rc\"; }} | gzip\n\
                  [ \"$(cat \"$rc\")\" = 0 ]",
                 user = shell_escape(&credentials.username),
             ),
@@ -793,10 +814,7 @@ async fn dump_to_s3(
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 tty: Some(false),
-                host_config: Some(HostConfig {
-                    network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-                    ..Default::default()
-                }),
+                host_config: Some(helper_host_config()),
                 ..Default::default()
             },
         )
@@ -1142,6 +1160,27 @@ mod tests {
         }
     }
 
+    /// A runaway dump tool is stopped by its helper's bounds, not by the
+    /// node running out of memory or processes.
+    #[test]
+    fn the_dump_helper_is_bounded_in_memory_and_processes() {
+        let host = helper_host_config();
+        assert_eq!(host.memory, Some(HELPER_MEMORY_BYTES));
+        assert_eq!(
+            host.memory_swap, host.memory,
+            "no swap beyond the memory bound"
+        );
+        assert_eq!(host.pids_limit, Some(HELPER_PIDS_LIMIT));
+        assert_eq!(
+            host.network_mode.as_deref(),
+            Some(temps_core::NETWORK_NAME.as_str())
+        );
+        assert_eq!(
+            host.security_opt,
+            Some(vec!["no-new-privileges:true".to_string()])
+        );
+    }
+
     /// No password reaches argv: each engine's credential travels in the
     /// helper's environment, and the dump connects to the service's
     /// container by name on the shared network.
@@ -1179,7 +1218,15 @@ mod tests {
         assert!(redis.script.contains("gzip -c"));
 
         let maria = dump_plan(DumpEngine::Mariadb, "temps-mariadb-shop", &credentials());
-        assert!(maria.script.starts_with("set -f\n"), "no globbing of database names");
+        assert!(
+            maria.script.starts_with("set -f\n"),
+            "no globbing of database names"
+        );
+        assert!(
+            maria.script.contains("--databases -- \"$@\""),
+            "schema names are arguments after `--`, never options"
+        );
+        assert!(!maria.script.contains("$dbs --"), "{}", maria.script);
         assert_eq!(
             maria.env,
             vec![

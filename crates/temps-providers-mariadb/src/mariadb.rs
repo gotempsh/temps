@@ -2484,7 +2484,8 @@ impl MariaDbService {
                  echo '-- No user databases to dump'; \
                  exit 0; \
              fi; \
-             $dump --databases $dbs --single-transaction --quick -uroot"
+             set -f; IFS='\n'; set -- $dbs; unset IFS; \
+             $dump --single-transaction --quick -uroot --databases -- \"$@\""
             .to_string(),
         ];
 
