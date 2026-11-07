@@ -82,6 +82,29 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         .map_err(engine_error)
     }
 
+    async fn preview_runtime_environment(
+        &self,
+        name: String,
+        service_type: ServiceType,
+        config: ServiceConfig,
+        project_slug: &str,
+        environment_slug: &str,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<HashMap<String, String>, NodeServiceError> {
+        externalsvc::preview_runtime_environment(
+            name,
+            service_type,
+            config,
+            project_slug,
+            environment_slug,
+            docker,
+            published_address,
+        )
+        .await
+        .map_err(engine_error)
+    }
+
     async fn revoke_runtime_environment(
         &self,
         name: String,

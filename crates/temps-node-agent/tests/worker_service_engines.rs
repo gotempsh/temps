@@ -12,7 +12,10 @@
 //! 5. a linked app's environment is provisioned (`runtime_env`): the
 //!    per-environment database, user or bucket key is made, and the
 //!    container the agent created is kept, not replaced by the engine;
-//! 6. stop, start and remove through the agent.
+//! 6. the console's per-environment preview (`runtime_env_preview`) shows
+//!    what provisioning gave out;
+//! 7. stop, start and remove through the agent, after which a preview is
+//!    refused and creates nothing.
 //!
 //! The agent binds service ports on 127.0.0.1 here, so the probes and the
 //! provisioning connect to the stored host as they are; the rewrite to a
@@ -38,7 +41,8 @@ use bollard::Docker;
 use serde_json::{json, Value};
 use temps_node_agent::handlers::AgentState;
 use temps_node_agent::service_handlers::{
-    create_service, health_probe, remove_service, runtime_env, start_service, stop_service,
+    create_service, health_probe, remove_service, runtime_env, runtime_env_preview, start_service,
+    stop_service,
 };
 use temps_node_agent::service_observe_handlers::{service_runtime, service_stats};
 use temps_node_agent::{ServiceCreateRequest, ServicePortMapping};
@@ -286,6 +290,22 @@ async fn wait_healthy(agent: &Arc<AgentState>, config: &ServiceConfig, label: &s
     }
 }
 
+async fn preview(agent: &Arc<AgentState>, config: &ServiceConfig) -> (u16, Value) {
+    envelope(
+        runtime_env_preview(
+            State(agent.clone()),
+            Json(RemoteRuntimeEnvRequest {
+                service_config: config.clone(),
+                project_slug: "shop".into(),
+                environment_slug: "production".into(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await
+}
+
 async fn provision(agent: &Arc<AgentState>, config: &ServiceConfig, label: &str) -> (u16, Value) {
     // A fresh container may answer its health probe before it accepts the
     // admin connection; retry for a bounded time.
@@ -464,6 +484,26 @@ async fn every_engine_on_a_worker_is_created_probed_provisioned_and_controlled_b
                 engine.label
             ));
         }
+
+        // 6. The per-environment preview gives what provisioning gave.
+        let (status, previewed) = preview(&agent, &config).await;
+        if status != 200 {
+            failures.push(format!(
+                "{}: the preview failed ({status}): {previewed}",
+                engine.label
+            ));
+        } else if previewed["data"]["environment"] != provisioned["data"]["environment"] {
+            failures.push(format!(
+                "{}: the preview differs from what provisioning gave out: {} vs {}",
+                engine.label, previewed["data"]["environment"], provisioned["data"]["environment"]
+            ));
+        }
+        if container_id(&docker, &container).await != after {
+            failures.push(format!(
+                "{}: the preview touched the container",
+                engine.label
+            ));
+        }
         if !is_running(&docker, &container).await {
             failures.push(format!(
                 "{}: the container is not running after provisioning",
@@ -471,7 +511,7 @@ async fn every_engine_on_a_worker_is_created_probed_provisioned_and_controlled_b
             ));
         }
 
-        // 6. Stop, start and remove through the agent.
+        // 7. Stop, start and remove through the agent.
         let (status, body) = envelope(
             stop_service(State(agent.clone()), Path(container.clone()))
                 .await
@@ -501,8 +541,21 @@ async fn every_engine_on_a_worker_is_created_probed_provisioned_and_controlled_b
             "{}: the container survived its removal",
             engine.label
         );
+        // A preview of a service with no container here is refused, and
+        // the engine's `init` never gets to create one.
+        let (status, refused) = preview(&agent, &config).await;
+        if status == 200 || !refused.to_string().contains("has no container") {
+            failures.push(format!(
+                "{}: a preview without a container was not refused ({status}): {refused}",
+                engine.label
+            ));
+        }
+        if container_id(&docker, &container).await.is_some() {
+            // The cleanup guard removes it under the same name.
+            failures.push(format!("{}: a preview created a container", engine.label));
+        }
         println!(
-            "{}: create, health, runtime, stats, provisioning, stop/start, remove OK",
+            "{}: create, health, runtime, stats, provisioning, preview, stop/start, remove OK",
             engine.label
         );
     }

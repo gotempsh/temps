@@ -709,11 +709,6 @@ impl ExternalServiceManager {
             return Ok(cluster_vars);
         }
 
-        let service_instance = self.create_service_instance_for_parameters(
-            service.name.clone(),
-            service_type,
-            &parameters,
-        )?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -725,6 +720,32 @@ impl ExternalServiceManager {
             })?,
         };
 
+        // A service on a worker is previewed by its node's agent, as it is
+        // provisioned there (`get_runtime_env_vars`): this server never
+        // builds an engine, let alone a container, for it.
+        if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id) {
+            let client = self.get_remote_client(node_id).await?;
+            return client
+                .preview_runtime_env_vars(crate::remote_service_client::RemoteRuntimeEnvRequest {
+                    service_config,
+                    project_slug: project_scope,
+                    environment_slug: environment_scope,
+                })
+                .await
+                .map(|response| response.environment)
+                .map_err(|error| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to preview the runtime environment of service {} on node {}: {}",
+                        service_id_val, node_id, error
+                    ),
+                });
+        }
+
+        let service_instance = self.create_service_instance_for_parameters(
+            service.name.clone(),
+            service_type,
+            &parameters,
+        )?;
         service_instance
             .init(service_config.clone())
             .await
@@ -1347,6 +1368,70 @@ mod tests {
     #[tokio::test]
     async fn service_preview_rejects_soft_deleted_environment() {
         assert_preview_rejects_unavailable_environment(21).await;
+    }
+
+    /// The per-environment preview of a database on a worker node, asked of
+    /// a server with no Docker. It used to build a local engine (failing
+    /// here with "Docker unavailable", and on a server with Docker letting
+    /// the engine create a container on the wrong host); the worker service
+    /// was then left out of the preview. It goes to its node's agent now:
+    /// this node has only a plain http:// address, so the request is refused
+    /// by the agent client (credentials are only sent sealed), naming the
+    /// node, and no engine is ever built here.
+    #[tokio::test]
+    async fn a_worker_service_is_previewed_by_its_agent_never_a_local_engine() {
+        let encryption =
+            temps_core::EncryptionService::new_from_password("service-parameter-reveal-test");
+        let mut node = nodes_test_model(3);
+        node.address = "http://127.0.0.1:9".to_string();
+        node.token_encrypted = Some(encryption.encrypt_string("node-token").unwrap());
+        let mut service = encrypted_service_model(
+            11,
+            serde_json::json!({
+                "host": "localhost",
+                "port": "5561",
+                "username": "app",
+                "password": "s3cret",
+                "database": "orders",
+            }),
+        );
+        service.node_id = Some(3);
+        let link = project_services::Model {
+            id: 9,
+            project_id: 10,
+            service_id: 11,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service.clone()], vec![service]])
+                .append_query_results([vec![node]])
+                .into_connection(),
+        );
+        let manager = control_plane_manager_with_db(db);
+        assert!(
+            manager.require_docker().is_err(),
+            "no Docker on this server"
+        );
+
+        let error = manager
+            .preview_service_environment_variables(11, &link, "shop", "production")
+            .await
+            .expect_err("a plain-http node is never sent the service's credentials");
+
+        assert!(
+            !matches!(error, ExternalServiceError::DockerUnavailable { .. }),
+            "a local engine was built: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to preview the runtime environment of service 11 on node 3"),
+            "{message}"
+        );
+        assert!(message.contains("plain http://"), "{message}");
     }
 
     #[tokio::test]

@@ -1826,6 +1826,72 @@ pub async fn runtime_env(
     }
 }
 
+/// Preview a project's runtime environment of a service this node runs, as
+/// [`runtime_env`] would provision it, without creating, renaming or
+/// provisioning anything. The console's per-environment preview of a worker
+/// service comes here, so the control plane never builds an engine (or a
+/// container) of its own for it.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/runtime-env-preview",
+    request_body = RemoteRuntimeEnvRequest,
+    responses(
+        (status = 200, description = "Runtime environment previewed", body = AgentResponse<RemoteRuntimeEnvResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Preview failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn runtime_env_preview(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RemoteRuntimeEnvRequest>,
+) -> impl IntoResponse {
+    let service_name = request.service_config.name.clone();
+    let service_type = request.service_config.service_type;
+    tracing::debug!(
+        service = %service_name,
+        service_type = %service_type,
+        project = %request.project_slug,
+        environment = %request.environment_slug,
+        "Previewing external-service runtime environment"
+    );
+    let Some(docker) = state.docker.as_ref().map(|docker| Arc::new(docker.clone())) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Docker client is unavailable while previewing service '{}'",
+                service_name
+            ),
+        )
+        .into_response();
+    };
+    let published_address = published_probe_address(&state.host_bind_address());
+    match state
+        .service_runtime
+        .preview_runtime_environment(
+            service_name.clone(),
+            service_type,
+            request.service_config,
+            &request.project_slug,
+            &request.environment_slug,
+            docker,
+            published_address,
+        )
+        .await
+    {
+        Ok(environment) => ok_response(RemoteRuntimeEnvResponse { environment }).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to preview the runtime environment of service '{}': {}",
+                service_name, error
+            ),
+        )
+        .into_response(),
+    }
+}
+
 /// Revoke a project environment's managed S3 credentials on the worker that
 /// owns the storage engine. Mirrors `runtime_env`: the control plane sends the
 /// stored service configuration and the tenant identity, nothing else.
@@ -3212,6 +3278,50 @@ mod injected_engine_tests {
             .into_response();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            runtime
+                .provisioned_through
+                .lock()
+                .expect("provisioned_through")
+                .as_slice(),
+            [Some(
+                "10.42.0.22"
+                    .parse::<std::net::IpAddr>()
+                    .expect("an address")
+            )]
+        );
+    }
+
+    /// A preview reaches the engine's preview (here the stub), through the
+    /// node's bind address like provisioning, and its failure names the
+    /// service and says it was a preview.
+    #[tokio::test]
+    async fn a_runtime_preview_runs_on_this_node_through_its_bind_address() {
+        let runtime = Arc::new(StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        *state.host_bind_address.write().expect("bind address") = "10.42.0.22".to_string();
+        let request = temps_service_protocol::RemoteRuntimeEnvRequest {
+            service_config: temps_service_protocol::ServiceConfig {
+                name: "orders".to_string(),
+                service_type: temps_service_protocol::ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "port": "5561"}),
+            },
+            project_slug: "shop".to_string(),
+            environment_slug: "production".to_string(),
+        };
+
+        let response = runtime_env_preview(State(state), Json(request))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(response).await;
+        assert!(
+            text.contains("Failed to preview the runtime environment of service 'orders'"),
+            "{text}"
+        );
+        assert!(text.contains("preview"), "the stub's preview ran: {text}");
         assert_eq!(
             runtime
                 .provisioned_through

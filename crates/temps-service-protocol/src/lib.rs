@@ -611,6 +611,25 @@ pub trait NodeServiceRuntime: Send + Sync {
         published_address: Option<IpAddr>,
     ) -> Result<HashMap<String, String>, NodeServiceError>;
 
+    /// Preview one project's runtime environment of a service this node
+    /// runs: what [`Self::provision_runtime_environment`] would return, with
+    /// nothing created, renamed or provisioned. Refuses a service whose
+    /// container this node does not run.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one argument per input of the provisioning call; a struct would only rename them"
+    )]
+    async fn preview_runtime_environment(
+        &self,
+        name: String,
+        service_type: ServiceType,
+        config: ServiceConfig,
+        project_slug: &str,
+        environment_slug: &str,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<HashMap<String, String>, NodeServiceError>;
+
     /// Revoke a project environment's managed S3 credentials.
     async fn revoke_runtime_environment(
         &self,

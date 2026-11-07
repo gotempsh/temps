@@ -461,33 +461,7 @@ mod tests {
         project_id: i32,
         slug: &str,
     ) -> temps_entities::environments::Model {
-        let now = Utc::now();
-        temps_entities::environments::Model {
-            id,
-            name: slug.to_string(),
-            slug: slug.to_string(),
-            subdomain: format!("{slug}-{project_id}"),
-            last_deployment: None,
-            host: String::new(),
-            upstreams: Default::default(),
-            created_at: now,
-            updated_at: now,
-            project_id,
-            current_deployment_id: None,
-            branch: None,
-            deleted_at: None,
-            deployment_config: None,
-            is_preview: false,
-            protected: false,
-            sleeping: false,
-            attack_mode: None,
-            shield_mode: None,
-            shield_exempt_paths: Default::default(),
-            force_https: None,
-            last_activity_at: None,
-            ingress_mode: Default::default(),
-            workload_mode: Default::default(),
-        }
+        environment_model(id, project_id, slug)
     }
 
     /// Project `acme` + environment `web-prod` is already linked; the manager

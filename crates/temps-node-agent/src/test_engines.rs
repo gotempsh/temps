@@ -85,6 +85,23 @@ impl NodeServiceRuntime for StubRuntime {
         Err(not_available("provision"))
     }
 
+    async fn preview_runtime_environment(
+        &self,
+        _name: String,
+        _service_type: ServiceType,
+        _config: ServiceConfig,
+        _project_slug: &str,
+        _environment_slug: &str,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<HashMap<String, String>, NodeServiceError> {
+        self.provisioned_through
+            .lock()
+            .expect("provisioned_through")
+            .push(published_address);
+        Err(not_available("preview"))
+    }
+
     async fn revoke_runtime_environment(
         &self,
         _name: String,

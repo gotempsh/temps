@@ -378,6 +378,41 @@ pub(super) fn environment_preview_project(id: i32) -> projects::Model {
     }
 }
 
+/// Environment `slug` (row `id`) of project `project_id`, live.
+pub(super) fn environment_model(
+    id: i32,
+    project_id: i32,
+    slug: &str,
+) -> temps_entities::environments::Model {
+    let now = Utc::now();
+    temps_entities::environments::Model {
+        id,
+        name: slug.to_string(),
+        slug: slug.to_string(),
+        subdomain: format!("{slug}-{project_id}"),
+        last_deployment: None,
+        host: String::new(),
+        upstreams: Default::default(),
+        created_at: now,
+        updated_at: now,
+        project_id,
+        current_deployment_id: None,
+        branch: None,
+        deleted_at: None,
+        deployment_config: None,
+        is_preview: false,
+        protected: false,
+        sleeping: false,
+        attack_mode: None,
+        shield_mode: None,
+        shield_exempt_paths: Default::default(),
+        force_https: None,
+        last_activity_at: None,
+        ingress_mode: Default::default(),
+        workload_mode: Default::default(),
+    }
+}
+
 #[cfg(feature = "docker-tests")]
 pub(super) async fn insert_test_service(
     db: &DatabaseConnection,

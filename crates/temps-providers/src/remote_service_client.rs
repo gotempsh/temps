@@ -407,6 +407,17 @@ impl RemoteServiceClient {
             .await
     }
 
+    /// Preview the runtime environment a project environment would receive
+    /// from a service on the remote node, with nothing provisioned there.
+    pub async fn preview_runtime_env_vars(
+        &self,
+        request: RemoteRuntimeEnvRequest,
+    ) -> Result<RemoteRuntimeEnvResponse, ExternalServiceError> {
+        // The service config holds the service's credentials.
+        self.agent_post_sealed("/agent/services/runtime-env-preview", &request)
+            .await
+    }
+
     /// Revoke the per-environment storage credentials a project link
     /// provisioned on the worker that owns the service. Unlinking must not
     /// leave working keys behind, and the control plane has no route to the
@@ -1558,6 +1569,64 @@ mod tests {
         assert_eq!(
             response.environment.get("DATABASE_URL").map(String::as_str),
             Some("postgres://app:secret@postgres-orders-db:5432/storefront_production")
+        );
+        server.abort();
+    }
+
+    /// The console's per-environment preview of a worker service reaches the
+    /// agent's preview route, sealed, never the provisioning one.
+    #[tokio::test]
+    async fn a_runtime_preview_is_sealed_to_the_agents_preview_route() {
+        async fn handler(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: RemoteRuntimeEnvRequest =
+                open_for_test(&headers, "/agent/services/runtime-env-preview", &sealed);
+            assert_eq!(request.service_config.name, "orders-db");
+            assert_eq!(request.project_slug, "storefront");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"environment": {"POSTGRES_DATABASE": "storefront_production"}},
+                "error": null
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/runtime-env-preview", post(handler)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let response = client
+            .preview_runtime_env_vars(RemoteRuntimeEnvRequest {
+                service_config: ServiceConfig {
+                    name: "orders-db".to_string(),
+                    service_type: ServiceType::Postgres,
+                    version: None,
+                    parameters: serde_json::json!({"host": "localhost", "password": "secret"}),
+                },
+                project_slug: "storefront".to_string(),
+                environment_slug: "production".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response
+                .environment
+                .get("POSTGRES_DATABASE")
+                .map(String::as_str),
+            Some("storefront_production")
         );
         server.abort();
     }
