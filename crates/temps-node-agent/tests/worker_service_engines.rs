@@ -2039,3 +2039,310 @@ fn a_garage_service_on_a_worker_is_refused_before_the_agent_is_called() {
     assert!(message.contains("garage.toml"), "{message}");
     assert!(message.contains("rustfs"), "{message}");
 }
+
+/// Managed S3 storage on a worker is restored in place exactly as on the
+/// control plane: the agent's `data-restore` mirrors each backed-up bucket
+/// with `--overwrite --remove`, so objects written after the backup are
+/// deleted and changed ones put back, and the bucket holds what the backup
+/// holds, no more.
+///
+/// 40 objects are backed up through the agent's `data-backup`; then 5 are
+/// added and one is overwritten; the restore leaves exactly the 40, with
+/// the overwritten one back to its backed-up content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
+    use temps_node_agent::service_data_handlers::{data_backup, data_restore};
+    use temps_service_protocol::{
+        RemoteServiceBackupRequest, RemoteServiceRestoreRequest, WorkerS3Destination,
+    };
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!(
+                "Docker not available (set DOCKER_HOST), skipping the worker S3 restore proof"
+            );
+            return;
+        }
+    };
+    let agent = agent_state(docker.clone());
+    let suffix = std::process::id();
+    let name = format!("wses3r{suffix}");
+    let store_name = format!("wses3rbk{suffix}");
+    let engine = engines()
+        .into_iter()
+        .find(|engine| engine.label == "rustfs")
+        .expect("the RustFS engine");
+    let mut parameters = control_plane_parameters(&engine);
+    parameters.insert("port".into(), json!(free_port().to_string()));
+    let params = ExternalServiceManager::remote_create_params(
+        9,
+        &name,
+        &engine.service_type,
+        &as_strings(&parameters),
+        false,
+    )
+    .expect("the create request");
+    for image in [params.image.as_str(), RUSTFS_IMAGE] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the worker S3 restore proof");
+            return;
+        }
+    }
+    let network = params
+        .network
+        .clone()
+        .expect("worker services join a network");
+    let _cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![params.name.clone(), store_name.clone()],
+        volumes: params.volumes.keys().cloned().collect(),
+    };
+    let (status, created) = envelope(
+        create_service(
+            State(agent.clone()),
+            Json(ServiceCreateRequest {
+                name: params.name.clone(),
+                service_type: params.service_type.clone(),
+                image: params.image.clone(),
+                environment: params.environment.clone(),
+                port_mappings: params
+                    .port_mappings
+                    .iter()
+                    .map(|p| ServicePortMapping {
+                        host_port: p.host_port,
+                        container_port: p.container_port,
+                    })
+                    .collect(),
+                volumes: params.volumes.clone(),
+                network: params.network.clone(),
+                command: params.command.clone(),
+                resource_limits: None,
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "create failed: {created}");
+    let container = created["data"]["container_name"]
+        .as_str()
+        .expect("the created container's name")
+        .to_string();
+    let host_port = created["data"]["host_port"]
+        .as_u64()
+        .expect("the published host port");
+    let mut stored = parameters.clone();
+    stored.insert("port".into(), json!(host_port.to_string()));
+    stored.insert("container_name".into(), json!(container.clone()));
+    let config = ServiceConfig {
+        name: name.clone(),
+        service_type: engine.service_type,
+        version: None,
+        parameters: serde_json::to_value(&stored).expect("stored parameters"),
+    };
+    wait_healthy(&agent, &config, "rustfs").await;
+
+    // The backup store: another RustFS on the service's network.
+    let store_port = free_port();
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(&store_name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(RUSTFS_IMAGE.to_string()),
+                env: Some(vec![
+                    format!("RUSTFS_ACCESS_KEY={WALG_S3_KEY}"),
+                    format!("RUSTFS_SECRET_KEY={WALG_S3_KEY}"),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.clone()),
+                    port_bindings: Some(HashMap::from([(
+                        "9000/tcp".to_string(),
+                        Some(vec![bollard::models::PortBinding {
+                            host_ip: Some("127.0.0.1".to_string()),
+                            host_port: Some(store_port.to_string()),
+                        }]),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the backup store container");
+    docker
+        .start_container(
+            &store_name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("start the backup store");
+
+    let client = |endpoint: String, key: &str, secret: &str| {
+        let credentials = temps_providers::externalsvc::S3Credentials {
+            access_key_id: key.to_string(),
+            secret_key: secret.to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some(endpoint),
+            bucket_name: String::new(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        };
+        async move { credentials.build_s3_client().await }
+    };
+    let text = |key: &str| stored[key].as_str().expect("a generated key").to_string();
+    let service = client(
+        format!("http://127.0.0.1:{host_port}"),
+        &text("access_key"),
+        &text("secret_key"),
+    )
+    .await;
+    let store = client(
+        format!("http://127.0.0.1:{store_port}"),
+        WALG_S3_KEY,
+        WALG_S3_KEY,
+    )
+    .await;
+    async fn make_bucket(s3: &aws_sdk_s3::Client, bucket: &str) {
+        let mut made = Err(String::new());
+        for _ in 0..60 {
+            made = s3
+                .create_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"));
+            if made.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        made.unwrap_or_else(|e| panic!("creating bucket {bucket}: {e}"));
+    }
+    make_bucket(&service, "files").await;
+    make_bucket(&store, "backups").await;
+    let put = |key: String, body: &'static str| {
+        let service = service.clone();
+        async move {
+            service
+                .put_object()
+                .bucket("files")
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                    body.as_bytes(),
+                ))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("put {key}: {e:?}"));
+        }
+    };
+    for i in 0..40 {
+        put(format!("docs/{i:02}.txt"), "backed up").await;
+    }
+    let objects = || {
+        let service = service.clone();
+        async move {
+            let mut keys = Vec::new();
+            let mut token = None;
+            loop {
+                let page = service
+                    .list_objects_v2()
+                    .bucket("files")
+                    .set_continuation_token(token)
+                    .send()
+                    .await
+                    .expect("list the bucket");
+                keys.extend(
+                    page.contents()
+                        .iter()
+                        .filter_map(|o| o.key().map(str::to_string)),
+                );
+                token = page.next_continuation_token().map(str::to_string);
+                if token.is_none() {
+                    break;
+                }
+            }
+            keys.sort();
+            keys
+        }
+    };
+    let backed_up = objects().await;
+    assert_eq!(backed_up.len(), 40);
+
+    let destination = WorkerS3Destination {
+        bucket: "backups".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some(format!("http://{store_name}:9000")),
+        force_path_style: true,
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_access_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+    };
+    let prefix = "external_services/s3/proof/backup-1";
+    let (status, body) = envelope(
+        data_backup(
+            State(agent.clone()),
+            Json(RemoteServiceBackupRequest {
+                service_config: config.clone(),
+                destination: destination.clone(),
+                key: prefix.to_string(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "the backup failed: {body}");
+
+    // After the backup: 5 new objects and one changed.
+    for i in 40..45 {
+        put(format!("docs/{i:02}.txt"), "after the backup").await;
+    }
+    put("docs/00.txt".to_string(), "changed after the backup").await;
+    assert_eq!(objects().await.len(), 45);
+
+    let (status, body) = envelope(
+        data_restore(
+            State(agent.clone()),
+            Json(RemoteServiceRestoreRequest {
+                service_config: config.clone(),
+                source: destination,
+                location: prefix.to_string(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "the restore failed: {body}");
+    let restored = objects().await;
+    assert_eq!(
+        restored.len(),
+        40,
+        "objects written after the backup must be removed: {restored:?}"
+    );
+    assert_eq!(restored, backed_up);
+    let first = service
+        .get_object()
+        .bucket("files")
+        .key("docs/00.txt")
+        .send()
+        .await
+        .expect("read the restored object")
+        .body
+        .collect()
+        .await
+        .expect("the restored object's body")
+        .into_bytes();
+    assert_eq!(&first[..], b"backed up");
+    println!(
+        "worker S3 restore proof: 45 objects before, {} after",
+        restored.len()
+    );
+}
