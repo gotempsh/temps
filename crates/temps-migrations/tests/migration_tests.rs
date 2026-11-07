@@ -7470,8 +7470,13 @@ async fn test_github_manifest_states_migration_is_single_use_and_reversible() ->
     {
         Ok(container) => container,
         Err(error) => {
-            eprintln!("Skipping manifest state migration test: Docker unavailable: {error}");
-            return Ok(());
+            // Only a missing Docker skips the test; any other startup failure
+            // is a broken setup and must stay visible.
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping manifest state migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
         }
     };
     let port = container.get_host_port_ipv4(5432).await?;

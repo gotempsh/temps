@@ -31,7 +31,7 @@ import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
 import {
-  createAttemptGate,
+  createManifestSetupTracker,
   GITHUB_APP_WINDOW,
   githubWindowUsable,
   submitGitHubManifest,
@@ -125,10 +125,13 @@ export function GitProviderFlow({
   const [providerName, setProviderName] = useState('')
   const [gitlabBaseUrl, setGitlabBaseUrl] = useState('https://gitlab.com')
   const [isCreatingApp, setIsCreatingApp] = useState(false)
-  const [manifestAttempts] = useState(createAttemptGate)
-  const githubWindowRef = useRef<Window | null>(null)
-  // Leaving the flow makes an attempt that is still waiting for its state stale.
-  useEffect(() => () => manifestAttempts.invalidate(), [manifestAttempts])
+  const [manifestSetup] = useState(() => createManifestSetupTracker<Window>())
+  // Leaving the flow stops a setup that is still waiting for its state.
+  useEffect(() => () => manifestSetup.cancel(), [manifestSetup])
+  const cancelManifestSetup = () => {
+    manifestSetup.cancel()
+    setIsCreatingApp(false)
+  }
   const [copiedCallback, setCopiedCallback] = useState(false)
   const [gitlabClientId, setGitlabClientId] = useState('')
   const [gitlabClientSecret, setGitlabClientSecret] = useState('')
@@ -481,34 +484,29 @@ export function GitProviderFlow({
       }
 
       setIsCreatingApp(true)
-      const attempt = manifestAttempts.begin()
 
       // Open GitHub's window now, inside the click, so a popup blocker lets it
       // through. The manifest is posted into it once the server has issued the
       // state that GitHub has to hand back to the callback.
-      // A window an earlier attempt left open is reused by name; it is not
-      // this attempt's to close.
-      const earlierWindow = githubWindowRef.current
-      const reusesWindow = earlierWindow !== null && !earlierWindow.closed
-      const githubWindow = window.open('', GITHUB_APP_WINDOW)
-      githubWindowRef.current = githubWindow
-      const closeOwnWindow = () => {
-        if (!reusesWindow) githubWindow?.close()
-      }
+      const { attempt, window: githubWindow } = manifestSetup.begin(() =>
+        window.open('', GITHUB_APP_WINDOW)
+      )
       let manifestState: string
       try {
         manifestState = (await startManifestFlow.mutateAsync({})).state
       } catch {
-        // The mutation reports why (see `meta.errorTitle`).
-        closeOwnWindow()
-        setIsCreatingApp(false)
+        // The mutation reports why (see `meta.errorTitle`). An attempt that was
+        // cancelled or replaced meanwhile leaves the loading flag and the
+        // window to whoever owns them now.
+        manifestSetup.closeWindowFor(attempt)
+        if (manifestSetup.isCurrent(attempt)) setIsCreatingApp(false)
         return
       }
 
-      // The operator went Back (or left) while the state was being issued:
-      // post nothing and watch for nothing.
-      if (!manifestAttempts.isCurrent(attempt)) {
-        closeOwnWindow()
+      // The operator went Back, picked another method or left while the state
+      // was being issued: post nothing and watch for nothing.
+      if (!manifestSetup.isCurrent(attempt)) {
+        manifestSetup.closeWindowFor(attempt)
         return
       }
       if (!githubWindowUsable(githubWindow)) {
@@ -554,6 +552,7 @@ export function GitProviderFlow({
       }
 
       submitGitHubManifest(manifestData, manifestState, GITHUB_APP_WINDOW)
+      manifestSetup.manifestPosted()
       toast.success('Opening GitHub App creation page...', {
         description: 'Complete the setup in the new tab, then return here',
         duration: 5000,
@@ -644,7 +643,15 @@ export function GitProviderFlow({
     setIsWaitingForWebhook(true)
   }
 
+  // Choosing anything but the App stops an App setup that is still waiting
+  // for its state.
+  const chooseMethod = (method: Method) => {
+    if (method !== 'app') cancelManifestSetup()
+    setSelectedMethod(method)
+  }
+
   const handleMethodSelect = (method: Method) => {
+    if (method !== 'app') cancelManifestSetup()
     setSelectedMethod(method)
     if (method === 'pat') {
       setCurrentStep('configure-pat')
@@ -798,8 +805,7 @@ export function GitProviderFlow({
 
   const handleBack = () => {
     // A GitHub App setup still waiting for its state must not carry on.
-    manifestAttempts.invalidate()
-    setIsCreatingApp(false)
+    cancelManifestSetup()
     if (currentStep === 'provider') {
       onCancel?.()
     } else if (currentStep === 'method') {
@@ -1328,7 +1334,7 @@ export function GitProviderFlow({
                   selectedMethod !== 'existing-app' &&
                     'hover:border-muted-foreground/50 hover:shadow-md'
                 )}
-                onClick={() => setSelectedMethod('existing-app')}
+                onClick={() => chooseMethod('existing-app')}
               >
                 <CardHeader>
                   <div className="flex items-start justify-between">
@@ -1620,7 +1626,7 @@ export function GitProviderFlow({
                 selectedMethod !== 'pat' &&
                   'hover:border-muted-foreground/50 hover:shadow-md'
               )}
-              onClick={() => setSelectedMethod('pat')}
+              onClick={() => chooseMethod('pat')}
             >
               <CardHeader>
                 <div className="flex items-start justify-between">

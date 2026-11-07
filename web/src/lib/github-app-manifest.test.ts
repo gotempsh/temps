@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import { installBrowserWindow } from '@/test/dom'
 import {
-  createAttemptGate,
+  createManifestSetupTracker,
   githubManifestAction,
   githubWindowUsable,
   submitGitHubManifest,
@@ -76,32 +76,90 @@ describe('submitGitHubManifest', () => {
   })
 })
 
-describe('createAttemptGate', () => {
-  test('an attempt is current until another begins or the gate is invalidated', () => {
-    const gate = createAttemptGate()
-    const first = gate.begin()
-    expect(gate.isCurrent(first)).toBe(true)
+function fakeWindow() {
+  const window = {
+    closed: false,
+    closeCalls: 0,
+    close() {
+      window.closed = true
+      window.closeCalls += 1
+    },
+  }
+  return window
+}
 
-    const second = gate.begin()
-    expect(gate.isCurrent(first)).toBe(false)
-    expect(gate.isCurrent(second)).toBe(true)
+describe('createManifestSetupTracker', () => {
+  test('an attempt is current until it is cancelled or replaced', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const first = setup.begin(() => fakeWindow())
+    expect(setup.isCurrent(first.attempt)).toBe(true)
+
+    setup.cancel()
+
+    expect(setup.isCurrent(first.attempt)).toBe(false)
+    expect(setup.isCurrent(setup.begin(() => fakeWindow()).attempt)).toBe(true)
   })
 
-  test('going Back or leaving makes the attempt in flight stale', () => {
-    const gate = createAttemptGate()
-    const attempt = gate.begin()
+  test('Back while the state is pending: the stale attempt closes its own blank window', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const first = setup.begin(() => fakeWindow())
 
-    gate.invalidate()
+    setup.cancel()
+    setup.closeWindowFor(first.attempt)
 
-    expect(gate.isCurrent(attempt)).toBe(false)
+    expect(first.window?.closed).toBe(true)
   })
 
-  test('an attempt started after Back is current again', () => {
-    const gate = createAttemptGate()
-    gate.begin()
-    gate.invalidate()
+  test('Back and start again: the stale attempt cannot close the window the new one uses', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const shared = fakeWindow()
+    const first = setup.begin(() => shared)
+    setup.cancel()
+    const second = setup.begin(() => shared)
 
-    expect(gate.isCurrent(gate.begin())).toBe(true)
+    // The first request answers (or fails) after the second attempt began.
+    setup.closeWindowFor(first.attempt)
+
+    expect(shared.closed).toBe(false)
+    expect(setup.isCurrent(first.attempt)).toBe(false)
+    expect(setup.isCurrent(second.attempt)).toBe(true)
+
+    // The new attempt owns the window and may close it if it fails.
+    setup.closeWindowFor(second.attempt)
+    expect(shared.closed).toBe(true)
+  })
+
+  test('a window with a manifest in it is never closed by a later failing attempt', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const shared = fakeWindow()
+    const first = setup.begin(() => shared)
+    setup.manifestPosted()
+
+    const retry = setup.begin(() => shared)
+    setup.closeWindowFor(retry.attempt)
+    setup.closeWindowFor(first.attempt)
+
+    expect(shared.closed).toBe(false)
+  })
+
+  test('once the operator closed the window, a new attempt may close its fresh one', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const old = fakeWindow()
+    setup.begin(() => old)
+    setup.manifestPosted()
+    old.close()
+
+    const fresh = fakeWindow()
+    const retry = setup.begin(() => fresh)
+    setup.closeWindowFor(retry.attempt)
+
+    expect(fresh.closed).toBe(true)
+  })
+
+  test('a blocked popup (null) is handed back as null', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+
+    expect(setup.begin(() => null).window).toBeNull()
   })
 })
 
