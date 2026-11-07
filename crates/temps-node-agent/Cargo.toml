@@ -88,6 +88,8 @@ temps-docker-capture = { path = "../temps-docker-capture" }
 temps-entities = { path = "../temps-entities" }
 # Lists the bucket of the worker WAL-G proof.
 aws-sdk-s3 = { workspace = true }
+# The cancellation token of the control-plane WAL-G backup in the same proof.
+tokio-util = { workspace = true }
 tempfile = { workspace = true }
 rcgen = { workspace = true }
 # `test-util` provides the paused clock the build-queue tests use.

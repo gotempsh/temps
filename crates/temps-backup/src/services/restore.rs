@@ -160,6 +160,8 @@ pub enum RestoreError {
     Internal { reason: String },
 }
 
+mod worker_walg;
+
 fn selected_walg_target_user_data(
     backup: &temps_entities::backups::Model,
 ) -> Result<Option<String>, RestoreError> {
@@ -1080,18 +1082,46 @@ impl RestoreService {
         ),
         RestoreError,
     > {
+        self.capabilities_of(service_id, true).await
+    }
+
+    /// The restore modes of `service_id`, and with `read_window` the PITR
+    /// window its archive covers where that is read from the archive
+    /// (admission needs the modes only).
+    async fn capabilities_of(
+        &self,
+        service_id: i32,
+        read_window: bool,
+    ) -> Result<
+        (
+            temps_providers::externalsvc::RestoreCapabilities,
+            RestoreServiceIdentity,
+        ),
+        RestoreError,
+    > {
         let service = self.load_service(service_id).await?;
         let identity = RestoreServiceIdentity {
             id: service.id,
             name: service.name.clone(),
             service_type: service.service_type.clone(),
         };
-        // A service on a worker node is restored on that node, in place
-        // only (see `job_restore_supported` and `agent_restore_supported`).
-        // Its engine is not on this host, which may have no Docker at all.
-        if crate::engines::workload_job::takes_job_path(&service)
-            || crate::engines::worker_agent::takes_agent_path(&service)
-        {
+        // A PostgreSQL on a worker node restores WAL-G backups on its node
+        // in place and to a point in time, through its agent, with the
+        // window its archive covers (see `worker_walg`).
+        if crate::engines::workload_job::takes_job_path(&service) {
+            let capabilities = worker_walg::capabilities(
+                &self.db,
+                &self.encryption_service,
+                &service,
+                read_window,
+            )
+            .await;
+            return Ok((capabilities, identity));
+        }
+        // The other services on a worker node are restored on that node, in
+        // place only (see `agent_restore_supported`). Their engine is not on
+        // this host, which may have no Docker at all.
+        if crate::engines::worker_agent::takes_agent_path(&service) {
             return Ok((worker_restore_capabilities(), identity));
         }
         let service_type =
@@ -1221,7 +1251,9 @@ impl RestoreService {
         // ADR-055 Phase 9: a database on a worker node is restored by a job
         // on its node, which applies a dump in place. Refuse anything else
         // now, not after the run started.
-        if crate::engines::workload_job::takes_job_path(&target) {
+        if worker_walg::takes_walg_path(&target, &backup_location) {
+            worker_walg::walg_restore_supported(&target, &mode)?;
+        } else if crate::engines::workload_job::takes_job_path(&target) {
             job_restore_supported(&target, &backup_location, &mode)?;
         } else if crate::engines::worker_agent::takes_agent_path(&target) {
             agent_restore_supported(&target, &backup_location, &mode)?;
@@ -1242,7 +1274,7 @@ impl RestoreService {
 
         // Capabilities come from the TARGET — we're going to run the
         // restore logic on its service instance.
-        let caps = self.get_capabilities(target_service_id).await?;
+        let (caps, _) = self.capabilities_of(target_service_id, false).await?;
         match &mode {
             RestoreRequestMode::InPlace => {
                 if !caps.restore_in_place {
@@ -1843,6 +1875,14 @@ fn worker_restore_plan(
     cross_service: bool,
 ) -> Option<WorkerRestorePlan> {
     let node = crate::engines::workload_job::worker_node(target)?;
+    if worker_walg::takes_walg_path(target, location) {
+        return Some(WorkerRestorePlan {
+            steps: worker_walg::steps(node, location, mode, container, cross_service),
+            refusal: worker_walg::walg_restore_supported(target, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
     if crate::engines::workload_job::takes_job_path(target) {
         let mut steps = vec![
             format!(
@@ -2229,6 +2269,20 @@ async fn run_restore_inner(
                 service_id: run.source_service_id,
             })?;
 
+    // ADR-091: a WAL-G backup is restored into a PostgreSQL on a worker
+    // node by the control plane's own WAL-G restore, run by its agent.
+    if worker_walg::takes_walg_path(&target_service, &backup_model.s3_location) {
+        return worker_walg::run(
+            &db,
+            &enc,
+            &mgr,
+            run_id,
+            &backup_model,
+            &target_service,
+            &mode,
+        )
+        .await;
+    }
     // ADR-055 Phase 9: a database on a worker node is restored by a job on
     // its node. Every other target takes the path below, unchanged.
     if crate::engines::workload_job::takes_job_path(&target_service) {
@@ -3465,9 +3519,9 @@ fn job_restore_supported(
     if !crate::engines::workload_job::restore_takes_job_path(target, backup_location) {
         return Err(RestoreError::Validation {
             message: format!(
-                "Database {} ('{}') runs on worker node {node}, where restores apply a pg_dumpall \
-                 dump (`.sql.gz`) for now; backup '{backup_location}' is not one (restoring a \
-                 WAL-G backup on a worker node is not available yet)",
+                "Database {} ('{}') runs on worker node {node}, where a restore applies a \
+                 pg_dumpall dump (`.sql.gz`) or a WAL-G backup (`s3://…`); backup \
+                 '{backup_location}' is neither",
                 target.id, target.name
             ),
         });
@@ -6988,8 +7042,9 @@ mod tests {
     }
 
     /// The restore page of a database on a worker node, read from a server
-    /// that runs no containers: in place only, answered without an engine,
-    /// for every worker engine. Before, the engine lookup needed this
+    /// that runs no containers: answered without an engine, for every worker
+    /// engine; in place only, and to a point in time for PostgreSQL (its
+    /// WAL-G restore runs on the node). Before, the engine lookup needed this
     /// server's Docker and the page failed with a generic 500.
     #[tokio::test]
     async fn a_worker_service_reports_its_restore_options_on_a_control_plane_profile() {
@@ -7006,7 +7061,11 @@ mod tests {
             assert_eq!(identity.id, 5);
             assert!(capabilities.restore_in_place, "{service_type}");
             assert!(!capabilities.restore_to_new_service, "{service_type}");
-            assert!(!capabilities.pitr, "{service_type}");
+            assert_eq!(
+                capabilities.pitr,
+                service_type == "postgres",
+                "{service_type}"
+            );
         }
     }
 
@@ -7221,7 +7280,9 @@ mod tests {
         );
         assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
 
-        // What the job cannot apply is refused in the plan as at start.
+        // A WAL-G backup is restored on the node by the control plane's
+        // WAL-G restore, which the plan describes; into a new service it is
+        // refused in the plan as at start.
         let walg = worker_restore_plan(
             &database,
             "s3://backups/external_services/postgres/orders/walg",
@@ -7230,7 +7291,26 @@ mod tests {
             false,
         )
         .expect("a worker database");
-        assert!(walg.refusal.is_some_and(|r| r.contains("worker node 2")));
+        assert!(walg.refusal.is_none(), "{:?}", walg.refusal);
+        assert!(
+            walg.steps.join("\n").contains("wal-g backup-fetch"),
+            "{:?}",
+            walg.steps
+        );
+        let walg_copy = worker_restore_plan(
+            &database,
+            "s3://backups/external_services/postgres/orders/walg",
+            &RestoreRequestMode::NewService {
+                name: "orders-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "postgres-orders",
+            false,
+        )
+        .expect("a worker database");
+        assert!(walg_copy
+            .refusal
+            .is_some_and(|r| r.contains("worker node 2") && r.contains("new_service")));
         let copy = worker_restore_plan(
             &database,
             "external_services/postgres/orders/u/dump.sql.gz",

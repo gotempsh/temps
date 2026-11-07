@@ -693,6 +693,69 @@ impl ExternalServiceManager {
         Ok(result)
     }
 
+    /// Restore PostgreSQL service `service_id`, which runs on a worker node,
+    /// from the WAL-G repository `walg_prefix` in `source`, in place or to
+    /// `recovery_target`, with the control plane's own restore run by the
+    /// node's agent. `restored_login` is the login the restored data answers
+    /// to (the backup origin's, for another service's backup); the service's
+    /// own stored configuration is the running server's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the restore's inputs, as the agent request"
+    )]
+    pub async fn walg_restore_worker_postgres(
+        &self,
+        service_id: i32,
+        restored_login: Option<&serde_json::Map<String, serde_json::Value>>,
+        source: crate::remote_service_client::WorkerS3Destination,
+        walg_prefix: String,
+        recovery_target: Option<crate::remote_service_client::RecoveryTarget>,
+        target_user_data: Option<String>,
+    ) -> Result<crate::remote_service_client::PostgresWalgRestoreResult, ExternalServiceError> {
+        let (node_id, live_service_config) = self
+            .worker_service_target(service_id, "WAL-G restore")
+            .await?;
+        let mut service_config = live_service_config.clone();
+        if let (Some(login), Some(parameters)) =
+            (restored_login, service_config.parameters.as_object_mut())
+        {
+            for (key, value) in login {
+                parameters.insert(key.clone(), value.clone());
+            }
+        }
+        let result = self
+            .get_remote_client(node_id)
+            .await?
+            .postgres_walg_restore(&crate::remote_service_client::PostgresWalgRestoreRequest {
+                service_id,
+                node_id,
+                service_config,
+                live_service_config,
+                source,
+                walg_prefix,
+                recovery_target,
+                target_user_data,
+            })
+            .await?;
+        // The restored server, or the original put back, runs in a recreated
+        // container with a new address on the node's networks.
+        if !matches!(
+            result,
+            crate::remote_service_client::PostgresWalgRestoreResult::Refused { .. }
+        ) {
+            if let Err(error) = self.register_standalone_service_dns(service_id).await {
+                warn!(
+                    service_id,
+                    node_id,
+                    error = %error,
+                    "PostgreSQL was recreated on its node by a WAL-G restore, but its internal \
+                     DNS record could not be republished"
+                );
+            }
+        }
+        Ok(result)
+    }
+
     /// Restore service `service_id`, which runs on a worker node, in place on
     /// that node from the backup at `location` in `source`.
     pub async fn restore_worker_service(

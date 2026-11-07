@@ -527,6 +527,73 @@ pub enum PostgresWalgBackupResult {
     Failed { reason: String },
 }
 
+/// Engine-specific recovery target for PITR.
+///
+/// Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
+/// variants or define their own semantics when they grow PITR support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecoveryTarget {
+    /// Recover to a specific timestamp.
+    Time {
+        #[schema(value_type = String, format = DateTime)]
+        time: chrono::DateTime<chrono::Utc>,
+    },
+    /// Recover to a specific transaction id (Postgres).
+    Xid { xid: String },
+    /// Recover to a specific log sequence number (Postgres).
+    Lsn { lsn: String },
+    /// Recover to a named restore point created via `pg_create_restore_point` (Postgres).
+    Name { name: String },
+}
+
+/// `POST /agent/services/postgres/walg-restore`: the control plane's WAL-G
+/// restore of a worker's PostgreSQL, run on its node against its container
+/// (ADR-091). The node fetches the base backup into a staging directory
+/// while the server runs, swaps it in keeping the original aside, starts the
+/// restored server, and keeps the result only once recovery has promoted;
+/// otherwise it puts the original back. No command comes from the caller.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresWalgRestoreRequest {
+    pub service_id: i32,
+    /// The node the service runs on, recorded on the recreated container's
+    /// placement.
+    pub node_id: i32,
+    /// The login the restored data answers to: the target's configuration
+    /// with the backup's origin login when the backup is another service's.
+    pub service_config: ServiceConfig,
+    /// The target's own configuration: the login of the server running now,
+    /// and of the original when it is put back.
+    pub live_service_config: ServiceConfig,
+    /// The S3 source holding the backup.
+    pub source: WorkerS3Destination,
+    /// The backup's WAL-G repository, `s3://<source's bucket>/…/walg`.
+    pub walg_prefix: String,
+    /// The point to recover to; `None` stops at the base backup's
+    /// consistency point.
+    #[serde(default)]
+    pub recovery_target: Option<RecoveryTarget>,
+    /// The sentinel user data that selects the base backup; `None` selects
+    /// the latest.
+    #[serde(default)]
+    pub target_user_data: Option<String>,
+}
+
+/// What a [`PostgresWalgRestoreRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PostgresWalgRestoreResult {
+    /// The restored server finished recovery and promoted; the original data
+    /// was deleted.
+    Completed,
+    /// Nothing was changed: the request cannot run on this service.
+    Refused { reason: String },
+    /// The restore failed. The original is running again unless the reason
+    /// says otherwise.
+    Failed { reason: String },
+}
+
 /// Runs once between creating a replacement container and starting it, with
 /// its id (the agent joins it to the overlay there). Shared, unlike
 /// [`AfterCreate`], because an engine may recreate more than once.
@@ -751,6 +818,19 @@ pub trait NodeServiceRuntime: Send + Sync {
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
     ) -> Result<PostgresWalgBackupResult, NodeServiceError>;
+
+    /// Run the control plane's WAL-G restore on this node (see
+    /// [`PostgresWalgRestoreRequest`]). The restored and, on failure, the
+    /// original container are rebuilt from the running container's own
+    /// specification, attached as `node` says.
+    async fn postgres_walg_restore(
+        &self,
+        request: PostgresWalgRestoreRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgRestoreResult, NodeServiceError>;
 }
 
 #[cfg(test)]

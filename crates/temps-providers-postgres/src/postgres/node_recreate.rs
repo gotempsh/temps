@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The one step of continuous archiving that depends on where PostgreSQL
-//! runs: the container recreate that turns `archive_mode` on.
+//! The steps of continuous archiving and WAL-G restore that depend on where
+//! PostgreSQL runs: the container recreates that turn `archive_mode` on, and
+//! that start a restored data directory (or put the original back).
 //!
 //! On the control plane the provider builds the replacement from its own
 //! specification. A worker's container was created by its agent (ports on
-//! the node's address, the node's DNS, the agent's labels), so there the
-//! replacement is the running container's own inspected specification with
-//! only `archive_mode` changed. Both run under the same recreate guard.
+//! the node's address, the node's DNS, the agent's labels, its restart
+//! policy), so there the replacement is the running container's own
+//! inspected specification with only `archive_mode` changed.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -48,18 +49,35 @@ impl std::fmt::Debug for NodeRecreate {
 }
 
 /// The replacement of a worker's PostgreSQL container: its own admitted
-/// specification with archiving on.
-pub(super) struct NodeArchivePlan {
+/// specification, restart policy included, with `archive_mode` set as asked.
+pub(super) struct NodeContainerPlan {
     plan: DatabaseWorkloadPlan,
     existing: ContainerInspectResponse,
     secrets: BTreeMap<String, String>,
 }
 
-/// `command` with `archive_mode` set to `on`: an existing setting in any of
-/// PostgreSQL's spellings (`-c archive_mode=off`, `-carchive_mode=off`,
+/// What a replacement does with the running container's `archive_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NodeArchiveMode {
+    /// Turn archiving on (a backup or a re-point).
+    On,
+    /// Start with archiving off (a restored cluster, see `restore_from_walg`).
+    Off,
+    /// The running container's own setting (putting the original back).
+    Keep,
+}
+
+/// `command` with `archive_mode` set to `on`: see [`command_with_archive_mode`].
+#[cfg(test)]
+pub(super) fn command_with_archive_mode_on(command: Vec<String>) -> Vec<String> {
+    command_with_archive_mode(command, "on")
+}
+
+/// `command` with `archive_mode` set to `value`: an existing setting in any
+/// of PostgreSQL's spellings (`-c archive_mode=off`, `-carchive_mode=off`,
 /// `--archive_mode=off`, `--archive-mode=off`) is changed in place, and one
 /// is added when there is none. Every other argument is kept as it is.
-pub(super) fn command_with_archive_mode_on(command: Vec<String>) -> Vec<String> {
+pub(super) fn command_with_archive_mode(command: Vec<String>, value: &str) -> Vec<String> {
     fn is_archive_mode(key: &str) -> bool {
         key.replace('-', "_").eq_ignore_ascii_case("archive_mode")
     }
@@ -77,14 +95,14 @@ pub(super) fn command_with_archive_mode_on(command: Vec<String>) -> Vec<String> 
             match setting.split_once('=') {
                 Some((key, _)) if is_archive_mode(key) => {
                     found = true;
-                    format!("{prefix}{key}=on")
+                    format!("{prefix}{key}={value}")
                 }
                 _ => part,
             }
         })
         .collect();
     if !found {
-        command.extend(["-c".to_string(), "archive_mode=on".to_string()]);
+        command.extend(["-c".to_string(), format!("archive_mode={value}")]);
     }
     command
 }
@@ -96,7 +114,19 @@ impl PostgresService {
         &self,
         node: &NodeRecreate,
         container_name: &str,
-    ) -> Result<NodeArchivePlan> {
+    ) -> Result<NodeContainerPlan> {
+        self.node_container_plan(node, container_name, NodeArchiveMode::On)
+            .await
+    }
+
+    /// The running container's own specification as a plan to create it
+    /// again, `archive_mode` set by `archive`. Read-only.
+    pub(super) async fn node_container_plan(
+        &self,
+        node: &NodeRecreate,
+        container_name: &str,
+        archive: NodeArchiveMode,
+    ) -> Result<NodeContainerPlan> {
         let snapshot = runtime::snapshot(&self.docker, container_name)
             .await
             .map_err(|e| EngineError::failed(&self.name, e.to_string()))?;
@@ -126,23 +156,30 @@ impl PostgresService {
                 ),
             )
         })?;
-        let command = process
-            .command
-            .take()
-            .or_else(|| snapshot.image_cmd.clone())
-            .filter(|command| !command.is_empty())
-            .ok_or_else(|| {
-                EngineError::failed(
-                    &self.name,
-                    format!(
-                        "the container '{container_name}' of PostgreSQL service {} on node {} \
-                         has no command to turn archive_mode on in",
-                        node.service_id, node.node_id
-                    ),
-                )
-            })?;
-        process.command = Some(command_with_archive_mode_on(command));
-        let plan = DatabaseWorkloadPlan::admit(
+        let value = match archive {
+            NodeArchiveMode::On => Some("on"),
+            NodeArchiveMode::Off => Some("off"),
+            NodeArchiveMode::Keep => None,
+        };
+        if let Some(value) = value {
+            let command = process
+                .command
+                .take()
+                .or_else(|| snapshot.image_cmd.clone())
+                .filter(|command| !command.is_empty())
+                .ok_or_else(|| {
+                    EngineError::failed(
+                        &self.name,
+                        format!(
+                            "the container '{container_name}' of PostgreSQL service {} on node {} \
+                             has no command to set archive_mode={value} in",
+                            node.service_id, node.node_id
+                        ),
+                    )
+                })?;
+            process.command = Some(command_with_archive_mode(command, value));
+        }
+        let mut plan = DatabaseWorkloadPlan::admit(
             &DatabaseIdentity {
                 service_id: node.service_id,
                 service_name: self.name.clone(),
@@ -153,7 +190,10 @@ impl PostgresService {
             &process,
         )
         .map_err(|e| EngineError::failed(&self.name, e.to_string()))?;
-        Ok(NodeArchivePlan {
+        // The agent created it `unless-stopped`; the spec's default would
+        // turn that into `always`.
+        plan.keep_restart_policy(&existing);
+        Ok(NodeContainerPlan {
             plan,
             secrets: process.secret_values(),
             existing,
@@ -204,11 +244,32 @@ impl PostgresService {
         .await
         .map_err(|e| EngineError::failed(&self.name, e.to_string()))
     }
+
+    /// Create and start the container `planned` describes, in place of
+    /// whatever ran under its name. Nothing checks the data it finds: the
+    /// restore that calls this verifies the server itself.
+    pub(super) async fn node_create_from_plan(
+        &self,
+        node: &NodeRecreate,
+        planned: &NodeContainerPlan,
+    ) -> Result<()> {
+        let after_create = Arc::clone(&node.after_create);
+        runtime::create_and_start(
+            &self.docker,
+            &planned.plan,
+            &planned.secrets,
+            &node.attachment,
+            move |id| after_create(id),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| EngineError::failed(&self.name, e.to_string()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::command_with_archive_mode_on;
+    use super::{command_with_archive_mode, command_with_archive_mode_on};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
@@ -260,6 +321,35 @@ mod tests {
                 "--archive-mode=on",
                 "--ARCHIVE_MODE=on",
             ])
+        );
+    }
+
+    /// A restored cluster starts with archiving off, whatever the original
+    /// ran with.
+    #[test]
+    fn a_restored_command_turns_archiving_off() {
+        assert_eq!(
+            command_with_archive_mode(
+                args(&[
+                    "postgres",
+                    "-c",
+                    "archive_mode=on",
+                    "-c",
+                    "archive_timeout=60"
+                ]),
+                "off"
+            ),
+            args(&[
+                "postgres",
+                "-c",
+                "archive_mode=off",
+                "-c",
+                "archive_timeout=60"
+            ])
+        );
+        assert_eq!(
+            command_with_archive_mode(args(&["postgres"]), "off"),
+            args(&["postgres", "-c", "archive_mode=off"])
         );
     }
 

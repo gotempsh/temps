@@ -14,6 +14,7 @@ mod config;
 mod lifecycle;
 mod node_recreate;
 mod restore;
+mod restore_swap;
 pub mod sandbox;
 mod service_impl;
 mod walg;

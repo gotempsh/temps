@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, RecreateHook, RemoteServiceBackupRequest,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
+    PostgresWalgRestoreResult, RecreateHook, RemoteServiceBackupRequest,
     RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
 };
 use tokio::sync::Semaphore;
@@ -219,7 +220,7 @@ pub async fn postgres_walg_backup(
     Json(request): Json<PostgresWalgBackupRequest>,
 ) -> axum::response::Response {
     let service = request.service_config.name.clone();
-    let Some(_permit) = admit(&DATA_OPERATIONS) else {
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
         return busy("back up", &service);
     };
     let Some(docker) = state.docker.as_ref() else {
@@ -236,8 +237,96 @@ pub async fn postgres_walg_backup(
         &state,
         Some(temps_core::NETWORK_NAME.to_string()),
     );
+    let after_create = overlay_hook(docker);
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .postgres_walg_backup(
+                request,
+                engine_docker,
+                node,
+                after_create,
+                published_address,
+            )
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "WAL-G base backup could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAL-G base backup of service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "WAL-G base backup panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAL-G base backup of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("WAL-G base backup", &service),
+    };
+    match &outcome {
+        PostgresWalgBackupResult::Completed { restarted, .. } => {
+            if *restarted {
+                reroute_recreated_postgres(&state, docker, &service).await;
+            }
+            tracing::info!(service = %service, restarted, "WAL-G base backup completed");
+        }
+        PostgresWalgBackupResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "WAL-G base backup refused");
+        }
+        PostgresWalgBackupResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "WAL-G base backup failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// What [`run_detached`] returns: the engine's outcome, or why it has none.
+enum Detached<T> {
+    Done(Result<T, temps_service_protocol::NodeServiceError>),
+    DeadlineExceeded,
+    Panicked(String),
+}
+
+/// Run `engine` in its own task, holding `permit` until it ends, bounded by
+/// [`DATA_OPERATION_DEADLINE`]. A control plane that stops waiting drops
+/// this request, and with it any future it awaits: a WAL-G engine stopped
+/// between moving the data directory aside and starting the server again
+/// would leave the service down. Detached, it finishes, putting the
+/// original back if it must.
+async fn run_detached<T, F>(permit: tokio::sync::SemaphorePermit<'static>, engine: F) -> Detached<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, temps_service_protocol::NodeServiceError>>
+        + Send
+        + 'static,
+{
+    let task = tokio::spawn(async move {
+        let _permit = permit;
+        tokio::time::timeout(DATA_OPERATION_DEADLINE, engine).await
+    });
+    match task.await {
+        Ok(Ok(outcome)) => Detached::Done(outcome),
+        Ok(Err(_)) => Detached::DeadlineExceeded,
+        Err(error) => Detached::Panicked(error.to_string()),
+    }
+}
+
+/// Joins a container a PostgreSQL engine recreated to the overlay, between
+/// create and start, as every container this agent creates.
+fn overlay_hook(docker: &bollard::Docker) -> RecreateHook {
     let overlay_docker = docker.clone();
-    let after_create: RecreateHook = Arc::new(move |id: String| {
+    Arc::new(move |id: String| {
         let docker = overlay_docker.clone();
         Box::pin(async move {
             if let Err(error) =
@@ -251,61 +340,127 @@ pub async fn postgres_walg_backup(
                 );
             }
         })
-    });
-    let published_address =
-        crate::service_handlers::published_probe_address(&state.host_bind_address());
-    let outcome = match tokio::time::timeout(
-        DATA_OPERATION_DEADLINE,
-        state.service_runtime.postgres_walg_backup(
-            request,
-            Arc::new(docker.clone()),
-            node,
-            after_create,
-            published_address,
-        ),
+    })
+}
+
+/// A recreated container starts without the routes to the other workers'
+/// overlay ranges. Its name is the managed `postgres-<service>`, the only one
+/// the WAL-G engines run on here.
+async fn reroute_recreated_postgres(state: &AgentState, docker: &bollard::Docker, service: &str) {
+    let container = format!("postgres-{service}");
+    if let Err(error) = crate::service_handlers::install_overlay_peer_routes_after_start(
+        docker,
+        &container,
+        &state.overlay_peers,
     )
     .await
     {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(error)) => {
-            tracing::error!(service = %service, %error, "WAL-G base backup could not run");
+        tracing::warn!(
+            container = %container,
+            %error,
+            "Failed to install overlay peer routes after recreating a service"
+        );
+    }
+}
+
+/// `POST /agent/services/postgres/walg-restore`: the control plane's WAL-G
+/// restore (in place, or to a point in time) of a PostgreSQL service on
+/// this node, run by the same engine as on the control plane.
+///
+/// The base backup is fetched into a staging directory on the data volume
+/// while the server runs; the original data directory is kept aside until
+/// the restored server has finished recovery and promoted, and is put back,
+/// its container started as it was, when it does not. The recreated
+/// containers are the running container's own specification (restart policy
+/// included), attached to this node as every container this agent creates.
+/// Engine outcomes come back as 200 with `completed`, `refused` (nothing was
+/// changed) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/postgres/walg-restore",
+    request_body = PostgresWalgRestoreRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<PostgresWalgRestoreResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Restore deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn postgres_walg_restore(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<PostgresWalgRestoreRequest>,
+) -> axum::response::Response {
+    let service = request.live_service_config.name.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("restore", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("restore", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.source.bucket,
+        pitr = request.recovery_target.is_some(),
+        "Restoring a service on this node from WAL-G"
+    );
+    let node = crate::service_handlers::node_attachment(
+        &state,
+        Some(temps_core::NETWORK_NAME.to_string()),
+    );
+    let after_create = overlay_hook(docker);
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .postgres_walg_restore(
+                request,
+                engine_docker,
+                node,
+                after_create,
+                published_address,
+            )
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "WAL-G restore could not run");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("WAL-G base backup of service '{service}' could not run: {error}"),
+                format!("WAL-G restore of service '{service}' could not run: {error}"),
             )
             .into_response();
         }
-        Err(_) => return deadline_exceeded("WAL-G base backup", &service),
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "WAL-G restore panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WAL-G restore of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("WAL-G restore", &service),
     };
     match &outcome {
-        PostgresWalgBackupResult::Completed { restarted, .. } => {
-            if *restarted {
-                // A recreated container starts without the routes to the
-                // other workers' overlay ranges. Its name is the managed
-                // `postgres-<service>`, the only one the engine backs up here.
-                let container = format!("postgres-{service}");
-                if let Err(error) =
-                    crate::service_handlers::install_overlay_peer_routes_after_start(
-                        docker,
-                        &container,
-                        &state.overlay_peers,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        container = %container,
-                        %error,
-                        "Failed to install overlay peer routes after recreating a service"
-                    );
-                }
-            }
-            tracing::info!(service = %service, restarted, "WAL-G base backup completed");
+        PostgresWalgRestoreResult::Completed => {
+            reroute_recreated_postgres(&state, docker, &service).await;
+            tracing::info!(service = %service, "WAL-G restore completed");
         }
-        PostgresWalgBackupResult::Refused { reason } => {
-            tracing::warn!(service = %service, %reason, "WAL-G base backup refused");
+        PostgresWalgRestoreResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "WAL-G restore refused");
         }
-        PostgresWalgBackupResult::Failed { reason } => {
-            tracing::error!(service = %service, %reason, "WAL-G base backup failed");
+        PostgresWalgRestoreResult::Failed { reason } => {
+            // The original was started again in a recreated container.
+            reroute_recreated_postgres(&state, docker, &service).await;
+            tracing::error!(service = %service, %reason, "WAL-G restore failed");
         }
     }
     AgentResponse::ok(outcome).into_response()
@@ -328,6 +483,10 @@ mod tests {
             .route(
                 "/agent/services/postgres/walg-backup",
                 post(postgres_walg_backup),
+            )
+            .route(
+                "/agent/services/postgres/walg-restore",
+                post(postgres_walg_restore),
             )
             .with_state(state)
     }
@@ -485,6 +644,107 @@ mod tests {
             node.network.as_deref(),
             Some(temps_core::NETWORK_NAME.as_str())
         );
+    }
+
+    fn walg_restore_body() -> serde_json::Value {
+        let config = serde_json::json!({
+            "name": "orders",
+            "service_type": "postgres",
+            "version": null,
+            "parameters": {"host": "localhost", "port": "5432"}
+        });
+        serde_json::json!({
+            "service_id": 8,
+            "node_id": 2,
+            "service_config": config.clone(),
+            "live_service_config": config,
+            "source": backup_body(None)["destination"].clone(),
+            "walg_prefix": "s3://backups/external_services/postgres/orders/walg",
+            "recovery_target": {"kind": "time", "time": "2026-11-07T10:00:00.123456Z"},
+            "target_user_data": null
+        })
+    }
+
+    /// A WAL-G restore names no command, image, path or attachment either:
+    /// the engine runs on this node with this node's attachment, the typed
+    /// recovery target arrives as sent, and a failure to run names the
+    /// service.
+    #[tokio::test]
+    async fn a_walg_restore_runs_the_engine_with_this_nodes_attachment() {
+        for field in ["command", "image", "pgdata", "host_ip"] {
+            let mut body = walg_restore_body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/postgres/walg-restore",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state.clone()),
+            "/agent/services/postgres/walg-restore",
+            walg_restore_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("WAL-G restore of service 'orders' could not run"),
+            "{error}"
+        );
+        let asked = runtime.walg_restores.lock().expect("walg_restores");
+        let [(request, node, _)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.service_id, 8);
+        assert!(matches!(
+            &request.recovery_target,
+            Some(temps_service_protocol::RecoveryTarget::Time { time })
+                if time.to_rfc3339() == "2026-11-07T10:00:00.123456+00:00"
+        ));
+        assert_eq!(node.host_ip, state.host_bind_address());
+        assert_eq!(
+            node.network.as_deref(),
+            Some(temps_core::NETWORK_NAME.as_str())
+        );
+    }
+
+    /// An engine keeps running, and keeps its slot, when the request that
+    /// started it is dropped: a WAL-G restore stopped mid-swap would leave
+    /// the service down.
+    #[tokio::test]
+    async fn a_detached_engine_finishes_after_its_request_is_dropped() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let permit = admit(&SLOTS).expect("a free slot");
+        let request = tokio::spawn(run_detached(permit, async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+            Ok::<_, temps_service_protocol::NodeServiceError>(())
+        }));
+        started_rx.await.expect("the engine started");
+        request.abort();
+        let _ = request.await;
+        assert!(admit(&SLOTS).is_none(), "the engine still holds its slot");
+        release_tx.send(()).expect("the engine is still running");
+        done_rx
+            .await
+            .expect("the engine finished after the request was dropped");
+        for _ in 0..50 {
+            if admit(&SLOTS).is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the engine's slot was not released when it finished");
     }
 
     /// A node runs a bounded number of backups and restores at once; one

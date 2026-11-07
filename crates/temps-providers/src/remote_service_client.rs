@@ -17,11 +17,12 @@ pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCr
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, RemoteHealthProbeRequest,
-    RemoteHealthProbeResponse, RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse,
-    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
-    RemoteServiceRestoreResponse, RemoteWalHealthRequest, RemoteWalHealthResponse,
-    ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
+    PostgresWalgRestoreResult, RecoveryTarget, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
+    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthRequest, RemoteWalHealthResponse, ServiceContainerRuntime,
+    ServiceContainerStats, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -497,6 +498,30 @@ impl RemoteServiceClient {
         );
         self.agent_post_with_timeout(
             "/agent/services/postgres/walg-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's PostgreSQL from WAL-G, in place or to a point in
+    /// time, with the control plane's own restore run by the node's agent.
+    /// The S3 source's credentials and the logins travel sealed; an agent
+    /// without the route is told to update.
+    pub async fn postgres_walg_restore(
+        &self,
+        request: &PostgresWalgRestoreRequest,
+    ) -> Result<PostgresWalgRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.live_service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            pitr = request.recovery_target.is_some(),
+            "Restoring a PostgreSQL service on its remote node from WAL-G"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-restore",
             request,
             DATA_OPERATION_TIMEOUT,
         )
@@ -1872,6 +1897,104 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("/agent/services/postgres/walg-backup"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A WAL-G restore reaches the node sealed, with the source's credentials,
+    /// both logins and the typed recovery target, and the engine's outcome
+    /// comes back as it is. An agent without the route is told to update.
+    #[tokio::test]
+    async fn a_walg_restore_is_sealed_to_the_node_and_its_outcome_returned() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgRestoreRequest =
+                open_for_test(&headers, "/agent/services/postgres/walg-restore", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(
+                request.service_config.parameters["password"],
+                "origin-password"
+            );
+            assert_eq!(
+                request.live_service_config.parameters["password"],
+                "db-password"
+            );
+            assert_eq!(
+                request.source.session_token.as_deref(),
+                Some("destination-session")
+            );
+            assert!(matches!(
+                request.recovery_target,
+                Some(RecoveryTarget::Lsn { ref lsn }) if lsn == "0/3000060"
+            ));
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "failed", "reason": "the original database was put back unchanged"},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/walg-restore", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = |password: &str| ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "password": password}),
+        };
+        let request = PostgresWalgRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config("origin-password"),
+            live_service_config: config("db-password"),
+            source: worker_destination(),
+            walg_prefix: "s3://backups/external_services/postgres/billing/walg".to_string(),
+            recovery_target: Some(RecoveryTarget::Lsn {
+                lsn: "0/3000060".to_string(),
+            }),
+            target_user_data: None,
+        };
+        let outcome = client(address)
+            .postgres_walg_restore(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgRestoreResult::Failed {
+                reason: "the original database was put back unchanged".to_string()
+            }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_walg_restore(&request)
+            .await
+            .expect_err("an older agent cannot restore from WAL-G");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/walg-restore"),
             "{message}"
         );
         assert!(message.contains("Update the node's agent"), "{message}");

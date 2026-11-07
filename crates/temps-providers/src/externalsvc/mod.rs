@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 pub mod postgres_role_reconciler;
 pub mod postgres_walg_backup;
+pub mod postgres_walg_restore;
 pub mod worker_data;
 
 #[cfg(test)]

@@ -43,6 +43,15 @@ pub(crate) struct StubRuntime {
             Option<std::net::IpAddr>,
         )>,
     >,
+    /// The WAL-G restores asked for, with the attachment and published
+    /// address.
+    pub(crate) walg_restores: Mutex<
+        Vec<(
+            temps_service_protocol::PostgresWalgRestoreRequest,
+            temps_service_protocol::NodeAttachment,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -172,6 +181,21 @@ impl NodeServiceRuntime for StubRuntime {
             .expect("walg_backups")
             .push((request, node, published_address));
         Err(not_available("postgres_walg_backup"))
+    }
+
+    async fn postgres_walg_restore(
+        &self,
+        request: temps_service_protocol::PostgresWalgRestoreRequest,
+        _docker: Arc<Docker>,
+        node: temps_service_protocol::NodeAttachment,
+        _after_create: temps_service_protocol::RecreateHook,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgRestoreResult, NodeServiceError> {
+        self.walg_restores
+            .lock()
+            .expect("walg_restores")
+            .push((request, node, published_address));
+        Err(not_available("postgres_walg_restore"))
     }
 }
 

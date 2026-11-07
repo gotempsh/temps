@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 pub use temps_service_protocol::{
-    HealthProbeResult, HealthProbeStatus, ServiceConfig, ServiceType,
+    HealthProbeResult, HealthProbeStatus, RecoveryTarget, ServiceConfig, ServiceType,
 };
 use utoipa::ToSchema;
 
@@ -751,26 +751,6 @@ pub enum RestoreMode {
         /// The recovery target — engine decides which variant it honors.
         target: RecoveryTarget,
     },
-}
-
-/// Engine-specific recovery target for PITR.
-///
-/// Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
-/// variants or define their own semantics when they grow PITR support.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RecoveryTarget {
-    /// Recover to a specific timestamp.
-    Time {
-        #[schema(value_type = String, format = DateTime)]
-        time: chrono::DateTime<chrono::Utc>,
-    },
-    /// Recover to a specific transaction id (Postgres).
-    Xid { xid: String },
-    /// Recover to a specific log sequence number (Postgres).
-    Lsn { lsn: String },
-    /// Recover to a named restore point created via `pg_create_restore_point` (Postgres).
-    Name { name: String },
 }
 
 /// Context passed to restore methods: database handle, S3 clients, and

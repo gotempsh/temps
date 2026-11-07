@@ -75,8 +75,13 @@ For PostgreSQL:
    (the console's "repoint continuous archive source").
 3. **Staged restore.** In-place restore and PITR from a WAL-G base: the
    provider's own restore, which fetches into the volume next to the live
-   data, recovers (with `recovery_target_time` for PITR), verifies, and only
-   then swaps. The old data stays until the new data is verified.
+   data while the server runs, writes the recovery settings (the recovery
+   target for PITR), stops the server and swaps the restored directory in
+   with the original moved aside on the same volume, then starts it and
+   waits for recovery to promote. Only then is the original deleted; when
+   recovery does not promote, the original is moved back and its container
+   started as it was. The agent runs it in a task of its own, so a control
+   plane that stops waiting cannot interrupt it between the two.
 
 Redis, MongoDB and MariaDB get the same shape in later steps: their WAL-G
 stream or physical backup, their restore, and for MariaDB binlog shipping.
@@ -110,8 +115,9 @@ worker would therefore break the service's address.
 So the recreate step is a parameter of the node half:
 
 - on the control plane, the provider's own container specification, as today;
-- on a worker, the running container's own inspected specification, with
-  only the PostgreSQL setting being changed (`archive_mode`) replaced.
+- on a worker, the running container's own inspected specification
+  (restart policy included), with only the PostgreSQL setting being changed
+  (`archive_mode`) replaced.
 
 Both run under the same recreate guard: refuse unless the new container
 mounts the same data, set the original aside, verify the same cluster came

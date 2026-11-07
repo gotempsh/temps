@@ -753,6 +753,32 @@ impl DatabaseWorkloadPlan {
         })
     }
 
+    /// Restart the container the way `existing` restarts, instead of the
+    /// spec's `always`: a container rebuilt from its own inspected
+    /// specification (a worker's) keeps the policy it was created with.
+    /// An unset policy leaves the spec's.
+    pub fn keep_restart_policy(&mut self, existing: &ContainerInspectResponse) {
+        use bollard::models::RestartPolicyNameEnum as Name;
+        let Some(name) = existing
+            .host_config
+            .as_ref()
+            .and_then(|host| host.restart_policy.as_ref())
+            .and_then(|policy| policy.name)
+        else {
+            return;
+        };
+        let kept = match name {
+            Name::NO => RestartPolicy::Never,
+            Name::ALWAYS => RestartPolicy::Always,
+            Name::UNLESS_STOPPED => RestartPolicy::UnlessStopped,
+            Name::ON_FAILURE => RestartPolicy::OnFailure,
+            Name::EMPTY => return,
+        };
+        if let Lifetime::LongRunning { restart } = &mut self.spec.lifetime {
+            *restart = kept;
+        }
+    }
+
     /// Admit the plan's spec again where it is executed (a worker's agent):
     /// a plan is never trusted to have been admitted by its sender.
     pub fn readmit(&self) -> Result<Self, ServiceWorkloadError> {
@@ -1083,6 +1109,51 @@ mod tests {
                 .any(|e| e.starts_with("REDIS_PASSWORD=")),
             "the worker's Redis never had the variable"
         );
+    }
+
+    /// A worker's container rebuilt from its own specification restarts as
+    /// it did; one with no recorded policy gets the spec's.
+    #[test]
+    fn a_rebuilt_container_keeps_its_own_restart_policy() {
+        use bollard::models::{HostConfig, RestartPolicy as DockerPolicy, RestartPolicyNameEnum};
+        let process = DatabaseProcess::from_remote_params(DatabaseEngine::Redis, &redis_params());
+        let admitted = DatabaseWorkloadPlan::admit(
+            &identity(DatabaseEngine::Redis, "redis-orders", Some(3)),
+            &process,
+        )
+        .unwrap();
+        let restart_of = |plan: &DatabaseWorkloadPlan| {
+            let values = process.secret_values();
+            database_create_body(plan, SecretValues::Resolved(&values), &Default::default())
+                .unwrap()
+                .host_config
+                .and_then(|host| host.restart_policy)
+                .and_then(|policy| policy.name)
+        };
+        let existing = |name| ContainerInspectResponse {
+            host_config: Some(HostConfig {
+                restart_policy: Some(DockerPolicy {
+                    name,
+                    maximum_retry_count: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut plan = admitted.clone();
+        plan.keep_restart_policy(&existing(Some(RestartPolicyNameEnum::UNLESS_STOPPED)));
+        assert_eq!(
+            restart_of(&plan),
+            Some(RestartPolicyNameEnum::UNLESS_STOPPED)
+        );
+        let mut plan = admitted.clone();
+        plan.keep_restart_policy(&existing(Some(RestartPolicyNameEnum::NO)));
+        assert_eq!(restart_of(&plan), Some(RestartPolicyNameEnum::NO));
+        for unset in [None, Some(RestartPolicyNameEnum::EMPTY)] {
+            let mut plan = admitted.clone();
+            plan.keep_restart_policy(&existing(unset));
+            assert_eq!(restart_of(&plan), Some(RestartPolicyNameEnum::ALWAYS));
+        }
     }
 
     #[test]
