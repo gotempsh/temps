@@ -35,6 +35,7 @@ impl LoadBalancer {
             .req_header()
             .headers
             .iter()
+            .filter(|(name, _)| name.as_str() != temps_core::probe_auth::HEADER)
             .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
             .collect();
         ctx.request_headers = Some(request_headers);

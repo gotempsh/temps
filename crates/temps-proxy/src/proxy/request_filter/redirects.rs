@@ -56,6 +56,7 @@ impl LoadBalancer {
             resp.insert_header("Content-Length", content_length.to_string())?;
             resp.insert_header("Connection", "close")?;
 
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), false).await?;
             session
                 .write_response_body(Some(key_auth_bytes), true)
@@ -240,7 +241,11 @@ impl LoadBalancer {
             );
 
             // Use 301 Permanent Redirect for HTTP→HTTPS
-            let resp = https_redirect_response(&redirect_url, &ctx.request_id)?;
+            let mut resp = https_redirect_response(
+                &redirect_url,
+                &ctx.request_id,
+                self.expose_probe_markers(session),
+            )?;
             // Managed monitors use this marker to distinguish the proxy's
             // pre-upstream protocol upgrade from an application's own 3xx.
             // It carries no trust decision by itself: monitors still require
@@ -248,6 +253,7 @@ impl LoadBalancer {
             // local TLS listener.
             ctx.routing_status = "http_to_https_redirect".to_string();
 
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(Flow::Answered);
         }
@@ -281,7 +287,7 @@ impl LoadBalancer {
             let mut resp = ResponseHeader::build(status_code, None)?;
             resp.insert_header("Location", &redirect_url)?;
             resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+            mark_served_by_proxy(&mut resp, self.expose_probe_markers(session))?;
 
             // Add CORS headers for redirect responses
             resp.insert_header("Access-Control-Allow-Origin", "*")?;
@@ -289,6 +295,7 @@ impl LoadBalancer {
             // Update context for logging
             ctx.routing_status = "redirected".to_string();
 
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(Flow::Answered); // Skip proxying
         }
@@ -310,7 +317,12 @@ impl LoadBalancer {
         {
             let location =
                 domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            let resp = domain_redirect_response(status_code, &location)?;
+            let mut resp = domain_redirect_response(
+                status_code,
+                &location,
+                self.expose_probe_markers(session),
+            )?;
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(Flow::Answered);
         }

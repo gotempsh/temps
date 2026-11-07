@@ -43,19 +43,41 @@ pub fn generate_preview_form_html_labeled(
     show_error: bool,
     console_url: Option<&str>,
 ) -> String {
+    generate_preview_form_with_identity(label, port, next, show_error, console_url, false)
+}
+
+pub fn generate_preview_form_with_identity(
+    label: &str,
+    port: u16,
+    next: &str,
+    show_error: bool,
+    console_url: Option<&str>,
+    hide: bool,
+) -> String {
     // The template historically used `{{SESSION_ID}}` substituted into
     // `session #{{SESSION_ID}}`. We replace the whole legacy phrase with the
     // provided label, then clear any remaining `{{SESSION_ID}}` tokens.
     let escaped_label = html_escape(label);
-    let with_label = PREVIEW_FORM_HTML.replace("session #{{SESSION_ID}}", &escaped_label);
+    let template = if hide {
+        crate::branded_404::neutralize_access_response(PREVIEW_FORM_HTML.to_string())
+    } else {
+        PREVIEW_FORM_HTML.to_string()
+    };
+    let with_label = template.replace("session #{{SESSION_ID}}", &escaped_label);
     let managed = console_url.and_then(|base| console_handoff_url(base, label, port, next));
     let (managed_link, managed_script) = if let Some((url, origin)) = managed {
         let js_url = js_string(&url);
         let js_origin = js_string(&origin);
         let js_next = js_string(next);
         let key = js_string(&format!("temps:preview-handoff:{label}:{port}"));
+        let intro = if hide { "" } else { "If you use Temps, " };
+        let sign_in = if hide {
+            "sign in to the console"
+        } else {
+            "open or sign in to Temps"
+        };
         (
-            format!("<p class=\"managed-help\">If you use Temps, <a id=\"console-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">open or sign in to Temps</a> to restore access. You can also use the preview password below.</p><p id=\"handoff-status\" class=\"managed-help\" hidden>Automatic sign-in did not complete. Check that preview cookies are enabled, or use the link above to retry.</p>", html_escape(&url)),
+            format!("<p class=\"managed-help\">{intro}<a id=\"console-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{sign_in}</a> to restore access. You can also use the preview password below.</p><p id=\"handoff-status\" class=\"managed-help\" hidden>Automatic sign-in did not complete. Check that preview cookies are enabled, or use the link above to retry.</p>", html_escape(&url)),
             format!(r#"<script>
 (() => {{
   const destination = {js_url};
@@ -84,15 +106,21 @@ pub fn generate_preview_form_html_labeled(
 </script>"#),
         )
     } else {
+        let help = "<p class=\"managed-help\">This preview is protected. Enter its password below. To enable automatic sign-in through Temps, an administrator must configure the console external URL.</p>".to_string();
         (
-            "<p class=\"managed-help\">This preview is protected. Enter its password below. To enable automatic sign-in through Temps, an administrator must configure the console external URL.</p>".to_string(),
+            if hide {
+                crate::branded_404::neutralize_access_response(help)
+            } else {
+                help
+            },
             r#"<script>
 if (window.parent !== window) {
   // A wildcard target must never receive the preview path or query.
   // The console verifies the sender and derives its own active iframe path.
   window.parent.postMessage({ type: 'temps:preview-auth-required' }, '*');
 }
-</script>"#.to_string(),
+</script>"#
+                .to_string(),
         )
     };
     with_label
@@ -409,5 +437,35 @@ mod tests {
     fn logout_cookie_omits_secure_on_http() {
         let c = build_logout_cookie_sandbox("abc", "localho.st", false);
         assert!(!c.contains("Secure"));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn neutral_preview_forms_and_bridge_preserve_user_data() {
+        let next = "/Temps console/automatic sign-in through Temps?x=Temps console";
+        for error in [false, true] {
+            for console in [None, Some("https://console.example.test")] {
+                let html = generate_preview_form_with_identity(
+                    "sandbox sbx_abc",
+                    3000,
+                    next,
+                    error,
+                    console,
+                    true,
+                );
+                assert!(html.contains(&format!("value=\"{}\"", html_escape(next))));
+                assert!(!html.contains("open or sign in to Temps"));
+                assert!(!html.contains("Protected by Temps"));
+                if console.is_some() {
+                    assert!(html.contains(&js_string(next)));
+                }
+            }
+        }
+        let bridge = generate_preview_bridge_html("Temps console", next);
+        assert!(bridge.contains(&format!("value=\"{}\"", html_escape(next))));
+        assert!(bridge.contains("preview for Temps console"));
     }
 }

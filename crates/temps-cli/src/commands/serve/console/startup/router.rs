@@ -239,6 +239,11 @@ pub(super) async fn build_router(
         ingress_app,
         public_app,
     } = assemble_public_apps(&config, &ready_flag, public_router, mcp_root_router);
+    let ingress_app = ingress_app.map(|app| {
+        app.layer(axum::Extension(
+            service_context.require_service::<temps_config::ConfigService>(),
+        ))
+    });
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same

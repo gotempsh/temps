@@ -73,13 +73,14 @@ fn apply_forwarded_ip_trust_refresh(
 /// ignored and loopback is used as the client IP for IP-based controls.
 async fn load_initial_forwarded_ip_trust(
     config_service: &temps_config::ConfigService,
-) -> Result<(bool, Option<Arc<HeaderName>>)> {
+) -> Result<(bool, Option<Arc<HeaderName>>, bool)> {
     let settings = config_service.get_settings().await.map_err(|error| {
         anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
     })?;
     Ok((
         settings.trust_loopback_forwarded_ip(),
         loopback_ja4_header(&settings),
+        settings.expose_platform_identity(),
     ))
 }
 
@@ -88,6 +89,7 @@ async fn load_initial_forwarded_ip_trust(
 #[derive(Debug)]
 struct LoopbackTrust {
     forwarded_ip: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
     /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
     ja4_header: Arc<ArcSwapOption<HeaderName>>,
 }
@@ -130,7 +132,7 @@ fn start_forwarded_ip_trust_refresh(
     // (the outer runtime is only driving synchronous setup at this point), but this
     // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
     // for — worth knowing before attempting to un-ignore those tests.
-    let (initial, initial_ja4_header) =
+    let (initial, initial_ja4_header, initial_identity) =
         runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
     info!(
         enabled = initial,
@@ -138,9 +140,11 @@ fn start_forwarded_ip_trust_refresh(
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
     let trust = LoopbackTrust {
+        expose_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
         forwarded_ip: Arc::new(AtomicBool::new(initial)),
         ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
     };
+    let identity = Arc::downgrade(&trust.expose_platform_identity);
     let snapshot = Arc::downgrade(&trust.forwarded_ip);
     let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
@@ -159,6 +163,9 @@ fn start_forwarded_ip_trust_refresh(
                 info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
             }
             if let Some(settings) = &settings {
+                if let Some(identity) = identity.upgrade() {
+                    identity.store(settings.expose_platform_identity(), Ordering::Relaxed);
+                }
                 let header = loopback_ja4_header(settings);
                 let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
                 if apply_loopback_ja4_header_refresh(&ja4_header, header) {
@@ -740,6 +747,7 @@ pub fn setup_proxy_server(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
@@ -1175,6 +1183,7 @@ pub fn create_proxy_service(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)
@@ -1297,6 +1306,7 @@ mod preflight_bind_tests {
     fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
         let settings = AppSettings {
             trust_loopback_forwarded_ip: Some(true),
+            expose_platform_identity: Some(true),
             ..AppSettings::default()
         };
         let row = settings::Model {
@@ -1316,6 +1326,7 @@ mod preflight_bind_tests {
         let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
         assert!(trust.forwarded_ip.load(Ordering::Relaxed));
+        assert!(trust.expose_platform_identity.load(Ordering::Relaxed));
         assert!(
             trust.ja4_header.load().is_none(),
             "no JA4 header configured"

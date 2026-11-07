@@ -932,6 +932,7 @@ pub struct ConfigService {
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
     settings_cache: tokio::sync::RwLock<SettingsCacheState>,
+    expose_platform_identity: std::sync::atomic::AtomicBool,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -997,6 +998,7 @@ impl ConfigService {
             config,
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
+            expose_platform_identity: std::sync::atomic::AtomicBool::new(false),
             listener_handle: std::sync::Mutex::new(None),
             build_limits: tokio::sync::watch::channel(None).0,
             clickhouse_compression: ClickHouseCompression::default(),
@@ -1490,7 +1492,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
     }
 
-    /// Get the application settings
+    /// Lock-free view for console ingress error pages, updated with the settings cache.
+    pub fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the application settings.
     pub async fn get_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         // Serve from the in-memory cache while it is fresh — this is what keeps
         // the proxy's per-request callers off the database (see field docs).
@@ -1642,6 +1650,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // guard as the settings snapshot. A DB read started before an
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
+        self.expose_platform_identity.store(
+            settings.expose_platform_identity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_process_wide_settings(&settings);
         if publish_limits {
             self.publish_build_limits(&settings);
@@ -1660,6 +1672,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return false;
         }
         cache.generation = cache.generation.wrapping_add(1);
+        self.expose_platform_identity.store(
+            settings.expose_platform_identity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_process_wide_settings(&settings);
         self.publish_build_limits(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
@@ -2042,6 +2058,16 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
 
+    async fn refresh_settings_snapshot(&self) {
+        match tokio::time::timeout(SETTINGS_CACHE_TTL, self.get_settings()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "Settings snapshot refresh failed; retaining the last known value")
+            }
+            Err(_) => warn!("Settings snapshot refresh timed out; retaining the last known value"),
+        }
+    }
+
     /// Spawn the background task that LISTENs on the Postgres `settings_change`
     /// channel and invalidates the in-memory settings cache the instant any
     /// process writes the settings row. This makes cross-process settings
@@ -2062,87 +2088,103 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         let database_url = self.get_database_url();
 
         let handle = tokio::spawn(async move {
-            use sqlx::postgres::{PgListener, PgPool};
-
-            // Establish the initial connection + subscription. A failure here is
-            // non-fatal: the cache TTL still expires settings within 5s.
-            let pool = match PgPool::connect(&database_url).await {
-                Ok(pool) => pool,
-                Err(e) => {
-                    warn!(
-                        "settings_change listener: failed to connect to Postgres ({}); \
-                         falling back to {}s cache TTL only",
-                        e,
-                        SETTINGS_CACHE_TTL.as_secs()
-                    );
-                    return;
+            let refresh_service = service.clone();
+            let refresh = async move {
+                loop {
+                    let Some(service) = refresh_service.upgrade() else {
+                        return;
+                    };
+                    service.refresh_settings_snapshot().await;
+                    drop(service);
+                    tokio::time::sleep(SETTINGS_CACHE_TTL).await;
                 }
             };
+            let listen = async move {
+                use sqlx::postgres::{PgListener, PgPool};
 
-            let mut pg_listener = match PgListener::connect_with(&pool).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    warn!(
-                        "settings_change listener: failed to create PgListener ({}); \
-                         falling back to {}s cache TTL only",
-                        e,
-                        SETTINGS_CACHE_TTL.as_secs()
-                    );
-                    return;
-                }
-            };
-
-            if let Err(e) = pg_listener.listen("settings_change").await {
-                warn!(
-                    "settings_change listener: failed to subscribe ({}); \
-                     falling back to {}s cache TTL only",
-                    e,
-                    SETTINGS_CACHE_TTL.as_secs()
-                );
-                return;
-            }
-            info!("Started listening for settings_change events");
-
-            // Pure event-driven loop: invalidate on each NOTIFY. After a
-            // listener error we reconnect, re-subscribe, and invalidate once to
-            // catch any change missed during the gap.
-            loop {
-                match pg_listener.recv().await {
-                    Ok(_notification) => {
-                        let Some(service) = service.upgrade() else {
-                            return;
-                        };
-                        service.invalidate_settings_cache().await;
-                    }
+                // Establish the initial connection + subscription. A failure here is
+                // non-fatal: the cache TTL still expires settings within 5s.
+                let pool = match PgPool::connect(&database_url).await {
+                    Ok(pool) => pool,
                     Err(e) => {
-                        warn!("Error receiving settings_change notification: {}", e);
+                        warn!(
+                            "settings_change listener: failed to connect to Postgres ({}); \
+                         falling back to {}s cache TTL only",
+                            e,
+                            SETTINGS_CACHE_TTL.as_secs()
+                        );
+                        return;
+                    }
+                };
 
-                        // Back off, then attempt to reconnect.
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let mut pg_listener = match PgListener::connect_with(&pool).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        warn!(
+                            "settings_change listener: failed to create PgListener ({}); \
+                         falling back to {}s cache TTL only",
+                            e,
+                            SETTINGS_CACHE_TTL.as_secs()
+                        );
+                        return;
+                    }
+                };
 
-                        match PgListener::connect_with(&pool).await {
-                            Ok(mut new_listener) => {
-                                if let Err(e) = new_listener.listen("settings_change").await {
-                                    warn!("Failed to re-subscribe to settings_change: {}", e);
-                                } else {
-                                    pg_listener = new_listener;
-                                    info!("Reconnected to settings_change listener");
+                if let Err(e) = pg_listener.listen("settings_change").await {
+                    warn!(
+                        "settings_change listener: failed to subscribe ({}); \
+                     falling back to {}s cache TTL only",
+                        e,
+                        SETTINGS_CACHE_TTL.as_secs()
+                    );
+                    return;
+                }
+                info!("Started listening for settings_change events");
+
+                // Pure event-driven loop: invalidate on each NOTIFY. After a
+                // listener error we reconnect, re-subscribe, and invalidate once to
+                // catch any change missed during the gap.
+                loop {
+                    match pg_listener.recv().await {
+                        Ok(_notification) => {
+                            let Some(service) = service.upgrade() else {
+                                return;
+                            };
+                            service.invalidate_settings_cache().await;
+                        }
+                        Err(e) => {
+                            warn!("Error receiving settings_change notification: {}", e);
+
+                            // Back off, then attempt to reconnect.
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                            match PgListener::connect_with(&pool).await {
+                                Ok(mut new_listener) => {
+                                    if let Err(e) = new_listener.listen("settings_change").await {
+                                        warn!("Failed to re-subscribe to settings_change: {}", e);
+                                    } else {
+                                        pg_listener = new_listener;
+                                        info!("Reconnected to settings_change listener");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to reconnect settings_change listener: {}", e);
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to reconnect settings_change listener: {}", e);
-                            }
-                        }
 
-                        // Recovery: invalidate so a NOTIFY missed during the gap
-                        // can't leave the cache holding stale settings.
-                        let Some(service) = service.upgrade() else {
-                            return;
-                        };
-                        service.invalidate_settings_cache().await;
+                            // Recovery: invalidate so a NOTIFY missed during the gap
+                            // can't leave the cache holding stale settings.
+                            let Some(service) = service.upgrade() else {
+                                return;
+                            };
+                            service.invalidate_settings_cache().await;
+                        }
                     }
                 }
-            }
+            };
+            // Keep the atomic ingress snapshot fresh even when no requests read
+            // settings, LISTEN startup fails, or a notification reload fails.
+            tokio::join!(listen, refresh);
         });
 
         if let Ok(mut guard) = self.listener_handle.lock() {
@@ -6154,6 +6196,23 @@ mod tests {
             "v2",
             "invalidate_settings_cache must force a fresh DB read, not serve the cached v1"
         );
+    }
+
+    #[tokio::test]
+    async fn settings_snapshot_refresh_recovers_without_an_http_request() {
+        let mut row = settings_row("privacy");
+        row.data["expose_platform_identity"] = serde_json::json!(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "temporary database outage".into(),
+            )])
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        svc.refresh_settings_snapshot().await;
+        assert!(!svc.expose_platform_identity());
+        svc.refresh_settings_snapshot().await;
+        assert!(svc.expose_platform_identity());
     }
 
     #[test]

@@ -251,6 +251,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   screenshots: ScreenshotSettings
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
+  /** Omit platform branding from proxy responses. */
+  expose_platform_identity: boolean
   /** Database-backed proxy forwarded-IP trust opt-in. */
   trust_loopback_forwarded_ip: boolean
   /** Header a trusted loopback proxy sends the visitor's JA4 in; null = none. */
@@ -354,93 +356,95 @@ export async function updatePlatformSettings(
 
 export function buildPlatformSettingsUpdateBody(
   updated: PlatformSettings
-): AppSettings {
-  const body: AppSettings = {
-    dns_provider: updated.dns_provider,
-    external_url: updated.external_url,
-    internal_url: updated.internal_url,
-    // Sent explicitly so clearing the field (null) reaches the server; an
-    // omitted key would keep the stored value.
-    public_ingress_url: updated.public_ingress_url ?? null,
-    letsencrypt: updated.letsencrypt,
-    preview_domain: updated.preview_domain,
-    edge_target: updated.edge_target,
-    cloudflare_new_projects: updated.cloudflare_new_projects,
-    bunny_new_projects: updated.bunny_new_projects,
-    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
-    // omitting this would silently reset the console's HTTPS policy back to
-    // "automatic" whenever any other settings page is saved.
-    console_force_https: updated.console_force_https,
-    screenshots: updated.screenshots,
-    security_headers: updated.security_headers,
-    rate_limiting: updated.rate_limiting,
-    trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
-    loopback_ja4_header: updated.loopback_ja4_header ?? null,
-    // Edited on the Security page; the server also preserves an omitted
-    // value, but the page's own save must carry it to take effect.
-    trusted_private_networks: updated.trusted_private_networks,
-    // The settings endpoint replaces the full AppSettings document. Omitting
-    // this field makes serde restore DockerRegistrySettings::default(), so a
-    // successful save immediately clears the registry configuration.
-    docker_registry: updated.docker_registry,
-    // Same reasoning: omitting this would silently clear the configured
-    // registry-mirror prefix on every unrelated settings save.
-    registry_mirror_prefix: updated.registry_mirror_prefix,
-    disk_space_alert: updated.disk_space_alert,
-    // The response replaces encrypted provider credentials with masked status
-    // fields. The server restores those omitted secrets from storage on PUT.
-    agent_sandbox:
-      updated.agent_sandbox as unknown as AppSettings['agent_sandbox'],
-    ai_config: updated.ai_config,
-    build_limits: updated.build_limits,
-    ai_chat_limits: updated.ai_chat_limits,
-    ai_workspace_file_limits: updated.ai_workspace_file_limits,
-    request_timeouts: updated.request_timeouts,
-    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
-    // omitting these would silently reset the operator's connection cap and
-    // override ceilings to "unlimited" on every unrelated settings save.
-    connection_limits: updated.connection_limits,
-    tenant_resource_ceilings: updated.tenant_resource_ceilings,
-    monitoring: updated.monitoring,
-    observability_compression: updated.observability_compression,
-    observability_retention: updated.observability_retention,
-    // Same reasoning: omitting this would reset the analytics windows -- and
-    // turn a configured "keep" (null) back into a default cleanup window.
-    analytics_retention: updated.analytics_retention,
-    // Same reasoning: omitting this would reset Docker log rotation and the
-    // collected-log cache/head budgets to defaults on every unrelated save.
-    container_logs: updated.container_logs,
-    // Same `#[serde(default)]` reasoning as the blocks below: omitting this
-    // would reset the geolocation refresh interval and staleness window to
-    // their defaults on every unrelated settings save. The server preserves
-    // the stored license key when `maxmind_license_key` is blank, and restores
-    // the read-only metadata fields this round-trips.
-    geo: updated.geo,
-    // Must be sent on every save: the server deserializes `AppSettings` with
-    // `#[serde(default)]`, so omitting this field would silently re-enable
-    // console updates whenever any other settings page is saved.
-    self_update: updated.self_update,
-    // Same reasoning: omitting this would silently reset cluster DNS back to
-    // disabled on every unrelated settings save.
-    cluster_dns: updated.cluster_dns,
-    // Same reasoning, and the one block with real money attached: omitting
-    // this would reset the Cloud destination and outbox ceiling (ADR-041) and
-    // both bulk-activation spend guards (ADR-042) to their build-time defaults
-    // on every unrelated settings save. `updated` is the server's own GET
-    // response merged with the caller's patch, so this is the stored `cloud`
-    // block round-tripped, not form state — there is no UI control for these
-    // fields yet, and this send path must not depend on one appearing.
-    // The server also preserves unsent `cloud` fields, but a client that knows
-    // the values should not rely on that.
-    cloud: updated.cloud,
-    // Same reasoning: omitting this would silently disable the MCP server on
-    // every unrelated settings save.
-    mcp_server: updated.mcp_server,
-    // The server preserves an omitted block (#1171), but the On-demand TLS
-    // page edits it through this builder, so it must be sent for a save
-    // there to take effect.
-    on_demand_tls: updated.on_demand_tls,
-  }
+): AppSettings & Pick<PlatformSettings, 'expose_platform_identity'> {
+  const body: AppSettings & Pick<PlatformSettings, 'expose_platform_identity'> =
+    {
+      dns_provider: updated.dns_provider,
+      external_url: updated.external_url,
+      internal_url: updated.internal_url,
+      // Sent explicitly so clearing the field (null) reaches the server; an
+      // omitted key would keep the stored value.
+      public_ingress_url: updated.public_ingress_url ?? null,
+      letsencrypt: updated.letsencrypt,
+      preview_domain: updated.preview_domain,
+      edge_target: updated.edge_target,
+      cloudflare_new_projects: updated.cloudflare_new_projects,
+      bunny_new_projects: updated.bunny_new_projects,
+      // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+      // omitting this would silently reset the console's HTTPS policy back to
+      // "automatic" whenever any other settings page is saved.
+      console_force_https: updated.console_force_https,
+      screenshots: updated.screenshots,
+      security_headers: updated.security_headers,
+      rate_limiting: updated.rate_limiting,
+      expose_platform_identity: updated.expose_platform_identity,
+      trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
+      loopback_ja4_header: updated.loopback_ja4_header ?? null,
+      // Edited on the Security page; the server also preserves an omitted
+      // value, but the page's own save must carry it to take effect.
+      trusted_private_networks: updated.trusted_private_networks,
+      // The settings endpoint replaces the full AppSettings document. Omitting
+      // this field makes serde restore DockerRegistrySettings::default(), so a
+      // successful save immediately clears the registry configuration.
+      docker_registry: updated.docker_registry,
+      // Same reasoning: omitting this would silently clear the configured
+      // registry-mirror prefix on every unrelated settings save.
+      registry_mirror_prefix: updated.registry_mirror_prefix,
+      disk_space_alert: updated.disk_space_alert,
+      // The response replaces encrypted provider credentials with masked status
+      // fields. The server restores those omitted secrets from storage on PUT.
+      agent_sandbox:
+        updated.agent_sandbox as unknown as AppSettings['agent_sandbox'],
+      ai_config: updated.ai_config,
+      build_limits: updated.build_limits,
+      ai_chat_limits: updated.ai_chat_limits,
+      ai_workspace_file_limits: updated.ai_workspace_file_limits,
+      request_timeouts: updated.request_timeouts,
+      // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+      // omitting these would silently reset the operator's connection cap and
+      // override ceilings to "unlimited" on every unrelated settings save.
+      connection_limits: updated.connection_limits,
+      tenant_resource_ceilings: updated.tenant_resource_ceilings,
+      monitoring: updated.monitoring,
+      observability_compression: updated.observability_compression,
+      observability_retention: updated.observability_retention,
+      // Same reasoning: omitting this would reset the analytics windows -- and
+      // turn a configured "keep" (null) back into a default cleanup window.
+      analytics_retention: updated.analytics_retention,
+      // Same reasoning: omitting this would reset Docker log rotation and the
+      // collected-log cache/head budgets to defaults on every unrelated save.
+      container_logs: updated.container_logs,
+      // Same `#[serde(default)]` reasoning as the blocks below: omitting this
+      // would reset the geolocation refresh interval and staleness window to
+      // their defaults on every unrelated settings save. The server preserves
+      // the stored license key when `maxmind_license_key` is blank, and restores
+      // the read-only metadata fields this round-trips.
+      geo: updated.geo,
+      // Must be sent on every save: the server deserializes `AppSettings` with
+      // `#[serde(default)]`, so omitting this field would silently re-enable
+      // console updates whenever any other settings page is saved.
+      self_update: updated.self_update,
+      // Same reasoning: omitting this would silently reset cluster DNS back to
+      // disabled on every unrelated settings save.
+      cluster_dns: updated.cluster_dns,
+      // Same reasoning, and the one block with real money attached: omitting
+      // this would reset the Cloud destination and outbox ceiling (ADR-041) and
+      // both bulk-activation spend guards (ADR-042) to their build-time defaults
+      // on every unrelated settings save. `updated` is the server's own GET
+      // response merged with the caller's patch, so this is the stored `cloud`
+      // block round-tripped, not form state — there is no UI control for these
+      // fields yet, and this send path must not depend on one appearing.
+      // The server also preserves unsent `cloud` fields, but a client that knows
+      // the values should not rely on that.
+      cloud: updated.cloud,
+      // Same reasoning: omitting this would silently disable the MCP server on
+      // every unrelated settings save.
+      mcp_server: updated.mcp_server,
+      // The server preserves an omitted block (#1171), but the On-demand TLS
+      // page edits it through this builder, so it must be sent for a save
+      // there to take effect.
+      on_demand_tls: updated.on_demand_tls,
+    }
   return body
 }
 

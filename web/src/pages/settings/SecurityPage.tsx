@@ -31,6 +31,7 @@ import type {
 interface SecurityFormData {
   security_headers: SecurityHeadersType
   rate_limiting: RateLimitType
+  expose_platform_identity: boolean
   trust_loopback_forwarded_ip: boolean
   /** Blank means none; sent as null. */
   loopback_ja4_header: string
@@ -71,12 +72,17 @@ export function SecurityPage() {
         permissions_policy: null,
       },
       rate_limiting: DEFAULT_RATE_LIMITING,
+      expose_platform_identity: false,
       trust_loopback_forwarded_ip: false,
       loopback_ja4_header: '',
       trusted_private_networks_text: '',
     },
   })
 
+  const exposePlatformIdentity = useWatch({
+    control,
+    name: 'expose_platform_identity',
+  })
   const securityHeaders = useWatch({ control, name: 'security_headers' })
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
   const trustLoopbackForwardedIp = useWatch({
@@ -111,6 +117,7 @@ export function SecurityPage() {
             permissions_policy: null,
           },
           rate_limiting: settings.rate_limiting || DEFAULT_RATE_LIMITING,
+          expose_platform_identity: settings.expose_platform_identity,
           trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
           loopback_ja4_header: settings.loopback_ja4_header ?? '',
           trusted_private_networks_text: (
@@ -187,6 +194,31 @@ export function SecurityPage() {
         onSubmit={handleSubmit(onSubmit)}
         className="space-y-6 border-t pt-8"
       >
+        <SettingsSection
+          id="setting-response-branding"
+          title="Response privacy"
+          icon={Shield}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="expose-platform-identity">
+              Show Temps branding in responses
+            </Label>
+            <Switch
+              id="expose-platform-identity"
+              checked={exposePlatformIdentity}
+              onCheckedChange={(checked) =>
+                setValue('expose_platform_identity', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+          <p className="text-sm text-muted-foreground">
+            When off, omits proxy-added branding, keeping required protocol
+            names and license notices. Existing policies for application headers
+            still apply.
+          </p>
+        </SettingsSection>
         <SettingsSection
           title="Proxy client IP"
           description="Choose when Temps trusts forwarding headers from a local reverse proxy"

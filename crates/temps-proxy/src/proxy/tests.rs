@@ -351,8 +351,9 @@ mod https_redirect_tests {
 
     #[test]
     fn proxy_https_redirect_response_has_monitor_marker() {
-        let response = https_redirect_response("https://app.example.test/health", "request-1")
-            .expect("build HTTPS redirect response");
+        let response =
+            https_redirect_response("https://app.example.test/health", "request-1", true)
+                .expect("build HTTPS redirect response");
         assert_eq!(response.status.as_u16(), 301);
         assert_eq!(
             response
@@ -379,7 +380,7 @@ mod https_redirect_tests {
 
     #[test]
     fn domain_redirect_says_temps_answered() {
-        let response = domain_redirect_response(301, "https://example.test/pricing")
+        let response = domain_redirect_response(301, "https://example.test/pricing", true)
             .expect("build domain redirect response");
         assert_eq!(response.status.as_u16(), 301);
         assert_eq!(
@@ -396,6 +397,18 @@ mod https_redirect_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1")
         );
+    }
+
+    #[test]
+    fn domain_redirect_hides_markers_without_changing_redirect() {
+        let response =
+            domain_redirect_response(302, "https://example.test/pricing", false).unwrap();
+        assert_eq!(response.status.as_u16(), 302);
+        assert_eq!(
+            response.headers.get("location").unwrap(),
+            "https://example.test/pricing"
+        );
+        assert!(!response.headers.contains_key("x-temps-proxy-probe-capable"));
     }
 
     #[test]
@@ -2617,6 +2630,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), BLOCKED, true).await?);
@@ -2648,6 +2664,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
@@ -2692,6 +2711,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
         let (head, _, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, false).await?);
         assert!(head.starts_with("HTTP/1.1 426"), "{head}");
@@ -3583,4 +3605,23 @@ mod upstream_retry_tests {
         assert!(session.pipelining_enabled());
         assert_eq!(session.req_header().uri.path(), "/a");
     }
+}
+
+#[test]
+fn hidden_identity_redirect_keeps_request_id_and_local_probe_protocol() {
+    let public =
+        https_redirect_response("https://app.example.test/health", "request-1", false).unwrap();
+    assert_eq!(public.headers.get("X-Request-ID").unwrap(), "request-1");
+    assert!(!public.headers.contains_key("X-Temps-Proxy-Probe-Capable"));
+    assert!(!public.headers.contains_key("X-Temps-Proxy-Https-Redirect"));
+    let local =
+        https_redirect_response("https://app.example.test/health", "request-1", true).unwrap();
+    assert_eq!(
+        local.headers.get("X-Temps-Proxy-Probe-Capable").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        local.headers.get("X-Temps-Proxy-Https-Redirect").unwrap(),
+        "1"
+    );
 }

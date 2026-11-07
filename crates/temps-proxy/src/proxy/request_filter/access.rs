@@ -293,7 +293,11 @@ impl LoadBalancer {
             .await?;
         session
             .write_response_body(
-                Some(Bytes::from_static(b"Sign in to Temps to open this page.\n")),
+                Some(Bytes::from_static(if !self.expose_platform_identity() {
+                    b"Sign in to open this page.\n"
+                } else {
+                    b"Sign in to Temps to open this page.\n"
+                })),
                 true,
             )
             .await?;

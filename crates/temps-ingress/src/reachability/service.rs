@@ -1090,7 +1090,11 @@ impl ReachabilityService {
             let mut verdict = address_reachability(&facts, directs, deployed, environment_name);
             // DNS cannot tell for an address behind a CDN or proxy: ask it.
             if super::forward_check::applies(&verdict, &facts.resolution) {
-                let probe = super::forward_check::probe(&verdict.address).await;
+                let probe = super::forward_check::probe(
+                    &verdict.address,
+                    &self.deps.config.get_server_config().encryption_key,
+                )
+                .await;
                 verdict = super::forward_check::judged(verdict, probe);
             }
             verdicts.push(verdict);
@@ -1105,8 +1109,13 @@ impl ReachabilityService {
             if verdict.audience == Audience::SignedIn
                 && verdict.state == super::model::ReachState::Reachable
             {
-                let probe =
-                    super::gate_check::probe(&verdict.address, *gate, team_domain.as_deref()).await;
+                let probe = super::gate_check::probe(
+                    &verdict.address,
+                    *gate,
+                    team_domain.as_deref(),
+                    &self.deps.config.get_server_config().encryption_key,
+                )
+                .await;
                 *verdict = super::gate_check::judged(verdict.clone(), probe);
             }
         }

@@ -603,6 +603,7 @@ async fn client_supplied_trust_headers_never_reach_the_app_or_the_log() {
     f.route_host(|_, _| {});
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {HOST}\r\n\
+         X-Origin-Probe-Authorization: test-credential\r\n\
          X-Temps-Demo-Mode: true\r\n\
          {identity}-email: spoofed@example.test\r\n\
          {status_host}: status.example.test\r\n\
@@ -643,6 +644,7 @@ async fn client_supplied_trust_headers_never_reach_the_app_or_the_log() {
         .as_ref()
         .expect("headers captured");
     for name in [
+        temps_core::probe_auth::HEADER,
         "x-real-ip",
         "cf-connecting-ip",
         "forwarded",
@@ -1420,4 +1422,492 @@ async fn the_admin_gate_hands_a_denied_client_to_the_public_only_listener() {
     let reply = send(&lb, &get("/"), CLEAN_IP).await;
     reply.assert_forwarded("no_project");
     assert!(reply.ctx.public_surface_only);
+}
+
+#[tokio::test]
+async fn platform_identity_exposure_preserves_application_headers() {
+    for expose in [false, true] {
+        let fixture = fixture_with(ProxyConfig::default());
+        fixture
+            .lb
+            .expose_platform_identity
+            .store(expose, Ordering::Relaxed);
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(get("/").as_bytes()).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        let mut ctx = fixture.lb.new_ctx();
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        for (name, value) in [
+            ("Server", "application-server"),
+            ("X-Powered-By", "application"),
+            ("X-Upstream-Custom", "app-diagnostic"),
+            ("X-Temps-Custom", "app-value"),
+        ] {
+            response.insert_header(name, value).unwrap();
+        }
+        fixture
+            .lb
+            .upstream_response_filter(&mut session, &mut response, &mut ctx)
+            .await
+            .unwrap();
+        for (name, value) in [
+            ("Server", "application-server"),
+            ("X-Powered-By", "application"),
+            ("X-Upstream-Custom", "app-diagnostic"),
+            ("X-Temps-Custom", "app-value"),
+        ] {
+            assert_eq!(response.headers.get(name).unwrap(), value);
+        }
+        assert_eq!(
+            response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+            expose
+        );
+        ctx.upstream_write_pending_time_ms = Some(12);
+        fixture.lb.add_response_timing(&mut response, &ctx).unwrap();
+        assert_eq!(
+            response.headers.contains_key("X-Upstream-Write-Pending"),
+            expose
+        );
+        assert_eq!(response.headers.contains_key("X-Response-Time"), expose);
+    }
+}
+
+#[tokio::test]
+async fn platform_identity_exposure_keeps_app_timing_headers() {
+    for expose in [false, true] {
+        let fixture = fixture_with(ProxyConfig::default());
+        fixture
+            .lb
+            .expose_platform_identity
+            .store(expose, Ordering::Relaxed);
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        response
+            .insert_header("X-Upstream-Write-Pending", "app-owned")
+            .unwrap();
+        response
+            .insert_header("X-Response-Time", "app-owned")
+            .unwrap();
+        fixture
+            .lb
+            .add_response_timing(&mut response, &fixture.lb.new_ctx())
+            .unwrap();
+        assert_eq!(
+            response.headers.get("X-Upstream-Write-Pending").unwrap(),
+            "app-owned"
+        );
+        assert_eq!(
+            response.headers.get("X-Response-Time").unwrap(),
+            "app-owned"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hidden_platform_identity_requires_authentication_even_on_loopback() {
+    let fixture = fixture_with(ProxyConfig::default());
+    fixture
+        .lb
+        .expose_platform_identity
+        .store(false, Ordering::Relaxed);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    client.write_all(get("/").as_bytes()).await.unwrap();
+    use pingora_core::protocols::GetSocketDigest;
+    use std::os::fd::AsRawFd;
+    let digest = pingora_core::protocols::SocketDigest::from_raw_fd(server.as_raw_fd());
+    let mut stream = pingora_core::protocols::l4::stream::Stream::from(server);
+    stream.set_socket_digest(digest);
+    let mut session = Session::new_h1(Box::new(stream));
+    assert!(session.read_request().await.unwrap());
+    assert!(!fixture.lb.expose_probe_markers(&session));
+    session
+        .req_header_mut()
+        .insert_header("User-Agent", "Temps-Reachability/1.0")
+        .unwrap();
+    assert!(!fixture.lb.expose_probe_markers(&session));
+    session
+        .req_header_mut()
+        .insert_header(temps_core::probe_auth::HEADER, "invalid")
+        .unwrap();
+    assert!(!fixture.lb.expose_probe_markers(&session));
+    let host = session
+        .req_header()
+        .headers
+        .get("host")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let token = temps_core::probe_auth::sign(
+        &fixture.lb.config_service.get_server_config().encryption_key,
+        host,
+        temps_core::probe_auth::now(),
+    );
+    session
+        .req_header_mut()
+        .insert_header(temps_core::probe_auth::HEADER, token)
+        .unwrap();
+    assert!(fixture.lb.expose_probe_markers(&session));
+    let mut ctx = fixture.lb.new_ctx();
+    let mut upstream = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+    upstream
+        .insert_header(temps_core::probe_auth::HEADER, "credential")
+        .unwrap();
+    upstream.insert_header("X-App-Header", "preserved").unwrap();
+    fixture
+        .lb
+        .upstream_request_filter(&mut session, &mut upstream, &mut ctx)
+        .await
+        .unwrap();
+    assert!(!upstream
+        .headers
+        .contains_key(temps_core::probe_auth::HEADER));
+    assert_eq!(upstream.headers.get("X-App-Header").unwrap(), "preserved");
+    let mut app_response = pingora_http::ResponseHeader::build(200, None).unwrap();
+    app_response.insert_header("Server", "app-owned").unwrap();
+    fixture
+        .lb
+        .upstream_response_filter(&mut session, &mut app_response, &mut ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        app_response
+            .headers
+            .get("X-Temps-Proxy-Probe-Capable")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(app_response.headers.get("Server").unwrap(), "app-owned");
+    let mut response = crate::proxy::https_redirect_response(
+        "https://app.example.test/",
+        "probe-request",
+        fixture.lb.expose_probe_markers(&session),
+    )
+    .unwrap();
+    fixture
+        .lb
+        .protect_probe_response(&session, &mut response)
+        .unwrap();
+    assert_eq!(
+        response.headers.get("cache-control").unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(
+        response.headers.get("vary").unwrap(),
+        temps_core::probe_auth::HEADER
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("X-Temps-Proxy-Https-Redirect")
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response.headers.get("X-Temps-Proxy-Probe-Capable").unwrap(),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn platform_identity_controls_error_and_challenge_responses() {
+    for expose in [false, true] {
+        for outcome in [
+            None,
+            Some(temps_shield::Outcome::HttpsRequired),
+            Some(temps_shield::Outcome::Block),
+            Some(temps_shield::Outcome::Unavailable),
+            Some(temps_shield::Outcome::Challenge {
+                token: "token".to_string(),
+                difficulty: 20,
+            }),
+        ] {
+            let fixture = fixture_with(ProxyConfig::default());
+            fixture
+                .lb
+                .expose_platform_identity
+                .store(expose, Ordering::Relaxed);
+            let (mut client, server) = tokio::io::duplex(65536);
+            client.write_all(get("/").as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = fixture.lb.new_ctx();
+            let failed_upstream = outcome.is_none();
+            ctx.shield_header = Some("challenge");
+            if let Some(outcome) = outcome {
+                fixture
+                    .lb
+                    .answer_shield(&mut session, &mut ctx, outcome, None)
+                    .await
+                    .unwrap();
+            } else {
+                fixture
+                    .lb
+                    .fail_to_proxy(
+                        &mut session,
+                        &pingora::Error::new(pingora::ErrorType::ConnectRefused),
+                        &mut ctx,
+                    )
+                    .await;
+            }
+            drop(session);
+            let mut raw = Vec::new();
+            client.read_to_end(&mut raw).await.unwrap();
+            let response = String::from_utf8(raw).unwrap();
+            assert!(response
+                .to_lowercase()
+                .contains(&format!("x-request-id: {}", ctx.request_id)));
+            if !expose {
+                assert!(!response.to_lowercase().contains("temps"), "{response}");
+            } else if failed_upstream {
+                assert!(response.contains("Temps"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn hidden_identity_replaces_cached_upstream_responses_without_changing_app_headers() {
+    for expose in [false, true] {
+        for method in ["GET", "HEAD", "PUT"] {
+            let f = fixture();
+            f.lb.expose_platform_identity
+                .store(expose, Ordering::Relaxed);
+            let (mut client, server) = tokio::io::duplex(4096);
+            client.write_all(get("/").as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = f.lb.new_ctx();
+            ctx.project = Some(Arc::new(project(PROJECT)));
+            ctx.upstream_host = Some("127.0.0.1:9000".into());
+            let mut request =
+                pingora_http::RequestHeader::build(method, b"/api/asset", None).unwrap();
+            request.insert_header("If-None-Match", "\"v1\"").unwrap();
+            request
+                .insert_header("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+                .unwrap();
+            request
+                .insert_header("If-Match", "\"write-version\"")
+                .unwrap();
+            request
+                .insert_header("If-Unmodified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+                .unwrap();
+            f.lb.upstream_request_filter(&mut session, &mut request, &mut ctx)
+                .await
+                .unwrap();
+            let refresh = !expose && method != "PUT";
+            assert_eq!(request.headers.contains_key("If-None-Match"), !refresh);
+            assert_eq!(request.headers.contains_key("If-Modified-Since"), !refresh);
+            assert!(request.headers.contains_key("If-Match"));
+            assert!(request.headers.contains_key("If-Unmodified-Since"));
+            // Model an unchanged app that returns 304 only for a conditional read.
+            if method != "PUT" {
+                let status = if request.headers.contains_key("If-None-Match") {
+                    304
+                } else {
+                    200
+                };
+                let mut response = pingora_http::ResponseHeader::build(status, None).unwrap();
+                response.insert_header("ETag", "\"v1\"").unwrap();
+                response
+                    .insert_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .unwrap();
+                response
+                    .insert_header("Cache-Control", "public, max-age=0")
+                    .unwrap();
+                response.insert_header("Server", "application").unwrap();
+                f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status.as_u16(), if !expose { 200 } else { 304 });
+                assert_eq!(response.headers.get("ETag").unwrap(), "\"v1\"");
+                assert_eq!(
+                    response.headers.get("Cache-Control").unwrap(),
+                    "public, max-age=0"
+                );
+                assert_eq!(response.headers.get("Server").unwrap(), "application");
+                assert_eq!(
+                    response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+                    expose
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn platform_identity_exposure_preserves_console_and_public_api_conditional_reads() {
+    for expose in [false, true] {
+        for public_surface in [false, true] {
+            for method in ["GET", "HEAD"] {
+                let f = fixture_with(ProxyConfig {
+                    console_ingress_address: Some("127.0.0.1:3001".into()),
+                    ..ProxyConfig::default()
+                });
+                f.lb.expose_platform_identity
+                    .store(expose, Ordering::Relaxed);
+                let (mut client, server) = tokio::io::duplex(4096);
+                client
+                    .write_all(get("/api/flags/snapshot").as_bytes())
+                    .await
+                    .unwrap();
+                let mut session =
+                    Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+                assert!(session.read_request().await.unwrap());
+                let mut ctx = f.lb.new_ctx();
+                ctx.public_surface_only = public_surface;
+                // Resolve the real console peer, as Pingora does before filtering
+                // its request. Cover both the full and public-only listeners.
+                let _peer = f.lb.upstream_peer(&mut session, &mut ctx).await.unwrap();
+                assert_eq!(
+                    ctx.upstream_host.as_deref(),
+                    Some(if public_surface {
+                        "127.0.0.1:3001"
+                    } else {
+                        "127.0.0.1:3000"
+                    })
+                );
+                let mut request =
+                    RequestHeader::build(method, b"/api/flags/snapshot", None).unwrap();
+                request
+                    .insert_header("If-None-Match", "\"snapshot-v1\"")
+                    .unwrap();
+                request
+                    .insert_header("If-Modified-Since", "Wed, 21 Oct 2015 07:28:00 GMT")
+                    .unwrap();
+                f.lb.upstream_request_filter(&mut session, &mut request, &mut ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    request.headers.get("If-None-Match").unwrap(),
+                    "\"snapshot-v1\""
+                );
+                assert_eq!(
+                    request.headers.get("If-Modified-Since").unwrap(),
+                    "Wed, 21 Oct 2015 07:28:00 GMT"
+                );
+                let mut response = pingora_http::ResponseHeader::build(304, None).unwrap();
+                response.insert_header("ETag", "\"snapshot-v1\"").unwrap();
+                f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status.as_u16(), 304);
+                assert_eq!(response.headers.get("ETag").unwrap(), "\"snapshot-v1\"");
+                assert_eq!(
+                    response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+                    expose
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn probe_authentication_uses_the_routed_authority() {
+    let f = fixture();
+    f.lb.expose_platform_identity
+        .store(false, Ordering::Relaxed);
+    let token = temps_core::probe_auth::sign(
+        &f.lb.config_service.get_server_config().encryption_key,
+        HOST,
+        temps_core::probe_auth::now(),
+    );
+    for (host, uri, authenticated) in [
+        (None, "https://app.example.test/", true),
+        (None, "https://APP.example.test:8443/", true),
+        (Some("APP.example.test:8443"), "/", true),
+        (None, "https://other.example.test/", false),
+        (None, "/", false),
+        (Some("bad@host"), "https://app.example.test/", false),
+        (
+            Some("other.example.test"),
+            "https://app.example.test/",
+            false,
+        ),
+        (Some(HOST), "https://other.example.test/", true),
+    ] {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(get("/").as_bytes()).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.unwrap());
+        // Model Pingora's parsed HTTP/2 header shape: :authority is carried
+        // by the URI and Host may be absent. The hook uses the same header
+        // representation for both downstream protocols.
+        session.req_header_mut().remove_header("Host");
+        session.req_header_mut().set_uri(uri.parse().unwrap());
+        if let Some(host) = host {
+            session
+                .req_header_mut()
+                .insert_header("Host", host)
+                .unwrap();
+        }
+        session
+            .req_header_mut()
+            .insert_header(temps_core::probe_auth::HEADER, token.clone())
+            .unwrap();
+        assert_eq!(
+            f.lb.authenticated_probe(&session),
+            authenticated,
+            "host={host:?} uri={uri}"
+        );
+        let mut ctx = f.lb.new_ctx();
+        let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers.contains_key("X-Temps-Proxy-Probe-Capable"),
+            authenticated
+        );
+        assert_eq!(
+            response
+                .headers
+                .get("Cache-Control")
+                .map(|v| v.to_str().unwrap()),
+            authenticated.then_some("private, no-store")
+        );
+    }
+}
+
+#[tokio::test]
+async fn upstream_cannot_supply_a_shield_verdict_in_either_branding_mode() {
+    for expose in [false, true] {
+        for verdict in [None, Some("challenge")] {
+            let f = fixture();
+            f.lb.expose_platform_identity
+                .store(expose, Ordering::Relaxed);
+            let (mut client, server) = tokio::io::duplex(4096);
+            client.write_all(get("/").as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+            assert!(session.read_request().await.unwrap());
+            let mut ctx = f.lb.new_ctx();
+            ctx.shield_header = verdict;
+            let mut response = pingora_http::ResponseHeader::build(200, None).unwrap();
+            response
+                .insert_header(temps_shield::RESPONSE_HEADER, "fabricated-verdict")
+                .unwrap();
+            response.insert_header("X-App-Header", "preserved").unwrap();
+            f.lb.upstream_response_filter(&mut session, &mut response, &mut ctx)
+                .await
+                .unwrap();
+            f.lb.response_filter(&mut session, &mut response, &mut ctx)
+                .await
+                .unwrap();
+            let expected = verdict
+                .filter(|_| expose)
+                .map(|verdict| temps_shield::response_header_value(verdict, &ctx.request_id));
+            assert_eq!(
+                response
+                    .headers
+                    .get(temps_shield::RESPONSE_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                expected.as_deref()
+            );
+            assert_eq!(response.headers.get("X-App-Header").unwrap(), "preserved");
+        }
+    }
 }

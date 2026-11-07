@@ -2363,6 +2363,10 @@ async fn serve_public_only(
 async fn public_only_not_found(req: Request) -> Response {
     use axum::response::IntoResponse;
 
+    let hide_identity = req
+        .extensions()
+        .get::<Arc<temps_config::ConfigService>>()
+        .is_none_or(|settings| !settings.expose_platform_identity());
     let headers = req.headers();
     let wants_html = !req.uri().path().starts_with("/api/")
         && headers
@@ -2386,7 +2390,7 @@ async fn public_only_not_found(req: Request) -> Response {
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
         ],
-        temps_proxy::branded_404::render(host, request_id),
+        temps_proxy::branded_404::render_with_identity(host, request_id, hide_identity),
     )
         .into_response()
 }
@@ -2567,7 +2571,54 @@ mod public_only_app_tests {
     }
 
     #[tokio::test]
-    async fn a_browser_gets_the_branded_404_and_an_api_client_an_empty_one() {
+    async fn public_ingress_exposes_platform_identity_only_when_enabled() {
+        for expose in [None, Some(false), Some(true)] {
+            let now = chrono::Utc::now();
+            let settings = temps_config::AppSettings {
+                expose_platform_identity: expose,
+                ..Default::default()
+            };
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![temps_entities::settings::Model {
+                        id: 1,
+                        data: settings.to_json(),
+                        created_at: now,
+                        updated_at: now,
+                    }]])
+                    .into_connection(),
+            );
+            let config = temps_config::ServerConfig::new(
+                "127.0.0.1:3000".into(),
+                "postgresql://test".into(),
+                None,
+                None,
+            )
+            .unwrap();
+            let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
+            service.get_settings().await.unwrap();
+            let request = Request::builder()
+                .uri("/dashboard")
+                .header(header::HOST, "hooks.example.test")
+                .header(header::ACCEPT, "text/html")
+                .body(Body::empty())
+                .unwrap();
+            let response = send(app().layer(axum::Extension(service)), request).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&body)
+                    .to_lowercase()
+                    .contains("temps"),
+                expose == Some(true)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_browser_gets_a_neutral_404_by_default_and_an_api_client_an_empty_one() {
         let browser = Request::builder()
             .uri("/dashboard")
             .header(header::HOST, "hooks.example.com")
@@ -2582,9 +2633,10 @@ mod public_only_app_tests {
         let html = String::from_utf8_lossy(&body);
         assert!(
             html.contains("<!doctype html>"),
-            "expected the branded page"
+            "expected the neutral page"
         );
         assert!(html.contains("hooks.example.com"));
+        assert!(!html.to_lowercase().contains("temps"));
         assert!(
             !html.contains("id=\"root\""),
             "the dashboard bundle must never be served here"

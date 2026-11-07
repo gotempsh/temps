@@ -1370,3 +1370,37 @@ fn legacy_multi_node_settings_without_mtls_field_remain_plaintext_until_migrated
     let parsed = AppSettings::from_json(legacy);
     assert!(!parsed.multi_node.require_mtls);
 }
+
+#[test]
+fn platform_identity_is_hidden_by_default_and_exposure_can_be_enabled() {
+    assert!(!AppSettings::default().expose_platform_identity());
+    for json in [
+        r#"{}"#,
+        r#"{"expose_platform_identity":null}"#,
+        r#"{"expose_platform_identity":false}"#,
+    ] {
+        let settings: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(!settings.expose_platform_identity());
+    }
+    let settings: AppSettings =
+        serde_json::from_str(r#"{"expose_platform_identity":true}"#).unwrap();
+    assert!(settings.expose_platform_identity());
+}
+
+#[test]
+fn malformed_settings_preserve_platform_identity_choice() {
+    for enabled in [false, true] {
+        let settings = AppSettings::from_json(serde_json::json!({
+            "geo": "not an object",
+            "expose_platform_identity": enabled
+        }));
+        assert_eq!(settings.expose_platform_identity(), enabled);
+    }
+    for flag in [serde_json::Value::Null, serde_json::json!("invalid")] {
+        let settings = AppSettings::from_json(serde_json::json!({
+            "geo": "not an object",
+            "expose_platform_identity": flag
+        }));
+        assert!(!settings.expose_platform_identity());
+    }
+}

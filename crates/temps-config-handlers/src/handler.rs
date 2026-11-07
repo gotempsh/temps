@@ -216,6 +216,32 @@ impl AuditOperation for PublicIngressUrlUpdatedAudit {
     }
 }
 
+/// Record the old and new instance-wide response privacy choices.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlatformIdentityExposureUpdatedAudit {
+    context: AuditContext,
+    previous_enabled: bool,
+    new_enabled: bool,
+}
+
+impl AuditOperation for PlatformIdentityExposureUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "PLATFORM_IDENTITY_EXPOSURE_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// `FORWARDED_IP_TRUST_UPDATED` — a change to whether Temps trusts
 /// `X-Forwarded-For`/`X-Real-IP` from a loopback reverse proxy.
 ///
@@ -449,6 +475,8 @@ pub struct AppSettingsResponse {
     /// Database-backed opt-in; this is the sole control surface for every
     /// proxy process, including a standalone `temps proxy`.
     pub trust_loopback_forwarded_ip: bool,
+    /// Opt in to proxy-added platform branding in public application responses.
+    pub expose_platform_identity: bool,
     /// The header a trusted loopback proxy sends the visitor's JA4 in.
     /// `None` records no JA4 behind such a proxy.
     #[schema(example = "x-ja4")]
@@ -1101,6 +1129,7 @@ impl From<AppSettings> for AppSettingsResponse {
         // Resolved before the literal below starts moving fields out of
         // `settings`; absence means "never configured", which reads as default.
         let self_update = settings.self_update();
+        let expose_platform_identity = settings.expose_platform_identity();
         let trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
         Self {
             plugin_installation_reporting_enabled: settings.plugin_installation_reporting_enabled,
@@ -1132,6 +1161,7 @@ impl From<AppSettings> for AppSettingsResponse {
             security_headers: settings.security_headers,
             rate_limiting: settings.rate_limiting,
             trust_loopback_forwarded_ip,
+            expose_platform_identity,
             loopback_ja4_header: settings.loopback_ja4_header,
             docker_registry: DockerRegistrySettingsMasked {
                 enabled: settings.docker_registry.enabled,
@@ -2463,6 +2493,9 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     if incoming.self_update.is_none() {
         incoming.self_update = current.self_update.clone();
     }
+    if incoming.expose_platform_identity.is_none() {
+        incoming.expose_platform_identity = current.expose_platform_identity;
+    }
     if incoming.trust_loopback_forwarded_ip.is_none() {
         incoming.trust_loopback_forwarded_ip = current.trust_loopback_forwarded_ip;
     }
@@ -3641,6 +3674,7 @@ async fn update_settings(
     let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
+    let previous_expose_platform_identity = stored_settings.expose_platform_identity();
     let previous_trust_loopback_forwarded_ip = stored_settings.trust_loopback_forwarded_ip();
     let previous_public_ingress_url = stored_settings.public_ingress_url.clone();
 
@@ -3840,6 +3874,7 @@ async fn update_settings(
     settings.loopback_ja4_header =
         validate_loopback_ja4_header(settings.loopback_ja4_header.as_deref())?;
 
+    let next_expose_platform_identity = settings.expose_platform_identity();
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
     let previous_clickhouse_compression = stored_settings.clickhouse.compression;
     let next_clickhouse_compression = settings.clickhouse.compression;
@@ -3966,6 +4001,32 @@ async fn update_settings(
                 }
             }
 
+            if next_expose_platform_identity != previous_expose_platform_identity {
+                info!(
+                    previous_enabled = previous_expose_platform_identity,
+                    new_enabled = next_expose_platform_identity,
+                    "Platform response identity setting changed"
+                );
+                let identity_audit = PlatformIdentityExposureUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_enabled: previous_expose_platform_identity,
+                    new_enabled: next_expose_platform_identity,
+                };
+                if let Err(e) = app_state
+                    .audit_service
+                    .create_audit_log(&identity_audit)
+                    .await
+                {
+                    error!(
+                        "Failed to create the platform response identity audit log: {}",
+                        e
+                    );
+                }
+            }
             if next_trust_loopback_forwarded_ip != previous_trust_loopback_forwarded_ip {
                 info!(
                     previous_enabled = previous_trust_loopback_forwarded_ip,
@@ -4567,6 +4628,31 @@ mod tests {
             ])
     }
 
+    #[test]
+    fn platform_identity_defaults_and_omitted_updates() {
+        let mut incoming = AppSettings::default();
+        assert!(!incoming.expose_platform_identity());
+        let stored = AppSettings {
+            expose_platform_identity: Some(true),
+            ..AppSettings::default()
+        };
+        preserve_omitted_security_fields(&mut incoming, &stored);
+        assert!(AppSettingsResponse::from(incoming).expose_platform_identity);
+        let mut explicit = AppSettings {
+            expose_platform_identity: Some(false),
+            ..AppSettings::default()
+        };
+        preserve_omitted_security_fields(&mut explicit, &stored);
+        assert!(!AppSettingsResponse::from(explicit).expose_platform_identity);
+        let mut omitted = AppSettings::default();
+        let stored = AppSettings {
+            expose_platform_identity: Some(false),
+            ..AppSettings::default()
+        };
+        preserve_omitted_security_fields(&mut omitted, &stored);
+        assert!(!AppSettingsResponse::from(omitted).expose_platform_identity);
+    }
+
     #[tokio::test]
     async fn public_ingress_url_is_normalized_when_the_hostname_is_free() {
         let svc = ingress_config_service(free_hostname_db());
@@ -5049,6 +5135,7 @@ mod tests {
             plugin_installation_reporting_enabled: true,
             anonymous_telemetry_enabled: Some(false),
             trust_loopback_forwarded_ip: Some(true),
+            expose_platform_identity: Some(true),
             self_update: Some(temps_config::SelfUpdateSettings {
                 enabled: false,
                 ..Default::default()
@@ -7268,7 +7355,14 @@ mod tests {
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
         );
-        let state = Arc::new(SettingsState {
+        configure_routes().with_state(settings_test_state(db, Arc::new(NoopAuditLogger)))
+    }
+
+    fn settings_test_state(
+        db: Arc<sea_orm::DatabaseConnection>,
+        audit: Arc<dyn AuditLogger>,
+    ) -> Arc<SettingsState> {
+        Arc::new(SettingsState {
             config_service: Arc::new(ConfigService::new(
                 Arc::new(
                     temps_config::ServerConfig::new(
@@ -7285,7 +7379,7 @@ mod tests {
                 temps_core::EncryptionService::new(&"11".repeat(32))
                     .expect("valid test encryption key"),
             ),
-            audit_service: Arc::new(NoopAuditLogger),
+            audit_service: audit,
             sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
             route_table_refresher: None,
             enrollment_token_service: Arc::new(
@@ -7294,8 +7388,119 @@ mod tests {
             update_status: None,
             self_updater: None,
             clickhouse_health: None,
-        });
-        configure_routes().with_state(state)
+        })
+    }
+
+    #[derive(Default)]
+    struct IdentityAudit(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[temps_core::async_trait::async_trait]
+    impl AuditLogger for IdentityAudit {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((operation.operation_type(), operation.serialize()?));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_identity_settings_require_write_permission() {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(guard_principal(temps_auth::Role::Reader))
+            .extension(RequestMetadata {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "test".to_string(),
+                headers: Default::default(),
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "http://localhost".to_string(),
+                scheme: "http".to_string(),
+                host: "localhost".to_string(),
+                is_secure: false,
+            })
+            .body(axum::body::Body::from(
+                r#"{"expose_platform_identity":true}"#,
+            ))
+            .unwrap();
+        let response = unauthenticated_settings_router()
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn platform_identity_settings_save_and_audit() {
+        use tower::ServiceExt;
+        let now = chrono::Utc::now();
+        let row = temps_entities::settings::Model {
+            id: 1,
+            data: AppSettings::default().to_json(),
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row]; 8])
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let audit = Arc::new(IdentityAudit::default());
+        let state = settings_test_state(db, audit.clone());
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/settings")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(guard_principal(temps_auth::Role::Admin))
+            .extension(RequestMetadata {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "test".to_string(),
+                headers: Default::default(),
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "http://localhost".to_string(),
+                scheme: "http".to_string(),
+                host: "localhost".to_string(),
+                is_secure: false,
+            })
+            .body(axum::body::Body::from(
+                r#"{"expose_platform_identity":true}"#,
+            ))
+            .unwrap();
+        let response = configure_routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(state
+            .config_service
+            .get_settings()
+            .await
+            .unwrap()
+            .expose_platform_identity());
+        assert!(audit.0.lock().unwrap().iter().any(|(event, payload)| {
+            let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+            event == "PLATFORM_IDENTITY_EXPOSURE_UPDATED"
+                && payload["previous_enabled"] == false
+                && payload["new_enabled"] == true
+        }));
     }
 
     #[tokio::test]

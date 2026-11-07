@@ -116,6 +116,9 @@ pub struct AppSettings {
     /// This is the sole control surface — there is no CLI/env override.
     #[serde(default)]
     pub trust_loopback_forwarded_ip: Option<bool>,
+    /// Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+    #[serde(default)]
+    pub expose_platform_identity: Option<bool>,
     /// The header a trusted loopback proxy puts the visitor's JA4 TLS
     /// fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
     /// `trust_loopback_forwarded_ip` trusts, and removed from every request
@@ -2471,6 +2474,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             trust_loopback_forwarded_ip: None,
+            expose_platform_identity: None,
             loopback_ja4_header: None,
             docker_registry: DockerRegistrySettings::default(),
             registry_mirror_prefix: None,
@@ -2522,6 +2526,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    /// Expose identity only when enabled, including settings saved before this field existed.
+    pub fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity.unwrap_or(false)
+    }
+
     /// The database-backed opt-in, disabled until explicitly set by an admin.
     pub fn trust_loopback_forwarded_ip(&self) -> bool {
         self.trust_loopback_forwarded_ip.unwrap_or(false)
@@ -2730,6 +2739,11 @@ impl AppSettings {
                 Some(serde_json::Value::Bool(enabled)) => Some(*enabled),
                 Some(_) => Some(false),
             };
+            // Preserve an explicit branding choice when another section is malformed.
+            // An absent or invalid flag keeps the privacy-preserving default.
+            let expose_platform_identity = value
+                .get("expose_platform_identity")
+                .and_then(serde_json::Value::as_bool);
             // Same for the ClickHouse wire-compression mode: resetting a saved
             // `none` to the LZ4 default would silently re-break a deployment
             // whose proxy corrupts LZ4 framing, over an unrelated bad section.
@@ -2759,6 +2773,7 @@ impl AppSettings {
             };
             Self {
                 anonymous_telemetry_enabled,
+                expose_platform_identity,
                 clickhouse,
                 on_demand_tls,
                 shield,
