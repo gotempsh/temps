@@ -28,7 +28,7 @@ Managed services are databases and storage systems that Temps provisions as Dock
 |---------|--------------|----------|
 | **PostgreSQL** | `gotempsh/postgres-walg:18-bookworm` | Primary database with WAL-G streaming backups |
 | **MariaDB** | `mariadb:lts` | MySQL-compatible relational database |
-| **Redis** | `gotempsh/redis-walg:8-bookworm` | Caching, sessions, pub/sub, and queues |
+| **Redis** | `ghcr.io/gotempsh/redis-walg:8-trixie` | Caching, sessions, pub/sub, and queues |
 | **MongoDB** | `gotempsh/mongodb-walg:8.0` | Document database |
 | **S3 Storage** | `rustfs/rustfs:1.0.0` | S3-compatible object storage (`rustfs` by default or `garage`) |
 
@@ -102,7 +102,7 @@ curl -X POST "https://your-temps-instance/api/external-services" \
 | Parameter | Default | Editable after creation |
 |-----------|---------|----------------------|
 | `port` | Auto-assigned from 6379 | Yes |
-| `docker_image` | `gotempsh/redis-walg:8-bookworm` | Yes |
+| `docker_image` | `ghcr.io/gotempsh/redis-walg:8-trixie` | Yes |
 | `password` | Auto-generated | No (read-only) |
 
 **MongoDB:**
