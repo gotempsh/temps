@@ -235,7 +235,7 @@ jobs:
             reported=$(docker run --rm --entrypoint "$VERSION_COMMAND" database-image-verify:ci --version)
             echo "$IMAGE_REF reports: $reported"
             if ! grep -Eq "$EXPECT_VERSION" <<<"$reported"; then
-              echo "::error title=Server version mismatch::$IMAGE_REF reports '$reported', expected /$EXPECT_VERSION/. Either the build pulled a different server package than the base image tag, or the base image's variant no longer receives the newest upstream release (as redis:8-bookworm stopped at 8.4.0); refusing to publish a mislabeled or stale image."
+              echo "::error title=Server version mismatch::$IMAGE_REF reports '$reported', expected /$EXPECT_VERSION/. Either the build pulled a different server package than the base image tag, or the base image's variant no longer receives the newest upstream release (as redis:8-bookworm stopped at 8.4.0); refusing to publish a mislabeled or stale image. If upstream was publishing a release while this ran, its tags move one by one: re-run once they have settled."
               exit 1
             fi
           fi

@@ -205,6 +205,23 @@ fn example_docker_image() -> &'static str {
     DEFAULT_REDIS_IMAGE
 }
 
+/// The tag of an image reference, as Docker resolves it: `latest` when the
+/// reference names none, and the digest for a digest-only reference. Only the
+/// last path segment can carry a tag, so a registry port
+/// (`registry:5000/redis`) is not mistaken for one.
+fn image_reference_tag(image: &str) -> String {
+    let (name, digest) = match image.split_once('@') {
+        Some((name, digest)) => (name, Some(digest)),
+        None => (image, None),
+    };
+    let last_segment = name.rsplit('/').next().unwrap_or(name);
+    match (last_segment.split_once(':'), digest) {
+        (Some((_, tag)), _) => tag.to_string(),
+        (None, Some(digest)) => digest.to_string(),
+        (None, None) => "latest".to_string(),
+    }
+}
+
 /// Whether `image` runs Dragonfly rather than a server with a `redis-server`
 /// binary (Redis, Valkey, KeyDB). Only the last path segment of the repository
 /// names the engine; a registry host or namespace says nothing about it.
@@ -3690,12 +3707,9 @@ impl ExternalService for RedisService {
             )
         })?;
 
-        // Extract version from image name (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie" -> "8-trixie")
-        let version = if let Some(tag_pos) = image.rfind(':') {
-            image[tag_pos + 1..].to_string()
-        } else {
-            DEFAULT_REDIS_TAG.to_string()
-        };
+        // The version is the tag the container was created from; an untagged
+        // `redis` ran `redis:latest`, whatever Temps would default to today.
+        let version = image_reference_tag(&image);
 
         // Extract port from additional config if provided, otherwise use 6379
         let port = additional_config
@@ -4709,19 +4723,25 @@ mod tests {
     fn test_import_redis_version_extraction() {
         let test_cases = vec![
             ("gotempsh/redis-walg:8-bookworm", "8-bookworm"),
+            ("ghcr.io/gotempsh/redis-walg:8-trixie", "8-trixie"),
             ("redis:latest", "latest"),
             ("redis:6.2", "6.2"),
             ("redis:7.0-alpine", "7.0-alpine"),
+            // Untagged: Docker ran `latest`, not the default Temps would pick.
+            ("redis", "latest"),
+            ("registry.internal:5000/cache/redis", "latest"),
+            ("registry.internal:5000/cache/redis:7.4", "7.4"),
+            ("redis@sha256:0123abcd", "sha256:0123abcd"),
+            ("redis:7.4@sha256:0123abcd", "7.4"),
         ];
 
         for (image, expected_version) in test_cases {
-            let version = if let Some(tag_pos) = image.rfind(':') {
-                image[tag_pos + 1..].to_string()
-            } else {
-                "latest".to_string()
-            };
-
-            assert_eq!(version, expected_version, "Failed for image: {}", image);
+            assert_eq!(
+                image_reference_tag(image),
+                expected_version,
+                "Failed for image: {}",
+                image
+            );
         }
     }
 
@@ -4865,14 +4885,15 @@ mod tests {
         let redis_service = RedisService::new(service_name.clone(), docker.clone());
 
         // Initialize Redis service
-        match redis_service.init(redis_config.clone()).await {
-            Ok(_) => println!("✓ Redis service initialized"),
-            Err(e) => {
-                println!("Failed to initialize Redis: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
+        // Docker and MinIO are up, so a failure here is the image under test
+        // (it can't be pulled, or doesn't start): fail rather than skip, or
+        // the backup path would pass without having run.
+        if let Err(e) = redis_service.init(redis_config.clone()).await {
+            let _ = redis_service.remove().await;
+            let _ = minio.cleanup().await;
+            panic!("Failed to initialize Redis from {DEFAULT_REDIS_IMAGE}: {e}");
         }
+        println!("✓ Redis service initialized");
 
         // Connect to Redis using the async ConnectionManager. This must NOT
         // be `redis::Client::get_connection()` — that's the blocking, no-
