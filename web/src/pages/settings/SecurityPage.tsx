@@ -210,8 +210,9 @@ export function SecurityPage() {
             />
           </div>
           <p className="text-sm text-muted-foreground">
-            When on, adds Temps headers (Server, timing, served-by) and branded
-            error pages; when off, responses don’t reveal Temps.
+            When off, omits proxy-added branding, keeping required protocol
+            names and license notices. Existing policies for application headers
+            still apply.
           </p>
         </SettingsSection>
         <SettingsSection
