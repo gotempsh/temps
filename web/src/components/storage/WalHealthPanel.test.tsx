@@ -122,3 +122,56 @@ describe('a database whose WAL health is not checked', () => {
     expect(markup).toContain('update the agent on node worker-3')
   })
 })
+
+describe('Cloud backup compatibility', () => {
+  function renderCapability(
+    capability: ExternalServiceBackupCapabilityResponse
+  ): string {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    })
+    client.setQueryData(['wal-health', 7], { wal_health: null })
+    client.setQueryData(
+      getExternalServiceBackupCapabilityQueryKey({ path: { id: 7 } }),
+      capability
+    )
+    return renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel
+          serviceId={7}
+          serviceType="postgres"
+          onUpgrade={() => {}}
+        />
+      </QueryClientProvider>
+    )
+  }
+
+  test('a local image without WAL-G offers the image upgrade', () => {
+    const markup = renderCapability({
+      cloud_backup_compatible: false,
+      artifact: 'logical_pg_dump',
+      engine: 'postgres_pgdump',
+      verified: true,
+      wal_g_installed: false,
+      reason: 'PostgreSQL WAL-G is not installed',
+      recommended_image: 'gotempsh/postgres-walg:18-bookworm',
+    })
+    expect(markup).toContain('Cloud backups need WAL-G')
+    expect(markup).toContain('Upgrade backup engine')
+  })
+
+  test('a service on a worker node is never sent to the image upgrade', () => {
+    const markup = renderCapability({
+      cloud_backup_compatible: false,
+      artifact: 'logical_pg_dumpall',
+      engine: 'postgres_job',
+      verified: true,
+      wal_g_installed: false,
+      reason: 'Service 7 runs on worker node 1',
+      recommended_image: null,
+    })
+    expect(markup).toContain('Service 7 runs on worker node 1')
+    expect(markup).not.toContain('Cloud backups need WAL-G')
+    expect(markup).not.toContain('Upgrade backup engine')
+  })
+})
