@@ -247,6 +247,16 @@ pub fn build_router(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
         )
+        // Backups and in-place restores of a worker's services, with the
+        // engine's own tools on this node (sealed: they carry credentials).
+        .route(
+            "/agent/services/data-backup",
+            post(crate::service_data_handlers::data_backup),
+        )
+        .route(
+            "/agent/services/data-restore",
+            post(crate::service_data_handlers::data_restore),
+        )
         .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
@@ -1859,6 +1869,8 @@ pub(crate) mod tests {
             "/agent/services/exec",
             "/agent/services/workload",
             "/agent/services/wal-health",
+            "/agent/services/data-backup",
+            "/agent/services/data-restore",
             "/agent/sandboxes",
             "/agent/sandboxes/exec",
             "/agent/sandboxes/write-file",
