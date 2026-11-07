@@ -480,7 +480,7 @@ pub struct RemoteServiceRestoreResponse {
 
 /// `POST /agent/services/postgres/walg-backup`: a WAL-G base backup of a
 /// PostgreSQL service on the node that runs it, by the control plane's own
-/// engine (ADR-091). Continuous archiving is turned on (or its settings file
+/// engine (ADR-092). Continuous archiving is turned on (or its settings file
 /// refreshed) first, exactly as on the control plane.
 ///
 /// Names no command, image, host or path: the container follows from the
@@ -549,7 +549,7 @@ pub enum RecoveryTarget {
 
 /// `POST /agent/services/postgres/walg-restore`: the control plane's WAL-G
 /// restore of a worker's PostgreSQL, run on its node against its container
-/// (ADR-091). The node fetches the base backup into a staging directory
+/// (ADR-092). The node fetches the base backup into a staging directory
 /// while the server runs, swaps it in keeping the original aside, starts the
 /// restored server, and keeps the result only once recovery has promoted;
 /// otherwise it puts the original back. No command comes from the caller.

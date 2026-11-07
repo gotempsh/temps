@@ -61,7 +61,7 @@ pub async fn probe_external_service_backup_capability(
     manager: &temps_providers::ExternalServiceManager,
 ) -> ExternalServiceBackupCapability {
     // A standalone PostgreSQL on a worker takes the control plane's WAL-G
-    // engine when its image has WAL-G (ADR-091): the same check, run by its
+    // engine when its image has WAL-G (ADR-092): the same check, run by its
     // node's agent.
     if crate::engines::workload_job::takes_job_path(service) {
         if let Some(node_id) = worker_node(service) {
@@ -557,7 +557,7 @@ mod tests {
         assert!(worker_capability(&service("redis", "standalone")).is_none());
     }
 
-    /// Parity (ADR-091): a worker PostgreSQL whose agent finds WAL-G reports
+    /// Parity (ADR-092): a worker PostgreSQL whose agent finds WAL-G reports
     /// exactly what a local one does, so the console's "not available"
     /// notice goes away; without WAL-G it says what to change on the worker,
     /// never to move the service.

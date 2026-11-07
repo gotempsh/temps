@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The node half of a PostgreSQL WAL-G restore (ADR-091): the control
+//! The node half of a PostgreSQL WAL-G restore (ADR-092): the control
 //! plane's own `restore_from_walg`, run by a worker's agent against the
 //! container it hosts.
 //!

@@ -191,7 +191,7 @@ pub async fn data_restore(
 }
 
 /// Take a WAL-G base backup of a PostgreSQL service this node runs, with the
-/// control plane's own engine (ADR-091): continuous archiving is turned on
+/// control plane's own engine (ADR-092): continuous archiving is turned on
 /// or refreshed first, then `wal-g backup-push` runs in the container.
 ///
 /// Turning archiving on while `archive_mode` is off restarts PostgreSQL in a

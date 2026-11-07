@@ -481,7 +481,7 @@ impl RemoteServiceClient {
     }
 
     /// Take a WAL-G base backup of a PostgreSQL service on the worker that
-    /// runs it, with the control plane's own engine (ADR-091). The
+    /// runs it, with the control plane's own engine (ADR-092). The
     /// destination's credentials and the service's travel only in the
     /// sealed body.
     pub async fn postgres_walg_backup(

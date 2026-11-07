@@ -880,7 +880,7 @@ impl WalgFixture {
     }
 }
 
-/// ADR-091, PostgreSQL step 1: a worker's WAL-G PostgreSQL, created by the
+/// ADR-092, PostgreSQL step 1: a worker's WAL-G PostgreSQL, created by the
 /// agent as a control-plane-profile server asks, is backed up by the control
 /// plane's own WAL-G engine through the agent's sealed operation.
 ///
@@ -1134,7 +1134,7 @@ async fn a_worker_postgres_is_backed_up_by_the_control_plane_walg_engine_through
     );
 }
 
-/// ADR-091, PostgreSQL step 3: a worker's WAL-G PostgreSQL is restored in
+/// ADR-092, PostgreSQL step 3: a worker's WAL-G PostgreSQL is restored in
 /// place, and to a point in time, by the control plane's own WAL-G restore
 /// through the agent's sealed operation, and a restore that fails leaves the
 /// database it found.
@@ -1349,7 +1349,7 @@ async fn a_worker_postgres_is_restored_and_recovered_to_a_point_in_time_through_
     println!("worker WAL-G restore proof: PITR to {t}, in place, and a rolled-back failure");
 }
 
-/// The same WAL-G restore on the control plane (ADR-091: one implementation,
+/// The same WAL-G restore on the control plane (ADR-092: one implementation,
 /// the transport alone differs): a PostgreSQL the provider created and backs
 /// up is recovered to a point in time, restored in place, and left as it was
 /// by a restore that cannot promote, with the provider's own container

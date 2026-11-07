@@ -26,7 +26,7 @@
 //!
 //! Every service on a worker node is backed up on that node. A PostgreSQL
 //! service on a WAL-G image takes the same engine as on the control plane,
-//! whose container steps its node's agent runs (ADR-091); without WAL-G it
+//! whose container steps its node's agent runs (ADR-092); without WAL-G it
 //! takes a dump job (`workload_job`). The others are backed up by the node's
 //! agent (`worker_agent`).
 //!
@@ -423,7 +423,7 @@ mod tests {
         }
     }
 
-    /// Parity (ADR-091): a PostgreSQL on a WAL-G image takes the same engine
+    /// Parity (ADR-092): a PostgreSQL on a WAL-G image takes the same engine
     /// on a worker as on the control plane, decided by the same check run by
     /// its node's agent in the service's container; without WAL-G, the
     /// worker's dump job. No local Docker is opened either way.

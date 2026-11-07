@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! WAL-G restores of a PostgreSQL on a worker node (ADR-091, PostgreSQL
+//! WAL-G restores of a PostgreSQL on a worker node (ADR-092, PostgreSQL
 //! step 3): the control plane's own `restore_from_walg`, run on the node by
 //! its agent, in place or to a point in time.
 //!

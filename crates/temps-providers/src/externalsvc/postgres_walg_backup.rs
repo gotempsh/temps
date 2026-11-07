@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The node half of a PostgreSQL WAL-G base backup (ADR-091): everything the
+//! The node half of a PostgreSQL WAL-G base backup (ADR-092): everything the
 //! backup does to the container. The control plane runs it with its own
 //! Docker client for a service it hosts; a worker's agent runs the same
 //! function with the node's client for a service on that worker.

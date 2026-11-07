@@ -16,7 +16,7 @@
 //!
 //! The node half is one function. For a service on this host it runs here
 //! with this host's Docker; for a service on a worker node, that node's
-//! agent runs it with the node's Docker (ADR-091). Everything else, and so
+//! agent runs it with the node's Docker (ADR-092). Everything else, and so
 //! every artifact, is the same for both.
 
 use std::sync::Arc;
