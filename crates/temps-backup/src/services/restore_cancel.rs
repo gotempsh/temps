@@ -39,11 +39,21 @@ use tracing::{info, warn};
 
 use super::restore::{RestoreError, ACTIVE_RESTORE_STATUSES};
 
+/// The phase of a run whose worker node already runs its maximum of backups
+/// and restores: nothing has run on the node, so it can always be stopped.
+pub const WAITING_FOR_NODE_PHASE: &str = "waiting_for_node";
+
 /// Phases in which a restore that overwrites its target can still be stopped.
-const DESTRUCTIVE_CANCELLABLE_PHASES: [&str; 2] = ["prepare", "download"];
+const DESTRUCTIVE_CANCELLABLE_PHASES: [&str; 3] = ["prepare", "download", WAITING_FOR_NODE_PHASE];
 
 /// Phases in which a restore into a service it creates can still be stopped.
-const NEW_SERVICE_CANCELLABLE_PHASES: [&str; 4] = ["prepare", "download", "provision", "recover"];
+const NEW_SERVICE_CANCELLABLE_PHASES: [&str; 5] = [
+    "prepare",
+    "download",
+    "provision",
+    "recover",
+    WAITING_FOR_NODE_PHASE,
+];
 
 /// Whether a run writes over an existing service's data. Mirrors
 /// `RestoreRequestMode::is_destructive`, from the stored columns: PITR in
@@ -645,10 +655,12 @@ mod tests {
         for (mode, target) in [("in_place", None), ("pitr", None), ("pitr", Some(" "))] {
             assert_eq!(
                 cancellable_phases(mode, target),
-                &["prepare", "download"],
+                &["prepare", "download", "waiting_for_node"],
                 "{mode} {target:?}"
             );
-            assert!(not_cancellable_reason(&run(mode, target, "running", "download")).is_none());
+            for phase in ["download", "waiting_for_node"] {
+                assert!(not_cancellable_reason(&run(mode, target, "running", phase)).is_none());
+            }
             let reason = not_cancellable_reason(&run(mode, target, "running", "restore"))
                 .expect("writing phase is not cancellable");
             assert!(reason.contains("started writing data"), "{reason}");
@@ -658,7 +670,13 @@ mod tests {
     #[test]
     fn new_service_runs_are_cancellable_until_registration() {
         for (mode, target) in [("new_service", Some("copy")), ("pitr", Some("copy"))] {
-            for phase in ["prepare", "download", "provision", "recover"] {
+            for phase in [
+                "prepare",
+                "download",
+                "provision",
+                "recover",
+                "waiting_for_node",
+            ] {
                 assert!(
                     not_cancellable_reason(&run(mode, target, "running", phase)).is_none(),
                     "{mode} {phase}"

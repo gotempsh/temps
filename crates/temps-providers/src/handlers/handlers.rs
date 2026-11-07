@@ -198,6 +198,7 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::ControlPlaneAddressRequired { .. }
@@ -259,6 +260,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::ControlPlaneAddressRequired { .. }
@@ -295,6 +297,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
         E::LockTimeout { .. } => "Service Busy",
+        // A worker node at its limit of backups and restores: retry once
+        // one finishes.
+        E::NodeBusy { .. } => "Node Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(

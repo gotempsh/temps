@@ -313,17 +313,29 @@ async fn backup_on_worker(
         "backup",
     )
     .await?;
-    let request = deps.manager.walg_backup_worker_postgres(
-        service.id,
-        super::worker_agent::destination(&target),
-        bucket_path.to_string(),
-        backup_uuid.to_string(),
-        allow_restart,
+    // A node already running its maximum of backups and restores is waited
+    // for (bounded, within this backup's own runtime limit) instead of
+    // failing the backup.
+    let request = crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || {
+            deps.manager.walg_backup_worker_postgres(
+                service.id,
+                super::worker_agent::destination(&target),
+                bucket_path.to_string(),
+                backup_uuid.to_string(),
+                allow_restart,
+            )
+        },
+        |wait| super::worker_agent::wait_for_node_slot(ctx.backup_id, service.id, wait),
     );
     let result = tokio::select! {
         // Dropping the request ends it on the node too.
         _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-        result = request => result,
+        result = request => match result {
+            Ok(result) => result,
+            Err(never) => match never {},
+        },
     }
     .map_err(|e| BackupError::Failed {
         reason: format!(

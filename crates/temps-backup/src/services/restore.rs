@@ -3631,11 +3631,17 @@ async fn run_agent_restore(
         "restoring service {} in place on its node",
         target.id
     );
-    mgr.restore_worker_service(target.id, worker_agent::destination(&s3), location)
-        .await
-        .map_err(|e| RestoreError::ExternalService {
-            reason: format!("restore run {run_id} on node {node_id}: {e}"),
-        })?;
+    // A node already running its maximum of backups and restores is waited
+    // for, visibly and cancellably, instead of failing the run.
+    crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || mgr.restore_worker_service(target.id, worker_agent::destination(&s3), location.clone()),
+        |wait| wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
+    )
+    .await?
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id} on node {node_id}: {e}"),
+    })?;
     reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
     if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
@@ -3761,6 +3767,35 @@ async fn run_job_restore(
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
     }
     Ok(None)
+}
+
+/// The wait hook of a restore run whose worker node is busy
+/// ([`crate::node_busy`]): the run shows `waiting_for_node` (cancellable,
+/// nothing ran), checked every few seconds for a cancel while it sleeps, then
+/// re-enters `resume_phase` unless it was cancelled.
+pub(super) async fn wait_for_node_slot(
+    db: &DatabaseConnection,
+    run_id: i32,
+    resume_phase: &str,
+    wait: crate::node_busy::NodeWait,
+) -> Result<(), RestoreError> {
+    use super::restore_cancel::{enter_phase_unless_cancelled, WAITING_FOR_NODE_PHASE};
+    const CANCEL_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+    warn!(
+        run_id,
+        "restore run {run_id} waits for a slot: {}",
+        wait.describe()
+    );
+    let deadline = tokio::time::Instant::now() + wait.delay;
+    loop {
+        enter_phase_unless_cancelled(db, run_id, WAITING_FOR_NODE_PHASE).await?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(CANCEL_CHECK.min(deadline - now)).await;
+    }
+    enter_phase_unless_cancelled(db, run_id, resume_phase).await
 }
 
 async fn update_phase(
@@ -5643,6 +5678,89 @@ mod tests {
             .expect("views");
         assert_eq!(views[0].source_backup, RestoreRunSourceBackup::default());
         assert!(db.into_transaction_log().is_empty());
+    }
+
+    fn busy_wait(delay: std::time::Duration) -> crate::node_busy::NodeWait {
+        crate::node_busy::NodeWait {
+            attempt: 1,
+            delay,
+            waited: std::time::Duration::ZERO,
+            node: "worker-1".to_string(),
+            detail: "this node already runs 2 backups or restores".to_string(),
+        }
+    }
+
+    /// A run whose node is busy shows `waiting_for_node`, then goes back to
+    /// the phase it was about to enter.
+    #[tokio::test]
+    async fn a_run_waiting_for_its_node_shows_it_then_resumes_its_phase() {
+        let entered = || sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([entered(), entered()])
+            .into_connection();
+        wait_for_node_slot(&db, 7, "restore", busy_wait(std::time::Duration::ZERO))
+            .await
+            .expect("the wait ends in the restore phase");
+        let phases: Vec<String> = db
+            .into_transaction_log()
+            .into_iter()
+            .map(|statement| format!("{statement:?}"))
+            .collect();
+        assert_eq!(phases.len(), 2, "{phases:?}");
+        assert!(phases[0].contains("waiting_for_node"), "{}", phases[0]);
+        assert!(phases[1].contains("\"restore\""), "{}", phases[1]);
+    }
+
+    /// A cancel requested while the run waits for its node stops it there:
+    /// nothing ran on the node.
+    #[tokio::test]
+    async fn a_run_waiting_for_its_node_stops_when_cancelled() {
+        let now = Utc::now();
+        let cancelled = temps_entities::restore_runs::Model {
+            id: 7,
+            source_backup_id: 3,
+            source_service_id: 11,
+            target_service_id: Some(11),
+            target_service_name: None,
+            mode: "in_place".to_string(),
+            status: "running".to_string(),
+            phase: "waiting_for_node".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(now),
+            finished_at: None,
+            created_by: 1,
+            created_at: now,
+            updated_at: now,
+            cancel_requested_at: Some(now),
+            cancel_requested_by: Some(1),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results([vec![cancelled]])
+            .into_connection();
+        let error = wait_for_node_slot(
+            &db,
+            7,
+            "restore",
+            busy_wait(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect_err("a cancelled run does not wait");
+        assert!(
+            matches!(&error, RestoreError::RestoreCancelled { restore_run_id: 7, phase } if phase == "waiting_for_node"),
+            "{error:?}"
+        );
     }
 
     // ---- MockDatabase-backed validation tests ---------------------------

@@ -950,6 +950,15 @@ impl RemoteServiceClient {
         if !body.success {
             let mut error = body.error.unwrap_or_default();
             truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
+            // The node runs its maximum of backups and restores: nothing ran,
+            // and the caller decides whether to wait for a slot.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ExternalServiceError::NodeBusy {
+                    node: self.node_name.clone(),
+                    route: path.to_string(),
+                    detail: error,
+                });
+            }
             return Err(ExternalServiceError::InternalError {
                 reason: format!(
                     "Agent on node {} returned error ({}): {}",
@@ -2000,6 +2009,66 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A node at its limit of backups and restores answers 429; the client
+    /// returns the typed `NodeBusy` (nothing ran), so callers can wait for a
+    /// slot instead of failing the run.
+    #[tokio::test]
+    async fn a_busy_node_is_reported_as_node_busy() {
+        async fn busy() -> (reqwest::StatusCode, Json<serde_json::Value>) {
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "success": false,
+                    "data": null,
+                    "error": "Cannot restore service 'orders': this node already runs 2 backups or restores; retry when one finishes"
+                })),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/data-restore", post(busy)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let error = client
+            .restore_service(&RemoteServiceRestoreRequest {
+                service_config: ServiceConfig {
+                    name: "orders".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                source: worker_destination(),
+                location: "external_services/redis/orders/dump.rdb.gz".to_string(),
+            })
+            .await
+            .expect_err("a busy node runs nothing");
+        server.abort();
+        match error {
+            ExternalServiceError::NodeBusy {
+                node,
+                route,
+                detail,
+            } => {
+                assert_eq!(node, "worker-1");
+                assert_eq!(route, "/agent/services/data-restore");
+                assert!(detail.contains("already runs 2"), "{detail}");
+            }
+            other => panic!("expected NodeBusy, got {other:?}"),
+        }
     }
 
     /// A WAL-G restore reaches the node sealed, with the source's credentials,

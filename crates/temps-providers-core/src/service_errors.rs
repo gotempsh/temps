@@ -301,6 +301,17 @@ pub enum ExternalServiceError {
     #[error("Internal error: {reason}")]
     InternalError { reason: String },
 
+    /// A worker node turned a backup or restore away because it already runs
+    /// as many as it allows at once (its agent answered 429). Nothing ran on
+    /// the node; the same request succeeds once one of the others finishes,
+    /// so callers wait and retry instead of failing.
+    #[error("Node '{node}' is busy and did not start {route}: {detail}")]
+    NodeBusy {
+        node: String,
+        route: String,
+        detail: String,
+    },
+
     /// The local Docker daemon is structurally unavailable in this process —
     /// the process was started without a socket (e.g. a containerised
     /// control plane). Use [`Self::LocalWorkloadsDisabled`] when the daemon
@@ -510,6 +521,7 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::NodeBusy { .. }
         | E::ControlPlaneAddressRequired { .. }
         | E::ControlPlaneMemberUnreachable { .. }
         | E::ClusterPortsUnavailable { .. }

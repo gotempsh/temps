@@ -139,6 +139,24 @@ impl WorkerAgentEngine {
     }
 }
 
+/// The wait hook of a backup whose worker node is busy: logged with the
+/// backup's IDs (a backup row has no phase), then a sleep the executor's
+/// cancel and runtime limit cut short by dropping it.
+pub(crate) async fn wait_for_node_slot(
+    backup_id: i32,
+    service_id: i32,
+    wait: crate::node_busy::NodeWait,
+) -> Result<(), std::convert::Infallible> {
+    tracing::warn!(
+        backup_id,
+        service_id,
+        "backup {backup_id} of service {service_id} waits for a slot: {}",
+        wait.describe()
+    );
+    tokio::time::sleep(wait.delay).await;
+    Ok(())
+}
+
 #[async_trait]
 impl BackupEngine for WorkerAgentEngine {
     fn engine(&self) -> &'static str {
@@ -218,14 +236,25 @@ impl BackupEngine for WorkerAgentEngine {
             "WorkerAgentEngine: backing up the service on its node"
         );
 
-        let request = deps
-            .manager
-            .backup_worker_service(service_id, destination(&s3), key.clone());
+        // A node already running its maximum of backups and restores is
+        // waited for (bounded, within this backup's own runtime limit)
+        // instead of failing the backup.
+        let request = crate::node_busy::retry_while_node_busy(
+            &crate::node_busy::NodeBusyPolicy::DEFAULT,
+            || {
+                deps.manager
+                    .backup_worker_service(service_id, destination(&s3), key.clone())
+            },
+            |wait| wait_for_node_slot(backup_id, service_id, wait),
+        );
         let response = tokio::select! {
             // Dropping the request ends it on the node too: the agent removes
             // its helper and aborts the upload.
             _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-            response = request => response,
+            response = request => match response {
+                Ok(response) => response,
+                Err(never) => match never {},
+            },
         }
         .map_err(|e| BackupError::Failed {
             reason: format!(

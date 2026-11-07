@@ -352,19 +352,26 @@ pub(super) async fn run(
         "restoring database {} from WAL-G on its node",
         target.id
     );
-    let outcome = mgr
-        .walg_restore_worker_postgres(
-            target.id,
-            restored_login.as_ref(),
-            worker_agent::destination(&s3),
-            backup.s3_location.clone(),
-            recovery_target,
-            target_user_data,
-        )
-        .await
-        .map_err(|e| RestoreError::ExternalService {
-            reason: format!("restore run {run_id} on node {node_id}: {e}"),
-        })?;
+    // A node already running its maximum of backups and restores is waited
+    // for, visibly and cancellably, instead of failing the run.
+    let outcome = crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || {
+            mgr.walg_restore_worker_postgres(
+                target.id,
+                restored_login.as_ref(),
+                worker_agent::destination(&s3),
+                backup.s3_location.clone(),
+                recovery_target.clone(),
+                target_user_data.clone(),
+            )
+        },
+        |wait| super::wait_for_node_slot(db.as_ref(), run_id, phase, wait),
+    )
+    .await?
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id} on node {node_id}: {e}"),
+    })?;
     match outcome {
         PostgresWalgRestoreResult::Completed => {}
         PostgresWalgRestoreResult::Refused { reason } => {
