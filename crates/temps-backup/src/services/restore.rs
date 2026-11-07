@@ -1768,6 +1768,92 @@ fn validate_pitr_backup_location(
     Ok(())
 }
 
+/// The service that produced `backup`: its producer link, or for a
+/// control-plane backup row the `service_id` its metadata records. `None`
+/// when neither names one (an orphan from another Temps, a deleted producer).
+async fn backup_origin_service_id(
+    db: &DatabaseConnection,
+    backup: &temps_entities::backups::Model,
+) -> Option<i32> {
+    temps_entities::external_service_backups::Entity::find()
+        .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup.id))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|b| b.service_id)
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&backup.metadata)
+                .ok()
+                .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
+                .and_then(|id| i32::try_from(id).ok())
+        })
+}
+
+/// The credentials a cross-service restore of `backup` leaves in `target`'s
+/// data, which the target's stored config is patched to once the restore
+/// succeeds: the same reconciliation, under the same per-engine gates
+/// ([`credential_propagation_gates`]), as a restore on the control plane.
+///
+/// `None` when the backup is the target's own, when its data carries no
+/// credentials, or when the origin is unknown or its config unreadable (the
+/// restore then keeps the target's credentials, as on the control plane;
+/// the restore plan warns about it).
+async fn origin_credentials_to_reconcile(
+    db: &DatabaseConnection,
+    mgr: &ExternalServiceManager,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+) -> Option<RestoredServiceCredentials> {
+    let (preserves_source_credentials, _) =
+        credential_propagation_gates(&target.service_type, &backup.s3_location);
+    if !preserves_source_credentials {
+        return None;
+    }
+    let origin_id = backup_origin_service_id(db, backup).await?;
+    if origin_id == target.id {
+        return None;
+    }
+    match mgr.get_service_config(origin_id).await {
+        Ok(origin) => {
+            RestoredServiceCredentials::from_origin(&target.service_type, &origin.parameters)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to read origin service {} config; the restore of backup {} into service \
+                 {} keeps the target's credentials, which may not match the restored data: {}",
+                origin_id, backup.id, target.id, e
+            );
+            None
+        }
+    }
+}
+
+/// Patch `target`'s stored credentials to the ones its restored data now
+/// expects. A failure is logged, never fatal: the data is restored, and the
+/// operator can reset the password.
+async fn reconcile_restored_credentials(
+    db: &DatabaseConnection,
+    enc: &Arc<temps_core::EncryptionService>,
+    target_id: i32,
+    credentials: Option<&RestoredServiceCredentials>,
+) {
+    let Some(credentials) = credentials else {
+        return;
+    };
+    match patch_service_credentials(db, enc, target_id, credentials).await {
+        Ok(()) => info!(
+            "Updated target service {} config credentials to match restored data",
+            target_id
+        ),
+        Err(e) => error!(
+            "Restore on service {} succeeded but patching stored credentials failed; the \
+             service's UI-shown credentials will be stale until someone updates them. Error: {}",
+            target_id, e
+        ),
+    }
+}
+
 /// Which credential-reconciliation steps a restore needs, as
 /// `(preserves_source_credentials, wants_pre_restore_merge)`.
 ///
@@ -2044,6 +2130,7 @@ async fn run_restore_inner(
         return run_job_restore(
             &db,
             &enc,
+            &mgr,
             &plane,
             run_id,
             &backup_model,
@@ -2100,20 +2187,7 @@ async fn run_restore_inner(
 
     let live_target_config = source_config.clone();
 
-    let origin_service_id: Option<i32> = temps_entities::external_service_backups::Entity::find()
-        .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup_model.id))
-        .one(db.as_ref())
-        .await
-        .ok()
-        .flatten()
-        .map(|b| b.service_id)
-        .or_else(|| {
-            // Fallback: control-plane backup row's metadata stores it.
-            serde_json::from_str::<serde_json::Value>(&backup_model.metadata)
-                .ok()
-                .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
-                .map(|id| id as i32)
-        });
+    let origin_service_id = backup_origin_service_id(db.as_ref(), &backup_model).await;
 
     // Whether the RESTORED DATA carries source-side credentials that the
     // target's stored config must be reconciled with.
@@ -2608,23 +2682,13 @@ async fn run_restore_inner(
         // origin's credentials. PostgreSQL also inherits its role/database.
         // Reconcile the encrypted login while retaining the target's endpoint
         // and physical ownership so UI/env vars/CLI match restored data.
-        if let Some(credentials) = origin_credentials_for_post_restore_patch.as_ref() {
-            if let Err(e) =
-                patch_service_credentials(&db, &enc, target_service.id, credentials).await
-            {
-                // Don't fail the restore over a config patch — data is
-                // restored, user can reset password manually. Log loudly.
-                error!(
-                    "Restore on service {} succeeded but patching stored credentials failed; the service's UI-shown credentials will be stale until someone updates them. Error: {}",
-                    target_service.id, e
-                );
-            } else {
-                info!(
-                    "Updated target service {} config credentials to match restored data",
-                    target_service.id
-                );
-            }
-        }
+        reconcile_restored_credentials(
+            &db,
+            &enc,
+            target_service.id,
+            origin_credentials_for_post_restore_patch.as_ref(),
+        )
+        .await;
         None
     };
 
@@ -3284,7 +3348,9 @@ fn job_restore_supported(
     if !matches!(mode, RestoreRequestMode::InPlace) {
         return Err(RestoreError::Validation {
             message: format!(
-                "Database {} ('{}') runs on worker node {node}, where restores run as a job that                  applies a dump in place; restore mode '{}' is not available there. Restore in                  place, or move the database to the control plane first",
+                "Database {} ('{}') runs on worker node {node}, where restores run as a job that \
+                 applies a dump in place; restore mode '{}' is not available there. Restore in \
+                 place, or move the database to the control plane first",
                 target.id,
                 target.name,
                 mode.as_str()
@@ -3294,7 +3360,8 @@ fn job_restore_supported(
     if !crate::engines::workload_job::restore_takes_job_path(target, backup_location) {
         return Err(RestoreError::Validation {
             message: format!(
-                "Database {} ('{}') runs on worker node {node}, where restores apply a pg_dumpall                  dump (`.sql.gz`); backup '{backup_location}' is not one",
+                "Database {} ('{}') runs on worker node {node}, where restores apply a pg_dumpall \
+                 dump (`.sql.gz`); backup '{backup_location}' is not one",
                 target.id, target.name
             ),
         });
@@ -3302,9 +3369,10 @@ fn job_restore_supported(
     Ok(())
 }
 
-/// What a service on a worker node can restore: in place, from its own
-/// backups. Restoring into a new service, or to a point in time, is refused
-/// explicitly at admission.
+/// What a service on a worker node can restore: in place, from any backup in
+/// the format its node applies, its own or another service's (confirmed as
+/// a cross-service restore, like on the control plane). Restoring into a new
+/// service, or to a point in time, is refused explicitly at admission.
 fn worker_restore_capabilities() -> temps_providers::externalsvc::RestoreCapabilities {
     temps_providers::externalsvc::RestoreCapabilities {
         restore_in_place: true,
@@ -3367,20 +3435,11 @@ async fn run_agent_restore(
             target.id
         ),
     })?;
-    // A dump carries its origin's users and passwords; the target's stored
-    // credentials stay right only for its own backups.
-    if backup.id > 0 {
-        let origin = workload_job::backup_origin(db.as_ref(), backup.id).await?;
-        if origin.is_some_and(|origin| origin != target.id) {
-            return Err(RestoreError::Validation {
-                message: format!(
-                    "Backup {} was taken from another service; restores of service {} on \
-                     worker node {node_id} apply only its own backups",
-                    backup.id, target.id
-                ),
-            });
-        }
-    }
+    // A backup of another service is admitted as on the control plane (the
+    // destructive restore was confirmed at `start_restore`); a dump that
+    // carries its origin's users (MongoDB) leaves the target with the
+    // origin's credentials, which its stored config is patched to below.
+    let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
     let s3 = workload_job::s3_target(
         db.as_ref(),
         enc,
@@ -3417,6 +3476,7 @@ async fn run_agent_restore(
         .map_err(|e| RestoreError::ExternalService {
             reason: format!("restore run {run_id} on node {node_id}: {e}"),
         })?;
+    reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
     if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
     }
@@ -3425,9 +3485,14 @@ async fn run_agent_restore(
 
 /// Restore `backup` in place into `target`, a database on a worker node, by
 /// a job on that node (ADR-055 Phase 9): `wal-g st cat | gunzip | psql`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore worker's shared handles and the run's own inputs, as run_restore_worker"
+)]
 async fn run_job_restore(
     db: &Arc<DatabaseConnection>,
     enc: &Arc<temps_core::EncryptionService>,
+    mgr: &Arc<ExternalServiceManager>,
     plane: &temps_workload_plane::PlaneSlot,
     run_id: i32,
     backup: &temps_entities::backups::Model,
@@ -3442,22 +3507,14 @@ async fn run_job_restore(
             target.id
         ),
     })?;
-    // A dump carries its origin's roles and their passwords; the target's
-    // stored credentials stay right only for its own backups.
-    if backup.id > 0 {
-        let origin = workload_job::backup_origin(db.as_ref(), backup.id).await?;
-        if origin.is_some_and(|origin| origin != target.id) {
-            return Err(RestoreError::Validation {
-                message: format!(
-                    "Backup {} was taken from another database; restores of database {} on                      worker node {node_id} apply only its own backups",
-                    backup.id, target.id
-                ),
-            });
-        }
-    }
+    // A backup of another database is admitted as on the control plane (the
+    // destructive restore was confirmed at `start_restore`). Its dump carries
+    // the origin's roles and their passwords; see below.
+    let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
     let plane = plane.get().ok_or_else(|| RestoreError::Internal {
         reason: format!(
-            "restore run {run_id}: database {} is on worker node {node_id}, and restoring it              needs the workload plane, which this process does not run",
+            "restore run {run_id}: database {} is on worker node {node_id}, and restoring it \
+             needs the workload plane, which this process does not run",
             target.id
         ),
     })?;
@@ -3469,6 +3526,20 @@ async fn run_job_restore(
     let parameters: serde_json::Value =
         serde_json::from_str(&config_json).unwrap_or_else(|_| serde_json::json!({}));
     let (job_target, password) = workload_job::pg_target(target, node_id, &parameters);
+    // The dump runs `ALTER ROLE` for every role of its origin. When the
+    // target logs in as one of them, its password changes to the origin's
+    // midway, and the dump's next `\connect` would fail with the target's:
+    // the job switches the login to the origin's password first (on the
+    // control plane the dump is applied over the container's local socket,
+    // where the password is never asked again).
+    let restored_login = origin_credentials.as_ref().and_then(|origin| {
+        (origin
+            .username
+            .as_deref()
+            .unwrap_or(workload_job::DEFAULT_PG_USERNAME)
+            == job_target.username)
+            .then(|| origin.password.clone())
+    });
     let s3 = workload_job::s3_target(
         db.as_ref(),
         enc,
@@ -3516,8 +3587,8 @@ async fn run_job_restore(
         workload_job::JobPurpose::Restore {
             restore_run_id: run_id,
         },
-        workload_job::restore_script(&job_target, &object_key),
-        workload_job::job_env(&password, &s3),
+        workload_job::restore_script(&job_target, &object_key, restored_login.is_some()),
+        workload_job::restore_env(&password, &s3, restored_login.as_deref()),
         // Past the safe point: nothing may interrupt the apply.
         &tokio_util::sync::CancellationToken::new(),
     )
@@ -3525,6 +3596,7 @@ async fn run_job_restore(
     .map_err(|e| RestoreError::ExternalService {
         reason: format!("restore run {run_id}: {e}"),
     })?;
+    reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
     if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
     }
@@ -6866,6 +6938,119 @@ mod tests {
         assert_eq!(problem.status_code.as_u16(), 503);
         assert!(rendered.contains("service 5 ('cache')"), "{rendered}");
         assert!(rendered.contains("not available here"), "{rendered}");
+    }
+
+    /// The origin credentials a restore of backup 4, taken from service 5,
+    /// leaves in worker service 7 of `service_type`, read through a manager
+    /// on a server without Docker. `origin_config` is the origin's stored
+    /// config (`None`: the origin row is gone).
+    async fn worker_origin_credentials(
+        service_type: &str,
+        backup_location: &str,
+        producer: i32,
+        origin_config: Option<&str>,
+    ) -> Option<RestoredServiceCredentials> {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let enc = Arc::new(EncryptionService::new(key).unwrap());
+        let mut origin = crashed_run_service();
+        origin.id = 5;
+        origin.service_type = service_type.to_string();
+        origin.node_id = Some(1);
+        origin.config = origin_config.map(|config| enc.encrypt_string(config).unwrap());
+        let mut db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_producer_row(1, 4, producer)]]);
+        db = if origin_config.is_some() {
+            db.append_query_results(vec![vec![origin.clone()], vec![origin.clone()]])
+        } else {
+            db.append_query_results(vec![Vec::<temps_entities::external_services::Model>::new()])
+        };
+        let db = Arc::new(db.into_connection());
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
+        let mgr = temps_providers::ExternalServiceManager::new_with_handle(
+            db.clone(),
+            enc,
+            handle,
+            false,
+            dns_registry,
+        );
+        let mut target = crashed_run_service();
+        target.id = 7;
+        target.service_type = service_type.to_string();
+        target.node_id = Some(1);
+        let mut backup = tracked_backup(4);
+        backup.s3_location = backup_location.to_string();
+        origin_credentials_to_reconcile(db.as_ref(), &mgr, &backup, &target).await
+    }
+
+    /// A restore into a worker service of another service's backup is
+    /// reconciled as on the control plane: the restored data's login
+    /// (Postgres: role and database too; MongoDB: the admin password)
+    /// becomes the target's stored credentials.
+    #[tokio::test]
+    async fn a_cross_service_restore_into_a_worker_takes_the_origins_login() {
+        let postgres = worker_origin_credentials(
+            "postgres",
+            "external_services/postgres/a/1/dump.sql.gz",
+            5,
+            Some(r#"{"password":"origin-pw","username":"app","database":"shop"}"#),
+        )
+        .await
+        .expect("a Postgres dump carries its origin's roles");
+        assert_eq!(postgres.password, "origin-pw");
+        assert_eq!(postgres.username.as_deref(), Some("app"));
+        assert_eq!(postgres.database.as_deref(), Some("shop"));
+
+        let mongo = worker_origin_credentials(
+            "mongodb",
+            "mongodb/a/1/dump.archive.gz",
+            5,
+            Some(r#"{"password":"origin-pw","username":"admin"}"#),
+        )
+        .await
+        .expect("a mongodump carries admin.system.users");
+        assert_eq!(mongo.password, "origin-pw");
+        assert_eq!(mongo.username, None, "only Postgres moves the login name");
+    }
+
+    /// What carries no credentials, or is the target's own, changes none;
+    /// an origin that is gone keeps the target's, as on the control plane.
+    #[tokio::test]
+    async fn a_restore_without_foreign_credentials_keeps_the_targets() {
+        let config = Some(r#"{"password":"origin-pw"}"#);
+        // A logical MariaDB dump excludes the `mysql` schema; Redis and
+        // storage have no auth in their data. Neither reads the origin.
+        assert!(
+            worker_origin_credentials("mariadb", "mariadb/a/1/dump.sql.gz", 5, config)
+                .await
+                .is_none()
+        );
+        assert!(
+            worker_origin_credentials("redis", "redis/a/1/dump.rdb.gz", 5, config)
+                .await
+                .is_none()
+        );
+        // The target's own backup.
+        assert!(worker_origin_credentials(
+            "postgres",
+            "external_services/postgres/a/1/dump.sql.gz",
+            7,
+            config
+        )
+        .await
+        .is_none());
+        // The origin was deleted.
+        assert!(worker_origin_credentials(
+            "postgres",
+            "external_services/postgres/a/1/dump.sql.gz",
+            5,
+            None
+        )
+        .await
+        .is_none());
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -91,7 +91,18 @@ pub mod exit {
     /// truncated). Found by a verification pass before anything is applied;
     /// see [`super::restore_script`].
     pub const CORRUPT_DUMP: i64 = 7;
+    /// Switching the login to the password the dump restores failed; nothing
+    /// was applied. See [`super::restore_script`].
+    pub const LOGIN_SWITCH_FAILED: i64 = 8;
 }
+
+/// The login of a PostgreSQL service whose config names none, as the
+/// provider creates it.
+pub const DEFAULT_PG_USERNAME: &str = "postgres";
+
+/// The variable through which a restore job receives the password the dump
+/// it applies gives the job's login ([`restore_script`]).
+pub const RESTORED_PASSWORD_ENV: &str = "TEMPS_RESTORED_PASSWORD";
 
 /// Whether a backup (and an in-place restore) of `service` runs as a job on
 /// its node. See the module docs for why this is the gate.
@@ -356,6 +367,21 @@ pub fn backup_script(target: &PgJobTarget, object_key: &str) -> String {
     )
 }
 
+/// The variables of a restore job: those of [`job_env`], and, when the dump
+/// gives the job's login another password ([`restore_script`] with
+/// `switch_login`), that password in [`RESTORED_PASSWORD_ENV`].
+pub fn restore_env(
+    password: &str,
+    s3: &S3JobTarget,
+    restored_password: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = job_env(password, s3);
+    if let Some(restored) = restored_password {
+        env.push((RESTORED_PASSWORD_ENV.to_string(), restored.to_string()));
+    }
+    env
+}
+
 /// The restore script: the object streams through gunzip into `psql`, as
 /// the local pg_dump restore applies a `pg_dumpall --clean` dump (errors on
 /// objects that already exist are reported, not fatal).
@@ -382,7 +408,41 @@ pub fn backup_script(target: &PgJobTarget, object_key: &str) -> String {
 /// A `gunzip` failure whose fetch either succeeded or was killed by SIGPIPE
 /// (status 141: gunzip stopped reading first) is a corrupt object
 /// ([`exit::CORRUPT_DUMP`]); any other fetch failure is a download failure.
-pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
+///
+/// A dump of another database runs `ALTER ROLE ... PASSWORD` for every role
+/// of its origin. When the job's login is one of them, its password changes
+/// midway, and the dump's next `\connect` would be refused with the old one.
+/// With `switch_login`, the job therefore gives its login the password the
+/// dump restores ([`RESTORED_PASSWORD_ENV`]) once the object is verified and
+/// before anything is applied, and applies the dump with it. The password
+/// reaches `psql` from the environment and is quoted by it (`:'...'`); it is
+/// never part of the script or of an argv. A failed switch exits with
+/// [`exit::LOGIN_SWITCH_FAILED`] and nothing applied.
+pub fn restore_script(target: &PgJobTarget, object_key: &str, switch_login: bool) -> String {
+    let switch = if switch_login {
+        // The quoted heredoc keeps the shell from expanding anything in the
+        // SQL; psql reads the password from the environment through a
+        // backtick builtin `printf`, so it never appears in an argv.
+        format!(
+            "[ -n \"${env}\" ] || {{ echo 'temps: the password the dump restores is missing; \
+             nothing was applied' >&2; exit {code}; }}\n\
+             psql -X -q -v ON_ERROR_STOP=1 --no-password --host={host} --port={port} \
+             --username={user} --dbname=postgres >/dev/null <<'TEMPS_SQL' \
+             || {{ echo 'temps: switching the login to the restored password failed; nothing \
+             was applied' >&2; exit {code}; }}\n\
+             \\set restored_password `printf %s \"${env}\"`\n\
+             ALTER ROLE CURRENT_USER PASSWORD :'restored_password';\n\
+             TEMPS_SQL\n\
+             PGPASSWORD=\"${env}\"; export PGPASSWORD\n",
+            env = RESTORED_PASSWORD_ENV,
+            host = q(&target.host),
+            port = target.port,
+            user = q(&target.username),
+            code = exit::LOGIN_SWITCH_FAILED,
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{REQUIRE_WALG}\n\
          fetch_rc=\"${{TMPDIR:-/tmp}}/temps-restore-fetch.rc\"\n\
@@ -400,6 +460,7 @@ pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
          ${{unzip:-without a status}}$1\" >&2; exit 7; }}; }}\n\
          stream -t\n\
          check '; nothing was applied'\n\
+         {switch}\
          stream | psql -X -q --no-password --host={host} --port={port} --username={user} \
          --dbname=postgres >/dev/null\n\
          psql_rc=$?\n\
@@ -852,6 +913,9 @@ fn failed(
             "the dump in S3 is corrupt or truncated (gunzip could not decompress it); \
              restore from another backup",
         ),
+        Some(exit::LOGIN_SWITCH_FAILED) => Some(
+            "switching the login to the password the dump restores failed; nothing was applied",
+        ),
         Some(exit::NO_WALG) => Some(
             "the database's image has no wal-g; backups of a database on a worker node need \
              one of Temps' PostgreSQL images",
@@ -897,7 +961,7 @@ pub fn pg_target(
             .to_string(),
         host: super::dispatch::service_container_name(service),
         port: 5432,
-        username: text("username").unwrap_or("postgres").to_string(),
+        username: text("username").unwrap_or(DEFAULT_PG_USERNAME).to_string(),
         database: text("database")
             .or_else(|| text("db_name"))
             .unwrap_or("postgres")
@@ -1510,19 +1574,6 @@ pub fn restore_takes_job_path(
     takes_job_path(target) && backup_location.ends_with(".sql.gz")
 }
 
-/// The origin database of backup `backup_id`, from its producer link.
-pub async fn backup_origin(
-    db: &DatabaseConnection,
-    backup_id: i32,
-) -> Result<Option<i32>, sea_orm::DbErr> {
-    use temps_entities::external_service_backups::{Column, Entity};
-    Ok(Entity::find()
-        .filter(Column::BackupId.eq(backup_id))
-        .one(db)
-        .await?
-        .map(|link| link.service_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1693,7 +1744,7 @@ mod tests {
 
     #[test]
     fn the_restore_script_streams_the_object_into_psql() {
-        let script = restore_script(&target(), "p/dump.sql.gz");
+        let script = restore_script(&target(), "p/dump.sql.gz", false);
         assert!(script.contains("wal-g st cat 'p/dump.sql.gz'"), "{script}");
         assert!(script.contains("{ gunzip \"$@\"; echo $?"), "{script}");
         // Verified before anything is applied, then applied.
@@ -1946,7 +1997,7 @@ mod tests {
         let object = tempfile::NamedTempFile::new().expect("object");
         std::fs::write(object.path(), b"SELECT 1;\n").expect("writing the object");
         let object_path = object.path().to_str().expect("utf-8 path");
-        let script = restore_script(&target(), "p/dump.sql.gz");
+        let script = restore_script(&target(), "p/dump.sql.gz", false);
         let run = |env: &[(&str, &str)]| {
             let mut all = vec![("STUB_OBJECT", object_path)];
             all.extend_from_slice(env);
@@ -2001,6 +2052,113 @@ mod tests {
         }
     }
 
+    /// A restore that switches the login runs `psql` twice: first the
+    /// `ALTER ROLE` with the target's password, then the dump with the
+    /// restored one. The password reaches neither the script nor an argv,
+    /// and a failed or impossible switch applies nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_switched_login_applies_the_dump_with_the_restored_password() {
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        // Each call appends its password, argv and input to the log; a call
+        // whose input is the switch exits `$STUB_SWITCH_RC`.
+        stubs.add(
+            "psql",
+            "input=$(cat)\n\
+             printf 'call pw=%s argv=%s\\n%s\\n' \"$PGPASSWORD\" \"$*\" \"$input\" >> \"$STUB_PSQL_INPUT\"\n\
+             case \"$input\" in *'ALTER ROLE'*) exit \"${STUB_SWITCH_RC:-0}\";; esac\n\
+             exit 0",
+        );
+        let object = tempfile::NamedTempFile::new().expect("object");
+        std::fs::write(object.path(), b"SELECT 1;\n").expect("writing the object");
+        let object_path = object.path().to_str().expect("utf-8 path");
+        let script = restore_script(&target(), "p/dump.sql.gz", true);
+        assert!(
+            !script.contains("origin-secret"),
+            "the script never carries the password"
+        );
+        let run = |extra: &[(&str, &str)]| {
+            let mut env = vec![
+                ("STUB_OBJECT", object_path),
+                ("PGPASSWORD", "target-secret"),
+                (RESTORED_PASSWORD_ENV, "origin-secret"),
+            ];
+            env.extend_from_slice(extra);
+            stubs.run(&script, &env)
+        };
+
+        let (code, stderr, log) = run(&[]);
+        assert_eq!(code, 0, "{stderr}");
+        let log = String::from_utf8(log.expect("psql ran")).expect("utf-8 log");
+        let calls: Vec<&str> = log.split("call ").filter(|c| !c.is_empty()).collect();
+        assert_eq!(calls.len(), 2, "{log}");
+        assert!(calls[0].starts_with("pw=target-secret "), "{log}");
+        assert!(
+            calls[0].contains("ALTER ROLE CURRENT_USER PASSWORD :'restored_password';"),
+            "{log}"
+        );
+        assert!(
+            calls[0].contains("\\set restored_password `printf %s \"$TEMPS_RESTORED_PASSWORD\"`"),
+            "psql reads the password itself, unexpanded by the shell: {log}"
+        );
+        assert!(calls[1].starts_with("pw=origin-secret "), "{log}");
+        assert!(calls[1].contains("SELECT 1;"), "{log}");
+        for call in &calls {
+            let first_line = call.lines().next().unwrap_or_default();
+            let argv = first_line.split(" argv=").nth(1).unwrap_or_default();
+            assert!(!argv.is_empty(), "{log}");
+            assert!(
+                !argv.contains("origin-secret"),
+                "the password is in an argv: {argv}"
+            );
+        }
+
+        // The switch fails: nothing applied.
+        let (code, stderr, log) = run(&[("STUB_SWITCH_RC", "3")]);
+        assert_eq!(code, exit::LOGIN_SWITCH_FAILED as i32, "{stderr}");
+        assert!(stderr.contains("nothing was applied"), "{stderr}");
+        let log = String::from_utf8(log.unwrap_or_default()).expect("utf-8 log");
+        assert!(!log.contains("SELECT 1;"), "the dump ran: {log}");
+
+        // No restored password: refused before psql runs at all.
+        let (code, stderr, log) = run(&[(RESTORED_PASSWORD_ENV, "")]);
+        assert_eq!(code, exit::LOGIN_SWITCH_FAILED as i32, "{stderr}");
+        assert_eq!(log, None, "psql ran without a password to switch to");
+    }
+
+    #[test]
+    fn a_restore_env_carries_the_restored_password_only_when_switching() {
+        let s3 = S3JobTarget {
+            s3_source_id: 1,
+            bucket: "b".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            force_path_style: false,
+            access_key_id: "a".into(),
+            secret_access_key: "s".into(),
+            session_token: None,
+        };
+        let has = |env: &[(String, String)]| env.iter().any(|(k, _)| k == RESTORED_PASSWORD_ENV);
+        assert!(!has(&restore_env("t", &s3, None)));
+        assert_eq!(restore_env("t", &s3, None), job_env("t", &s3));
+        let env = restore_env("t", &s3, Some("o"));
+        assert!(env.contains(&(RESTORED_PASSWORD_ENV.to_string(), "o".to_string())));
+        assert!(env.contains(&("PGPASSWORD".to_string(), "t".to_string())));
+        assert!(!restore_script(&target(), "k", false).contains(RESTORED_PASSWORD_ENV));
+    }
+
+    #[test]
+    fn a_failed_login_switch_names_its_step() {
+        let status = temps_workload::WorkloadStatus {
+            phase: WorkloadPhase::Failed,
+            exit_code: Some(exit::LOGIN_SWITCH_FAILED),
+            ..Default::default()
+        };
+        let error = failed(&target(), "restore", 9, &status, None);
+        assert!(error.to_string().contains("nothing was applied"), "{error}");
+    }
+
     /// The reported failure itself, with the host's real `gunzip`: S3 serves
     /// a truncated `.sql.gz` successfully, and the restore must fail before
     /// `psql` sees any of it.
@@ -2015,7 +2173,7 @@ mod tests {
             return;
         }
         let stubs = Stubs::with_walg_and_psql();
-        let script = restore_script(&target(), "p/dump.sql.gz");
+        let script = restore_script(&target(), "p/dump.sql.gz", false);
         let sql = "CREATE TABLE proof(x int);\n".repeat(2_000);
         let whole = gzip(sql.as_bytes());
 
