@@ -498,7 +498,9 @@ pub struct RestorePlan {
     /// Backup we'll read from.
     pub source_backup: PlanSourceBackup,
     /// How the restore will be performed: "walg_restore", "pg_dump_restore",
-    /// "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
+    /// "mariadb_physical_restore", "mariadb_dump_restore",
+    /// "mongodump_restore", "redis_rdb_restore", "s3_mirror_restore", or
+    /// "unsupported".
     pub strategy: String,
     /// Ordered list of human-readable actions the orchestrator will take.
     pub steps: Vec<String>,
@@ -536,7 +538,8 @@ pub struct PlanSourceBackup {
     /// True when the original row's `s3_location` was empty and we resolved
     /// a location by probing S3. The UI shows this as a warning.
     pub location_was_resolved: bool,
-    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
+    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "mongodump",
+    /// "redis_rdb", "s3_mirror", "unknown".
     pub format: String,
     pub size_bytes: Option<i64>,
     pub created_at: Option<String>,
@@ -770,44 +773,10 @@ impl RestoreService {
             }
         }
 
-        // Strategy classification.
-        //
-        // MariaDB is classified FIRST and entirely on its own terms. Its
-        // logical dump object is named `dump.sql.gz`, so the generic
-        // `.sql.gz` arm below would label it `pg_dump_restore` and the plan
-        // would describe a `pg_restore` that never runs. Its physical base is
-        // a WAL-G repository (or, in older buckets, a `base.mbstream.gz`
-        // object), neither of which matches a generic arm — both would land
-        // in `unsupported` even though they are the engine's PITR format.
+        // Strategy classification: see `classify_restore_strategy`.
         let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
         let engine_lower = target.service_type.to_ascii_lowercase();
-        let strategy = if target_is_mariadb {
-            // Same predicate the MariaDB engine itself dispatches on, so the
-            // preview cannot promise a restore shape the executor won't take.
-            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
-                &resolved_location,
-            ) {
-                "mariadb_physical_restore"
-            } else if resolved_location.ends_with(".sql.gz") {
-                "mariadb_dump_restore"
-            } else {
-                "unsupported"
-            }
-        } else if resolved_location.starts_with("s3://") {
-            "walg_restore"
-        } else if resolved_location.ends_with(".sql.gz")
-            || resolved_location.ends_with(".pgdump.gz")
-        {
-            "pg_dump_restore"
-        } else if engine_lower == "redis"
-            && temps_providers::externalsvc::redis::classify_redis_backup_location(
-                &resolved_location,
-            ) == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip
-        {
-            "redis_rdb_restore"
-        } else {
-            "unsupported"
-        };
+        let strategy = classify_restore_strategy(&engine_lower, &resolved_location);
 
         // PITR needs a continuous change stream anchored to the base backup:
         // WAL-G's WAL archive for Postgres, archived binary logs for MariaDB's
@@ -820,10 +789,10 @@ impl RestoreService {
                         .into(),
                 );
             } else {
-                errors.push(
-                    "PITR requires a WAL-G backup. The selected backup is pg_dump; choose a WAL-G backup or a different mode."
-                        .into(),
-                );
+                errors.push(format!(
+                    "PITR requires a WAL-G backup. The selected backup is {}; choose a WAL-G backup or a different mode.",
+                    restore_format(strategy).replace('_', " ")
+                ));
             }
         }
 
@@ -886,7 +855,10 @@ impl RestoreService {
             && engine_preserves_source_credentials
             && matches!(
                 strategy,
-                "walg_restore" | "pg_dump_restore" | "mariadb_physical_restore"
+                "walg_restore"
+                    | "pg_dump_restore"
+                    | "mariadb_physical_restore"
+                    | "mongodump_restore"
             )
         {
             let origin_still_known = backup_row
@@ -1034,16 +1006,7 @@ impl RestoreService {
                 origin_service_name,
                 location: resolved_location,
                 location_was_resolved,
-                format: match strategy {
-                    "walg_restore" => "walg".into(),
-                    "pg_dump_restore" => "pg_dump".into(),
-                    // Match the engine keys the MariaDB backup engines
-                    // register under, so the plan's `format` lines up with
-                    // `classify_backup_format` and the backup list UI.
-                    "mariadb_physical_restore" => "mariadb_physical".into(),
-                    "mariadb_dump_restore" => "mariadb_dump".into(),
-                    _ => "unknown".into(),
-                },
+                format: restore_format(strategy).into(),
                 size_bytes: backup_row.as_ref().and_then(|b| b.size_bytes),
                 created_at: backup_row.as_ref().map(|b| b.started_at.to_rfc3339()),
             },
@@ -1857,6 +1820,66 @@ async fn backup_origin_service_name(
         })
 }
 
+/// How a backup at `location` is restored into a `service_type` service
+/// (lowercase): the strategy a restore plan reports, from the location alone,
+/// the same way the engines dispatch on it.
+///
+/// MariaDB is classified FIRST and entirely on its own terms. Its logical
+/// dump object is named `dump.sql.gz`, so the generic `.sql.gz` arm below
+/// would label it `pg_dump_restore` and the plan would describe a
+/// `pg_restore` that never runs. Its physical base is a WAL-G repository
+/// (or, in older buckets, a `base.mbstream.gz` object), neither of which
+/// matches a generic arm. MongoDB and the object stores are classified
+/// before the generic arms too: a MongoDB object that is not a WAL-G
+/// prefix is a `mongodump --archive` (the MongoDB engine's dump, also what a
+/// worker's agent writes), and an object-store location that is not a
+/// WAL-G prefix is a bucket-mirror prefix.
+fn classify_restore_strategy(service_type: &str, location: &str) -> &'static str {
+    match service_type {
+        "mariadb" => {
+            // Same predicate the MariaDB engine itself dispatches on, so the
+            // preview cannot promise a restore shape the executor won't take.
+            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
+                location,
+            ) {
+                "mariadb_physical_restore"
+            } else if location.ends_with(".sql.gz") {
+                "mariadb_dump_restore"
+            } else {
+                "unsupported"
+            }
+        }
+        _ if location.starts_with("s3://") => "walg_restore",
+        "mongodb" if !location.trim().is_empty() => "mongodump_restore",
+        "s3" | "rustfs" | "blob" | "minio" if !location.trim().is_empty() => "s3_mirror_restore",
+        _ if location.ends_with(".sql.gz") || location.ends_with(".pgdump.gz") => "pg_dump_restore",
+        "redis" | "kv"
+            if temps_providers::externalsvc::redis::classify_redis_backup_location(location)
+                == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip =>
+        {
+            "redis_rdb_restore"
+        }
+        _ => "unsupported",
+    }
+}
+
+/// The backup format a restore strategy reads, as a restore plan reports it.
+/// The MariaDB values match the engine keys its backup engines register
+/// under, so the plan lines up with `classify_backup_format` and the backup
+/// list.
+fn restore_format(strategy: &str) -> &'static str {
+    match strategy {
+        "walg_restore" => "walg",
+        "pg_dump_restore" => "pg_dump",
+        "mariadb_physical_restore" => "mariadb_physical",
+        "mariadb_dump_restore" => "mariadb_dump",
+        "mongodump_restore" => "mongodump",
+        "redis_rdb_restore" => "redis_rdb",
+        "s3_mirror_restore" => "s3_mirror",
+        _ => "unknown",
+    }
+}
+
 /// What restoring into a service on a worker node runs, for a restore plan.
 struct WorkerRestorePlan {
     steps: Vec<String>,
@@ -1916,16 +1939,39 @@ fn worker_restore_plan(
         });
     }
     if crate::engines::worker_agent::takes_agent_path(target) {
+        use crate::engines::worker_agent::{worker_service_kind, WorkerServiceKind};
+        use temps_providers::externalsvc::worker_data::DumpEngine;
+        let applies = match worker_service_kind(&target.service_type) {
+            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) => format!(
+                "The agent downloads the mongodump archive {location} and replays it into \
+                 {container} with `mongorestore --archive --gzip --drop`, MongoDB's own restore: \
+                 every database is replaced, `admin.system.users` included"
+            ),
+            Some(WorkerServiceKind::Dump(DumpEngine::Redis)) => format!(
+                "The agent installs the RDB snapshot {location} into {container} with Redis's \
+                 own restore, which stops and starts the container (existing data is replaced)"
+            ),
+            Some(WorkerServiceKind::Dump(DumpEngine::Mariadb)) => format!(
+                "The agent applies the SQL dump {location} into {container} with MariaDB's own \
+                 restore (existing data in the dumped databases is replaced)"
+            ),
+            Some(WorkerServiceKind::Storage) => format!(
+                "The agent mirrors each bucket under {location} into {container} with \
+                 `rc mirror --overwrite --remove`: missing objects are added, changed ones \
+                 overwritten, and objects the backup does not have are deleted"
+            ),
+            None => format!(
+                "The agent applies {location} in place with {}'s own restore (existing data is \
+                 overwritten)",
+                target.service_type
+            ),
+        };
         return Some(WorkerRestorePlan {
             steps: vec![
                 format!(
                     "Restore on worker node {node}, through its agent, into container {container}"
                 ),
-                format!(
-                    "The agent applies {location} in place with {}'s own restore (existing data \
-                     is overwritten)",
-                    target.service_type
-                ),
+                applies,
             ],
             refusal: agent_restore_supported(target, location, mode)
                 .err()
@@ -4373,18 +4419,26 @@ fn build_mongodb_steps(
     destructive: &mut bool,
     errors: &mut Vec<String>,
 ) -> Option<&'static str> {
-    let _ = resolved_location; // wal-g reads from WALG_S3_PREFIX, not a single key
+    // A WAL-G backup is fetched from WALG_S3_PREFIX, not a single key; a
+    // mongodump archive is one object, downloaded and replayed by a sidecar.
+    let archive = strategy == "mongodump_restore";
+    let fetch = |into: &str| {
+        if archive {
+            format!(
+                "Download the mongodump archive {resolved_location} and run `mongorestore \
+                 --archive --gzip --drop` against {into} from a one-shot sidecar"
+            )
+        } else {
+            format!(
+                "Run `wal-g backup-fetch LATEST` inside {into}; WAL-G decompresses the archived \
+                 mongodump stream and pipes it to `mongorestore --archive --drop`"
+            )
+        }
+    };
     match mode {
         RestoreRequestMode::InPlace => {
             *destructive = true;
-            steps.push(format!(
-                "Run `wal-g backup-fetch LATEST` inside {}",
-                container_name
-            ));
-            steps.push(
-                "WAL-G decompresses the archived mongodump stream and pipes it to `mongorestore --archive --drop`"
-                    .into(),
-            );
+            steps.push(fetch(container_name));
             steps.push(format!(
                 "mongorestore replaces ALL databases on {}, including `admin.system.users` — target's root user takes on the source's password",
                 container_name
@@ -4400,10 +4454,7 @@ fn build_mongodb_steps(
                 name
             ));
             steps.push("Start the new container and wait for mongod to initialize".into());
-            steps.push(
-                "Run `wal-g backup-fetch LATEST` inside the new container; WAL-G pipes the mongodump stream to `mongorestore --archive --drop`"
-                    .into(),
-            );
+            steps.push(fetch("the new container"));
             steps.push(
                 "Because mongorestore replays `admin.system.users`, the new service's root user is the SOURCE's credentials, not the freshly-generated ones"
                     .into(),
@@ -4418,7 +4469,9 @@ fn build_mongodb_steps(
             );
         }
     }
-    if matches!(mode, RestoreRequestMode::NewService { .. }) && strategy == "walg_restore" {
+    if matches!(mode, RestoreRequestMode::NewService { .. })
+        && matches!(strategy, "walg_restore" | "mongodump_restore")
+    {
         Some("MongoDB clone credentials: the archive replaces admin users with those from the backup. The new service's displayed password may differ from the restored password; verify the backup's credentials or reset the database password before linking applications. This clone path does not automatically reconcile stored credentials.")
     } else {
         None
@@ -7464,6 +7517,148 @@ mod tests {
             false,
         )
         .is_none());
+    }
+
+    /// The restore plan names what each backup is and how it is applied,
+    /// for the formats worker nodes and the control plane write: a
+    /// mongodump archive and a bucket mirror are not "unsupported"/"unknown".
+    #[test]
+    fn a_plan_classifies_every_backup_format_the_engines_write() {
+        for (engine, location, strategy, format) in [
+            (
+                "postgres",
+                "s3://b/external_services/postgres/orders/walg",
+                "walg_restore",
+                "walg",
+            ),
+            (
+                "postgres",
+                "external_services/postgres/orders/u/dump.sql.gz",
+                "pg_dump_restore",
+                "pg_dump",
+            ),
+            (
+                "mongodb",
+                "external_services/mongodb/docs/2026/01/01/u/dump.archive",
+                "mongodump_restore",
+                "mongodump",
+            ),
+            (
+                "mongodb",
+                "s3://b/external_services/mongodb/docs/walg",
+                "walg_restore",
+                "walg",
+            ),
+            (
+                "redis",
+                "external_services/redis/cache/u/dump.rdb.gz",
+                "redis_rdb_restore",
+                "redis_rdb",
+            ),
+            (
+                "mariadb",
+                "external_services/mariadb/shop/u/dump.sql.gz",
+                "mariadb_dump_restore",
+                "mariadb_dump",
+            ),
+            (
+                "s3",
+                "external_services/s3/files/2026/01/01/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            (
+                "rustfs",
+                "external_services/s3/files/2026/01/01/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            (
+                "blob",
+                "external_services/blob/files/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            ("redis", "legacy-backup.tar", "unsupported", "unknown"),
+            ("mongodb", "", "unsupported", "unknown"),
+        ] {
+            let classified = classify_restore_strategy(engine, location);
+            assert_eq!(classified, strategy, "{engine} {location}");
+            assert_eq!(restore_format(classified), format, "{engine} {location}");
+        }
+    }
+
+    /// A mongodump archive is planned as the archive restore the MongoDB
+    /// engine runs, never as a WAL-G fetch.
+    #[test]
+    fn a_mongodump_archive_plan_describes_mongorestore_not_walg() {
+        for mode in [
+            RestoreRequestMode::InPlace,
+            RestoreRequestMode::NewService {
+                name: "docs-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+        ] {
+            let (mut steps, mut destructive, mut errors) = (Vec::new(), false, Vec::new());
+            build_mongodb_steps(
+                "mongodump_restore",
+                &mode,
+                "temps-mongodb-docs",
+                "external_services/mongodb/docs/u/dump.archive",
+                &mut steps,
+                &mut destructive,
+                &mut errors,
+            );
+            let text = steps.join("\n");
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(!text.contains("wal-g"), "{text}");
+            assert!(text.contains("dump.archive"), "{text}");
+            assert!(
+                text.contains("mongorestore --archive --gzip --drop"),
+                "{text}"
+            );
+        }
+    }
+
+    /// On a worker, the plan says what the agent applies for each engine:
+    /// MongoDB's archive restore and the exact bucket mirror.
+    #[test]
+    fn a_worker_restore_plan_names_the_engines_restore() {
+        let mut docs = crashed_run_service();
+        docs.service_type = "mongodb".to_string();
+        docs.name = "docs".to_string();
+        docs.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &docs,
+            "external_services/mongodb/docs/u/dump.archive",
+            &RestoreRequestMode::InPlace,
+            "temps-mongodb-docs",
+            false,
+        )
+        .expect("a worker MongoDB");
+        let text = plan.steps.join("\n");
+        assert!(
+            text.contains("mongorestore --archive --gzip --drop"),
+            "{text}"
+        );
+        assert!(!text.contains("wal-g"), "{text}");
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+
+        let mut files = crashed_run_service();
+        files.service_type = "s3".to_string();
+        files.name = "files".to_string();
+        files.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &files,
+            "external_services/s3/files/u",
+            &RestoreRequestMode::InPlace,
+            "files",
+            false,
+        )
+        .expect("a worker storage service");
+        let text = plan.steps.join("\n");
+        assert!(text.contains("--overwrite --remove"), "{text}");
+        assert!(text.contains("deleted"), "{text}");
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {
