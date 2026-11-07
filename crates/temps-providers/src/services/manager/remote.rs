@@ -581,6 +581,70 @@ impl ExternalServiceManager {
             })?;
         Ok(result.exit_code)
     }
+
+    /// The worker node service `service_id` runs on, refusing one on the
+    /// control plane: its data operations take the local engines.
+    async fn worker_service_target(
+        &self,
+        service_id: i32,
+        operation: &str,
+    ) -> Result<(i32, crate::externalsvc::ServiceConfig), ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
+        else {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "service {} ('{}') runs on the control plane; its {operation} uses this \
+                     server's engines, not a worker's",
+                    service.id, service.name
+                ),
+            });
+        };
+        let config = self.get_service_config(service_id).await?;
+        Ok((node_id, config))
+    }
+
+    /// Back up service `service_id`, which runs on a worker node, on that
+    /// node: the agent runs the engine's own dump (or bucket mirror) and
+    /// writes it to `key` in `destination`. Credentials travel sealed.
+    pub async fn backup_worker_service(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        key: String,
+    ) -> Result<crate::remote_service_client::RemoteServiceBackupResponse, ExternalServiceError>
+    {
+        let (node_id, service_config) = self.worker_service_target(service_id, "backup").await?;
+        self.get_remote_client(node_id)
+            .await?
+            .backup_service(&crate::remote_service_client::RemoteServiceBackupRequest {
+                service_config,
+                destination,
+                key,
+            })
+            .await
+    }
+
+    /// Restore service `service_id`, which runs on a worker node, in place on
+    /// that node from the backup at `location` in `source`.
+    pub async fn restore_worker_service(
+        &self,
+        service_id: i32,
+        source: crate::remote_service_client::WorkerS3Destination,
+        location: String,
+    ) -> Result<crate::remote_service_client::RemoteServiceRestoreResponse, ExternalServiceError>
+    {
+        let (node_id, service_config) = self.worker_service_target(service_id, "restore").await?;
+        self.get_remote_client(node_id)
+            .await?
+            .restore_service(&crate::remote_service_client::RemoteServiceRestoreRequest {
+                service_config,
+                source,
+                location,
+            })
+            .await
+    }
 }
 
 #[cfg(test)]

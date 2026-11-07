@@ -114,6 +114,24 @@ impl NodeServiceRuntime for StubRuntime {
     ) -> Result<RemoteWalHealthResponse, NodeServiceError> {
         Err(not_available("WAL probe"))
     }
+
+    async fn backup_service(
+        &self,
+        _request: temps_service_protocol::RemoteServiceBackupRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::RemoteServiceBackupResponse, NodeServiceError> {
+        Err(not_available("backup_service"))
+    }
+
+    async fn restore_service(
+        &self,
+        _request: temps_service_protocol::RemoteServiceRestoreRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::RemoteServiceRestoreResponse, NodeServiceError> {
+        Err(not_available("restore_service"))
+    }
 }
 
 /// What [`StubPluginBuilder`] does with a build.

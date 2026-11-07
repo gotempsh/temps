@@ -396,6 +396,88 @@ pub struct RemoteWalHealthResponse {
     pub error: Option<String>,
 }
 
+/// The S3 bucket a worker writes a backup to or reads one from, with
+/// decrypted credentials. Only ever sent inside a body sealed to the node;
+/// `Debug` prints neither the secret key nor the session token.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerS3Destination {
+    pub bucket: String,
+    pub region: String,
+    /// `None`: AWS's own endpoint for the region.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    pub force_path_style: bool,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// Present for a temporary credential (Temps Cloud managed backups).
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for WorkerS3Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerS3Destination")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("force_path_style", &self.force_path_style)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// `POST /agent/services/data-backup`: back up a service this node runs into
+/// `destination`, with the engine's own tool, on this node.
+///
+/// The agent takes no command, image or host from the caller: the engine and
+/// its fixed dump command follow from `service_config.service_type`, the
+/// container from the service's name, and the image from that container.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteServiceBackupRequest {
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The object key of a dump (`.../dump.archive`), or the key prefix the
+    /// buckets of a storage service are mirrored under.
+    pub key: String,
+}
+
+/// What a worker backup wrote.
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct RemoteServiceBackupResponse {
+    /// Bytes uploaded for a dump; `0` for a bucket mirror (the control plane
+    /// measures the prefix).
+    pub size_bytes: u64,
+    /// The buckets a storage service's mirror copied.
+    #[serde(default)]
+    pub buckets: Vec<String>,
+}
+
+/// `POST /agent/services/data-restore`: restore a service this node runs, in
+/// place, from a backup the worker path wrote (`location` is that backup's
+/// object key or mirror prefix in `source`).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteServiceRestoreRequest {
+    pub service_config: ServiceConfig,
+    pub source: WorkerS3Destination,
+    pub location: String,
+}
+
+/// What a worker restore applied.
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+pub struct RemoteServiceRestoreResponse {
+    /// The buckets a storage service's restore copied back.
+    #[serde(default)]
+    pub buckets: Vec<String>,
+}
+
 /// Where on its node an instance is attached. The only part of a database
 /// request that differs by node, on purpose.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -561,6 +643,27 @@ pub trait NodeServiceRuntime: Send + Sync {
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
     ) -> Result<RemoteWalHealthResponse, NodeServiceError>;
+
+    /// Back up the service `request` names, which this node runs, with the
+    /// engine's own tool: a dump streamed to the destination for MongoDB,
+    /// Redis and MariaDB, a bucket mirror for managed S3 storage. Never stops
+    /// or restarts the service. `published_address` is as for
+    /// [`Self::probe_service_health`].
+    async fn backup_service(
+        &self,
+        request: RemoteServiceBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteServiceBackupResponse, NodeServiceError>;
+
+    /// Restore the service `request` names, in place, from a backup that
+    /// [`Self::backup_service`] wrote, with the engine's own restore.
+    async fn restore_service(
+        &self,
+        request: RemoteServiceRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<RemoteServiceRestoreResponse, NodeServiceError>;
 }
 
 #[cfg(test)]
@@ -601,6 +704,53 @@ mod tests {
         let logged = format!("{body:?}");
         assert!(logged.contains("POSTGRES_PASSWORD"));
         assert!(!logged.contains("hunter2"));
+    }
+
+    /// A worker backup request's credentials never reach a log line, and the
+    /// agent refuses a field it does not know (no caller-chosen command).
+    #[test]
+    fn worker_backup_requests_hide_credentials_and_take_no_command() {
+        let request: RemoteServiceBackupRequest = serde_json::from_value(serde_json::json!({
+            "service_config": {
+                "name": "cache",
+                "service_type": "redis",
+                "version": null,
+                "parameters": {}
+            },
+            "destination": {
+                "bucket": "backups",
+                "region": "us-east-1",
+                "force_path_style": true,
+                "access_key_id": "AKIAEXAMPLE",
+                "secret_access_key": "very-secret",
+                "session_token": "session-secret"
+            },
+            "key": "redis/cache/1/dump.rdb.gz"
+        }))
+        .expect("parse request");
+        let logged = format!("{request:?}");
+        assert!(!logged.contains("very-secret"), "{logged}");
+        assert!(!logged.contains("session-secret"), "{logged}");
+        assert!(logged.contains("AKIAEXAMPLE"));
+
+        let refused = serde_json::from_value::<RemoteServiceBackupRequest>(serde_json::json!({
+            "service_config": {
+                "name": "cache",
+                "service_type": "redis",
+                "version": null,
+                "parameters": {}
+            },
+            "destination": {
+                "bucket": "backups",
+                "region": "us-east-1",
+                "force_path_style": true,
+                "access_key_id": "a",
+                "secret_access_key": "b"
+            },
+            "key": "k",
+            "command": ["sh", "-c", "id"]
+        }));
+        assert!(refused.is_err());
     }
 
     #[test]

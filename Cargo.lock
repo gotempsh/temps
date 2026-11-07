@@ -15016,6 +15016,7 @@ dependencies = [
  "bollard",
  "bytes",
  "chrono",
+ "flate2",
  "futures",
  "hex",
  "hmac 0.13.0",

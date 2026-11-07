@@ -21,6 +21,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 pub mod postgres_role_reconciler;
+pub mod worker_data;
 
 #[cfg(test)]
 mod runtime_provisioning_tests {
