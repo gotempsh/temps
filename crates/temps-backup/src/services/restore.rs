@@ -56,6 +56,15 @@ pub enum RestoreError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    #[error(
+        "Cannot read the restore options of service {service_id} ('{service_name}'): {reason}"
+    )]
+    CapabilitiesUnavailable {
+        service_id: i32,
+        service_name: String,
+        reason: String,
+    },
+
     #[error("Cannot reserve restored service name '{name}': {reason}")]
     ServiceNameConflict { name: String, reason: String },
 
@@ -1078,26 +1087,25 @@ impl RestoreService {
             ServiceType::from_str(&service.service_type).map_err(|e| RestoreError::Validation {
                 message: format!("Invalid service type '{}': {}", service.service_type, e),
             })?;
+        let unavailable = |reason: String| RestoreError::CapabilitiesUnavailable {
+            service_id,
+            service_name: service.name.clone(),
+            reason,
+        };
         let service_config = self
             .external_service_manager
             .get_service_config(service_id)
             .await
-            .map_err(|e| RestoreError::ExternalService {
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| unavailable(format!("loading its configuration failed: {e}")))?;
         let instance = self
             .external_service_manager
             .resolve_service_instance(&service.name, service_type)
             .await
-            .map_err(|e| RestoreError::ExternalService {
-                reason: format!("get service instance: {}", e),
-            })?;
+            .map_err(|e| unavailable(format!("its engine is not available here: {e}")))?;
         let capabilities = instance
             .restore_capabilities(service_config)
             .await
-            .map_err(|e| RestoreError::ExternalService {
-                reason: format!("Failed to read restore capabilities: {}", e),
-            })?;
+            .map_err(|e| unavailable(format!("its engine could not answer: {e}")))?;
         Ok((capabilities, identity))
     }
 
@@ -6773,6 +6781,91 @@ mod tests {
         assert!(!crate::engines::worker_agent::takes_agent_path(
             &crashed_run_service()
         ));
+    }
+
+    /// A RestoreService on a control-plane-profile server: no Docker.
+    fn control_plane_restore_service(
+        rows: Vec<temps_entities::external_services::Model>,
+    ) -> RestoreService {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(rows.into_iter().map(|row| vec![row]))
+                .into_connection(),
+        );
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let enc = Arc::new(EncryptionService::new(key).unwrap());
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
+        let mgr = Arc::new(temps_providers::ExternalServiceManager::new_with_handle(
+            db.clone(),
+            enc.clone(),
+            handle,
+            false,
+            dns_registry,
+        ));
+        RestoreService::new(db, mgr, enc)
+    }
+
+    /// The restore page of a database on a worker node, read from a server
+    /// that runs no containers: in place only, answered without an engine,
+    /// for every worker engine. Before, the engine lookup needed this
+    /// server's Docker and the page failed with a generic 500.
+    #[tokio::test]
+    async fn a_worker_service_reports_its_restore_options_on_a_control_plane_profile() {
+        for service_type in ["postgres", "mongodb", "redis", "mariadb", "s3"] {
+            let mut service = crashed_run_service();
+            service.id = 5;
+            service.service_type = service_type.to_string();
+            service.node_id = Some(2);
+            let restore = control_plane_restore_service(vec![service]);
+            let (capabilities, identity) = restore
+                .get_capabilities_with_identity(5)
+                .await
+                .unwrap_or_else(|e| panic!("{service_type}: {e}"));
+            assert_eq!(identity.id, 5);
+            assert!(capabilities.restore_in_place, "{service_type}");
+            assert!(!capabilities.restore_to_new_service, "{service_type}");
+            assert!(!capabilities.pitr, "{service_type}");
+        }
+    }
+
+    /// A service whose engine this server cannot build (a control-plane
+    /// service with no Docker here) gets a 503 that names it and says why,
+    /// never the generic 500.
+    #[tokio::test]
+    async fn restore_options_that_cannot_be_read_are_a_specific_problem() {
+        let mut service = crashed_run_service();
+        service.id = 5;
+        service.config = Some(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap()
+            .encrypt_string(r#"{"port":"6379","password":"p"}"#)
+            .unwrap(),
+        );
+        // The capability lookup, then the configuration load's own reads.
+        let restore = control_plane_restore_service(vec![service; 4]);
+        let error = restore
+            .get_capabilities_with_identity(5)
+            .await
+            .expect_err("no engine can answer without Docker");
+        assert!(
+            matches!(
+                &error,
+                RestoreError::CapabilitiesUnavailable { service_id: 5, service_name, .. }
+                    if service_name == "cache"
+            ),
+            "{error}"
+        );
+        let rendered = error.to_string();
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code.as_u16(), 503);
+        assert!(rendered.contains("service 5 ('cache')"), "{rendered}");
+        assert!(rendered.contains("not available here"), "{rendered}");
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {
