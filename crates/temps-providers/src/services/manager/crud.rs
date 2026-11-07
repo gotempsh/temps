@@ -38,6 +38,16 @@ fn imported_container_name(
         .filter(|name| !name.is_empty())
 }
 
+/// Why an image change of a service on a worker node is refused: the
+/// engines replace containers on this server's Docker only.
+fn worker_image_change_refusal(service_name: &str, node_id: i32) -> String {
+    format!(
+        "Service '{service_name}' runs on worker node {node_id}, and an image change replaces \
+         its container on this server's Docker, where it has none. Nothing was changed; take a \
+         backup, create a service with the new image on the node and restore into it"
+    )
+}
+
 impl ExternalServiceManager {
     pub async fn get_service_by_name(
         &self,
@@ -695,6 +705,15 @@ impl ExternalServiceManager {
         self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
+        // The engines replace the container on this server's Docker. A
+        // service on a worker node has none here, and an engine that finds
+        // no container creates one: an empty server beside the real one.
+        if let Some(node_id) = service.node_id {
+            return Err(ExternalServiceError::UpgradeRejected {
+                id: service_id,
+                reason: worker_image_change_refusal(&service.name, node_id),
+            });
+        }
         self.ensure_unambiguous_service_name(&service).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
 
