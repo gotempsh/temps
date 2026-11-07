@@ -32,7 +32,7 @@ import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
 import {
   createManifestSetupTracker,
-  GITHUB_APP_WINDOW,
+  githubAppWindowName,
   githubWindowUsable,
   submitGitHubManifest,
 } from '@/lib/github-app-manifest'
@@ -126,6 +126,7 @@ export function GitProviderFlow({
   const [gitlabBaseUrl, setGitlabBaseUrl] = useState('https://gitlab.com')
   const [isCreatingApp, setIsCreatingApp] = useState(false)
   const [manifestSetup] = useState(() => createManifestSetupTracker<Window>())
+  const [githubWindowName] = useState(githubAppWindowName)
   // Leaving the flow stops a setup that is still waiting for its state.
   useEffect(() => () => manifestSetup.cancel(), [manifestSetup])
   const cancelManifestSetup = () => {
@@ -489,7 +490,7 @@ export function GitProviderFlow({
       // through. The manifest is posted into it once the server has issued the
       // state that GitHub has to hand back to the callback.
       const { attempt, window: githubWindow } = manifestSetup.begin(() =>
-        window.open('', GITHUB_APP_WINDOW)
+        window.open('', githubWindowName)
       )
       let manifestState: string
       try {
@@ -551,7 +552,7 @@ export function GitProviderFlow({
         default_events: ['push', 'pull_request'],
       }
 
-      submitGitHubManifest(manifestData, manifestState, GITHUB_APP_WINDOW)
+      submitGitHubManifest(manifestData, manifestState, githubWindowName)
       manifestSetup.manifestPosted()
       toast.success('Opening GitHub App creation page...', {
         description: 'Complete the setup in the new tab, then return here',
@@ -559,6 +560,8 @@ export function GitProviderFlow({
       })
 
       setTimeout(() => {
+        // A newer attempt started in the meantime owns the loading state.
+        if (!manifestSetup.isCurrent(attempt)) return
         setIsCreatingApp(false)
 
         // Start polling for new installations

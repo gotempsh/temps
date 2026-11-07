@@ -284,10 +284,12 @@ mod tests {
         use temps_entities::users;
         use temps_test_utils::TestDatabase;
 
-        // Needs Docker for the database. Past this point a broken setup fails
-        // the test instead of skipping it.
-        if !temps_test_utils::docker_available().await {
-            eprintln!("Skipping manifest state database test: Docker unavailable");
+        // Needs an existing database or Docker to start one. Past this point a
+        // broken setup fails the test instead of skipping it.
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping manifest state database test: no database and no Docker");
             return;
         }
         let test_db = TestDatabase::with_migrations().await.unwrap();

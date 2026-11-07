@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { installBrowserWindow } from '@/test/dom'
 import {
   createManifestSetupTracker,
+  GITHUB_APP_WINDOW,
+  githubAppWindowName,
   githubManifestAction,
   githubWindowUsable,
   submitGitHubManifest,
@@ -112,21 +114,36 @@ describe('createManifestSetupTracker', () => {
 
   test('Back and start again: the stale attempt cannot close the window the new one uses', () => {
     const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
-    const shared = fakeWindow()
-    const first = setup.begin(() => shared)
+    const first = setup.begin(() => fakeWindow())
     setup.cancel()
-    const second = setup.begin(() => shared)
+    // Back closed the first blank window, so starting again opens a new one.
+    const second = setup.begin(() => fakeWindow())
+    expect(first.window?.closed).toBe(true)
+    expect(second.window?.closed).toBe(false)
 
     // The first request answers (or fails) after the second attempt began.
     setup.closeWindowFor(first.attempt)
 
-    expect(shared.closed).toBe(false)
+    expect(second.window?.closed).toBe(false)
     expect(setup.isCurrent(first.attempt)).toBe(false)
     expect(setup.isCurrent(second.attempt)).toBe(true)
 
-    // The new attempt owns the window and may close it if it fails.
+    // The new attempt owns its window and may close it if it fails.
     setup.closeWindowFor(second.attempt)
-    expect(shared.closed).toBe(true)
+    expect(second.window?.closed).toBe(true)
+  })
+
+  test('a window shared by name is not closed by the attempt that lost it', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const shared = fakeWindow()
+    const first = setup.begin(() => shared)
+    // A second attempt starts without a cancel in between and reuses the window.
+    const second = setup.begin(() => shared)
+
+    setup.closeWindowFor(first.attempt)
+
+    expect(shared.closed).toBe(false)
+    expect(setup.isCurrent(second.attempt)).toBe(true)
   })
 
   test('a window with a manifest in it is never closed by a later failing attempt', () => {
@@ -156,6 +173,25 @@ describe('createManifestSetupTracker', () => {
     expect(fresh.closed).toBe(true)
   })
 
+  test('cancelling closes the blank window of the attempt in flight', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const first = setup.begin(() => fakeWindow())
+
+    setup.cancel()
+
+    expect(first.window?.closed).toBe(true)
+  })
+
+  test('cancelling leaves a window that already holds a manifest open', () => {
+    const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
+    const first = setup.begin(() => fakeWindow())
+    setup.manifestPosted()
+
+    setup.cancel()
+
+    expect(first.window?.closed).toBe(false)
+  })
+
   test('a blocked popup (null) is handed back as null', () => {
     const setup = createManifestSetupTracker<ReturnType<typeof fakeWindow>>()
 
@@ -174,5 +210,15 @@ describe('githubWindowUsable', () => {
 
   test('an open window can', () => {
     expect(githubWindowUsable({ closed: false })).toBe(true)
+  })
+})
+
+describe('githubAppWindowName', () => {
+  test('each flow instance gets its own window name', () => {
+    const first = githubAppWindowName()
+    const second = githubAppWindowName()
+
+    expect(first.startsWith(GITHUB_APP_WINDOW)).toBe(true)
+    expect(first).not.toBe(second)
   })
 })

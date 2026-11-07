@@ -1,8 +1,17 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/** Name of the browser window the GitHub App page opens in. */
+/** Prefix of the name of the browser window the GitHub App page opens in. */
 export const GITHUB_APP_WINDOW = 'temps-github-app'
+
+/**
+ * A window name for one flow instance. Windows are shared by name, so a flow
+ * that is opened again while an earlier one is still setting up must not reuse
+ * (and so be able to close) the earlier one's window.
+ */
+export function githubAppWindowName(): string {
+  return `${GITHUB_APP_WINDOW}-${Math.random().toString(36).slice(2, 10)}`
+}
 
 /**
  * Where the manifest is posted. `state` must be the one the server issued for
@@ -48,9 +57,13 @@ export function createManifestSetupTracker<W extends SetupWindow>() {
       github = openWindow()
       return { attempt: latest, window: github }
     },
-    /** Stop whatever attempt is in flight (Back, another method, leaving). */
+    /**
+     * Stop whatever attempt is in flight (Back, another method, leaving) and
+     * close the blank window it opened, unless a manifest is already in it.
+     */
     cancel(): void {
       current = 0
+      if (!holdsManifest) github?.close()
     },
     /** Whether the attempt may still post its manifest and watch for the app. */
     isCurrent: (attempt: number): boolean => attempt === current,
