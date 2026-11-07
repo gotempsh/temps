@@ -60,6 +60,12 @@ pub async fn probe_external_service_backup_capability(
     service: &external_services::Model,
     manager: &temps_providers::ExternalServiceManager,
 ) -> ExternalServiceBackupCapability {
+    // A standalone service on a worker node is backed up on that node, by a
+    // job (PostgreSQL) or its agent (the rest): what that writes does not
+    // depend on the tools in its image.
+    if let Some(capability) = worker_capability(service) {
+        return capability;
+    }
     let service_type = service.service_type.to_ascii_lowercase();
     if !requires_live_tool_probe(&service_type, &service.topology) {
         return classify_capability(service, ToolProbe::Available);
@@ -319,6 +325,57 @@ fn classify_capability(
     }
 }
 
+/// What a backup of a standalone service on a worker node writes: a logical
+/// dump taken on the node (or a bucket mirror for storage), whatever its
+/// image holds. `None` for a service the local engines back up.
+fn worker_capability(
+    service: &external_services::Model,
+) -> Option<ExternalServiceBackupCapability> {
+    use crate::engines::worker_agent::{self, WorkerServiceKind};
+    use temps_providers::externalsvc::worker_data::DumpEngine;
+    let node = worker_node(service)?;
+    let (engine, artifact) = if crate::engines::workload_job::takes_job_path(service) {
+        (
+            crate::engines::workload_job::ENGINE_KEY,
+            "logical_pg_dumpall",
+        )
+    } else if worker_agent::takes_agent_path(service) {
+        match worker_agent::worker_service_kind(&service.service_type)? {
+            WorkerServiceKind::Storage => {
+                return Some(compatible(worker_agent::ENGINE_KEY, "object_set", false))
+            }
+            WorkerServiceKind::Dump(DumpEngine::Mongodb) => {
+                (worker_agent::ENGINE_KEY, "mongodump_archive")
+            }
+            WorkerServiceKind::Dump(DumpEngine::Redis) => (worker_agent::ENGINE_KEY, "redis_rdb"),
+            WorkerServiceKind::Dump(DumpEngine::Mariadb) => {
+                (worker_agent::ENGINE_KEY, "logical_mariadb_dump")
+            }
+        }
+    } else {
+        return None;
+    };
+    Some(ExternalServiceBackupCapability {
+        cloud_backup_compatible: false,
+        verified: true,
+        wal_g_installed: false,
+        engine: engine.to_string(),
+        artifact: artifact.to_string(),
+        reason: Some(format!(
+            "Service {} runs on worker node {node}, where backups are logical dumps taken on the \
+             node and uploaded to the chosen S3 source; WAL-G repositories and point-in-time \
+             recovery are not available there yet.",
+            service.id
+        )),
+        remediation: Some(
+            "Backups and in-place restores work as they are. For WAL-G point-in-time recovery, \
+             run the service on a node that keeps its WAL-G archive (the control plane)."
+                .to_string(),
+        ),
+        recommended_image: None,
+    })
+}
+
 fn compatible(
     engine: &str,
     artifact: &str,
@@ -401,6 +458,38 @@ fn recommended_image(service_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// A worker's services report the dump their node writes, without a
+    /// probe; a storage service's mirror stays an object set.
+    #[test]
+    fn worker_services_report_the_dump_taken_on_their_node() {
+        let mut redis = service("redis", "standalone");
+        redis.node_id = Some(3);
+        let capability = worker_capability(&redis).expect("a worker service");
+        assert_eq!(capability.engine, "worker_agent");
+        assert_eq!(capability.artifact, "redis_rdb");
+        assert!(!capability.cloud_backup_compatible);
+        assert!(capability.verified);
+        assert!(capability
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("worker node 3"));
+
+        let mut postgres = service("postgres", "standalone");
+        postgres.node_id = Some(3);
+        let capability = worker_capability(&postgres).expect("a worker database");
+        assert_eq!(capability.engine, "postgres_workload_job");
+        assert_eq!(capability.artifact, "logical_pg_dumpall");
+
+        let mut storage = service("rustfs", "standalone");
+        storage.node_id = Some(3);
+        let capability = worker_capability(&storage).expect("a worker storage service");
+        assert!(capability.cloud_backup_compatible);
+        assert_eq!(capability.artifact, "object_set");
+
+        assert!(worker_capability(&service("redis", "standalone")).is_none());
+    }
+
     #[test]
     fn a_worker_probe_reads_the_tool_check_exit_code() {
         assert_eq!(tool_probe_from_exit_code(0), ToolProbe::Available);

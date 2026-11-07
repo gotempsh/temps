@@ -1061,6 +1061,19 @@ impl RestoreService {
         RestoreError,
     > {
         let service = self.load_service(service_id).await?;
+        let identity = RestoreServiceIdentity {
+            id: service.id,
+            name: service.name.clone(),
+            service_type: service.service_type.clone(),
+        };
+        // A service on a worker node is restored on that node, in place
+        // only (see `job_restore_supported` and `agent_restore_supported`).
+        // Its engine is not on this host, which may have no Docker at all.
+        if crate::engines::workload_job::takes_job_path(&service)
+            || crate::engines::worker_agent::takes_agent_path(&service)
+        {
+            return Ok((worker_restore_capabilities(), identity));
+        }
         let service_type =
             ServiceType::from_str(&service.service_type).map_err(|e| RestoreError::Validation {
                 message: format!("Invalid service type '{}': {}", service.service_type, e),
@@ -1085,11 +1098,6 @@ impl RestoreService {
             .map_err(|e| RestoreError::ExternalService {
                 reason: format!("Failed to read restore capabilities: {}", e),
             })?;
-        let identity = RestoreServiceIdentity {
-            id: service.id,
-            name: service.name,
-            service_type: service.service_type,
-        };
         Ok((capabilities, identity))
     }
 
@@ -1196,6 +1204,8 @@ impl RestoreService {
         // now, not after the run started.
         if crate::engines::workload_job::takes_job_path(&target) {
             job_restore_supported(&target, &backup_location, &mode)?;
+        } else if crate::engines::worker_agent::takes_agent_path(&target) {
+            agent_restore_supported(&target, &backup_location, &mode)?;
         }
 
         // Engine-compat guard: refuse to restore a postgres backup onto a
@@ -2027,6 +2037,20 @@ async fn run_restore_inner(
             &db,
             &enc,
             &plane,
+            run_id,
+            &backup_model,
+            &target_service,
+            &mode,
+        )
+        .await;
+    }
+    // The other services on a worker node are restored in place by the
+    // node's agent, with the engine's own restore.
+    if crate::engines::worker_agent::takes_agent_path(&target_service) {
+        return run_agent_restore(
+            &db,
+            &enc,
+            &mgr,
             run_id,
             &backup_model,
             &target_service,
@@ -3268,6 +3292,127 @@ fn job_restore_supported(
         });
     }
     Ok(())
+}
+
+/// What a service on a worker node can restore: in place, from its own
+/// backups. Restoring into a new service, or to a point in time, is refused
+/// explicitly at admission.
+fn worker_restore_capabilities() -> temps_providers::externalsvc::RestoreCapabilities {
+    temps_providers::externalsvc::RestoreCapabilities {
+        restore_in_place: true,
+        restore_to_new_service: false,
+        pitr: false,
+        earliest_pitr_time: None,
+        latest_pitr_time: None,
+    }
+}
+
+/// Refuse what a restore by a worker's agent cannot do: anything but in
+/// place, or a backup in another format than the worker backup writes.
+fn agent_restore_supported(
+    target: &temps_entities::external_services::Model,
+    backup_location: &str,
+    mode: &RestoreRequestMode,
+) -> Result<(), RestoreError> {
+    let node = crate::engines::workload_job::worker_node(target).unwrap_or_default();
+    if !matches!(mode, RestoreRequestMode::InPlace) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Service {} ('{}') runs on worker node {node}, where restores run on the node and \
+                 apply a backup in place; restore mode '{}' is not available there yet. Restore \
+                 in place, or restore into a new service on the control plane",
+                target.id,
+                target.name,
+                mode.as_str()
+            ),
+        });
+    }
+    if !crate::engines::worker_agent::restore_location_matches(target, backup_location) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Service {} ('{}', {}) runs on worker node {node}, where restores apply the \
+                 backups taken on the node; backup '{backup_location}' is in another format",
+                target.id, target.name, target.service_type
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Restore `backup` in place into `target`, a MongoDB, Redis, MariaDB or
+/// storage service on a worker node, through the node's agent, which runs the
+/// engine's own restore there.
+async fn run_agent_restore(
+    db: &Arc<DatabaseConnection>,
+    enc: &Arc<temps_core::EncryptionService>,
+    mgr: &Arc<ExternalServiceManager>,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+    mode: &RestoreRequestMode,
+) -> Result<Option<i32>, RestoreError> {
+    use crate::engines::{worker_agent, workload_job};
+    agent_restore_supported(target, &backup.s3_location, mode)?;
+    let node_id = workload_job::worker_node(target).ok_or_else(|| RestoreError::Internal {
+        reason: format!(
+            "restore run {run_id}: service {} left its worker node",
+            target.id
+        ),
+    })?;
+    // A dump carries its origin's users and passwords; the target's stored
+    // credentials stay right only for its own backups.
+    if backup.id > 0 {
+        let origin = workload_job::backup_origin(db.as_ref(), backup.id).await?;
+        if origin.is_some_and(|origin| origin != target.id) {
+            return Err(RestoreError::Validation {
+                message: format!(
+                    "Backup {} was taken from another service; restores of service {} on \
+                     worker node {node_id} apply only its own backups",
+                    backup.id, target.id
+                ),
+            });
+        }
+    }
+    let s3 = workload_job::s3_target(
+        db.as_ref(),
+        enc,
+        backup.s3_source_id,
+        target.id,
+        node_id,
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
+    let bucket_prefix = format!("s3://{}/", s3.bucket);
+    let location = backup
+        .s3_location
+        .strip_prefix(&bucket_prefix)
+        .unwrap_or(&backup.s3_location)
+        .trim_start_matches('/')
+        .to_string();
+
+    // The last safe point: once the node starts writing, the run can no
+    // longer be cancelled.
+    super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "restore").await?;
+    info!(
+        run_id,
+        service_id = target.id,
+        node_id,
+        backup_id = backup.id,
+        "restoring service {} in place on its node",
+        target.id
+    );
+    mgr.restore_worker_service(target.id, worker_agent::destination(&s3), location)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id} on node {node_id}: {e}"),
+        })?;
+    if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
+        warn!("Restore run {run_id}: recording the verify phase failed: {e}");
+    }
+    Ok(None)
 }
 
 /// Restore `backup` in place into `target`, a database on a worker node, by
@@ -6555,6 +6700,79 @@ mod tests {
         legacy.workload_mode = Default::default();
         assert!(takes_job_path(&legacy));
         assert!(takes_job_path(&worker_postgres()));
+    }
+
+    /// MongoDB, Redis, MariaDB and storage services on a worker restore in
+    /// place through the node's agent, from their own backup format; another
+    /// mode is refused explicitly, naming the node, never silently.
+    #[test]
+    fn a_worker_service_restores_only_in_place_from_its_own_format() {
+        let cases = [
+            (
+                "redis",
+                "external_services/redis/cache/2026/01/01/u/dump.rdb.gz",
+            ),
+            (
+                "mongodb",
+                "external_services/mongodb/cache/2026/01/01/u/dump.archive",
+            ),
+            (
+                "mariadb",
+                "external_services/mariadb/cache/2026/01/01/u/dump.sql.gz",
+            ),
+            ("rustfs", "external_services/s3/cache/u"),
+        ];
+        for (service_type, key) in cases {
+            let target = temps_entities::external_services::Model {
+                service_type: service_type.to_string(),
+                node_id: Some(4),
+                ..crashed_run_service()
+            };
+            assert!(crate::engines::worker_agent::takes_agent_path(&target));
+            assert!(
+                agent_restore_supported(&target, key, &RestoreRequestMode::InPlace).is_ok(),
+                "{service_type}"
+            );
+            let new_service = RestoreRequestMode::NewService {
+                name: "copy".into(),
+                parameter_overrides: serde_json::json!({}),
+            };
+            match agent_restore_supported(&target, key, &new_service) {
+                Err(RestoreError::Validation { message }) => {
+                    assert!(message.contains("worker node 4"), "{message}");
+                    assert!(message.contains("in place"), "{message}");
+                    assert!(message.contains("new_service"), "{message}");
+                }
+                other => panic!("{service_type}: expected a refusal, got {other:?}"),
+            }
+        }
+        let redis = temps_entities::external_services::Model {
+            node_id: Some(4),
+            ..crashed_run_service()
+        };
+        match agent_restore_supported(
+            &redis,
+            "external_services/mongodb/x/dump.archive",
+            &RestoreRequestMode::InPlace,
+        ) {
+            Err(RestoreError::Validation { message }) => {
+                assert!(message.contains("another format"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A service on a worker reports in-place restore only, without asking
+    /// this host's Docker; the local services keep their engines' answer.
+    #[test]
+    fn worker_services_restore_in_place_only() {
+        let capabilities = worker_restore_capabilities();
+        assert!(capabilities.restore_in_place);
+        assert!(!capabilities.restore_to_new_service);
+        assert!(!capabilities.pitr);
+        assert!(!crate::engines::worker_agent::takes_agent_path(
+            &crashed_run_service()
+        ));
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {
