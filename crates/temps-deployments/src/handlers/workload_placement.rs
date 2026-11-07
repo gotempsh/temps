@@ -213,6 +213,10 @@ fn audit_context(auth: &temps_auth::AuthContext, metadata: &RequestMetadata) -> 
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
+/// Get an environment's workload mode (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Environments default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "Workload Placement", get,
     path = "/internal/environments/{environment_id}/workload-mode",
@@ -243,6 +247,10 @@ pub async fn admin_get_environment_workload_mode(
     }))
 }
 
+/// Change an environment's workload mode (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Environments default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "Workload Placement", put,
     path = "/internal/environments/{environment_id}/workload-mode",
@@ -302,6 +310,10 @@ async fn isolation_response(
     })
 }
 
+/// Get an environment's workload isolation (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Environments default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "Workload Placement", get,
     path = "/internal/environments/{environment_id}/workload-isolation",
@@ -331,6 +343,10 @@ pub async fn admin_get_environment_workload_isolation(
     ))
 }
 
+/// Change an environment's workload isolation (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Environments default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "Workload Placement", put,
     path = "/internal/environments/{environment_id}/workload-isolation",
@@ -451,6 +467,10 @@ pub async fn admin_set_node_resources(
     Ok(Json(current.into()))
 }
 
+/// Explain where the workload plane would place an environment (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Environments default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "Workload Placement", get,
     path = "/internal/environments/{environment_id}/placement/explain",
@@ -509,6 +529,10 @@ pub async fn admin_explain_environment_placement(
     }))
 }
 
+/// Recommend node pinning for an environment (internal, operator-only)
+///
+/// An ADR-055 migration control for operators and the CLI; the console does
+/// not show it. Environments default to `legacy` and need no change here.
 #[utoipa::path(
     tag = "Workload Placement", get,
     path = "/internal/environments/{environment_id}/placement/recommendation",

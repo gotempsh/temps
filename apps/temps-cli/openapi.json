@@ -114891,6 +114891,7 @@
     },
     "/internal/environments/{environment_id}/placement/explain": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_explain_environment_placement",
         "parameters": [
           {
@@ -114970,6 +114971,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Explain where the workload plane would place an environment (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -114977,6 +114979,7 @@
     },
     "/internal/environments/{environment_id}/placement/recommendation": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_environment_pinning_recommendation",
         "parameters": [
           {
@@ -115070,6 +115073,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Recommend node pinning for an environment (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -115657,6 +115661,7 @@
     },
     "/internal/environments/{environment_id}/workload-isolation": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_get_environment_workload_isolation",
         "parameters": [
           {
@@ -115726,11 +115731,13 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Get an environment's workload isolation (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
       },
       "put": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_set_environment_workload_isolation",
         "parameters": [
           {
@@ -115820,6 +115827,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Change an environment's workload isolation (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
@@ -115827,6 +115835,7 @@
     },
     "/internal/environments/{environment_id}/workload-mode": {
       "get": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_get_environment_workload_mode",
         "parameters": [
           {
@@ -115896,11 +115905,13 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Get an environment's workload mode (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]
       },
       "put": {
+        "description": "An ADR-055 migration control for operators and the CLI; the console does\nnot show it. Environments default to `legacy` and need no change here.",
         "operationId": "admin_set_environment_workload_mode",
         "parameters": [
           {
@@ -115990,6 +116001,7 @@
             "bearer_auth": []
           }
         ],
+        "summary": "Change an environment's workload mode (internal, operator-only)",
         "tags": [
           "Workload Placement"
         ]

@@ -5688,12 +5688,24 @@ export const completeCiBuild = <ThrowOnError extends boolean = false>(options: O
     }
 });
 
+/**
+ * Explain where the workload plane would place an environment (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminExplainEnvironmentPlacement = <ThrowOnError extends boolean = false>(options: Options<AdminExplainEnvironmentPlacementData, ThrowOnError>): RequestResult<AdminExplainEnvironmentPlacementResponses, AdminExplainEnvironmentPlacementErrors, ThrowOnError> => (options.client ?? client).get<AdminExplainEnvironmentPlacementResponses, AdminExplainEnvironmentPlacementErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/environments/{environment_id}/placement/explain',
     ...options
 });
 
+/**
+ * Recommend node pinning for an environment (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminEnvironmentPinningRecommendation = <ThrowOnError extends boolean = false>(options: Options<AdminEnvironmentPinningRecommendationData, ThrowOnError>): RequestResult<AdminEnvironmentPinningRecommendationResponses, AdminEnvironmentPinningRecommendationErrors, ThrowOnError> => (options.client ?? client).get<AdminEnvironmentPinningRecommendationResponses, AdminEnvironmentPinningRecommendationErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/environments/{environment_id}/placement/recommendation',
@@ -5744,12 +5756,24 @@ export const adminAttachEnvironmentVolume = <ThrowOnError extends boolean = fals
     }
 });
 
+/**
+ * Get an environment's workload isolation (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminGetEnvironmentWorkloadIsolation = <ThrowOnError extends boolean = false>(options: Options<AdminGetEnvironmentWorkloadIsolationData, ThrowOnError>): RequestResult<AdminGetEnvironmentWorkloadIsolationResponses, AdminGetEnvironmentWorkloadIsolationErrors, ThrowOnError> => (options.client ?? client).get<AdminGetEnvironmentWorkloadIsolationResponses, AdminGetEnvironmentWorkloadIsolationErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/environments/{environment_id}/workload-isolation',
     ...options
 });
 
+/**
+ * Change an environment's workload isolation (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminSetEnvironmentWorkloadIsolation = <ThrowOnError extends boolean = false>(options: Options<AdminSetEnvironmentWorkloadIsolationData, ThrowOnError>): RequestResult<AdminSetEnvironmentWorkloadIsolationResponses, AdminSetEnvironmentWorkloadIsolationErrors, ThrowOnError> => (options.client ?? client).put<AdminSetEnvironmentWorkloadIsolationResponses, AdminSetEnvironmentWorkloadIsolationErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/environments/{environment_id}/workload-isolation',
@@ -5760,12 +5784,24 @@ export const adminSetEnvironmentWorkloadIsolation = <ThrowOnError extends boolea
     }
 });
 
+/**
+ * Get an environment's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminGetEnvironmentWorkloadMode = <ThrowOnError extends boolean = false>(options: Options<AdminGetEnvironmentWorkloadModeData, ThrowOnError>): RequestResult<AdminGetEnvironmentWorkloadModeResponses, AdminGetEnvironmentWorkloadModeErrors, ThrowOnError> => (options.client ?? client).get<AdminGetEnvironmentWorkloadModeResponses, AdminGetEnvironmentWorkloadModeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/environments/{environment_id}/workload-mode',
     ...options
 });
 
+/**
+ * Change an environment's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminSetEnvironmentWorkloadMode = <ThrowOnError extends boolean = false>(options: Options<AdminSetEnvironmentWorkloadModeData, ThrowOnError>): RequestResult<AdminSetEnvironmentWorkloadModeResponses, AdminSetEnvironmentWorkloadModeErrors, ThrowOnError> => (options.client ?? client).put<AdminSetEnvironmentWorkloadModeResponses, AdminSetEnvironmentWorkloadModeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/internal/environments/{environment_id}/workload-mode',
