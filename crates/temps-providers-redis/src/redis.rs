@@ -4548,6 +4548,36 @@ mod tests {
         assert_eq!(input.docker_image, DEFAULT_REDIS_IMAGE);
     }
 
+    /// The user docs that state the Redis default must name the image the
+    /// provider actually uses, or operators who copy it get a stale (and,
+    /// for the old `8-bookworm` tag, unpatched) server.
+    #[test]
+    fn docs_name_the_default_redis_image() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for page in [
+            "docs/howto/set-up-managed-services/page.mdx",
+            "docs/features/managed-services/page.mdx",
+            "docs/tutorials/deploy-with-database/page.mdx",
+        ] {
+            let text = std::fs::read_to_string(root.join(page))
+                .unwrap_or_else(|e| panic!("read {page}: {e}"));
+            let references: Vec<&str> = text
+                .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '(' | ')'))
+                .filter(|word| word.contains("redis-walg"))
+                .collect();
+            assert!(
+                !references.is_empty(),
+                "{page} no longer names the Redis image"
+            );
+            for reference in references {
+                assert_eq!(
+                    reference, DEFAULT_REDIS_IMAGE,
+                    "stale Redis image in {page}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_image_and_version_in_config() {
         // Test Redis configuration with docker_image field
