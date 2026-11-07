@@ -14,6 +14,7 @@ import type {
 } from '@/api/client/types.gen'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -1283,7 +1284,7 @@ export function ServiceRestore() {
           {needsTypedConfirm ? (
             <div className="space-y-2">
               <Label htmlFor="confirm-name">
-                Type <code>{service.name}</code> to confirm
+                Type <ConfirmNameBadge value={service.name} /> to confirm
               </Label>
               <Input
                 id="confirm-name"
