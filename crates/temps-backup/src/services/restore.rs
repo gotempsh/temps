@@ -829,14 +829,10 @@ impl RestoreService {
         // (the backup's recorded producer ids), not by name: a service that
         // was deleted and re-created under the same name is a different
         // service.
-        let origin_service_name = backup_row
-            .as_ref()
-            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
-            .and_then(|v| {
-                v.get("service_name")
-                    .and_then(|s| s.as_str())
-                    .map(String::from)
-            });
+        let origin_service_name = match backup_row.as_ref() {
+            Some(backup) => backup_origin_service_name(self.db.as_ref(), backup).await,
+            None => None,
+        };
         let origin_binding = self
             .resolve_origin_binding(target_service_id, &selector)
             .await?;
@@ -931,77 +927,92 @@ impl RestoreService {
         let mut steps: Vec<String> = Vec::new();
         let mut destructive = false;
 
-        match engine_lower.as_str() {
-            "postgres" => {
-                build_postgres_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            "redis" => {
-                build_redis_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            "mongodb" => {
-                if let Some(warning) = build_mongodb_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                ) {
-                    warnings.push(warning.into());
+        // A service on a worker node is restored there, by a job or its
+        // agent: describe what actually runs, and refuse what it cannot do,
+        // as `start_restore` will.
+        if let Some(worker) = worker_restore_plan(
+            &target,
+            &resolved_location,
+            &mode,
+            &container_name,
+            origin_binding.cross_service,
+        ) {
+            steps = worker.steps;
+            destructive = true;
+            errors.extend(worker.refusal);
+        } else {
+            match engine_lower.as_str() {
+                "postgres" => {
+                    build_postgres_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
                 }
-            }
-            "mariadb" => {
-                build_mariadb_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            "s3" | "rustfs" | "blob" | "minio" => {
-                build_object_store_steps(
-                    strategy,
-                    &mode,
-                    &target.name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            other => {
-                errors.push(format!(
+                "redis" => {
+                    build_redis_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
+                }
+                "mongodb" => {
+                    if let Some(warning) = build_mongodb_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    ) {
+                        warnings.push(warning.into());
+                    }
+                }
+                "mariadb" => {
+                    build_mariadb_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
+                }
+                "s3" | "rustfs" | "blob" | "minio" => {
+                    build_object_store_steps(
+                        strategy,
+                        &mode,
+                        &target.name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
+                }
+                other => {
+                    errors.push(format!(
                     "Restore plan preview is not implemented for engine '{}'. The orchestrator may still run, but the step-by-step preview below will be generic.",
                     other
                 ));
-                steps.push(format!("Target: {}", container_name));
-                steps.push(format!(
-                    "Strategy: {} (details depend on the '{}' engine)",
-                    strategy, other
-                ));
-                steps.push("Dispatch restore via the engine's trait implementation".into());
-                if matches!(mode, RestoreRequestMode::InPlace) {
-                    destructive = true;
+                    steps.push(format!("Target: {}", container_name));
+                    steps.push(format!(
+                        "Strategy: {} (details depend on the '{}' engine)",
+                        strategy, other
+                    ));
+                    steps.push("Dispatch restore via the engine's trait implementation".into());
+                    if matches!(mode, RestoreRequestMode::InPlace) {
+                        destructive = true;
+                    }
                 }
             }
         }
@@ -1788,6 +1799,100 @@ async fn backup_origin_service_id(
                 .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
                 .and_then(|id| i32::try_from(id).ok())
         })
+}
+
+/// The name of the service that produced `backup`, for a restore plan: the
+/// producer the restore itself binds to ([`backup_origin_service_id`]), else
+/// the name its metadata recorded. `None` when neither is known.
+async fn backup_origin_service_name(
+    db: &DatabaseConnection,
+    backup: &temps_entities::backups::Model,
+) -> Option<String> {
+    if let Some(service_id) = backup_origin_service_id(db, backup).await {
+        if let Ok(Some(service)) = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(db)
+            .await
+        {
+            return Some(service.name);
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(&backup.metadata)
+        .ok()
+        .and_then(|v| {
+            v.get("service_name")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
+}
+
+/// What restoring into a service on a worker node runs, for a restore plan.
+struct WorkerRestorePlan {
+    steps: Vec<String>,
+    /// Why `start_restore` would refuse it.
+    refusal: Option<String>,
+}
+
+/// The plan of a restore into `target` when it runs on a worker node: a job
+/// on the node (PostgreSQL) or the node's agent (the other engines), both
+/// reached through the agent. `None` for a target on the control plane.
+fn worker_restore_plan(
+    target: &temps_entities::external_services::Model,
+    location: &str,
+    mode: &RestoreRequestMode,
+    container: &str,
+    cross_service: bool,
+) -> Option<WorkerRestorePlan> {
+    let node = crate::engines::workload_job::worker_node(target)?;
+    if crate::engines::workload_job::takes_job_path(target) {
+        let mut steps = vec![
+            format!(
+                "Run a restore job on worker node {node}, through its agent, next to database \
+                 container {container}"
+            ),
+            format!(
+                "The job reads {location} from S3 and checks that it decompresses completely; \
+                 nothing is applied if it does not"
+            ),
+        ];
+        if cross_service {
+            steps.push(
+                "Give the job's login the password the dump restores, before applying it".into(),
+            );
+        }
+        steps.push(format!(
+            "Apply the dump in place into {container} with psql, stopping at the first error \
+             (existing data is overwritten)"
+        ));
+        if cross_service {
+            steps.push(
+                "Update the service's stored credentials to the restored login's password".into(),
+            );
+        }
+        return Some(WorkerRestorePlan {
+            steps,
+            refusal: job_restore_supported(target, location, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
+    if crate::engines::worker_agent::takes_agent_path(target) {
+        return Some(WorkerRestorePlan {
+            steps: vec![
+                format!(
+                    "Restore on worker node {node}, through its agent, into container {container}"
+                ),
+                format!(
+                    "The agent applies {location} in place with {}'s own restore (existing data \
+                     is overwritten)",
+                    target.service_type
+                ),
+            ],
+            refusal: agent_restore_supported(target, location, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
+    None
 }
 
 /// The credentials a cross-service restore of `backup` leaves in `target`'s
@@ -7051,6 +7156,115 @@ mod tests {
             None
         )
         .await
+        .is_none());
+    }
+
+    /// A restore plan names the service that produced the backup from its
+    /// producer link, the origin the restore itself binds to, even when the
+    /// backup's metadata records no name. Before, the plan said "an unknown
+    /// service" for a backup that was linked to a live one.
+    #[tokio::test]
+    async fn a_plan_names_the_backups_producer_from_its_link() {
+        let mut origin = crashed_run_service();
+        origin.id = 5;
+        origin.name = "orders-old".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_producer_row(1, 4, 5)]])
+            .append_query_results(vec![vec![origin]])
+            .into_connection();
+        let mut backup = tracked_backup(4);
+        backup.metadata = "{}".to_string();
+        assert_eq!(
+            backup_origin_service_name(&db, &backup).await.as_deref(),
+            Some("orders-old")
+        );
+
+        // No producer: the name the metadata recorded, if any.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<temps_entities::external_service_backups::Model>::new(),
+            ])
+            .into_connection();
+        backup.metadata = r#"{"service_name":"orders-gone"}"#.to_string();
+        assert_eq!(
+            backup_origin_service_name(&db, &backup).await.as_deref(),
+            Some("orders-gone")
+        );
+    }
+
+    /// The plan of a restore into a worker's service describes what runs
+    /// there (a job or the agent on the node), never the control plane's
+    /// host-side steps, and refuses what `start_restore` refuses.
+    #[test]
+    fn a_worker_restore_plan_describes_the_job_on_its_node() {
+        let mut database = crashed_run_service();
+        database.service_type = "postgres".to_string();
+        database.name = "orders".to_string();
+        database.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &database,
+            "external_services/postgres/orders-old/u/dump.sql.gz",
+            &RestoreRequestMode::InPlace,
+            "postgres-orders",
+            true,
+        )
+        .expect("a worker database");
+        let text = plan.steps.join("\n");
+        assert!(
+            text.contains("restore job on worker node 2, through its agent"),
+            "{text}"
+        );
+        assert!(text.contains("password the dump restores"), "{text}");
+        assert!(
+            !text.contains("on the host") && !text.contains("sidecar"),
+            "{text}"
+        );
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+
+        // What the job cannot apply is refused in the plan as at start.
+        let walg = worker_restore_plan(
+            &database,
+            "s3://backups/external_services/postgres/orders/walg",
+            &RestoreRequestMode::InPlace,
+            "postgres-orders",
+            false,
+        )
+        .expect("a worker database");
+        assert!(walg.refusal.is_some_and(|r| r.contains("worker node 2")));
+        let copy = worker_restore_plan(
+            &database,
+            "external_services/postgres/orders/u/dump.sql.gz",
+            &RestoreRequestMode::NewService {
+                name: "orders-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "postgres-orders",
+            false,
+        )
+        .expect("a worker database");
+        assert!(copy.refusal.is_some_and(|r| r.contains("new_service")));
+
+        let mut cache = crashed_run_service();
+        cache.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &cache,
+            "external_services/redis/cache/u/dump.rdb.gz",
+            &RestoreRequestMode::InPlace,
+            "redis-cache",
+            false,
+        )
+        .expect("a worker cache");
+        assert!(plan.steps[0].contains("worker node 2, through its agent"));
+
+        // A control-plane target keeps the control plane's steps.
+        database.node_id = None;
+        assert!(worker_restore_plan(
+            &database,
+            "external_services/postgres/orders/u/dump.sql.gz",
+            &RestoreRequestMode::InPlace,
+            "postgres-orders",
+            false,
+        )
         .is_none());
     }
 
