@@ -16,6 +16,28 @@ fn agent_worker_threads(available_parallelism: usize) -> usize {
     available_parallelism.clamp(1, MAX_AGENT_WORKER_THREADS)
 }
 
+/// See [`AgentCommand::labels_settings`]. `agent.json` is reloaded, and
+/// written next to, only when it is this agent's own config: it parsed, and
+/// any `--node-id` names the same node. An agent configured by flags never
+/// takes another node's labels from a stale file.
+fn labels_settings_for(
+    pinned: bool,
+    flag_node_id: Option<i32>,
+    saved_node_id: Option<i32>,
+    data_dir: PathBuf,
+) -> temps_node_agent::labels::LabelsSettings {
+    use temps_node_agent::labels::{LabelsOrigin, LabelsSettings};
+    let own_file = saved_node_id.is_some_and(|saved| flag_node_id.is_none_or(|flag| flag == saved));
+    LabelsSettings {
+        origin: if pinned {
+            LabelsOrigin::Override
+        } else {
+            LabelsOrigin::AgentJson
+        },
+        data_dir: own_file.then_some(data_dir),
+    }
+}
+
 /// Resolve the agent data directory (`TEMPS_DATA_DIR` env var, or
 /// `~/.temps`, or `./` as a last resort). Used for the saved agent
 /// config and the per-node DNS resolver snapshot (`<dir>/dns/zone.json`).
@@ -87,7 +109,8 @@ pub struct AgentCommand {
     pub node_id: Option<i32>,
 
     /// Node labels for scheduling (comma-separated key=value pairs, e.g., "region=us-east,gpu=true").
-    /// Overrides labels from saved config. Sent in every heartbeat.
+    /// Overrides labels from saved config for the life of the process: `temps
+    /// agent labels set` changes are then ignored. Sent in every heartbeat.
     #[arg(long, env = "TEMPS_NODE_LABELS", value_delimiter = ',')]
     pub labels: Vec<String>,
 
@@ -153,6 +176,10 @@ pub enum AgentSubcommand {
     /// Choose whether this worker takes public traffic (ADR 058 D7)
     #[command(subcommand)]
     Ingress(super::agent_ingress::AgentIngressCommand),
+    /// Show or change this worker's scheduling labels, such as
+    /// `temps.sh/role=dedicated` (ADR-091)
+    #[command(subcommand)]
+    Labels(super::agent_labels::AgentLabelsCommand),
 }
 
 impl AgentCommand {
@@ -160,6 +187,7 @@ impl AgentCommand {
         match &self.service {
             Some(AgentSubcommand::Service(command)) => return command.execute(),
             Some(AgentSubcommand::Ingress(command)) => return command.execute(),
+            Some(AgentSubcommand::Labels(command)) => return command.execute(),
             None => {}
         }
         // A Mac worker (ADR 090): pin the Docker app `temps join` recorded
@@ -182,6 +210,7 @@ impl AgentCommand {
         rt.block_on(async move {
             let disable_state_stream = self.disable_state_stream;
             let config = self.resolve_config()?;
+            let labels = self.labels_settings();
 
             #[cfg(target_os = "macos")]
             if let Some(worker) = mac_worker.clone() {
@@ -580,6 +609,7 @@ impl AgentCommand {
                 docker_socket_grant,
                 temps_node_agent::server::AgentServerOptions {
                     state_stream: !disable_state_stream,
+                    labels,
                     engines: temps_node_agent::server::AgentEngines {
                         service_runtime: Arc::new(
                             temps_providers::node_runtime::ProvidersNodeRuntime,
@@ -811,6 +841,20 @@ impl AgentCommand {
         Ok(config)
     }
 
+    /// ADR-091: labels from `--labels`/`TEMPS_NODE_LABELS` are pinned;
+    /// labels from a saved `agent.json` are reloaded from it while the agent
+    /// runs, and the labels the control plane accepts are recorded next to
+    /// it for `temps agent labels`.
+    fn labels_settings(&self) -> temps_node_agent::labels::LabelsSettings {
+        let saved_node_id = self.load_saved_config().map(|config| config.node_id);
+        labels_settings_for(
+            !self.labels.is_empty(),
+            self.node_id,
+            saved_node_id,
+            agent_data_dir(),
+        )
+    }
+
     /// Try to load `agent.json` from the configured agent data directory.
     /// Returns None if not found or unparsable.
     fn load_saved_config(&self) -> Option<temps_node_agent::AgentConfig> {
@@ -924,6 +968,31 @@ async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_reload_only_from_this_agents_own_agent_json() {
+        use temps_node_agent::labels::LabelsOrigin;
+        let dir = PathBuf::from("/root/.temps");
+        let own = labels_settings_for(false, None, Some(4), dir.clone());
+        assert_eq!(own.origin, LabelsOrigin::AgentJson);
+        assert_eq!(own.data_dir.as_deref(), Some(dir.as_path()));
+        assert!(labels_settings_for(false, Some(4), Some(4), dir.clone())
+            .data_dir
+            .is_some());
+        // Configured by flags for another node, or the file did not parse.
+        assert!(labels_settings_for(false, Some(9), Some(4), dir.clone())
+            .data_dir
+            .is_none());
+        assert!(labels_settings_for(false, None, None, dir.clone())
+            .data_dir
+            .is_none());
+        let pinned = labels_settings_for(true, None, Some(4), dir);
+        assert_eq!(pinned.origin, LabelsOrigin::Override);
+        assert!(
+            pinned.data_dir.is_some(),
+            "a pinned agent still records its labels"
+        );
+    }
 
     #[test]
     fn agent_runtime_uses_available_threads_on_small_hosts() {

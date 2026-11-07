@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod agent_ingress;
+pub mod agent_labels;
 pub mod agent_launchd;
 pub mod agent_service;
 pub mod api_key;

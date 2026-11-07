@@ -165,7 +165,7 @@ fn path_is_safe(owner: u32, group: u32, mode: u32, me: u32) -> bool {
 /// The data directory an installed plist runs the agent with, so uninstall
 /// and status act on the worker that was installed, not on the current
 /// shell's default.
-fn installed_data_dir(plist: &str) -> Option<PathBuf> {
+pub(super) fn installed_data_dir(plist: &str) -> Option<PathBuf> {
     let after_key = plist.split("<key>TEMPS_DATA_DIR</key>").nth(1)?;
     let value = after_key
         .split("<string>")
@@ -571,8 +571,9 @@ pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
     if uid() == 0 {
         return ServiceAfterJoin::NotRestarted {
             service: launch_agent(&home, true),
-            reason: "this join ran as root, so it saved root's agent config, and cannot reach \
-                     a LaunchAgent, which runs as you. On a Mac, run `temps join` without sudo"
+            reason: "this ran as root, so it used root's agent config, and cannot reach a \
+                     LaunchAgent, which runs as you. On a Mac, run `temps join` and `temps agent \
+                     labels` without sudo"
                 .to_string(),
             fix: None,
         };
@@ -599,8 +600,8 @@ pub fn restart_after_join(data_dir: &Path) -> ServiceAfterJoin {
         installed => {
             return refuse(
                 format!(
-                    "it runs the agent from {}, but this join saved its config in {}, so join \
-                     left it alone and it keeps the old config",
+                    "it runs the agent from {}, but the config being applied is in {}, so it \
+                     was left alone and it keeps the old config",
                     installed.map_or_else(
                         || "an unknown directory".to_string(),
                         |dir| dir.display().to_string()

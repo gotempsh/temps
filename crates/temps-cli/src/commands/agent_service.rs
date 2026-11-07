@@ -395,15 +395,63 @@ enum TrustedPath {
 fn first_unsafe_component(
     path: &Path,
     lookup: impl Fn(&Path) -> std::io::Result<(u32, u32, u32)>,
+    problem: fn(u32, u32, u32) -> Option<UnsafeOwnership>,
 ) -> anyhow::Result<Option<(PathBuf, UnsafeOwnership)>> {
     for component in path.ancestors() {
         let (uid, gid, mode) = lookup(component).map_err(|error| {
             anyhow::anyhow!("could not check who owns {}: {error}", component.display())
         })?;
-        if let Some(problem) = ownership_problem(uid, gid, mode) {
+        if let Some(problem) = problem(uid, gid, mode) {
             return Ok(Some((component.to_path_buf(), problem)));
         }
     }
+    Ok(None)
+}
+
+/// For a command run as root that edits the agent's files (`temps agent
+/// labels`, `temps agent ingress`): the first of `dir` (canonical) and its
+/// ancestors that someone other than root could change, and why. Whoever
+/// controls such a directory could swap files under a root process, turning
+/// its reads and writes into theirs.
+#[cfg(unix)]
+pub(super) fn not_root_controlled(dir: &Path) -> anyhow::Result<Option<String>> {
+    use std::os::unix::fs::MetadataExt;
+    let lookup =
+        |path: &Path| std::fs::metadata(path).map(|meta| (meta.uid(), meta.gid(), meta.mode()));
+    Ok(
+        first_unsafe_component(dir, lookup, edit_ownership_problem)?.map(|(path, problem)| {
+            let why = match problem {
+                UnsafeOwnership::NotOwnedByRoot { uid } => {
+                    format!("is owned by uid {uid}, not root")
+                }
+                UnsafeOwnership::WritableByGroup { gid, mode } => {
+                    format!("is writable by group {gid} (mode {mode:04o})")
+                }
+                UnsafeOwnership::WritableByOthers { mode } => {
+                    format!("is writable by everyone (mode {mode:04o})")
+                }
+            };
+            format!("{} {why}", path.display())
+        }),
+    )
+}
+
+/// [`ownership_problem`] for a root command that renames files into a
+/// directory: any group-writable entry is refused, root's group included,
+/// since a member of group 0 need not be root and could swap the file
+/// between the check and the rename.
+fn edit_ownership_problem(uid: u32, gid: u32, mode: u32) -> Option<UnsafeOwnership> {
+    match ownership_problem(uid, gid, mode) {
+        None if mode & 0o020 != 0 => Some(UnsafeOwnership::WritableByGroup {
+            gid,
+            mode: mode & 0o7777,
+        }),
+        found => found,
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn not_root_controlled(_dir: &Path) -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
@@ -473,7 +521,7 @@ fn require_root_owned(
     path: &Path,
     lookup: impl Fn(&Path) -> std::io::Result<(u32, u32, u32)>,
 ) -> anyhow::Result<()> {
-    match first_unsafe_component(path, lookup)? {
+    match first_unsafe_component(path, lookup, ownership_problem)? {
         Some((unsafe_path, problem)) => Err(unsafe_path_error(
             action,
             role,
@@ -700,7 +748,7 @@ fn restart_unit_after_join(data_dir: &Path) -> ServiceAfterJoin {
     // SAFETY: geteuid has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } != 0 {
         return refuse(
-            format!("this join did not run as root, and only root restarts {SERVICE_NAME}"),
+            format!("this did not run as root, and only root restarts {SERVICE_NAME}"),
             Some(service.restart.clone()),
         );
     }
@@ -801,8 +849,8 @@ fn classify_unit(unit: &str, data_dir: &Path) -> UnitFile {
         Some(installed) if installed == data_dir => {}
         installed => {
             return UnitFile::Refused(format!(
-                "it runs the agent from {}, but this join saved its config in {}, so join left \
-                 it alone and it keeps the old config",
+                "it runs the agent from {}, but the config being applied is in {}, so it was \
+                 left alone and it keeps the old config",
                 installed.map_or_else(
                     || "an unknown directory".to_string(),
                     |dir| dir.display().to_string()
@@ -1071,6 +1119,11 @@ pub(super) fn stays_up(mut up: impl FnMut() -> bool, window: Duration, interval:
         }
         std::thread::sleep(interval);
     }
+}
+
+/// A read-only `systemctl` query, bounded by [`QUERY_TIMEOUT`].
+pub(super) fn systemctl_query(args: &[&str]) -> Result<String, String> {
+    systemctl_output(args, QUERY_TIMEOUT)
 }
 
 /// Run `systemctl args`, killed after `timeout`, and return its stdout.
@@ -1484,6 +1537,18 @@ mod tests {
     #[test]
     fn only_root_owned_paths_writable_by_root_alone_are_trusted() {
         assert_eq!(ownership_problem(0, 0, 0o100755), None);
+        // A root edit (`temps agent labels`) trusts no group-writable
+        // directory, not even root's group; the service install still does.
+        assert_eq!(ownership_problem(0, 0, 0o040775), None);
+        assert_eq!(
+            edit_ownership_problem(0, 0, 0o040775),
+            Some(UnsafeOwnership::WritableByGroup {
+                gid: 0,
+                mode: 0o0775
+            })
+        );
+        assert_eq!(edit_ownership_problem(0, 0, 0o040755), None);
+        assert!(edit_ownership_problem(1000, 0, 0o040700).is_some());
         assert_eq!(ownership_problem(0, 0, 0o040700), None);
         assert_eq!(
             ownership_problem(1000, 0, 0o100755),

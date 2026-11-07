@@ -495,6 +495,7 @@ fn spawn_heartbeat_loop(
     docker_socket_grant: DockerSocketGrant,
     wakers: HeartbeatWakers,
     resolver_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    labels_settings: crate::labels::LabelsSettings,
 ) {
     let HeartbeatWakers {
         mesh_listener,
@@ -504,7 +505,16 @@ fn spawn_heartbeat_loop(
     let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
     let token = config.token.clone();
-    let labels = config.labels.clone();
+    // ADR-091: labels saved in agent.json are reloaded while the agent runs
+    // (`temps agent labels set`); a change wakes the heartbeat. `kept_sender`
+    // holds the channel open when nothing reloads.
+    let enrollment = crate::labels::Enrollment {
+        node_id: config.node_id,
+        control_plane_url: config.control_plane_url.clone(),
+    };
+    let (mut labels_rx, kept_sender) =
+        crate::labels::watch_labels(&labels_settings, config.labels.clone(), enrollment.clone());
+    let mut accepted_labels = crate::labels::AcceptedLabels::new(labels_settings, enrollment);
     // ADR 045: advertise this host's own grant so the control plane can gate
     // placement up front instead of discovering mid-deploy that the node would
     // have deployed the project without the socket. Snapshotted once at
@@ -513,6 +523,7 @@ fn spawn_heartbeat_loop(
     let docker_socket_projects = docker_socket_grant.to_vec();
 
     tokio::spawn(async move {
+        let _kept_sender = kept_sender;
         // Strict TLS — the worker→control-plane heartbeat carries the
         // node's auth token. A MitM with a self-signed cert here would
         // capture the token and impersonate this worker. There is no
@@ -566,6 +577,17 @@ fn spawn_heartbeat_loop(
                         mesh_listener = ?mesh_listener.get(),
                         "the agent API's mesh listener changed; sending a heartbeat now"
                     );
+                }
+                // ADR-091: labels changed in agent.json are reported at
+                // once, so `temps agent labels set` can confirm them.
+                Ok(()) = labels_rx.changed() => {
+                    tracing::info!(node_id, "labels changed; sending a heartbeat now");
+                    if let Some(last) = last_beat {
+                        let gap = last.elapsed();
+                        if gap < EARLY_BEAT_MIN_GAP {
+                            tokio::time::sleep(EARLY_BEAT_MIN_GAP - gap).await;
+                        }
+                    }
                 }
                 // ADR-055 §7: a changed instance report is sent early rather
                 // than up to 30 s late, but never more often than once per
@@ -661,6 +683,9 @@ fn spawn_heartbeat_loop(
                 known_platform
             };
 
+            let current = labels_rx.borrow_and_update().clone();
+            accepted_labels.sending(&current);
+            let labels = current.labels;
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,
@@ -894,6 +919,7 @@ fn spawn_heartbeat_loop(
                             addresses_sent = Some(addresses);
                             beats_since_addresses_sent = 0;
                         }
+                        accepted_labels.accepted(&labels).await;
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
                     }
@@ -1150,6 +1176,9 @@ pub struct AgentServerOptions {
     /// before; `temps agent --disable-state-stream` is the rollback.
     pub state_stream: bool,
     pub engines: AgentEngines,
+    /// Where the reported labels come from, and whether they are reloaded
+    /// from `agent.json` (ADR-091). The default reloads nothing.
+    pub labels: crate::labels::LabelsSettings,
 }
 
 impl AgentServerOptions {
@@ -1157,6 +1186,7 @@ impl AgentServerOptions {
         Self {
             state_stream: true,
             engines,
+            labels: crate::labels::LabelsSettings::default(),
         }
     }
 }
@@ -1301,6 +1331,7 @@ pub async fn start_agent_server_with(
             node_runtime,
         },
         network.overlay_bridge_address.clone(),
+        options.labels.clone(),
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -1544,6 +1575,101 @@ pub(crate) mod tests {
             join_url: None,
             overlay_network_name: None,
         }
+    }
+
+    /// ADR-091 end to end on the agent side: `temps agent labels set`
+    /// rewrites agent.json, and the running heartbeat loop reports the new
+    /// labels to the control plane without a restart, then records them.
+    #[tokio::test]
+    async fn a_label_change_in_agent_json_reaches_the_control_plane_without_a_restart() {
+        let beats: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorded = beats.clone();
+        let control_plane = Router::new().route(
+            "/api/internal/nodes/{id}/heartbeat",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({"status": "ok"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, control_plane).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_json = dir.path().join("agent.json");
+        let saved = |labels: &str| {
+            format!(r#"{{"node_id":1,"control_plane_url":"{url}","labels":{labels}}}"#)
+        };
+        std::fs::write(&agent_json, saved(r#"{"zone":"a"}"#)).unwrap();
+        let mut config = test_agent_config(false);
+        config.node_id = 1;
+        config.control_plane_url = url.clone();
+        config.labels = serde_json::json!({"zone": "a"});
+        // Nothing answers here: the inventory listing fails and is skipped.
+        let deployer = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "worker-1".into(),
+            )
+            .unwrap(),
+        );
+        spawn_heartbeat_loop(
+            &config,
+            deployer,
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            Default::default(),
+            DockerSocketGrant::default(),
+            HeartbeatWakers {
+                mesh_listener: Default::default(),
+                node_runtime: None,
+            },
+            Default::default(),
+            crate::labels::LabelsSettings {
+                origin: crate::labels::LabelsOrigin::AgentJson,
+                data_dir: Some(dir.path().to_path_buf()),
+            },
+        );
+
+        let accepted = |labels: serde_json::Value| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                tokio::time::timeout(Duration::from_secs(25), async {
+                    loop {
+                        if crate::labels::read_status(&dir)
+                            .is_some_and(|status| status.labels == labels)
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .expect("the control plane accepted these labels and the agent recorded them")
+            }
+        };
+        accepted(serde_json::json!({"zone": "a"})).await;
+        let first_beats = beats.lock().unwrap().len();
+
+        std::fs::write(
+            &agent_json,
+            saved(r#"{"zone":"a","temps.sh/role":"dedicated"}"#),
+        )
+        .unwrap();
+        let wanted = serde_json::json!({"zone": "a", "temps.sh/role": "dedicated"});
+        accepted(wanted.clone()).await;
+        let beats = beats.lock().unwrap();
+        // Sent early, not at the next 30-second tick.
+        assert!(beats.len() > first_beats);
+        assert_eq!(beats.last().unwrap()["labels"], wanted);
+        let status = crate::labels::read_status(dir.path()).unwrap();
+        assert_eq!(status.origin, crate::labels::LabelsOrigin::AgentJson);
+        assert_eq!(status.node_id, 1);
+        assert_eq!(status.control_plane_url.as_deref(), Some(url.as_str()));
     }
 
     #[test]

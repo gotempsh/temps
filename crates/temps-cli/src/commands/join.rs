@@ -60,7 +60,9 @@ pub struct JoinCommand {
     #[arg(long, env = "TEMPS_RELAY_URL")]
     pub relay_url: Option<String>,
 
-    /// Labels for node scheduling (key=value pairs)
+    /// Labels for node scheduling (key=value pairs). `temps.sh/role=builder`
+    /// makes a build-only node, `temps.sh/role=dedicated` a dedicated one.
+    /// Change them later with `temps agent labels set`
     #[arg(long, value_delimiter = ',')]
     pub labels: Vec<String>,
 
@@ -987,7 +989,12 @@ impl JoinCommand {
     }
 
     async fn run(mut self) -> anyhow::Result<()> {
-        let labels = self.parse_labels();
+        let labels = self.parse_labels()?;
+        // Refused before anything is registered: a root join must not save
+        // its config where another user could redirect it.
+        super::agent_labels::check_join_target(
+            &crate::commands::agent::agent_data_dir().join("agent.json"),
+        )?;
 
         let node_name = self
             .name
@@ -1164,14 +1171,10 @@ impl JoinCommand {
 
         let config_path = temps_dir.join("agent.json");
         let json = serde_json::to_string_pretty(config)?;
-        std::fs::write(&config_path, &json)?;
-
-        // Set file permissions to 0600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        // Owner-only (0600), renamed into place under the lock `temps agent
+        // labels` and `temps agent ingress` take, so an edit overlapping
+        // this join cannot write the old enrollment back over the new one.
+        super::agent_labels::replace_agent_config(&config_path, &json)?;
 
         println!("Agent config saved to {}", config_path.display());
         Ok(())
@@ -2219,17 +2222,13 @@ impl JoinCommand {
         }
     }
 
-    fn parse_labels(&self) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-        for label in &self.labels {
-            if let Some((key, value)) = label.split_once('=') {
-                map.insert(
-                    key.to_string(),
-                    serde_json::Value::String(value.to_string()),
-                );
-            }
-        }
-        serde_json::Value::Object(map)
+    /// `--labels`, checked by the rules `temps agent labels set` applies
+    /// (ADR-091 D2) before anything is registered, so a typo such as
+    /// `temps.sh/role=dedicatd` stops the join instead of doing nothing.
+    fn parse_labels(&self) -> anyhow::Result<serde_json::Value> {
+        let labels = temps_core::node_labels::parse_labels(&self.labels)
+            .map_err(|error| anyhow::anyhow!("--labels: {error}"))?;
+        Ok(temps_core::node_labels::to_json(&labels))
     }
 }
 

@@ -108,6 +108,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [088](./088-workers-join-with-no-public-address.md) | Workers Join With No Public Address | Proposed |  |
 | [089](./089-project-edge-rules.md) | Project Edge Rules — the Engine for the Request-Level Firewall | Accepted |  |
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
+| [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
 
 ## Supporting documents
 
