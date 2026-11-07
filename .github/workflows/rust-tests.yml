@@ -1414,6 +1414,8 @@ jobs:
             archive: docker-tests
             filter: package(temps-providers*) and kind(=lib) and not test(/^query::/) and not test(orchestrator_) and not test(backup_and_restore_to_s3)
             test_threads: "2"
+            # Creates Redis services from the default image.
+            redis_image: true
           - group: docker-backups
             # Heavyweight S3 backup/restore integration tests
             # (test_{mongodb,postgres,redis,s3}_backup_and_restore_to_s3). Each
@@ -1431,6 +1433,7 @@ jobs:
                (kind(=lib) and test(resolve_backup_location_from_s3_finds_mariadb))))
             extra_args: --no-capture
             test_threads: "1"
+            redis_image: true
           - group: postgres-upgrades
             # PostgreSQL major-version upgrade orchestrator integration tests.
             # Each test pulls pg17 + pg18 images and runs a real dump/restore,
@@ -1624,6 +1627,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/nextest-apply-learned-serial.sh
+
+      # After "Free up disk space", which prunes every image. Builds the
+      # default Redis image from this checkout when its tag is not published
+      # yet (a change moving the default), so the tests run against it.
+      - name: Make the default Redis image available
+        if: env.GROUP_RUNS == 'true' && matrix.redis_image
+        run: .github/scripts/ensure-default-redis-image.sh
 
       - name: Run integration tests
         if: env.GROUP_RUNS == 'true'
