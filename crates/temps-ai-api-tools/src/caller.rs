@@ -949,7 +949,9 @@ impl InternalApiCaller {
                     &scope.project_scope,
                     self.default_limit,
                     self.max_limit,
-                ) {
+                )
+                .and_then(|built| self.validate_plugin_route(op, &built))
+                {
                     Err(e) => WritePrepareOutcome::Invalid(format!(
                         "{e}\nRun `{} --help` to check its flags.",
                         op.operation_id
@@ -1113,6 +1115,31 @@ impl InternalApiCaller {
         self.call_inner(operation_id, params, scope).await
     }
 
+    fn validate_plugin_route(
+        &self,
+        operation: &ApiOperation,
+        built: &BuiltRequest,
+    ) -> Result<(), ApiToolError> {
+        let Some(plugin) = operation
+            .operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|pair| pair.0))
+        else {
+            return Ok(());
+        };
+        if self
+            .plugins
+            .as_ref()
+            .is_some_and(|binding| binding.snapshot.resolves_to(operation, &built.path))
+        {
+            return Ok(());
+        }
+        Err(ApiToolError::PluginOperation {
+            plugin: plugin.into(), operation_id: operation.operation_id.clone(),
+            reason: "Rendered path selects a different plugin endpoint; use that endpoint's declared tool and approval flow".into(),
+        })
+    }
+
     async fn call_inner(
         &self,
         operation_id: &str,
@@ -1142,6 +1169,7 @@ impl InternalApiCaller {
             self.default_limit,
             self.max_limit,
         )?;
+        self.validate_plugin_route(op, &built)?;
 
         // Handles belong in credential body fields only, never in a URL.
         crate::secrets::reject_references_in_url(operation_id, &built.path, &built.query)?;

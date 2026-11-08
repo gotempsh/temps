@@ -3073,4 +3073,59 @@ mod tests {
             assert!(audit.operations.lock().unwrap().is_empty());
         }
     }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_invalid_json_and_media_type_are_problem_details() {
+        use tower::ServiceExt;
+        for (body, content_type, status) in [
+            (
+                "untrusted-payload",
+                "application/json",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"actor_id":"fixture","enabled":"untrusted-payload"}"#,
+                "application/json",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "untrusted-payload",
+                "text/plain",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut state = test_state();
+            state.audit_service = audit.clone();
+            let response = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(Role::PlatformAdmin).0))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            let problem: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(problem["title"], "Invalid Plugin AI Access Request");
+            assert!(problem["detail"].as_str().unwrap().contains("reports"));
+            assert!(!problem.to_string().contains("untrusted-payload"));
+            assert!(audit.operations.lock().unwrap().is_empty());
+        }
+    }
 }

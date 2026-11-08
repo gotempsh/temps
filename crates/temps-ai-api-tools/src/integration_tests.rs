@@ -1017,4 +1017,96 @@ mod tests {
             false
         );
     }
+
+    #[tokio::test]
+    async fn read_templates_cannot_dispatch_static_or_nested_write_and_unmarked_routes() {
+        use crate::{
+            ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry,
+            WritePrepareOutcome,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mutation = move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"changed":true})) }
+        };
+        let router = Router::new()
+            .route(
+                "/x/reports/reports/{id}",
+                get(|| async { Json(json!({"read":true})) }),
+            )
+            .route(
+                "/x/reports/reports/{id}/{part}",
+                get(|| async { Json(json!({"read":true})) }),
+            )
+            .route("/x/reports/reports/reset", get(mutation.clone()))
+            .route("/x/reports/reports/private", get(mutation.clone()))
+            .route("/x/reports/reports/reset/{part}", get(mutation));
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{
+            "/reports/{id}":{"get":{"operationId":"read","x-temps-ai-tool":{},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}},
+            "/reports/{id}/{part}":{"get":{"operationId":"part","x-temps-ai-tool":{},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"part","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}},
+            "/reports/reset":{"get":{"operationId":"reset","x-temps-ai-tool":{"access":"write"},"responses":{"200":{"description":"ok"}}}},
+            "/reports/private":{"get":{"operationId":"private","responses":{"200":{"description":"ok"}}}},
+            "/reports/reset/{part}":{"get":{"operationId":"reset_part","x-temps-ai-tool":{"access":"write"},"parameters":[{"name":"part","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}
+        }})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let read = ApiToolsHandle::new();
+        let write = ApiToolsHandle::new();
+        for (handle, access) in [
+            (read.clone(), PluginToolAccess::Read),
+            (write.clone(), PluginToolAccess::Write),
+        ] {
+            registry.bind(
+                InternalApiCaller::new_allowlisted(router.clone(), &spec, vec![]),
+                access,
+                Arc::new(temps_core::audit::NoopAuditLogger),
+                move |caller| handle.set(caller),
+            );
+        }
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: auth_with_role(7, Role::PlatformAdmin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let reader = read.get().unwrap();
+        assert!(reader
+            .call("plugin.reports.read", json!({"id":"123"}), &scope)
+            .await
+            .is_ok());
+        for (operation, params) in [
+            ("plugin.reports.read", json!({"id":"reset"})),
+            ("plugin.reports.read", json!({"id":"private"})),
+            (
+                "plugin.reports.part",
+                json!({"id":"reset","part":"summary"}),
+            ),
+        ] {
+            let error = reader.call(operation, params, &scope).await.unwrap_err();
+            assert!(
+                matches!(error, crate::ApiToolError::PluginOperation { ref plugin, ref operation_id, .. } if plugin=="reports" && operation_id==operation)
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let writer = write.get().unwrap();
+        let prepared = match writer.prepare_write_cli("plugin.reports.reset", &scope) {
+            WritePrepareOutcome::Prepared(prepared) => prepared,
+            _ => panic!("the explicit write operation must still be preparable"),
+        };
+        writer
+            .execute_approved_write(
+                &prepared.operation_id,
+                prepared.params,
+                &scope,
+                prepared.plugin_revision.as_deref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

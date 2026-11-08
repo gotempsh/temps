@@ -29,6 +29,7 @@ pub struct PluginToolsIndex {
     pub(crate) revision: uuid::Uuid,
     tools: Vec<PluginTool>,
     secrets: HashMap<String, Vec<SecretPath>>,
+    routes: HashMap<String, matchit::Router<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +54,12 @@ pub enum PluginToolsError {
         plugin: String,
         operation_id: String,
     },
+    #[error("Cannot index route '{path}' for plugin '{plugin}': {source}")]
+    InvalidRoute {
+        plugin: String,
+        path: String,
+        source: matchit::InsertError,
+    },
 }
 
 impl PluginToolsIndex {
@@ -60,6 +67,7 @@ impl PluginToolsIndex {
     pub fn without_plugin(&self, plugin: &str) -> Self {
         let mut index = self.clone();
         index.tools.retain(|tool| tool.plugin != plugin);
+        index.routes.remove(plugin);
         let prefix = format!("plugin.{plugin}.");
         index
             .secrets
@@ -70,6 +78,7 @@ impl PluginToolsIndex {
     pub fn extend(&mut self, other: Self) {
         self.tools.extend(other.tools);
         self.secrets.extend(other.secrets);
+        self.routes.extend(other.routes);
     }
 
     pub(crate) fn append_to(&self, index: &mut ReadOnlyApiIndex, access: PluginToolAccess) {
@@ -105,6 +114,19 @@ impl PluginToolsIndex {
         }
         let mut tools = Vec::new();
         let mut secrets = HashMap::new();
+        let mut router = matchit::Router::new();
+        // Include unmarked endpoints: a read template must not select one of
+        // them, or a static GET explicitly elevated to write access.
+        for path in openapi.paths.paths.keys() {
+            let full_path = format!("/x/{plugin}{path}");
+            router
+                .insert(full_path.clone(), full_path)
+                .map_err(|source| PluginToolsError::InvalidRoute {
+                    plugin: plugin.into(),
+                    path: path.clone(),
+                    source,
+                })?;
+        }
         let schema_components = components_json(openapi);
         let mut ids = std::collections::HashSet::new();
         for (path, item) in &openapi.paths.paths {
@@ -195,6 +217,7 @@ impl PluginToolsIndex {
                     &resolve_body_params(&effective, openapi),
                     openapi,
                 );
+                preserve_query_array_items(&mut operation, &effective, openapi);
                 operation.has_json_body = effective
                     .request_body
                     .as_ref()
@@ -230,6 +253,7 @@ impl PluginToolsIndex {
         Ok(Self {
             tools,
             secrets,
+            routes: HashMap::from([(plugin.to_string(), router)]),
             revision: uuid::Uuid::nil(),
         })
     }
@@ -244,6 +268,27 @@ impl PluginToolsIndex {
             .iter()
             .find(|t| t.enabled && t.access == access && t.operation.operation_id == id)
             .map(|t| &t.operation)
+    }
+
+    pub(crate) fn resolves_to(&self, operation: &ApiOperation, path: &str) -> bool {
+        let Some(plugin) = operation
+            .operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|pair| pair.0))
+        else {
+            return false;
+        };
+        let Some(router) = self.routes.get(plugin) else {
+            return false;
+        };
+        let matches = |path: &str| {
+            router
+                .at(path)
+                .is_ok_and(|route| route.value == &operation.path)
+        };
+        // Check both URL representations, so decoding in a plugin framework
+        // cannot change a template request into another declared endpoint.
+        matches(path) && urlencoding::decode(path).is_ok_and(|decoded| matches(&decoded))
     }
 }
 
@@ -276,6 +321,46 @@ fn validate_body_schema(
         plugin: plugin.into(),
         operation_id: operation_id.into(),
     })
+}
+
+fn preserve_query_array_items(
+    operation: &mut ApiOperation,
+    declaration: &Operation,
+    openapi: &utoipa::openapi::OpenApi,
+) {
+    for parameter in declaration.parameters.iter().flatten() {
+        let Some(parameter) = resolve_component(
+            parameter,
+            openapi.components.as_ref().map(|c| &c.parameters),
+            "#/components/parameters/",
+        ) else {
+            continue;
+        };
+        if parameter.parameter_in != ParameterIn::Query {
+            continue;
+        }
+        let Some(schema) = parameter
+            .schema
+            .as_ref()
+            .and_then(|schema| deref_schema(schema, openapi))
+        else {
+            continue;
+        };
+        let Some(item_ty) = array_item_type(schema, openapi) else {
+            continue;
+        };
+        if let Some(param) = operation.params.iter_mut().find(|param| {
+            param.name == parameter.name && matches!(param.location, ParamLocation::Query)
+        }) {
+            if needs_json_input(schema, openapi, 0) {
+                param.ty = "json".into();
+                param.item_ty = None;
+            } else {
+                param.ty = "array".into();
+                param.item_ty = Some(item_ty);
+            }
+        }
+    }
 }
 
 /// Composite plugin inputs require an explicit JSON value, not scalar guessing.
@@ -705,5 +790,34 @@ mod tests {
         assert_eq!(operation.params.len(), 1);
         assert_eq!(operation.params[0].name, "report_name");
         assert!(operation.params[0].required);
+    }
+
+    #[test]
+    fn query_string_array_items_survive_cli_coercion_including_schema_references() {
+        use crate::cli::{resolve, CliAction, CliMode};
+        for schema in [
+            json!({"type":"array","items":{"type":"string"}}),
+            json!({"$ref":"#/components/schemas/Ids"}),
+        ] {
+            let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"schemas":{"Ids":{"type":"array","items":{"$ref":"#/components/schemas/Id"}},"Id":{"type":"string"}}},"paths":{"/list":{"get":{"operationId":"list","x-temps-ai-tool":{},"parameters":[{"in":"query","name":"ids","required":true,"schema":schema}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let plugin = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut index = ReadOnlyApiIndex::from_openapi_allowlist(&spec, &[]);
+            plugin.append_to(&mut index, PluginToolAccess::Read);
+            let (op, params) = match resolve(
+                &index,
+                "plugin.reports.list --ids 123,true",
+                &|_| true,
+                CliMode::ReadOnly,
+            ) {
+                CliAction::Execute(op, params) => (op, params),
+                CliAction::Terminal(error) => panic!("{error}"),
+            };
+            assert_eq!(params, json!({"ids":["123","true"]}));
+            let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
+            assert_eq!(
+                urlencoding::decode(&request.query).unwrap(),
+                "ids=[\"123\",\"true\"]"
+            );
+        }
     }
 }

@@ -32,6 +32,7 @@ tracing = { workspace = true }
 
 # HTTP framework
 axum = { workspace = true }
+matchit = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
 

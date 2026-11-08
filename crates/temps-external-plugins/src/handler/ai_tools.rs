@@ -44,15 +44,20 @@ pub(super) async fn get_plugin_ai_tools(
         .map_err(grant_problem)
 }
 
-#[utoipa::path(tag="External Plugins", put, path="/x/plugins/{name}/ai-tools", params(("name"=String,Path)), request_body=UpdatePluginAiTools, responses((status=200,body=PluginAiToolsResponse),(status=401),(status=403),(status=404),(status=409),(status=500)), security(("bearer_auth"=[])))]
+#[utoipa::path(tag="External Plugins", put, path="/x/plugins/{name}/ai-tools", params(("name"=String,Path)), request_body=UpdatePluginAiTools, responses((status=200,body=PluginAiToolsResponse),(status=400),(status=401),(status=403),(status=404),(status=409),(status=413),(status=415),(status=422),(status=500)), security(("bearer_auth"=[])))]
 pub(super) async fn put_plugin_ai_tools(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
     Path(name): Path<String>,
-    Json(request): Json<UpdatePluginAiTools>,
+    request: Result<Json<UpdatePluginAiTools>, JsonRejection>,
 ) -> Result<Json<PluginAiToolsResponse>, Problem> {
     permission_guard!(auth, SystemAdmin);
+    let Json(request) = request.map_err(|rejection| {
+        temps_core::problemdetails::new(rejection.status())
+            .with_title("Invalid Plugin AI Access Request")
+            .with_detail(format!("AI access settings for plugin '{name}' require an application/json body containing actor_id and a boolean enabled field"))
+    })?;
     temps_auth::require_sensitive_action(
         state.sensitive_action_authorizer.as_ref(),
         &auth,

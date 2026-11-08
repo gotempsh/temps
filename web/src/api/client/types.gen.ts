@@ -92236,10 +92236,14 @@ export type PutPluginAiToolsData = {
 };
 
 export type PutPluginAiToolsErrors = {
+    400: unknown;
     401: unknown;
     403: unknown;
     404: unknown;
     409: unknown;
+    413: unknown;
+    415: unknown;
+    422: unknown;
     500: unknown;
 };
 
