@@ -35,8 +35,11 @@ is replaced. Toggle writes require management permission and a Temps audit entry
 Router replay carries the actual user's AuthContext. The existing plugin proxy
 strips caller-supplied identity headers and injects authenticated identity; plugin
 permissions still apply. Project selector validation and auto-fill, response
-bounds and secret redaction apply equally to plugin operations. Descriptions and
-responses are untrusted content, never instructions or authorization. Timeout
+bounds and secret redaction apply equally to plugin operations. Tool responses
+also scrub the exact authentication signature and actor token injected
+by the proxy, so diagnostic header echoes cannot expose those credentials. The
+per-call redaction slot holds at most these two values and uses atomic publication.
+Descriptions and responses are untrusted content, never instructions or authorization. Timeout
 and unavailable errors identify the plugin and operation. Every executed plugin
 write also receives a Temps audit record containing actor, operation and outcome.
 Rendered request paths must resolve to the declared endpoint for the requested

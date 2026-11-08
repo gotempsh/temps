@@ -1238,13 +1238,15 @@ impl InternalApiCaller {
             req.extensions_mut().insert(origin.clone());
         }
 
-        if operation_id.starts_with("plugin.") {
-            if let Some(binding) = &self.plugins {
-                req.extensions_mut().insert(crate::PluginDispatchGuard {
-                    binding: binding.clone(),
-                    operation_id: operation_id.to_owned(),
-                });
-            }
+        let plugin_guard = self
+            .plugins
+            .as_ref()
+            .filter(|_| operation_id.starts_with("plugin."))
+            .map(|binding| {
+                crate::PluginDispatchGuard::new(binding.clone(), operation_id.to_owned())
+            });
+        if let Some(guard) = &plugin_guard {
+            req.extensions_mut().insert(guard.clone());
         }
 
         // Step 4: replay through the router.
@@ -1264,6 +1266,9 @@ impl InternalApiCaller {
         let (mut body_value, truncated) =
             collect_body(response.into_body(), self.max_response_bytes, operation_id).await?;
         crate::secrets::scrub(&mut body_value, &substituted);
+        if let Some(guard) = &plugin_guard {
+            guard.scrub_response(&mut body_value);
+        }
 
         if truncated {
             warn!(

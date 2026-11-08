@@ -4,6 +4,7 @@
 use crate::{InternalApiCaller, PluginToolAccess, PluginToolsIndex};
 use arc_swap::ArcSwap;
 use std::sync::{Arc, Mutex, Weak};
+use temps_core::secret_string::SecretString;
 
 type Subscriber = Box<dyn Fn(Arc<PluginToolsIndex>) + Send + Sync>;
 
@@ -106,9 +107,34 @@ impl temps_core::audit::AuditOperation for PluginWriteAudit<'_> {
 pub struct PluginDispatchGuard {
     pub(crate) binding: PluginBinding,
     pub(crate) operation_id: String,
+    response_credentials: Arc<ArcSwap<Vec<SecretString>>>,
 }
 
 impl PluginDispatchGuard {
+    pub(crate) fn new(binding: PluginBinding, operation_id: String) -> Self {
+        Self {
+            binding,
+            operation_id,
+            response_credentials: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        }
+    }
+
+    /// The proxy records only the two credentials it actually injected. This
+    /// per-call slot is never serialized or logged and uses no application lock.
+    pub fn record_response_credentials(&self, signature: Option<&str>, actor_token: Option<&str>) {
+        self.response_credentials.store(Arc::new(
+            [signature, actor_token]
+                .into_iter()
+                .flatten()
+                .map(SecretString::new)
+                .collect(),
+        ));
+    }
+
+    pub(crate) fn scrub_response(&self, response: &mut serde_json::Value) {
+        crate::secrets::scrub(response, &self.response_credentials.load());
+    }
+
     pub fn is_current(&self) -> bool {
         self.binding.registry.upgrade().is_some_and(|registry| {
             Arc::ptr_eq(&registry.snapshot(), &self.binding.snapshot)

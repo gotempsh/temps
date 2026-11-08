@@ -361,6 +361,21 @@ async fn forward_to_unix_socket(
     let (mut parts, body) = original_request.into_parts();
 
     inject_temps_headers(&mut parts.headers, proxy, auth);
+    if let Some(guard) = parts
+        .extensions
+        .get::<temps_ai_api_tools::PluginDispatchGuard>()
+    {
+        guard.record_response_credentials(
+            parts
+                .headers
+                .get(headers::AUTH_SIGNATURE)
+                .and_then(|value| value.to_str().ok()),
+            parts
+                .headers
+                .get(headers::ACTOR_TOKEN)
+                .and_then(|value| value.to_str().ok()),
+        );
+    }
 
     let target_uri: hyper::Uri = path_and_query
         .parse()
@@ -1270,5 +1285,137 @@ mod tests {
             bytes.is_empty(),
             "no identity, credential or mutation reaches a replaced plugin"
         );
+    }
+
+    #[tokio::test]
+    async fn ai_header_echoes_scrub_injected_credentials_from_success_and_errors() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope,
+        };
+        for method in ["GET", "TRACE"] {
+            for status in [200, 400, 500] {
+                #[cfg(target_os = "macos")]
+                let root = PathBuf::from("/private/tmp");
+                #[cfg(not(target_os = "macos"))]
+                let root = std::env::temp_dir();
+                let directory = tempfile::tempdir_in(root).unwrap();
+                let socket = directory.path().join("p.sock");
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+                let token_tx = Arc::new(std::sync::Mutex::new(Some(token_tx)));
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let result = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            hyper::service::service_fn(
+                                move |request: hyper::Request<hyper::body::Incoming>| {
+                                    let token_tx = token_tx.clone();
+                                    async move {
+                                        assert_eq!(request.method().as_str(), method);
+                                        let signature = request.headers()[headers::AUTH_SIGNATURE]
+                                            .to_str()
+                                            .unwrap();
+                                        let token = request.headers()[headers::ACTOR_TOKEN]
+                                            .to_str()
+                                            .unwrap();
+                                        assert_eq!(signature, "fixture-signature");
+                                        assert!(!token.is_empty());
+                                        token_tx
+                                            .lock()
+                                            .unwrap()
+                                            .take()
+                                            .unwrap()
+                                            .send(token.to_owned())
+                                            .unwrap();
+                                        Ok::<_, std::convert::Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .header("content-type", "text/plain")
+                                                .body(Body::from(format!(
+                                                    "echo signature={signature} actor={token}"
+                                                )))
+                                                .unwrap(),
+                                        )
+                                    }
+                                },
+                            ),
+                        )
+                        .await;
+                    if let Err(error) = result {
+                        assert!(
+                            std::error::Error::source(&error)
+                                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                                .is_some_and(
+                                    |source| source.kind() == std::io::ErrorKind::NotConnected
+                                ),
+                            "{error}"
+                        );
+                    }
+                });
+                let crypto = ActorCryptoSlot::default();
+                crypto.set(Arc::new(
+                    temps_core::CookieCrypto::new("0123456789abcdef0123456789abcdef").unwrap(),
+                ));
+                let proxy = PluginProxy::new(socket, "reports".into(), "fixture-signature".into())
+                    .with_actor_minting(crypto, true);
+                let router = Router::new().nest("/x/reports", create_plugin_proxy_router(proxy));
+                let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/echo":{(method.to_lowercase()):{"operationId":"echo","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+                let registry = Arc::new(PluginToolsRegistry::default());
+                let handle = ApiToolsHandle::new();
+                let target = handle.clone();
+                registry.bind(
+                    InternalApiCaller::new_allowlisted(router, &spec, vec![]),
+                    if method == "GET" {
+                        PluginToolAccess::Read
+                    } else {
+                        PluginToolAccess::Write
+                    },
+                    Arc::new(temps_core::audit::NoopAuditLogger),
+                    move |caller| target.set(caller),
+                );
+                registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+                let scope = ApiCallScope {
+                    auth: AuthContext::new_persisted_session(
+                        test_user(42, "reader@example.test"),
+                        Role::Admin,
+                        7,
+                    ),
+                    project_scope: ProjectSelectorScope::Unrestricted,
+                    origin: None,
+                    secrets: None,
+                };
+                let caller = handle.get().unwrap();
+                let revision = caller.plugin_tools_revision();
+                let result = if method == "GET" {
+                    caller
+                        .call("plugin.reports.echo", serde_json::json!({}), &scope)
+                        .await
+                } else {
+                    caller
+                        .execute_approved_write(
+                            "plugin.reports.echo",
+                            serde_json::json!({}),
+                            &scope,
+                            revision.as_deref(),
+                        )
+                        .await
+                };
+                let output = if status == 200 {
+                    result.unwrap().body.to_string()
+                } else {
+                    result.unwrap_err().to_string()
+                };
+                let token = token_rx.await.unwrap();
+                assert!(!output.contains("fixture-signature"), "{output}");
+                assert!(!output.contains(&token));
+                if status != 500 {
+                    assert!(output.contains("signature=*** actor=***"), "{output}");
+                }
+                server.await.unwrap();
+            }
+        }
     }
 }
