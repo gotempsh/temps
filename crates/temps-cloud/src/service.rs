@@ -672,13 +672,7 @@ impl CloudService {
     /// working the moment the instance links and goes quiet (cheaply) the
     /// moment it disconnects, with no separate start/stop wiring needed.
     ///
-    /// This same connection also negotiates `Capability::InstanceStatusReporting`
-    /// (ADR-039), but no `StatusProvider` is wired up here yet: counting
-    /// deployments/services/projects and reading resource usage needs
-    /// database and system access this crate does not have reason to hold
-    /// just for this. Passing `None` is a deliberately silent no-op — the
-    /// capability is still offered, and status reporting activates with no
-    /// further wiring once a provider is registered.
+    /// Reports the worker count from the local database in the background.
     pub fn start_heartbeat_sender(&self) {
         let mut task = self
             .heartbeat_task
@@ -688,8 +682,11 @@ impl CloudService {
             tracing::info!("Cloud service launching heartbeat sender task");
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
+            let provider = Arc::new(temps_cloud_client::status_provider::WorkerStatusProvider(
+                self.db.clone(),
+            ));
             *task = Some(tokio::spawn(async move {
-                temps_cloud_client::heartbeat::run(link, cancel, None).await;
+                temps_cloud_client::heartbeat::run(link, cancel, Some(provider)).await;
             }));
         } else {
             tracing::debug!("Cloud heartbeat sender task is already registered");
