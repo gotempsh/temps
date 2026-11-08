@@ -3820,3 +3820,50 @@ async fn the_time_budget_starts_when_the_turn_is_prepared() {
 
     assert_eq!(turn.budget.remaining(), Duration::from_secs(60));
 }
+
+#[tokio::test]
+async fn write_tool_dispatch_refreshes_plugin_publications_within_the_turn() {
+    use temps_ai_api_tools::{
+        InternalApiCaller, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry,
+        WriteApiToolsHandle,
+    };
+    let registry = Arc::new(PluginToolsRegistry::default());
+    let handle = Arc::new(WriteApiToolsHandle::new());
+    let spec = |description: &str| {
+        serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{"description":description},"responses":{"200":{"description":"ok"}}}}}})).unwrap()
+    };
+    let before = spec("Report before reload");
+    let target = handle.clone();
+    registry.bind(
+        InternalApiCaller::new_write_allowlisted(axum::Router::new(), &before, vec![]),
+        PluginToolAccess::Write,
+        Arc::new(temps_core::audit::NoopAuditLogger),
+        move |caller| target.set(caller),
+    );
+    registry.publish(PluginToolsIndex::from_openapi("reports", &before, false).unwrap());
+    let mut router = stage_router(Arc::new(StubProvider {
+        tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    router.write_handle = Some(handle.clone());
+    router.pending = Some(Arc::new(PendingActionService::new(
+        Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        handle,
+        Arc::new(temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap()),
+    )));
+    let call = tool_call(
+        "write-help",
+        "temps_write",
+        r#"{"command":"plugin.reports.create --help"}"#,
+    );
+    let first = router.dispatch(&call, &test_auth()).await;
+    assert!(first.contains("Report before reload"), "{first}");
+    assert!(router
+        .dispatch(&call, &test_auth())
+        .await
+        .starts_with("You already ran"));
+    let after = spec("Report after reload");
+    registry.publish(PluginToolsIndex::from_openapi("reports", &after, true).unwrap());
+    let next = router.dispatch(&call, &test_auth()).await;
+    assert!(next.contains("Report after reload"), "{next}");
+    assert!(!next.contains("Report before reload"));
+}

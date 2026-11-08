@@ -215,4 +215,47 @@ describe("endpoint AI tools", () => {
       label: "report",
     });
   });
+  it("publishes and resolves named schemas for GET and POST tools", async () => {
+    const item = z.object({ id: z.number() }).meta({ id: "ReportsItem" });
+    const input = z.object({ filter: item });
+    const p = plugin()
+      .tool({
+        name: "named",
+        description: "Named query",
+        method: "GET",
+        input,
+        handler: (value) => value,
+      })
+      .tool({
+        name: "named_write",
+        description: "Named body",
+        input,
+        handler: (value) => value,
+      });
+    const spec = p.openapi!() as {
+      paths: Record<
+        string,
+        { get?: { parameters: Array<{ schema: { $ref: string } }> } }
+      >;
+      components: { schemas: Record<string, unknown> };
+    };
+    const ref = spec.paths["/tools/named"].get!.parameters[0].schema.$ref;
+    expect(
+      spec.components.schemas[ref.replace("#/components/schemas/", "")],
+    ).toMatchObject({ type: "object" });
+    expect(JSON.stringify(spec)).not.toContain("#/$defs/");
+    expect(Object.keys(spec.components.schemas)).toHaveLength(2);
+    const query = new URLSearchParams({ filter: '{"id":1}' });
+    const response = await request(p, "GET", `/tools/named?${query}`);
+    expect(response.writeHead).toHaveBeenCalledWith(200, {
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(response.end.mock.calls[0][0])).toEqual({
+      filter: { id: 1 },
+    });
+    expect(
+      (await request(p, "POST", "/tools/named_write", '{"filter":{"id":2}}'))
+        .writeHead,
+    ).toHaveBeenCalledWith(200, { "Content-Type": "application/json" });
+  });
 });

@@ -890,6 +890,7 @@ mod tests {
     #[test]
     fn operation_help_explains_optional_project_linkage() {
         let operation = ApiOperation {
+            has_json_body: false,
             operation_id: "create_service".to_string(),
             path: "/external-services".to_string(),
             method: "POST".to_string(),
@@ -1043,6 +1044,7 @@ mod tests {
     #[test]
     fn operation_schema_preserves_number_looking_string_flags() {
         let operation = ApiOperation {
+            has_json_body: false,
             operation_id: "create_service".to_string(),
             path: "/external-services".to_string(),
             method: "POST".to_string(),
@@ -1219,6 +1221,7 @@ mod tests {
             object_shape: None,
         };
         ApiOperation {
+            has_json_body: false,
             operation_id: "create_environment_variable".to_string(),
             path: "/projects/{project_id}/env-vars".to_string(),
             method: "POST".to_string(),
@@ -1405,6 +1408,7 @@ mod tests {
     #[test]
     fn help_without_list_flags_has_no_list_hint() {
         let help = render_operation_help(&ApiOperation {
+            has_json_body: false,
             params: vec![ParamSpec {
                 name: "name".to_string(),
                 location: ParamLocation::Body,

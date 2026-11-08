@@ -220,6 +220,9 @@ pub struct ParamSpec {
 /// A single operation kept in the index (GET *or* an allowlisted write method).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiOperation {
+    /// Plugin JSON body metadata, including schemas with no flattened fields.
+    #[serde(default)]
+    pub has_json_body: bool,
     /// Stable identifier for this operation, used as the tool call name.
     pub operation_id: String,
     /// URL path template, e.g. `/projects/{project_id}/deployments/{id}`.
@@ -744,6 +747,7 @@ fn build_api_operation(
     params.extend_from_slice(extra_params);
 
     ApiOperation {
+        has_json_body: false,
         operation_id,
         path,
         method: method.to_string(),

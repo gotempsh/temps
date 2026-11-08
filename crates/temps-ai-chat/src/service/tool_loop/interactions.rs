@@ -339,7 +339,7 @@ pub(super) struct ToolRouter {
     pub(super) provider: Option<Arc<dyn ConversationContextProvider>>,
     pub(super) api_tools: Option<Arc<dyn ConversationContextProvider>>,
     pub(super) repo_tools: Option<Arc<dyn ConversationContextProvider>>,
-    pub(super) write_handle: Option<Arc<temps_ai_api_tools::InternalApiCaller>>,
+    pub(super) write_handle: Option<Arc<temps_ai_api_tools::WriteApiToolsHandle>>,
     pub(super) pending: Option<Arc<PendingActionService>>,
     pub(super) audit: Option<Arc<dyn AuditLogger>>,
     pub(super) interactions: PlatformInteractionExecutor,
@@ -349,6 +349,19 @@ pub(super) struct ToolRouter {
 impl ToolRouter {
     pub(super) async fn dispatch(&self, call: &ToolCall, auth: &AuthContext) -> String {
         let mut state = self.state.lock().await;
+        let write_caller = self.write_handle.as_ref().and_then(|handle| handle.get());
+        let revision = write_caller
+            .as_ref()
+            .and_then(|caller| caller.plugin_tools_revision());
+        if state.write_tools_revision != revision {
+            // Discovery and refusals from an old publication cannot prevent a
+            // fresh proposal. Execution still requires its normal approval.
+            state.seen_calls.retain(|key, _| {
+                !key.starts_with("temps_write|")
+                    && !key.starts_with("mcp__temps-chat__temps_write|")
+            });
+            state.write_tools_revision = revision;
+        }
         dispatch_conversation_tool(
             call,
             self.project_id,
@@ -359,7 +372,7 @@ impl ToolRouter {
             self.provider.as_ref(),
             self.api_tools.as_ref(),
             self.repo_tools.as_ref(),
-            self.write_handle.as_deref(),
+            write_caller.as_deref(),
             self.pending.as_deref(),
             self.audit.as_deref(),
             Some(&self.interactions),

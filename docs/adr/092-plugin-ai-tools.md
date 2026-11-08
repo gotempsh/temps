@@ -58,6 +58,8 @@ authorization and approval boundaries.
 The external plugin service owns the index and republishes it after lifecycle
 changes and persisted consent updates. Core callers subscribe once at startup;
 ArcSwap handles publish rebuilt callers for both chat and the per-turn MCP bridge.
+Each tool dispatch loads the current write caller, so new proposals within an
+active turn use the latest declaration and consent.
 Execution rejects revoked or replaced snapshots. The caller carries an in-process
 publication guard through the router; the proxy checks it after connecting and
 before sending credentials or request bytes. The connected socket pins the plugin

@@ -13,7 +13,7 @@ plugin.tool({
   name: "reports",
   description: "List reports for a project",
   method: "GET",
-  input: z.object({ project_id: z.coerce.number().int() }),
+  input: z.object({ project_id: z.number().int() }),
   handler: async (input, context, request) => {
     // Enforce the caller's permissions just as for any other endpoint.
     return listAuthorizedReports(request, input.project_id);
@@ -23,8 +23,11 @@ runPlugin(plugin);
 ```
 
 `method` defaults to POST and `path` to `/tools/<name>`. Paths are static;
-GET input comes from query parameters (use Zod coercion for numbers), and other
-methods accept a JSON object capped at 128 KiB. Inputs are validated before the
+GET input comes from query parameters. Non-string schemas decode JSON values,
+including numbers, booleans, nullable values, arrays and objects; string schemas
+and unions with string alternatives preserve the query text. Named Zod schemas
+are published as OpenAPI components. Other methods accept a JSON object capped
+at 128 KiB. Inputs are validated before the
 handler runs. Non-GET methods cannot declare `access: 'read'`; GET can declare
 `access: 'write'` when reading has side effects. Descriptions are capped at 500
 characters. Names and routes must be unique. Do not register a tool over an

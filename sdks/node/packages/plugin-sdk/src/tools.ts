@@ -27,6 +27,7 @@ export interface PluginToolOptions<T extends z.ZodObject> {
 /** Add endpoint-backed AI tools to an existing plugin without changing its protocol. */
 export function createToolPlugin(base: TempsPlugin) {
   const paths: Record<string, Record<string, unknown>> = {};
+  const definitions: Record<string, unknown> = {};
   const routes = new Map<string, (ctx: PluginContext) => RequestHandler>();
   const plugin: TempsPlugin & {
     tool<T extends z.ZodObject>(options: PluginToolOptions<T>): typeof plugin;
@@ -43,6 +44,16 @@ export function createToolPlugin(base: TempsPlugin) {
         openapi: "3.1.0",
         info: { title: base.manifest().name, version: base.manifest().version },
         ...original,
+        components: {
+          ...(original?.components as Record<string, unknown> | undefined),
+          schemas: {
+            ...(
+              original?.components as
+                { schemas?: Record<string, unknown> } | undefined
+            )?.schemas,
+            ...definitions,
+          },
+        },
         paths: {
           ...(original?.paths as Record<string, unknown> | undefined),
           ...paths,
@@ -89,7 +100,12 @@ export function createToolPlugin(base: TempsPlugin) {
         )
       )
         throw new Error("Duplicate tool name or route");
-      const schema = z.toJSONSchema(options.input, { io: "input" });
+      const schema = promoteDefinitions(
+        z.toJSONSchema(options.input, { io: "input" }),
+        options.name,
+        definitions,
+        base.openapi?.(),
+      );
       const description = Array.from(options.description)
         .slice(0, 500)
         .join("");
@@ -129,7 +145,7 @@ export function createToolPlugin(base: TempsPlugin) {
                 new URL(req.url ?? "/", "http://plugin.local").searchParams,
                 ([name, value]) => {
                   const property = schema.properties?.[name];
-                  const types = querySchemaTypes(property);
+                  const types = querySchemaTypes(property, definitions);
                   // The generic API caller serializes non-string query values as JSON.
                   // Preserve string fields (including numeric-looking identifiers).
                   return [
@@ -177,17 +193,80 @@ export function createToolPlugin(base: TempsPlugin) {
 }
 
 /** Composite Zod schemas use alternatives rather than a direct JSON type. */
-function querySchemaTypes(schema: unknown): string[] {
+function querySchemaTypes(
+  schema: unknown,
+  definitions: Record<string, unknown>,
+  seen = new Set<string>(),
+): string[] {
   if (!schema || typeof schema !== "object") return ["string"];
   const value = schema as Record<string, unknown>;
+  if (
+    typeof value.$ref === "string" &&
+    value.$ref.startsWith("#/components/schemas/")
+  ) {
+    if (seen.has(value.$ref)) return ["string"];
+    const next = new Set(seen).add(value.$ref);
+    return querySchemaTypes(
+      definitions[value.$ref.slice("#/components/schemas/".length)],
+      definitions,
+      next,
+    );
+  }
   if (typeof value.type === "string") return [value.type];
   if (Array.isArray(value.type))
     return value.type.filter(
       (type): type is string => typeof type === "string",
     );
   for (const key of ["anyOf", "oneOf", "allOf"]) {
-    if (Array.isArray(value[key])) return value[key].flatMap(querySchemaTypes);
+    if (Array.isArray(value[key]))
+      return value[key].flatMap((child) =>
+        querySchemaTypes(child, definitions, seen),
+      );
   }
   // Unconstrained schemas (including coercion inputs) also accept strings.
   return ["string"];
+}
+
+/** JSON Schema document references must point into the enclosing OpenAPI document. */
+function promoteDefinitions<T extends Record<string, unknown>>(
+  schema: T,
+  tool: string,
+  definitions: Record<string, unknown>,
+  original: Record<string, unknown> | undefined,
+): T {
+  const local = (schema.$defs ?? {}) as Record<string, unknown>;
+  const existing = (
+    original?.components as { schemas?: Record<string, unknown> } | undefined
+  )?.schemas;
+  const names = new Map<string, string>();
+  Object.keys(local).forEach((key, index) => {
+    const name = `TempsAiTool_${tool}_${index}`;
+    if (existing?.[name] !== undefined || definitions[name] !== undefined)
+      throw new Error(`Tool ${tool} schema conflicts with component ${name}`);
+    names.set(
+      `#/$defs/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`,
+      name,
+    );
+  });
+  const rewrite = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(rewrite);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [
+        key,
+        key === "$ref" && typeof child === "string" && names.has(child)
+          ? `#/components/schemas/${names.get(child)}`
+          : rewrite(child),
+      ]),
+    );
+  };
+  for (const [key, value] of Object.entries(local)) {
+    const name = names.get(
+      `#/$defs/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`,
+    );
+    if (name) definitions[name] = rewrite(value);
+  }
+  const root = { ...schema };
+  delete root.$defs;
+  return rewrite(root) as T;
 }

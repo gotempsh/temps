@@ -189,6 +189,20 @@ impl PluginToolsIndex {
                     &resolve_body_params(&effective, openapi),
                     openapi,
                 );
+                operation.has_json_body = effective
+                    .request_body
+                    .as_ref()
+                    .and_then(|body| {
+                        resolve_component(
+                            body,
+                            openapi
+                                .components
+                                .as_ref()
+                                .map(|components| &components.request_bodies),
+                            "#/components/requestBodies/",
+                        )
+                    })
+                    .is_some_and(|body| body.content.contains_key("application/json"));
                 operation.summary = Some(description.clone());
                 operation.description = Some(description);
                 // Do not let plugin-supplied tags impersonate core permission groups.
@@ -481,5 +495,22 @@ mod tests {
         assert!(index
             .callable("plugin.reports.reset", PluginToolAccess::Read)
             .is_none());
+    }
+    #[test]
+    fn empty_json_request_bodies_are_preserved_including_component_references() {
+        for body in [
+            serde_json::json!({"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{}}}}}),
+            serde_json::json!({"$ref":"#/components/requestBodies/Empty"}),
+        ] {
+            let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"requestBodies":{"Empty":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{}}}}}}},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"requestBody":body,"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let index = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let op = index
+                .callable("plugin.reports.create", PluginToolAccess::Write)
+                .unwrap();
+            assert!(op.params.is_empty());
+            let request =
+                crate::build_request_parts(op, &serde_json::json!({}), &[], 20, 100).unwrap();
+            assert_eq!(request.body, Some(serde_json::json!({})));
+        }
     }
 }

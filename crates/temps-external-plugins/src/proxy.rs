@@ -1132,7 +1132,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            hyper::server::conn::http1::Builder::new()
+            let result = hyper::server::conn::http1::Builder::new()
                 .serve_connection(
                     hyper_util::rt::TokioIo::new(stream),
                     hyper::service::service_fn(
@@ -1150,8 +1150,16 @@ mod tests {
                         },
                     ),
                 )
-                .await
-                .unwrap();
+                .await;
+            if let Err(error) = result {
+                // macOS UDS shutdown may report ENOTCONN after a successful response.
+                assert!(
+                    std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<std::io::Error>())
+                        .is_some_and(|source| source.kind() == std::io::ErrorKind::NotConnected),
+                    "{error}"
+                );
+            }
         });
         let router = Router::new().nest(
             "/x/reports",

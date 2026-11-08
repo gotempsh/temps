@@ -267,8 +267,8 @@ mod tests {
     #[tokio::test]
     async fn failed_uninstall_revocation_retains_other_plugins_tools() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir(directory.path().join("reports")).unwrap();
-        std::fs::write(directory.path().join("reports/active.json"), "{}").unwrap();
+        std::fs::create_dir_all(directory.path().join("plugins/reports")).unwrap();
+        std::fs::write(directory.path().join("plugins/reports/active.json"), "{}").unwrap();
         let service = ExternalPluginsService::new_empty(
             crate::manager::ExternalPluginConfig::new(
                 directory.path().to_path_buf(),
@@ -286,7 +286,10 @@ mod tests {
         index.extend(PluginToolsIndex::from_openapi("metrics", &spec, true).unwrap());
         service.ai_tools.publish(index);
         let error = service.uninstall_plugin("reports").await.unwrap_err();
-        assert!(error.to_string().contains("revocation unavailable"));
+        assert!(
+            error.to_string().contains("revocation unavailable"),
+            "{error}"
+        );
         let remaining = service.ai_tools.snapshot();
         assert_eq!(remaining.tools().len(), 1);
         assert!(remaining

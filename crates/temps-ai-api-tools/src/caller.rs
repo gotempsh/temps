@@ -540,10 +540,11 @@ fn build_request_parts_scoped(
     // optional (e.g. DeployFromImageRequest) accept `{}`, and axum's `Json`
     // extractor 415s on a missing content type — so an empty body must still be
     // sent as `{}`, not omitted. GET/DELETE ops without a body stay body-less.
-    let op_expects_body = op
-        .params
-        .iter()
-        .any(|p| matches!(p.location, ParamLocation::Body));
+    let op_expects_body = op.has_json_body
+        || op
+            .params
+            .iter()
+            .any(|p| matches!(p.location, ParamLocation::Body));
     let body = if body_map.is_empty() {
         if op_expects_body {
             Some(Value::Object(serde_json::Map::new()))
@@ -583,6 +584,13 @@ pub struct InternalApiCaller {
 }
 
 impl InternalApiCaller {
+    /// Publication identity for invalidating turn-local discovery/refusal caches.
+    pub fn plugin_tools_revision(&self) -> Option<String> {
+        self.plugins
+            .as_ref()
+            .map(|binding| binding.snapshot.revision.to_string())
+    }
+
     pub(crate) fn with_plugin_snapshot(
         mut self,
         binding: crate::plugin_registry::PluginBinding,
@@ -1717,6 +1725,7 @@ mod tests {
 
     fn make_op(operation_id: &str, path: &str, params: Vec<ParamSpec>) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
             operation_id: operation_id.to_string(),
             path: path.to_string(),
             method: "GET".to_string(),
@@ -1735,6 +1744,7 @@ mod tests {
         params: Vec<ParamSpec>,
     ) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
             operation_id: operation_id.to_string(),
             path: path.to_string(),
             method: method.to_string(),
@@ -1803,6 +1813,7 @@ mod tests {
 
     fn op_tagged(tag: &str) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
             tags: if tag.is_empty() {
                 vec![]
             } else {
@@ -1814,6 +1825,7 @@ mod tests {
 
     fn op_tagged_with_method(tag: &str, method: &str) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
             method: method.to_string(),
             tags: if tag.is_empty() {
                 vec![]
