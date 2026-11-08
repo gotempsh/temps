@@ -179,4 +179,40 @@ describe("endpoint AI tools", () => {
       (await request(p, "GET", `/tools/typed?${query}`)).writeHead,
     ).toHaveBeenCalledWith(400);
   });
+  it("decodes nullable and union GET schemas while preserving string alternatives", async () => {
+    const p = plugin().tool({
+      name: "composite",
+      description: "Composite query",
+      method: "GET",
+      input: z.object({
+        count: z.number().nullable(),
+        active: z.boolean().nullable(),
+        choice: z.union([z.number(), z.boolean()]),
+        label: z.union([z.string(), z.number()]),
+      }),
+      handler: (input) => input,
+    });
+    const first = await request(
+      p,
+      "GET",
+      "/tools/composite?count=7&active=false&choice=true&label=123",
+    );
+    expect(JSON.parse(first.end.mock.calls[0][0])).toEqual({
+      count: 7,
+      active: false,
+      choice: true,
+      label: "123",
+    });
+    const second = await request(
+      p,
+      "GET",
+      "/tools/composite?count=null&active=null&choice=2&label=report",
+    );
+    expect(JSON.parse(second.end.mock.calls[0][0])).toEqual({
+      count: null,
+      active: null,
+      choice: 2,
+      label: "report",
+    });
+  });
 });

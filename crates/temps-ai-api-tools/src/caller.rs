@@ -238,6 +238,28 @@ pub fn build_request_parts(
     build_request_parts_scoped(op, params, &project_scope, default_limit, max_limit)
 }
 
+fn validate_plugin_path_value(
+    op: &ApiOperation,
+    param: &ParamSpec,
+    str_val: &str,
+) -> Result<(), ApiToolError> {
+    if op.operation_id.starts_with("plugin.")
+        && (str_val.is_empty()
+            || matches!(str_val, "." | "..")
+            || str_val.contains(['/', '\\', '%']))
+    {
+        return Err(ApiToolError::BadParamType {
+            name: param.name.clone(),
+            problem: "path value could change the declared plugin endpoint".into(),
+            expected:
+                "a nonempty path segment without dot traversal, separators or percent escapes"
+                    .into(),
+            operation_id: op.operation_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Policy-aware request builder used by chat tool calls. Unlike the public
 /// convenience wrapper, this preserves `Allowed([])` as an explicit deny-all
 /// project-selector boundary for an application with no selected project.
@@ -494,18 +516,7 @@ fn build_request_parts_scoped(
         match param.location {
             ParamLocation::Path => {
                 let str_val = value_to_string(&value);
-                if op.operation_id.starts_with("plugin.")
-                    && (str_val.is_empty()
-                        || matches!(str_val.as_str(), "." | "..")
-                        || str_val.contains(['/', '\\', '%']))
-                {
-                    return Err(ApiToolError::BadParamType {
-                        name: param.name.clone(),
-                        problem: "path value could change the declared plugin endpoint".into(),
-                        expected: "a nonempty path segment without dot traversal, separators or percent escapes".into(),
-                        operation_id: op.operation_id.clone(),
-                    });
-                }
+                validate_plugin_path_value(op, param, &str_val)?;
                 let placeholder = format!("{{{}}}", param.name);
                 path = path.replace(&placeholder, &urlencoding::encode(&str_val));
             }

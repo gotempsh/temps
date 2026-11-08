@@ -69,7 +69,11 @@ export function PluginAiTools({ name }: { name: string }) {
     }
   }
   return (
-    <SettingsSection title="AI chat tools" icon={Bot} id="ai-tools">
+    <SettingsSection
+      title="AI chat tools"
+      icon={Bot}
+      id="setting-plugin-ai-tools"
+    >
       {tools.isPending ? (
         <Skeleton className="h-16 w-full" />
       ) : tools.isError ? (

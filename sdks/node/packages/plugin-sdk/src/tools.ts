@@ -129,21 +129,12 @@ export function createToolPlugin(base: TempsPlugin) {
                 new URL(req.url ?? "/", "http://plugin.local").searchParams,
                 ([name, value]) => {
                   const property = schema.properties?.[name];
-                  const type =
-                    property && typeof property === "object"
-                      ? property.type
-                      : undefined;
+                  const types = querySchemaTypes(property);
                   // The generic API caller serializes non-string query values as JSON.
                   // Preserve string fields (including numeric-looking identifiers).
                   return [
                     name,
-                    [
-                      "number",
-                      "integer",
-                      "boolean",
-                      "array",
-                      "object",
-                    ].includes(type as string)
+                    types.length > 0 && !types.includes("string")
                       ? JSON.parse(value)
                       : value,
                   ];
@@ -183,4 +174,20 @@ export function createToolPlugin(base: TempsPlugin) {
     },
   };
   return plugin;
+}
+
+/** Composite Zod schemas use alternatives rather than a direct JSON type. */
+function querySchemaTypes(schema: unknown): string[] {
+  if (!schema || typeof schema !== "object") return ["string"];
+  const value = schema as Record<string, unknown>;
+  if (typeof value.type === "string") return [value.type];
+  if (Array.isArray(value.type))
+    return value.type.filter(
+      (type): type is string => typeof type === "string",
+    );
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(value[key])) return value[key].flatMap(querySchemaTypes);
+  }
+  // Unconstrained schemas (including coercion inputs) also accept strings.
+  return ["string"];
 }
