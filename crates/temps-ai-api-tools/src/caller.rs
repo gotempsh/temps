@@ -211,9 +211,11 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///   is allowed. Operations without a project selector remain available: their
 ///   authorization is evaluated by the real router using the authenticated
 ///   user's current role and permissions.
-/// - **Limit injection**: if a param named `limit` exists in the operation:
+/// - **Core pagination**: if a query param named `limit` exists in a core operation:
 ///   - absent → `default_limit` is injected.
 ///   - present → clamped to `[1, max_limit]`.
+///
+///   Plugin parameters retain their declared endpoint's semantics.
 ///
 /// ## Parameters
 ///
@@ -258,6 +260,12 @@ fn validate_plugin_path_value(
         });
     }
     Ok(())
+}
+
+fn is_core_pagination_limit(op: &ApiOperation, param: &ParamSpec) -> bool {
+    !op.operation_id.starts_with("plugin.")
+        && param.name == "limit"
+        && matches!(param.location, ParamLocation::Query)
 }
 
 fn parameter_is_supplied(
@@ -340,7 +348,7 @@ fn build_request_parts_scoped(
             {
                 return false; // auto-filled
             }
-            if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
+            if is_core_pagination_limit(op, param) {
                 return false; // injected with a default
             }
             match param.location {
@@ -436,8 +444,8 @@ fn build_request_parts_scoped(
                     }
                 }
             }
-        } else if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
-            // Limit injection: default + clamp (only for query params named "limit").
+        } else if is_core_pagination_limit(op, param) {
+            // Only core endpoints share these pagination semantics.
             let raw = params_obj.and_then(|o| o.get(&param.name));
             let limit_val = match raw {
                 Some(v) => {
@@ -2829,6 +2837,39 @@ mod tests {
     // -----------------------------------------------------------------------
     // Limit injection + clamping
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugin_limit_preserves_values_and_omission_for_reads_and_writes() {
+        for method in ["GET", "POST"] {
+            for (ty, values) in [
+                ("string", vec![serde_json::json!("unlimited")]),
+                ("number", vec![serde_json::json!(0.5)]),
+                (
+                    "integer",
+                    vec![serde_json::json!(0), serde_json::json!(9999)],
+                ),
+            ] {
+                let mut limit = query_param("limit", false);
+                limit.ty = ty.into();
+                let mut op = make_op(
+                    "plugin.reports.evaluate",
+                    "/x/reports/evaluate",
+                    vec![limit],
+                );
+                op.method = method.into();
+                let absent =
+                    build_request_parts(&op, &serde_json::json!({}), &[], 20, 100).unwrap();
+                assert!(absent.query.is_empty());
+                for value in values {
+                    let expected = format!("limit={}", value_to_string(&value));
+                    let request =
+                        build_request_parts(&op, &serde_json::json!({"limit":value}), &[], 20, 100)
+                            .unwrap();
+                    assert_eq!(urlencoding::decode(&request.query).unwrap(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn limit_defaults_when_absent() {
