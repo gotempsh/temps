@@ -1090,6 +1090,7 @@ impl InternalApiCaller {
                     "AI access is disabled; enable it in plugin settings",
                 ));
             }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             if binding.access == crate::PluginToolAccess::Write {
                 let event = crate::plugin_registry::PluginWriteAudit {
                     plugin,
@@ -1097,12 +1098,10 @@ impl InternalApiCaller {
                     user_id: scope.auth.user_id_opt(),
                     succeeded: None,
                 };
-                if let Err(error) = binding.audit.create_audit_log(&event).await {
-                    tracing::error!(plugin, operation_id, %error, "Failed to audit plugin AI write attempt");
-                }
+                binding.audit_write(&event, deadline).await;
             }
-            let result = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
+            let result = match tokio::time::timeout_at(
+                deadline,
                 self.call_inner(operation_id, params, scope),
             )
             .await
@@ -1120,9 +1119,7 @@ impl InternalApiCaller {
                     user_id: scope.auth.user_id_opt(),
                     succeeded: Some(result.is_ok()),
                 };
-                if let Err(error) = binding.audit.create_audit_log(&event).await {
-                    tracing::error!(plugin, operation_id, %error, "Failed to audit plugin AI write");
-                }
+                binding.audit_write(&event, deadline).await;
             }
             return result;
         }

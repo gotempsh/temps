@@ -421,12 +421,16 @@ mod tests {
             "{error}"
         );
         let remaining = service.ai_tools.snapshot();
-        assert_eq!(remaining.tools().len(), 1);
+        assert_eq!(remaining.tools().len(), 2);
         assert!(remaining
             .callable("plugin.metrics.list", PluginToolAccess::Read)
             .is_some());
         assert!(remaining
             .callable("plugin.reports.list", PluginToolAccess::Read)
-            .is_none());
+            .is_some());
+        assert!(directory
+            .path()
+            .join("plugins/reports/active.json")
+            .is_file());
     }
 }

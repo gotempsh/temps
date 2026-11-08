@@ -35,6 +35,13 @@ pub struct PluginToolsIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginToolsError {
+    #[error("Cannot index operation '{operation_id}' for plugin '{plugin}': required {location} parameter '{parameter}' is unsupported")]
+    UnsupportedParameter {
+        plugin: String,
+        operation_id: String,
+        parameter: String,
+        location: String,
+    },
     #[error(
         "Cannot index plugin query parameter '{parameter}' in operation '{operation_id}': {reason}"
     )]
@@ -245,6 +252,7 @@ impl PluginToolsIndex {
                         parameters.push(inherited.clone());
                     }
                 }
+                validate_required_parameters(plugin, id, &effective, openapi)?;
                 let mut operation = build_api_operation(
                     format!("plugin.{plugin}.{id}"),
                     format!("/x/{plugin}{path}"),
@@ -388,6 +396,37 @@ fn validate_body_schema(
         plugin: plugin.into(),
         operation_id: operation_id.into(),
     })
+}
+
+fn validate_required_parameters(
+    plugin: &str,
+    operation_id: &str,
+    declaration: &Operation,
+    openapi: &utoipa::openapi::OpenApi,
+) -> Result<(), PluginToolsError> {
+    for parameter in declaration.parameters.iter().flatten() {
+        let Some(parameter) = resolve_component(
+            parameter,
+            openapi.components.as_ref().map(|c| &c.parameters),
+            "#/components/parameters/",
+        ) else {
+            continue;
+        };
+        if matches!(parameter.required, utoipa::openapi::Required::True)
+            && !matches!(
+                parameter.parameter_in,
+                ParameterIn::Path | ParameterIn::Query
+            )
+        {
+            return Err(PluginToolsError::UnsupportedParameter {
+                plugin: plugin.into(),
+                operation_id: operation_id.into(),
+                parameter: parameter.name.clone(),
+                location: format!("{:?}", parameter.parameter_in),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn preserve_query_input_types(

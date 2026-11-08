@@ -75,6 +75,25 @@ pub(crate) struct PluginBinding {
     pub audit: Arc<dyn temps_core::AuditLogger>,
 }
 
+impl PluginBinding {
+    /// Best-effort auditing cannot strand an approved action or hide its result.
+    pub async fn audit_write(&self, event: &PluginWriteAudit<'_>, deadline: tokio::time::Instant) {
+        let audit_deadline =
+            deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+        match tokio::time::timeout_at(audit_deadline, self.audit.create_audit_log(event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(plugin = event.plugin, operation_id = event.operation_id, %error, "Failed to audit plugin AI write")
+            }
+            Err(_) => tracing::error!(
+                plugin = event.plugin,
+                operation_id = event.operation_id,
+                "Plugin AI write audit exceeded its deadline"
+            ),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct PluginWriteAudit<'a> {
     pub plugin: &'a str,

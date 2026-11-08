@@ -1014,14 +1014,27 @@ impl ExternalPluginsService {
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
-            return Err(ExternalPluginsError::NotInstalled {
-                name: name.to_string(),
-            });
+        let active_path = self
+            .manager
+            .config()
+            .plugins_dir
+            .join(name)
+            .join("active.json");
+        match tokio::fs::symlink_metadata(&active_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ExternalPluginsError::NotInstalled { name: name.into() });
+            }
+            Err(error) => {
+                return Err(ExternalPluginsError::Install(InstallError::Io {
+                    plugin: name.into(),
+                    path: active_path.display().to_string(),
+                    reason: error.to_string(),
+                }))
+            }
         }
-        self.ai_tools
-            .publish(self.ai_tools.snapshot().without_plugin(name));
-        self.manager.shutdown_plugin(name).await;
+        // Persist revocation before removing the installation. A database failure
+        // leaves the installation intact so reinstall cannot inherit stale consent.
         crate::grants::PluginGrantService::new(self.db.clone())
             .revoke_actor(name)
             .await
@@ -1032,6 +1045,15 @@ impl ExternalPluginsService {
                     reason: error.to_string(),
                 })
             })?;
+
+        self.ai_tools
+            .publish(self.ai_tools.snapshot().without_plugin(name));
+        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
+            return Err(ExternalPluginsError::NotInstalled {
+                name: name.to_string(),
+            });
+        }
+        self.manager.shutdown_plugin(name).await;
 
         self.refresh_runtime_surfaces().await;
         Ok(())
@@ -2249,6 +2271,41 @@ except Exception:
             .await
             .expect("catalogue update task")
             .expect("catalogue update must commit after installation finishes");
+    }
+
+    #[tokio::test]
+    async fn failed_uninstall_revocation_preserves_installation_until_retry() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
+        let temp = tempfile::tempdir().unwrap();
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        let active = config.plugins_dir.join("reports/active.json");
+        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
+        std::fs::write(&active, b"fixture active selection").unwrap();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([DbErr::Custom("revocation unavailable".into())])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<temps_entities::external_plugin_actors::Model>::new()])
+            .into_connection();
+        let service = ExternalPluginsService::new_empty(config, None, Arc::new(db));
+        let before = service.ai_tools.snapshot();
+        assert!(service.uninstall_plugin("reports").await.is_err());
+        assert!(
+            active.is_file(),
+            "a failed revocation must not remove the active installation"
+        );
+        assert!(Arc::ptr_eq(&before, &service.ai_tools.snapshot()));
+        service.uninstall_plugin("reports").await.unwrap();
+        assert!(
+            !active.exists(),
+            "deactivation follows durable revocation on retry"
+        );
+        assert!(!Arc::ptr_eq(&before, &service.ai_tools.snapshot()));
     }
 
     #[tokio::test]

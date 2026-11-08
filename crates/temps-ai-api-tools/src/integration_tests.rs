@@ -951,6 +951,71 @@ mod tests {
             .await
             .is_err());
     }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_audits_do_not_block_plugin_write_completion() {
+        use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct StalledAudit {
+            calls: AtomicUsize,
+            stall_call: usize,
+        }
+        #[async_trait::async_trait]
+        impl temps_core::AuditLogger for StalledAudit {
+            async fn create_audit_log(
+                &self,
+                _: &dyn temps_core::audit::AuditOperation,
+            ) -> temps_core::AuditResult<()> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.stall_call {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        }
+        for stall_call in [0, 1] {
+            let executed = Arc::new(AtomicUsize::new(0));
+            let count = executed.clone();
+            let router = Router::new().route(
+                "/x/reports/reports",
+                axum::routing::post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { Json(json!({"created":true})) }
+                }),
+            );
+            let spec = plugin_spec();
+            let registry = Arc::new(PluginToolsRegistry::default());
+            let handle = ApiToolsHandle::new();
+            let target = handle.clone();
+            let audit = Arc::new(StalledAudit {
+                calls: AtomicUsize::new(0),
+                stall_call,
+            });
+            registry.bind(
+                InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+                PluginToolAccess::Write,
+                audit.clone(),
+                move |caller| target.set(caller),
+            );
+            registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                handle.get().unwrap().execute_write(
+                    "plugin.reports.create",
+                    json!({}),
+                    &secrets_scope(None),
+                ),
+            )
+            .await
+            .expect("audit must not exceed its budget")
+            .unwrap();
+            assert_eq!(result.body["created"], true);
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(audit.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_plugin_writes_leave_an_audit_attempt() {
         use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};

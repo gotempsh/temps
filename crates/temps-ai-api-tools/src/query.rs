@@ -199,6 +199,23 @@ mod tests {
     }
 
     #[test]
+    fn required_inputs_that_cannot_be_forwarded_are_rejected() {
+        for location in ["header", "cookie", "querystring"] {
+            let parameter = json!({"name":"X-Report-Version","in":location,
+                "required":true,"schema":{"type":"string"}});
+            let error = index(parameter.clone()).unwrap_err();
+            assert!(
+                matches!(error, crate::PluginToolsError::UnsupportedParameter {
+                ref parameter, ..
+            } if parameter == "X-Report-Version")
+            );
+            let mut optional = parameter;
+            optional["required"] = json!(false);
+            assert!(index(optional).is_ok());
+        }
+    }
+
+    #[test]
     fn unsupported_declarations_are_rejected_before_discovery() {
         for declaration in [
             json!({"schema":{"type":"object"}}),
