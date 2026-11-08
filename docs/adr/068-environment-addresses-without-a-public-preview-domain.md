@@ -66,7 +66,7 @@ The managed environment domain row is the environment's identity, and it is
 kept for the life of the environment whatever happens to addressing. Changing
 `preview_domain`, adding or removing a tunnel, or adding custom domains never
 deletes or renames it; only renaming or deleting the environment does, as
-today. What changes is how that label is *served*: under the preview domain
+today. What changes is how that label is _served_: under the preview domain
 (D2) and, when the preview domain cannot be reached, under a tunnel's zone
 (D3).
 
@@ -74,12 +74,12 @@ today. What changes is how that label is *served*: under the preview domain
 
 The control plane classifies `preview_domain`, from facts it already has:
 
-| Status | Meaning | Source |
-|---|---|---|
-| `local_only` | `localhost`, `localho.st` or a name under them | `is_local_only` |
+| Status       | Meaning                                                                           | Source             |
+| ------------ | --------------------------------------------------------------------------------- | ------------------ |
+| `local_only` | `localhost`, `localho.st` or a name under them                                    | `is_local_only`    |
 | `unresolved` | a probe label under it (`temps-probe-<random>.<preview_domain>`) does not resolve | DNS, as ADR 064 D7 |
-| `no_way_in` | it resolves, but to no address a listener of this install serves publicly | ADR 064 ways in |
-| `usable` | it resolves to a public way in of this install | ADR 064 ways in |
+| `no_way_in`  | it resolves, but to no address a listener of this install serves publicly         | ADR 064 ways in    |
+| `usable`     | it resolves to a public way in of this install                                    | ADR 064 ways in    |
 
 The status is shown next to the setting, and it is the "valid preview domain"
 every later decision refers to. It is recomputed when the setting, the nodes'
@@ -173,6 +173,28 @@ no longer resolves.
 A monitor whose check path was set by the user keeps that path on the new
 address. A monitor created by hand with an explicit URL is not changed.
 
+### D5 amendment — solution first, one recommended action (2026-11-08)
+
+The console nudge is a compact neutral row: “Make production reachable”.
+Show one recommended action, preserving the planner's server-side preference
+order. When a configured tunnel covers a suggested hostname, offer an editable
+single DNS label and a zone picker only when there are multiple zones. Prefer
+the configured environment-host tunnel, then stable connector order. “Add
+domain” uses the existing per-address `existing_tunnel` plan/run, not the
+installation-wide `tunnel_environment_hosts` switch. Never silently confirm a
+plan that changes an existing routing choice; link to its review page instead.
+Show progress and the verified live URL inline, with a link to the durable run
+for waiting, conflict, verification and recovery.
+
+Other ways and the technical reason live behind a quiet disclosure. With no
+safe one-step action, link to the environment's Make it reachable page. Render
+once per environment view, only for a deployed web service, and allow “Not now”
+per environment in browser storage where no server preference exists. The
+existing reachability links remain available after dismissal. Health status
+labels and dots are outside this amendment: worker-side health checks own
+that behavior. Deploy summaries, server-generated logs and notifications
+use the same short, solution-first vocabulary.
+
 ### D5. Warn when a deploy produces an app nobody can open
 
 A successful deployment of a hosted environment carries a **reachability
@@ -204,6 +226,7 @@ table):
    tunnel that could carry it (D3), the preview domain, a custom domain, and
    public ingress on a worker (with the exact `temps agent ingress` command)
    when no node takes public traffic.
+
 2. **The deployment and project APIs.** A `reachability_warning` field
    (`null` when there is none) with the message and the fixes, so the console
    and `temps deploy` print the same words.
@@ -274,10 +297,10 @@ reachable". It is done when the preview domain is `usable` or a tunnel has
 
 ## Phases
 
-| Phase | Scope |
-|---|---|
-| 1 | D2 preview-domain status; D4 primary address in the header, open button, deployment page and API ordering; the monitor's `no_address` state; D5 warning in the log, the API, the console and notifications; the checklist step |
-| 2 | D3 tunnel environment hosts: `environment_hosts` and `generated_by_connector_id` columns, generation, publication, renames, withdrawal, and the one-click fix from the D5 warning |
+| Phase | Scope                                                                                                                                                                                                                          |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1     | D2 preview-domain status; D4 primary address in the header, open button, deployment page and API ordering; the monitor's `no_address` state; D5 warning in the log, the API, the console and notifications; the checklist step |
+| 2     | D3 tunnel environment hosts: `environment_hosts` and `generated_by_connector_id` columns, generation, publication, renames, withdrawal, and the one-click fix from the D5 warning                                              |
 
 ## Open questions
 
@@ -299,7 +322,7 @@ or the code reads it a particular way, the choice is listed here.
 ### Phase 1
 
 - **Only a sure answer warns.** The D5 warning and the D4 `no_address` state
-  are set only when reachability settles on "not reachable" *and* no way in
+  are set only when reachability settles on "not reachable" _and_ no way in
   was ever set up for any address. Each verdict carries that as a flag
   (`nothing_set_up`, internal, not in the API), set only for a local-only
   host, an audience routing does not serve, nothing deployed, and the
