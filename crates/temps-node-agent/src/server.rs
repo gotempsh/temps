@@ -625,6 +625,14 @@ fn spawn_heartbeat_loop(
             ) {
                 fields.insert(temps_core::node_address::AGENT_HOST_KEY.to_string(), host);
             }
+            // Whether `<env>.<project>.temps.local` names, which resolve to
+            // this node's bridge, are actually served here, and why not.
+            if let (Some(proxy), Some(fields)) = (
+                crate::internal_proxy::heartbeat_value(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(crate::internal_proxy::HEARTBEAT_KEY.to_string(), proxy);
+            }
             // The node runtime's reports: only those that changed since the
             // last accepted beat.
             let instance_reports = match &node_runtime {

@@ -684,6 +684,34 @@ pub struct NodeDnsStatusEntry {
     pub dns_resolver_consecutive_failures: i32,
     pub dns_resolver_last_error: Option<String>,
     pub dns_resolver_record_count: Option<i32>,
+    /// Whether the node's internal edge proxy listens on its bridge address
+    /// (port 80), which is where every `<env>.<project>.temps.local` name
+    /// points. The resolver can be healthy while this is `false`: the names
+    /// resolve and every call fails. `None` = not reported (older agent, or
+    /// no overlay bridge yet).
+    pub internal_proxy_listening: Option<bool>,
+    /// The address the proxy binds, e.g. `10.205.0.1:80`.
+    pub internal_proxy_address: Option<String>,
+    /// Why the last bind failed, written for the operator; `None` while it
+    /// listens.
+    pub internal_proxy_error: Option<String>,
+}
+
+/// The internal proxy's state from a heartbeat's `capacity.internal_proxy`:
+/// `(listening, address, error)`, all `None` when the agent never reported
+/// it.
+fn internal_proxy_from_capacity(
+    capacity: &serde_json::Value,
+) -> (Option<bool>, Option<String>, Option<String>) {
+    let proxy = &capacity["internal_proxy"];
+    let text = |key: &str| {
+        proxy[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    (proxy["listening"].as_bool(), text("address"), text("error"))
 }
 
 /// An internal DNS name two owners publish (ADR-055 §10). The holder's
@@ -3300,17 +3328,26 @@ async fn cluster_dns_status(
     let now = chrono::Utc::now();
     let node_entries = nodes
         .into_iter()
-        .map(|n| NodeDnsStatusEntry {
-            node_id: n.id,
-            node_name: n.name,
-            node_status: n.status,
-            dns_resolver_running: n.dns_resolver_running,
-            dns_resolver_tasks_alive: n.dns_resolver_tasks_alive,
-            dns_resolver_last_sync_at: n.dns_resolver_last_sync_at.map(|t| t.to_rfc3339()),
-            seconds_since_last_sync: n.dns_resolver_last_sync_at.map(|t| (now - t).num_seconds()),
-            dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
-            dns_resolver_last_error: n.dns_resolver_last_error,
-            dns_resolver_record_count: n.dns_resolver_record_count,
+        .map(|n| {
+            let (internal_proxy_listening, internal_proxy_address, internal_proxy_error) =
+                internal_proxy_from_capacity(&n.capacity);
+            NodeDnsStatusEntry {
+                node_id: n.id,
+                node_name: n.name,
+                node_status: n.status,
+                dns_resolver_running: n.dns_resolver_running,
+                dns_resolver_tasks_alive: n.dns_resolver_tasks_alive,
+                dns_resolver_last_sync_at: n.dns_resolver_last_sync_at.map(|t| t.to_rfc3339()),
+                seconds_since_last_sync: n
+                    .dns_resolver_last_sync_at
+                    .map(|t| (now - t).num_seconds()),
+                dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
+                dns_resolver_last_error: n.dns_resolver_last_error,
+                dns_resolver_record_count: n.dns_resolver_record_count,
+                internal_proxy_listening,
+                internal_proxy_address,
+                internal_proxy_error,
+            }
         })
         .collect();
 
@@ -4668,6 +4705,45 @@ mod tests {
     use sea_orm::{DatabaseBackend, EntityTrait, MockDatabase};
     use temps_entities::{deployment_containers, nodes};
     use tower::ServiceExt;
+
+    #[test]
+    fn internal_proxy_state_is_read_from_the_heartbeat_capacity() {
+        let held = serde_json::json!({
+            "cpu_cores": 44,
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": false,
+                "error": "another program already listens on 10.205.0.1:80",
+                "attempts": 7,
+            },
+        });
+        assert_eq!(
+            internal_proxy_from_capacity(&held),
+            (
+                Some(false),
+                Some("10.205.0.1:80".to_string()),
+                Some("another program already listens on 10.205.0.1:80".to_string()),
+            )
+        );
+
+        let serving = serde_json::json!({
+            "internal_proxy": {"address": "10.205.0.1:80", "listening": true, "error": null},
+        });
+        assert_eq!(
+            internal_proxy_from_capacity(&serving),
+            (Some(true), Some("10.205.0.1:80".to_string()), None)
+        );
+
+        // An agent from before this field, or a malformed value: unknown,
+        // never "not listening".
+        for unknown in [
+            serde_json::json!({"cpu_cores": 2}),
+            serde_json::json!({"internal_proxy": "yes"}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(internal_proxy_from_capacity(&unknown), (None, None, None));
+        }
+    }
 
     // ── Removing containers a node removal would lose track of ──────────
 

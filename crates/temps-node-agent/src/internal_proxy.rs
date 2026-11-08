@@ -304,6 +304,155 @@ fn duration_micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+/// Key of the internal proxy's state in the heartbeat's `capacity`.
+///
+/// No column: `capacity` is agent-derived and wholly replaced on every beat,
+/// which is exactly the lifecycle of "is the proxy listening right now".
+pub const HEARTBEAT_KEY: &str = "internal_proxy";
+
+/// First and longest wait between two bind attempts.
+const BIND_RETRY_FIRST: Duration = Duration::from_secs(1);
+const BIND_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// What the internal edge proxy is doing, as the heartbeat reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalProxyStatus {
+    pub address: SocketAddr,
+    pub listening: bool,
+    /// Why the last bind failed, written for the operator. `None` once
+    /// listening.
+    pub error: Option<String>,
+    /// Bind attempts so far, the successful one included.
+    pub attempts: u32,
+}
+
+impl InternalProxyStatus {
+    pub fn heartbeat_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "address": self.address.to_string(),
+            "listening": self.listening,
+            "error": self.error,
+            "attempts": self.attempts,
+        })
+    }
+}
+
+/// One proxy per agent process (see [`spawn`]), so its state is too.
+static STATUS: RwLock<Option<InternalProxyStatus>> = RwLock::new(None);
+
+/// The proxy's state for the heartbeat; `None` until the first bind attempt
+/// (the overlay bridge has no address yet).
+pub fn heartbeat_value() -> Option<serde_json::Value> {
+    STATUS
+        .read()
+        .as_ref()
+        .map(InternalProxyStatus::heartbeat_value)
+}
+
+fn record_status(status: InternalProxyStatus) {
+    *STATUS.write() = Some(status);
+}
+
+/// Why the proxy could not listen on `addr`, and what to do about it.
+///
+/// The failure this exists for: anything already listening on port 80 of
+/// every address (`0.0.0.0:80`: nginx, Caddy, Traefik, another Temps) owns
+/// the bridge address too. `<env>.<project>.temps.local` names still resolve
+/// to the bridge, so every app-to-app call reaches that program and gets its
+/// answer (typically a 404), with nothing pointing at the cause.
+pub fn explain_bind_error(error: &std::io::Error, addr: SocketAddr) -> String {
+    let ip = addr.ip();
+    let port = addr.port();
+    match error.kind() {
+        std::io::ErrorKind::AddrInUse => format!(
+            "another program already listens on {addr}, or on port {port} of every address of \
+             this host (0.0.0.0:{port}: a web server such as nginx, Caddy or Traefik, or another \
+             Temps install), so calls to <environment>.<project>.temps.local names reach that \
+             program instead of this node's internal proxy and fail. Free port {port} on this \
+             worker; the agent keeps retrying and starts serving as soon as it can"
+        ),
+        std::io::ErrorKind::AddrNotAvailable => format!(
+            "{ip} is not an address of this host yet (the overlay bridge is not up); the agent \
+             keeps retrying"
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "the agent may not listen on port {port} of {ip}: ports below 1024 need root or \
+             CAP_NET_BIND_SERVICE. Run the agent service as root; it keeps retrying"
+        ),
+        // Also the failures after the bind (the first read of workload
+        // identities from Docker), which release the port again.
+        _ => format!("could not start on {addr}: {error}; the agent keeps retrying"),
+    }
+}
+
+/// Wait before bind attempt `attempt + 1`: 1 s, doubling, at most 60 s.
+pub fn bind_retry_delay(attempt: u32) -> Duration {
+    let factor = 1u32 << attempt.saturating_sub(1).min(6);
+    (BIND_RETRY_FIRST * factor).min(BIND_RETRY_MAX)
+}
+
+/// [`spawn`], retried until the listener binds or `shutdown` is notified.
+///
+/// A failed bind used to be logged once and never tried again, leaving the
+/// node advertising `*.temps.local` names nobody served until the agent was
+/// restarted. The state of every attempt goes to the heartbeat
+/// ([`heartbeat_value`]), and a bind that succeeds after failures says so.
+pub async fn spawn_supervised(
+    bridge_ip: IpAddr,
+    port: u16,
+    store: SharedRouteStore,
+    docker: bollard::Docker,
+    shutdown: Arc<Notify>,
+) {
+    let address = SocketAddr::new(bridge_ip, port);
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match spawn(
+            bridge_ip,
+            port,
+            store.clone(),
+            docker.clone(),
+            shutdown.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                if attempts > 1 {
+                    info!(%address, attempts, "internal edge proxy listening after failed binds");
+                }
+                record_status(InternalProxyStatus {
+                    address,
+                    listening: true,
+                    error: None,
+                    attempts,
+                });
+                return;
+            }
+            Err(error) => {
+                let explained = explain_bind_error(&error, address);
+                // The first failure and then every doubling: a conflict
+                // that lasts for days must not log once a minute forever.
+                if attempts.is_power_of_two() {
+                    warn!(%address, attempts, %error, "internal edge proxy cannot listen: {explained}");
+                } else {
+                    debug!(%address, attempts, %error, "internal edge proxy still cannot listen");
+                }
+                record_status(InternalProxyStatus {
+                    address,
+                    listening: false,
+                    error: Some(explained),
+                    attempts,
+                });
+                tokio::select! {
+                    _ = tokio::time::sleep(bind_retry_delay(attempts)) => {}
+                    _ = shutdown.notified() => return,
+                }
+            }
+        }
+    }
+}
+
 /// Spawn the proxy on `<bridge_ip>:80`. Returns once the listener is
 /// bound; the request loop runs in a background task and exits when
 /// `shutdown` is notified.
@@ -2251,6 +2400,112 @@ mod tests {
             gate: None,
             shield: None,
         }
+    }
+
+    #[test]
+    fn a_port_held_on_every_address_is_explained_as_such() {
+        let addr: SocketAddr = "10.205.0.1:80".parse().unwrap();
+        let held = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let message = explain_bind_error(&held, addr);
+        for needle in [
+            "10.205.0.1:80",
+            "0.0.0.0:80",
+            "temps.local",
+            "Free port 80",
+            "keeps retrying",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from {message}"
+            );
+        }
+
+        let missing = std::io::Error::from(std::io::ErrorKind::AddrNotAvailable);
+        assert!(explain_bind_error(&missing, addr).contains("overlay bridge is not up"));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(explain_bind_error(&denied, addr).contains("CAP_NET_BIND_SERVICE"));
+        let docker = std::io::Error::other("docker unreachable");
+        let message = explain_bind_error(&docker, addr);
+        assert!(message.contains("docker unreachable") && message.contains("keeps retrying"));
+    }
+
+    #[test]
+    fn bind_retries_back_off_from_one_second_to_a_minute() {
+        let secs: Vec<u64> = (0..=9).map(|a| bind_retry_delay(a).as_secs()).collect();
+        assert_eq!(secs, vec![1, 1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(bind_retry_delay(u32::MAX), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn status_heartbeat_value_carries_the_reason() {
+        let status = InternalProxyStatus {
+            address: "10.205.0.1:80".parse().unwrap(),
+            listening: false,
+            error: Some("held".into()),
+            attempts: 3,
+        };
+        assert_eq!(
+            status.heartbeat_value(),
+            serde_json::json!({
+                "address": "10.205.0.1:80",
+                "listening": false,
+                "error": "held",
+                "attempts": 3,
+            })
+        );
+    }
+
+    /// The failure seen on a worker whose host already runs a web server on
+    /// port 80: the proxy keeps trying instead of giving up after one
+    /// attempt, and the heartbeat says why it is not listening.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_port_is_retried_and_reported() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let store = Arc::new(RouteStore::new(PathBuf::from("/tmp/unused-routes.json")));
+        // Never contacted: the bind fails before the proxy touches Docker.
+        let docker = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:9",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let task = tokio::spawn(spawn_supervised(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            store,
+            docker,
+            Arc::clone(&shutdown),
+        ));
+
+        let mut reported = None;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let value = heartbeat_value();
+            if value
+                .as_ref()
+                .and_then(|v| v["attempts"].as_u64())
+                .is_some_and(|attempts| attempts >= 3)
+            {
+                reported = value;
+                break;
+            }
+        }
+        let reported = reported.expect("the bind was not retried");
+        assert_eq!(reported["listening"], false);
+        assert_eq!(reported["address"], format!("127.0.0.1:{port}"));
+        assert!(reported["error"]
+            .as_str()
+            .unwrap()
+            .contains("another program already listens"));
+
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(120), task)
+            .await
+            .expect("supervisor did not stop on shutdown")
+            .unwrap();
+        drop(blocker);
     }
 
     #[test]
