@@ -112,6 +112,20 @@ fn page() -> AccessPageQuery {
 }
 
 #[test]
+fn service_save_rejects_destinations_the_sdk_cannot_represent() {
+    let mut req = request();
+    // Individually valid DNS labels can still exceed the SDK's total host bound.
+    req.policy.origin = format!("https://{}", vec!["a".repeat(63); 5].join("."));
+    assert!(matches!(
+        validate_service(&mut req),
+        Err(AccessError::Validation {
+            field: "origin",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn validates_and_normalizes_service_policy() {
     let mut req = request();
     validate_service(&mut req).unwrap();
@@ -184,6 +198,7 @@ fn typed_status_is_never_connected_and_expiry_is_exact() {
     let result = grant_response(g.clone(), &s, "sbx_test", now).unwrap();
     assert!(!result.connected);
     assert_eq!(result.status, ServiceGrantStatus::IntegrationUnavailable);
+    assert!(result.reason.contains("live access is not enabled"));
     assert_eq!(
         grant_response(g.clone(), &s, "sbx_test", g.expires_at)
             .unwrap()

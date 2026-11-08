@@ -4,10 +4,15 @@
 //! Integration seam only. Saving a request is deliberately separate from
 //! provisioning it. A future adapter must reauthorize a fresh request, bind it
 //! to a sandbox incarnation, and acknowledge enforcement before reporting ready.
-use crate::error::AccessError;
+use crate::{
+    error::AccessError,
+    tokenless::{PreparedSession, RevokeSession},
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+pub(crate) const UNAVAILABLE_REASON: &str = "Tokenless policy preparation is available, but live access is not enabled. Hard expiry, confirmed revocation and sandbox transport are still required. Saved requests do not connect sandboxes; enabling access will require a new request.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -28,11 +33,10 @@ pub struct AccessCapability {
 pub trait ServiceAccessBroker: Send + Sync {
     fn capability(&self) -> AccessCapability;
     /// No implementation may interpret an old saved intent as fresh consent.
-    /// The integration implementation must add a typed, incarnation-bound
-    /// provisioning command before enabling this operation.
-    async fn provision(&self, grant_id: &str) -> Result<(), AccessError>;
+    /// Preparation alone does not authorize activation.
+    async fn provision(&self, session: &PreparedSession) -> Result<(), AccessError>;
     /// Must not acknowledge until the runtime has stopped forwarding traffic.
-    async fn revoke(&self, grant_id: &str) -> Result<(), AccessError>;
+    async fn revoke(&self, session: &RevokeSession) -> Result<(), AccessError>;
 }
 
 pub struct UnavailableTokenlessBroker;
@@ -43,20 +47,20 @@ impl ServiceAccessBroker for UnavailableTokenlessBroker {
             state: AccessCapabilityState::IntegrationUnavailable,
             configured: false,
             can_save_requests: true,
-            reason: "The Tokenless integration is not installed. You can save services and access requests, but they do not connect sandboxes. Installing the integration will require a new access request.".into(),
+            reason: UNAVAILABLE_REASON.into(),
             setup_path: None,
         }
     }
-    async fn provision(&self, grant_id: &str) -> Result<(), AccessError> {
+    async fn provision(&self, session: &PreparedSession) -> Result<(), AccessError> {
         Err(AccessError::BrokerUnavailable {
             operation: "provision",
-            grant_id: grant_id.into(),
+            grant_id: session.grant_id().to_string(),
         })
     }
-    async fn revoke(&self, grant_id: &str) -> Result<(), AccessError> {
+    async fn revoke(&self, session: &RevokeSession) -> Result<(), AccessError> {
         Err(AccessError::BrokerUnavailable {
             operation: "revoke",
-            grant_id: grant_id.into(),
+            grant_id: session.grant_id.to_string(),
         })
     }
 }
@@ -68,12 +72,23 @@ mod tests {
     async fn unavailable_adapter_never_claims_enforcement() {
         let broker = UnavailableTokenlessBroker;
         assert!(!broker.capability().configured);
+        assert!(broker
+            .capability()
+            .reason
+            .contains("live access is not enabled"));
+        assert!(broker.capability().reason.contains("new request"));
+        let session = crate::tokenless::tests::prepared_session();
+        let grant_id = session.grant_id().to_string();
+        let revoke = RevokeSession {
+            target: session.target().clone(),
+            grant_id: session.grant_id().into(),
+        };
         for result in [
-            broker.provision("grant-test").await,
-            broker.revoke("grant-test").await,
+            broker.provision(&session).await,
+            broker.revoke(&revoke).await,
         ] {
             assert!(
-                matches!(result, Err(AccessError::BrokerUnavailable { grant_id, .. }) if grant_id == "grant-test")
+                matches!(result, Err(AccessError::BrokerUnavailable { grant_id: id, .. }) if id == grant_id)
             );
         }
     }

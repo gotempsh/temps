@@ -407,63 +407,8 @@ pub fn validate_service(request: &mut SaveAccessService) -> Result<(), AccessErr
             return Err(invalid("credential", "must be a nonempty bearer value of at most 16384 printable ASCII bytes, without whitespace"));
         }
     }
-    let url = url::Url::parse(&request.policy.origin)
-        .map_err(|_| invalid("origin", "must be an HTTPS origin"))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| invalid("origin", "must have a DNS hostname"))?;
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || host.parse::<std::net::IpAddr>().is_ok()
-        || !host.contains('.')
-        || host.ends_with('.')
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || !host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        })
-    {
-        return Err(invalid(
-            "origin",
-            "must be a DNS HTTPS origin on port 443, without credentials, path, query or fragment",
-        ));
-    }
-    request.policy.origin = format!("https://{host}");
-    if request.policy.path_prefixes.is_empty() || request.policy.path_prefixes.len() > 32 {
-        return Err(invalid(
-            "path_prefixes",
-            "provide between 1 and 32 path prefixes",
-        ));
-    }
-    for path in &request.policy.path_prefixes {
-        if !path.starts_with('/')
-            || path.len() > 512
-            || path.contains("//")
-            || path.split('/').any(|s| s == "." || s == "..")
-            || !path
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"/-_.~".contains(&c))
-        {
-            return Err(invalid(
-                "path_prefixes",
-                "use absolute paths without encoding, traversal, query strings or wildcards",
-            ));
-        }
-    }
-    if request.policy.methods.is_empty() || request.policy.methods.len() > 6 {
-        return Err(invalid("methods", "provide between 1 and 6 HTTP methods"));
-    }
+    let (policy, _) = crate::tokenless::compile_policy(&request.policy)?;
+    request.policy = policy;
     Ok(())
 }
 
@@ -515,7 +460,10 @@ fn grant_response(
             "The service changed. Review its policy and save a new request.",
         )
     } else {
-        (ServiceGrantStatus::IntegrationUnavailable, "The Tokenless integration is not installed. This request does not connect the sandbox and will not activate automatically.")
+        (
+            ServiceGrantStatus::IntegrationUnavailable,
+            crate::broker::UNAVAILABLE_REASON,
+        )
     };
     let policy = serde_json::from_value(grant.policy_snapshot).map_err(|source| {
         AccessError::StoredPolicy {

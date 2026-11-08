@@ -24,6 +24,8 @@ utoipa.workspace = true
 sea-orm.workspace = true
 async-trait.workspace = true
 url.workspace = true
+# Pin the audited SDK contract while upstream enforcement work continues.
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "bd4ca27af474592b60354fc7343b3a9b1153f3c1" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

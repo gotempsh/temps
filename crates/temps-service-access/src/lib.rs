@@ -6,5 +6,6 @@ pub mod error;
 pub mod handlers;
 mod plugin;
 pub mod service;
+pub mod tokenless;
 pub mod types;
 pub use plugin::ServiceAccessPlugin;
