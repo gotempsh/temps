@@ -70,12 +70,17 @@ pub(super) async fn put_plugin_ai_tools(
         actor_id: request.actor_id.clone(),
         enabled: request.enabled,
     };
-    let response = state
-        .service
-        .update_plugin_ai_tools(&name, request)
-        .await
-        .map_err(grant_problem)?;
-    record_audit(&state, &event).await;
+    let result = state.service.update_plugin_ai_tools(&name, request).await;
+    if result.is_ok()
+        || matches!(
+            &result,
+            Err(crate::grants::GrantError::AiToolsPublication { .. })
+        )
+    {
+        // Publication failure happens after the durable change; retain its audit.
+        record_audit(&state, &event).await;
+    }
+    let response = result.map_err(grant_problem)?;
     Ok(Json(response))
 }
 

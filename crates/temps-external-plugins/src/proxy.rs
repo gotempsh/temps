@@ -1295,7 +1295,10 @@ mod tests {
             PluginToolsRegistry, ProjectSelectorScope,
         };
         for method in ["GET", "TRACE"] {
-            for status in [200, 400, 500] {
+            for (status, cap) in [200, 400, 500]
+                .into_iter()
+                .flat_map(|status| [30, 70, 128 * 1024].map(|cap| (status, cap)))
+            {
                 #[cfg(target_os = "macos")]
                 let root = PathBuf::from("/private/tmp");
                 #[cfg(not(target_os = "macos"))]
@@ -1367,7 +1370,8 @@ mod tests {
                 let handle = ApiToolsHandle::new();
                 let target = handle.clone();
                 registry.bind(
-                    InternalApiCaller::new_allowlisted(router, &spec, vec![]),
+                    InternalApiCaller::new_allowlisted(router, &spec, vec![])
+                        .with_max_response_bytes(cap),
                     if method == "GET" {
                         PluginToolAccess::Read
                     } else {
@@ -1410,9 +1414,16 @@ mod tests {
                 };
                 let token = token_rx.await.unwrap();
                 assert!(!output.contains("fixture-signature"), "{output}");
+                assert!(!output.contains("fixture-signatur"), "{output}");
                 assert!(!output.contains(&token));
-                if status != 500 {
+                assert!(!output.contains(&token[..20]), "{output}");
+                if status != 500 && cap == 128 * 1024 {
                     assert!(output.contains("signature=*** actor=***"), "{output}");
+                } else if status != 500 {
+                    assert!(
+                        output.contains("omitted to protect credentials"),
+                        "{output}"
+                    );
                 }
                 server.await.unwrap();
             }

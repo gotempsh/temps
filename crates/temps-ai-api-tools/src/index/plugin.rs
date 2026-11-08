@@ -35,6 +35,8 @@ pub struct PluginToolsIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginToolsError {
+    #[error("Cannot index AI tools for plugin '{plugin}': name overlaps the host plugin management namespace")]
+    ReservedPluginName { plugin: String },
     #[error("Cannot index AI operation '{operation_id}' for plugin '{plugin}': parameter '{parameter}' occurs in multiple locations")]
     AmbiguousParameter {
         plugin: String,
@@ -117,6 +119,11 @@ impl PluginToolsIndex {
         openapi: &utoipa::openapi::OpenApi,
         enabled: bool,
     ) -> Result<Self, PluginToolsError> {
+        if plugin.eq_ignore_ascii_case("plugins") {
+            return Err(PluginToolsError::ReservedPluginName {
+                plugin: plugin.into(),
+            });
+        }
         if !valid_identifier(plugin) {
             return Err(PluginToolsError::InvalidPluginName {
                 plugin: plugin.into(),
@@ -514,6 +521,18 @@ mod tests {
             }}}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn host_management_namespace_cannot_be_exposed_by_a_plugin() {
+        for name in ["plugins", "Plugins", "PLUGINS"] {
+            for method in ["get", "put", "post"] {
+                assert!(matches!(
+                    PluginToolsIndex::from_openapi(name, &spec(method, json!({})), true),
+                    Err(PluginToolsError::ReservedPluginName { .. })
+                ));
+            }
+        }
     }
 
     #[test]

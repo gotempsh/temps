@@ -1284,6 +1284,17 @@ impl InternalApiCaller {
         // Step 5: collect body with size cap.
         let (mut body_value, truncated) =
             collect_body(response.into_body(), self.max_response_bytes, operation_id).await?;
+        // A byte cap can cut through a credential (including its JSON-escaped
+        // representation). Full-value replacement cannot safely mask that prefix.
+        // Keep bounded output, but withhold truncated credential-bearing responses.
+        if truncated
+            && (!substituted.is_empty()
+                || plugin_guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.has_response_credentials()))
+        {
+            body_value = Value::String("Truncated response omitted to protect credentials".into());
+        }
         crate::secrets::scrub(&mut body_value, &substituted);
         if let Some(guard) = &plugin_guard {
             guard.scrub_response(&mut body_value);

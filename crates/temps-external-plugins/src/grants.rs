@@ -38,6 +38,10 @@ pub struct PluginGrants {
 
 #[derive(Debug, Error)]
 pub enum GrantError {
+    #[error(
+        "AI consent was saved for plugin '{plugin_name}', but publishing tools failed: {source}"
+    )]
+    AiToolsPublication { plugin_name: String, source: DbErr },
     #[error("Plugin actor for '{plugin_name}' was not found or is inactive")]
     NotFound { plugin_name: String },
     #[error("Invalid grant configuration for plugin '{plugin_name}': {reason}")]

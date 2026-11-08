@@ -120,12 +120,23 @@ impl ExternalPluginsService {
                     operation: "update AI tool consent",
                     source,
                 })?;
-        self.rebuild_ai_tools().await;
+        self.try_rebuild_ai_tools()
+            .await
+            .map_err(|source| GrantError::AiToolsPublication {
+                plugin_name: name.into(),
+                source,
+            })?;
         Ok(self.ai_tools_response(saved))
     }
 
     /// Called under the lifecycle lock so old discovery cannot overwrite a toggle.
     pub(crate) async fn rebuild_ai_tools(&self) {
+        if let Err(error) = self.try_rebuild_ai_tools().await {
+            tracing::error!(%error, "Failed to load plugin AI consent; tools disabled; retry a consent save or reload plugins to recover");
+        }
+    }
+
+    async fn try_rebuild_ai_tools(&self) -> Result<(), sea_orm::DbErr> {
         let actors = match temps_core::retry::RetryConfig::default()
             .retry_if(
                 || async {
@@ -141,8 +152,7 @@ impl ExternalPluginsService {
             Ok(actors) => actors,
             Err(error) => {
                 self.ai_tools.publish(PluginToolsIndex::default());
-                tracing::error!(%error, "Failed to load plugin AI consent; tools disabled");
-                return;
+                return Err(error);
             }
         };
         let enabled: std::collections::HashMap<_, _> = actors
@@ -163,6 +173,7 @@ impl ExternalPluginsService {
             }
         }
         self.ai_tools.publish(index);
+        Ok(())
     }
 }
 
@@ -328,7 +339,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn saved_consent_survives_a_failed_index_refresh_for_auditing() {
+    async fn saved_consent_reports_a_failed_index_refresh_for_auditing_and_retry() {
         let actor = actors::Model {
             id: uuid::Uuid::from_u128(3),
             plugin_name: "reports".into(),
@@ -347,7 +358,7 @@ mod tests {
                 .append_query_errors([DbErr::Custom("refresh unavailable".into())])
                 .into_connection(),
         );
-        let response = service
+        let error = service
             .update_plugin_ai_tools(
                 "reports",
                 UpdatePluginAiTools {
@@ -356,10 +367,9 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .unwrap_err();
         assert!(
-            response.enabled,
-            "saved changes must return success so handlers audit them"
+            matches!(error, GrantError::AiToolsPublication { plugin_name, .. } if plugin_name == "reports")
         );
         assert!(
             service.ai_tools.snapshot().tools().is_empty(),
