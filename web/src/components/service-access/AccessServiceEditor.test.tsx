@@ -1,0 +1,314 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { afterEach, expect, test } from 'bun:test'
+import type { ReactNode } from 'react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import type {
+  AccessServiceResponse,
+  CreateAccessServiceData,
+  RequestServiceGrant,
+} from '@/api/client'
+import { AccessServiceEditor } from './AccessServiceEditor'
+import { ServiceGrantEditor } from './ServiceGrantEditor'
+
+installBrowserWindow()
+afterEach(cleanup)
+const service: AccessServiceResponse = {
+  id: 'svc_test',
+  project_id: 7,
+  name: 'API',
+  policy: {
+    origin: 'https://api.example.com',
+    path_prefixes: ['/v1'],
+    methods: ['GET'],
+  },
+  enabled: true,
+  has_credential: true,
+  max_ttl_seconds: 120,
+  version: 4,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+}
+function provider(children: ReactNode) {
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+  })
+  return (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+async function click(label: string) {
+  await act(async () => {
+    fireEvent.click(within(document.body).getByRole('button', { name: label }))
+  })
+}
+async function editName() {
+  await act(async () => {
+    fireEvent.change(within(document.body).getByLabelText('Name'), {
+      target: { value: 'Updated API' },
+    })
+  })
+}
+test('saving an edit sends the pinned version without resending a stored credential', async () => {
+  let submitted: CreateAccessServiceData['body'] | undefined
+  let saved = 0
+  const api = mockApi({
+    'PUT /projects/7/access-services/svc_test': async (request) => {
+      submitted = (await request.json()) as CreateAccessServiceData['body']
+      return jsonResponse({ ...service, name: 'Updated API', version: 5 })
+    },
+  })
+  render(
+    provider(
+      <AccessServiceEditor
+        open
+        projectId={7}
+        service={service}
+        onClose={() => {}}
+        onSaved={() => {
+          saved += 1
+        }}
+      />
+    )
+  )
+  await editName()
+  await click('Save service')
+  await waitFor(() => expect(saved).toBe(1))
+  expect(submitted?.expected_version).toBe(4)
+  expect(submitted?.credential).toBeUndefined()
+  expect(submitted?.name).toBe('Updated API')
+  api.restore()
+})
+test('a version conflict stays visible and does not report a successful save', async () => {
+  let saved = 0
+  const api = mockApi({
+    'PUT /projects/7/access-services/svc_test': () =>
+      jsonResponse(
+        { detail: 'The service changed; reload before saving.' },
+        409
+      ),
+  })
+  render(
+    provider(
+      <AccessServiceEditor
+        open
+        projectId={7}
+        service={service}
+        onClose={() => {}}
+        onSaved={() => {
+          saved += 1
+        }}
+      />
+    )
+  )
+  await editName()
+  await click('Save service')
+  await waitFor(() =>
+    expect(document.body.textContent).toContain(
+      'The service changed; reload before saving.'
+    )
+  )
+  expect(saved).toBe(0)
+  api.restore()
+})
+test('request editor defaults to the service limit and saves the selected policy version', async () => {
+  let submitted: RequestServiceGrant | undefined
+  let saved = 0
+  const api = mockApi({
+    'POST /projects/7/sandboxes/sbx_test/service-grants': async (request) => {
+      submitted = (await request.json()) as RequestServiceGrant
+      return jsonResponse({ id: 'grant_test', connected: false }, 201)
+    },
+  })
+  render(
+    provider(
+      <ServiceGrantEditor
+        projectId={7}
+        sandboxId="sbx_test"
+        service={service}
+        onClose={() => {}}
+        onSaved={() => {
+          saved += 1
+        }}
+      />
+    )
+  )
+  expect(
+    (
+      within(document.body).getByLabelText(
+        'Lifetime (seconds)'
+      ) as HTMLInputElement
+    ).value
+  ).toBe('120')
+  await click('Save access request')
+  await waitFor(() => expect(saved).toBe(1))
+  expect(submitted).toEqual({
+    service_id: 'svc_test',
+    service_version: 4,
+    ttl_seconds: 120,
+  })
+  api.restore()
+})
+test('request failures explain the missing permission without closing the form', async () => {
+  let closed = false
+  const api = mockApi({
+    'POST /projects/7/sandboxes/sbx_test/service-grants': () =>
+      jsonResponse({ detail: 'Sandbox write permission is required.' }, 403),
+  })
+  render(
+    provider(
+      <ServiceGrantEditor
+        projectId={7}
+        sandboxId="sbx_test"
+        service={service}
+        onClose={() => {
+          closed = true
+        }}
+        onSaved={() => {}}
+      />
+    )
+  )
+  await click('Save access request')
+  await waitFor(() =>
+    expect(document.body.textContent).toContain(
+      'Sandbox write permission is required.'
+    )
+  )
+  expect(closed).toBe(false)
+  api.restore()
+})
+
+test.each(['service', 'grant'] as const)(
+  '%s editor prevents edits while saving and restores them after failure',
+  async (kind) => {
+    let respond: (response: Response) => void = () => {}
+    const pendingResponse = new Promise<Response>((resolve) => {
+      respond = resolve
+    })
+    const route =
+      kind === 'service'
+        ? 'PUT /projects/7/access-services/svc_test'
+        : 'POST /projects/7/sandboxes/sbx_test/service-grants'
+    const api = mockApi({ [route]: () => pendingResponse })
+    let closed = false
+    const callbacks = {
+      onClose: () => {
+        closed = true
+      },
+      onSaved: () => {},
+    }
+    try {
+      render(
+        provider(
+          kind === 'service' ? (
+            <AccessServiceEditor
+              open
+              projectId={7}
+              service={service}
+              {...callbacks}
+            />
+          ) : (
+            <ServiceGrantEditor
+              projectId={7}
+              sandboxId="sbx_test"
+              service={service}
+              {...callbacks}
+            />
+          )
+        )
+      )
+      if (kind === 'service') await editName()
+      const input = within(document.body).getByLabelText(
+        kind === 'service' ? 'Name' : 'Lifetime (seconds)'
+      ) as HTMLInputElement
+      const value = input.value
+      await click(kind === 'service' ? 'Save service' : 'Save access request')
+      await waitFor(() =>
+        expect(input.closest('fieldset')?.disabled).toBe(true)
+      )
+      expect(closed).toBe(false)
+      await act(async () => {
+        respond(
+          jsonResponse({ detail: 'Save failed; retry your changes.' }, 409)
+        )
+      })
+      await waitFor(() =>
+        expect(input.closest('fieldset')?.disabled).toBe(false)
+      )
+      expect(input.value).toBe(value)
+      expect(closed).toBe(false)
+      expect(document.body.textContent).toContain(
+        'Save failed; retry your changes.'
+      )
+    } finally {
+      respond(jsonResponse({}, 500))
+      api.restore()
+    }
+  }
+)
+
+test.each(['service', 'grant'] as const)(
+  '%s validation shows a field-labelled summary and recovers when corrected',
+  async (kind) => {
+    render(
+      provider(
+        kind === 'service' ? (
+          <AccessServiceEditor
+            open
+            projectId={7}
+            service={service}
+            onClose={() => {}}
+            onSaved={() => {}}
+          />
+        ) : (
+          <ServiceGrantEditor
+            projectId={7}
+            sandboxId="sbx_test"
+            service={service}
+            onClose={() => {}}
+            onSaved={() => {}}
+          />
+        )
+      )
+    )
+    const input = within(document.body).getByLabelText(
+      kind === 'service' ? 'Name' : 'Lifetime (seconds)'
+    ) as HTMLInputElement
+    await act(async () => {
+      fireEvent.change(input, {
+        target: { value: kind === 'service' ? '' : '0' },
+      })
+      fireEvent.submit(input.closest('form')!)
+    })
+    await waitFor(() =>
+      expect(document.body.textContent).toContain('Fix 1 field before saving')
+    )
+    expect(document.body.textContent).toContain(
+      kind === 'service' ? 'Name:' : 'Lifetime (seconds):'
+    )
+    await act(async () => {
+      fireEvent.change(input, {
+        target: { value: kind === 'service' ? 'Valid API' : '60' },
+      })
+    })
+    await waitFor(() =>
+      expect(document.body.textContent).not.toContain(
+        'Fix 1 field before saving'
+      )
+    )
+  }
+)

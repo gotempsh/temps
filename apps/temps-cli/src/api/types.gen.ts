@@ -17,6 +17,18 @@ export type AccessBinding = {
     provider_id: number;
 };
 
+export type AccessCapability = {
+    can_save_requests: boolean;
+    configured: boolean;
+    reason: string;
+    setup_path?: string | null;
+    state: AccessCapabilityState;
+};
+
+export type AccessCapabilityState = 'integration_unavailable';
+
+export type AccessMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
 export type AccessPermission = 'apps_edit' | 'organizations_read';
 
 export type AccessPermissionCheck = {
@@ -57,6 +69,26 @@ export type AccessProviderResponse = {
      * `<team>.cloudflareaccess.com`.
      */
     team_domain: string;
+};
+
+export type AccessServiceList = {
+    items: Array<AccessServiceResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AccessServiceResponse = {
+    created_at: string;
+    enabled: boolean;
+    has_credential: boolean;
+    id: string;
+    max_ttl_seconds: number;
+    name: string;
+    policy: SandboxAccessPolicy;
+    project_id: number;
+    updated_at: string;
+    version: number;
 };
 
 export type AccessTokenCheckRequest = {
@@ -2078,6 +2110,10 @@ export type AppSettings = {
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
+    /**
+     * Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+     */
+    expose_platform_identity?: boolean | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -2341,6 +2377,10 @@ export type AppSettingsResponse = {
      * connection is configured; they do not use the monitoring store toggle.
      */
     effective_observability_store: MetricsStoreKind;
+    /**
+     * Opt in to proxy-added platform branding in public application responses.
+     */
+    expose_platform_identity: boolean;
     external_url?: string | null;
     /**
      * Geolocation refresh policy and freshness, with the MaxMind license key
@@ -26976,6 +27016,15 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
+export type RequestServiceGrant = {
+    service_id: string;
+    service_version: number;
+    /**
+     * Absolute expiry is calculated at creation, even if the broker is unavailable.
+     */
+    ttl_seconds: number;
+};
+
 /**
  * Upstream request/connection timeouts for customer app traffic.
  *
@@ -27631,6 +27680,10 @@ export type RevenueRow = {
     ts: string;
 };
 
+export type RevokeServiceGrant = {
+    expected_version: number;
+};
+
 /**
  * Risk level for a migration step
  */
@@ -28157,6 +28210,22 @@ export type S3SourceResponse = {
 };
 
 /**
+ * Exact destination and request scope. The broker must validate this again
+ * against its supported protocols before installing a policy.
+ */
+export type SandboxAccessPolicy = {
+    methods: Array<AccessMethod>;
+    /**
+     * HTTPS origin only; no path, userinfo, query, fragment or non-443 port.
+     */
+    origin: string;
+    /**
+     * Segment-boundary path prefixes, for example `/owner/private-repo`.
+     */
+    path_prefixes: Array<string>;
+};
+
+/**
  * Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker
  * containers, Firecracker microVMs and microsandbox (libkrun) microVMs
  * coexist on the same host behind the same `SandboxProvider` seam;
@@ -28516,6 +28585,24 @@ export type SandboxStatusResponse = {
      * when not configured it carries the reason and where to set it up.
      */
     microsandbox: MicrosandboxCapability;
+};
+
+export type SaveAccessService = {
+    clear_credential?: boolean;
+    /**
+     * Allows requests to be saved; does not enable a network connection.
+     */
+    enabled: boolean;
+    /**
+     * Required for updates; omit for creation.
+     */
+    expected_version?: number | null;
+    /**
+     * Maximum lifetime of a request, between 60 and 86400 seconds.
+     */
+    max_ttl_seconds: number;
+    name: string;
+    policy: SandboxAccessPolicy;
 };
 
 export type SaveAgentTokenRequest = {
@@ -29660,6 +29747,34 @@ export type ServiceDownAlertResponse = {
      */
     silenced_until?: string | null;
 };
+
+export type ServiceGrantList = {
+    items: Array<ServiceGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ServiceGrantResponse = {
+    /**
+     * Always false until an enforcement adapter is implemented.
+     */
+    connected: boolean;
+    created_at: string;
+    expires_at: string;
+    id: string;
+    policy: SandboxAccessPolicy;
+    reason: string;
+    revoked_at?: string | null;
+    sandbox_id: string;
+    service_id: string;
+    service_name: string;
+    service_version: number;
+    status: ServiceGrantStatus;
+    version: number;
+};
+
+export type ServiceGrantStatus = 'integration_unavailable' | 'expired' | 'revoked' | 'service_disabled' | 'policy_changed';
 
 export type ServiceHealthResponse = {
     /**
@@ -37449,6 +37564,10 @@ export type AppSettingsWritable = {
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
+    /**
+     * Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+     */
+    expose_platform_identity?: boolean | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -37751,6 +37870,25 @@ export type S3SourceResponseWritable = {
     region: string;
     secret_key: string;
     updated_at: number;
+};
+
+export type SaveAccessServiceWritable = {
+    clear_credential?: boolean;
+    credential?: SecretString | null;
+    /**
+     * Allows requests to be saved; does not enable a network connection.
+     */
+    enabled: boolean;
+    /**
+     * Required for updates; omit for creation.
+     */
+    expected_version?: number | null;
+    /**
+     * Maximum lifetime of a request, between 60 and 86400 seconds.
+     */
+    max_ttl_seconds: number;
+    name: string;
+    policy: SandboxAccessPolicy;
 };
 
 export type GetPlatformInfoData = {
@@ -68588,6 +68726,157 @@ export type GrantProjectAccessResponses = {
 
 export type GrantProjectAccessResponse = GrantProjectAccessResponses[keyof GrantProjectAccessResponses];
 
+export type ListAccessServicesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/access-services';
+};
+
+export type ListAccessServicesErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessServicesResponses = {
+    /**
+     * Success
+     */
+    200: AccessServiceList;
+};
+
+export type ListAccessServicesResponse = ListAccessServicesResponses[keyof ListAccessServicesResponses];
+
+export type CreateAccessServiceData = {
+    body: SaveAccessServiceWritable;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-services';
+};
+
+export type CreateAccessServiceErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessServiceResponses = {
+    /**
+     * Success
+     */
+    201: AccessServiceResponse;
+};
+
+export type CreateAccessServiceResponse = CreateAccessServiceResponses[keyof CreateAccessServiceResponses];
+
+export type UpdateAccessServiceData = {
+    body: SaveAccessServiceWritable;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Service ID
+         */
+        service_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-services/{service_id}';
+};
+
+export type UpdateAccessServiceErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessServiceResponses = {
+    /**
+     * Success
+     */
+    200: AccessServiceResponse;
+};
+
+export type UpdateAccessServiceResponse = UpdateAccessServiceResponses[keyof UpdateAccessServiceResponses];
+
 export type RevokeProjectAccessData = {
     body?: never;
     path: {
@@ -81393,6 +81682,169 @@ export type GetProjectRuntimeHealthResponses = {
 
 export type GetProjectRuntimeHealthResponse = GetProjectRuntimeHealthResponses[keyof GetProjectRuntimeHealthResponses];
 
+export type ListServiceGrantsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Opaque sandbox ID
+         */
+        sandbox_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants';
+};
+
+export type ListServiceGrantsErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListServiceGrantsResponses = {
+    /**
+     * Success
+     */
+    200: ServiceGrantList;
+};
+
+export type ListServiceGrantsResponse = ListServiceGrantsResponses[keyof ListServiceGrantsResponses];
+
+export type RequestServiceGrantData = {
+    body: RequestServiceGrant;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Opaque sandbox ID
+         */
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants';
+};
+
+export type RequestServiceGrantErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type RequestServiceGrantResponses = {
+    /**
+     * Success
+     */
+    201: ServiceGrantResponse;
+};
+
+export type RequestServiceGrantResponse = RequestServiceGrantResponses[keyof RequestServiceGrantResponses];
+
+export type RevokeServiceGrantData = {
+    body: RevokeServiceGrant;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Opaque sandbox ID
+         */
+        sandbox_id: string;
+        /**
+         * Grant request ID
+         */
+        grant_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke';
+};
+
+export type RevokeServiceGrantErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type RevokeServiceGrantResponses = {
+    /**
+     * Success
+     */
+    200: ServiceGrantResponse;
+};
+
+export type RevokeServiceGrantResponse = RevokeServiceGrantResponses[keyof RevokeServiceGrantResponses];
+
 export type ListProjectSecretsData = {
     body?: never;
     path: {
@@ -81626,6 +82078,54 @@ export type ListSecretHistoryResponses = {
 };
 
 export type ListSecretHistoryResponse = ListSecretHistoryResponses[keyof ListSecretHistoryResponses];
+
+export type AccessCapabilityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-access/capability';
+};
+
+export type AccessCapabilityErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type AccessCapabilityResponses = {
+    /**
+     * Success
+     */
+    200: AccessCapability;
+};
+
+export type AccessCapabilityResponse = AccessCapabilityResponses[keyof AccessCapabilityResponses];
 
 export type UpdateServiceTemplateRuntimeData = {
     body: UpdateServiceTemplateRuntimeRequest;

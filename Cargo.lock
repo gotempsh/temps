@@ -13012,6 +13012,7 @@ dependencies = [
  "temps-sandbox-providers",
  "temps-schema",
  "temps-screenshots",
+ "temps-service-access",
  "temps-status-page",
  "temps-teams",
  "temps-test-utils",
@@ -15601,6 +15602,28 @@ dependencies = [
  "url",
  "utoipa",
  "zip",
+]
+
+[[package]]
+name = "temps-service-access"
+version = "0.1.0-beta.61"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-authz",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

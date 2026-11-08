@@ -1,0 +1,365 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use super::{audit::AccessAudit, AccessAppState};
+use crate::{
+    broker::{AccessCapability, AccessCapabilityState},
+    error::AccessError,
+    types::*,
+};
+use axum::{
+    extract::{Extension, Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post, put},
+    Json, Router,
+};
+use std::sync::Arc;
+use temps_authz::{
+    deny_deployment_token, project_permission_guard, project_scope_guard, RequireAuth,
+};
+use temps_core::{
+    problemdetails::{self, Problem},
+    AuditContext, RequestMetadata,
+};
+use utoipa::OpenApi;
+
+#[derive(OpenApi)]
+#[openapi(paths(access_capability, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
+    components(schemas(AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
+    tags((name="Sandbox service access", description="Saved service policies and time-limited access requests; runtime integration is not installed")))]
+pub struct ServiceAccessApiDoc;
+
+pub fn configure_routes() -> Router<Arc<AccessAppState>> {
+    Router::new()
+        .route(
+            "/projects/{project_id}/service-access/capability",
+            get(access_capability),
+        )
+        .route(
+            "/projects/{project_id}/access-services",
+            get(list_access_services).post(create_access_service),
+        )
+        .route(
+            "/projects/{project_id}/access-services/{service_id}",
+            put(update_access_service),
+        )
+        .route(
+            "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants",
+            get(list_service_grants).post(request_service_grant),
+        )
+        .route(
+            "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke",
+            post(revoke_service_grant),
+        )
+}
+
+impl From<AccessError> for Problem {
+    fn from(error: AccessError) -> Self {
+        let (status, title) = match &error {
+            AccessError::NotFound { .. } => {
+                (StatusCode::NOT_FOUND, "Service access resource not found")
+            }
+            AccessError::Validation { .. } => {
+                (StatusCode::BAD_REQUEST, "Invalid service access request")
+            }
+            AccessError::Conflict { .. } => {
+                (StatusCode::CONFLICT, "Service access version changed")
+            }
+            AccessError::Database { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Service access storage failed",
+            ),
+            AccessError::Encryption { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Service credential encryption failed",
+            ),
+            AccessError::StoredPolicy { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored service access policy is invalid",
+            ),
+            AccessError::BrokerUnavailable { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service access integration unavailable",
+            ),
+        };
+        // Domain Display deliberately omits driver/crypto sources and all secrets.
+        if status.is_server_error() {
+            tracing::error!(operation = "service_access", error = %error, "Service access request failed");
+        }
+        problemdetails::new(status)
+            .with_title(title)
+            .with_detail(error.to_string())
+    }
+}
+
+async fn audit(
+    state: &AccessAppState,
+    auth: &temps_authz::AuthContext,
+    metadata: RequestMetadata,
+    project_id: i32,
+    resource_id: &str,
+    version: i32,
+    operation: &'static str,
+) {
+    let event = AccessAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address),
+            user_agent: metadata.user_agent,
+        },
+        project_id,
+        resource_id: resource_id.into(),
+        version,
+        operation,
+    };
+    if state.audit_service.create_audit_log(&event).await.is_err() {
+        tracing::error!(
+            project_id,
+            resource_id,
+            operation,
+            "Failed to record service access audit event"
+        );
+    }
+}
+
+#[utoipa::path(get, path="/projects/{project_id}/service-access/capability", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID")),
+responses((status=200, description="Success", body=AccessCapability), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn access_capability(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsRead,
+        project_id,
+        &state.project_access_checker
+    );
+    Ok(Json(state.service.capability()))
+}
+
+#[utoipa::path(get, path="/projects/{project_id}/access-services", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), AccessPageQuery),
+responses((status=200, description="Success", body=AccessServiceList), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn list_access_services(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path(project_id): Path<i32>,
+    Query(query): Query<AccessPageQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsRead,
+        project_id,
+        &state.project_access_checker
+    );
+    Ok(Json(state.service.list_services(project_id, query).await?))
+}
+
+#[utoipa::path(post, path="/projects/{project_id}/access-services", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID")),
+request_body=SaveAccessService,
+responses((status=201, description="Success", body=AccessServiceResponse), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn create_access_service(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path(project_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<SaveAccessService>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        &state.project_access_checker
+    );
+    let response = state
+        .service
+        .save_service(project_id, None, request)
+        .await?;
+    audit(
+        &state,
+        &auth,
+        metadata,
+        project_id,
+        &response.id,
+        response.version,
+        "SANDBOX_ACCESS_SERVICE_CREATED",
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[utoipa::path(put, path="/projects/{project_id}/access-services/{service_id}", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), ("service_id" = String, Path, description="Service ID")),
+request_body=SaveAccessService,
+responses((status=200, description="Success", body=AccessServiceResponse), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn update_access_service(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path((project_id, service_id)): Path<(i32, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<SaveAccessService>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        &state.project_access_checker
+    );
+    let response = state
+        .service
+        .save_service(project_id, Some(service_id), request)
+        .await?;
+    audit(
+        &state,
+        &auth,
+        metadata,
+        project_id,
+        &response.id,
+        response.version,
+        "SANDBOX_ACCESS_SERVICE_UPDATED",
+    )
+    .await;
+    Ok((StatusCode::OK, Json(response)))
+}
+
+#[utoipa::path(get, path="/projects/{project_id}/sandboxes/{sandbox_id}/service-grants", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), ("sandbox_id" = String, Path, description="Opaque sandbox ID"), AccessPageQuery),
+responses((status=200, description="Success", body=ServiceGrantList), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn list_service_grants(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path((project_id, sandbox_id)): Path<(i32, String)>,
+    Query(query): Query<AccessPageQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsRead,
+        project_id,
+        &state.project_access_checker
+    );
+    project_permission_guard!(
+        auth,
+        SandboxesRead,
+        project_id,
+        &state.project_access_checker
+    );
+    Ok(Json(
+        state
+            .service
+            .list_grants(
+                project_id,
+                &sandbox_id,
+                auth.user_id(),
+                auth.is_admin(),
+                query,
+            )
+            .await?,
+    ))
+}
+
+#[utoipa::path(post, path="/projects/{project_id}/sandboxes/{sandbox_id}/service-grants", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), ("sandbox_id" = String, Path, description="Opaque sandbox ID")),
+request_body=RequestServiceGrant,
+responses((status=201, description="Success", body=ServiceGrantResponse), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn request_service_grant(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path((project_id, sandbox_id)): Path<(i32, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<RequestServiceGrant>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        &state.project_access_checker
+    );
+    project_permission_guard!(
+        auth,
+        SandboxesWrite,
+        project_id,
+        &state.project_access_checker
+    );
+    let response = state
+        .service
+        .request_grant(
+            project_id,
+            &sandbox_id,
+            auth.user_id(),
+            auth.is_admin(),
+            request,
+        )
+        .await?;
+    audit(
+        &state,
+        &auth,
+        metadata,
+        project_id,
+        &response.id,
+        response.version,
+        "SANDBOX_SERVICE_GRANT_REQUESTED",
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[utoipa::path(post, path="/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), ("sandbox_id" = String, Path, description="Opaque sandbox ID"), ("grant_id" = String, Path, description="Grant request ID")),
+request_body=RevokeServiceGrant,
+responses((status=200, description="Success", body=ServiceGrantResponse), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn revoke_service_grant(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path((project_id, sandbox_id, grant_id)): Path<(i32, String, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<RevokeServiceGrant>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsWrite,
+        project_id,
+        &state.project_access_checker
+    );
+    project_permission_guard!(
+        auth,
+        SandboxesWrite,
+        project_id,
+        &state.project_access_checker
+    );
+    let response = state
+        .service
+        .revoke_grant(
+            project_id,
+            &sandbox_id,
+            &grant_id,
+            auth.user_id(),
+            auth.is_admin(),
+            request.expected_version,
+        )
+        .await?;
+    audit(
+        &state,
+        &auth,
+        metadata,
+        project_id,
+        &response.id,
+        response.version,
+        "SANDBOX_SERVICE_GRANT_REVOKED",
+    )
+    .await;
+    Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests;

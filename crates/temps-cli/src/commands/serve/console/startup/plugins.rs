@@ -236,6 +236,7 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // Feature flags (depends on database only: flags are control-plane
         // rows, no container and no background task).
         || Box::new(FlagsPlugin::new()),
+        || Box::new(temps_service_access::ServiceAccessPlugin::new()),
         // Ingress connectors such as Cloudflare Tunnel (ADR 058; depends on the
         // DNS plugin and the shared route table).
         || Box::new(temps_ingress::IngressPlugin::new()),
@@ -513,6 +514,7 @@ mod tests {
         "kv",
         "blob",
         "flags",
+        "service-access",
         "ingress",
         "environments",
         "projects",

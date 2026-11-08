@@ -21,6 +21,18 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
+        "pre-integration service access is console/API-only; credentials and fresh grant consent are managed directly until runtime enforcement is available",
+        &[
+            "access_capability",
+            "create_access_service",
+            "list_access_services",
+            "list_service_grants",
+            "request_service_grant",
+            "revoke_service_grant",
+            "update_access_service",
+        ],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),

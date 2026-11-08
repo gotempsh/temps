@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-service-access"
+version.workspace = true
+edition.workspace = true
+description = "Project service policies and time-limited sandbox access requests with a fail-closed broker boundary"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-authz = { path = "../temps-authz" }
+temps-entities = { path = "../temps-entities" }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+utoipa.workspace = true
+sea-orm.workspace = true
+async-trait.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

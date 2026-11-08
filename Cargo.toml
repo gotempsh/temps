@@ -97,6 +97,7 @@ members = [
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-flags",
+    "crates/temps-service-access",
     "crates/temps-ingress",
     "crates/temps-edge-rules",
     "crates/temps-blob",

@@ -7444,3 +7444,69 @@ async fn test_ingress_connector_host_suffix_migration_up_and_down() -> anyhow::R
     assert_eq!(survivors.len(), 1, "down must keep the tunnel");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> anyhow::Result<()> {
+    let docker = match bollard::Docker::connect_with_defaults() {
+        Ok(docker) => docker,
+        Err(error) => {
+            eprintln!("Skipping service access migration: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    if let Err(error) = docker.ping().await {
+        eprintln!("Skipping service access migration: Docker unavailable: {error}");
+        return Ok(());
+    }
+    let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261108_000001_sandbox_service_access";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9201,'Access test','repo','owner','/','main','nodejs','access-test',now(),now()), (9202,'Other project','repo','owner','/','main','nodejs','other-access-test',now(),now())").await?;
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists(&db, "sandbox_access_services").await?);
+    assert!(table_exists(&db, "sandbox_service_grants").await?);
+    db.execute_unprepared("INSERT INTO sandbox_access_services (id,project_id,name,policy,max_ttl_seconds) VALUES ('svc_test',9201,'API','{}',900)").await?;
+    for ttl in [0, 59, 86401] {
+        assert!(db.execute_unprepared(&format!("INSERT INTO sandbox_access_services (id,project_id,name,policy,max_ttl_seconds) VALUES ('invalid',9201,'API','{{}}',{ttl})")).await.is_err());
+    }
+    db.execute_unprepared("INSERT INTO sandboxes (id,public_id,name,user_id,project_id) VALUES (9201,'sbx_access_test','access-test',NULL,9201)").await?;
+    db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('grant_test',9201,'svc_test',9201,1,'{}',now()+interval '15 minutes')").await?;
+    assert!(db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('cross-project',9202,'svc_test',9201,1,'{}',now()+interval '15 minutes')").await.is_err());
+    assert!(db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('too-long',9201,'svc_test',9201,1,'{}',now()+interval '25 hours')").await.is_err());
+    assert!(db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('already-expired',9201,'svc_test',9201,1,'{}',now()-interval '1 second')").await.is_err());
+    let error = Migrator::down(&db, Some(steps_back_to(name)))
+        .await
+        .expect_err("populated tables must not be discarded");
+    assert!(error
+        .to_string()
+        .contains("remove saved services and requests explicitly"));
+    assert!(table_exists(&db, "sandbox_access_services").await?);
+    // Project deletion owns the intent rows; no broker binding exists to orphan.
+    db.execute_unprepared("DELETE FROM projects WHERE id IN (9201,9202)")
+        .await?;
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert!(!table_exists(&db, "sandbox_access_services").await?);
+    assert!(!table_exists(&db, "sandbox_service_grants").await?);
+    Migrator::up(&db, None).await?;
+    assert!(table_exists(&db, "sandbox_access_services").await?);
+    Ok(())
+}

@@ -95,6 +95,7 @@ import {
   PREVIEW_ACCESS_ANCHOR,
   SandboxPreviewLinksCard,
 } from '@/components/sandboxes/SandboxPreviewLinksCard'
+import { SandboxServiceAccess } from '@/components/service-access/SandboxServiceAccess'
 import { SandboxTerminalCard } from '@/components/sandboxes/SandboxTerminalCard'
 import { terminalUnavailableReason } from '@/components/sandboxes/sandbox-terminal'
 import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
@@ -877,6 +878,11 @@ export default function SandboxDetail() {
             <SandboxTerminalCard
               sandboxId={sandbox.id}
               unavailableReason={terminalUnavailableReason(sandbox)}
+            />
+
+            <SandboxServiceAccess
+              projectId={sandbox.project_id}
+              sandboxId={sandbox.id}
             />
 
             {/* Command workbench — primary action, always visible */}
