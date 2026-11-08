@@ -1349,6 +1349,9 @@ mod tests {
             "temps-projects",
             "temps-providers",
             "temps-proxy",
+            // Service policies and sandbox grant requests narrow project and
+            // sandbox permissions to the project whose resources they access.
+            "temps-service-access",
             "temps-status-page",
         ];
 
