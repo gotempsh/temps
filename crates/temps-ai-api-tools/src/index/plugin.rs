@@ -123,20 +123,22 @@ impl PluginToolsIndex {
                     .collect();
                 let mut effective = op.clone();
                 let parameters = effective.parameters.get_or_insert_with(Vec::new);
+                let components = openapi.components.as_ref().map(|c| &c.parameters);
                 for inherited in item.parameters.iter().flatten() {
-                    let overridden =
-                        parameters
-                            .iter()
-                            .any(|parameter| match (parameter, inherited) {
-                                (RefOr::T(local), RefOr::T(shared)) => {
-                                    local.name == shared.name
-                                        && local.parameter_in == shared.parameter_in
-                                }
-                                (RefOr::Ref(local), RefOr::Ref(shared)) => {
-                                    local.ref_location == shared.ref_location
-                                }
-                                _ => false,
-                            });
+                    // Use the same resolution rules as schema construction. OpenAPI
+                    // overrides are identified by (name, in), not reference spelling.
+                    let Some(shared) =
+                        resolve_component(inherited, components, "#/components/parameters/")
+                    else {
+                        continue;
+                    };
+                    let overridden = parameters.iter().any(|parameter| {
+                        resolve_component(parameter, components, "#/components/parameters/")
+                            .is_some_and(|local| {
+                                local.name == shared.name
+                                    && local.parameter_in == shared.parameter_in
+                            })
+                    });
                     if !overridden {
                         parameters.push(inherited.clone());
                     }
@@ -326,6 +328,55 @@ mod tests {
         );
         let built = crate::build_request_parts(op, &json!({"report_id":7}), &[], 20, 100).unwrap();
         assert_eq!(built.path, "/x/reports/reports/7");
+    }
+
+    #[test]
+    fn referenced_parameters_override_by_resolved_name_and_location() {
+        let shared = json!({"name":"mode", "in":"query", "required":false,
+            "schema":{"type":"string", "enum":["summary"]}});
+        let local = json!({"name":"mode", "in":"query", "required":false,
+            "schema":{"type":"string", "enum":["detail"]}});
+        for shared_ref in [false, true] {
+            for local_ref in [false, true] {
+                let inherited = if shared_ref {
+                    json!({"$ref":"#/components/parameters/SharedMode"})
+                } else {
+                    shared.clone()
+                };
+                let override_param = if local_ref {
+                    json!({"$ref":"#/components/parameters/LocalMode"})
+                } else {
+                    local.clone()
+                };
+                let api = serde_json::from_value(json!({
+                    "openapi":"3.1.0", "info":{"title":"Reports", "version":"1"},
+                    "paths":{"/reports":{
+                        "parameters":[inherited],
+                        "get":{"operationId":"reports", "x-temps-ai-tool":{},
+                            "parameters":[override_param], "responses":{"200":{"description":"OK"}}}
+                    }},
+                    "components":{"parameters":{"SharedMode":shared, "LocalMode":local}}
+                }))
+                .unwrap();
+                let index = PluginToolsIndex::from_openapi("reports", &api, true).unwrap();
+                let op = index
+                    .callable("plugin.reports.reports", PluginToolAccess::Read)
+                    .unwrap();
+                assert_eq!(
+                    op.params.len(),
+                    1,
+                    "shared_ref={shared_ref}, local_ref={local_ref}"
+                );
+                let request =
+                    crate::build_request_parts(op, &json!({"mode":"detail"}), &[], 20, 100)
+                        .unwrap();
+                assert_eq!(request.query, "mode=detail");
+                assert!(
+                    crate::build_request_parts(op, &json!({"mode":"summary"}), &[], 20, 100)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]
