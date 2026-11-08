@@ -125,9 +125,12 @@ mod public_route_tests {
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
     pub(super) fn state() -> Arc<AppState> {
-        state_with_db(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ))
+        state_over(MockDatabase::new(DatabaseBackend::Postgres))
+    }
+
+    /// Like [`state`], over a database the test has queued results on.
+    pub(super) fn state_over(database: MockDatabase) -> Arc<AppState> {
+        state_with_db(Arc::new(database.into_connection()))
     }
 
     pub(super) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
@@ -246,6 +249,7 @@ mod public_route_tests {
     #[tokio::test]
     async fn browser_callbacks_and_management_routes_stay_off_the_public_router() {
         for path in [
+            "/git-providers/github/manifest/start",
             "/webhook/git/github/auth",
             "/webhook/git/github/callback",
             "/webhook/git/github/install",
