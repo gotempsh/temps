@@ -29,7 +29,7 @@ pub struct PluginToolsIndex {
     pub(crate) revision: uuid::Uuid,
     tools: Vec<PluginTool>,
     secrets: HashMap<String, Vec<SecretPath>>,
-    routes: HashMap<String, matchit::Router<String>>,
+    routes: HashMap<String, HashMap<String, matchit::Router<String>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -114,19 +114,7 @@ impl PluginToolsIndex {
         }
         let mut tools = Vec::new();
         let mut secrets = HashMap::new();
-        let mut router = matchit::Router::new();
-        // Include unmarked endpoints: a read template must not select one of
-        // them, or a static GET explicitly elevated to write access.
-        for path in openapi.paths.paths.keys() {
-            let full_path = format!("/x/{plugin}{path}");
-            router
-                .insert(full_path.clone(), full_path)
-                .map_err(|source| PluginToolsError::InvalidRoute {
-                    plugin: plugin.into(),
-                    path: path.clone(),
-                    source,
-                })?;
-        }
+        let mut routes: HashMap<String, matchit::Router<String>> = HashMap::new();
         let schema_components = components_json(openapi);
         let mut ids = std::collections::HashSet::new();
         for (path, item) in &openapi.paths.paths {
@@ -141,6 +129,19 @@ impl PluginToolsIndex {
                 ("TRACE", &item.trace),
             ] {
                 let Some(op) = operation else { continue };
+                // Compare endpoints for the requested method, including
+                // unmarked operations and GETs explicitly elevated to write.
+                // A POST-only static route cannot override a GET template.
+                let full_path = format!("/x/{plugin}{path}");
+                routes
+                    .entry(method.into())
+                    .or_default()
+                    .insert(full_path.clone(), full_path)
+                    .map_err(|source| PluginToolsError::InvalidRoute {
+                        plugin: plugin.into(),
+                        path: path.clone(),
+                        source,
+                    })?;
                 let Some(mark) = op
                     .extensions
                     .as_ref()
@@ -253,7 +254,7 @@ impl PluginToolsIndex {
         Ok(Self {
             tools,
             secrets,
-            routes: HashMap::from([(plugin.to_string(), router)]),
+            routes: HashMap::from([(plugin.to_string(), routes)]),
             revision: uuid::Uuid::nil(),
         })
     }
@@ -278,7 +279,11 @@ impl PluginToolsIndex {
         else {
             return false;
         };
-        let Some(router) = self.routes.get(plugin) else {
+        let Some(router) = self
+            .routes
+            .get(plugin)
+            .and_then(|routes| routes.get(&operation.method))
+        else {
             return false;
         };
         let matches = |path: &str| {
@@ -856,5 +861,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn route_resolution_only_compares_endpoints_for_the_requested_method() {
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{
+            "/reports/{name}":{"get":{"operationId":"read","x-temps-ai-tool":{},"parameters":[{"name":"name","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}},
+            "/reports/export":{"post":{"operationId":"export","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}},
+            "/reports/reset":{"get":{"operationId":"reset","x-temps-ai-tool":{"access":"write"},"responses":{"200":{"description":"ok"}}}},
+            "/reports/private":{"get":{"responses":{"200":{"description":"ok"}}}}
+        }})).unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+        let read = index
+            .callable("plugin.reports.read", PluginToolAccess::Read)
+            .unwrap();
+        assert!(index.resolves_to(read, "/x/reports/reports/export"));
+        assert!(!index.resolves_to(read, "/x/reports/reports/reset"));
+        assert!(!index.resolves_to(read, "/x/reports/reports/private"));
+        let write = index
+            .callable("plugin.reports.export", PluginToolAccess::Write)
+            .unwrap();
+        assert!(index.resolves_to(write, "/x/reports/reports/export"));
     }
 }

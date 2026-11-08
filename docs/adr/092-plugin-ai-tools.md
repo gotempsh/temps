@@ -39,7 +39,8 @@ bounds and secret redaction apply equally to plugin operations. Descriptions and
 responses are untrusted content, never instructions or authorization. Timeout
 and unavailable errors identify the plugin and operation. Every executed plugin
 write also receives a Temps audit record containing actor, operation and outcome.
-Rendered request paths must resolve to the declared endpoint, including when
+Rendered request paths must resolve to the declared endpoint for the requested
+HTTP method, including when
 static or nested routes take precedence over a parameterized route. The index
 includes unmarked routes for this check, preventing a read tool from selecting
 an unmarked endpoint or an endpoint requiring write approval.
