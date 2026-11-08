@@ -605,7 +605,8 @@ fn spawn_heartbeat_loop(
         let mut addresses_sent: Option<Vec<crate::overlay_addresses::OverlayAddress>> = None;
         let mut beats_since_addresses_sent: u32 = 0;
         let mut capacity_sampler = CapacitySampler::new();
-        let mut resolver_coverage = temps_deployer::resolver_coverage::ResolverCoverage::new();
+        let mut resolver_coverage =
+            temps_deployer::resolver_coverage::ResolverCoverage::for_node(node_id);
 
         let mut last_beat: Option<tokio::time::Instant> = None;
 

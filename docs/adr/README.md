@@ -32,7 +32,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [008](./008-pty-agent.md) | In-Sandbox PTY Agent Replaces `docker exec` + `dtach` | Proposed |  |
 | [009](./009-sandbox-api-versioning.md) | Sandbox API Versioning Policy | Accepted |  |
 | [010](./010-provider-boundary-traits.md) | Provider Boundary Traits | Accepted |  |
-| [011](./011-internal-dns-ha-databases.md) | Internal DNS for HA Database Resolution | Accepted |  |
+| [011](./011-internal-dns-ha-databases.md) | Internal DNS for HA Database Resolution | Accepted | amended by [097](./097-internal-dns-canary-corrections.md) |
 | [012](./012-clickhouse-analytics-backend.md) | ClickHouse as an external analytics backend | Accepted |  |
 | [013](./013-sandbox-egress-credential-proxy.md) | Sandbox Egress Credential Proxy | Proposed |  |
 | [014](./014-unified-backup-architecture.md) | Unified Backup Execution Architecture | Proposed |  |
@@ -45,7 +45,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [021](./021-humanized-alert-notifications.md) | Humanized alert notification text (deterministic default, optional AI enrichment) | Proposed |  |
 | [022](./022-ai-foundation-structured-output.md) | A general AI foundation for typed/structured output (`AiService`) | Proposed |  |
 | [023](./023-ai-debugging-conversations.md) | Persistent AI debugging conversations (chat per interaction) | Proposed |  |
-| [024](./024-control-plane-dns-resolver.md) | Control-plane DNS resolver for single-node *.temps.local resolution | Proposed |  |
+| [024](./024-control-plane-dns-resolver.md) | Control-plane DNS resolver for single-node *.temps.local resolution | Proposed | amended by [097](./097-internal-dns-canary-corrections.md) |
 | [025](./025-unified-alarm-log.md) | Unified alarm log (one queryable firing history across all sources) | Proposed |  |
 | [026](./026-metric-alert-label-filters-and-dynamic-alerting.md) | Label filters and per-series ("dynamic") alerting for OTel metrics | Proposed |  |
 | [027](./027-cross-project-trace-linking.md) | Cross-project trace linking | Proposed |  |
@@ -112,7 +112,8 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [092](./092-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [093](./093-scoped-s3-credentials-for-worker-jobs.md) |
 | [093](./093-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [092](./092-worker-backups-run-the-local-engines.md) |
 | [094](./094-cloud-console-session-revocation.md) | Temps Cloud console sessions end when Cloud revokes the user | Accepted |  |
-| [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed |  |
+| [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed | amended by [097](./097-internal-dns-canary-corrections.md) |
+| [097](./097-internal-dns-canary-corrections.md) | Internal DNS canary corrections | Accepted | amends [011](./011-internal-dns-ha-databases.md); amends [024](./024-control-plane-dns-resolver.md); amends [095](./095-internal-dns-observability.md) |
 
 ## Supporting documents
 
