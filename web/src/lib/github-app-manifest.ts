@@ -82,6 +82,26 @@ export function createManifestSetupTracker<W extends SetupWindow>() {
   }
 }
 
+/**
+ * Open (or reuse) the named window GitHub's App page loads in, without giving
+ * that page a reference back to the console.
+ *
+ * `window.open` with a name gives the new window an `opener`, unlike the
+ * `target="_blank"` form this replaced, which browsers open as `noopener`.
+ * Passing `noopener` would also drop the handle the setup needs to post the
+ * manifest and close a blank window, so the opener is cleared instead while
+ * the window is still a same-origin blank page. It stays cleared when the
+ * window navigates to GitHub.
+ */
+export function openGithubAppWindow<W extends { opener: unknown }>(
+  name: string,
+  open: (url: string, target: string) => W | null
+): W | null {
+  const githubWindow = open('', name)
+  if (githubWindow) githubWindow.opener = null
+  return githubWindow
+}
+
 /** Whether a window returned by `window.open` can still receive the manifest. */
 export function githubWindowUsable(
   githubWindow: { closed: boolean } | null

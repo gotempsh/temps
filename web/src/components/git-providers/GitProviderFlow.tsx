@@ -34,6 +34,7 @@ import {
   createManifestSetupTracker,
   githubAppWindowName,
   githubWindowUsable,
+  openGithubAppWindow,
   submitGitHubManifest,
 } from '@/lib/github-app-manifest'
 import { isGitHubApp } from '@/lib/provider'
@@ -490,7 +491,9 @@ export function GitProviderFlow({
       // through. The manifest is posted into it once the server has issued the
       // state that GitHub has to hand back to the callback.
       const { attempt, window: githubWindow } = manifestSetup.begin(() =>
-        window.open('', githubWindowName)
+        openGithubAppWindow(githubWindowName, (url, target) =>
+          window.open(url, target)
+        )
       )
       let manifestState: string
       try {

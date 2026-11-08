@@ -10,10 +10,39 @@ import {
   githubAppWindowName,
   githubManifestAction,
   githubWindowUsable,
+  openGithubAppWindow,
   submitGitHubManifest,
 } from './github-app-manifest'
 
 installBrowserWindow()
+
+describe('openGithubAppWindow', () => {
+  test('opens the named window and cuts its link back to the console', () => {
+    const opened: Array<[string, string]> = []
+    const githubWindow = { opener: {} as unknown }
+
+    const result = openGithubAppWindow(
+      'temps-github-app-abc',
+      (url, target) => {
+        opened.push([url, target])
+        return githubWindow
+      }
+    )
+
+    expect(result).toBe(githubWindow)
+    expect(opened).toEqual([['', 'temps-github-app-abc']])
+    expect(githubWindow.opener).toBeNull()
+  })
+
+  test('a blocked popup is passed through as null', () => {
+    expect(
+      openGithubAppWindow<{ opener: unknown }>(
+        'temps-github-app-abc',
+        () => null
+      )
+    ).toBeNull()
+  })
+})
 
 describe('githubManifestAction', () => {
   test('carries the server-issued state to GitHub', () => {
