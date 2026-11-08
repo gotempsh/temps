@@ -73,3 +73,70 @@ impl TempsPlugin for ServiceAccessPlugin {
         Some(<ServiceAccessApiDoc as OpenApiTrait>::openapi())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_schema_exposes_all_service_access_operations() {
+        let schema = ServiceAccessPlugin::new()
+            .openapi_schema()
+            .expect("service-access plugin must expose an OpenAPI schema");
+        for (path, method, operation_id) in [
+            (
+                "/projects/{project_id}/service-access/capability",
+                "GET",
+                "access_capability",
+            ),
+            (
+                "/projects/{project_id}/access-services",
+                "GET",
+                "list_access_services",
+            ),
+            (
+                "/projects/{project_id}/access-services",
+                "POST",
+                "create_access_service",
+            ),
+            (
+                "/projects/{project_id}/access-services/{service_id}",
+                "PUT",
+                "update_access_service",
+            ),
+            (
+                "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants",
+                "GET",
+                "list_service_grants",
+            ),
+            (
+                "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants",
+                "POST",
+                "request_service_grant",
+            ),
+            (
+                "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke",
+                "POST",
+                "revoke_service_grant",
+            ),
+        ] {
+            let item = schema
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("missing OpenAPI path: {path}"));
+            let operation = match method {
+                "GET" => item.get.as_ref(),
+                "POST" => item.post.as_ref(),
+                "PUT" => item.put.as_ref(),
+                _ => panic!("unsupported test method: {method}"),
+            }
+            .unwrap_or_else(|| panic!("missing OpenAPI operation: {method} {path}"));
+            assert_eq!(
+                operation.operation_id.as_deref(),
+                Some(operation_id),
+                "{method} {path}"
+            );
+        }
+    }
+}
