@@ -12365,6 +12365,7 @@ dependencies = [
 name = "temps-ai-api-tools"
 version = "0.1.0-beta.61"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "chrono",

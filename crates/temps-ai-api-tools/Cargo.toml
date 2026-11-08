@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 # Internal crates
 temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }

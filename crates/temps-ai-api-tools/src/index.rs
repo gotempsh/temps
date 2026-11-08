@@ -38,6 +38,9 @@
 //! | Object required      | `obj.required: Vec<String>`                               |
 //! | $ref location        | `Ref::ref_location: String`                               |
 
+mod plugin;
+pub use plugin::{PluginTool, PluginToolAccess, PluginToolsError, PluginToolsIndex};
+
 use std::collections::{BTreeMap, HashMap};
 
 use crate::secrets::{secret_paths_for_request_body, SecretPath};
