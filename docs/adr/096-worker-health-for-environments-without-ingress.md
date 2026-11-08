@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # ADR-096: Worker health for environments without ingress
 
-**Status:** Proposed
+**Status:** Accepted
 **Amends:** [ADR-068](./068-environment-addresses-without-a-public-preview-domain.md)
 **Builds on:** [ADR-053](./053-distributed-runtime-health-and-worker-uptime.md), [ADR-064](./064-making-a-project-reachable.md), [ADR-020](./020-multi-node-deployment-hardening.md)
 
@@ -68,4 +68,6 @@ Add focused tests for check selection, worker target restrictions, the existing
 agent report round trip and project card presentation. Run touched-crate check
 and clippy plus focused tests, and web type checking/formatting. Integration
 acceptance is a later step on an internal canary; this change stays local until
-that validation. No public API shape change is intended.
+that validation. The batch monitor-health API adds optional runtime status and a bounded reason,
+plus an optional environment filter for the environment bar. Existing external
+status fields keep their meaning; older clients can ignore the additive fields.

@@ -14,10 +14,7 @@ import {
   environmentLiveStatus,
   type EnvironmentLiveStatus,
 } from '@/lib/project-environment-selection'
-import {
-  containerHealthIssues,
-  healthEnvironment,
-} from '@/lib/project-failure-state'
+import { containerHealthIssues } from '@/lib/project-failure-state'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
 
 /** How often a running deployment is re-read, and an idle one. */
@@ -43,7 +40,6 @@ export interface EnvironmentHealth {
 export function useEnvironmentHealth({
   project,
   environment,
-  environments,
   enabled,
   onDeploymentSettled,
 }: {
@@ -86,15 +82,13 @@ export function useEnvironmentHealth({
     retry: false,
   })
 
-  // Monitors check the project's production environment, so their verdict
-  // only describes that one.
-  const watched = healthEnvironment(environments)
-  const monitorsWatchThis = active && watched?.id === environment?.id
+  // Scope observations to the selected environment, including previews.
   const monitors = useProjectsMonitorHealth(
-    monitorsWatchThis ? [project.id] : []
+    active ? [project.id] : [],
+    environmentId
   )
-  const monitorStatus = monitorsWatchThis
-    ? monitors.data?.projects?.[String(project.id)]?.status
+  const monitorHealth = active
+    ? monitors.data?.projects?.[String(project.id)]
     : undefined
 
   const unhealthyContainers = useMemo(
@@ -129,7 +123,9 @@ export function useEnvironmentHealth({
         ? environmentLiveStatus(environment, {
             latestDeployment,
             unhealthyContainers,
-            monitorStatus,
+            monitorStatus: monitorHealth?.status,
+            runtimeStatus: monitorHealth?.runtime_status,
+            runtimeReason: monitorHealth?.runtime_reason,
           })
         : undefined,
     latestDeploymentId: latestDeployment?.id,

@@ -476,6 +476,10 @@ pub struct ProjectMonitorHealth {
     /// (monitors exist but the environment has no deployment to check yet),
     /// or "no_monitors"
     pub status: String,
+    /// Worker runtime health when external uptime has no address to check.
+    pub runtime_status: Option<String>,
+    /// Short, credential-free explanation of the worker observation.
+    pub runtime_reason: Option<String>,
 }
 
 // Time-bucketed aggregated data
