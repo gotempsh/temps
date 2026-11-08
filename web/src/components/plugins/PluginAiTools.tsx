@@ -76,6 +76,16 @@ export function PluginAiTools({ name }: { name: string }) {
       handleSensitiveActionError(error, () => void toggle(values))
     }
   }
+  async function reloadSettings() {
+    const result = await tools.refetch()
+    if (result.isSuccess && result.data) {
+      form.reset({
+        enabled: result.data.enabled,
+        actor_id: result.data.actor_id,
+      })
+      save.reset()
+    }
+  }
   return (
     <>
       <section
@@ -147,10 +157,24 @@ export function PluginAiTools({ name }: { name: string }) {
                   </p>
                 )}
                 {save.isError && (
-                  <p role="alert" className="text-sm text-destructive">
-                    Could not update AI access. Your previous setting is
-                    unchanged; try again.
-                  </p>
+                  <div role="alert" className="space-y-2 text-sm">
+                    <p className="text-destructive">
+                      Could not update AI access. Reload settings to discard
+                      this edit and check the current installation before
+                      choosing access again.
+                    </p>
+                    <Button
+                      variant="outline"
+                      aria-disabled={tools.isFetching}
+                      onClick={() => {
+                        if (!tools.isFetching) void reloadSettings()
+                      }}
+                    >
+                      {tools.isFetching
+                        ? 'Reloading settings…'
+                        : 'Reload settings'}
+                    </Button>
+                  </div>
                 )}
                 {tools.data.tools.length === 0 ? (
                   <p className="text-sm text-muted-foreground">

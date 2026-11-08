@@ -145,17 +145,14 @@ export function createToolPlugin(base: TempsPlugin) {
                 new URL(req.url ?? "/", "http://plugin.local").searchParams,
                 ([name, value]) => {
                   const property = schema.properties?.[name];
-                  const types = querySchemaTypes(property, definitions);
+                  const encoding = queryEncoding(property, definitions);
                   // Composite inputs use JSON to distinguish a number from a
                   // numeric-looking string. Plain string fields stay unchanged.
-                  if (
-                    types.length > 1 ||
-                    types.some((type) => type !== "string")
-                  ) {
+                  if (encoding.jsonEncoded) {
                     try {
                       return [name, JSON.parse(value)];
                     } catch (error) {
-                      if (!types.includes("string")) throw error;
+                      if (!encoding.acceptsString) throw error;
                     }
                   }
                   return [name, value];
@@ -198,38 +195,44 @@ export function createToolPlugin(base: TempsPlugin) {
 }
 
 /** Composite Zod schemas use alternatives rather than a direct JSON type. */
-function querySchemaTypes(
+function queryEncoding(
   schema: unknown,
   definitions: Record<string, unknown>,
   seen = new Set<string>(),
-): string[] {
-  if (!schema || typeof schema !== "object") return ["string"];
+): { acceptsString: boolean; jsonEncoded: boolean } {
+  const plainString = { acceptsString: true, jsonEncoded: false };
+  if (!schema || typeof schema !== "object") return plainString;
   const value = schema as Record<string, unknown>;
   if (
     typeof value.$ref === "string" &&
     value.$ref.startsWith("#/components/schemas/")
   ) {
-    if (seen.has(value.$ref)) return ["string"];
+    if (seen.has(value.$ref)) return plainString;
     const next = new Set(seen).add(value.$ref);
-    return querySchemaTypes(
+    return queryEncoding(
       definitions[value.$ref.slice("#/components/schemas/".length)],
       definitions,
       next,
     );
   }
-  if (typeof value.type === "string") return [value.type];
+  if (typeof value.type === "string")
+    return {
+      acceptsString: value.type === "string",
+      jsonEncoded: value.type !== "string",
+    };
   if (Array.isArray(value.type))
-    return value.type.filter(
-      (type): type is string => typeof type === "string",
-    );
+    return { acceptsString: value.type.includes("string"), jsonEncoded: true };
   for (const key of ["anyOf", "oneOf", "allOf"]) {
     if (Array.isArray(value[key]))
-      return value[key].flatMap((child) =>
-        querySchemaTypes(child, definitions, seen),
-      );
+      return {
+        acceptsString: value[key].some(
+          (child) => queryEncoding(child, definitions, seen).acceptsString,
+        ),
+        jsonEncoded: true,
+      };
   }
   // Unconstrained schemas (including coercion inputs) also accept strings.
-  return ["string"];
+  return plainString;
 }
 
 /** JSON Schema document references must point into the enclosing OpenAPI document. */

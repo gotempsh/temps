@@ -34,6 +34,32 @@ async function request(
   return res;
 }
 describe("endpoint AI tools", () => {
+  it("decodes single-string composite query schemas including references", async () => {
+    for (const value of [
+      z.union([z.string()]),
+      z.union([z.string()]).meta({ id: "ReportChoice" }),
+      z.intersection(z.string(), z.string()),
+    ]) {
+      const p = plugin().tool({
+        name: "search",
+        description: "Search reports",
+        method: "GET",
+        input: z.object({ value }),
+        handler: (input) => input,
+      });
+      const response = await request(
+        p,
+        "GET",
+        "/tools/search?value=%22report%22",
+      );
+      expect(response.writeHead).toHaveBeenCalledWith(200, {
+        "Content-Type": "application/json",
+      });
+      expect(JSON.parse(response.end.mock.calls[0][0])).toEqual({
+        value: "report",
+      });
+    }
+  });
   it("registers a validated route and emits a marked OpenAPI operation", async () => {
     const p = plugin();
     p.tool({

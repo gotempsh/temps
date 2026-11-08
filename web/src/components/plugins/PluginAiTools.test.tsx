@@ -143,3 +143,46 @@ test('failed reads show a retry instead of a misleading empty state', async () =
   expect(view.getByRole('button', { name: 'Retry' })).toBeTruthy()
   expect(view.queryByText('This plugin declares no AI tools.')).toBeNull()
 })
+
+test('reloads a replacement identity and requires a new consent choice after conflict', async () => {
+  const replacement = {
+    ...settings,
+    actor_id: '00000000-0000-4000-8000-000000000002',
+  }
+  let replaced = false
+  const submitted: unknown[] = []
+  mockApi({
+    'GET /x/plugins/reports/ai-tools': () =>
+      jsonResponse(replaced ? replacement : settings),
+    'PUT /x/plugins/reports/ai-tools': async (request) => {
+      submitted.push(await request.json())
+      if (!replaced) {
+        replaced = true
+        return jsonResponse(
+          { title: 'Conflict', detail: 'Plugin identity changed' },
+          409
+        )
+      }
+      return jsonResponse({ ...replacement, enabled: true })
+    },
+  })
+  const view = mount()
+  const toggle = await view.findByRole('switch')
+  await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
+  fireEvent.click(toggle)
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+  fireEvent.click(await view.findByRole('button', { name: 'Reload settings' }))
+  await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
+  expect(submitted).toEqual([{ actor_id: settings.actor_id, enabled: true }])
+  expect(
+    view.getByRole('button', { name: 'Save' }).hasAttribute('disabled')
+  ).toBe(true)
+  fireEvent.click(toggle)
+  fireEvent.click(view.getByRole('button', { name: 'Save' }))
+  await waitFor(() =>
+    expect(submitted).toEqual([
+      { actor_id: settings.actor_id, enabled: true },
+      { actor_id: replacement.actor_id, enabled: true },
+    ])
+  )
+})

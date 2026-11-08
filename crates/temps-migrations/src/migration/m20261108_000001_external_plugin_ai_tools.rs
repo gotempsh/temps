@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Persist AI-tool consent on each plugin actor so replacement installations
+//! cannot inherit access. Existing and new actors default to disabled; no
+//! backfill enables plugins. Pending actions gain a nullable publication revision:
+//! existing core approvals keep NULL, while new plugin approvals pin the index
+//! revision and are invalidated when plugin declarations or consent change.
+//! These settings belong to their existing records rather than separate tables.
+
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
