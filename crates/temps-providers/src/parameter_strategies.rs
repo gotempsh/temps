@@ -716,7 +716,7 @@ impl ParameterStrategy for RedisParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("gotempsh/redis-walg:8-bookworm".to_string()),
+                JsonValue::String(crate::externalsvc::redis::DEFAULT_REDIS_IMAGE.to_string()),
             );
         }
 
@@ -775,8 +775,11 @@ impl ParameterStrategy for RedisParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., gotempsh/redis-walg:8-bookworm)",
-                    "default": "gotempsh/redis-walg:8-bookworm"
+                    "description": format!(
+                        "Docker image (updateable, e.g., {})",
+                        crate::externalsvc::redis::DEFAULT_REDIS_IMAGE
+                    ),
+                    "default": crate::externalsvc::redis::DEFAULT_REDIS_IMAGE
                 }
             },
             "readonly": ["password"]

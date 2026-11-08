@@ -134,6 +134,8 @@ pub type SharedOverlayReport = Arc<std::sync::RwLock<OverlayReport>>;
 pub struct HealthSlots {
     pub dns: SharedDnsHealth,
     pub overlay: SharedOverlayReport,
+    /// The resolver and its query observer, for `/agent/dns/*` (ADR-095).
+    pub dns_report: crate::dns_report::SharedAgentDns,
 }
 
 /// Longest wait between overlay attempts while the same failure persists.
@@ -524,6 +526,7 @@ async fn run(
     let HealthSlots {
         dns: dns_health,
         overlay: overlay_report,
+        dns_report: agent_dns,
     } = health;
     info!(
         node_id = config.node_id,
@@ -564,6 +567,7 @@ async fn run(
         shared_peers: &shared_peers,
         dns_health: &dns_health,
         dns_policy: &dns_policy,
+        agent_dns: &agent_dns,
     };
 
     let mesh_url = format!(
@@ -1942,11 +1946,13 @@ fn save_snapshot(path: &std::path::Path, snapshot: &WirePeerListResponse) -> std
 /// module (`agent.rs`'s CLI wiring, `service_handlers.rs`'s container-attach
 /// path) — this struct doesn't change their meaning, just groups the
 /// references for one function call.
+#[derive(Clone, Copy)]
 struct SharedSlots<'a> {
     overlay_bridge_address: &'a Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: &'a SharedPeers,
     dns_health: &'a SharedDnsHealth,
     dns_policy: &'a DnsPolicySlot,
+    agent_dns: &'a crate::dns_report::SharedAgentDns,
 }
 
 async fn apply(
@@ -2084,9 +2090,7 @@ async fn apply(
         bridge_address,
         resolver,
         config,
-        slots.overlay_bridge_address,
-        slots.dns_health,
-        slots.dns_policy,
+        slots,
     )
     .await;
 
@@ -2255,10 +2259,15 @@ async fn reconcile_resolver(
     bridge_address: IpAddr,
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
-    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
-    dns_health: &SharedDnsHealth,
-    dns_policy: &DnsPolicySlot,
+    slots: &SharedSlots<'_>,
 ) {
+    let SharedSlots {
+        overlay_bridge_address,
+        dns_health,
+        dns_policy,
+        agent_dns,
+        ..
+    } = *slots;
     if !cluster_dns_enabled {
         if let Some(handle) = resolver.take() {
             info!(
@@ -2271,6 +2280,7 @@ async fn reconcile_resolver(
             }
         }
         publish_dns_health(dns_health, false, None, None);
+        agent_dns.publish_stopped(None);
         return;
     }
 
@@ -2294,6 +2304,7 @@ async fn reconcile_resolver(
                     "{error}; new containers use Docker's embedded DNS until it answers"
                 );
             }
+            agent_dns.publish_running(handle.view(), status.tasks_alive, probe_error.clone());
             publish_dns_health(dns_health, answering, Some(&status), probe_error);
             return;
         }
@@ -2320,7 +2331,13 @@ async fn reconcile_resolver(
     apply_dns_control_plane_trust(config, &mut dns_cfg).await;
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
-    match DnsResolverHandle::start_with_policy(dns_cfg, Some(dns_policy.clone())).await {
+    match DnsResolverHandle::start_observed(
+        dns_cfg,
+        Some(dns_policy.clone()),
+        Some(agent_dns.observer()),
+    )
+    .await
+    {
         Ok(handle) => {
             info!(
                 snapshot = %snapshot_path.display(),
@@ -2365,6 +2382,14 @@ async fn reconcile_resolver(
 
     let status = resolver.as_ref().map(|h| h.status());
     let running = resolver.is_some() && start_error.is_none();
+    match resolver.as_ref() {
+        Some(handle) => agent_dns.publish_running(
+            handle.view(),
+            status.as_ref().is_some_and(|s| s.tasks_alive),
+            start_error.clone(),
+        ),
+        None => agent_dns.publish_stopped(start_error.clone()),
+    }
     publish_dns_health(dns_health, running, status.as_ref(), start_error);
 }
 

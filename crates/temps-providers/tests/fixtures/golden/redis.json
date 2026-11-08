@@ -57,7 +57,7 @@
           "no-new-privileges:true"
         ]
       },
-      "Image": "gotempsh/redis-walg:8-bookworm",
+      "Image": "ghcr.io/gotempsh/redis-walg:8-trixie",
       "Labels": {
         "temps.service_name": "golden",
         "temps.service_type": "redis"

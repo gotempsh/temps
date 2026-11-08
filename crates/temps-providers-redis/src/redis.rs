@@ -29,6 +29,16 @@ use urlencoding;
 /// extend this in the future.
 const REDIS_BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Repository of the managed Redis + WAL-G image, published to GHCR by
+/// `.github/workflows/database-images.yml` and rebuilt weekly.
+pub const DEFAULT_REDIS_REPOSITORY: &str = "ghcr.io/gotempsh/redis-walg";
+/// Floating tag of [`DEFAULT_REDIS_REPOSITORY`] that follows the newest Redis 8
+/// release. Trixie: upstream ships no Redis release after 8.4.0 for bookworm,
+/// so the old `gotempsh/redis-walg:8-bookworm` stopped receiving fixes.
+pub const DEFAULT_REDIS_TAG: &str = "8-trixie";
+/// Image new Redis services run unless the user picks another.
+pub const DEFAULT_REDIS_IMAGE: &str = "ghcr.io/gotempsh/redis-walg:8-trixie";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedisBackupLocationKind {
     Walg,
@@ -72,7 +82,7 @@ pub struct RedisInputConfig {
     )]
     pub password: Option<String>,
 
-    /// Full Docker image reference (e.g., "gotempsh/redis-walg:8-bookworm")
+    /// Full Docker image reference (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie")
     #[serde(default = "default_docker_image")]
     #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
@@ -211,11 +221,28 @@ fn example_password() -> &'static str {
 }
 
 fn default_docker_image() -> String {
-    "gotempsh/redis-walg:8-bookworm".to_string()
+    DEFAULT_REDIS_IMAGE.to_string()
 }
 
 fn example_docker_image() -> &'static str {
-    "gotempsh/redis-walg:8-bookworm"
+    DEFAULT_REDIS_IMAGE
+}
+
+/// The tag of an image reference, as Docker resolves it: `latest` when the
+/// reference names none, and the digest for a digest-only reference. Only the
+/// last path segment can carry a tag, so a registry port
+/// (`registry:5000/redis`) is not mistaken for one.
+fn image_reference_tag(image: &str) -> String {
+    let (name, digest) = match image.split_once('@') {
+        Some((name, digest)) => (name, Some(digest)),
+        None => (image, None),
+    };
+    let last_segment = name.rsplit('/').next().unwrap_or(name);
+    match (last_segment.split_once(':'), digest) {
+        (Some((_, tag)), _) => tag.to_string(),
+        (None, Some(digest)) => digest.to_string(),
+        (None, None) => "latest".to_string(),
+    }
 }
 
 /// Whether `image` runs Dragonfly rather than a server with a `redis-server`
@@ -1723,7 +1750,7 @@ impl RedisService {
             .config
             .as_ref()
             .and_then(|c| c.image.clone())
-            .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
+            .unwrap_or_else(default_docker_image);
 
         // Step 1: Disable the restart policy and stop the container so it releases
         // the data volume exclusively to the restore helper.
@@ -3535,7 +3562,10 @@ impl ExternalService for RedisService {
 
     fn get_default_docker_image(&self) -> (String, String) {
         // Return (image_name, version)
-        ("gotempsh/redis-walg".to_string(), "8-bookworm".to_string())
+        (
+            DEFAULT_REDIS_REPOSITORY.to_string(),
+            DEFAULT_REDIS_TAG.to_string(),
+        )
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
@@ -3571,7 +3601,7 @@ impl ExternalService for RedisService {
     }
 
     fn get_default_version(&self) -> String {
-        "8-bookworm".to_string()
+        DEFAULT_REDIS_TAG.to_string()
     }
 
     async fn get_current_version(&self) -> Result<String> {
@@ -3693,12 +3723,9 @@ impl ExternalService for RedisService {
             )
         })?;
 
-        // Extract version from image name (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
-        let version = if let Some(tag_pos) = image.rfind(':') {
-            image[tag_pos + 1..].to_string()
-        } else {
-            "8-bookworm".to_string()
-        };
+        // The version is the tag the container was created from; an untagged
+        // `redis` ran `redis:latest`, whatever Temps would default to today.
+        let version = image_reference_tag(&image);
 
         // Extract port from additional config if provided, otherwise use 6379
         let port = additional_config
@@ -3966,7 +3993,7 @@ mod tests {
             }
         };
 
-        let image = "gotempsh/redis-walg:8-bookworm";
+        let image = DEFAULT_REDIS_IMAGE;
         if docker.inspect_image(image).await.is_err() {
             println!("Redis WAL-G image is unavailable; skipping restart-loop test");
             return;
@@ -4519,13 +4546,67 @@ mod tests {
 
         let (image_name, version) = service.get_default_docker_image();
         assert_eq!(
-            image_name, "gotempsh/redis-walg",
-            "Default image should be gotempsh/redis-walg"
+            image_name, "ghcr.io/gotempsh/redis-walg",
+            "Default image should be the GHCR-published redis-walg"
         );
-        assert_eq!(
-            version, "8-bookworm",
-            "Default version should be 8-bookworm"
+        assert_eq!(version, "8-trixie", "Default version should be 8-trixie");
+        assert_eq!(service.get_default_version(), version);
+        assert_eq!(format!("{image_name}:{version}"), DEFAULT_REDIS_IMAGE);
+    }
+
+    /// Issue #1844: the default named the hand-pushed Docker Hub
+    /// `gotempsh/redis-walg:8-bookworm`, built on a Debian variant upstream
+    /// Redis stopped publishing after 8.4.0, so new services got an unpatched
+    /// server. The default must be the GHCR image the weekly workflow rebuilds
+    /// (`database_image_matrix.py` publishes `redis-walg:8-trixie`).
+    #[test]
+    fn default_image_is_the_weekly_rebuilt_trixie_image() {
+        assert_eq!(default_docker_image(), DEFAULT_REDIS_IMAGE);
+        assert!(
+            DEFAULT_REDIS_IMAGE.starts_with("ghcr.io/gotempsh/redis-walg:"),
+            "{DEFAULT_REDIS_IMAGE} must be the GHCR-published image"
         );
+        assert!(
+            !DEFAULT_REDIS_IMAGE.contains("bookworm"),
+            "{DEFAULT_REDIS_IMAGE}: upstream Redis no longer ships bookworm builds"
+        );
+
+        let input: RedisInputConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "password": "pw",
+        }))
+        .unwrap();
+        assert_eq!(input.docker_image, DEFAULT_REDIS_IMAGE);
+    }
+
+    /// The user docs that state the Redis default must name the image the
+    /// provider actually uses, or operators who copy it get a stale (and,
+    /// for the old `8-bookworm` tag, unpatched) server.
+    #[test]
+    fn docs_name_the_default_redis_image() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for page in [
+            "docs/howto/set-up-managed-services/page.mdx",
+            "docs/features/managed-services/page.mdx",
+            "docs/tutorials/deploy-with-database/page.mdx",
+        ] {
+            let text = std::fs::read_to_string(root.join(page))
+                .unwrap_or_else(|e| panic!("read {page}: {e}"));
+            let references: Vec<&str> = text
+                .split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '(' | ')'))
+                .filter(|word| word.contains("redis-walg"))
+                .collect();
+            assert!(
+                !references.is_empty(),
+                "{page} no longer names the Redis image"
+            );
+            for reference in references {
+                assert_eq!(
+                    reference, DEFAULT_REDIS_IMAGE,
+                    "stale Redis image in {page}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4659,19 +4740,25 @@ mod tests {
     fn test_import_redis_version_extraction() {
         let test_cases = vec![
             ("gotempsh/redis-walg:8-bookworm", "8-bookworm"),
+            ("ghcr.io/gotempsh/redis-walg:8-trixie", "8-trixie"),
             ("redis:latest", "latest"),
             ("redis:6.2", "6.2"),
             ("redis:7.0-alpine", "7.0-alpine"),
+            // Untagged: Docker ran `latest`, not the default Temps would pick.
+            ("redis", "latest"),
+            ("registry.internal:5000/cache/redis", "latest"),
+            ("registry.internal:5000/cache/redis:7.4", "7.4"),
+            ("redis@sha256:0123abcd", "sha256:0123abcd"),
+            ("redis:7.4@sha256:0123abcd", "7.4"),
         ];
 
         for (image, expected_version) in test_cases {
-            let version = if let Some(tag_pos) = image.rfind(':') {
-                image[tag_pos + 1..].to_string()
-            } else {
-                "latest".to_string()
-            };
-
-            assert_eq!(version, expected_version, "Failed for image: {}", image);
+            assert_eq!(
+                image_reference_tag(image),
+                expected_version,
+                "Failed for image: {}",
+                image
+            );
         }
     }
 
@@ -4802,7 +4889,7 @@ mod tests {
             "host": "localhost",
             "port": redis_port.to_string(),
             "password": redis_password,
-            "docker_image": "gotempsh/redis-walg:8-bookworm",
+            "docker_image": DEFAULT_REDIS_IMAGE,
         });
 
         let redis_config = ServiceConfig {
@@ -4815,14 +4902,15 @@ mod tests {
         let redis_service = RedisService::new(service_name.clone(), docker.clone());
 
         // Initialize Redis service
-        match redis_service.init(redis_config.clone()).await {
-            Ok(_) => println!("✓ Redis service initialized"),
-            Err(e) => {
-                println!("Failed to initialize Redis: {}. Skipping test", e);
-                let _ = minio.cleanup().await;
-                return;
-            }
+        // Docker and MinIO are up, so a failure here is the image under test
+        // (it can't be pulled, or doesn't start): fail rather than skip, or
+        // the backup path would pass without having run.
+        if let Err(e) = redis_service.init(redis_config.clone()).await {
+            let _ = redis_service.remove().await;
+            let _ = minio.cleanup().await;
+            panic!("Failed to initialize Redis from {DEFAULT_REDIS_IMAGE}: {e}");
         }
+        println!("✓ Redis service initialized");
 
         // Connect to Redis using the async ConnectionManager. This must NOT
         // be `redis::Client::get_connection()` — that's the blocking, no-

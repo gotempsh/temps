@@ -578,20 +578,18 @@ impl AgentCommand {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     };
-                    if let Err(e) = temps_node_agent::internal_proxy::spawn(
+                    // Retried until it binds: something else holding port 80
+                    // (or Docker not answering yet) must not disable
+                    // `*.temps.local` routing for the agent's lifetime. Each
+                    // attempt's outcome rides on the heartbeat.
+                    temps_node_agent::internal_proxy::spawn_supervised(
                         bridge_ip,
                         80,
                         store,
                         proxy_docker,
                         proxy_shutdown,
                     )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "internal edge proxy failed to bind; internal HTTP routing disabled"
-                        );
-                    }
+                    .await;
                 });
             }
 

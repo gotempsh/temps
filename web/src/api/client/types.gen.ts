@@ -5274,6 +5274,26 @@ export type ClusterCapacity = {
 };
 
 /**
+ * `GET /cluster/dns/resolvers`.
+ */
+export type ClusterDnsResolversResponse = {
+    cluster_dns_enabled: boolean;
+    open_alerts: Array<DnsAlertEntry>;
+    /**
+     * How often resolvers report, in seconds.
+     */
+    report_interval_secs: number;
+    /**
+     * Control plane first, then workers by id.
+     */
+    resolvers: Array<DnsResolverEntry>;
+    /**
+     * Records in the zone (`service_endpoints`).
+     */
+    zone_record_count: number;
+};
+
+/**
  * Cluster-DNS resolver settings (ADR-024, experimental beta).
  *
  * When `enabled`, the Temps control plane starts a Hickory DNS resolver and
@@ -10919,6 +10939,24 @@ export type DnsAckResponse = {
 };
 
 /**
+ * An open DNS alarm.
+ */
+export type DnsAlertEntry = {
+    /**
+     * `dns_resolver_down`, `dns_sync_stale`, `dns_query_failures` or
+     * `dns_internal_proxy_down`.
+     */
+    alarm_type: string;
+    fired_at: string;
+    id: number;
+    message?: string | null;
+    node_id?: number | null;
+    severity: string;
+    status: string;
+    title: string;
+};
+
+/**
  * Result of a single DNS TXT record creation for ACME challenge
  */
 export type DnsChallengeRecordResult = {
@@ -11043,6 +11081,18 @@ export type DnsNameConflictEntry = {
 };
 
 /**
+ * Queries per outcome in one bucket.
+ */
+export type DnsOutcomeCounts = {
+    error: number;
+    nodata: number;
+    noerror: number;
+    nxdomain: number;
+    refused: number;
+    servfail: number;
+};
+
+/**
  * DNS provider credentials (API-facing)
  */
 export type DnsProviderCredentials = {
@@ -11125,6 +11175,47 @@ export type DnsProviderSettingsMasked = {
  * Supported DNS provider types
  */
 export type DnsProviderType = 'cloudflare' | 'bunny' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual' | 'pebble';
+
+/**
+ * One logged query.
+ */
+export type DnsQueryLogEntry = {
+    answer_count: number;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    id: number;
+    latency_us: number;
+    node_id: number;
+    node_name: string;
+    observed_at: string;
+    outcome: string;
+    project_id?: number | null;
+    project_name?: string | null;
+    /**
+     * The name asked; `None` for a forwarded (outside-zone) name, which is
+     * never stored.
+     */
+    qname?: string | null;
+    qtype: string;
+    service_id?: number | null;
+    service_name?: string | null;
+    source_ip: string;
+    /**
+     * `internal` or `external`.
+     */
+    zone: string;
+};
+
+export type DnsQueryLogResponse = {
+    items: Array<DnsQueryLogEntry>;
+    page: number;
+    page_size: number;
+    /**
+     * How long entries are kept, in hours.
+     */
+    retention_hours: number;
+    total: number;
+};
 
 /**
  * A DNS record
@@ -11321,6 +11412,35 @@ export type DnsRecordContent = {
 };
 
 /**
+ * One record of the internal zone.
+ */
+export type DnsRecordEntry = {
+    created_at: string;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    fqdn: string;
+    generation: number;
+    id: number;
+    node_id?: number | null;
+    node_name?: string | null;
+    owner_id: number;
+    /**
+     * What published it: `environment`, `service_member`, `service_role`,
+     * `node`, `static`.
+     */
+    owner_kind: string;
+    project_id?: number | null;
+    project_name?: string | null;
+    record_type: string;
+    service_id?: number | null;
+    service_name?: string | null;
+    target_ip?: string | null;
+    target_port?: number | null;
+    ttl: number;
+    updated_at: string;
+};
+
+/**
  * A DNS record the operator must create.
  */
 export type DnsRecordInstruction = {
@@ -11340,6 +11460,13 @@ export type DnsRecordInstruction = {
      * Record value.
      */
     value: string;
+};
+
+export type DnsRecordListResponse = {
+    items: Array<DnsRecordEntry>;
+    page: number;
+    page_size: number;
+    total: number;
 };
 
 export type DnsRecordResponse = {
@@ -11432,6 +11559,116 @@ export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'fail
 export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'TXT' | 'MX' | 'NS' | 'SRV' | 'CAA' | 'PTR';
 
 /**
+ * `POST /cluster/dns/resolve`.
+ */
+export type DnsResolveRequest = {
+    /**
+     * The name, e.g. `production.shop.temps.local`.
+     */
+    name: string;
+    /**
+     * The node whose resolver answers; 0 is the control plane.
+     */
+    node_id: number;
+    /**
+     * Answer as one of this project's containers on that node would be
+     * answered, its network policy included.
+     */
+    project_id?: number | null;
+    /**
+     * `A` (default), `AAAA`, `CNAME`, `SRV` or `TXT`.
+     */
+    record_type?: string | null;
+};
+
+export type DnsResolveResponse = {
+    answers: Array<DnsResolvedRecord>;
+    /**
+     * The container address the query was answered as.
+     */
+    asked_as?: string | null;
+    /**
+     * Answered from the internal zone.
+     */
+    authoritative: boolean;
+    latency_ms: number;
+    name: string;
+    node_id: number;
+    /**
+     * A caveat about how the answer was obtained.
+     */
+    note?: string | null;
+    /**
+     * `noerror`, `nodata`, `nxdomain`, `servfail`, `error`.
+     */
+    outcome: string;
+    /**
+     * `NOERROR`, `NXDOMAIN`, `SERVFAIL`...
+     */
+    rcode: string;
+    record_type: string;
+};
+
+/**
+ * One answer record.
+ */
+export type DnsResolvedRecord = {
+    data: string;
+    name: string;
+    record_type: string;
+    ttl: number;
+};
+
+/**
+ * One node's resolver, as last reported.
+ */
+export type DnsResolverEntry = {
+    build_version?: string | null;
+    consecutive_sync_failures: number;
+    /**
+     * Query-log entries the resolver dropped under load.
+     */
+    dropped_log_entries: number;
+    health: ResolverHealth;
+    /**
+     * Why the resolver is not healthy.
+     */
+    health_reason?: string | null;
+    internal_proxy?: InternalProxyState | null;
+    is_control_plane: boolean;
+    last_error?: string | null;
+    last_ok_at?: string | null;
+    /**
+     * Seconds since the zone last synced; `None` for the control plane,
+     * whose zone is fed locally.
+     */
+    last_sync_age_secs?: number | null;
+    listen_address?: string | null;
+    /**
+     * 0 is the control plane.
+     */
+    node_id: number;
+    node_name: string;
+    /**
+     * `active`, `draining`, `offline`...; `active` for the control plane.
+     */
+    node_status: string;
+    /**
+     * Records the resolver serves.
+     */
+    record_count?: number | null;
+    /**
+     * `ok`, `agent_too_old`, `unreachable`, `rejected` or `invalid`;
+     * `None` before the first report.
+     */
+    report_state?: string | null;
+    reported_at?: string | null;
+    running: boolean;
+    tasks_alive: boolean;
+    zone_generation?: number | null;
+};
+
+/**
  * Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
  * `temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
  * declared separately rather than shared: the agent and control-plane
@@ -11459,6 +11696,31 @@ export type DnsResolverHeartbeat = {
      * meaningful when `running`.
      */
     tasks_alive?: boolean;
+};
+
+export type DnsTrafficBucket = {
+    /**
+     * Forwarded queries.
+     */
+    external: DnsOutcomeCounts;
+    /**
+     * `*.temps.local` queries.
+     */
+    internal: DnsOutcomeCounts;
+    /**
+     * Mean latency of internal queries, in milliseconds.
+     */
+    internal_latency_ms?: number | null;
+    time: string;
+};
+
+export type DnsTrafficResponse = {
+    buckets: Array<DnsTrafficBucket>;
+    from: string;
+    node_id: number;
+    range: string;
+    step_secs: number;
+    to: string;
 };
 
 /**
@@ -18130,6 +18392,29 @@ export type Intent = {
 };
 
 /**
+ * A worker's internal edge proxy, from its heartbeat's
+ * `capacity.internal_proxy`. Every `<env>.<project>.temps.local` name
+ * points at the node's bridge, port 80, where this proxy listens: the
+ * resolver can be healthy while the proxy is not, and then the names
+ * resolve and every call to them fails.
+ */
+export type InternalProxyState = {
+    /**
+     * The address it binds, e.g. `10.205.0.1:80`.
+     */
+    address?: string | null;
+    /**
+     * Why the last bind failed; `None` while it listens.
+     */
+    error?: string | null;
+    /**
+     * `None` when the agent does not report it (an older agent, or no
+     * overlay bridge yet): unknown, never "not listening".
+     */
+    listening?: boolean | null;
+};
+
+/**
  * One CIDR in a policy, in canonical form (network address, explicit prefix).
  */
 export type IpAccessCidrEntry = {
@@ -20813,6 +21098,23 @@ export type NodeDnsStatusEntry = {
      */
     dns_resolver_running?: boolean | null;
     dns_resolver_tasks_alive?: boolean | null;
+    /**
+     * The address the proxy binds, e.g. `10.205.0.1:80`.
+     */
+    internal_proxy_address?: string | null;
+    /**
+     * Why the last bind failed, written for the operator; `None` while it
+     * listens.
+     */
+    internal_proxy_error?: string | null;
+    /**
+     * Whether the node's internal edge proxy listens on its bridge address
+     * (port 80), which is where every `<env>.<project>.temps.local` name
+     * points. The resolver can be healthy while this is `false`: the names
+     * resolve and every call fails. `None` = not reported (older agent, or
+     * no overlay bridge yet).
+     */
+    internal_proxy_listening?: boolean | null;
     node_id: number;
     node_name: string;
     /**
@@ -27529,6 +27831,11 @@ export type ResolverCoverageHost = {
     node_id?: number | null;
     node_name: string;
 };
+
+/**
+ * What a resolver looks like right now.
+ */
+export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting';
 
 /**
  * Quick count of resources involved in the migration
@@ -35503,7 +35810,7 @@ export type UpdateIpAccessControlRequest = {
  */
 export type UpdateKvRequest = {
     /**
-     * Docker image to use (e.g., "gotempsh/redis-walg:8-bookworm")
+     * Docker image to use (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie")
      */
     docker_image?: string | null;
 };
@@ -37452,6 +37759,11 @@ export type WireguardMeshStatusResponse = {
 };
 
 /**
+ * What a worker node may receive from an S3 source (ADR-093).
+ */
+export type WorkerCredentialsPolicy = 'scoped' | 'allow_full';
+
+/**
  * What a new worker installs, so it never runs an older Temps than its
  * control plane.
  */
@@ -37464,9 +37776,6 @@ export type WorkerInstall = {
 } | {
     kind: 'latest';
 };
- * What a worker node may receive from an S3 source (ADR-093).
- */
-export type WorkerCredentialsPolicy = 'scoped' | 'allow_full';
 
 export type WorkflowDryRunRequest = {
     /**
@@ -48651,6 +48960,204 @@ export type DeleteAccessProviderResponses = {
 
 export type DeleteAccessProviderResponse = DeleteAccessProviderResponses[keyof DeleteAccessProviderResponses];
 
+export type ListDnsQueriesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Entries per page, at most 100. Defaults to 20.
+         */
+        page_size?: number;
+        /**
+         * Queries answered by this node's resolver (0 is the control plane).
+         */
+        node_id?: number;
+        /**
+         * `noerror`, `nodata`, `nxdomain`, `servfail`, `refused` or `error`.
+         */
+        outcome?: string;
+        /**
+         * `internal` or `external`.
+         */
+        zone?: string;
+        /**
+         * Substring of the name asked.
+         */
+        name?: string;
+        /**
+         * Queries from this project's containers.
+         */
+        project_id?: number;
+    };
+    url: '/cluster/dns/queries';
+};
+
+export type ListDnsQueriesErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDnsQueriesResponses = {
+    /**
+     * Recent DNS queries
+     */
+    200: DnsQueryLogResponse;
+};
+
+export type ListDnsQueriesResponse = ListDnsQueriesResponses[keyof ListDnsQueriesResponses];
+
+export type ListDnsRecordsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed).
+         */
+        page?: number;
+        /**
+         * Records per page, at most 100. Defaults to 20.
+         */
+        page_size?: number;
+        /**
+         * Substring of the name or target address.
+         */
+        search?: string;
+        /**
+         * Records pinned to this node.
+         */
+        node_id?: number;
+        /**
+         * `environment`, `service_member`, `service_role`, `node` or `static`.
+         */
+        owner_kind?: string;
+    };
+    url: '/cluster/dns/records';
+};
+
+export type ListDnsRecordsErrors = {
+    /**
+     * Invalid filter
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDnsRecordsResponses = {
+    /**
+     * Records of the internal zone
+     */
+    200: DnsRecordListResponse;
+};
+
+export type ListDnsRecordsResponse = ListDnsRecordsResponses[keyof ListDnsRecordsResponses];
+
+export type ResolveDnsNameData = {
+    body: DnsResolveRequest;
+    path?: never;
+    query?: never;
+    url: '/cluster/dns/resolve';
+};
+
+export type ResolveDnsNameErrors = {
+    /**
+     * Invalid name or record type
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * The resolver is not running, the agent is too old, or the project has no container on that node
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The resolver could not be reached
+     */
+    502: unknown;
+};
+
+export type ResolveDnsNameResponses = {
+    /**
+     * The answer
+     */
+    200: DnsResolveResponse;
+};
+
+export type ResolveDnsNameResponse = ResolveDnsNameResponses[keyof ResolveDnsNameResponses];
+
+export type ListDnsResolversData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cluster/dns/resolvers';
+};
+
+export type ListDnsResolversErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDnsResolversResponses = {
+    /**
+     * Resolver health per node
+     */
+    200: ClusterDnsResolversResponse;
+};
+
+export type ListDnsResolversResponse = ListDnsResolversResponses[keyof ListDnsResolversResponses];
+
 export type ClusterDnsStatusData = {
     body?: never;
     path?: never;
@@ -48681,6 +49188,51 @@ export type ClusterDnsStatusResponses = {
 };
 
 export type ClusterDnsStatusResponse2 = ClusterDnsStatusResponses[keyof ClusterDnsStatusResponses];
+
+export type DnsTrafficData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The node whose resolver to chart; 0 (the default) is the control
+         * plane.
+         */
+        node_id?: number;
+        /**
+         * `1h` (default), `6h`, `24h` or `7d`.
+         */
+        range?: string;
+    };
+    url: '/cluster/dns/traffic';
+};
+
+export type DnsTrafficErrors = {
+    /**
+     * Invalid range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DnsTrafficResponses = {
+    /**
+     * DNS traffic over time
+     */
+    200: DnsTrafficResponse;
+};
+
+export type DnsTrafficResponse2 = DnsTrafficResponses[keyof DnsTrafficResponses];
 
 export type GetDashboardProjectsAnalyticsData = {
     body?: never;

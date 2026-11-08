@@ -459,7 +459,7 @@ pub async fn kv_status(
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
 
-            // Extract version from docker_image tag (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
+            // Extract version from docker_image tag (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie" -> "8-trixie")
             // This ensures the version always matches the actual docker image being used
             let version = docker_image
                 .as_ref()
@@ -602,7 +602,7 @@ pub async fn kv_enable(
             serde_json::json!(request.persistence),
         );
 
-        // Extract version from docker_image (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
+        // Extract version from docker_image (e.g., "ghcr.io/gotempsh/redis-walg:8-trixie" -> "8-trixie")
         let version = parameters
             .get("docker_image")
             .and_then(|v| v.as_str())

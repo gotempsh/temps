@@ -93,6 +93,19 @@ pub enum AlarmType {
     CronJobFailed,
     RuntimeProbeFailed,
     RuntimeMonitoringLost,
+    /// A node's internal DNS resolver is not running, its tasks died, or it
+    /// stopped reporting (ADR-095). Scoped to the node (`metadata.node_id`).
+    DnsResolverDown,
+    /// A worker's resolver has not synced the zone from the control plane
+    /// recently, or keeps failing to (ADR-095).
+    DnsSyncStale,
+    /// A node's resolver answered SERVFAIL, or NXDOMAIN for names that
+    /// should exist, more than usual (ADR-095).
+    DnsQueryFailures,
+    /// A worker's internal edge proxy cannot listen on its bridge address,
+    /// where every `<env>.<project>.temps.local` name points: the names
+    /// resolve and every call to them fails (ADR-095).
+    DnsInternalProxyDown,
 }
 
 impl AlarmType {
@@ -127,7 +140,24 @@ impl AlarmType {
             Self::CronJobFailed => "cron_job_failed",
             Self::RuntimeProbeFailed => "runtime_probe_failed",
             Self::RuntimeMonitoringLost => "runtime_monitoring_lost",
+            Self::DnsResolverDown => "dns_resolver_down",
+            Self::DnsSyncStale => "dns_sync_stale",
+            Self::DnsQueryFailures => "dns_query_failures",
+            Self::DnsInternalProxyDown => "dns_internal_proxy_down",
         }
+    }
+
+    /// Alarms about one node, identified by `metadata.node_id`: each node
+    /// gets its own cooldown bucket.
+    pub fn is_node_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeOffline
+                | Self::DnsResolverDown
+                | Self::DnsSyncStale
+                | Self::DnsQueryFailures
+                | Self::DnsInternalProxyDown
+        )
     }
 
     pub fn parse_alarm_type(s: &str) -> Option<Self> {
@@ -161,6 +191,10 @@ impl AlarmType {
             "cron_job_failed" => Some(Self::CronJobFailed),
             "runtime_probe_failed" => Some(Self::RuntimeProbeFailed),
             "runtime_monitoring_lost" => Some(Self::RuntimeMonitoringLost),
+            "dns_resolver_down" => Some(Self::DnsResolverDown),
+            "dns_sync_stale" => Some(Self::DnsSyncStale),
+            "dns_query_failures" => Some(Self::DnsQueryFailures),
+            "dns_internal_proxy_down" => Some(Self::DnsInternalProxyDown),
             _ => None,
         }
     }
@@ -909,6 +943,26 @@ impl AlarmService {
     /// Acknowledged ones count: left open, one would outlive the outage it was about
     /// and stand in for the node's next one. Node alarms carry the node as
     /// `metadata.node_id`, alarms fired before this method existed included.
+    /// Whether a firing or acknowledged alarm of `alarm_type` is open for
+    /// `node_id`, so a monitor raises a condition once, not every pass.
+    pub async fn has_open_node_alarm(
+        &self,
+        node_id: i32,
+        alarm_type: AlarmType,
+    ) -> Result<bool, AlarmError> {
+        use sea_orm::PaginatorTrait;
+        let open = alarms::Entity::find()
+            .filter(alarms::Column::AlarmType.eq(alarm_type.as_str()))
+            .filter(alarms::Column::Status.is_in([
+                AlarmStatus::Firing.as_str(),
+                AlarmStatus::Acknowledged.as_str(),
+            ]))
+            .filter(alarm_for_node(i64::from(node_id)))
+            .count(self.db.as_ref())
+            .await?;
+        Ok(open > 0)
+    }
+
     pub async fn resolve_node_alarms(
         &self,
         node_id: i32,
@@ -1516,7 +1570,7 @@ impl AlarmService {
         // Node alarms have no project or deployment scope either. Each node gets
         // its own bucket, or a second node going down inside the cooldown would
         // raise nothing.
-        if request.alarm_type == AlarmType::NodeOffline {
+        if request.alarm_type.is_node_scoped() {
             let node_id = request
                 .metadata
                 .as_ref()
@@ -1962,6 +2016,10 @@ mod tests {
             AlarmType::CronJobFailed,
             AlarmType::RuntimeProbeFailed,
             AlarmType::RuntimeMonitoringLost,
+            AlarmType::DnsResolverDown,
+            AlarmType::DnsSyncStale,
+            AlarmType::DnsQueryFailures,
+            AlarmType::DnsInternalProxyDown,
         ];
 
         for t in &types {
@@ -3474,6 +3532,76 @@ mod tests {
         let sql = format!("{log:?}");
         assert!(sql.contains("metadata->>'node_id'"), "{sql}");
         assert!(sql.contains("\"7\""), "bound to this node: {sql}");
+    }
+
+    #[test]
+    fn dns_alarms_are_node_scoped() {
+        for alarm_type in [
+            AlarmType::NodeOffline,
+            AlarmType::DnsResolverDown,
+            AlarmType::DnsSyncStale,
+            AlarmType::DnsQueryFailures,
+            AlarmType::DnsInternalProxyDown,
+        ] {
+            assert!(alarm_type.is_node_scoped(), "{}", alarm_type.as_str());
+        }
+        assert!(!AlarmType::NodeFailover.is_node_scoped());
+        assert!(!AlarmType::DiskSpaceLow.is_node_scoped());
+    }
+
+    /// A DNS alarm on one node must not hold back the same alarm on another.
+    #[tokio::test]
+    async fn a_dns_alarm_cooldown_is_scoped_to_that_node() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(0)),
+            }]])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        let mut request = node_offline_request(4);
+        request.alarm_type = AlarmType::DnsResolverDown;
+        assert!(!service.is_in_cooldown(&request).await.unwrap());
+        drop(service);
+
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("metadata->>'node_id'"), "{sql}");
+        assert!(sql.contains("\"4\""), "bound to this node: {sql}");
+        assert!(sql.contains("dns_resolver_down"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn an_open_node_alarm_is_found_for_that_node_only() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(1)),
+            }]])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = AlarmService::new(
+            db.clone(),
+            Arc::new(TrackingNotificationService::new()),
+            Arc::new(TrackingJobQueue::new()),
+        );
+        assert!(service
+            .has_open_node_alarm(9, AlarmType::DnsSyncStale)
+            .await
+            .unwrap());
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped its connection clone")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("\"9\""), "{sql}");
+        assert!(sql.contains("dns_sync_stale"), "{sql}");
+        assert!(sql.contains("acknowledged"), "{sql}");
     }
 
     #[tokio::test]

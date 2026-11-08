@@ -21,6 +21,9 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-dns = { path = "../temps-dns" }
+# ADR-095: DNS report wire types and test resolution against a resolver.
+temps-node-dns = { path = "../temps-node-dns" }
+hickory-proto = { workspace = true }
 temps-monitoring = { path = "../temps-monitoring" }
 temps-entities = { path = "../temps-entities" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
