@@ -13,6 +13,7 @@ pub struct Model {
     pub binary_sha256: String,
     pub source_identity: String,
     pub active: bool,
+    /// Administrator consent for marked AI tools; false for existing and new actors.
     pub ai_tools_enabled: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
