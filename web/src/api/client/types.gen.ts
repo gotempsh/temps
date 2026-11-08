@@ -8733,6 +8733,7 @@ export type CreateS3SourceRequest = {
      * provider; stored encrypted and never returned.
      */
     secret_key: SecretString;
+    worker_credentials?: WorkerCredentialsPolicy | null;
 };
 
 export type CreateSandboxBody = {
@@ -23406,7 +23407,8 @@ export type PlanRequest = {
 export type PlanSourceBackup = {
     created_at?: string | null;
     /**
-     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
+     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "mongodump",
+     * "redis_rdb", "s3_mirror", "unknown".
      */
     format: string;
     /**
@@ -27779,7 +27781,9 @@ export type RestorePlan = {
     steps: Array<string>;
     /**
      * How the restore will be performed: "walg_restore", "pg_dump_restore",
-     * "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
+     * "mariadb_physical_restore", "mariadb_dump_restore",
+     * "mongodump_restore", "redis_rdb_restore", "s3_mirror_restore", or
+     * "unsupported".
      */
     strategy: string;
     /**
@@ -28441,18 +28445,6 @@ export type S3ConnectionTestResponse = {
 };
 
 /**
- * S3 credentials distributed to agents for backup/restore operations.
- */
-export type S3CredentialsResponse = {
-    access_key_id: string;
-    bucket_name: string;
-    endpoint?: string | null;
-    force_path_style: boolean;
-    region: string;
-    secret_key: string;
-};
-
-/**
  * Outcome of copying one managed S3 service's buckets into another.
  */
 export type S3MigrationReport = {
@@ -28487,6 +28479,10 @@ export type S3SourceResponse = {
     name: string;
     region: string;
     updated_at: number;
+    /**
+     * What a worker node receives from this source (ADR-093).
+     */
+    worker_credentials: WorkerCredentialsPolicy;
 };
 
 /**
@@ -35915,6 +35911,7 @@ export type UpdateS3SourceRequest = {
      */
     region?: string | null;
     secret_key?: SecretString | null;
+    worker_credentials?: WorkerCredentialsPolicy | null;
 };
 
 /**
@@ -37416,6 +37413,11 @@ export type WireguardMeshStatusResponse = {
     state: WireguardMeshState;
 };
 
+/**
+ * What a worker node may receive from an S3 source (ADR-093).
+ */
+export type WorkerCredentialsPolicy = 'scoped' | 'allow_full';
+
 export type WorkflowDryRunRequest = {
     /**
      * Optional CPU override applied after parsing YAML (clamped server-side).
@@ -38106,6 +38108,10 @@ export type S3SourceResponseWritable = {
     region: string;
     secret_key: string;
     updated_at: number;
+    /**
+     * What a worker node receives from this source (ADR-093).
+     */
+    worker_credentials: WorkerCredentialsPolicy;
 };
 
 export type GetPlatformInfoData = {
@@ -54234,6 +54240,10 @@ export type GetRestoreCapabilitiesErrors = {
      * Service not found
      */
     404: ProblemDetails;
+    /**
+     * The service's engine cannot be reached to read its restore options
+     */
+    503: ProblemDetails;
 };
 
 export type GetRestoreCapabilitiesError = GetRestoreCapabilitiesErrors[keyof GetRestoreCapabilitiesErrors];
@@ -60201,46 +60211,6 @@ export type AdminSetNodeResourcesResponses = {
 };
 
 export type AdminSetNodeResourcesResponse = AdminSetNodeResourcesResponses[keyof AdminSetNodeResourcesResponses];
-
-export type GetS3CredentialsData = {
-    body?: never;
-    path: {
-        /**
-         * Node ID
-         */
-        node_id: number;
-        /**
-         * S3 source ID
-         */
-        s3_source_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/s3-credentials/{s3_source_id}';
-};
-
-export type GetS3CredentialsErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * S3 source not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetS3CredentialsResponses = {
-    /**
-     * S3 credentials
-     */
-    200: S3CredentialsResponse;
-};
-
-export type GetS3CredentialsResponse = GetS3CredentialsResponses[keyof GetS3CredentialsResponses];
 
 export type ReadNodeStateData = {
     body?: never;
