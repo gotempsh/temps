@@ -96,6 +96,7 @@ impl PluginBinding {
 
 #[derive(serde::Serialize)]
 pub(crate) struct PluginWriteAudit<'a> {
+    pub call_id: uuid::Uuid,
     pub plugin: &'a str,
     pub operation_id: &'a str,
     pub user_id: Option<i32>,

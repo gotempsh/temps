@@ -3,7 +3,7 @@
 
 //! Durable default-off consent and lifecycle publication of plugin tools.
 use crate::{grants::GrantError, service::ExternalPluginsService};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set};
 use serde::{Deserialize, Serialize};
 use temps_ai_api_tools::{PluginToolAccess, PluginToolsIndex};
 use temps_entities::external_plugin_actors::{self as actors, Entity as Actors};
@@ -18,6 +18,8 @@ pub struct AiToolInfo {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PluginAiToolsResponse {
     pub actor_id: String,
+    /// Binary revision returned by GET; a changed binary requires fresh consent.
+    pub installation_revision: String,
     pub enabled: bool,
     pub tools: Vec<AiToolInfo>,
 }
@@ -26,6 +28,8 @@ pub struct PluginAiToolsResponse {
 pub struct UpdatePluginAiTools {
     /// Current actor_id returned by GET; replacing the installation requires fresh consent.
     pub actor_id: String,
+    /// Binary revision returned by GET; a changed binary requires fresh consent.
+    pub installation_revision: String,
     pub enabled: bool,
 }
 
@@ -75,6 +79,7 @@ impl ExternalPluginsService {
             .collect();
         PluginAiToolsResponse {
             actor_id: actor.id.to_string(),
+            installation_revision: actor.binary_sha256,
             enabled: actor.ai_tools_enabled,
             tools,
         }
@@ -99,7 +104,9 @@ impl ExternalPluginsService {
             .ok_or_else(|| GrantError::NotFound {
                 plugin_name: name.into(),
             })?;
-        if actor.id.to_string() != request.actor_id {
+        if actor.id.to_string() != request.actor_id
+            || actor.binary_sha256 != request.installation_revision
+        {
             return Err(GrantError::ActorChanged {
                 plugin_name: name.into(),
             });
@@ -108,6 +115,7 @@ impl ExternalPluginsService {
         // outcome must never leave the prior consent executable.
         self.ai_tools
             .publish(self.ai_tools.snapshot().without_plugin(name));
+        self.schedule_consent_recovery();
         let mut active: actors::ActiveModel = actor.into();
         active.ai_tools_enabled = Set(request.enabled);
         active.updated_at = Set(chrono::Utc::now());
@@ -132,35 +140,116 @@ impl ExternalPluginsService {
     /// Called under the lifecycle lock so old discovery cannot overwrite a toggle.
     pub(crate) async fn rebuild_ai_tools(&self) {
         if let Err(error) = self.try_rebuild_ai_tools().await {
-            tracing::error!(%error, "Failed to load plugin AI consent; tools disabled; retry a consent save or reload plugins to recover");
+            tracing::error!(%error, "Failed to load plugin AI consent; tools disabled; transient failures recover automatically");
         }
     }
 
     async fn try_rebuild_ai_tools(&self) -> Result<(), sea_orm::DbErr> {
-        let actors = match temps_core::retry::RetryConfig::default()
+        match load_ai_tools(&self.db, &self.manager).await {
+            Ok(index) => {
+                self.ai_tools.publish(index);
+                self.ai_recovery.cancel();
+                Ok(())
+            }
+            Err(error) => {
+                self.ai_tools.publish(PluginToolsIndex::default());
+                if retryable_consent_load(&error) {
+                    self.schedule_consent_recovery();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    // One worker per service, also armed before a cancellable consent write.
+    // It reloads authoritative state, never retries a potentially committed write.
+    fn schedule_consent_recovery(&self) {
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut task = self
+            .ai_recovery
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let (db, manager, registry, lifecycle, closing) = (
+            self.db.clone(),
+            self.manager.clone(),
+            self.ai_tools.clone(),
+            self.lifecycle.clone(),
+            self.closing.clone(),
+        );
+        *task = Some(tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(delay).await;
+                let _lifecycle = lifecycle.lock().await;
+                if closing.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                match load_ai_tools(&db, &manager).await {
+                    Ok(index) => {
+                        registry.publish(index);
+                        return;
+                    }
+                    Err(error) if retryable_consent_load(&error) => {
+                        tracing::warn!(%error, "Plugin AI consent recovery will retry");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Plugin AI consent recovery stopped after a permanent failure");
+                        return;
+                    }
+                }
+                delay = (delay * 2).min(std::time::Duration::from_secs(60));
+            }
+        }));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ConsentRecovery {
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+impl ConsentRecovery {
+    pub(crate) fn cancel(&self) {
+        if let Some(task) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+    }
+}
+impl Drop for ConsentRecovery {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+async fn load_ai_tools(
+    db: &sea_orm::DatabaseConnection,
+    manager: &crate::manager::ExternalPluginManager,
+) -> Result<PluginToolsIndex, sea_orm::DbErr> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let actors = temps_core::retry::RetryConfig::default()
             .retry_if(
                 || async {
                     Actors::find()
                         .filter(actors::Column::Active.eq(true))
-                        .all(self.db.as_ref())
+                        // Wait for an uncertain UPDATE to settle before republishing consent.
+                        .lock_exclusive()
+                        .all(db)
                         .await
                 },
                 retryable_consent_load,
             )
-            .await
-        {
-            Ok(actors) => actors,
-            Err(error) => {
-                self.ai_tools.publish(PluginToolsIndex::default());
-                return Err(error);
-            }
-        };
+            .await?;
         let enabled: std::collections::HashMap<_, _> = actors
             .into_iter()
             .map(|a| (a.plugin_name, a.ai_tools_enabled))
             .collect();
         let mut index = PluginToolsIndex::default();
-        for (name, spec) in self.manager.openapi_schemas().await {
+        for (name, spec) in manager.openapi_schemas().await {
             match PluginToolsIndex::from_openapi(
                 &name,
                 &spec,
@@ -172,9 +261,17 @@ impl ExternalPluginsService {
                 }
             }
         }
-        self.ai_tools.publish(index);
-        Ok(())
-    }
+        Ok(index)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::SqlxError(
+            sea_orm::sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "loading plugin AI consent exceeded 30 seconds",
+            )),
+        )))
+    })
 }
 
 fn retryable_consent_load(error: &sea_orm::DbErr) -> bool {
@@ -183,7 +280,7 @@ fn retryable_consent_load(error: &sea_orm::DbErr) -> bool {
         DbErr::ConnectionAcquire(_) => true,
         DbErr::Conn(RuntimeErr::SqlxError(error)) | DbErr::Query(RuntimeErr::SqlxError(error)) => {
             match error {
-                Error::Io(_) | Error::PoolTimedOut | Error::PoolClosed => true,
+                Error::Io(_) | Error::Protocol(_) | Error::PoolTimedOut | Error::PoolClosed => true,
                 Error::Database(error) => error.code().is_some_and(|code| {
                     code.starts_with("08")
                         || matches!(
@@ -218,6 +315,48 @@ mod tests {
 
     fn declaration() -> utoipa::openapi::OpenApi {
         serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}}}})).unwrap()
+    }
+
+    #[test]
+    fn protocol_disconnects_are_retryable_but_decode_errors_are_not() {
+        assert!(retryable_consent_load(&DbErr::Query(
+            sea_orm::RuntimeErr::SqlxError(sea_orm::sqlx::Error::Protocol(
+                "connection interrupted".into()
+            ),)
+        )));
+        assert!(!retryable_consent_load(&DbErr::Custom(
+            "invalid schema".into()
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_republishes_after_failure_and_is_cancelled_on_shutdown() {
+        let service = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("first load failed".into())])
+                .append_query_results([Vec::<actors::Model>::new()])
+                .into_connection(),
+        );
+        // A cancelled or failed write schedules recovery before it is awaited.
+        service.schedule_consent_recovery();
+        service.schedule_consent_recovery();
+        service.try_rebuild_ai_tools().await.unwrap_err();
+        let failed = service.ai_tools.snapshot();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!Arc::ptr_eq(&failed, &service.ai_tools.snapshot()));
+        assert!(service
+            .ai_recovery
+            .task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_finished());
+        service.schedule_consent_recovery();
+        service.shutdown_all().await;
+        assert!(service.ai_recovery.task.lock().unwrap().is_none());
     }
 
     #[test]
@@ -256,7 +395,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_connection_retries_schedule_automatic_recovery() {
+        let service = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors((0..3).map(|_| {
+                    DbErr::Query(sea_orm::RuntimeErr::SqlxError(
+                        sea_orm::sqlx::Error::Protocol("connection interrupted".into()),
+                    ))
+                }))
+                .append_query_results([Vec::<actors::Model>::new()])
+                .into_connection(),
+        );
+        service.try_rebuild_ai_tools().await.unwrap_err();
+        let failed = service.ai_tools.snapshot();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!Arc::ptr_eq(&failed, &service.ai_tools.snapshot()));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn uncertain_consent_update_revokes_only_the_target_before_awaiting_the_write() {
         let actor = actors::Model {
             id: uuid::Uuid::from_u128(4),
@@ -274,6 +433,7 @@ mod tests {
                 .append_query_errors([DbErr::Conn(sea_orm::RuntimeErr::Internal(
                     "write outcome unknown".into(),
                 ))])
+                .append_query_results([Vec::<actors::Model>::new()])
                 .into_connection(),
         );
         let mut index = PluginToolsIndex::from_openapi("reports", &declaration(), true).unwrap();
@@ -284,6 +444,7 @@ mod tests {
                 "reports",
                 UpdatePluginAiTools {
                     actor_id: actor.id.to_string(),
+                    installation_revision: actor.binary_sha256.clone(),
                     enabled: false
                 }
             )
@@ -299,6 +460,14 @@ mod tests {
             .snapshot()
             .callable("plugin.metrics.list", PluginToolAccess::Read)
             .is_some());
+        let revoked = service.ai_tools.snapshot();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !Arc::ptr_eq(&revoked, &service.ai_tools.snapshot()),
+            "failed UPDATE must recover without another save"
+        );
     }
 
     #[tokio::test]
@@ -335,7 +504,7 @@ mod tests {
                 .into_connection(),
         );
         assert!(
-            matches!(changed.update_plugin_ai_tools("reports",UpdatePluginAiTools {actor_id:uuid::Uuid::from_u128(1).to_string(),enabled:true}).await,Err(GrantError::ActorChanged {plugin_name}) if plugin_name=="reports")
+            matches!(changed.update_plugin_ai_tools("reports",UpdatePluginAiTools {actor_id:uuid::Uuid::from_u128(1).to_string(),installation_revision:"fixture".into(),enabled:true}).await,Err(GrantError::ActorChanged {plugin_name}) if plugin_name=="reports")
         );
     }
     #[tokio::test]
@@ -363,6 +532,7 @@ mod tests {
                 "reports",
                 UpdatePluginAiTools {
                     actor_id: uuid::Uuid::from_u128(3).to_string(),
+                    installation_revision: "fixture".into(),
                     enabled: true,
                 },
             )

@@ -911,6 +911,11 @@ mod tests {
         assert_eq!(entry["plugin"], "reports");
         assert_eq!(entry["user_id"], 7);
         assert_eq!(entry["succeeded"], true);
+        assert!(entry["call_id"].as_str().is_some());
+        assert_eq!(
+            entry["call_id"],
+            serde_json::from_str::<Value>(&entries[0]).unwrap()["call_id"]
+        );
         // Reload invalidates old snapshots, even if the declarations are identical.
         registry.publish(PluginToolsIndex::from_openapi("reports", &plugin_spec(), true).unwrap());
         assert!(ready

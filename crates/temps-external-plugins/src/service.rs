@@ -45,7 +45,8 @@ pub struct ExternalPluginsService {
     /// are reflected without restarting the server.
     proxy_router: Arc<RwLock<Router>>,
     /// Serializes discovery, reload, and install/promotion lifecycles.
-    pub(crate) lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) ai_recovery: crate::ai_tools::ConsentRecovery,
     /// Serializes every read/compare/write mutation of the persisted registry
     /// trust state. Catalogue requests can overlap on the network, but they
     /// must be committed in a single monotonic order with installations.
@@ -54,7 +55,7 @@ pub struct ExternalPluginsService {
     install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
-    closing: AtomicBool,
+    pub(crate) closing: Arc<AtomicBool>,
     /// Compiles plugins on a worker node when this process has no Docker.
     remote_builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
 }
@@ -556,11 +557,12 @@ impl ExternalPluginsService {
             event_listener: RwLock::new(None),
             queue,
             proxy_router: Arc::new(RwLock::new(Router::new())),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
-            closing: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
             remote_builder: None,
             ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         }
@@ -659,11 +661,12 @@ impl ExternalPluginsService {
             event_listener: RwLock::new(event_listener),
             queue,
             proxy_router: Arc::new(RwLock::new(proxy_router)),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
-            closing: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
             remote_builder: None,
             ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         };
@@ -1061,10 +1064,12 @@ impl ExternalPluginsService {
 
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.ai_recovery.cancel();
         self.ai_tools
             .publish(temps_ai_api_tools::PluginToolsIndex::default());
-        self.closing.store(true, Ordering::Release);
         let _lifecycle = self.lifecycle.lock().await;
+        self.ai_recovery.cancel();
         // A lifecycle operation already holding the lock may have published
         // after the early revocation. Revoke its snapshot before stopping.
         self.ai_tools
@@ -2667,6 +2672,7 @@ websocket_key = headers["sec-websocket-key"]"#);
                 "reports",
                 crate::ai_tools::UpdatePluginAiTools {
                     actor_id: settings.actor_id.clone(),
+                    installation_revision: settings.installation_revision.clone(),
                     enabled: true,
                 },
             )
@@ -2686,6 +2692,7 @@ websocket_key = headers["sec-websocket-key"]"#);
                 "reports",
                 crate::ai_tools::UpdatePluginAiTools {
                     actor_id: settings.actor_id,
+                    installation_revision: settings.installation_revision,
                     enabled: false,
                 },
             )

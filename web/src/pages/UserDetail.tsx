@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { summarizeActivity } from './UserDetail.activity'
 import {
   listAuditLogsOptions,
   listUsersOptions,
@@ -147,15 +148,7 @@ export function UserDetail() {
   const stats = useMemo(() => {
     if (!statsLogs) return null
     const cutoff = statsUpdatedAt - STATS_WINDOW_MS
-    let actions30d = 0
-    let lastActivity: number | undefined
-    for (const log of statsLogs) {
-      if (lastActivity === undefined || log.audit_date > lastActivity) {
-        lastActivity = log.audit_date
-      }
-      if (log.audit_date >= cutoff) actions30d++
-    }
-    return { actions30d, lastActivity }
+    return summarizeActivity(statsLogs, cutoff)
   }, [statsLogs, statsUpdatedAt])
 
   const lastLogin = lastLoginQuery.data?.[0]

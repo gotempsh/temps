@@ -20,6 +20,7 @@ afterEach(() => {
 })
 const settings = {
   actor_id: '00000000-0000-4000-8000-000000000001',
+  installation_revision: 'binary-one',
   enabled: false,
   tools: [
     {
@@ -109,7 +110,11 @@ test('lists read/write tools and saves consent with actor identity and success f
   expect(submitted).toBeUndefined()
   fireEvent.click(view.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(success).toHaveBeenCalledTimes(1))
-  expect(submitted).toEqual({ actor_id: settings.actor_id, enabled: true })
+  expect(submitted).toEqual({
+    actor_id: settings.actor_id,
+    installation_revision: settings.installation_revision,
+    enabled: true,
+  })
   expect(success).toHaveBeenCalledTimes(1)
 })
 
@@ -156,48 +161,76 @@ test('failed reads show a retry instead of a misleading empty state', async () =
   expect(view.queryByText('This plugin declares no AI tools.')).toBeNull()
 })
 
-test('reloads a replacement identity and requires a new consent choice after conflict', async () => {
-  const replacement = {
-    ...settings,
-    actor_id: '00000000-0000-4000-8000-000000000002',
-  }
-  let replaced = false
-  const submitted: unknown[] = []
-  mockApi({
-    'GET /x/plugins/reports/ai-tools': () =>
-      jsonResponse(replaced ? replacement : settings),
-    'PUT /x/plugins/reports/ai-tools': async (request) => {
-      submitted.push(await request.json())
-      if (!replaced) {
-        replaced = true
-        return jsonResponse(
-          { title: 'Conflict', detail: 'Plugin identity changed' },
-          409
-        )
-      }
-      return jsonResponse({ ...replacement, enabled: true })
-    },
-  })
-  const view = mount()
-  const toggle = await view.findByRole('checkbox')
-  await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
-  fireEvent.click(toggle)
-  fireEvent.click(view.getByRole('button', { name: 'Save' }))
-  fireEvent.click(await view.findByRole('button', { name: 'Reload settings' }))
-  await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
-  expect(submitted).toEqual([{ actor_id: settings.actor_id, enabled: true }])
-  expect(
-    view.getByRole('button', { name: 'Save' }).hasAttribute('disabled')
-  ).toBe(true)
-  fireEvent.click(toggle)
-  fireEvent.click(view.getByRole('button', { name: 'Save' }))
-  await waitFor(() =>
+test.each(['actor', 'binary'])(
+  'reloads a replacement %s and requires a new consent choice after conflict',
+  async (kind) => {
+    const replacement = {
+      ...settings,
+      actor_id:
+        kind === 'actor'
+          ? '00000000-0000-4000-8000-000000000002'
+          : settings.actor_id,
+      installation_revision:
+        kind === 'binary' ? 'binary-two' : settings.installation_revision,
+    }
+    let replaced = false
+    const submitted: unknown[] = []
+    mockApi({
+      'GET /x/plugins/reports/ai-tools': () =>
+        jsonResponse(replaced ? replacement : settings),
+      'PUT /x/plugins/reports/ai-tools': async (request) => {
+        submitted.push(await request.json())
+        if (!replaced) {
+          replaced = true
+          return jsonResponse(
+            { title: 'Conflict', detail: 'Plugin identity changed' },
+            409
+          )
+        }
+        return jsonResponse({ ...replacement, enabled: true })
+      },
+    })
+    const view = mount()
+    const toggle = await view.findByRole('checkbox')
+    await waitFor(() =>
+      expect(toggle.getAttribute('aria-checked')).toBe('false')
+    )
+    fireEvent.click(toggle)
+    fireEvent.click(view.getByRole('button', { name: 'Save' }))
+    fireEvent.click(
+      await view.findByRole('button', { name: 'Reload settings' })
+    )
+    await waitFor(() =>
+      expect(toggle.getAttribute('aria-checked')).toBe('false')
+    )
     expect(submitted).toEqual([
-      { actor_id: settings.actor_id, enabled: true },
-      { actor_id: replacement.actor_id, enabled: true },
+      {
+        actor_id: settings.actor_id,
+        installation_revision: settings.installation_revision,
+        enabled: true,
+      },
     ])
-  )
-})
+    expect(
+      view.getByRole('button', { name: 'Save' }).hasAttribute('disabled')
+    ).toBe(true)
+    fireEvent.click(toggle)
+    fireEvent.click(view.getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(submitted).toEqual([
+        {
+          actor_id: settings.actor_id,
+          installation_revision: settings.installation_revision,
+          enabled: true,
+        },
+        {
+          actor_id: replacement.actor_id,
+          installation_revision: replacement.installation_revision,
+          enabled: true,
+        },
+      ])
+    )
+  }
+)
 
 test('does not request or show admin consent settings for non-administrators', async () => {
   let requests = 0

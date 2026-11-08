@@ -23651,6 +23651,10 @@ export type PluginAiCapability = {
 export type PluginAiToolsResponse = {
     actor_id: string;
     enabled: boolean;
+    /**
+     * Binary revision returned by GET; a changed binary requires fresh consent.
+     */
+    installation_revision: string;
     tools: Array<AiToolInfo>;
 };
 
@@ -24205,12 +24209,6 @@ export type ProblemDetails = {
      */
     detail?: string | null;
     /**
-     * Additional properties of the problem
-     */
-    extensions: {
-        [key: string]: unknown;
-    };
-    /**
      * A URI reference that identifies the specific occurrence of the problem
      */
     instance?: string | null;
@@ -24226,6 +24224,7 @@ export type ProblemDetails = {
      * A URI reference that identifies the problem type
      */
     type?: string | null;
+    [key: string]: unknown;
 };
 
 export type ProfileResponse = {
@@ -35669,6 +35668,10 @@ export type UpdatePluginAiTools = {
      */
     actor_id: string;
     enabled: boolean;
+    /**
+     * Binary revision returned by GET; a changed binary requires fresh consent.
+     */
+    installation_revision: string;
 };
 
 export type UpdatePreferencesRequest = {

@@ -50530,6 +50530,10 @@
           "enabled": {
             "type": "boolean"
           },
+          "installation_revision": {
+            "description": "Binary revision returned by GET; a changed binary requires fresh consent.",
+            "type": "string"
+          },
           "tools": {
             "items": {
               "$ref": "#/components/schemas/AiToolInfo"
@@ -50539,6 +50543,7 @@
         },
         "required": [
           "actor_id",
+          "installation_revision",
           "enabled",
           "tools"
         ],
@@ -51255,6 +51260,9 @@
         "type": "object"
       },
       "ProblemDetails": {
+        "additionalProperties": {
+          "description": "Additional properties of the problem"
+        },
         "description": "Representation of a Problem error to return to the client.\nFollows RFC 7807 - Problem Details for HTTP APIs",
         "example": {
           "additional_info": "Custom field with additional details",
@@ -51271,11 +51279,6 @@
               "string",
               "null"
             ]
-          },
-          "extensions": {
-            "additionalProperties": true,
-            "description": "Additional properties of the problem",
-            "type": "object"
           },
           "instance": {
             "description": "A URI reference that identifies the specific occurrence of the problem",
@@ -51309,8 +51312,7 @@
           }
         },
         "required": [
-          "title",
-          "extensions"
+          "title"
         ],
         "type": "object"
       },
@@ -75479,10 +75481,15 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "installation_revision": {
+            "description": "Binary revision returned by GET; a changed binary requires fresh consent.",
+            "type": "string"
           }
         },
         "required": [
           "actor_id",
+          "installation_revision",
           "enabled"
         ],
         "type": "object"

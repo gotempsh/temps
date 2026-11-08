@@ -1091,8 +1091,10 @@ impl InternalApiCaller {
                 ));
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let call_id = uuid::Uuid::new_v4();
             if binding.access == crate::PluginToolAccess::Write {
                 let event = crate::plugin_registry::PluginWriteAudit {
+                    call_id,
                     plugin,
                     operation_id,
                     user_id: scope.auth.user_id_opt(),
@@ -1114,6 +1116,7 @@ impl InternalApiCaller {
             };
             if binding.access == crate::PluginToolAccess::Write {
                 let event = crate::plugin_registry::PluginWriteAudit {
+                    call_id,
                     plugin,
                     operation_id,
                     user_id: scope.auth.user_id_opt(),

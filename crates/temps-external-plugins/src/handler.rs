@@ -2972,7 +2972,7 @@ mod tests {
                         .uri("/x/plugins/reports/ai-tools")
                         .header("content-type", "application/json")
                         .body(axum::body::Body::from(
-                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"enabled":true})
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"installation_revision":"fixture","enabled":true})
                                 .to_string(),
                         ))
                         .unwrap(),
@@ -3023,7 +3023,7 @@ mod tests {
                     .uri("/x/plugins/reports/ai-tools")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"enabled":true})
+                        serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"installation_revision":"fixture","enabled":true})
                             .to_string(),
                     ))
                     .unwrap(),
@@ -3110,7 +3110,7 @@ mod tests {
                         .uri("/x/plugins/reports/ai-tools")
                         .header("content-type", "application/json")
                         .body(axum::body::Body::from(
-                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(2),"enabled":true})
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(2),"installation_revision":"fixture","enabled":true})
                                 .to_string(),
                         ))
                         .unwrap(),

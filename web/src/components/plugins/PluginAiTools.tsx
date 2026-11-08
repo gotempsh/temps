@@ -28,6 +28,7 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 const consentSchema = z.object({
   enabled: z.boolean(),
   actor_id: z.string().uuid(),
+  installation_revision: z.string().min(1),
 })
 
 export function PluginAiTools({ name }: { name: string }) {
@@ -45,17 +46,21 @@ export function PluginAiTools({ name }: { name: string }) {
     enabled: isAdmin,
   })
   const form = useForm({
-    defaultValues: { enabled: false, actor_id: '' },
+    defaultValues: { enabled: false, actor_id: '', installation_revision: '' },
     resolver: zodResolver(consentSchema),
   })
   const enabled = useWatch({ control: form.control, name: 'enabled' })
   const dirty = form.formState.isDirty
   useEffect(() => {
     if (tools.data && !dirty)
-      form.reset({ enabled: tools.data.enabled, actor_id: tools.data.actor_id })
+      form.reset({
+        enabled: tools.data.enabled,
+        actor_id: tools.data.actor_id,
+        installation_revision: tools.data.installation_revision,
+      })
   }, [tools.data, dirty, form])
   const save = useMutation({
-    mutationFn: async (body: { enabled: boolean; actor_id: string }) => {
+    mutationFn: async (body: z.infer<typeof consentSchema>) => {
       if (!tools.data)
         throw new Error('Load plugin settings before changing AI access.')
       return (
@@ -68,7 +73,11 @@ export function PluginAiTools({ name }: { name: string }) {
     },
     onSuccess: (data) => {
       client.setQueryData(queryKey, data)
-      form.reset({ enabled: data.enabled, actor_id: data.actor_id })
+      form.reset({
+        enabled: data.enabled,
+        actor_id: data.actor_id,
+        installation_revision: data.installation_revision,
+      })
       toast.success('Plugin AI access updated')
     },
   })
@@ -85,6 +94,7 @@ export function PluginAiTools({ name }: { name: string }) {
       form.reset({
         enabled: result.data.enabled,
         actor_id: result.data.actor_id,
+        installation_revision: result.data.installation_revision,
       })
       save.reset()
     }
@@ -154,7 +164,8 @@ export function PluginAiTools({ name }: { name: string }) {
                 <p className="text-sm text-muted-foreground">
                   Enabling lets AI chat read plugin data as the signed-in user.
                   Write tools use the existing approval flow. Plugin permissions
-                  still apply.
+                  still apply. Updating the plugin binary turns AI access off
+                  until you enable it again.
                 </p>
                 {!tools.data.enabled && (
                   <p className="text-sm text-muted-foreground">
