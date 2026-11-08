@@ -498,7 +498,9 @@ pub struct RestorePlan {
     /// Backup we'll read from.
     pub source_backup: PlanSourceBackup,
     /// How the restore will be performed: "walg_restore", "pg_dump_restore",
-    /// "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
+    /// "mariadb_physical_restore", "mariadb_dump_restore",
+    /// "mongodump_restore", "redis_rdb_restore", "s3_mirror_restore", or
+    /// "unsupported".
     pub strategy: String,
     /// Ordered list of human-readable actions the orchestrator will take.
     pub steps: Vec<String>,
@@ -536,7 +538,8 @@ pub struct PlanSourceBackup {
     /// True when the original row's `s3_location` was empty and we resolved
     /// a location by probing S3. The UI shows this as a warning.
     pub location_was_resolved: bool,
-    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
+    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "mongodump",
+    /// "redis_rdb", "s3_mirror", "unknown".
     pub format: String,
     pub size_bytes: Option<i64>,
     pub created_at: Option<String>,
@@ -558,6 +561,9 @@ pub struct RestoreService {
     /// of a database on a worker node run as a job through it (ADR-055
     /// Phase 9); an empty slot refuses them with the reason.
     workload_plane: Arc<temps_workload_plane::PlaneSlot>,
+    /// Derives the S3 credential a restore on a worker node receives
+    /// (ADR-093).
+    worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 impl RestoreService {
@@ -566,6 +572,14 @@ impl RestoreService {
         external_service_manager: Arc<ExternalServiceManager>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
+        // Without the shared scoper a worker restore still never receives a
+        // source's own credential: this one scopes through STS and refuses
+        // a managed source (it has no Cloud minter).
+        let worker_credentials = Arc::new(
+            temps_providers::worker_s3_scope::WorkerCredentialScoper::new(
+                encryption_service.clone(),
+            ),
+        );
         Self {
             db,
             external_service_manager,
@@ -573,7 +587,18 @@ impl RestoreService {
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             cancellations: super::restore_cancel::RestoreCancellations::default(),
             workload_plane: Arc::new(temps_workload_plane::PlaneSlot::new()),
+            worker_credentials,
         }
+    }
+
+    /// Derive worker restores' S3 credentials with `scoper`, the process's
+    /// shared one (it holds the Temps Cloud minter).
+    pub fn with_worker_credentials(
+        mut self,
+        scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
+    ) -> Self {
+        self.worker_credentials = scoper;
+        self
     }
 
     /// Restore databases on worker nodes through `plane` (ADR-055 Phase 9).
@@ -770,44 +795,10 @@ impl RestoreService {
             }
         }
 
-        // Strategy classification.
-        //
-        // MariaDB is classified FIRST and entirely on its own terms. Its
-        // logical dump object is named `dump.sql.gz`, so the generic
-        // `.sql.gz` arm below would label it `pg_dump_restore` and the plan
-        // would describe a `pg_restore` that never runs. Its physical base is
-        // a WAL-G repository (or, in older buckets, a `base.mbstream.gz`
-        // object), neither of which matches a generic arm — both would land
-        // in `unsupported` even though they are the engine's PITR format.
+        // Strategy classification: see `classify_restore_strategy`.
         let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
         let engine_lower = target.service_type.to_ascii_lowercase();
-        let strategy = if target_is_mariadb {
-            // Same predicate the MariaDB engine itself dispatches on, so the
-            // preview cannot promise a restore shape the executor won't take.
-            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
-                &resolved_location,
-            ) {
-                "mariadb_physical_restore"
-            } else if resolved_location.ends_with(".sql.gz") {
-                "mariadb_dump_restore"
-            } else {
-                "unsupported"
-            }
-        } else if resolved_location.starts_with("s3://") {
-            "walg_restore"
-        } else if resolved_location.ends_with(".sql.gz")
-            || resolved_location.ends_with(".pgdump.gz")
-        {
-            "pg_dump_restore"
-        } else if engine_lower == "redis"
-            && temps_providers::externalsvc::redis::classify_redis_backup_location(
-                &resolved_location,
-            ) == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip
-        {
-            "redis_rdb_restore"
-        } else {
-            "unsupported"
-        };
+        let strategy = classify_restore_strategy(&engine_lower, &resolved_location);
 
         // PITR needs a continuous change stream anchored to the base backup:
         // WAL-G's WAL archive for Postgres, archived binary logs for MariaDB's
@@ -820,10 +811,10 @@ impl RestoreService {
                         .into(),
                 );
             } else {
-                errors.push(
-                    "PITR requires a WAL-G backup. The selected backup is pg_dump; choose a WAL-G backup or a different mode."
-                        .into(),
-                );
+                errors.push(format!(
+                    "PITR requires a WAL-G backup. The selected backup is {}; choose a WAL-G backup or a different mode.",
+                    restore_format(strategy).replace('_', " ")
+                ));
             }
         }
 
@@ -886,7 +877,10 @@ impl RestoreService {
             && engine_preserves_source_credentials
             && matches!(
                 strategy,
-                "walg_restore" | "pg_dump_restore" | "mariadb_physical_restore"
+                "walg_restore"
+                    | "pg_dump_restore"
+                    | "mariadb_physical_restore"
+                    | "mongodump_restore"
             )
         {
             let origin_still_known = backup_row
@@ -1034,16 +1028,7 @@ impl RestoreService {
                 origin_service_name,
                 location: resolved_location,
                 location_was_resolved,
-                format: match strategy {
-                    "walg_restore" => "walg".into(),
-                    "pg_dump_restore" => "pg_dump".into(),
-                    // Match the engine keys the MariaDB backup engines
-                    // register under, so the plan's `format` lines up with
-                    // `classify_backup_format` and the backup list UI.
-                    "mariadb_physical_restore" => "mariadb_physical".into(),
-                    "mariadb_dump_restore" => "mariadb_dump".into(),
-                    _ => "unknown".into(),
-                },
+                format: restore_format(strategy).into(),
                 size_bytes: backup_row.as_ref().and_then(|b| b.size_bytes),
                 created_at: backup_row.as_ref().map(|b| b.started_at.to_rfc3339()),
             },
@@ -1408,12 +1393,23 @@ impl RestoreService {
         let enc = self.encryption_service.clone();
         let telemetry = self.telemetry.clone();
         let plane = self.workload_plane.clone();
+        let scoper = self.worker_credentials.clone();
         // Registered before the worker starts so a cancellation that arrives
         // immediately still reaches it.
         let registration = self.cancellations.register(run_id);
         tokio::spawn(async move {
-            if let Err(e) =
-                run_restore_worker(db, mgr, enc, plane, telemetry, run_id, mode, registration).await
+            if let Err(e) = run_restore_worker(
+                db,
+                mgr,
+                enc,
+                plane,
+                scoper,
+                telemetry,
+                run_id,
+                mode,
+                registration,
+            )
+            .await
             {
                 error!("Restore run {} failed: {}", run_id, e);
             }
@@ -1857,6 +1853,66 @@ async fn backup_origin_service_name(
         })
 }
 
+/// How a backup at `location` is restored into a `service_type` service
+/// (lowercase): the strategy a restore plan reports, from the location alone,
+/// the same way the engines dispatch on it.
+///
+/// MariaDB is classified FIRST and entirely on its own terms. Its logical
+/// dump object is named `dump.sql.gz`, so the generic `.sql.gz` arm below
+/// would label it `pg_dump_restore` and the plan would describe a
+/// `pg_restore` that never runs. Its physical base is a WAL-G repository
+/// (or, in older buckets, a `base.mbstream.gz` object), neither of which
+/// matches a generic arm. MongoDB and the object stores are classified
+/// before the generic arms too: a MongoDB object that is not a WAL-G
+/// prefix is a `mongodump --archive` (the MongoDB engine's dump, also what a
+/// worker's agent writes), and an object-store location that is not a
+/// WAL-G prefix is a bucket-mirror prefix.
+fn classify_restore_strategy(service_type: &str, location: &str) -> &'static str {
+    match service_type {
+        "mariadb" => {
+            // Same predicate the MariaDB engine itself dispatches on, so the
+            // preview cannot promise a restore shape the executor won't take.
+            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
+                location,
+            ) {
+                "mariadb_physical_restore"
+            } else if location.ends_with(".sql.gz") {
+                "mariadb_dump_restore"
+            } else {
+                "unsupported"
+            }
+        }
+        _ if location.starts_with("s3://") => "walg_restore",
+        "mongodb" if !location.trim().is_empty() => "mongodump_restore",
+        "s3" | "rustfs" | "blob" | "minio" if !location.trim().is_empty() => "s3_mirror_restore",
+        _ if location.ends_with(".sql.gz") || location.ends_with(".pgdump.gz") => "pg_dump_restore",
+        "redis" | "kv"
+            if temps_providers::externalsvc::redis::classify_redis_backup_location(location)
+                == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip =>
+        {
+            "redis_rdb_restore"
+        }
+        _ => "unsupported",
+    }
+}
+
+/// The backup format a restore strategy reads, as a restore plan reports it.
+/// The MariaDB values match the engine keys its backup engines register
+/// under, so the plan lines up with `classify_backup_format` and the backup
+/// list.
+fn restore_format(strategy: &str) -> &'static str {
+    match strategy {
+        "walg_restore" => "walg",
+        "pg_dump_restore" => "pg_dump",
+        "mariadb_physical_restore" => "mariadb_physical",
+        "mariadb_dump_restore" => "mariadb_dump",
+        "mongodump_restore" => "mongodump",
+        "redis_rdb_restore" => "redis_rdb",
+        "s3_mirror_restore" => "s3_mirror",
+        _ => "unknown",
+    }
+}
+
 /// What restoring into a service on a worker node runs, for a restore plan.
 struct WorkerRestorePlan {
     steps: Vec<String>,
@@ -1916,16 +1972,39 @@ fn worker_restore_plan(
         });
     }
     if crate::engines::worker_agent::takes_agent_path(target) {
+        use crate::engines::worker_agent::{worker_service_kind, WorkerServiceKind};
+        use temps_providers::externalsvc::worker_data::DumpEngine;
+        let applies = match worker_service_kind(&target.service_type) {
+            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) => format!(
+                "The agent downloads the mongodump archive {location} and replays it into \
+                 {container} with `mongorestore --archive --gzip --drop`, MongoDB's own restore: \
+                 every database is replaced, `admin.system.users` included"
+            ),
+            Some(WorkerServiceKind::Dump(DumpEngine::Redis)) => format!(
+                "The agent installs the RDB snapshot {location} into {container} with Redis's \
+                 own restore, which stops and starts the container (existing data is replaced)"
+            ),
+            Some(WorkerServiceKind::Dump(DumpEngine::Mariadb)) => format!(
+                "The agent applies the SQL dump {location} into {container} with MariaDB's own \
+                 restore (existing data in the dumped databases is replaced)"
+            ),
+            Some(WorkerServiceKind::Storage) => format!(
+                "The agent mirrors each bucket under {location} into {container} with \
+                 `rc mirror --overwrite --remove`: missing objects are added, changed ones \
+                 overwritten, and objects the backup does not have are deleted"
+            ),
+            None => format!(
+                "The agent applies {location} in place with {}'s own restore (existing data is \
+                 overwritten)",
+                target.service_type
+            ),
+        };
         return Some(WorkerRestorePlan {
             steps: vec![
                 format!(
                     "Restore on worker node {node}, through its agent, into container {container}"
                 ),
-                format!(
-                    "The agent applies {location} in place with {}'s own restore (existing data \
-                     is overwritten)",
-                    target.service_type
-                ),
+                applies,
             ],
             refusal: agent_restore_supported(target, location, mode)
                 .err()
@@ -2052,6 +2131,7 @@ async fn run_restore_worker(
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
     plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     run_id: i32,
     mode: RestoreRequestMode,
@@ -2069,6 +2149,7 @@ async fn run_restore_worker(
         mgr,
         enc,
         plane,
+        scoper,
         run_id,
         mode,
         registration.token(),
@@ -2185,11 +2266,16 @@ fn restore_outcome_event(
     event.with("mode", mode).with_duration(elapsed)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's owned dependencies, one per argument"
+)]
 async fn run_restore_inner(
     db: Arc<DatabaseConnection>,
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
     plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
     run_id: i32,
     mode: RestoreRequestMode,
     cancel: tokio_util::sync::CancellationToken,
@@ -2275,6 +2361,7 @@ async fn run_restore_inner(
         return worker_walg::run(
             &db,
             &enc,
+            &scoper,
             &mgr,
             run_id,
             &backup_model,
@@ -2289,6 +2376,7 @@ async fn run_restore_inner(
         return run_job_restore(
             &db,
             &enc,
+            &scoper,
             &mgr,
             &plane,
             run_id,
@@ -2304,6 +2392,7 @@ async fn run_restore_inner(
         return run_agent_restore(
             &db,
             &enc,
+            &scoper,
             &mgr,
             run_id,
             &backup_model,
@@ -3578,9 +3667,14 @@ fn agent_restore_supported(
 /// Restore `backup` in place into `target`, a MongoDB, Redis, MariaDB or
 /// storage service on a worker node, through the node's agent, which runs the
 /// engine's own restore there.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's dependencies and the run's inputs"
+)]
 async fn run_agent_restore(
     db: &Arc<DatabaseConnection>,
     enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     mgr: &Arc<ExternalServiceManager>,
     run_id: i32,
     backup: &temps_entities::backups::Model,
@@ -3600,25 +3694,42 @@ async fn run_agent_restore(
     // carries its origin's users (MongoDB) leaves the target with the
     // origin's credentials, which its stored config is patched to below.
     let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
-    let s3 = workload_job::s3_target(
-        db.as_ref(),
-        enc,
-        backup.s3_source_id,
-        target.id,
-        node_id,
-        "restore",
-    )
-    .await
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id}: {e}"),
-    })?;
-    let bucket_prefix = format!("s3://{}/", s3.bucket);
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+    let bucket_prefix = format!("s3://{}/", s3_source.bucket_name);
     let location = backup
         .s3_location
         .strip_prefix(&bucket_prefix)
         .unwrap_or(&backup.s3_location)
         .trim_start_matches('/')
         .to_string();
+    // The worker can read this one backup and nothing else (ADR-093).
+    let read_prefix = match worker_agent::worker_service_kind(&target.service_type) {
+        Some(worker_agent::WorkerServiceKind::Storage) => {
+            temps_providers::worker_s3_scope::as_prefix(&location)
+        }
+        _ => temps_providers::worker_s3_scope::key_directory(&location),
+    };
+    let destination = worker_agent::scoped_destination(
+        scoper,
+        db.as_ref(),
+        backup.s3_source_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            target.id,
+            node_id,
+            read_prefix,
+            temps_core::ScopedS3Access::Read,
+            "restore",
+        ),
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
 
     // The last safe point: once the node starts writing, the run can no
     // longer be cancelled.
@@ -3631,11 +3742,17 @@ async fn run_agent_restore(
         "restoring service {} in place on its node",
         target.id
     );
-    mgr.restore_worker_service(target.id, worker_agent::destination(&s3), location)
-        .await
-        .map_err(|e| RestoreError::ExternalService {
-            reason: format!("restore run {run_id} on node {node_id}: {e}"),
-        })?;
+    // A node already running its maximum of backups and restores is waited
+    // for, visibly and cancellably, instead of failing the run.
+    crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || mgr.restore_worker_service(target.id, destination.clone(), location.clone()),
+        |wait| wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
+    )
+    .await?
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id} on node {node_id}: {e}"),
+    })?;
     reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
     if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
@@ -3652,6 +3769,7 @@ async fn run_agent_restore(
 async fn run_job_restore(
     db: &Arc<DatabaseConnection>,
     enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     mgr: &Arc<ExternalServiceManager>,
     plane: &temps_workload_plane::PlaneSlot,
     run_id: i32,
@@ -3700,21 +3818,14 @@ async fn run_job_restore(
             == job_target.username)
             .then(|| origin.password.clone())
     });
-    let s3 = workload_job::s3_target(
-        db.as_ref(),
-        enc,
-        backup.s3_source_id,
-        target.id,
-        node_id,
-        "restore",
-    )
-    .await
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id}: {e}"),
-    })?;
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
 
     // `wal-g st cat` reads keys relative to the bucket (`WALG_S3_PREFIX`).
-    let bucket_prefix = format!("s3://{}/", s3.bucket);
+    let bucket_prefix = format!("s3://{}/", s3_source.bucket_name);
     let object_key = backup
         .s3_location
         .strip_prefix(&bucket_prefix)
@@ -3725,10 +3836,28 @@ async fn run_job_restore(
         return Err(RestoreError::Validation {
             message: format!(
                 "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
-                backup.id, backup.s3_location, s3.bucket, backup.s3_source_id
+                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
             ),
         });
     }
+    // The job can read this one dump's directory and nothing else.
+    let s3 = workload_job::s3_target(
+        scoper,
+        db.as_ref(),
+        backup.s3_source_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            target.id,
+            node_id,
+            temps_providers::worker_s3_scope::key_directory(&object_key),
+            temps_core::ScopedS3Access::Read,
+            "restore",
+        ),
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
 
     // The last safe point: once the job starts writing, the run can no
     // longer be cancelled (`restore` is not a cancellable phase).
@@ -3761,6 +3890,35 @@ async fn run_job_restore(
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
     }
     Ok(None)
+}
+
+/// The wait hook of a restore run whose worker node is busy
+/// ([`crate::node_busy`]): the run shows `waiting_for_node` (cancellable,
+/// nothing ran), checked every few seconds for a cancel while it sleeps, then
+/// re-enters `resume_phase` unless it was cancelled.
+pub(super) async fn wait_for_node_slot(
+    db: &DatabaseConnection,
+    run_id: i32,
+    resume_phase: &str,
+    wait: crate::node_busy::NodeWait,
+) -> Result<(), RestoreError> {
+    use super::restore_cancel::{enter_phase_unless_cancelled, WAITING_FOR_NODE_PHASE};
+    const CANCEL_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+    warn!(
+        run_id,
+        "restore run {run_id} waits for a slot: {}",
+        wait.describe()
+    );
+    let deadline = tokio::time::Instant::now() + wait.delay;
+    loop {
+        enter_phase_unless_cancelled(db, run_id, WAITING_FOR_NODE_PHASE).await?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(CANCEL_CHECK.min(deadline - now)).await;
+    }
+    enter_phase_unless_cancelled(db, run_id, resume_phase).await
 }
 
 async fn update_phase(
@@ -4338,18 +4496,26 @@ fn build_mongodb_steps(
     destructive: &mut bool,
     errors: &mut Vec<String>,
 ) -> Option<&'static str> {
-    let _ = resolved_location; // wal-g reads from WALG_S3_PREFIX, not a single key
+    // A WAL-G backup is fetched from WALG_S3_PREFIX, not a single key; a
+    // mongodump archive is one object, downloaded and replayed by a sidecar.
+    let archive = strategy == "mongodump_restore";
+    let fetch = |into: &str| {
+        if archive {
+            format!(
+                "Download the mongodump archive {resolved_location} and run `mongorestore \
+                 --archive --gzip --drop` against {into} from a one-shot sidecar"
+            )
+        } else {
+            format!(
+                "Run `wal-g backup-fetch LATEST` inside {into}; WAL-G decompresses the archived \
+                 mongodump stream and pipes it to `mongorestore --archive --drop`"
+            )
+        }
+    };
     match mode {
         RestoreRequestMode::InPlace => {
             *destructive = true;
-            steps.push(format!(
-                "Run `wal-g backup-fetch LATEST` inside {}",
-                container_name
-            ));
-            steps.push(
-                "WAL-G decompresses the archived mongodump stream and pipes it to `mongorestore --archive --drop`"
-                    .into(),
-            );
+            steps.push(fetch(container_name));
             steps.push(format!(
                 "mongorestore replaces ALL databases on {}, including `admin.system.users` — target's root user takes on the source's password",
                 container_name
@@ -4365,10 +4531,7 @@ fn build_mongodb_steps(
                 name
             ));
             steps.push("Start the new container and wait for mongod to initialize".into());
-            steps.push(
-                "Run `wal-g backup-fetch LATEST` inside the new container; WAL-G pipes the mongodump stream to `mongorestore --archive --drop`"
-                    .into(),
-            );
+            steps.push(fetch("the new container"));
             steps.push(
                 "Because mongorestore replays `admin.system.users`, the new service's root user is the SOURCE's credentials, not the freshly-generated ones"
                     .into(),
@@ -4383,7 +4546,9 @@ fn build_mongodb_steps(
             );
         }
     }
-    if matches!(mode, RestoreRequestMode::NewService { .. }) && strategy == "walg_restore" {
+    if matches!(mode, RestoreRequestMode::NewService { .. })
+        && matches!(strategy, "walg_restore" | "mongodump_restore")
+    {
         Some("MongoDB clone credentials: the archive replaces admin users with those from the backup. The new service's displayed password may differ from the restored password; verify the backup's credentials or reset the database password before linking applications. This clone path does not automatically reconcile stored credentials.")
     } else {
         None
@@ -5645,6 +5810,89 @@ mod tests {
         assert!(db.into_transaction_log().is_empty());
     }
 
+    fn busy_wait(delay: std::time::Duration) -> crate::node_busy::NodeWait {
+        crate::node_busy::NodeWait {
+            attempt: 1,
+            delay,
+            waited: std::time::Duration::ZERO,
+            node: "worker-1".to_string(),
+            detail: "this node already runs 2 backups or restores".to_string(),
+        }
+    }
+
+    /// A run whose node is busy shows `waiting_for_node`, then goes back to
+    /// the phase it was about to enter.
+    #[tokio::test]
+    async fn a_run_waiting_for_its_node_shows_it_then_resumes_its_phase() {
+        let entered = || sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([entered(), entered()])
+            .into_connection();
+        wait_for_node_slot(&db, 7, "restore", busy_wait(std::time::Duration::ZERO))
+            .await
+            .expect("the wait ends in the restore phase");
+        let phases: Vec<String> = db
+            .into_transaction_log()
+            .into_iter()
+            .map(|statement| format!("{statement:?}"))
+            .collect();
+        assert_eq!(phases.len(), 2, "{phases:?}");
+        assert!(phases[0].contains("waiting_for_node"), "{}", phases[0]);
+        assert!(phases[1].contains("\"restore\""), "{}", phases[1]);
+    }
+
+    /// A cancel requested while the run waits for its node stops it there:
+    /// nothing ran on the node.
+    #[tokio::test]
+    async fn a_run_waiting_for_its_node_stops_when_cancelled() {
+        let now = Utc::now();
+        let cancelled = temps_entities::restore_runs::Model {
+            id: 7,
+            source_backup_id: 3,
+            source_service_id: 11,
+            target_service_id: Some(11),
+            target_service_name: None,
+            mode: "in_place".to_string(),
+            status: "running".to_string(),
+            phase: "waiting_for_node".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(now),
+            finished_at: None,
+            created_by: 1,
+            created_at: now,
+            updated_at: now,
+            cancel_requested_at: Some(now),
+            cancel_requested_by: Some(1),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results([vec![cancelled]])
+            .into_connection();
+        let error = wait_for_node_slot(
+            &db,
+            7,
+            "restore",
+            busy_wait(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect_err("a cancelled run does not wait");
+        assert!(
+            matches!(&error, RestoreError::RestoreCancelled { restore_run_id: 7, phase } if phase == "waiting_for_node"),
+            "{error:?}"
+        );
+    }
+
     // ---- MockDatabase-backed validation tests ---------------------------
 
     /// Construct a RestoreService wired to the provided MockDatabase. Uses a
@@ -6159,6 +6407,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -7346,6 +7595,148 @@ mod tests {
             false,
         )
         .is_none());
+    }
+
+    /// The restore plan names what each backup is and how it is applied,
+    /// for the formats worker nodes and the control plane write: a
+    /// mongodump archive and a bucket mirror are not "unsupported"/"unknown".
+    #[test]
+    fn a_plan_classifies_every_backup_format_the_engines_write() {
+        for (engine, location, strategy, format) in [
+            (
+                "postgres",
+                "s3://b/external_services/postgres/orders/walg",
+                "walg_restore",
+                "walg",
+            ),
+            (
+                "postgres",
+                "external_services/postgres/orders/u/dump.sql.gz",
+                "pg_dump_restore",
+                "pg_dump",
+            ),
+            (
+                "mongodb",
+                "external_services/mongodb/docs/2026/01/01/u/dump.archive",
+                "mongodump_restore",
+                "mongodump",
+            ),
+            (
+                "mongodb",
+                "s3://b/external_services/mongodb/docs/walg",
+                "walg_restore",
+                "walg",
+            ),
+            (
+                "redis",
+                "external_services/redis/cache/u/dump.rdb.gz",
+                "redis_rdb_restore",
+                "redis_rdb",
+            ),
+            (
+                "mariadb",
+                "external_services/mariadb/shop/u/dump.sql.gz",
+                "mariadb_dump_restore",
+                "mariadb_dump",
+            ),
+            (
+                "s3",
+                "external_services/s3/files/2026/01/01/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            (
+                "rustfs",
+                "external_services/s3/files/2026/01/01/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            (
+                "blob",
+                "external_services/blob/files/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            ("redis", "legacy-backup.tar", "unsupported", "unknown"),
+            ("mongodb", "", "unsupported", "unknown"),
+        ] {
+            let classified = classify_restore_strategy(engine, location);
+            assert_eq!(classified, strategy, "{engine} {location}");
+            assert_eq!(restore_format(classified), format, "{engine} {location}");
+        }
+    }
+
+    /// A mongodump archive is planned as the archive restore the MongoDB
+    /// engine runs, never as a WAL-G fetch.
+    #[test]
+    fn a_mongodump_archive_plan_describes_mongorestore_not_walg() {
+        for mode in [
+            RestoreRequestMode::InPlace,
+            RestoreRequestMode::NewService {
+                name: "docs-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+        ] {
+            let (mut steps, mut destructive, mut errors) = (Vec::new(), false, Vec::new());
+            build_mongodb_steps(
+                "mongodump_restore",
+                &mode,
+                "temps-mongodb-docs",
+                "external_services/mongodb/docs/u/dump.archive",
+                &mut steps,
+                &mut destructive,
+                &mut errors,
+            );
+            let text = steps.join("\n");
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(!text.contains("wal-g"), "{text}");
+            assert!(text.contains("dump.archive"), "{text}");
+            assert!(
+                text.contains("mongorestore --archive --gzip --drop"),
+                "{text}"
+            );
+        }
+    }
+
+    /// On a worker, the plan says what the agent applies for each engine:
+    /// MongoDB's archive restore and the exact bucket mirror.
+    #[test]
+    fn a_worker_restore_plan_names_the_engines_restore() {
+        let mut docs = crashed_run_service();
+        docs.service_type = "mongodb".to_string();
+        docs.name = "docs".to_string();
+        docs.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &docs,
+            "external_services/mongodb/docs/u/dump.archive",
+            &RestoreRequestMode::InPlace,
+            "temps-mongodb-docs",
+            false,
+        )
+        .expect("a worker MongoDB");
+        let text = plan.steps.join("\n");
+        assert!(
+            text.contains("mongorestore --archive --gzip --drop"),
+            "{text}"
+        );
+        assert!(!text.contains("wal-g"), "{text}");
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+
+        let mut files = crashed_run_service();
+        files.service_type = "s3".to_string();
+        files.name = "files".to_string();
+        files.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &files,
+            "external_services/s3/files/u",
+            &RestoreRequestMode::InPlace,
+            "files",
+            false,
+        )
+        .expect("a worker storage service");
+        let text = plan.steps.join("\n");
+        assert!(text.contains("--overwrite --remove"), "{text}");
+        assert!(text.contains("deleted"), "{text}");
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {

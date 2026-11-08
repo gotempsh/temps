@@ -17,12 +17,13 @@ pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCr
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecoveryTarget, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
-    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, RemoteServiceBackupRequest,
-    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
-    RemoteWalHealthRequest, RemoteWalHealthResponse, ServiceContainerRuntime,
-    ServiceContainerStats, WorkerS3Destination,
+    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget,
+    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
+    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -504,6 +505,50 @@ impl RemoteServiceClient {
         .await
     }
 
+    /// Point a worker PostgreSQL's continuous archiving at another S3
+    /// source, without a base backup. The source's credentials travel
+    /// sealed; an agent without the route is told to update.
+    pub async fn postgres_walg_archive(
+        &self,
+        request: &PostgresWalgArchiveRequest,
+    ) -> Result<PostgresWalgArchiveResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Pointing a remote PostgreSQL service's WAL-G archiving at an S3 source"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-archive",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Refresh the credential a worker PostgreSQL's continuous archiving
+    /// reads (ADR-093). Travels sealed; an agent without the route is told
+    /// to update.
+    pub async fn postgres_walg_credentials(
+        &self,
+        request: &PostgresWalgCredentialsRequest,
+    ) -> Result<PostgresWalgCredentialsResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Refreshing a remote PostgreSQL service's WAL-G archiving credential"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-credentials",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
     /// Restore a worker's PostgreSQL from WAL-G, in place or to a point in
     /// time, with the control plane's own restore run by the node's agent.
     /// The S3 source's credentials and the logins travel sealed; an agent
@@ -928,6 +973,15 @@ impl RemoteServiceClient {
         if !body.success {
             let mut error = body.error.unwrap_or_default();
             truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
+            // The node runs its maximum of backups and restores: nothing ran,
+            // and the caller decides whether to wait for a slot.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(ExternalServiceError::NodeBusy {
+                    node: self.node_name.clone(),
+                    route: path.to_string(),
+                    detail: error,
+                });
+            }
             return Err(ExternalServiceError::InternalError {
                 reason: format!(
                     "Agent on node {} returned error ({}): {}",
@@ -1924,6 +1978,144 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// An archive re-point reaches the node sealed, with the destination's
+    /// credentials, and an agent without the route is told to update.
+    #[tokio::test]
+    async fn a_walg_archive_repoint_is_sealed_to_the_node() {
+        async fn walg(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgArchiveRequest =
+                open_for_test(&headers, "/agent/services/postgres/walg-archive", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(request.bucket_path, "fleet-b");
+            assert_eq!(
+                request.destination.secret_access_key,
+                worker_destination().secret_access_key
+            );
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "completed", "restarted": true},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/postgres/walg-archive", post(walg)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let request = PostgresWalgArchiveRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: ServiceConfig {
+                name: "orders".to_string(),
+                service_type: ServiceType::Postgres,
+                version: None,
+                parameters: serde_json::json!({"host": "localhost", "password": "db-password"}),
+            },
+            destination: worker_destination(),
+            bucket_path: "fleet-b".to_string(),
+        };
+        let outcome = client(address)
+            .postgres_walg_archive(&request)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            outcome,
+            PostgresWalgArchiveResult::Completed { restarted: true }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let error = client(older)
+            .postgres_walg_archive(&request)
+            .await
+            .expect_err("an older agent cannot re-point archiving");
+        server.abort();
+        let message = error.to_string();
+        assert!(
+            message.contains("/agent/services/postgres/walg-archive"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A node at its limit of backups and restores answers 429; the client
+    /// returns the typed `NodeBusy` (nothing ran), so callers can wait for a
+    /// slot instead of failing the run.
+    #[tokio::test]
+    async fn a_busy_node_is_reported_as_node_busy() {
+        async fn busy() -> (reqwest::StatusCode, Json<serde_json::Value>) {
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "success": false,
+                    "data": null,
+                    "error": "Cannot restore service 'orders': this node already runs 2 backups or restores; retry when one finishes"
+                })),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/agent/services/data-restore", post(busy)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = RemoteServiceClient::new(
+            format!("http://{address}"),
+            "node-token".to_string(),
+            "worker-1".to_string(),
+        )
+        .unwrap()
+        .with_sealing(test_sealing());
+        let error = client
+            .restore_service(&RemoteServiceRestoreRequest {
+                service_config: ServiceConfig {
+                    name: "orders".to_string(),
+                    service_type: ServiceType::Redis,
+                    version: None,
+                    parameters: serde_json::json!({}),
+                },
+                source: worker_destination(),
+                location: "external_services/redis/orders/dump.rdb.gz".to_string(),
+            })
+            .await
+            .expect_err("a busy node runs nothing");
+        server.abort();
+        match error {
+            ExternalServiceError::NodeBusy {
+                node,
+                route,
+                detail,
+            } => {
+                assert_eq!(node, "worker-1");
+                assert_eq!(route, "/agent/services/data-restore");
+                assert!(detail.contains("already runs 2"), "{detail}");
+            }
+            other => panic!("expected NodeBusy, got {other:?}"),
+        }
     }
 
     /// A WAL-G restore reaches the node sealed, with the source's credentials,

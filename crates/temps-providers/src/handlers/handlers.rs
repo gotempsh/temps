@@ -198,6 +198,7 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::ControlPlaneAddressRequired { .. }
@@ -259,6 +260,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::ControlPlaneAddressRequired { .. }
@@ -295,6 +297,9 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         E::ClusterNotSettled { .. } => "Cluster Not Ready",
         E::ClusterBusy { .. } => "Cluster Busy",
         E::LockTimeout { .. } => "Service Busy",
+        // A worker node at its limit of backups and restores: retry once
+        // one finishes.
+        E::NodeBusy { .. } => "Node Busy",
         // The request itself is invalid, not in conflict with any state.
         E::ClusterMemberLimitExceeded { .. } => {
             return Some(
@@ -3428,23 +3433,12 @@ async fn get_service_preview_environment_variable_names(
     permission_guard!(auth, ExternalServicesRead);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
-    let options = EnvironmentVariableOptions {
-        include_docker: false,
-        include_runtime: false,
-        // names_only, so values aren't returned regardless.
-        mask_sensitive: true,
-        names_only: true,
-    };
-
     match app_state
         .external_service_manager
-        .get_environment_variables(id, None, None, options)
+        .get_service_preview_environment_variable_names(id)
         .await
     {
-        Ok(response) => {
-            let variable_names: Vec<String> = response.variables.keys().cloned().collect();
-            Ok((StatusCode::OK, Json(variable_names)))
-        }
+        Ok(variable_names) => Ok((StatusCode::OK, Json(variable_names))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(external_service_problem(

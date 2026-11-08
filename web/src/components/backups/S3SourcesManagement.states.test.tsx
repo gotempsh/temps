@@ -103,6 +103,7 @@ test('cached S3 sources stay visible when a refresh fails', () => {
       access_key_id: '***',
       is_default: true,
       managed_by_cloud: false,
+      worker_credentials: 'scoped',
       created_at: Date.parse('2026-01-01T00:00:00Z'),
       updated_at: Date.parse('2026-01-01T00:00:00Z'),
     },

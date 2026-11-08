@@ -264,6 +264,7 @@ fn phase_description(phase: &str) -> &str {
     match phase {
         "prepare" => "preparation",
         "download" => "the backup download",
+        "waiting_for_node" => "the wait for its worker node to free a slot",
         "provision" => "provisioning of the new service",
         "restore" => "the data restore",
         "recover" => "point-in-time recovery",
@@ -421,6 +422,10 @@ mod tests {
     fn message_names_each_phase_and_never_claims_rollback() {
         for (phase, description) in [
             ("prepare", "preparation"),
+            (
+                "waiting_for_node",
+                "the wait for its worker node to free a slot",
+            ),
             ("provision", "provisioning of the new service"),
             ("restore", "the data restore"),
             ("recover", "point-in-time recovery"),

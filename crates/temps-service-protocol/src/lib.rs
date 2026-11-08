@@ -527,6 +527,75 @@ pub enum PostgresWalgBackupResult {
     Failed { reason: String },
 }
 
+/// `POST /agent/services/postgres/walg-archive`: turn continuous WAL-G
+/// archiving on, or point it at another S3 source, without a base backup
+/// (ADR-092). The control plane's own `enable_continuous_archiving`, run on
+/// the node: `walg.env` rewritten for the destination, `archive_command`
+/// reading it, and, when `archive_mode` is off, the guarded recreate of the
+/// running container with archiving on. Sent only for an operator's
+/// explicit, audited re-point, which accepts that restart, as on the
+/// control plane. No command comes from the caller.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresWalgArchiveRequest {
+    pub service_id: i32,
+    /// The node the service runs on, recorded on a recreated container's
+    /// placement.
+    pub node_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+}
+
+/// What a [`PostgresWalgArchiveRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PostgresWalgArchiveResult {
+    /// Archiving writes to the destination.
+    Completed {
+        /// PostgreSQL was restarted in a recreated container to turn
+        /// archiving on; its data was verified to be the same cluster first.
+        restarted: bool,
+    },
+    /// Nothing was changed and retrying cannot change that.
+    Refused { reason: String },
+    /// Archiving could not be pointed at the destination; a retry may
+    /// succeed.
+    Failed { reason: String },
+}
+
+/// `POST /agent/services/postgres/walg-credentials`: replace the credential
+/// continuous archiving reads from `walg.env` with a fresh one for the same
+/// WAL-G repository (ADR-093). A worker's archiving credential is scoped to
+/// the service's repository and short-lived, so the control plane refreshes
+/// it on an interval. Nothing else changes: no `ALTER SYSTEM`, no restart;
+/// refused when archiving is not set up on the node. No command comes from
+/// the caller.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresWalgCredentialsRequest {
+    pub service_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+}
+
+/// What a [`PostgresWalgCredentialsRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PostgresWalgCredentialsResult {
+    /// `walg.env` holds the new credential.
+    Refreshed,
+    /// Nothing was changed: archiving is not set up on this node.
+    Refused { reason: String },
+    /// The file could not be written; a retry may succeed.
+    Failed { reason: String },
+}
+
 /// Engine-specific recovery target for PITR.
 ///
 /// Postgres honors all variants; Redis/Mongo/S3 will likely reject non-Time
@@ -818,6 +887,26 @@ pub trait NodeServiceRuntime: Send + Sync {
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
     ) -> Result<PostgresWalgBackupResult, NodeServiceError>;
+
+    /// Point continuous archiving at a destination on this node (see
+    /// [`PostgresWalgArchiveRequest`]), recreating as for a backup.
+    async fn postgres_walg_archive(
+        &self,
+        request: PostgresWalgArchiveRequest,
+        docker: Arc<Docker>,
+        node: NodeAttachment,
+        after_create: RecreateHook,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgArchiveResult, NodeServiceError>;
+
+    /// Refresh the credential continuous archiving reads on this node (see
+    /// [`PostgresWalgCredentialsRequest`]). Never recreates or restarts.
+    async fn postgres_walg_credentials(
+        &self,
+        request: PostgresWalgCredentialsRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgCredentialsResult, NodeServiceError>;
 
     /// Run the control plane's WAL-G restore on this node (see
     /// [`PostgresWalgRestoreRequest`]). The restored and, on failure, the

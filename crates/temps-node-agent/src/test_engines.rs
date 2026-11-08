@@ -43,6 +43,13 @@ pub(crate) struct StubRuntime {
             Option<std::net::IpAddr>,
         )>,
     >,
+    /// The WAL-G archive re-points asked for, with the attachment.
+    pub(crate) walg_archives: Mutex<
+        Vec<(
+            temps_service_protocol::PostgresWalgArchiveRequest,
+            temps_service_protocol::NodeAttachment,
+        )>,
+    >,
     /// The WAL-G restores asked for, with the attachment and published
     /// address.
     pub(crate) walg_restores: Mutex<
@@ -52,6 +59,8 @@ pub(crate) struct StubRuntime {
             Option<std::net::IpAddr>,
         )>,
     >,
+    /// The WAL-G archiving credential refreshes asked for.
+    pub(crate) walg_credentials: Mutex<Vec<temps_service_protocol::PostgresWalgCredentialsRequest>>,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -181,6 +190,34 @@ impl NodeServiceRuntime for StubRuntime {
             .expect("walg_backups")
             .push((request, node, published_address));
         Err(not_available("postgres_walg_backup"))
+    }
+
+    async fn postgres_walg_archive(
+        &self,
+        request: temps_service_protocol::PostgresWalgArchiveRequest,
+        _docker: Arc<Docker>,
+        node: temps_service_protocol::NodeAttachment,
+        _after_create: temps_service_protocol::RecreateHook,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgArchiveResult, NodeServiceError> {
+        self.walg_archives
+            .lock()
+            .expect("walg_archives")
+            .push((request, node));
+        Err(not_available("postgres_walg_archive"))
+    }
+
+    async fn postgres_walg_credentials(
+        &self,
+        request: temps_service_protocol::PostgresWalgCredentialsRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgCredentialsResult, NodeServiceError> {
+        self.walg_credentials
+            .lock()
+            .expect("walg_credentials")
+            .push(request);
+        Ok(temps_service_protocol::PostgresWalgCredentialsResult::Refreshed)
     }
 
     async fn postgres_walg_restore(

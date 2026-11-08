@@ -30,11 +30,15 @@ use serde_json::json;
 use tracing::info;
 
 use super::v2_common;
-use super::workload_job::{s3_target, worker_node, S3JobTarget};
+use super::workload_job::{is_loopback_endpoint, worker_node, DatabaseJobError};
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
+use temps_core::ScopedS3Access;
 use temps_providers::externalsvc::worker_data::DumpEngine;
 use temps_providers::externalsvc::ServiceType;
 use temps_providers::remote_service_client::WorkerS3Destination;
+use temps_providers::worker_s3_scope::{
+    key_directory, WorkerCredentialError, WorkerCredentialScoper, WorkerS3Grant,
+};
 
 /// Engine key stored in `backup_jobs.engine` for a backup a worker's agent
 /// took.
@@ -107,16 +111,60 @@ fn dump_engine_label(engine: DumpEngine) -> &'static str {
     }
 }
 
-/// The S3 source as the agent receives it.
-pub fn destination(target: &S3JobTarget) -> WorkerS3Destination {
-    WorkerS3Destination {
-        bucket: target.bucket.clone(),
-        region: target.region.clone(),
-        endpoint: target.endpoint.clone(),
-        force_path_style: target.force_path_style,
-        access_key_id: target.access_key_id.clone(),
-        secret_access_key: target.secret_access_key.clone(),
-        session_token: target.session_token.clone(),
+/// The prefix a worker backup at `key` may write: a dump's own directory
+/// (`.../<service>/<date>/<uuid>/`), or a mirror's own prefix.
+pub fn backup_scope_prefix(key: &str, kind: WorkerServiceKind) -> String {
+    match kind {
+        WorkerServiceKind::Dump(_) => key_directory(key),
+        WorkerServiceKind::Storage => temps_providers::worker_s3_scope::as_prefix(key),
+    }
+}
+
+/// The S3 destination a worker job receives (ADR-093): a credential the
+/// control plane derives for `grant` (the job's prefixes, read or write, a
+/// lifetime), never the source's own unless the source allows it and cannot
+/// scope. Refuses an endpoint on this host's loopback, which the node cannot
+/// reach.
+pub async fn scoped_destination(
+    scoper: &WorkerCredentialScoper,
+    db: &DatabaseConnection,
+    s3_source_id: i32,
+    grant: WorkerS3Grant,
+    operation: &'static str,
+) -> Result<WorkerS3Destination, BackupError> {
+    let source = v2_common::load_s3_source(db, s3_source_id).await?;
+    if let Some(endpoint) = source.endpoint.as_ref().filter(|e| is_loopback_endpoint(e)) {
+        return Err(DatabaseJobError::EndpointUnreachable {
+            service_id: grant.service_id,
+            operation,
+            node_id: grant.node_id,
+            s3_source_id,
+            endpoint: endpoint.clone(),
+        }
+        .into());
+    }
+    let node_id = grant.node_id;
+    let scoped = scoper
+        .destination(&source, grant)
+        .await
+        .map_err(credential_error)?;
+    if let Some(warning) = scoped.warning(&source.name, node_id) {
+        tracing::warn!(s3_source_id, node_id, "{warning}");
+    }
+    Ok(scoped.destination)
+}
+
+/// A credential that could not be derived, as the job's failure: retried
+/// only when the STS or Cloud may answer next time.
+pub fn credential_error(error: WorkerCredentialError) -> BackupError {
+    if error.is_retryable() {
+        BackupError::Failed {
+            reason: error.to_string(),
+        }
+    } else {
+        BackupError::PermanentFailure {
+            reason: error.to_string(),
+        }
     }
 }
 
@@ -125,6 +173,8 @@ pub struct WorkerAgentDeps {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Reaches the service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
+    /// Derives the job's S3 credential (ADR-093).
+    pub worker_credentials: Arc<WorkerCredentialScoper>,
 }
 
 pub struct WorkerAgentEngine {
@@ -137,6 +187,24 @@ impl WorkerAgentEngine {
             deps: Arc::new(deps),
         }
     }
+}
+
+/// The wait hook of a backup whose worker node is busy: logged with the
+/// backup's IDs (a backup row has no phase), then a sleep the executor's
+/// cancel and runtime limit cut short by dropping it.
+pub(crate) async fn wait_for_node_slot(
+    backup_id: i32,
+    service_id: i32,
+    wait: crate::node_busy::NodeWait,
+) -> Result<(), std::convert::Infallible> {
+    tracing::warn!(
+        backup_id,
+        service_id,
+        "backup {backup_id} of service {service_id} waits for a slot: {}",
+        wait.describe()
+    );
+    tokio::time::sleep(wait.delay).await;
+    Ok(())
 }
 
 #[async_trait]
@@ -196,19 +264,23 @@ impl BackupEngine for WorkerAgentEngine {
         )
         .await?;
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
-        // Refuses an endpoint on this host's loopback, which the node cannot
-        // reach.
-        let s3 = s3_target(
+        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
+        let key = backup_key(&s3_source.bucket_path, &service, &backup_uuid, kind);
+        // The worker can write this backup's own directory and nothing else.
+        let destination = scoped_destination(
+            &deps.worker_credentials,
             deps.db.as_ref(),
-            &deps.encryption_service,
             s3_source_id,
-            service_id,
-            node_id,
+            WorkerS3Grant::job(
+                service_id,
+                node_id,
+                backup_scope_prefix(&key, kind),
+                ScopedS3Access::Write,
+                "backup",
+            ),
             "backup",
         )
         .await?;
-        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
-        let key = backup_key(&s3_source.bucket_path, &service, &backup_uuid, kind);
         info!(
             backup_id,
             service_id,
@@ -218,14 +290,25 @@ impl BackupEngine for WorkerAgentEngine {
             "WorkerAgentEngine: backing up the service on its node"
         );
 
-        let request = deps
-            .manager
-            .backup_worker_service(service_id, destination(&s3), key.clone());
+        // A node already running its maximum of backups and restores is
+        // waited for (bounded, within this backup's own runtime limit)
+        // instead of failing the backup.
+        let request = crate::node_busy::retry_while_node_busy(
+            &crate::node_busy::NodeBusyPolicy::DEFAULT,
+            || {
+                deps.manager
+                    .backup_worker_service(service_id, destination.clone(), key.clone())
+            },
+            |wait| wait_for_node_slot(backup_id, service_id, wait),
+        );
         let response = tokio::select! {
             // Dropping the request ends it on the node too: the agent removes
             // its helper and aborts the upload.
             _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-            response = request => response,
+            response = request => match response {
+                Ok(response) => response,
+                Err(never) => match never {},
+            },
         }
         .map_err(|e| BackupError::Failed {
             reason: format!(
@@ -463,20 +546,21 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_receives_the_session_token() {
-        let target = S3JobTarget {
-            s3_source_id: 2,
-            bucket: "backups".to_string(),
-            region: "eu-west-1".to_string(),
-            endpoint: Some("https://s3.example.test".to_string()),
-            force_path_style: false,
-            access_key_id: "AKIA".to_string(),
-            secret_access_key: "secret".to_string(),
-            session_token: Some("token".to_string()),
-        };
-        let destination = destination(&target);
-        assert_eq!(destination.session_token.as_deref(), Some("token"));
-        assert_eq!(destination.bucket, "backups");
-        assert!(!destination.force_path_style);
+    fn a_worker_backup_is_scoped_to_its_own_directory() {
+        use temps_providers::externalsvc::worker_data::DumpEngine;
+        assert_eq!(
+            backup_scope_prefix(
+                "base/external_services/redis/cache/2026/11/08/u-1/dump.rdb.gz",
+                WorkerServiceKind::Dump(DumpEngine::Redis)
+            ),
+            "base/external_services/redis/cache/2026/11/08/u-1/"
+        );
+        assert_eq!(
+            backup_scope_prefix(
+                "base/external_services/s3/files/u-2",
+                WorkerServiceKind::Storage
+            ),
+            "base/external_services/s3/files/u-2/"
+        );
     }
 }

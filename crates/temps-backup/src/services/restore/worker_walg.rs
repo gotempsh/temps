@@ -274,9 +274,14 @@ async fn newest_or_oldest(
 
 /// Restore `backup`, a WAL-G backup, into `target`, a PostgreSQL on a worker
 /// node, in place or to the point `mode` names.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's dependencies and the run's inputs"
+)]
 pub(super) async fn run(
     db: &Arc<DatabaseConnection>,
     enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     mgr: &Arc<ExternalServiceManager>,
     run_id: i32,
     backup: &temps_entities::backups::Model,
@@ -311,29 +316,42 @@ pub(super) async fn run(
         origin.apply(&mut login);
         login
     });
-    let s3 = workload_job::s3_target(
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+    // The worker can read the backup's WAL-G repository (its base backups
+    // and the WAL recovery replays) and nothing else (ADR-093).
+    let Some(repository) = temps_providers::worker_s3_scope::s3_url_prefix(
+        &backup.s3_location,
+        &s3_source.bucket_name,
+    )
+    .filter(|prefix| !prefix.is_empty()) else {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
+                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
+            ),
+        });
+    };
+    let destination = worker_agent::scoped_destination(
+        scoper,
         db.as_ref(),
-        enc,
         backup.s3_source_id,
-        target.id,
-        node_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            target.id,
+            node_id,
+            repository,
+            temps_core::ScopedS3Access::Read,
+            "restore",
+        ),
         "restore",
     )
     .await
     .map_err(|e| RestoreError::ExternalService {
         reason: format!("restore run {run_id}: {e}"),
     })?;
-    if !backup
-        .s3_location
-        .starts_with(&format!("s3://{}/", s3.bucket))
-    {
-        return Err(RestoreError::Validation {
-            message: format!(
-                "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
-                backup.id, backup.s3_location, s3.bucket, backup.s3_source_id
-            ),
-        });
-    }
 
     // The last safe point: once the node stops the server, the run can no
     // longer be cancelled.
@@ -352,19 +370,26 @@ pub(super) async fn run(
         "restoring database {} from WAL-G on its node",
         target.id
     );
-    let outcome = mgr
-        .walg_restore_worker_postgres(
-            target.id,
-            restored_login.as_ref(),
-            worker_agent::destination(&s3),
-            backup.s3_location.clone(),
-            recovery_target,
-            target_user_data,
-        )
-        .await
-        .map_err(|e| RestoreError::ExternalService {
-            reason: format!("restore run {run_id} on node {node_id}: {e}"),
-        })?;
+    // A node already running its maximum of backups and restores is waited
+    // for, visibly and cancellably, instead of failing the run.
+    let outcome = crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || {
+            mgr.walg_restore_worker_postgres(
+                target.id,
+                restored_login.as_ref(),
+                destination.clone(),
+                backup.s3_location.clone(),
+                recovery_target.clone(),
+                target_user_data.clone(),
+            )
+        },
+        |wait| super::wait_for_node_slot(db.as_ref(), run_id, phase, wait),
+    )
+    .await?
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id} on node {node_id}: {e}"),
+    })?;
     match outcome {
         PostgresWalgRestoreResult::Completed => {}
         PostgresWalgRestoreResult::Refused { reason } => {

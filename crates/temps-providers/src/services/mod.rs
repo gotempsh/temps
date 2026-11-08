@@ -125,6 +125,11 @@ pub struct ExternalServiceManager {
     /// resolver answers. Empty otherwise, and on processes that run no
     /// resolver: local cluster members then keep Docker's embedded DNS.
     cluster_dns_slot: temps_dns::OverlayDnsSlot,
+    /// Derives the S3 credential a worker node receives (ADR-093). Each
+    /// constructor builds one that scopes through STS and refuses managed
+    /// sources; the plugin replaces it with the process's shared one, which
+    /// holds the Temps Cloud minter.
+    worker_credentials: Arc<crate::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 impl ExternalServiceManager {
@@ -149,6 +154,9 @@ impl ExternalServiceManager {
         docker: Arc<Docker>,
         dns_registry: Arc<temps_dns::DnsRegistry>,
     ) -> Self {
+        let worker_credentials = Arc::new(crate::worker_s3_scope::WorkerCredentialScoper::new(
+            encryption_service.clone(),
+        ));
         Self {
             db,
             encryption_service,
@@ -157,6 +165,7 @@ impl ExternalServiceManager {
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
+            worker_credentials,
         }
     }
 
@@ -170,6 +179,9 @@ impl ExternalServiceManager {
         local_workloads_enabled: bool,
         dns_registry: Arc<temps_dns::DnsRegistry>,
     ) -> Self {
+        let worker_credentials = Arc::new(crate::worker_s3_scope::WorkerCredentialScoper::new(
+            encryption_service.clone(),
+        ));
         Self {
             db,
             encryption_service,
@@ -178,7 +190,17 @@ impl ExternalServiceManager {
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
+            worker_credentials,
         }
+    }
+
+    /// Derive worker credentials with `scoper`, the process's shared one.
+    pub fn with_worker_credentials(
+        mut self,
+        scoper: Arc<crate::worker_s3_scope::WorkerCredentialScoper>,
+    ) -> Self {
+        self.worker_credentials = scoper;
+        self
     }
 
     /// Follow the control plane's cluster resolver slot, so local cluster

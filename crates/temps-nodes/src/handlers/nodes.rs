@@ -649,18 +649,6 @@ pub struct EdgeRoutesResponse {
     pub certificates: Option<EdgeCertificates>,
 }
 
-/// S3 credentials distributed to agents for backup/restore operations.
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct S3CredentialsResponse {
-    pub access_key_id: String,
-    pub secret_key: String,
-    pub region: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    pub bucket_name: String,
-    pub force_path_style: bool,
-}
-
 /// Per-node DNS resolver health, as last reported by that node's heartbeat.
 /// Part of `GET /api/cluster/dns/status`.
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -757,7 +745,6 @@ pub struct ClusterDnsStatusResponse {
         mesh_enroll,
         plane_identity,
         node_heartbeat,
-        get_s3_credentials,
         crate::handlers::network::list_peers,
         crate::handlers::network::register_mesh,
         crate::handlers::network::report_mesh_handshakes,
@@ -797,7 +784,6 @@ pub struct ClusterDnsStatusResponse {
         HeartbeatApiRequest,
         HeartbeatResponse,
         DnsResolverHeartbeat,
-        S3CredentialsResponse,
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
@@ -884,10 +870,6 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         // it sends the join token (ADR 060).
         .route("/internal/nodes/plane-identity", get(plane_identity))
         .route("/internal/nodes/{node_id}/heartbeat", post(node_heartbeat))
-        .route(
-            "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
-            get(get_s3_credentials),
-        )
         .route(
             "/internal/nodes/{node_id}/network/peers",
             get(crate::handlers::network::list_peers),
@@ -2715,128 +2697,6 @@ async fn ingest_instance_reports(
     }
 }
 
-/// Get decrypted S3 credentials for a backup/restore operation.
-///
-/// Agents call this endpoint to receive the S3 credentials they need to upload
-/// or download backups. The credentials are decrypted from the stored S3 source
-/// and returned over the authenticated TLS/WireGuard channel.
-#[utoipa::path(
-    tag = "Nodes",
-    get,
-    path = "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
-    params(
-        ("node_id" = i32, Path, description = "Node ID"),
-        ("s3_source_id" = i32, Path, description = "S3 source ID")
-    ),
-    responses(
-        (status = 200, description = "S3 credentials", body = S3CredentialsResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "S3 source not found"),
-        (status = 500, description = "Internal server error")
-    )
-)]
-async fn get_s3_credentials(
-    State(app_state): State<Arc<NodeAppState>>,
-    headers: HeaderMap,
-    Path((node_id, s3_source_id)): Path<(i32, i32)>,
-) -> Result<impl IntoResponse, Problem> {
-    // Verify the node's token
-    let token = extract_bearer_token(&headers)?;
-    let node = app_state
-        .node_service
-        .get_by_id(node_id)
-        .await
-        .map_err(Problem::from)?;
-
-    let token_hash = sha256_hex(&token);
-    if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
-        warn!(node_id, "Invalid token for S3 credentials request");
-        return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
-            .with_title("Invalid Token")
-            .with_detail(format!("Invalid authentication token for node {}", node_id)));
-    }
-
-    // Authorization (ADR-020 WS-4.1 / analyst-1): a valid node token only proves
-    // *which* node is calling — it does NOT entitle that node to every tenant's
-    // S3 credentials. Only hand back a source the node legitimately needs: one
-    // used by a backup of a service hosted on this node. Otherwise a single
-    // compromised worker could enumerate s3_source_id and exfiltrate all keys.
-    if !app_state
-        .node_service
-        .is_authorized_for_s3_source(node_id, s3_source_id)
-        .await
-        .map_err(Problem::from)?
-    {
-        warn!(
-            node_id,
-            s3_source_id,
-            "Node not authorized for S3 source (no backup of a service hosted on this node uses it)"
-        );
-        return Err(problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Forbidden")
-            .with_detail(format!(
-                "Node {} is not authorized for S3 source {}",
-                node_id, s3_source_id
-            )));
-    }
-
-    // Look up the S3 source
-    let s3_source = app_state
-        .node_service
-        .s3_source(s3_source_id)
-        .await
-        .map_err(|e| match e {
-            NodeError::Database(e) => {
-                error!("Failed to look up S3 source {}: {}", s3_source_id, e);
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database Error")
-                    .with_detail(format!("Failed to look up S3 source: {}", e))
-            }
-            other => Problem::from(other),
-        })?;
-
-    // Decrypt credentials
-    let access_key_id = app_state
-        .encryption_service
-        .decrypt_string(&s3_source.access_key_id)
-        .map_err(|e| {
-            error!(
-                "Failed to decrypt access key for S3 source {}: {}",
-                s3_source_id, e
-            );
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Decryption Error")
-                .with_detail("Failed to decrypt S3 credentials")
-        })?;
-
-    let secret_key = app_state
-        .encryption_service
-        .decrypt_string(&s3_source.secret_key)
-        .map_err(|e| {
-            error!(
-                "Failed to decrypt secret key for S3 source {}: {}",
-                s3_source_id, e
-            );
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Decryption Error")
-                .with_detail("Failed to decrypt S3 credentials")
-        })?;
-
-    info!(
-        "Distributed S3 credentials for source {} to node {} ({})",
-        s3_source_id, node_id, node.name
-    );
-
-    Ok(Json(S3CredentialsResponse {
-        access_key_id,
-        secret_key,
-        region: s3_source.region,
-        endpoint: s3_source.endpoint,
-        bucket_name: s3_source.bucket_name,
-        force_path_style: s3_source.force_path_style.unwrap_or(true),
-    }))
-}
-
 /// Return the route table for edge CDN nodes.
 ///
 /// Lists all active environment domains with their project/environment IDs
@@ -4434,11 +4294,6 @@ impl From<EdgeRouteError> for Problem {
 impl From<NodeError> for Problem {
     fn from(error: NodeError) -> Self {
         match error {
-            NodeError::S3SourceNotFound { s3_source_id } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("S3 Source Not Found")
-                    .with_detail(format!("S3 source {} not found", s3_source_id))
-            }
             NodeError::OnlyPlacementTarget {
                 node_id,
                 ref node_name,
@@ -6243,15 +6098,6 @@ mod tests {
             body.get("certificates").is_none(),
             "a worker receives no certificates: {body}"
         );
-    }
-
-    #[test]
-    fn a_missing_s3_source_is_a_404_naming_the_id() {
-        let problem = Problem::from(NodeError::S3SourceNotFound { s3_source_id: 12 });
-        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
-        let body = serde_json::to_value(&problem.body).unwrap();
-        assert_eq!(body["title"], "S3 Source Not Found");
-        assert_eq!(body["detail"], "S3 source 12 not found");
     }
 
     #[test]

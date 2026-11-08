@@ -868,6 +868,7 @@ mod tests {
                 managed_by_cloud: Set(managed_by_cloud),
                 lifecycle_reconcile_failed_at: Set(None),
                 lifecycle_reconcile_generation: Set(0),
+                worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
                 created_at: Set(now),
                 updated_at: Set(now),
                 backing_service_id: Set(None),
@@ -993,6 +994,7 @@ mod tests {
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -1029,6 +1031,7 @@ mod tests {
             id: Set(source.id),
             lifecycle_reconcile_failed_at: Set(Some(now)),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             ..Default::default()
         }
         .update(db.as_ref())
@@ -1096,6 +1099,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }

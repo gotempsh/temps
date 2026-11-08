@@ -17886,6 +17886,17 @@
           "secret_key": {
             "$ref": "#/components/schemas/SecretString",
             "description": "Secret access key that goes with the access key ID. Shown once by the\nprovider; stored encrypted and never returned."
+          },
+          "worker_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkerCredentialsPolicy",
+                "description": "What a worker node receives when it backs up or restores one of its\nservices into this source. Default `scoped`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -50244,7 +50255,7 @@
             ]
           },
           "format": {
-            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"unknown\".",
+            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"mongodump\",\n\"redis_rdb\", \"s3_mirror\", \"unknown\".",
             "type": "string"
           },
           "id": {
@@ -58449,7 +58460,7 @@
             "type": "array"
           },
           "strategy": {
-            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\", or \"unsupported\".",
+            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\",\n\"mongodump_restore\", \"redis_rdb_restore\", \"s3_mirror_restore\", or\n\"unsupported\".",
             "type": "string"
           },
           "target_service": {
@@ -60395,40 +60406,6 @@
         ],
         "type": "object"
       },
-      "S3CredentialsResponse": {
-        "description": "S3 credentials distributed to agents for backup/restore operations.",
-        "properties": {
-          "access_key_id": {
-            "type": "string"
-          },
-          "bucket_name": {
-            "type": "string"
-          },
-          "endpoint": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "force_path_style": {
-            "type": "boolean"
-          },
-          "region": {
-            "type": "string"
-          },
-          "secret_key": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "access_key_id",
-          "secret_key",
-          "region",
-          "bucket_name",
-          "force_path_style"
-        ],
-        "type": "object"
-      },
       "S3MigrationReport": {
         "description": "Outcome of copying one managed S3 service's buckets into another.",
         "properties": {
@@ -60517,6 +60494,10 @@
           "updated_at": {
             "format": "int64",
             "type": "integer"
+          },
+          "worker_credentials": {
+            "$ref": "#/components/schemas/WorkerCredentialsPolicy",
+            "description": "What a worker node receives from this source (ADR-093)."
           }
         },
         "required": [
@@ -60529,6 +60510,7 @@
           "region",
           "is_default",
           "managed_by_cloud",
+          "worker_credentials",
           "created_at",
           "updated_at"
         ],
@@ -76093,6 +76075,17 @@
                 "type": "null"
               }
             ]
+          },
+          "worker_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/WorkerCredentialsPolicy",
+                "description": "Optional new worker credentials policy."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object"
@@ -79862,6 +79855,14 @@
           "links"
         ],
         "type": "object"
+      },
+      "WorkerCredentialsPolicy": {
+        "description": "What a worker node may receive from an S3 source (ADR-093).",
+        "enum": [
+          "scoped",
+          "allow_full"
+        ],
+        "type": "string"
       },
       "WorkerInstall": {
         "description": "What a new worker installs, so it never runs an older Temps than its\ncontrol plane.",
@@ -108011,6 +108012,16 @@
               }
             },
             "description": "Service not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service's engine cannot be reached to read its restore options"
           }
         },
         "security": [
@@ -117239,59 +117250,6 @@
         ],
         "tags": [
           "Workload Placement"
-        ]
-      }
-    },
-    "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}": {
-      "get": {
-        "description": "Agents call this endpoint to receive the S3 credentials they need to upload\nor download backups. The credentials are decrypted from the stored S3 source\nand returned over the authenticated TLS/WireGuard channel.",
-        "operationId": "get_s3_credentials",
-        "parameters": [
-          {
-            "description": "Node ID",
-            "in": "path",
-            "name": "node_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "S3 source ID",
-            "in": "path",
-            "name": "s3_source_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/S3CredentialsResponse"
-                }
-              }
-            },
-            "description": "S3 credentials"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "404": {
-            "description": "S3 source not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "summary": "Get decrypted S3 credentials for a backup/restore operation.",
-        "tags": [
-          "Nodes"
         ]
       }
     },

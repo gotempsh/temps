@@ -1416,6 +1416,18 @@ impl CloudLink {
             .await
     }
 
+    /// A worker job's scoped credential for the managed bucket (ADR-093).
+    pub async fn managed_backup_scoped_credentials(
+        &self,
+        request: &temps_cloud_protocol::ManagedBackupScopedCredentialsRequest,
+    ) -> Result<temps_cloud_protocol::ManagedBackupScopedCredentials, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .managed_backup_scoped_credentials(&token, request)
+            .await
+    }
+
     pub async fn managed_ai_analysis(
         &self,
         request: &ManagedAiAnalysisRequest,

@@ -438,6 +438,7 @@ mod harness {
                 managed_by_cloud: Set(false),
                 lifecycle_reconcile_failed_at: Set(None),
                 lifecycle_reconcile_generation: Set(0),
+                worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
                 created_at: Set(now),
                 updated_at: Set(now),
             }

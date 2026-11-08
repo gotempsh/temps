@@ -376,25 +376,14 @@ impl ExternalServiceManager {
                 force_path_style: s3_source.force_path_style.unwrap_or(true),
             };
 
-            // Layout must match `crates/temps-backup/src/engines/postgres_walg.rs`
-            // exactly: WAL-G requires a base backup and the WAL segments covering
-            // its start/end LSN under the same prefix to be restorable.
-            let subpath_root = format!("external_services/postgres/{}", service.name);
-            let bucket_path_clean = s3_source.bucket_path.trim_matches('/');
-            let walg_prefix = if bucket_path_clean.is_empty() {
-                format!(
-                    "s3://{}/{}/walg",
-                    s3_source.bucket_name,
-                    subpath_root.trim_matches('/'),
-                )
-            } else {
-                format!(
-                    "s3://{}/{}/{}/walg",
-                    s3_source.bucket_name,
-                    bucket_path_clean,
-                    subpath_root.trim_matches('/'),
-                )
-            };
+            // The layout every PostgreSQL WAL-G backup uses, on the control
+            // plane and on workers: a base backup and the WAL covering it
+            // must share one prefix to be restorable.
+            let walg_prefix = crate::externalsvc::postgres_walg_backup::walg_prefix(
+                &s3_source.bucket_name,
+                &s3_source.bucket_path,
+                &service.name,
+            );
 
             let config_json = service
                 .config
@@ -414,16 +403,60 @@ impl ExternalServiceManager {
                 parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
             };
 
-            let docker = self.require_docker()?;
-            let postgres =
-                crate::externalsvc::postgres::PostgresService::new(service.name.clone(), docker);
-            postgres
-                .force_reenable_continuous_archiving(service_config, &s3_credentials, &walg_prefix)
-                .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: service_id,
-                    reason: format!("failed to repoint WAL archiving: {}", e),
-                })?;
+            if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
+            {
+                // A worker's container is on its node: its agent runs the
+                // same re-point there, with the node's recreate, holding a
+                // credential for the service's own WAL-G repository only
+                // (ADR-093).
+                let scoped = self
+                    .worker_credentials
+                    .destination(
+                        &s3_source,
+                        crate::worker_s3_scope::WorkerS3Grant::archive(
+                            service_id,
+                            node_id,
+                            crate::externalsvc::postgres_walg_backup::walg_key_prefix(
+                                &s3_source.bucket_path,
+                                &service.name,
+                            ),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| ExternalServiceError::InternalError {
+                        reason: format!(
+                            "could not re-point continuous archiving of service {service_id} \
+                             to S3 source {}: {error}",
+                            s3_source.id
+                        ),
+                    })?;
+                if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
+                    tracing::warn!(service_id, node_id, "{warning}");
+                }
+                self.walg_archive_worker_postgres(
+                    service_id,
+                    scoped.destination,
+                    s3_credentials.bucket_path.clone(),
+                )
+                .await?;
+            } else {
+                let docker = self.require_docker()?;
+                let postgres = crate::externalsvc::postgres::PostgresService::new(
+                    service.name.clone(),
+                    docker,
+                );
+                postgres
+                    .force_reenable_continuous_archiving(
+                        service_config,
+                        &s3_credentials,
+                        &walg_prefix,
+                    )
+                    .await
+                    .map_err(|e| ExternalServiceError::DockerError {
+                        id: service_id,
+                        reason: format!("failed to repoint WAL archiving: {}", e),
+                    })?;
+            }
         }
 
         // The container (when Postgres/Timescale) has already been
@@ -627,6 +660,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         }

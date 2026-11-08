@@ -51,6 +51,16 @@ impl ServiceMetadata {
         self.engine.get_environment_variables(parameters)
     }
 
+    /// The names of the variables the engine gives each linked environment
+    /// on top of its connection variables (its runtime definitions).
+    pub(crate) fn runtime_variable_names(&self) -> Vec<String> {
+        self.engine
+            .get_runtime_env_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()
+    }
+
     /// The engine's container-to-container connection variables for
     /// `parameters`.
     pub(crate) fn docker_environment_variables(
@@ -323,6 +333,57 @@ mod tests {
             .await
             .expect("masked values need no Docker");
         assert!(masked.values().all(|value| value == "***"), "{masked:?}");
+    }
+
+    /// The variable-name preview lists what a linked app receives, including
+    /// the per-environment names: a storage service's `S3_BUCKET` and a
+    /// database's per-environment database. On a worker node and on the
+    /// control plane alike, with no Docker.
+    #[tokio::test]
+    async fn the_name_preview_lists_the_per_environment_variables() {
+        let mut storage = crate::services::test_support::encrypted_service_model(
+            12,
+            serde_json::json!({
+                "host": "localhost",
+                "port": "9010",
+                "access_key": "ak",
+                "secret_key": "sk",
+                "region": "us-east-1",
+            }),
+        );
+        storage.name = "files".to_string();
+        storage.service_type = "s3".to_string();
+        for node_id in [Some(3), None] {
+            storage.node_id = node_id;
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results((0..2).map(|_| vec![storage.clone()]))
+                    .into_connection(),
+            );
+            let manager = crate::services::test_support::control_plane_manager_with_db(db);
+            let names = manager
+                .get_service_preview_environment_variable_names(12)
+                .await
+                .expect("names need no Docker");
+            for name in ["S3_BUCKET", "S3_ENDPOINT", "AWS_ACCESS_KEY_ID"] {
+                assert!(names.contains(&name.to_string()), "{node_id:?}: {names:?}");
+            }
+            let mut sorted = names.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(names, sorted, "sorted, each name once");
+        }
+
+        let (manager, _) = control_plane_answering(2);
+        let names = manager
+            .get_service_preview_environment_variable_names(11)
+            .await
+            .expect("names need no Docker");
+        assert!(
+            names.contains(&"POSTGRES_DATABASE".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"POSTGRES_URL".to_string()), "{names:?}");
     }
 
     /// The project's linked-service variables (what the environments page

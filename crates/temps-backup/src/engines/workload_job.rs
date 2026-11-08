@@ -970,46 +970,28 @@ pub fn pg_target(
     (target, text("password").unwrap_or_default().to_string())
 }
 
-/// The S3 source `s3_source_id`, decrypted, refused when a job on
-/// `node_id` could not reach it.
+/// The S3 source `s3_source_id` as a job on a worker node receives it: a
+/// credential derived for `grant` (ADR-093), never the source's own unless
+/// the source allows it and cannot scope. Refused when the job could not
+/// reach the source.
 pub async fn s3_target(
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     db: &DatabaseConnection,
-    encryption: &Arc<temps_core::EncryptionService>,
     s3_source_id: i32,
-    service_id: i32,
-    node_id: i32,
+    grant: temps_providers::worker_s3_scope::WorkerS3Grant,
     operation: &'static str,
 ) -> Result<S3JobTarget, BackupError> {
-    let source = v2_common::load_s3_source(db, s3_source_id).await?;
-    let decrypt = |field: &str, value: &str| {
-        encryption
-            .decrypt_string(value)
-            .map_err(|e| BackupError::PermanentFailure {
-                reason: format!("decrypting the {field} of S3 source {s3_source_id}: {e}"),
-            })
-    };
-    let access_key_id = decrypt("access key", &source.access_key_id)?;
-    let secret_access_key = decrypt("secret key", &source.secret_key)?;
-    let session_token = v2_common::decrypt_session_token(&source, encryption)?;
-    if let Some(endpoint) = source.endpoint.as_ref().filter(|e| is_loopback_endpoint(e)) {
-        return Err(DatabaseJobError::EndpointUnreachable {
-            service_id,
-            operation,
-            node_id,
-            s3_source_id,
-            endpoint: endpoint.clone(),
-        }
-        .into());
-    }
+    let destination =
+        super::worker_agent::scoped_destination(scoper, db, s3_source_id, grant, operation).await?;
     Ok(S3JobTarget {
         s3_source_id,
-        bucket: source.bucket_name.clone(),
-        region: source.region.clone(),
-        endpoint: source.endpoint.clone(),
-        force_path_style: source.force_path_style.unwrap_or(true),
-        access_key_id,
-        secret_access_key,
-        session_token,
+        bucket: destination.bucket,
+        region: destination.region,
+        endpoint: destination.endpoint,
+        force_path_style: destination.force_path_style,
+        access_key_id: destination.access_key_id,
+        secret_access_key: destination.secret_access_key,
+        session_token: destination.session_token,
     })
 }
 
@@ -1300,6 +1282,8 @@ pub struct PostgresWorkloadJobDeps {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// The workload plane, bound once `temps serve` starts it.
     pub plane: Arc<PlaneSlot>,
+    /// Derives the job's S3 credential (ADR-093).
+    pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 /// `postgres_workload_job`: a backup of a database on a worker node, as a
@@ -1392,16 +1376,6 @@ impl BackupEngine for PostgresWorkloadJobEngine {
         )
         .await?;
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
-        let s3 = s3_target(
-            deps.db.as_ref(),
-            &deps.encryption_service,
-            s3_source_id,
-            service_id,
-            node_id,
-            "backup",
-        )
-        .await?;
-
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let s3_key = v2_common::build_external_service_s3_key(
             &s3_source.bucket_path,
@@ -1410,6 +1384,21 @@ impl BackupEngine for PostgresWorkloadJobEngine {
             &backup_uuid,
             DUMP_FILE_SUFFIX,
         );
+        // The job can write this dump's own directory and nothing else.
+        let s3 = s3_target(
+            &deps.worker_credentials,
+            deps.db.as_ref(),
+            s3_source_id,
+            temps_providers::worker_s3_scope::WorkerS3Grant::job(
+                service_id,
+                node_id,
+                temps_providers::worker_s3_scope::key_directory(&s3_key),
+                temps_core::ScopedS3Access::Write,
+                "backup",
+            ),
+            "backup",
+        )
+        .await?;
         let config_json = deps
             .encryption_service
             .decrypt_string(service.config.as_deref().unwrap_or("{}"))
@@ -2504,6 +2493,12 @@ mod tests {
                     .expect("encryption"),
             ),
             plane: Arc::new(PlaneSlot::new()),
+            worker_credentials: Arc::new(
+                temps_providers::worker_s3_scope::WorkerCredentialScoper::new(Arc::new(
+                    temps_core::EncryptionService::new("test_encryption_key_1234567890ab")
+                        .expect("encryption"),
+                )),
+            ),
         });
         {
             let mut guard = AttemptGuard::new(attempt(jobs, &log), Arc::clone(&engine.abandoned));

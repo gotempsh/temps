@@ -531,9 +531,6 @@ pub enum NodeError {
         placements: Vec<NodePlacementReference>,
     },
 
-    #[error("S3 source {s3_source_id} not found")]
-    S3SourceNotFound { s3_source_id: i32 },
-
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
@@ -2046,45 +2043,6 @@ impl NodeService {
         db.execute_unprepared("SELECT pg_notify('route_table_changes', '')")
             .await?;
         Ok(updated)
-    }
-
-    /// Authorization check for `get_s3_credentials` (ADR-020 WS-4.1 / analyst-1).
-    ///
-    /// A worker node may only receive the plaintext credentials for an S3 source
-    /// it legitimately needs — i.e. a source used by a backup of a managed
-    /// service that is actually hosted on this node (standalone placement via
-    /// `external_services.node_id`, or a cluster member via
-    /// `service_members.node_id`). Without this gate any single node token could
-    /// enumerate `s3_source_id = 1..N` and exfiltrate every tenant's object-store
-    /// access+secret keys.
-    pub async fn is_authorized_for_s3_source(
-        &self,
-        node_id: i32,
-        s3_source_id: i32,
-    ) -> Result<bool, NodeError> {
-        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-
-        // EXISTS: a backup whose destination is `s3_source_id`, linked (via the
-        // external_service_backups join) to a service placed on `node_id`.
-        let sql = r#"
-            SELECT 1
-            FROM backups b
-            JOIN external_service_backups esb ON esb.backup_id = b.id
-            JOIN external_services es ON es.id = esb.service_id
-            LEFT JOIN service_members sm ON sm.service_id = es.id
-            WHERE b.s3_source_id = $1
-              AND (es.node_id = $2 OR sm.node_id = $2)
-            LIMIT 1
-        "#;
-
-        let stmt = Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            sql,
-            [s3_source_id.into(), node_id.into()],
-        );
-
-        let row = self.db.query_one(stmt).await?;
-        Ok(row.is_some())
     }
 
     /// Get a node by its name.

@@ -50,6 +50,8 @@ pub struct PostgresWalgDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
+    /// Derives a worker's S3 credential (ADR-093).
+    pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 pub struct PostgresWalgEngine {
@@ -302,28 +304,48 @@ async fn backup_on_worker(
     backup_uuid: &str,
     allow_restart: bool,
 ) -> Result<WalgBaseBackupOutcome, BackupError> {
-    // Refuses an endpoint on this host's loopback, which the node cannot
-    // reach.
-    let target = super::workload_job::s3_target(
+    // The base backup writes this credential into `walg.env`, where
+    // `archive_command` keeps using it: it is the archiving credential,
+    // limited to the service's own WAL-G repository and refreshed by the
+    // control plane (ADR-093).
+    let destination = super::worker_agent::scoped_destination(
+        &deps.worker_credentials,
         deps.db.as_ref(),
-        &deps.encryption_service,
         s3_source_id,
-        service.id,
-        node_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::archive(
+            service.id,
+            node_id,
+            temps_providers::externalsvc::postgres_walg_backup::walg_key_prefix(
+                bucket_path,
+                &service.name,
+            ),
+        ),
         "backup",
     )
     .await?;
-    let request = deps.manager.walg_backup_worker_postgres(
-        service.id,
-        super::worker_agent::destination(&target),
-        bucket_path.to_string(),
-        backup_uuid.to_string(),
-        allow_restart,
+    // A node already running its maximum of backups and restores is waited
+    // for (bounded, within this backup's own runtime limit) instead of
+    // failing the backup.
+    let request = crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || {
+            deps.manager.walg_backup_worker_postgres(
+                service.id,
+                destination.clone(),
+                bucket_path.to_string(),
+                backup_uuid.to_string(),
+                allow_restart,
+            )
+        },
+        |wait| super::worker_agent::wait_for_node_slot(ctx.backup_id, service.id, wait),
     );
     let result = tokio::select! {
         // Dropping the request ends it on the node too.
         _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-        result = request => result,
+        result = request => match result {
+            Ok(result) => result,
+            Err(never) => match never {},
+        },
     }
     .map_err(|e| BackupError::Failed {
         reason: format!(

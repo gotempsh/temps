@@ -1134,6 +1134,149 @@ async fn a_worker_postgres_is_backed_up_by_the_control_plane_walg_engine_through
     );
 }
 
+/// ADR-092, PostgreSQL step 2: a worker's archiving is turned on, then
+/// pointed at another S3 source, without a base backup, by the control
+/// plane's own `enable_continuous_archiving` through the agent.
+///
+/// 1. Archiving off: the running container is recreated with archiving on
+///    (its labels, port, network and restart policy kept), and WAL lands
+///    under the first source's prefix. No base backup is taken.
+/// 2. Re-pointed: nothing restarts, `walg.env` names the second prefix, and
+///    the next WAL lands there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_postgres_archive_is_turned_on_and_repointed_through_its_agent() {
+    use temps_providers::externalsvc::postgres_walg_backup::{walg_key_prefix, walg_prefix};
+    use temps_service_protocol::{PostgresWalgArchiveRequest, PostgresWalgArchiveResult};
+
+    let Some(fixture) = WalgFixture::start("wsearch", "walg-archive").await else {
+        return;
+    };
+    let fixture = &fixture;
+    let docker = &fixture.docker;
+    let container = fixture.container.as_str();
+    let archive = |bucket_path: &str| PostgresWalgArchiveRequest {
+        service_id: 8,
+        node_id: 2,
+        service_config: fixture.config.clone(),
+        destination: fixture.destination(),
+        bucket_path: bucket_path.to_string(),
+    };
+    let repoint = |request: PostgresWalgArchiveRequest| async move {
+        let (status, body) = envelope(
+            temps_node_agent::service_data_handlers::postgres_walg_archive(
+                State(fixture.agent.clone()),
+                Json(request),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200, "the re-point did not run: {body}");
+        serde_json::from_value::<PostgresWalgArchiveResult>(body["data"].clone())
+            .expect("an archive result")
+    };
+    let inspect = || async {
+        docker
+            .inspect_container(
+                container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("inspect the service container")
+    };
+    // WAL under `bucket_path`'s prefix once a segment is switched out.
+    let wal_lands_under = |bucket_path: &'static str| async move {
+        let key_prefix = format!("{}wal_005/", walg_key_prefix(bucket_path, &fixture.name));
+        let before = keys(&fixture.s3, &fixture.bucket, &key_prefix).await.len();
+        let (code, out) = psql(
+            docker,
+            container,
+            "create table if not exists t(x int); insert into t values (1); select pg_switch_wal()",
+        )
+        .await;
+        assert_eq!(code, 0, "{out}");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let now = keys(&fixture.s3, &fixture.bucket, &key_prefix).await.len();
+            if now > before {
+                return now;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no WAL arrived under {key_prefix}"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    };
+    let created = inspect().await;
+    assert_eq!(psql(docker, container, "show archive_mode").await.1, "off");
+
+    // 1. On, to the first source.
+    let first = repoint(archive("fleet-a")).await;
+    assert_eq!(
+        first,
+        PostgresWalgArchiveResult::Completed { restarted: true }
+    );
+    let recreated = inspect().await;
+    assert_ne!(recreated.id, created.id, "archive_mode was off: a recreate");
+    assert_eq!(
+        restart_policy(&recreated),
+        Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED)
+    );
+    let label = |i: &bollard::models::ContainerInspectResponse| {
+        i.config
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .and_then(|l| l.get("sh.temps.service.name").cloned())
+    };
+    assert_eq!(label(&recreated), label(&created));
+    assert_eq!(psql(docker, container, "show archive_mode").await.1, "on");
+    let walg_env = || async {
+        exec(docker, container, &["cat", "/var/lib/postgresql/walg.env"])
+            .await
+            .1
+    };
+    assert!(
+        walg_env()
+            .await
+            .contains(&walg_prefix(&fixture.bucket, "fleet-a", &fixture.name)),
+        "walg.env names the first prefix"
+    );
+    wal_lands_under("fleet-a").await;
+    let base_backups = keys(
+        &fixture.s3,
+        &fixture.bucket,
+        &format!(
+            "{}basebackups_005/",
+            walg_key_prefix("fleet-a", &fixture.name)
+        ),
+    )
+    .await;
+    assert!(
+        base_backups.is_empty(),
+        "a re-point takes no base backup: {base_backups:?}"
+    );
+
+    // 2. Re-pointed to the second source: no restart, WAL moves.
+    let second = repoint(archive("fleet-b")).await;
+    assert_eq!(
+        second,
+        PostgresWalgArchiveResult::Completed { restarted: false }
+    );
+    assert_eq!(
+        inspect().await.id,
+        recreated.id,
+        "a re-point with archiving on restarted PostgreSQL"
+    );
+    let env = walg_env().await;
+    assert!(
+        env.contains(&walg_prefix(&fixture.bucket, "fleet-b", &fixture.name)),
+        "walg.env names the second prefix"
+    );
+    let landed = wal_lands_under("fleet-b").await;
+    println!("worker WAL-G archive proof: on with a recreate, re-pointed, {landed} WAL objects under the second prefix");
+}
+
 /// ADR-092, PostgreSQL step 3: a worker's WAL-G PostgreSQL is restored in
 /// place, and to a point in time, by the control plane's own WAL-G restore
 /// through the agent's sealed operation, and a restore that fails leaves the
@@ -1347,6 +1490,228 @@ async fn a_worker_postgres_is_restored_and_recovered_to_a_point_in_time_through_
     );
     assert_agents_container(&inspect().await, "rollback");
     println!("worker WAL-G restore proof: PITR to {t}, in place, and a rolled-back failure");
+}
+
+/// ADR-092, PostgreSQL step 4: another service's WAL-G backup is restored
+/// into a worker's PostgreSQL through its agent, as a cross-service restore
+/// on the control plane: the restored data answers to the origin's login,
+/// which the control plane sends as the restored login, while the target's
+/// own login is the running server's until the swap.
+///
+/// Origin X: rows A, base backup, rows B, time T, rows C. Target Y, with its
+/// own data and password: a PITR from X's backup to T leaves Y with A and B
+/// (not C, not Y's own rows), on Y's container, answering to X's password
+/// and no longer to Y's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_services_walg_backup_is_restored_into_a_worker_postgres_through_its_agent() {
+    use temps_providers::externalsvc::postgres_walg_backup::walg_prefix;
+    use temps_service_protocol::{
+        PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
+        PostgresWalgRestoreResult, RecoveryTarget,
+    };
+
+    let Some(origin) = WalgFixture::start("wsexo", "walg-cross").await else {
+        return;
+    };
+    let Some(target) = WalgFixture::start("wsexy", "walg-cross-y").await else {
+        return;
+    };
+    let docker = &origin.docker;
+    let password = |fixture: &WalgFixture| {
+        fixture.config.parameters["password"]
+            .as_str()
+            .expect("a generated password")
+            .to_string()
+    };
+    let (origin_password, target_password) = (password(&origin), password(&target));
+    assert_ne!(origin_password, target_password);
+    let sql = |container: &str, statement: &str| {
+        let container = container.to_string();
+        let statement = statement.to_string();
+        async move {
+            let (code, out) = psql(docker, &container, &statement).await;
+            assert_eq!(code, 0, "{statement}: {out}");
+            out
+        }
+    };
+    // A login over the container's network address, as an application
+    // connects: the image trusts loopback, so only this checks the password.
+    let login = |container: &str, password: &str| {
+        let container = container.to_string();
+        let env = format!("PGPASSWORD={password}");
+        async move {
+            let output = temps_docker_util::exec_capture(
+                docker,
+                &container,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(vec![
+                        "sh",
+                        "-c",
+                        "psql -h \"$(hostname -i | cut -d' ' -f1)\" -U postgres -d postgres \
+                         -tAc 'select 1'",
+                    ]),
+                    env: Some(vec![env.as_str()]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+                temps_docker_util::ExecCaptureOptions::separate(
+                    temps_docker_util::OutputLimit::Head(4096),
+                    temps_docker_util::OutputLimit::Head(4096),
+                )
+                .exit_code(temps_docker_util::ExitCodePolicy::BestEffort),
+            )
+            .await
+            .expect("exec psql over TCP");
+            output.exit_code == Some(0)
+        }
+    };
+    assert!(login(&target.container, &target_password).await);
+    assert!(!login(&target.container, &origin_password).await);
+
+    let x = origin.container.as_str();
+    let y = target.container.as_str();
+    sql(y, "create table mine(x int); insert into mine values (7)").await;
+    sql(
+        x,
+        "create table proof(tag text); insert into proof values ('a')",
+    )
+    .await;
+    let backup = walg_backup(
+        &origin.agent,
+        &PostgresWalgBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: origin.config.clone(),
+            destination: origin.destination(),
+            bucket_path: WALG_BUCKET_PATH.to_string(),
+            backup_uuid: "cross-1".to_string(),
+            allow_restart: true,
+        },
+    )
+    .await;
+    assert!(
+        matches!(backup, PostgresWalgBackupResult::Completed { .. }),
+        "{backup:?}"
+    );
+    sql(x, "insert into proof values ('b')").await;
+    let t = sql(
+        x,
+        "select to_char(clock_timestamp() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .await;
+    let t: chrono::DateTime<chrono::Utc> = t.parse().unwrap_or_else(|e| panic!("T '{t}': {e}"));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sql(x, "insert into proof values ('c')").await;
+    sql(x, "select pg_switch_wal()").await;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let pending = psql(
+            docker,
+            x,
+            "select count(*) from pg_ls_dir('pg_wal/archive_status') f where f like '%.ready'",
+        )
+        .await
+        .1;
+        if pending == "0" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WAL was not archived: {pending} ready"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    // What the control plane sends for a cross-service restore: the
+    // target's configuration with the origin's login merged in, and the
+    // target's own as the running server's.
+    let mut restored_login = target.config.clone();
+    for key in ["password", "username", "database"] {
+        restored_login.parameters[key] = origin.config.parameters[key].clone();
+    }
+    let created = docker
+        .inspect_container(
+            y,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("inspect the target");
+    // The origin's bucket, reached from the target's container on the
+    // shared network.
+    let restored = walg_restore(
+        &target.agent,
+        &PostgresWalgRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: restored_login,
+            live_service_config: target.config.clone(),
+            source: origin.destination(),
+            walg_prefix: walg_prefix(&origin.bucket, WALG_BUCKET_PATH, &origin.name),
+            recovery_target: Some(RecoveryTarget::Time { time: t }),
+            target_user_data: Some(serde_json::json!({ "temps_backup_id": "cross-1" }).to_string()),
+        },
+    )
+    .await;
+    assert_eq!(
+        restored,
+        PostgresWalgRestoreResult::Completed,
+        "{restored:?}"
+    );
+    assert_eq!(
+        psql(
+            docker,
+            y,
+            "select string_agg(tag, ',' order by tag) from proof"
+        )
+        .await
+        .1,
+        "a,b",
+        "the target holds the origin's data to T"
+    );
+    assert_ne!(
+        psql(docker, y, "select count(*) from mine").await.0,
+        0,
+        "the target's own table is gone"
+    );
+    assert!(
+        login(y, &origin_password).await,
+        "the restored target answers to the origin's login"
+    );
+    assert!(
+        !login(y, &target_password).await,
+        "the target's previous password no longer works"
+    );
+    let replaced = docker
+        .inspect_container(
+            y,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("inspect the target");
+    let service_label = |i: &bollard::models::ContainerInspectResponse| {
+        i.config
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .and_then(|l| l.get("sh.temps.service.name").cloned())
+    };
+    assert_eq!(service_label(&replaced), service_label(&created));
+    assert_eq!(
+        restart_policy(&replaced),
+        Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED)
+    );
+    // The origin is untouched.
+    assert_eq!(
+        psql(
+            docker,
+            x,
+            "select string_agg(tag, ',' order by tag) from proof"
+        )
+        .await
+        .1,
+        "a,b,c"
+    );
+    println!("cross-service WAL-G restore proof: origin's backup recovered into the target to {t}");
 }
 
 /// The same WAL-G restore on the control plane (ADR-092: one implementation,
@@ -1673,4 +2038,311 @@ fn a_garage_service_on_a_worker_is_refused_before_the_agent_is_called() {
     let message = error.to_string();
     assert!(message.contains("garage.toml"), "{message}");
     assert!(message.contains("rustfs"), "{message}");
+}
+
+/// Managed S3 storage on a worker is restored in place exactly as on the
+/// control plane: the agent's `data-restore` mirrors each backed-up bucket
+/// with `--overwrite --remove`, so objects written after the backup are
+/// deleted and changed ones put back, and the bucket holds what the backup
+/// holds, no more.
+///
+/// 40 objects are backed up through the agent's `data-backup`; then 5 are
+/// added and one is overwritten; the restore leaves exactly the 40, with
+/// the overwritten one back to its backed-up content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
+    use temps_node_agent::service_data_handlers::{data_backup, data_restore};
+    use temps_service_protocol::{
+        RemoteServiceBackupRequest, RemoteServiceRestoreRequest, WorkerS3Destination,
+    };
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!(
+                "Docker not available (set DOCKER_HOST), skipping the worker S3 restore proof"
+            );
+            return;
+        }
+    };
+    let agent = agent_state(docker.clone());
+    let suffix = std::process::id();
+    let name = format!("wses3r{suffix}");
+    let store_name = format!("wses3rbk{suffix}");
+    let engine = engines()
+        .into_iter()
+        .find(|engine| engine.label == "rustfs")
+        .expect("the RustFS engine");
+    let mut parameters = control_plane_parameters(&engine);
+    parameters.insert("port".into(), json!(free_port().to_string()));
+    let params = ExternalServiceManager::remote_create_params(
+        9,
+        &name,
+        &engine.service_type,
+        &as_strings(&parameters),
+        false,
+    )
+    .expect("the create request");
+    for image in [params.image.as_str(), RUSTFS_IMAGE] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the worker S3 restore proof");
+            return;
+        }
+    }
+    let network = params
+        .network
+        .clone()
+        .expect("worker services join a network");
+    let _cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![params.name.clone(), store_name.clone()],
+        volumes: params.volumes.keys().cloned().collect(),
+    };
+    let (status, created) = envelope(
+        create_service(
+            State(agent.clone()),
+            Json(ServiceCreateRequest {
+                name: params.name.clone(),
+                service_type: params.service_type.clone(),
+                image: params.image.clone(),
+                environment: params.environment.clone(),
+                port_mappings: params
+                    .port_mappings
+                    .iter()
+                    .map(|p| ServicePortMapping {
+                        host_port: p.host_port,
+                        container_port: p.container_port,
+                    })
+                    .collect(),
+                volumes: params.volumes.clone(),
+                network: params.network.clone(),
+                command: params.command.clone(),
+                resource_limits: None,
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "create failed: {created}");
+    let container = created["data"]["container_name"]
+        .as_str()
+        .expect("the created container's name")
+        .to_string();
+    let host_port = created["data"]["host_port"]
+        .as_u64()
+        .expect("the published host port");
+    let mut stored = parameters.clone();
+    stored.insert("port".into(), json!(host_port.to_string()));
+    stored.insert("container_name".into(), json!(container.clone()));
+    let config = ServiceConfig {
+        name: name.clone(),
+        service_type: engine.service_type,
+        version: None,
+        parameters: serde_json::to_value(&stored).expect("stored parameters"),
+    };
+    wait_healthy(&agent, &config, "rustfs").await;
+
+    // The backup store: another RustFS on the service's network.
+    let store_port = free_port();
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(&store_name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(RUSTFS_IMAGE.to_string()),
+                env: Some(vec![
+                    format!("RUSTFS_ACCESS_KEY={WALG_S3_KEY}"),
+                    format!("RUSTFS_SECRET_KEY={WALG_S3_KEY}"),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.clone()),
+                    port_bindings: Some(HashMap::from([(
+                        "9000/tcp".to_string(),
+                        Some(vec![bollard::models::PortBinding {
+                            host_ip: Some("127.0.0.1".to_string()),
+                            host_port: Some(store_port.to_string()),
+                        }]),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the backup store container");
+    docker
+        .start_container(
+            &store_name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("start the backup store");
+
+    let client = |endpoint: String, key: &str, secret: &str| {
+        let credentials = temps_providers::externalsvc::S3Credentials {
+            access_key_id: key.to_string(),
+            secret_key: secret.to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some(endpoint),
+            bucket_name: String::new(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        };
+        async move { credentials.build_s3_client().await }
+    };
+    let text = |key: &str| stored[key].as_str().expect("a generated key").to_string();
+    let service = client(
+        format!("http://127.0.0.1:{host_port}"),
+        &text("access_key"),
+        &text("secret_key"),
+    )
+    .await;
+    let store = client(
+        format!("http://127.0.0.1:{store_port}"),
+        WALG_S3_KEY,
+        WALG_S3_KEY,
+    )
+    .await;
+    async fn make_bucket(s3: &aws_sdk_s3::Client, bucket: &str) {
+        let mut made = Err(String::new());
+        for _ in 0..60 {
+            made = s3
+                .create_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"));
+            if made.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        made.unwrap_or_else(|e| panic!("creating bucket {bucket}: {e}"));
+    }
+    make_bucket(&service, "files").await;
+    make_bucket(&store, "backups").await;
+    let put = |key: String, body: &'static str| {
+        let service = service.clone();
+        async move {
+            service
+                .put_object()
+                .bucket("files")
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                    body.as_bytes(),
+                ))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("put {key}: {e:?}"));
+        }
+    };
+    for i in 0..40 {
+        put(format!("docs/{i:02}.txt"), "backed up").await;
+    }
+    let objects = || {
+        let service = service.clone();
+        async move {
+            let mut keys = Vec::new();
+            let mut token = None;
+            loop {
+                let page = service
+                    .list_objects_v2()
+                    .bucket("files")
+                    .set_continuation_token(token)
+                    .send()
+                    .await
+                    .expect("list the bucket");
+                keys.extend(
+                    page.contents()
+                        .iter()
+                        .filter_map(|o| o.key().map(str::to_string)),
+                );
+                token = page.next_continuation_token().map(str::to_string);
+                if token.is_none() {
+                    break;
+                }
+            }
+            keys.sort();
+            keys
+        }
+    };
+    let backed_up = objects().await;
+    assert_eq!(backed_up.len(), 40);
+
+    let destination = WorkerS3Destination {
+        bucket: "backups".to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some(format!("http://{store_name}:9000")),
+        force_path_style: true,
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_access_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+    };
+    let prefix = "external_services/s3/proof/backup-1";
+    let (status, body) = envelope(
+        data_backup(
+            State(agent.clone()),
+            Json(RemoteServiceBackupRequest {
+                service_config: config.clone(),
+                destination: destination.clone(),
+                key: prefix.to_string(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "the backup failed: {body}");
+
+    // After the backup: 5 new objects and one changed.
+    for i in 40..45 {
+        put(format!("docs/{i:02}.txt"), "after the backup").await;
+    }
+    put("docs/00.txt".to_string(), "changed after the backup").await;
+    assert_eq!(objects().await.len(), 45);
+
+    let (status, body) = envelope(
+        data_restore(
+            State(agent.clone()),
+            Json(RemoteServiceRestoreRequest {
+                service_config: config.clone(),
+                source: destination,
+                location: prefix.to_string(),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "the restore failed: {body}");
+    let restored = objects().await;
+    assert_eq!(
+        restored.len(),
+        40,
+        "objects written after the backup must be removed: {restored:?}"
+    );
+    assert_eq!(restored, backed_up);
+    let first = service
+        .get_object()
+        .bucket("files")
+        .key("docs/00.txt")
+        .send()
+        .await
+        .expect("read the restored object")
+        .body
+        .collect()
+        .await
+        .expect("the restored object's body")
+        .into_bytes();
+    assert_eq!(&first[..], b"backed up");
+    println!(
+        "worker S3 restore proof: 45 objects before, {} after",
+        restored.len()
+    );
 }

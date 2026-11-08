@@ -26,8 +26,8 @@
 //! Credentials reach the helper only through its environment, never argv.
 //!
 //! A restore is the provider's own in-place restore (`restore_from_s3` for a
-//! dump, the bucket mirror's restore for storage), run here against this
-//! node's Docker. It is user-initiated: a Redis restore stops and starts the
+//! dump, the bucket mirror's exact restore for storage, which removes
+//! objects the backup does not have), run here against this node's Docker. It is user-initiated: a Redis restore stops and starts the
 //! container exactly as it does on the control plane.
 
 use std::net::IpAddr;
@@ -348,8 +348,12 @@ pub async fn restore_service_on_node(
         }
         None => {
             let backend = storage_backend(&config, docker, "restored")?;
+            // In place, as the control plane's restore: each backed-up bucket
+            // ends up exactly as backed up, objects written since removed
+            // (`--overwrite --remove`). Buckets the backup does not have are
+            // kept, as there.
             let report = backend
-                .restore(&config, &location(&source, &backup_location), false)
+                .restore(&config, &location(&source, &backup_location), IN_PLACE)
                 .await
                 .map_err(|error| WorkerDataError::Storage {
                     service,
@@ -362,6 +366,10 @@ pub async fn restore_service_on_node(
         }
     }
 }
+
+/// A restore on a worker is always in place (a new service on a worker is
+/// refused before the agent is called), so the bucket mirror is exact.
+const IN_PLACE: bool = true;
 
 /// The provider handle of a dump engine's service.
 fn dump_instance(
@@ -489,6 +497,7 @@ fn s3_source_row(destination: &WorkerS3Destination) -> temps_entities::s3_source
         managed_by_cloud: false,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: now,
         updated_at: now,
         backing_service_id: None,

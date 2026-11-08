@@ -960,7 +960,20 @@ impl PostgresService {
         *self.resource_limits.write().await = limits;
         let postgres_config = self.get_postgres_config(service_config)?;
         let container_name = self.get_live_container_name(&postgres_config);
+        let walg_env = self
+            .archive_walg_env(&container_name, s3_credentials, walg_prefix)
+            .await;
+        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config, allow_restart)
+            .await
+    }
 
+    /// The variables `archive_command` reads from `walg.env`.
+    async fn archive_walg_env(
+        &self,
+        container_name: &str,
+        s3_credentials: &crate::externalsvc::S3Credentials,
+        walg_prefix: &str,
+    ) -> Vec<String> {
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_prefix),
             format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
@@ -972,7 +985,7 @@ impl PostgresService {
         // it always did.
         walg_env.extend(s3_credentials.session_token_env());
         if let Some(resolved_endpoint) = s3_credentials
-            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .resolve_endpoint_for_container(&self.docker, container_name)
             .await
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
@@ -980,9 +993,46 @@ impl PostgresService {
         if s3_credentials.force_path_style {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
+        walg_env
+    }
 
-        self.enable_wal_archiving(&container_name, &walg_env, &postgres_config, allow_restart)
-            .await
+    /// Replace the credential in `walg.env` with a fresh one for the same
+    /// repository, and change nothing else: no `ALTER SYSTEM`, no reload, no
+    /// restart (`archive_command` reads the file on every segment). A worker's
+    /// archiving credential is short-lived and the control plane refreshes it
+    /// this way (ADR-093).
+    ///
+    /// Returns `false`, writing nothing, when archiving is not set up here
+    /// (no `walg.env` on the volume): a refresh never turns archiving on.
+    pub async fn refresh_archive_credentials(
+        &self,
+        service_config: ServiceConfig,
+        s3_credentials: &crate::externalsvc::S3Credentials,
+        walg_prefix: &str,
+    ) -> Result<bool> {
+        let postgres_config = self.get_postgres_config(service_config)?;
+        let container_name = self.get_live_container_name(&postgres_config);
+        let probe = crate::externalsvc::exec_util::run_exec(
+            &self.docker,
+            &container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "if [ -f /var/lib/postgresql/walg.env ]; then echo configured; else echo absent; fi"
+                    .to_string(),
+            ],
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
+        if !probe.output.contains("configured") {
+            return Ok(false);
+        }
+        let walg_env = self
+            .archive_walg_env(&container_name, s3_credentials, walg_prefix)
+            .await;
+        self.write_walg_env_file(&container_name, &walg_env).await?;
+        Ok(true)
     }
 }
 
