@@ -51,16 +51,20 @@ export function metricNodeOptions(
 
 /**
  * The scope for the `?node=` value. One node only: node 0, whatever the URL
- * says. Several: the node named by id, else all of them.
+ * says. Several: the node named by id, explicit all, or the page’s default.
  */
 export function resolveNodeScope(
   param: string | null,
-  options: NodeOption[]
+  options: NodeOption[],
+  defaultScope: 'all' | 'first' = 'all'
 ): NodeScope {
   if (options.length <= 1) return { kind: 'node', id: CONTROL_PLANE_NODE_ID }
   if (param != null && param !== ALL_NODES && /^\d+$/.test(param)) {
     const id = Number(param)
     if (options.some((o) => o.id === id)) return { kind: 'node', id }
+  }
+  if (defaultScope === 'first' && param !== ALL_NODES) {
+    return { kind: 'node', id: options[0].id }
   }
   return { kind: 'all', ids: options.map((o) => o.id) }
 }
