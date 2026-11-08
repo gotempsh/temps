@@ -1,4 +1,4 @@
-# ADR-096: Internal DNS canary corrections
+# ADR-097: Internal DNS canary corrections
 
 **Status:** Accepted; pending canary verification
 
