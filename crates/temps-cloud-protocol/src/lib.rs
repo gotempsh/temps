@@ -43,7 +43,8 @@ pub use console_proxy::{
 pub use messages::{
     truncate_status_text, BackupCompression, BackupEngine, BackupFormat,
     BackupLifecycleEventAccepted, BackupLifecycleEventRequest, BackupLifecycleStage,
-    BackupManifest, BackupManifestObjects, EnrollRequest, EnrollResponse, Envelope, Heartbeat,
+    BackupManifest, BackupManifestObjects, ConsoleLogout, ConsoleLogoutAck, ConsoleLogoutRejected,
+    EnrollRequest, EnrollResponse, Envelope, Heartbeat,
     HeartbeatAck, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
     ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedAiCitation,
     ManagedAiEvidence, ManagedAiTask, ManagedBackupCapability, ManagedNotificationAccepted,
@@ -54,8 +55,9 @@ pub use messages::{
     StatusSelfUpdateAttemptOutcome, StatusSelfUpdateBlocker, StatusSelfUpdatePhase,
     StatusSelfUpdateRestartMode, StatusSupervisorKind, TelemetryBatch, WalGObjectCompleted,
     WalGObjectDeclaration, WalGObjectKind, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
-    WalGSnapshotCompleted, WalGSnapshotRequest, BACKUP_MANIFEST_VERSION,
-    MANIFEST_DECLARATION_THRESHOLD, MAX_BACKUP_MANIFEST_BYTES, MAX_STATUS_TEXT_CHARS,
+    WalGSnapshotCompleted, WalGSnapshotRequest, BACKUP_MANIFEST_VERSION, CONSOLE_LOGOUT_ACK_KIND,
+    CONSOLE_LOGOUT_KIND, CONSOLE_LOGOUT_REJECTED_KIND, MANIFEST_DECLARATION_THRESHOLD,
+    MAX_BACKUP_MANIFEST_BYTES, MAX_CONSOLE_LOGOUT_REJECTION_CHARS, MAX_STATUS_TEXT_CHARS,
 };
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +112,17 @@ pub enum Capability {
     /// is split out: an old backend or an old instance on either end simply
     /// never opens the connection, exactly like [`Capability::TelemetryQuery`].
     ConsoleProxy,
+    /// Instance verifies and applies a [`crate::messages::ConsoleLogout`]
+    /// pushed on the management channel: an OpenID Connect Back-Channel
+    /// Logout token, signed by the backend's identity provider, that ends one
+    /// user's sessions issued through the backend-managed console provider
+    /// (ADR-094).
+    ///
+    /// Advertised by the instance only. The backend sends the frame only to
+    /// an instance that advertised it, so a peer that predates it never
+    /// receives one. The instance trusts the token's signature, never the
+    /// channel it arrived on.
+    ConsoleSessionLogout,
     /// A capability introduced by a newer peer. Older agents retain the
     /// connection and simply decline to negotiate the unknown feature.
     #[serde(other)]
@@ -359,6 +372,25 @@ mod tests {
             serde_json::from_str::<Capability>(r#""instance_status_reporting""#)
                 .expect("capability must parse"),
             Capability::InstanceStatusReporting
+        );
+    }
+
+    #[test]
+    fn console_session_logout_is_spelled_as_the_backend_reads_it() {
+        // The backend matches this wire name in the raw `Hello`, so a rename
+        // would silently stop every console logout push.
+        assert_eq!(
+            serde_json::to_string(&Capability::ConsoleSessionLogout).unwrap(),
+            r#""console_session_logout""#
+        );
+        let old_peer: Hello = serde_json::from_str(
+            r#"{"protocol_version":1,"agent_version":"old","capabilities":["telemetry_shipping"]}"#,
+        )
+        .unwrap();
+        let ours = hello(&[Capability::TelemetryShipping, Capability::ConsoleSessionLogout]);
+        assert_eq!(
+            ours.negotiate(&old_peer).unwrap(),
+            vec![Capability::TelemetryShipping]
         );
     }
 

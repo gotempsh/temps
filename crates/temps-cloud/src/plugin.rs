@@ -138,6 +138,9 @@ impl TempsPlugin for CloudPlugin {
                      no managed OIDC provider to provision"
                 ),
             }
+            // ADR-094: independent of the link's health, so Cloud sessions
+            // stay bounded even when initialization reports a problem.
+            service.start_console_session_checker();
             if cloud_initialization_succeeded(service.initialize().await) {
                 service.start_backup_mirror(
                     context.require_service::<sea_orm::DatabaseConnection>(),

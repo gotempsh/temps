@@ -202,6 +202,8 @@ pub struct CloudService {
     backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ADR-094: the Temps Cloud console session re-check.
+    console_session_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// ADR-045 §3: the console-proxy connection task and its own stop
     /// switch. Separate from `cancel` because the worker owns a dedicated
@@ -287,6 +289,7 @@ impl CloudService {
             backup_task: Mutex::new(None),
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
+            console_session_task: Mutex::new(None),
             lifecycle_notify_task: Mutex::new(None),
             console_proxy_task: Mutex::new(None),
             backup_mirror_wake: Arc::new(Notify::new()),
@@ -688,12 +691,46 @@ impl CloudService {
             tracing::info!("Cloud service launching heartbeat sender task");
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
+            // ADR-094: with an auth plugin, this instance applies Cloud's
+            // signed console logouts and says so in its `Hello`.
+            let console_logout = self.oidc_provisioner.get().map(|oidc| {
+                Arc::new(crate::console_sessions::ConsoleLogoutAdapter::new(oidc.clone()))
+                    as Arc<dyn temps_cloud_client::ConsoleLogoutSink>
+            });
             *task = Some(tokio::spawn(async move {
-                temps_cloud_client::heartbeat::run(link, cancel, None).await;
+                temps_cloud_client::heartbeat::run_with_console_logout(
+                    link,
+                    cancel,
+                    None,
+                    console_logout,
+                )
+                .await;
             }));
         } else {
             tracing::debug!("Cloud heartbeat sender task is already registered");
         }
+    }
+
+    /// ADR-094: re-check Temps Cloud console sessions with Cloud every minute
+    /// and end the ones Cloud no longer vouches for. Safe to start
+    /// unconditionally: without the Cloud-managed provider each pass is one
+    /// local query that finds nothing to do.
+    pub fn start_console_session_checker(&self) {
+        let mut task = self
+            .console_session_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_some() {
+            return;
+        }
+        let Some(oidc) = self.oidc_provisioner.get().cloned() else {
+            tracing::debug!("no OidcService registered; no Temps Cloud console sessions to check");
+            return;
+        };
+        let cancel = self.cancel.subscribe();
+        *task = Some(tokio::spawn(crate::console_sessions::run_session_checker(
+            oidc, cancel,
+        )));
     }
 
     /// Launch the backup lifecycle notifier: subscribes to the job queue and
@@ -1704,6 +1741,19 @@ impl CloudService {
             .take();
         if let Some(task) = heartbeat_task {
             await_task_shutdown(task, "Cloud heartbeat sender", SHUTDOWN_TASK_TIMEOUT).await;
+        }
+        let console_session_task = self
+            .console_session_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = console_session_task {
+            await_task_shutdown(
+                task,
+                "Temps Cloud console session checker",
+                SHUTDOWN_TASK_TIMEOUT,
+            )
+            .await;
         }
         let console_proxy_task = self
             .console_proxy_task
