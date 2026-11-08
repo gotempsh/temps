@@ -51,6 +51,40 @@ pub const ARCHIVE_CREDENTIAL_LIFETIME: Duration = Duration::from_secs(24 * 60 * 
 /// (its token rotation overlap), which leaves four hours of tolerance there
 /// and twenty-two with a store that grants the full lifetime.
 pub const ARCHIVE_CREDENTIAL_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+/// How often the archive-credential refresh looks for credentials that are due.
+pub const ARCHIVE_REFRESH_TICK: Duration = Duration::from_secs(15 * 60);
+/// How long after startup the first refresh pass runs. A plane's link to
+/// Temps Cloud comes up a moment after its background tasks, and a pass that
+/// runs before it can't mint a managed source's credential.
+pub const ARCHIVE_REFRESH_STARTUP_DELAY: Duration = Duration::from_secs(2 * 60);
+/// How soon a pass runs again when Temps Cloud wasn't connected yet, instead
+/// of a full [`ARCHIVE_REFRESH_TICK`].
+pub const ARCHIVE_REFRESH_NOT_CONNECTED_RETRY: Duration = Duration::from_secs(60);
+
+/// When the next archive-credential refresh pass runs, after one in which
+/// some credential couldn't be minted because Temps Cloud wasn't connected
+/// (`cloud_pending`) or not.
+pub fn next_archive_refresh_pass(cloud_pending: bool) -> Duration {
+    if cloud_pending {
+        ARCHIVE_REFRESH_NOT_CONNECTED_RETRY
+    } else {
+        ARCHIVE_REFRESH_TICK
+    }
+}
+
+/// What one archive-credential refresh of a worker PostgreSQL did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveCredentialRefresh {
+    /// The worker holds a fresh credential.
+    Refreshed,
+    /// Nothing to refresh: not a worker service, not archiving, or the agent
+    /// had nothing to update.
+    NotNeeded,
+    /// The managed source's credential couldn't be minted because this
+    /// instance isn't connected to Temps Cloud yet; retry soon.
+    CloudNotConnected,
+}
+
 /// Bound on one STS call.
 const STS_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_REGION: &str = "us-east-1";
@@ -242,6 +276,18 @@ impl WorkerCredentialError {
             }
             Self::InvalidGrant { .. } | Self::Decrypt { .. } | Self::Unscopable { .. } => false,
         }
+    }
+
+    /// Whether Temps Cloud didn't mint only because this instance isn't
+    /// connected to it (yet): at startup, before the Cloud link is up.
+    pub fn is_cloud_not_connected(&self) -> bool {
+        matches!(
+            self,
+            Self::Managed {
+                source: ScopedS3CredentialError::NotConnected,
+                ..
+            }
+        )
     }
 }
 
@@ -833,6 +879,35 @@ mod tests {
                 <= temps_core::MANAGED_SCOPED_CREDENTIAL_MAX_LIFETIME
         );
         assert!(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL * 3 <= ARCHIVE_CREDENTIAL_LIFETIME);
+    }
+
+    /// At startup the refresh can run before the plane's link to Temps Cloud
+    /// is up. That refusal is retried within a minute, not a full tick, and
+    /// only that one: a Cloud outage still waits for the next tick.
+    #[test]
+    fn a_plane_not_yet_connected_to_cloud_retries_its_archive_credential_within_a_minute() {
+        let managed = |source| WorkerCredentialError::Managed {
+            s3_source_id: 1,
+            service_id: 5,
+            node_id: 1,
+            purpose: "continuous archiving",
+            source,
+        };
+        assert!(managed(ScopedS3CredentialError::NotConnected).is_cloud_not_connected());
+        assert!(!managed(ScopedS3CredentialError::Transient {
+            access: "write",
+            prefixes: vec!["t/managed-backups/x/walg/".into()],
+            reason: "503".into(),
+        })
+        .is_cloud_not_connected());
+        assert_eq!(
+            next_archive_refresh_pass(true),
+            ARCHIVE_REFRESH_NOT_CONNECTED_RETRY
+        );
+        assert_eq!(next_archive_refresh_pass(false), ARCHIVE_REFRESH_TICK);
+        assert!(ARCHIVE_REFRESH_NOT_CONNECTED_RETRY <= Duration::from_secs(60));
+        assert!(ARCHIVE_REFRESH_STARTUP_DELAY >= ARCHIVE_REFRESH_NOT_CONNECTED_RETRY);
+        assert!(ARCHIVE_REFRESH_STARTUP_DELAY < ARCHIVE_REFRESH_TICK);
     }
 
     #[test]

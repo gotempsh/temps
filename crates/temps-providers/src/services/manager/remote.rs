@@ -748,16 +748,19 @@ impl ExternalServiceManager {
     /// Give the continuous archiving of PostgreSQL service `service_id`, on a
     /// worker node, a fresh credential for its own WAL-G repository in the
     /// S3 source it is pinned to (ADR-093). Rewrites `walg.env` on the node
-    /// and nothing else. `Ok(false)`: the service does not archive on a
+    /// and nothing else. `NotNeeded`: the service does not archive on a
     /// worker (not pinned, not PostgreSQL, or archiving not set up there).
+    /// `CloudNotConnected`: a managed source whose credential can't be minted
+    /// until this instance's link to Temps Cloud is up.
     pub async fn refresh_worker_archive_credentials(
         &self,
         service_id: i32,
-    ) -> Result<bool, ExternalServiceError> {
+    ) -> Result<crate::worker_s3_scope::ArchiveCredentialRefresh, ExternalServiceError> {
+        use crate::worker_s3_scope::ArchiveCredentialRefresh;
         let service = self.get_service(service_id).await?;
         let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
         else {
-            return Ok(false);
+            return Ok(ArchiveCredentialRefresh::NotNeeded);
         };
         let (Some(s3_source_id), true) = (
             service.continuous_archive_s3_source_id,
@@ -766,7 +769,7 @@ impl ExternalServiceManager {
                 "postgres" | "postgresql" | "timescale" | "timescaledb"
             ),
         ) else {
-            return Ok(false);
+            return Ok(ArchiveCredentialRefresh::NotNeeded);
         };
         let s3_source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
             .one(self.db.as_ref())
@@ -791,13 +794,21 @@ impl ExternalServiceManager {
                     ),
                 ),
             )
-            .await
-            .map_err(|error| ExternalServiceError::InternalError {
-                reason: format!(
-                    "could not refresh the WAL archiving credential of service {service_id} on \
-                     node {node_id}: {error}"
-                ),
-            })?;
+            .await;
+        let scoped = match scoped {
+            Ok(scoped) => scoped,
+            Err(error) if error.is_cloud_not_connected() => {
+                return Ok(ArchiveCredentialRefresh::CloudNotConnected);
+            }
+            Err(error) => {
+                return Err(ExternalServiceError::InternalError {
+                    reason: format!(
+                        "could not refresh the WAL archiving credential of service {service_id} \
+                         on node {node_id}: {error}"
+                    ),
+                });
+            }
+        };
         if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
             warn!(service_id, node_id, "{warning}");
         }
@@ -816,10 +827,10 @@ impl ExternalServiceManager {
             .await?;
         use crate::remote_service_client::PostgresWalgCredentialsResult;
         match result {
-            PostgresWalgCredentialsResult::Refreshed => Ok(true),
+            PostgresWalgCredentialsResult::Refreshed => Ok(ArchiveCredentialRefresh::Refreshed),
             PostgresWalgCredentialsResult::Refused { reason } => {
                 tracing::debug!(service_id, node_id, %reason, "archive credential not refreshed");
-                Ok(false)
+                Ok(ArchiveCredentialRefresh::NotNeeded)
             }
             PostgresWalgCredentialsResult::Failed { reason } => {
                 Err(ExternalServiceError::DockerError {
@@ -835,19 +846,27 @@ impl ExternalServiceManager {
 
     /// Keep every worker PostgreSQL's archiving credential fresh: each one
     /// is refreshed every [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`], well inside
-    /// its lifetime, and retried on the next tick when that fails. O(worker
-    /// PostgreSQL services) per tick, sequential.
+    /// its lifetime, and retried on the next tick when that fails. The first
+    /// pass runs [`ARCHIVE_REFRESH_STARTUP_DELAY`] after startup, once the
+    /// link to Temps Cloud is normally up; a pass that still finds it down
+    /// runs again after [`ARCHIVE_REFRESH_NOT_CONNECTED_RETRY`]. O(worker
+    /// PostgreSQL services) per pass, sequential.
     ///
     /// [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`]: crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
+    /// [`ARCHIVE_REFRESH_STARTUP_DELAY`]: crate::worker_s3_scope::ARCHIVE_REFRESH_STARTUP_DELAY
+    /// [`ARCHIVE_REFRESH_NOT_CONNECTED_RETRY`]: crate::worker_s3_scope::ARCHIVE_REFRESH_NOT_CONNECTED_RETRY
     pub fn spawn_worker_archive_credential_refresh(self: &std::sync::Arc<Self>) {
-        const TICK: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        use crate::worker_s3_scope::{
+            next_archive_refresh_pass, ArchiveCredentialRefresh, ARCHIVE_REFRESH_STARTUP_DELAY,
+            ARCHIVE_REFRESH_TICK,
+        };
         let manager = std::sync::Arc::clone(self);
         tokio::spawn(async move {
             let mut refreshed: HashMap<i32, std::time::Instant> = HashMap::new();
-            let mut interval = tokio::time::interval(TICK);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut next_pass = tokio::time::Instant::now() + ARCHIVE_REFRESH_STARTUP_DELAY;
             loop {
-                interval.tick().await;
+                tokio::time::sleep_until(next_pass).await;
+                next_pass = tokio::time::Instant::now() + ARCHIVE_REFRESH_TICK;
                 let services = match temps_entities::external_services::Entity::find()
                     .filter(
                         temps_entities::external_services::Column::ContinuousArchiveS3SourceId
@@ -863,6 +882,7 @@ impl ExternalServiceManager {
                         continue;
                     }
                 };
+                let mut cloud_pending = false;
                 let live: std::collections::HashSet<i32> =
                     services.iter().map(|service| service.id).collect();
                 refreshed.retain(|id, _| live.contains(id));
@@ -874,7 +894,7 @@ impl ExternalServiceManager {
                         continue;
                     }
                     match manager.refresh_worker_archive_credentials(service.id).await {
-                        Ok(true) => {
+                        Ok(ArchiveCredentialRefresh::Refreshed) => {
                             info!(
                                 service_id = service.id,
                                 "refreshed the WAL archiving credential of a worker PostgreSQL"
@@ -882,8 +902,18 @@ impl ExternalServiceManager {
                             refreshed.insert(service.id, std::time::Instant::now());
                         }
                         // Nothing to refresh: look again after a full interval.
-                        Ok(false) => {
+                        Ok(ArchiveCredentialRefresh::NotNeeded) => {
                             refreshed.insert(service.id, std::time::Instant::now());
+                        }
+                        // Startup, before the Cloud link is up: not a failure.
+                        Ok(ArchiveCredentialRefresh::CloudNotConnected) => {
+                            info!(
+                                service_id = service.id,
+                                retry_in_secs = next_archive_refresh_pass(true).as_secs(),
+                                "not connected to Temps Cloud yet, so the WAL archiving \
+                                 credential of a worker PostgreSQL waits for the link"
+                            );
+                            cloud_pending = true;
                         }
                         Err(error) => warn!(
                             service_id = service.id,
@@ -892,6 +922,9 @@ impl ExternalServiceManager {
                              retrying on the next tick"
                         ),
                     }
+                }
+                if cloud_pending {
+                    next_pass = tokio::time::Instant::now() + next_archive_refresh_pass(true);
                 }
             }
         });
