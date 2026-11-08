@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Callout, PageContainer, PageState } from '@temps-sdk/ds'
@@ -13,6 +13,7 @@ import {
   getAccessServiceOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AccessServiceEditor } from '@/components/service-access/AccessServiceEditor'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 function Editor({
@@ -44,6 +45,7 @@ export default function AccessServicePage() {
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const client = useQueryClient()
+  const { setBreadcrumbs } = useBreadcrumbs()
   const projectId = Number(rawProjectId)
   const valid =
     Number.isInteger(projectId) && projectId > 0 && projectId <= 2147483647
@@ -59,6 +61,20 @@ export default function AccessServicePage() {
     enabled: valid && !!serviceId,
     retry: false,
   })
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Projects', href: '/projects' },
+      ...(valid
+        ? [{ label: `Project ${projectId}`, href: `/projects/${projectId}` }]
+        : []),
+      {
+        label: serviceId
+          ? (service.data?.name ?? 'Edit service')
+          : 'Add service',
+      },
+    ])
+    return () => setBreadcrumbs([])
+  }, [projectId, valid, serviceId, service.data?.name, setBreadcrumbs])
   const back = () => {
     const sandbox = params.get('sandbox')
     navigate(

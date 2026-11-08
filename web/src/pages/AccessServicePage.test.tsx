@@ -16,6 +16,10 @@ import type { AccessServiceResponse } from '@/api/client'
 import { accessCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import {
+  BreadcrumbProvider,
+  useBreadcrumbs,
+} from '@/contexts/BreadcrumbContext'
 import AccessServicePage from './AccessServicePage'
 
 installBrowserWindow()
@@ -36,6 +40,15 @@ const service: AccessServiceResponse = {
   version: 4,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
+}
+
+function BreadcrumbProbe() {
+  const { breadcrumbs } = useBreadcrumbs()
+  return (
+    <output aria-label="Shared breadcrumbs">
+      {JSON.stringify(breadcrumbs)}
+    </output>
+  )
 }
 
 function mount(entry: string, canManage = true) {
@@ -61,20 +74,23 @@ function mount(entry: string, canManage = true) {
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[entry]}>
-        <Routes>
-          <Route
-            path="/projects/:projectId/access-services/new"
-            element={<AccessServicePage />}
-          />
-          <Route
-            path="/projects/:projectId/access-services/:serviceId/edit"
-            element={<AccessServicePage />}
-          />
-          <Route
-            path="/sandboxes/:sandboxId"
-            element={<div>Returned to sandbox</div>}
-          />
-        </Routes>
+        <BreadcrumbProvider>
+          <BreadcrumbProbe />
+          <Routes>
+            <Route
+              path="/projects/:projectId/access-services/new"
+              element={<AccessServicePage />}
+            />
+            <Route
+              path="/projects/:projectId/access-services/:serviceId/edit"
+              element={<AccessServicePage />}
+            />
+            <Route
+              path="/sandboxes/:sandboxId"
+              element={<div>Returned to sandbox</div>}
+            />
+          </Routes>
+        </BreadcrumbProvider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -135,6 +151,9 @@ test('direct editor URL loads masked service and preserves edits and version acr
 
 test('new service has a direct routed form without reading an existing service', () => {
   const client = mount('/projects/7/access-services/new?sandbox=sbx_test')
+  expect(
+    within(document.body).getByLabelText('Shared breadcrumbs').textContent
+  ).toContain('Add service')
   expect(
     within(document.body).getByRole('heading', { name: 'Add service' })
   ).toBeTruthy()
@@ -239,6 +258,43 @@ test('a failed capability refresh preserves edits through retry', async () => {
     expect(within(document.body).getByLabelText('Name')).toBe(field)
     expect(field.value).toBe('Unsaved edit')
     expect(field.closest('fieldset[disabled]')).toBeNull()
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('service editor routes populate and clear the shared breadcrumb trail', async () => {
+  const api = mockApi({
+    'GET /projects/7/access-services/svc_test': () => jsonResponse(service),
+  })
+  try {
+    const client = mount(
+      '/projects/7/access-services/svc_test/edit?sandbox=sbx_test'
+    )
+    await waitFor(() =>
+      expect(
+        within(document.body).getByLabelText('Shared breadcrumbs').textContent
+      ).toContain('API')
+    )
+    expect(
+      JSON.parse(
+        within(document.body).getByLabelText('Shared breadcrumbs')
+          .textContent ?? '[]'
+      )
+    ).toEqual([
+      { label: 'Projects', href: '/projects' },
+      { label: 'Project 7', href: '/projects/7' },
+      { label: 'API' },
+    ])
+    await act(async () =>
+      fireEvent.click(
+        within(document.body).getByRole('button', { name: 'Cancel' })
+      )
+    )
+    expect(
+      within(document.body).getByLabelText('Shared breadcrumbs').textContent
+    ).toBe('[]')
     client.clear()
   } finally {
     api.restore()
