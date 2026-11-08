@@ -55,6 +55,35 @@ export function bestAddress(
   )
 }
 
+/**
+ * Where the project bar's Visit button goes. A reachable address comes first
+ * (a custom domain before the generated one, as `bestAddress` orders them).
+ * Without one, a domain someone configured is still the place to go, since
+ * it is where the app is meant to live. Once the check says nothing reaches
+ * the environment, its generated address (`localho.st` with no ingress) leads
+ * nowhere, so there is no Visit. Until the check answers, the environment's
+ * own URL stands in.
+ */
+export function visitUrl(
+  reachability: EnvironmentReachability | undefined,
+  mainUrl: string | null | undefined
+): string | undefined {
+  if (reachability) {
+    const best = bestAddress(
+      reachability.addresses,
+      reachability.primary_address?.address
+    )
+    if (best) return addressUrl(best.address)
+    const configured =
+      reachability.addresses.find((a) => a.source === 'custom_domain') ??
+      reachability.addresses.find((a) => a.source === 'environment_domain') ??
+      reachability.addresses.find((a) => a.source === 'tunnel_host')
+    if (configured) return addressUrl(configured.address)
+    if (reachability.state === 'not_reachable') return undefined
+  }
+  return mainUrl ?? undefined
+}
+
 /** The header line: "Public at …" or "Not reachable yet — <reason>". */
 export function reachabilityHeadline(
   reachability: EnvironmentReachability

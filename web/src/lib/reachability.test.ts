@@ -36,6 +36,7 @@ import {
   accessPolicyMissing,
   dnsProviderSetupPath,
   dnsProviderTypeLabel,
+  visitUrl,
 } from './reachability'
 
 const address = (
@@ -770,5 +771,69 @@ describe('DNS provider setup', () => {
         'http://console.test'
       ).searchParams.has('provider')
     ).toBe(false)
+  })
+})
+
+describe('Visit button', () => {
+  const generated = 'http://hello-temps-production.localho.st'
+
+  test('opens the reachable custom domain, not the generated address', () => {
+    const url = visitUrl(
+      environment({
+        state: 'reachable',
+        addresses: [
+          address({
+            address: 'hello-temps-production.localho.st',
+            source: 'generated',
+            state: 'reachable',
+          }),
+          address({
+            address: 'app12.autoship.so',
+            state: 'reachable',
+            way_in: 'tunnel:autoship-so',
+          }),
+        ],
+      }),
+      generated
+    )
+    expect(url).toBe('https://app12.autoship.so')
+  })
+
+  test('opens a configured domain even before it reaches the app', () => {
+    const url = visitUrl(
+      environment({
+        addresses: [
+          address({
+            address: 'hello-temps-production.localho.st',
+            source: 'generated',
+          }),
+          address({ address: 'app12.autoship.so' }),
+        ],
+      }),
+      generated
+    )
+    expect(url).toBe('https://app12.autoship.so')
+  })
+
+  test('offers no Visit when nothing reaches it and no domain is set', () => {
+    const url = visitUrl(
+      environment({
+        addresses: [
+          address({
+            address: 'hello-temps-production.localho.st',
+            source: 'generated',
+          }),
+        ],
+      }),
+      generated
+    )
+    expect(url).toBeUndefined()
+  })
+
+  test('uses the environment URL until the check answers', () => {
+    expect(visitUrl(undefined, generated)).toBe(generated)
+    expect(
+      visitUrl(environment({ state: 'checking', addresses: [] }), generated)
+    ).toBe(generated)
   })
 })
