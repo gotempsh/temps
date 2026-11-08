@@ -196,6 +196,7 @@ export function ContainerLogsViewer({
     filteredLogs,
     connectionStatus,
     errorMessage,
+    retry,
     searchTerm,
     selectedLevels,
     currentMatchIndex,
@@ -263,7 +264,7 @@ export function ContainerLogsViewer({
                 : connectionStatus === 'complete'
                   ? 'text-muted-foreground'
                   : connectionStatus === 'connecting'
-                    ? 'text-yellow-700 dark:text-yellow-400'
+                    ? 'text-muted-foreground'
                     : 'text-red-700 dark:text-red-400'
             )}
           >
@@ -277,7 +278,7 @@ export function ContainerLogsViewer({
                   : connectionStatus === 'complete'
                     ? 'bg-muted-foreground'
                     : connectionStatus === 'connecting'
-                      ? 'bg-yellow-500'
+                      ? 'bg-muted-foreground'
                       : 'bg-red-500'
               )}
             />
@@ -497,7 +498,12 @@ export function ContainerLogsViewer({
         {errorMessage && (
           <Alert className="flex-shrink-0 mx-4 mt-2 border-destructive">
             <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{errorMessage}</AlertDescription>
+            <AlertDescription>
+              {errorMessage}
+              <Button variant="outline" size="sm" onClick={retry}>
+                Retry
+              </Button>
+            </AlertDescription>
           </Alert>
         )}
 

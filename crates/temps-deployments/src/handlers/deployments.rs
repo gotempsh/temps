@@ -1512,6 +1512,41 @@ async fn send_close_error(socket: &mut WebSocket, reason: &str) -> Result<(), ax
     send_log_stream_close(socket, 1011, reason).await
 }
 
+// Setup includes placement lookup, TLS client construction and the worker
+// request. Keep the upgraded connection alive throughout, not only once Docker
+// starts producing logs. Dropping this future cancels setup on disconnect.
+async fn prepare_log_stream<T>(
+    socket: &mut WebSocket,
+    setup: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(setup);
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(90));
+    tokio::pin!(deadline);
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(15));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                let _ = send_close_error(socket, "container log setup timed out").await;
+                return None;
+            }
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return None;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return None,
+                    _ => {}
+                }
+            }
+            result = &mut setup => return Some(result),
+        }
+    }
+}
+
 async fn handle_container_logs_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
@@ -1523,22 +1558,22 @@ async fn handle_container_logs_socket(
     );
 
     // Get the log stream from the deployment service
-    let log_stream = match state
-        .deployment_service
-        .get_container_logs_by_id(
-            params.project_id,
-            params.environment_id,
-            params.container_id.clone(),
-            crate::services::services::ContainerLogParams {
-                start_date: params.start_date,
-                end_date: params.end_date,
-                tail: params.tail,
-                timestamps: params.timestamps,
-                follow: params.follow,
-            },
-        )
-        .await
-    {
+    let setup = state.deployment_service.get_container_logs_by_id(
+        params.project_id,
+        params.environment_id,
+        params.container_id.clone(),
+        crate::services::services::ContainerLogParams {
+            start_date: params.start_date,
+            end_date: params.end_date,
+            tail: params.tail,
+            timestamps: params.timestamps,
+            follow: params.follow,
+        },
+    );
+    let Some(result) = prepare_log_stream(&mut socket, setup).await else {
+        return;
+    };
+    let log_stream = match result {
         Ok(stream) => stream,
         Err(e) => {
             error!(
@@ -1555,14 +1590,6 @@ async fn handle_container_logs_socket(
             {
                 error!("Failed to send error message over WebSocket: {}", e);
             }
-            // Close with an explicit normal-closure code (not `socket.close()`,
-            // which sends a bare Close frame with no code). The frontend only
-            // treats `event.code === 1000` as "don't reconnect" -- a codeless
-            // close reads as abnormal, and combined with the client resetting
-            // its retry counter on every successful re-open, that produced an
-            // infinite reconnect loop for containers whose `container_id` no
-            // longer resolves in Docker (e.g. long-lived rows pointing at a
-            // container Docker has since removed).
             let _ = send_close_error(&mut socket, "container logs unavailable").await;
             return;
         }
@@ -1588,6 +1615,12 @@ async fn handle_container_logs_socket(
                 if let Err(e) = socket.send(Message::Ping(Vec::new().into())).await {
                     debug!("WebSocket ping failed (client likely gone): {}", e);
                     break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    _ => {}
                 }
             }
             maybe_line = log_stream.next() => {
@@ -6982,5 +7015,62 @@ pub(crate) mod tests {
             !body.contains("boom") && !body.contains("panicked"),
             "the panic payload must stay out of the response: {body}"
         );
+    }
+}
+
+#[cfg(test)]
+mod log_setup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cold_log_setup_pings_before_upstream_is_ready_and_cancels_on_close() {
+        use axum::{routing::get, Router};
+        use futures::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        struct Cancelled(Arc<AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = cancelled.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let guard = Cancelled(flag);
+                    let setup = async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                    };
+                    prepare_log_stream(&mut socket, setup).await;
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(first.is_ping(), "cold setup must send a frame immediately");
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
     }
 }
