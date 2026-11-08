@@ -13,7 +13,10 @@ import {
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { AccessServiceResponse } from '@/api/client'
-import { accessCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  accessCapabilityOptions,
+  getAccessServiceOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
@@ -51,10 +54,22 @@ function BreadcrumbProbe() {
   )
 }
 
-function mount(entry: string, canManage = true) {
+function mount(
+  entry: string,
+  canManage = true,
+  cachedService?: AccessServiceResponse
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
+  if (cachedService) {
+    client.setQueryData(
+      getAccessServiceOptions({
+        path: { project_id: 7, service_id: cachedService.id },
+      }).queryKey,
+      cachedService
+    )
+  }
   client.setQueryData(
     accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
     {
@@ -295,6 +310,76 @@ test('service editor routes populate and clear the shared breadcrumb trail', asy
     expect(
       within(document.body).getByLabelText('Shared breadcrumbs').textContent
     ).toBe('[]')
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('reopening a cached service waits for a fresh version before editing', async () => {
+  let finishRead: ((response: Response) => void) | undefined
+  let submittedVersion: number | undefined
+  const api = mockApi({
+    'GET /projects/7/access-services/svc_test': () =>
+      new Promise<Response>((resolve) => {
+        finishRead = resolve
+      }),
+    'PUT /projects/7/access-services/svc_test': async (request) => {
+      const body = await request.json()
+      submittedVersion = body.expected_version
+      return jsonResponse({ ...service, version: 6 })
+    },
+  })
+  try {
+    const client = mount(
+      '/projects/7/access-services/svc_test/edit?sandbox=sbx_test',
+      true,
+      service
+    )
+    expect(within(document.body).queryByLabelText('Name')).toBeNull()
+    await waitFor(() => expect(finishRead).toBeDefined())
+    await act(async () =>
+      finishRead?.(
+        jsonResponse({ ...service, name: 'Current policy', version: 5 })
+      )
+    )
+    await waitFor(() =>
+      expect(
+        (within(document.body).getByLabelText('Name') as HTMLInputElement).value
+      ).toBe('Current policy')
+    )
+    await act(async () =>
+      fireEvent.change(within(document.body).getByLabelText('Name'), {
+        target: { value: 'Edited current policy' },
+      })
+    )
+    await act(async () =>
+      fireEvent.click(
+        within(document.body).getByRole('button', { name: 'Save service' })
+      )
+    )
+    await waitFor(() => expect(submittedVersion).toBe(5))
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('an initial refresh failure cannot open an obsolete cached policy', async () => {
+  const api = mockApi({
+    'GET /projects/7/access-services/svc_test': () =>
+      jsonResponse({ detail: 'Read unavailable' }, 503),
+  })
+  try {
+    const client = mount(
+      '/projects/7/access-services/svc_test/edit',
+      true,
+      service
+    )
+    await waitFor(() =>
+      expect(document.body.textContent).toContain('Read unavailable')
+    )
+    expect(within(document.body).queryByLabelText('Name')).toBeNull()
     client.clear()
   } finally {
     api.restore()

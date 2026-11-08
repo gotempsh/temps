@@ -60,7 +60,21 @@ export default function AccessServicePage() {
     }),
     enabled: valid && !!serviceId,
     retry: false,
+    refetchOnMount: 'always',
   })
+  const editorKey = `${projectId}:${serviceId ?? 'new'}`
+  const [loadedEditorKey, setLoadedEditorKey] = useState<string>()
+  const hasLoadedService = loadedEditorKey === editorKey
+  // Latch the first successful read for this route. Later refetch failures must
+  // keep the mounted draft, but cached data alone must not initialize an edit.
+  if (
+    serviceId &&
+    service.isFetchedAfterMount &&
+    service.isSuccess &&
+    !hasLoadedService
+  ) {
+    setLoadedEditorKey(editorKey)
+  }
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Projects', href: '/projects' },
@@ -88,7 +102,7 @@ export default function AccessServicePage() {
   }
   return (
     <PageContainer width="form">
-      {!valid || (serviceId && service.isError && !service.data) ? (
+      {!valid || (serviceId && service.isError && !hasLoadedService) ? (
         <PageState
           variant="failed"
           icon={PlugZap}
@@ -122,7 +136,7 @@ export default function AccessServicePage() {
             <Button onClick={() => void capability.refetch()}>Retry</Button>
           }
         />
-      ) : capability.isPending || (serviceId && !service.data) ? (
+      ) : capability.isPending || (serviceId && !hasLoadedService) ? (
         <Skeleton
           className="h-48 w-full"
           role="status"
@@ -155,7 +169,7 @@ export default function AccessServicePage() {
           )}
           <fieldset disabled={capability.isError} className="min-w-0">
             <Editor
-              key={`${projectId}:${serviceId ?? 'new'}`}
+              key={editorKey}
               projectId={projectId}
               service={service.data}
               onClose={back}
