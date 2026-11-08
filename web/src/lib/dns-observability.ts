@@ -198,6 +198,8 @@ const HEALTH_META: Record<ResolverHealth, HealthMeta> = {
   node_unavailable: { label: 'Node unavailable', tone: 'idle' },
   agent_too_old: { label: 'Agent too old', tone: 'warn' },
   not_reporting: { label: 'Not reporting', tone: 'warn' },
+  // A control plane on which no containers run: nothing to resolve for.
+  no_local_resolver: { label: 'No local resolver', tone: 'idle' },
 }
 
 export function resolverHealthMeta(health: ResolverHealth): HealthMeta {

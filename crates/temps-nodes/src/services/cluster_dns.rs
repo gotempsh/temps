@@ -87,6 +87,11 @@ pub enum ResolverHealth {
     /// No report recently: the agent cannot be reached, or the process that
     /// owns the control plane's resolver is not running.
     NotReporting,
+    /// The control plane has never run a resolver of its own: nothing
+    /// started one because no containers run on it (a hosted plane, or a
+    /// host without a container runtime). Expected, so it never alarms;
+    /// each worker's resolver serves the containers on that worker.
+    NoLocalResolver,
 }
 
 impl ResolverHealth {
@@ -99,6 +104,7 @@ impl ResolverHealth {
             Self::NodeUnavailable => "node_unavailable",
             Self::AgentTooOld => "agent_too_old",
             Self::NotReporting => "not_reporting",
+            Self::NoLocalResolver => "no_local_resolver",
         }
     }
 }
@@ -130,16 +136,25 @@ pub fn resolver_health(input: &HealthInput<'_>) -> (ResolverHealth, Option<Strin
         );
     }
     let Some(report) = input.report else {
-        return (
-            ResolverHealth::NotReporting,
-            Some(if control_plane {
-                "The control plane's resolver has not reported yet; it reports from the proxy \
-                 process every 30 seconds"
-                    .to_string()
-            } else {
-                "No DNS report from this node's agent yet".to_string()
-            }),
-        );
+        // The control plane's reporter starts with its resolver, so a
+        // control plane that never reported never ran one. Once it has
+        // reported, a missing report is an outage again (below).
+        return if control_plane {
+            (
+                ResolverHealth::NoLocalResolver,
+                Some(
+                    "The control plane runs no resolver of its own: no containers run on it, \
+                     so none was started. Each worker's resolver serves the containers on \
+                     that worker"
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                ResolverHealth::NotReporting,
+                Some("No DNS report from this node's agent yet".to_string()),
+            )
+        };
     };
     let stale_after = chrono::Duration::seconds(input.interval_secs.max(1) * MISSED_REPORTS);
     match ReportState::parse(&report.report_state) {
@@ -1344,7 +1359,7 @@ mod tests {
     fn missing_or_old_reports_are_not_reporting() {
         let now = Utc::now();
         assert_eq!(
-            health(0, "active", None, now).0,
+            health(3, "active", None, now).0,
             ResolverHealth::NotReporting
         );
         let old = report("ok", now - chrono::Duration::seconds(91));
@@ -1403,6 +1418,26 @@ mod tests {
         assert_eq!(stale.resolver_down, None);
         let healthy = evaluate_alerts(ResolverHealth::Healthy, None, 0, false, &none);
         assert_eq!(healthy, AlertDecision::default());
+    }
+
+    #[test]
+    fn a_control_plane_that_never_ran_a_resolver_is_expected_and_never_alarms() {
+        // A hosted plane: no containers run on the control plane, so its
+        // resolver (and the reporter that starts with it) never started.
+        let now = Utc::now();
+        let (h, reason) = health(0, "active", None, now);
+        assert_eq!(h, ResolverHealth::NoLocalResolver);
+        assert_eq!(h.as_str(), "no_local_resolver");
+        assert!(reason.unwrap().contains("no containers run on it"));
+        let none = RecentFailures::default();
+        let decision = evaluate_alerts(h, Some("x"), 10, true, &none);
+        assert_eq!(decision, AlertDecision::default());
+        // Once it has reported, going quiet is an outage again.
+        let old = report("ok", now - chrono::Duration::seconds(120));
+        assert_eq!(
+            health(0, "active", Some(&old), now).0,
+            ResolverHealth::NotReporting
+        );
     }
 
     #[test]

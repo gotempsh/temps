@@ -111,6 +111,12 @@ loop, which already probes the resolver on every pass, ingests its own
 resolver's report on the same interval through the same code the console
 uses for workers. Node 0 then reads like any worker, in either topology.
 
+That loop starts only where the control plane finds a container runtime,
+so a control plane on which no containers run (a hosted plane, whose
+workloads all run on workers) never reports. Node 0 without any report is
+therefore shown as **no local resolver**, which is expected and never
+alarms; once it has reported, a missing report is an outage again.
+
 ### 4. Where it is stored
 
 - **Counters** go to the metrics store (`SourceKind::Node`, `source_id` =
@@ -140,7 +146,8 @@ on it as well (it stays under Nodes → Advanced, where existing links
 point):
 
 - **Resolvers:** one row per node, control plane first: state (healthy,
-  stale, down, off, node unavailable, agent too old, not reporting) and
+  stale, down, off, node unavailable, agent too old, not reporting, or for
+  the control plane no local resolver) and
   why, version, records served against the zone's, last sync and failed
   syncs in a row, listen address, last report, and **internal routing**:
   whether the worker's internal edge proxy listens on its bridge address
@@ -184,7 +191,8 @@ own when the condition clears. Only while cluster DNS is on:
 
 - **`dns_resolver_down`** (critical): an active node whose resolver is not
   running, or whose tasks died, on two evaluations in a row; for node 0,
-  also when its report is older than three intervals.
+  also when its report is older than three intervals (a control plane that
+  never reported runs no resolver and raises nothing, §3).
 - **`dns_sync_stale`** (warning): a worker whose last successful sync is
   older than 2 minutes, or that failed 5 syncs in a row.
 - **`dns_query_failures`** (warning): over the last 5 minutes on one node,
