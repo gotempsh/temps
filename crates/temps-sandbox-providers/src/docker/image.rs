@@ -379,6 +379,8 @@ RUN chmod 0755 /usr/local/bin/temps-git-credential-helper /usr/local/bin/temps-g
 # being requested, so per-repo scoping degrades to refusal.
 RUN git config --system credential.helper /usr/local/bin/temps-git-credential-helper \
     && git config --system credential.useHttpPath true
+# Fail immediately when the credential daemon cannot supply credentials.
+ENV GIT_TERMINAL_PROMPT=0
 USER {user}
 WORKDIR {work_dir}
 # The container's CMD is whatever the caller passes (usually `sleep infinity`).

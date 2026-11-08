@@ -547,7 +547,10 @@ fn default_shell_env(
     let mut env: Vec<(String, String)> = inherited
         .into_iter()
         .filter(|(key, _)| {
-            key != "TERM" && key != "PATH" && !SHELL_OWNED_VARS.contains(&key.as_str())
+            key != "TERM"
+                && key != "PATH"
+                && key != "GIT_TERMINAL_PROMPT"
+                && !SHELL_OWNED_VARS.contains(&key.as_str())
         })
         .collect();
     if !env
@@ -559,12 +562,27 @@ fn default_shell_env(
     }
     env.push(("TERM".into(), "xterm-256color".into()));
     env.push(("PATH".into(), SHELL_PATH.into()));
+    // Also cover restored images whose baked environment predates this default.
+    env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
     env
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_git_never_prompts_even_when_inherited_environment_enables_it() {
+        for inherited in [vec![], vec![("GIT_TERMINAL_PROMPT".into(), "1".into())]] {
+            let env = default_shell_env(inherited);
+            let values: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == "GIT_TERMINAL_PROMPT")
+                .collect();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].1, "0");
+        }
+    }
 
     #[tokio::test]
     async fn run_refuses_to_displace_a_live_agent() {

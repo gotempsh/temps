@@ -154,9 +154,10 @@ fn explain_ipc_error(e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::NotFound => format!(
             "credential daemon socket not found at {path_str}. \
-             The daemon was not started for this session — try reopening \
-             the workspace, or check /tmp/temps-git-credential-daemon.log \
-             inside the sandbox for startup errors."
+             Git credentials are unavailable. Start an agent session in this \
+             workspace to provision the credential daemon; opening a Terminal \
+             alone does not start it. If it still fails, check \
+             /tmp/temps-git-credential-daemon.log for startup errors."
         ),
         io::ErrorKind::PermissionDenied => format!(
             "permission denied connecting to {path_str}. \
@@ -207,7 +208,9 @@ mod tests {
         let err = io::Error::from(io::ErrorKind::NotFound);
         let msg = explain_ipc_error(&err);
         assert!(msg.contains("not found"), "msg: {msg}");
-        assert!(msg.contains("daemon was not started"), "msg: {msg}");
+        assert!(msg.contains("Start an agent session"), "msg: {msg}");
+        assert!(msg.contains("Terminal"), "msg: {msg}");
+        assert!(!msg.contains("reopening"), "msg: {msg}");
     }
 
     /// EACCES means the socket exists but the caller's group membership

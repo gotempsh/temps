@@ -12,7 +12,7 @@
 //!    in favor of the daemon).
 //!    b. `printenv` does NOT show any `GITHUB_TOKEN` / `GH_TOKEN` /
 //!    `GITLAB_TOKEN` / `GL_TOKEN` env vars.
-//!    c. `/run/temps-git/` exists with mode 0750, owner
+//!    c. `/run/temps-git/` exists with mode 2750, owner
 //!    `temps-git:git-users`.
 //!    d. `/etc/temps/` exists with mode 0700, owner `temps-git:temps-git`.
 //!    e. As user `temps`: cannot read the env file (`cat
@@ -166,6 +166,36 @@ async fn exec_in_container(
     (stdout, stderr, exit_code)
 }
 
+/// Remove only this test's unique image, including on assertion failures.
+struct ImageGuard {
+    docker: Docker,
+    tag: String,
+}
+
+impl Drop for ImageGuard {
+    fn drop(&mut self) {
+        let docker = self.docker.clone();
+        let tag = self.tag.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async {
+                    let _ = docker
+                        .remove_image(
+                            &tag,
+                            None::<bollard::query_parameters::RemoveImageOptions>,
+                            None,
+                        )
+                        .await;
+                });
+            }
+        })
+        .join();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sandbox_image_credential_pipeline_smoke() {
     let docker = match docker_or_skip().await {
@@ -175,8 +205,19 @@ async fn sandbox_image_credential_pipeline_smoke() {
 
     // Build the image. Use a unique tag so this test doesn't fight with
     // the production image cache.
-    let tag = "temps-sandbox-credential-smoke:test";
-    if !build_image(&docker, tag).await {
+    let tag = format!(
+        "temps-sandbox-credential-smoke:{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _image_guard = ImageGuard {
+        docker: docker.clone(),
+        tag: tag.clone(),
+    };
+    if !build_image(&docker, &tag).await {
         panic!("image build failed — see stderr above");
     }
 
@@ -188,6 +229,11 @@ async fn sandbox_image_credential_pipeline_smoke() {
             bollard::models::ContainerCreateBody {
                 image: Some(tag.to_string()),
                 cmd: Some(vec!["sleep".into(), "infinity".into()]),
+                host_config: Some(bollard::models::HostConfig {
+                    security_opt: Some(vec!["no-new-privileges:true".into()]),
+                    cap_drop: Some(vec!["ALL".into()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -246,6 +292,33 @@ async fn sandbox_image_credential_pipeline_smoke() {
         id: &container.id,
     };
 
+    // A terminal stays open while Git asks for credentials. Reproduce that
+    // with a real PTY whose input stays open, without an external repository.
+    // `credential fill` exercises the same helper/prompt path as HTTPS clone.
+    let (_, _, socket_code) = exec_in_container(
+        &docker,
+        &container.id,
+        vec!["test", "-S", "/run/temps-git/git.sock"],
+        Some("temps"),
+    )
+    .await;
+    assert_ne!(socket_code, 0, "regression requires an absent daemon");
+    let (out, err, code) = exec_in_container(
+        &docker, &container.id,
+        vec!["sh", "-c", r#"sleep 4 | timeout 2 script -qec 'printf "protocol=https\nhost=github.com\npath=owner/private-repo\n\n" | git credential fill' /dev/null"#],
+        Some("temps"),
+    ).await;
+    assert_eq!(
+        code, 128,
+        "Git must fail, not wait for terminal input: {out} {err}"
+    );
+    assert!(
+        out.contains("credential daemon socket not found"),
+        "{out} {err}"
+    );
+    assert!(out.contains("terminal prompts disabled"), "{out} {err}");
+    assert!(!out.contains("\nUsername for"), "{out} {err}");
+
     // (a) ~/.git-credentials must not exist.
     {
         let (out, _, code) = exec_in_container(
@@ -286,7 +359,7 @@ async fn sandbox_image_credential_pipeline_smoke() {
         );
     }
 
-    // (c) /run/temps-git exists with mode 0750, owner temps-git:git-users.
+    // (c) /run/temps-git exists with mode 2750, owner temps-git:git-users.
     {
         let (out, _, _) = exec_in_container(
             &docker,
@@ -296,7 +369,7 @@ async fn sandbox_image_credential_pipeline_smoke() {
         )
         .await;
         assert!(
-            out.trim().starts_with("750 temps-git git-users"),
+            out.trim().starts_with("2750 temps-git git-users"),
             "/run/temps-git stat unexpected: {out:?}"
         );
     }
