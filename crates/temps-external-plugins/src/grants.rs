@@ -118,7 +118,9 @@ impl PluginGrantService {
         let id = uuid::Uuid::new_v4();
         // A reinstallation never inherits the previous actor's authority.
         // Active, authenticated upgrades retain the actor but cannot expand
-        // its grants; source-conflict checks happen before activation.
+        // its grants; source-conflict checks happen before activation. Startup
+        // also reconciles a verified binary activated before a crash: AI consent
+        // belongs to that binary, even if activation's database commit was lost.
         let transaction = self
             .db
             .begin()
@@ -153,7 +155,7 @@ impl PluginGrantService {
                 source,
             })?;
         transaction.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors (id, plugin_name, binary_sha256, source_identity, active) VALUES ($1,$2,$3,$4,TRUE) ON CONFLICT (plugin_name) DO NOTHING",
+            "INSERT INTO external_plugin_actors (id, plugin_name, binary_sha256, source_identity, active) VALUES ($1,$2,$3,$4,TRUE) ON CONFLICT (plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW()",
             [id.into(), plugin_name.into(), sha256.into(), source_identity.into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "ensure actor", source })?;
         let bound_id: String = transaction
@@ -436,7 +438,7 @@ mod tests {
             .await
             .unwrap();
         let actor_id = uuid::Uuid::parse_str(&id).unwrap();
-        for via_actor in [false, true] {
+        for activation in ["binary", "actor", "startup"] {
             let actor = actors::Entity::find_by_id(actor_id)
                 .one(db.as_ref())
                 .await
@@ -458,12 +460,34 @@ mod tests {
                     .unwrap()
                     .ai_tools_enabled
             );
-            let next_hash = if via_actor {
-                "binary-three"
-            } else {
-                "binary-two"
+            // Same-binary restart preserves consent and actor identity.
+            let rebound = grants
+                .ensure_actor("reports", &old_hash, "fixture-source")
+                .await
+                .unwrap();
+            assert_eq!(rebound.actor.id, id);
+            assert!(
+                actors::Entity::find_by_id(actor_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ai_tools_enabled
+            );
+            let next_hash = match activation {
+                "actor" => "binary-three",
+                "startup" => "binary-four",
+                _ => "binary-two",
             };
-            if via_actor {
+            if activation == "startup" {
+                // The installation already selects the new verified binary,
+                // but the previous actor commit did not run before restart.
+                let rebound = grants
+                    .ensure_actor("reports", next_hash, "fixture-source")
+                    .await
+                    .unwrap();
+                assert_eq!(rebound.actor.id, id);
+            } else if activation == "actor" {
                 grants
                     .commit_actor("reports", &id, next_hash, "fixture-source")
                     .await

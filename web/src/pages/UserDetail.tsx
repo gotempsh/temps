@@ -148,7 +148,7 @@ export function UserDetail() {
   const stats = useMemo(() => {
     if (!statsLogs) return null
     const cutoff = statsUpdatedAt - STATS_WINDOW_MS
-    return summarizeActivity(statsLogs, cutoff)
+    return summarizeActivity(statsLogs, cutoff, STATS_BATCH_SIZE)
   }, [statsLogs, statsUpdatedAt])
 
   const lastLogin = lastLoginQuery.data?.[0]
@@ -469,8 +469,8 @@ export function UserDetail() {
               label="Actions (30d)"
               value={
                 stats
-                  ? stats.actions30d >= STATS_BATCH_SIZE
-                    ? `${STATS_BATCH_SIZE}+`
+                  ? stats.actionsIncomplete
+                    ? `${stats.actions30d}+`
                     : String(stats.actions30d)
                   : undefined
               }
