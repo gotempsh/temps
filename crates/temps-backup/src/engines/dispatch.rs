@@ -16,9 +16,9 @@
 //! | `"postgres"`   | standalone, on a worker | no      | `"postgres_workload_job"` |
 //! | `"postgres"`   | other        | yes              | `"postgres_walg"`   |
 //! | `"postgres"`   | other        | no               | `"postgres_pgdump"` |
-//! | `"redis"` / `"mongodb"` / `"mariadb"` / storage | standalone, on a worker | – | `"worker_agent"` |
+//! | `"redis"` / `"mariadb"` / storage | standalone, on a worker | – | `"worker_agent"` |
 //! | `"redis"`      | any          | –                | `"redis"`           |
-//! | `"mongodb"`    | any          | –                | `"mongodb"`         |
+//! | `"mongodb"`    | any, here or on a worker | checked by the engine in the container | `"mongodb"` |
 //! | `"mariadb"`    | any          | yes (PITR tools) | `"mariadb_physical"` |
 //! | `"mariadb"`    | any          | no               | `"mariadb_dump"`    |
 //! | `"s3"` / `"minio"` / `"blob"` | any | –       | `"s3_mirror"`       |
@@ -27,8 +27,10 @@
 //! Every service on a worker node is backed up on that node. A PostgreSQL
 //! service on a WAL-G image takes the same engine as on the control plane,
 //! whose container steps its node's agent runs (ADR-099); without WAL-G it
-//! takes a dump job (`workload_job`). The others are backed up by the node's
-//! agent (`worker_agent`).
+//! takes a dump job (`workload_job`). A MongoDB takes the same `mongodb`
+//! engine everywhere: its WAL-G check runs in the container, on the node
+//! that has it. The others are backed up by the node's agent
+//! (`worker_agent`).
 //!
 //! The WAL-G and PITR-tool probes inspect a container on this host's Docker,
 //! or, for a worker's PostgreSQL, ask its node's agent.
@@ -585,7 +587,7 @@ mod tests {
     /// refused. The same types on the control plane keep their engines.
     #[tokio::test]
     async fn worker_services_resolve_to_the_agent_engine_without_docker() {
-        for service_type in ["mariadb", "redis", "mongodb", "s3", "rustfs", "blob"] {
+        for service_type in ["mariadb", "redis", "s3", "rustfs", "blob"] {
             let mut service = make_service(service_type, "standalone");
             service.node_id = Some(3);
             assert_eq!(
@@ -604,6 +606,32 @@ mod tests {
             engine_choice(&make_service("redis", "standalone")),
             Ok(EngineChoice::Known("redis"))
         ));
+    }
+
+    /// Parity (ADR-099): a MongoDB takes the same engine on a worker as on
+    /// the control plane, without this host's Docker; the engine checks for
+    /// WAL-G in the container, on the node that runs it.
+    #[tokio::test]
+    async fn a_worker_mongodb_takes_the_control_plane_engine() {
+        for service_type in ["mongodb", "mongo"] {
+            let local = make_service(service_type, "standalone");
+            let mut worker = local.clone();
+            worker.node_id = Some(3);
+            for service in [&local, &worker] {
+                assert!(matches!(
+                    engine_choice(service),
+                    Ok(EngineChoice::Known(key)) if key == super::super::mongodb::ENGINE_KEY
+                ));
+                assert_eq!(
+                    resolve_engine_key_on_this_host(service, &NoWorkers)
+                        .await
+                        .ok(),
+                    Some(super::super::mongodb::ENGINE_KEY),
+                    "{service_type} on node {:?}",
+                    service.node_id
+                );
+            }
+        }
     }
 
     #[test]

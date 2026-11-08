@@ -347,9 +347,10 @@ fn worker_capability(
             WorkerServiceKind::Storage => {
                 return Some(compatible(worker_agent::ENGINE_KEY, "object_set", false))
             }
-            WorkerServiceKind::Dump(DumpEngine::Mongodb) => {
-                (worker_agent::ENGINE_KEY, "mongodump_archive")
-            }
+            // MongoDB takes the control plane's engine on a worker, checked
+            // in its container like a local one (`worker_service_kind` never
+            // returns it).
+            WorkerServiceKind::Dump(DumpEngine::Mongodb) => return None,
             WorkerServiceKind::Dump(DumpEngine::Redis) => (worker_agent::ENGINE_KEY, "redis_rdb"),
             WorkerServiceKind::Dump(DumpEngine::Mariadb) => {
                 (worker_agent::ENGINE_KEY, "logical_mariadb_dump")
@@ -597,6 +598,37 @@ mod tests {
             .remediation
             .unwrap_or_default()
             .contains("control plane"));
+    }
+
+    /// Parity (ADR-099): a worker MongoDB is not described as a node dump;
+    /// it is probed in its container like a local one (the same `which
+    /// wal-g`, asked of its agent) and classified by the same function, so
+    /// it reports exactly what a local MongoDB on the same image reports.
+    #[test]
+    fn a_worker_mongodb_reports_exactly_what_a_local_one_does() {
+        for service_type in ["mongodb", "mongo"] {
+            let local = service(service_type, "standalone");
+            let mut worker = local.clone();
+            worker.node_id = Some(3);
+            assert!(worker_capability(&worker).is_none(), "{service_type}");
+            assert!(requires_live_tool_probe(service_type, "standalone"));
+            assert_eq!(tool_probe_command(service_type), vec!["which", "wal-g"]);
+            for probe in [
+                ToolProbe::Available,
+                ToolProbe::Missing,
+                ToolProbe::Unverified(UnverifiedCause::Unavailable),
+            ] {
+                assert_eq!(
+                    classify_capability(&worker, probe),
+                    classify_capability(&local, probe),
+                    "{service_type} {probe:?}"
+                );
+            }
+            let walg = classify_capability(&worker, ToolProbe::Available);
+            assert_eq!(walg.engine, "mongodb");
+            assert_eq!(walg.artifact, "mongodb_walg_stream");
+            assert!(walg.cloud_backup_compatible && walg.wal_g_installed);
+        }
     }
 
     #[test]

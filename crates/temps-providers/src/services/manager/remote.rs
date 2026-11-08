@@ -993,6 +993,63 @@ impl ExternalServiceManager {
         Ok(result)
     }
 
+    /// Back up MongoDB service `service_id`, which runs on a worker node, with
+    /// the control plane's own engine on that node (ADR-099): the backup
+    /// `mode` names, with `destination` scoped to it (ADR-093). Credentials
+    /// travel sealed.
+    pub async fn mongodb_backup_worker(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+        mode: crate::remote_service_client::MongodbBackupMode,
+    ) -> Result<crate::remote_service_client::MongodbBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "MongoDB backup")
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mongodb_backup(&crate::remote_service_client::MongodbBackupRequest {
+                service_id,
+                node_id,
+                service_config,
+                destination,
+                bucket_path,
+                backup_uuid,
+                mode,
+            })
+            .await
+    }
+
+    /// Restore MongoDB service `service_id`, which runs on a worker node, in
+    /// place from `location` in `source`, with the control plane's own
+    /// restore run by the node's agent. `origin_password` is the backup
+    /// origin's password for another service's backup, the provider's
+    /// fallback login as on the control plane.
+    pub async fn mongodb_restore_worker(
+        &self,
+        service_id: i32,
+        origin_password: Option<String>,
+        source: crate::remote_service_client::WorkerS3Destination,
+        location: String,
+    ) -> Result<crate::remote_service_client::MongodbRestoreResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "MongoDB restore")
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mongodb_restore(&crate::remote_service_client::MongodbRestoreRequest {
+                service_id,
+                node_id,
+                service_config,
+                origin_password,
+                source,
+                location,
+            })
+            .await
+    }
+
     /// Restore service `service_id`, which runs on a worker node, in place on
     /// that node from the backup at `location` in `source`.
     pub async fn restore_worker_service(

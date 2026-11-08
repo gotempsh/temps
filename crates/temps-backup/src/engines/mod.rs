@@ -12,7 +12,7 @@
 //!
 //! ## Phase 2–4 engines (external services)
 //! - [`redis`]: Redis via BGSAVE or WAL-G.
-//! - [`mongodb`]: MongoDB via mongodump.
+//! - [`mongodb`]: MongoDB via a WAL-G stream, or a mongodump archive without WAL-G; here or on a worker through its agent (ADR-099).
 //! - [`postgres_pgdump`]: Postgres via pg_dump sidecar (fallback).
 //! - [`postgres_walg`]: Postgres via WAL-G (preferred when available).
 //! - [`postgres_cluster`]: Postgres cluster (pg_auto_failover) via WAL-G.
@@ -20,7 +20,7 @@
 //! - [`mariadb_dump`]: MariaDB via `mariadb-dump` logical dump (fallback).
 //! - [`s3_mirror`]: S3-compatible object storage via `rc mirror` (RustFS CLI).
 //! - [`workload_job`]: Postgres on a worker node, as a job on that node (ADR-055).
-//! - [`worker_agent`]: MongoDB, Redis, MariaDB and storage on a worker node, by its agent.
+//! - [`worker_agent`]: Redis, MariaDB and storage on a worker node, by its agent.
 //! - [`dispatch`]: Engine-key resolution helper (`resolve_engine_key`).
 //!
 //! ## Adding a new engine

@@ -11,13 +11,17 @@
 //! cannot back up a worker's service. Here the worker runs the same native
 //! tools against its own container:
 //!
-//! - **MongoDB, Redis, MariaDB**: a one-shot helper from the service's own
-//!   image (already on the node) joins the service's network and runs the
-//!   engine's dump to stdout (`mongodump --archive --gzip`,
-//!   `redis-cli --rdb` then `gzip`, `mariadb-dump | gzip`). This process
-//!   streams that output into an S3 multipart upload, one part in memory at a
-//!   time. The object formats and suffixes are the local engines', so the
-//!   providers' own restores read them.
+//! - **Redis, MariaDB**: a one-shot helper from the service's own image
+//!   (already on the node) joins the service's network and runs the
+//!   engine's dump to stdout (`redis-cli --rdb` then `gzip`,
+//!   `mariadb-dump | gzip`). This process streams that output into an S3
+//!   multipart upload, one part in memory at a time. The object formats and
+//!   suffixes are the local engines', so the providers' own restores read
+//!   them.
+//! - **MongoDB** is not served here: it runs the control plane's own engine
+//!   on the node (`mongodb_backup`, ADR-099). That engine's `mongodump`
+//!   fallback, for an image without WAL-G, streams through the same helper
+//!   ([`dump_to_s3`]) on the control plane and on every worker.
 //! - **Managed S3 storage** (RustFS, Garage): the provider's bucket mirror,
 //!   which already runs its `rc` helper on this node's Docker.
 //!
@@ -237,6 +241,7 @@ pub async fn backup_service_on_node(
             source: Box::new(source),
         }
     })?;
+    refuse_own_engine(&config, "backed up")?;
     match DumpEngine::for_service_type(config.service_type) {
         Some(engine) => {
             if !key.ends_with(engine.file_suffix()) {
@@ -251,8 +256,16 @@ pub async fn backup_service_on_node(
                 });
             }
             let container = service_container(&config, docker.as_ref()).await?;
-            let size_bytes =
-                dump_to_s3(docker, engine, &config, &container, &destination, &key).await?;
+            let size_bytes = dump_to_s3(
+                docker,
+                engine,
+                &config,
+                &container,
+                &destination,
+                &key,
+                None,
+            )
+            .await?;
             Ok(RemoteServiceBackupResponse {
                 size_bytes,
                 buckets: vec![],
@@ -295,6 +308,7 @@ pub async fn restore_service_on_node(
             source: Box::new(error),
         }
     })?;
+    refuse_own_engine(&config, "restored")?;
     match DumpEngine::for_service_type(config.service_type) {
         Some(engine) => {
             if !backup_location.ends_with(engine.file_suffix()) {
@@ -365,6 +379,28 @@ pub async fn restore_service_on_node(
             })
         }
     }
+}
+
+/// MongoDB on a worker is backed up and restored by the control plane's own
+/// engine (`mongodb_backup`, ADR-099), never by these routes: a control plane
+/// still sending it here predates that and is refused, not served the old
+/// worker-only dump.
+fn refuse_own_engine(
+    config: &ServiceConfig,
+    operation: &'static str,
+) -> Result<(), WorkerDataError> {
+    if config.service_type != ServiceType::Mongodb {
+        return Ok(());
+    }
+    Err(WorkerDataError::Unsupported {
+        service: config.name.clone(),
+        service_type: config.service_type,
+        operation,
+        reason: "MongoDB on a worker node runs the control plane's MongoDB engine \
+                 (/agent/services/mongodb/backup and /agent/services/mongodb/restore); update the \
+                 control plane to this release"
+            .to_string(),
+    })
 }
 
 /// A restore on a worker is always in place (a new service on a worker is
@@ -458,7 +494,7 @@ fn location(destination: &WorkerS3Destination, prefix: &str) -> S3Location {
     }
 }
 
-fn s3_credentials(destination: &WorkerS3Destination) -> S3Credentials {
+pub(crate) fn s3_credentials(destination: &WorkerS3Destination) -> S3Credentials {
     S3Credentials {
         access_key_id: destination.access_key_id.clone(),
         secret_key: destination.secret_access_key.clone(),
@@ -479,7 +515,9 @@ fn s3_credentials(destination: &WorkerS3Destination) -> S3Credentials {
 
 /// The S3 source row the providers' restores read, holding the decrypted
 /// credentials as their contract expects. Never stored.
-fn s3_source_row(destination: &WorkerS3Destination) -> temps_entities::s3_sources::Model {
+pub(crate) fn s3_source_row(
+    destination: &WorkerS3Destination,
+) -> temps_entities::s3_sources::Model {
     let now = chrono::Utc::now();
     temps_entities::s3_sources::Model {
         id: 0,
@@ -734,13 +772,16 @@ async fn remove_helper(docker: &Docker, id: &str) {
 }
 
 /// Run the dump helper for `container` and stream its stdout into `key`.
-async fn dump_to_s3(
+/// The helper runs `helper_image` when given (the MongoDB engine's pinned
+/// `mongodump` image), else the container's own image.
+pub(crate) async fn dump_to_s3(
     docker: Arc<Docker>,
     engine: DumpEngine,
     config: &ServiceConfig,
     container: &str,
     destination: &WorkerS3Destination,
     key: &str,
+    helper_image: Option<&str>,
 ) -> Result<u64, WorkerDataError> {
     let service = config.name.clone();
     let helper_error = |step: &'static str| {
@@ -773,7 +814,11 @@ async fn dump_to_s3(
         });
     }
     let container_config = inspect.config.unwrap_or_default();
-    let Some(image) = container_config.image.filter(|image| !image.is_empty()) else {
+    let Some(image) = helper_image
+        .map(str::to_string)
+        .or(container_config.image)
+        .filter(|image| !image.is_empty())
+    else {
         return Err(WorkerDataError::Unsupported {
             service,
             service_type: config.service_type,
@@ -1404,18 +1449,67 @@ mod tests {
         assert!(matches!(backup, Err(WorkerDataError::Unsupported { .. })));
         let restore = restore_service_on_node(
             RemoteServiceRestoreRequest {
-                service_config: config(ServiceType::Mongodb, serde_json::json!({})),
+                service_config: config(ServiceType::Mariadb, serde_json::json!({})),
                 source: destination,
-                location: "mongodb/store/1/dump.rdb.gz".to_string(),
+                location: "mariadb/store/1/dump.rdb.gz".to_string(),
             },
             docker(),
             None,
         )
         .await;
         let Err(error) = restore else {
-            panic!("a Redis dump must not be applied to MongoDB");
+            panic!("a Redis dump must not be applied to MariaDB");
         };
-        assert!(error.to_string().contains("dump.archive"), "{error}");
+        assert!(error.to_string().contains("dump.sql.gz"), "{error}");
+    }
+
+    /// MongoDB on a worker runs the control plane's own engine (ADR-099):
+    /// the generic dump routes refuse it, naming the engine's routes, before
+    /// any container call, instead of serving the old worker-only dump.
+    #[tokio::test]
+    async fn mongodb_is_refused_by_the_generic_dump_routes() {
+        let destination = WorkerS3Destination {
+            bucket: "b".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: true,
+            access_key_id: "a".to_string(),
+            secret_access_key: "s".to_string(),
+            session_token: None,
+        };
+        let backup = backup_service_on_node(
+            RemoteServiceBackupRequest {
+                service_config: config(ServiceType::Mongodb, serde_json::json!({})),
+                destination: destination.clone(),
+                key: "mongodb/store/1/dump.archive".to_string(),
+            },
+            docker(),
+            None,
+        )
+        .await;
+        let restore = restore_service_on_node(
+            RemoteServiceRestoreRequest {
+                service_config: config(ServiceType::Mongodb, serde_json::json!({})),
+                source: destination,
+                location: "mongodb/store/1/dump.archive".to_string(),
+            },
+            docker(),
+            None,
+        )
+        .await;
+        for result in [backup.map(|_| ()), restore.map(|_| ())] {
+            let Err(error) = result else {
+                panic!("MongoDB must not take the generic dump route");
+            };
+            assert!(
+                matches!(error, WorkerDataError::Unsupported { .. }),
+                "{error}"
+            );
+            assert!(
+                error.to_string().contains("/agent/services/mongodb/backup"),
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]

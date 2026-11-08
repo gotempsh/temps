@@ -278,6 +278,14 @@ pub fn build_router(
             post(crate::service_data_handlers::postgres_walg_credentials),
         )
         .route(
+            "/agent/services/mongodb/backup",
+            post(crate::service_data_handlers::mongodb_backup),
+        )
+        .route(
+            "/agent/services/mongodb/restore",
+            post(crate::service_data_handlers::mongodb_restore),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )

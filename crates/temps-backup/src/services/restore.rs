@@ -160,6 +160,7 @@ pub enum RestoreError {
     Internal { reason: String },
 }
 
+mod worker_mongodb;
 mod worker_walg;
 
 fn selected_walg_target_user_data(
@@ -1103,6 +1104,11 @@ impl RestoreService {
             .await;
             return Ok((capabilities, identity));
         }
+        // A MongoDB on a worker node restores with the control plane's own
+        // restore on its node, in place (see `worker_mongodb`).
+        if worker_mongodb::takes_path(&service) {
+            return Ok((worker_mongodb::capabilities(), identity));
+        }
         // The other services on a worker node are restored on that node, in
         // place only (see `agent_restore_supported`). Their engine is not on
         // this host, which may have no Docker at all.
@@ -1240,6 +1246,8 @@ impl RestoreService {
             worker_walg::walg_restore_supported(&target, &mode)?;
         } else if crate::engines::workload_job::takes_job_path(&target) {
             job_restore_supported(&target, &backup_location, &mode)?;
+        } else if worker_mongodb::takes_path(&target) {
+            worker_mongodb::supported(&target, &mode)?;
         } else if crate::engines::worker_agent::takes_agent_path(&target) {
             agent_restore_supported(&target, &backup_location, &mode)?;
         }
@@ -1971,15 +1979,28 @@ fn worker_restore_plan(
                 .map(|e| e.to_string()),
         });
     }
+    if worker_mongodb::takes_path(target) {
+        let (steps, mut errors) = worker_mongodb::steps(
+            node,
+            classify_restore_strategy(&target.service_type, location),
+            mode,
+            container,
+            location,
+        );
+        errors.extend(
+            worker_mongodb::supported(target, mode)
+                .err()
+                .map(|e| e.to_string()),
+        );
+        return Some(WorkerRestorePlan {
+            steps,
+            refusal: (!errors.is_empty()).then(|| errors.join("; ")),
+        });
+    }
     if crate::engines::worker_agent::takes_agent_path(target) {
         use crate::engines::worker_agent::{worker_service_kind, WorkerServiceKind};
         use temps_providers::externalsvc::worker_data::DumpEngine;
         let applies = match worker_service_kind(&target.service_type) {
-            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) => format!(
-                "The agent downloads the mongodump archive {location} and replays it into \
-                 {container} with `mongorestore --archive --gzip --drop`, MongoDB's own restore: \
-                 every database is replaced, `admin.system.users` included"
-            ),
             Some(WorkerServiceKind::Dump(DumpEngine::Redis)) => format!(
                 "The agent installs the RDB snapshot {location} into {container} with Redis's \
                  own restore, which stops and starts the container (existing data is replaced)"
@@ -1993,7 +2014,8 @@ fn worker_restore_plan(
                  `rc mirror --overwrite --remove`: missing objects are added, changed ones \
                  overwritten, and objects the backup does not have are deleted"
             ),
-            None => format!(
+            // MongoDB takes `worker_mongodb` above.
+            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) | None => format!(
                 "The agent applies {location} in place with {}'s own restore (existing data is \
                  overwritten)",
                 target.service_type
@@ -2379,6 +2401,23 @@ async fn run_restore_inner(
             &scoper,
             &mgr,
             &plane,
+            run_id,
+            &backup_model,
+            &target_service,
+            &mode,
+        )
+        .await;
+    }
+    // ADR-099: a MongoDB on a worker node is restored by the control
+    // plane's own MongoDB restore, run by its agent.
+    if worker_mongodb::takes_path(&target_service) {
+        return worker_mongodb::run(
+            WorkerRestoreDeps {
+                db: &db,
+                enc: &enc,
+                scoper: &scoper,
+                mgr: &mgr,
+            },
             run_id,
             &backup_model,
             &target_service,
@@ -3662,6 +3701,63 @@ fn agent_restore_supported(
         });
     }
     Ok(())
+}
+
+/// What a worker engine's restore takes from the restore service: the
+/// database, the encryption service (the restored login is patched into
+/// the target's stored configuration), the credential scoper (ADR-093) and
+/// the manager that reaches the node's agent.
+pub(super) struct WorkerRestoreDeps<'a> {
+    pub db: &'a Arc<DatabaseConnection>,
+    pub enc: &'a Arc<temps_core::EncryptionService>,
+    pub scoper: &'a temps_providers::worker_s3_scope::WorkerCredentialScoper,
+    pub mgr: &'a Arc<ExternalServiceManager>,
+}
+
+/// The S3 source a restore on worker `node_id` receives (ADR-093): a
+/// read-only credential for `backup`'s own location (its WAL-G repository,
+/// or its object's directory) and for `extra_prefixes` (a point-in-time
+/// recovery's binary logs), never the source's own. A location outside the
+/// source's bucket, or with no directory of its own, is refused.
+pub(super) async fn worker_read_destination(
+    db: &Arc<DatabaseConnection>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target_id: i32,
+    node_id: i32,
+    extra_prefixes: &[String],
+) -> Result<temps_providers::remote_service_client::WorkerS3Destination, RestoreError> {
+    use crate::engines::worker_agent;
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+    let Some(read_prefix) =
+        worker_agent::restore_read_prefix(&backup.s3_location, &s3_source.bucket_name)
+    else {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} is at '{}', which is not a backup location inside bucket '{}' of S3 \
+                 source {}",
+                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
+            ),
+        });
+    };
+    let mut grant = temps_providers::worker_s3_scope::WorkerS3Grant::job(
+        target_id,
+        node_id,
+        read_prefix,
+        temps_core::ScopedS3Access::Read,
+        "restore",
+    );
+    grant.prefixes.extend(extra_prefixes.iter().cloned());
+    worker_agent::scoped_destination(scoper, db.as_ref(), backup.s3_source_id, grant, "restore")
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })
 }
 
 /// Restore `backup` in place into `target`, a MongoDB, Redis, MariaDB or
@@ -7191,19 +7287,16 @@ mod tests {
         assert!(takes_job_path(&worker_postgres()));
     }
 
-    /// MongoDB, Redis, MariaDB and storage services on a worker restore in
-    /// place through the node's agent, from their own backup format; another
-    /// mode is refused explicitly, naming the node, never silently.
+    /// Redis, MariaDB and storage services on a worker restore in place
+    /// through the node's agent, from their own backup format; another mode
+    /// is refused explicitly, naming the node, never silently. (MongoDB runs
+    /// the control plane's own restore on the node: `worker_mongodb`.)
     #[test]
     fn a_worker_service_restores_only_in_place_from_its_own_format() {
         let cases = [
             (
                 "redis",
                 "external_services/redis/cache/2026/01/01/u/dump.rdb.gz",
-            ),
-            (
-                "mongodb",
-                "external_services/mongodb/cache/2026/01/01/u/dump.archive",
             ),
             (
                 "mariadb",
@@ -7698,8 +7791,8 @@ mod tests {
         }
     }
 
-    /// On a worker, the plan says what the agent applies for each engine:
-    /// MongoDB's archive restore and the exact bucket mirror.
+    /// On a worker, the plan says what runs on the node for each engine:
+    /// the control plane's own MongoDB restore and the exact bucket mirror.
     #[test]
     fn a_worker_restore_plan_names_the_engines_restore() {
         let mut docs = crashed_run_service();
@@ -7720,7 +7813,23 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("wal-g"), "{text}");
+        assert!(text.contains("control plane's MongoDB restore"), "{text}");
+        assert!(text.contains("worker node 2"), "{text}");
         assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+        let refused = worker_restore_plan(
+            &docs,
+            "external_services/mongodb/docs/u/dump.archive",
+            &RestoreRequestMode::NewService {
+                name: "docs-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "temps-mongodb-docs",
+            false,
+        )
+        .expect("a worker MongoDB")
+        .refusal
+        .expect("a new service is refused on a worker");
+        assert!(refused.contains("Restore in place"), "{refused}");
 
         let mut files = crashed_run_service();
         files.service_type = "s3".to_string();

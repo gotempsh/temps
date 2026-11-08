@@ -671,6 +671,67 @@ const RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0";
 const WALG_S3_KEY: &str = "walgproofkey";
 const WALG_BUCKET_PATH: &str = "fleet";
 
+/// What the control plane sends the agent for a job on `prefixes` of
+/// `full`'s bucket (ADR-093): a credential the bucket's own STS (RustFS's
+/// `AssumeRole`) mints for those prefixes alone, through the control plane's
+/// own `WorkerCredentialScoper`. A proof that passes with it shows the
+/// engine's grant is enough; one with the full key would not.
+async fn scoped_destination(
+    full: &temps_service_protocol::WorkerS3Destination,
+    bucket_path: &str,
+    prefixes: &[String],
+    access: temps_core::ScopedS3Access,
+) -> temps_service_protocol::WorkerS3Destination {
+    use temps_providers::worker_s3_scope::{
+        WorkerCredentialScope, WorkerCredentialScoper, WorkerS3Grant,
+    };
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("an encryption key"),
+    );
+    let now = chrono::Utc::now();
+    let source = temps_entities::s3_sources::Model {
+        id: 1,
+        name: "proof".to_string(),
+        bucket_name: full.bucket.clone(),
+        region: full.region.clone(),
+        endpoint: full.endpoint.clone(),
+        bucket_path: bucket_path.to_string(),
+        access_key_id: encryption
+            .encrypt_string(&full.access_key_id)
+            .expect("encrypt"),
+        secret_key: encryption
+            .encrypt_string(&full.secret_access_key)
+            .expect("encrypt"),
+        session_token: None,
+        credentials_expire_at: None,
+        force_path_style: Some(full.force_path_style),
+        is_default: false,
+        managed_by_cloud: false,
+        lifecycle_reconcile_failed_at: None,
+        lifecycle_reconcile_generation: 0,
+        worker_credentials: temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+        created_at: now,
+        updated_at: now,
+        backing_service_id: None,
+    };
+    let mut grant = WorkerS3Grant::job(9, 2, prefixes[0].clone(), access, "proof");
+    grant.prefixes = prefixes.to_vec();
+    let scoped = WorkerCredentialScoper::new(encryption)
+        .destination(&source, grant)
+        .await
+        .unwrap_or_else(|e| panic!("RustFS did not mint a credential for {prefixes:?}: {e}"));
+    assert!(
+        matches!(scoped.scope, WorkerCredentialScope::Scoped { .. }),
+        "{:?}",
+        scoped.scope
+    );
+    assert_ne!(scoped.destination.access_key_id, full.access_key_id);
+    scoped.destination
+}
+
 /// A worker's PostgreSQL created by the agent as a control-plane-profile
 /// server asks, healthy, with an S3 bucket on its network.
 struct WalgFixture {
@@ -2345,4 +2406,773 @@ async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
         "worker S3 restore proof: 45 objects before, {} after",
         restored.len()
     );
+}
+
+const MONGO_WALG_IMAGE: &str = "gotempsh/mongodb-walg:8.0";
+const MONGO_PLAIN_IMAGE: &str = "mongo:7.0";
+const MONGO_BUCKET_PATH: &str = "fleet";
+
+/// A worker's MongoDB created by the agent as a control-plane-profile server
+/// asks, healthy, with an S3 bucket on its network that the agent process
+/// reaches through a published port (as the control plane's archive upload
+/// and download do) and WAL-G inside the container reaches by its network.
+struct MongoFixture {
+    docker: Docker,
+    agent: Arc<AgentState>,
+    name: String,
+    container: String,
+    config: ServiceConfig,
+    s3: aws_sdk_s3::Client,
+    s3_port: u16,
+    bucket: String,
+    _cleanup: Cleanup,
+}
+
+impl MongoFixture {
+    /// `None` (and a message) when Docker or an image is missing.
+    async fn start(tag: &str, image: &str, bucket: &str) -> Option<Self> {
+        let docker = match Docker::connect_with_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!(
+                    "Docker not available (set DOCKER_HOST), skipping the worker MongoDB {tag} proof"
+                );
+                return None;
+            }
+        };
+        let agent = agent_state(docker.clone());
+        let suffix = std::process::id();
+        let name = format!("{tag}{suffix}");
+        let s3_name = format!("{tag}s3{suffix}");
+
+        let mut parameters = control_plane_parameters(&Engine {
+            label: "mongodb",
+            service_type: ServiceType::Mongodb,
+            strategy: "mongodb",
+            parameters: json!({ "docker_image": image, "database": "admin", "username": "admin" }),
+            expected_env: &[],
+        });
+        parameters.insert("port".into(), json!(free_port().to_string()));
+        let params = ExternalServiceManager::remote_create_params(
+            9,
+            &name,
+            &ServiceType::Mongodb,
+            &as_strings(&parameters),
+            false,
+        )
+        .expect("the create request");
+        assert_eq!(
+            params.image, image,
+            "the create request runs the asked image"
+        );
+        for needed in [
+            params.image.as_str(),
+            RUSTFS_IMAGE,
+            temps_providers::externalsvc::mongodb_backup::MONGODUMP_HELPER_IMAGE,
+        ] {
+            if docker.inspect_image(needed).await.is_err() {
+                println!(
+                    "image {needed} is not present locally, skipping the worker MongoDB {tag} proof"
+                );
+                return None;
+            }
+        }
+        let network = params
+            .network
+            .clone()
+            .expect("worker services join a network");
+        let cleanup = Cleanup {
+            docker: docker.clone(),
+            containers: vec![params.name.clone(), s3_name.clone()],
+            volumes: params.volumes.keys().cloned().collect(),
+        };
+
+        let s3_port = free_port();
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                        .name(&s3_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(RUSTFS_IMAGE.to_string()),
+                    env: Some(vec![
+                        format!("RUSTFS_ACCESS_KEY={WALG_S3_KEY}"),
+                        format!("RUSTFS_SECRET_KEY={WALG_S3_KEY}"),
+                    ]),
+                    host_config: Some(bollard::models::HostConfig {
+                        network_mode: Some(network.clone()),
+                        port_bindings: Some(HashMap::from([(
+                            "9000/tcp".to_string(),
+                            Some(vec![bollard::models::PortBinding {
+                                host_ip: Some("127.0.0.1".to_string()),
+                                host_port: Some(s3_port.to_string()),
+                            }]),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the bucket container");
+
+        let (status, created) = envelope(
+            create_service(
+                State(agent.clone()),
+                Json(ServiceCreateRequest {
+                    name: params.name.clone(),
+                    service_type: params.service_type.clone(),
+                    image: params.image.clone(),
+                    environment: params.environment.clone(),
+                    port_mappings: params
+                        .port_mappings
+                        .iter()
+                        .map(|p| ServicePortMapping {
+                            host_port: p.host_port,
+                            container_port: p.container_port,
+                        })
+                        .collect(),
+                    volumes: params.volumes.clone(),
+                    network: params.network.clone(),
+                    command: params.command.clone(),
+                    resource_limits: None,
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200, "create failed: {created}");
+        let container = created["data"]["container_name"]
+            .as_str()
+            .expect("the created container's name")
+            .to_string();
+        let host_port = created["data"]["host_port"]
+            .as_u64()
+            .expect("the published host port");
+        docker
+            .start_container(
+                &s3_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("start the bucket");
+
+        let mut stored = parameters.clone();
+        stored.insert("port".into(), json!(host_port.to_string()));
+        stored.insert("container_name".into(), json!(container.clone()));
+        let config = ServiceConfig {
+            name: name.clone(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::to_value(&stored).expect("stored parameters"),
+        };
+        wait_healthy(&agent, &config, "mongodb").await;
+
+        let s3 = temps_providers::externalsvc::S3Credentials {
+            access_key_id: WALG_S3_KEY.to_string(),
+            secret_key: WALG_S3_KEY.to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
+            bucket_name: bucket.to_string(),
+            bucket_path: MONGO_BUCKET_PATH.to_string(),
+            force_path_style: true,
+        }
+        .build_s3_client()
+        .await;
+        let mut made = Err(String::new());
+        for _ in 0..60 {
+            made = s3
+                .create_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"));
+            if made.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        made.expect("creating the bucket");
+        let fixture = Self {
+            docker,
+            agent,
+            name,
+            container,
+            config,
+            s3,
+            s3_port,
+            bucket: bucket.to_string(),
+            _cleanup: cleanup,
+        };
+        // A fresh mongod may answer the health probe before it accepts the
+        // root login; wait until it does, for a bounded time.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (code, out) = fixture.mongosh(&fixture.password(), "print('ready')").await;
+            if code == 0 && out.ends_with("ready") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mongod never accepted the root login: {code} {out}"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Some(fixture)
+    }
+
+    fn password(&self) -> String {
+        self.config.parameters["password"]
+            .as_str()
+            .expect("a generated password")
+            .to_string()
+    }
+
+    /// `script` against database `shop`, logged in as the root user with
+    /// `password`: exit code and output.
+    async fn mongosh(&self, password: &str, script: &str) -> (i64, String) {
+        exec(
+            &self.docker,
+            &self.container,
+            &[
+                "mongosh",
+                "--quiet",
+                "--username",
+                "admin",
+                "--password",
+                password,
+                "--authenticationDatabase",
+                "admin",
+                "shop",
+                "--eval",
+                script,
+            ],
+        )
+        .await
+    }
+
+    /// The `x` of every document in `shop.proof`, in `_id` order.
+    async fn proof(&self) -> String {
+        let (code, out) = self
+            .mongosh(
+                &self.password(),
+                "print(db.proof.find().sort({_id: 1}).toArray().map(d => d.x).join(','))",
+            )
+            .await;
+        assert_eq!(code, 0, "reading shop.proof failed: {out}");
+        out.lines().last().unwrap_or_default().to_string()
+    }
+
+    async fn write(&self, script: &str) {
+        let (code, out) = self.mongosh(&self.password(), script).await;
+        assert_eq!(code, 0, "{script}: {out}");
+    }
+
+    /// The bucket as the control plane sends it to the agent.
+    fn destination(&self) -> temps_service_protocol::WorkerS3Destination {
+        temps_service_protocol::WorkerS3Destination {
+            bucket: self.bucket.clone(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{}", self.s3_port)),
+            force_path_style: true,
+            access_key_id: WALG_S3_KEY.to_string(),
+            secret_access_key: WALG_S3_KEY.to_string(),
+            session_token: None,
+        }
+    }
+
+    /// The bucket as the control plane's own engine holds it.
+    fn credentials(&self) -> temps_providers::externalsvc::S3Credentials {
+        temps_providers::externalsvc::S3Credentials {
+            access_key_id: WALG_S3_KEY.to_string(),
+            secret_key: WALG_S3_KEY.to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{}", self.s3_port)),
+            bucket_name: self.bucket.clone(),
+            bucket_path: MONGO_BUCKET_PATH.to_string(),
+            force_path_style: true,
+        }
+    }
+
+    /// A location this service's backups never use: an empty WAL-G
+    /// repository, or an archive key nothing was written to.
+    fn missing_location(&self, walg: bool) -> String {
+        use temps_providers::externalsvc::mongodb_backup::{archive_key, walg_prefix};
+        if walg {
+            walg_prefix(&self.bucket, MONGO_BUCKET_PATH, "nobackuphere")
+        } else {
+            archive_key(MONGO_BUCKET_PATH, &self.name, "missing", chrono::Utc::now())
+        }
+    }
+}
+
+/// How a proof reaches the engine: through the worker's agent, or as the
+/// control plane runs it for a service on its own host.
+#[derive(Clone, Copy, Debug)]
+enum MongoPath {
+    Agent,
+    ControlPlane,
+}
+
+/// What a backup wrote, with where a restore reads it.
+#[derive(Debug)]
+struct MongoBackup {
+    walg: bool,
+    location: String,
+}
+
+async fn mongo_backup(fixture: &MongoFixture, path: MongoPath, uuid: &str) -> MongoBackup {
+    use temps_providers::externalsvc::mongodb_backup::{
+        mongodb_backup, walg_prefix, MongodbBackup, MongodbBackupOutcome,
+    };
+    use temps_service_protocol::{MongodbBackupRequest, MongodbBackupResult};
+
+    let walg = |_: ()| MongoBackup {
+        walg: true,
+        location: walg_prefix(&fixture.bucket, MONGO_BUCKET_PATH, &fixture.name),
+    };
+    match path {
+        MongoPath::Agent => {
+            // As the control plane: check the image through the agent, pick
+            // the backup, scope the credential to its one location.
+            use temps_providers::externalsvc::mongodb_backup::{archive_key, walg_key_prefix};
+            use temps_service_protocol::MongodbBackupMode;
+            let has_walg = temps_providers::externalsvc::mongodb::MongodbService::new(
+                fixture.name.clone(),
+                Arc::new(fixture.docker.clone()),
+            )
+            .container_has_walg(&fixture.container)
+            .await;
+            let (mode, prefix) = if has_walg {
+                (
+                    MongodbBackupMode::WalgStream,
+                    walg_key_prefix(MONGO_BUCKET_PATH, &fixture.name),
+                )
+            } else {
+                let key = archive_key(MONGO_BUCKET_PATH, &fixture.name, uuid, chrono::Utc::now());
+                let prefix = temps_providers::worker_s3_scope::key_directory(&key);
+                (MongodbBackupMode::Archive { key }, prefix)
+            };
+            let destination = scoped_destination(
+                &fixture.destination(),
+                MONGO_BUCKET_PATH,
+                &[prefix],
+                temps_core::ScopedS3Access::Write,
+            )
+            .await;
+            let (status, body) = envelope(
+                temps_node_agent::service_data_handlers::mongodb_backup(
+                    State(fixture.agent.clone()),
+                    Json(MongodbBackupRequest {
+                        service_id: 9,
+                        node_id: 2,
+                        service_config: fixture.config.clone(),
+                        destination,
+                        bucket_path: MONGO_BUCKET_PATH.to_string(),
+                        backup_uuid: uuid.to_string(),
+                        mode,
+                    }),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(status, 200, "the agent did not run the backup: {body}");
+            let result: MongodbBackupResult =
+                serde_json::from_value(body["data"].clone()).expect("a MongoDB backup result");
+            match result {
+                MongodbBackupResult::WalgStream { .. } => walg(()),
+                MongodbBackupResult::Archive { key, size_bytes } => {
+                    assert!(size_bytes > 0, "an empty archive at {key}");
+                    MongoBackup {
+                        walg: false,
+                        location: key,
+                    }
+                }
+                other => panic!("the backup through the agent failed: {other:?}"),
+            }
+        }
+        MongoPath::ControlPlane => {
+            let outcome = mongodb_backup(
+                Arc::new(fixture.docker.clone()),
+                MongodbBackup {
+                    service_id: 9,
+                    container_name: fixture.container.clone(),
+                    service_config: fixture.config.clone(),
+                    s3: fixture.credentials(),
+                    backup_uuid: uuid.to_string(),
+                    mode: None,
+                },
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the control plane's backup failed: {e}"));
+            match outcome {
+                MongodbBackupOutcome::WalgStream { .. } => walg(()),
+                MongodbBackupOutcome::Archive { key, size_bytes } => {
+                    assert!(size_bytes > 0, "an empty archive at {key}");
+                    MongoBackup {
+                        walg: false,
+                        location: key,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Restore `location`, in the bucket of `held_by`, in place into `fixture`;
+/// `Err` is the engine's failure. `origin_password` is a cross-service
+/// restore's origin login.
+async fn mongo_restore(
+    fixture: &MongoFixture,
+    held_by: &MongoFixture,
+    path: MongoPath,
+    location: &str,
+    origin_password: Option<String>,
+) -> Result<(), String> {
+    use temps_providers::externalsvc::mongodb::MongodbService;
+    use temps_providers::externalsvc::{ExternalService, NoopRestoreGate, RestoreContext};
+    use temps_service_protocol::{MongodbRestoreRequest, MongodbRestoreResult};
+
+    let request = MongodbRestoreRequest {
+        service_id: 9,
+        node_id: 2,
+        service_config: fixture.config.clone(),
+        origin_password,
+        source: held_by.destination(),
+        location: location.to_string(),
+    };
+    match path {
+        MongoPath::Agent => {
+            // As the control plane: read access to this one location.
+            let read_prefix = match location.strip_prefix("s3://") {
+                Some(_) => {
+                    temps_providers::worker_s3_scope::s3_url_prefix(location, &held_by.bucket)
+                        .expect("a repository inside the bucket")
+                }
+                None => temps_providers::worker_s3_scope::key_directory(location),
+            };
+            let request = MongodbRestoreRequest {
+                source: scoped_destination(
+                    &held_by.destination(),
+                    MONGO_BUCKET_PATH,
+                    &[read_prefix],
+                    temps_core::ScopedS3Access::Read,
+                )
+                .await,
+                ..request
+            };
+            let (status, body) = envelope(
+                temps_node_agent::service_data_handlers::mongodb_restore(
+                    State(fixture.agent.clone()),
+                    Json(request),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(status, 200, "the agent did not run the restore: {body}");
+            match serde_json::from_value(body["data"].clone()).expect("a MongoDB restore result") {
+                MongodbRestoreResult::Completed => Ok(()),
+                MongodbRestoreResult::Failed { reason } => Err(reason),
+                MongodbRestoreResult::Refused { reason } => {
+                    panic!("the agent refused a restore of its own container: {reason}")
+                }
+            }
+        }
+        MongoPath::ControlPlane => {
+            // What `RestoreService` hands the provider for a local service.
+            let s3 = held_by.credentials();
+            let client = s3.build_s3_client().await;
+            let now = chrono::Utc::now();
+            let source = temps_entities::s3_sources::Model {
+                id: 1,
+                name: "proof".to_string(),
+                bucket_name: held_by.bucket.clone(),
+                region: "us-east-1".to_string(),
+                endpoint: s3.endpoint.clone(),
+                bucket_path: MONGO_BUCKET_PATH.to_string(),
+                access_key_id: WALG_S3_KEY.to_string(),
+                secret_key: WALG_S3_KEY.to_string(),
+                session_token: None,
+                credentials_expire_at: None,
+                force_path_style: Some(true),
+                is_default: false,
+                managed_by_cloud: false,
+                lifecycle_reconcile_failed_at: None,
+                lifecycle_reconcile_generation: 0,
+                worker_credentials: temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED
+                    .to_string(),
+                created_at: now,
+                updated_at: now,
+                backing_service_id: None,
+            };
+            let backup = temps_entities::backups::Model {
+                id: 1,
+                name: "proof".to_string(),
+                backup_id: "proof".to_string(),
+                schedule_id: None,
+                schedule_run_id: None,
+                backup_type: "full".to_string(),
+                state: "completed".to_string(),
+                started_at: now,
+                finished_at: Some(now),
+                size_bytes: None,
+                file_count: None,
+                s3_source_id: 1,
+                s3_location: location.to_string(),
+                error_message: None,
+                metadata: "{}".to_string(),
+                checksum: None,
+                compression_type: "gzip".to_string(),
+                created_by: 0,
+                expires_at: None,
+                tags: "[]".to_string(),
+            };
+            let target = temps_entities::external_services::Model {
+                id: 9,
+                name: fixture.name.clone(),
+                service_type: "mongodb".to_string(),
+                version: None,
+                status: "running".to_string(),
+                created_at: now,
+                updated_at: now,
+                slug: None,
+                config: None,
+                node_id: None,
+                topology: "standalone".to_string(),
+                error_message: None,
+                health_status: None,
+                last_health_check_at: None,
+                last_health_error: None,
+                consecutive_health_failures: 0,
+                health_metadata: None,
+                metrics_enabled: false,
+                default_backup_provisioned: false,
+                container_name: None,
+                created_by_user_id: None,
+                continuous_archive_s3_source_id: None,
+                continuous_archive_pinned_at: None,
+                workload_mode: Default::default(),
+                log_ingest_lines_per_sec: None,
+                log_ingest_kib_per_sec: None,
+            };
+            // The MongoDB restore reads no rows: a disconnected pool.
+            let pool = Default::default();
+            MongodbService::new(fixture.name.clone(), Arc::new(fixture.docker.clone()))
+                .restore_in_place(RestoreContext {
+                    s3_client: &client,
+                    s3_credentials: &s3,
+                    s3_source: &source,
+                    backup: &backup,
+                    backup_location: location,
+                    source_service: &target,
+                    source_config: request.engine_config(),
+                    live_target_config: fixture.config.clone(),
+                    pool: &pool,
+                    gate: &NoopRestoreGate,
+                })
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// Back up, change the data, fail a restore, restore: the sequence every
+/// MongoDB proof runs, through `path`.
+async fn mongo_backup_and_restore(fixture: &MongoFixture, path: MongoPath, expect_walg: bool) {
+    fixture
+        .write("db.proof.insertMany([{_id: 1, x: 42}, {_id: 2, x: 43}])")
+        .await;
+    assert_eq!(fixture.proof().await, "42,43");
+
+    let backup = mongo_backup(fixture, path, "proof-1").await;
+    assert_eq!(
+        backup.walg, expect_walg,
+        "{path:?}: the engine chose the wrong backup for this image: {backup:?}"
+    );
+    if backup.walg {
+        let key_prefix = temps_providers::externalsvc::mongodb_backup::walg_key_prefix(
+            MONGO_BUCKET_PATH,
+            &fixture.name,
+        );
+        let written = keys(&fixture.s3, &fixture.bucket, &key_prefix).await;
+        assert!(
+            written
+                .iter()
+                .any(|k| k.starts_with(&format!("{key_prefix}basebackups_005/"))),
+            "{path:?}: no WAL-G backup under {key_prefix}: {written:?}"
+        );
+    } else {
+        assert!(
+            temps_providers::externalsvc::mongodb_backup::is_archive_key_of(
+                &backup.location,
+                MONGO_BUCKET_PATH,
+                &fixture.name,
+                "proof-1",
+            ),
+            "{path:?}: the archive is not where the control plane records it: {}",
+            backup.location
+        );
+        assert_eq!(
+            keys(&fixture.s3, &fixture.bucket, &backup.location).await,
+            vec![backup.location.clone()]
+        );
+    }
+
+    // Changed after the backup.
+    fixture
+        .write("db.proof.deleteOne({_id: 1}); db.proof.insertOne({_id: 3, x: 7})")
+        .await;
+    assert_eq!(fixture.proof().await, "43,7");
+
+    // A restore that fails leaves the data as it was: a location with no
+    // backup, and (for an archive) one that is not a mongodump archive.
+    let missing = fixture.missing_location(backup.walg);
+    let failed = mongo_restore(fixture, fixture, path, &missing, None).await;
+    assert!(
+        failed.is_err(),
+        "{path:?}: restoring from {missing} succeeded"
+    );
+    assert_eq!(
+        fixture.proof().await,
+        "43,7",
+        "{path:?}: a failed restore from {missing} changed the data: {failed:?}"
+    );
+    if !backup.walg {
+        let corrupt = format!("{MONGO_BUCKET_PATH}/corrupt-{}/dump.archive", fixture.name);
+        fixture
+            .s3
+            .put_object()
+            .bucket(&fixture.bucket)
+            .key(&corrupt)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                b"not a mongodump archive",
+            ))
+            .send()
+            .await
+            .expect("upload the corrupt archive");
+        let failed = mongo_restore(fixture, fixture, path, &corrupt, None).await;
+        assert!(failed.is_err(), "{path:?}: restoring garbage succeeded");
+        assert_eq!(
+            fixture.proof().await,
+            "43,7",
+            "{path:?}: a failed restore of a corrupt archive changed the data: {failed:?}"
+        );
+    }
+
+    // The backup, in place.
+    mongo_restore(fixture, fixture, path, &backup.location, None)
+        .await
+        .unwrap_or_else(|e| panic!("{path:?}: restoring {} failed: {e}", backup.location));
+    assert_eq!(
+        fixture.proof().await,
+        "42,43",
+        "{path:?}: the restore did not bring back the backed-up data"
+    );
+    println!(
+        "MongoDB proof ({path:?}, {}): backed up to {}, a failed restore changed nothing, the \
+         restore brought the data back",
+        if backup.walg { "WAL-G" } else { "archive" },
+        backup.location
+    );
+}
+
+/// ADR-099, MongoDB: a worker's MongoDB, created by the agent as a
+/// control-plane-profile server asks, is backed up and restored in place by
+/// the control plane's own MongoDB engine through the agent's sealed routes.
+/// A WAL-G image streams into its WAL-G repository; an image without WAL-G
+/// gets a mongodump archive at the control plane's key. A restore that fails
+/// (no backup at the location, a corrupt archive) leaves the data as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_mongodb_is_backed_up_and_restored_by_the_control_plane_engine_through_its_agent()
+{
+    for (tag, image, walg) in [
+        ("wsemgw", MONGO_WALG_IMAGE, true),
+        ("wsemga", MONGO_PLAIN_IMAGE, false),
+    ] {
+        let Some(fixture) = MongoFixture::start(tag, image, &format!("{tag}-bucket")).await else {
+            continue;
+        };
+        mongo_backup_and_restore(&fixture, MongoPath::Agent, walg).await;
+    }
+}
+
+/// The same sequence as the control plane runs it for a MongoDB on its own
+/// host: the same backup function with its own Docker, the provider's same
+/// in-place restore, with no agent in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_plane_mongodb_is_backed_up_and_restored_by_the_same_engine() {
+    for (tag, image, walg) in [
+        ("cplmgw", MONGO_WALG_IMAGE, true),
+        ("cplmga", MONGO_PLAIN_IMAGE, false),
+    ] {
+        let Some(fixture) = MongoFixture::start(tag, image, &format!("{tag}-bucket")).await else {
+            continue;
+        };
+        mongo_backup_and_restore(&fixture, MongoPath::ControlPlane, walg).await;
+    }
+}
+
+/// A cross-service restore through the agent: another MongoDB's WAL-G backup
+/// restored in place into a worker's MongoDB brings the origin's
+/// `admin.system.users`, so the target answers to the origin's password
+/// afterwards, which the control plane then stores. The origin's password
+/// reaches the engine only as its fallback login.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_services_mongodb_backup_is_restored_into_a_worker_mongodb_through_its_agent() {
+    let Some(origin) = MongoFixture::start("wsemxo", MONGO_WALG_IMAGE, "wsemx-origin").await else {
+        return;
+    };
+    let Some(target) = MongoFixture::start("wsemxt", MONGO_WALG_IMAGE, "wsemx-target").await else {
+        return;
+    };
+    let (origin_password, target_password) = (origin.password(), target.password());
+    assert_ne!(origin_password, target_password);
+    origin.write("db.proof.insertOne({_id: 1, x: 99})").await;
+    target.write("db.proof.insertOne({_id: 1, x: 1})").await;
+
+    let backup = mongo_backup(&origin, MongoPath::Agent, "cross-1").await;
+    assert!(backup.walg, "{backup:?}");
+    mongo_restore(
+        &target,
+        &origin,
+        MongoPath::Agent,
+        &backup.location,
+        Some(origin_password.clone()),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the cross-service restore failed: {e}"));
+
+    let (code, out) = target
+        .mongosh(
+            &origin_password,
+            "print(db.proof.find().toArray().map(d => d.x).join(','))",
+        )
+        .await;
+    assert_eq!(
+        code, 0,
+        "the target does not answer to the origin's login: {out}"
+    );
+    assert_eq!(out.lines().last().unwrap_or_default(), "99");
+
+    // Restored again, the target now answers only to the origin's
+    // password: the engine falls back to it, as the control plane does on a
+    // retried cross-service restore.
+    mongo_restore(
+        &target,
+        &origin,
+        MongoPath::Agent,
+        &backup.location,
+        Some(origin_password.clone()),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the retried cross-service restore failed: {e}"));
 }

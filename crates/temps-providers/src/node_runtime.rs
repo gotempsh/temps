@@ -11,7 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
-    AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, NodeAttachment,
+    AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, MongodbBackupRequest,
+    MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult, NodeAttachment,
     NodeServiceError, NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
     PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
     PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
@@ -254,6 +255,34 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             published_address,
         )
         .await)
+    }
+
+    async fn mongodb_backup(
+        &self,
+        request: MongodbBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mongodb_backup::mongodb_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mongodb_restore(
+        &self,
+        request: MongodbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbRestoreResult, NodeServiceError> {
+        Ok(
+            externalsvc::mongodb_backup::mongodb_restore_on_node(
+                request,
+                docker,
+                published_address,
+            )
+            .await,
+        )
     }
 }
 

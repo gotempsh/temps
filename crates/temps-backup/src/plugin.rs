@@ -47,11 +47,10 @@ use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 /// Sourced from each engine's own `ENGINE_KEY` rather than re-spelled here, so
 /// a renamed engine cannot silently drop out of the unavailable set and start
 /// failing backups on a Dockerless control plane again.
-const DOCKER_BACKED_ENGINES: [&str; 7] = [
+const DOCKER_BACKED_ENGINES: [&str; 6] = [
     crate::engines::redis::ENGINE_KEY,
     crate::engines::postgres_pgdump::ENGINE_KEY,
     crate::engines::postgres_cluster::ENGINE_KEY,
-    crate::engines::mongodb::ENGINE_KEY,
     crate::engines::mariadb_physical::ENGINE_KEY,
     crate::engines::mariadb_dump::ENGINE_KEY,
     crate::engines::s3_mirror::ENGINE_KEY,
@@ -335,8 +334,8 @@ impl TempsPlugin for BackupPlugin {
                         worker_credentials: worker_credentials.clone(),
                     },
                 )))
-                // MongoDB, Redis, MariaDB and storage services on worker
-                // nodes, backed up by their node's agent. Needs no local
+                // Redis, MariaDB and storage services on worker nodes,
+                // backed up by their node's agent. Needs no local
                 // Docker either (see `engines::worker_agent`).
                 .register_engine(Arc::new(WorkerAgentEngine::new(WorkerAgentDeps {
                     db: db.clone(),
@@ -348,6 +347,15 @@ impl TempsPlugin for BackupPlugin {
                 // worker through its agent (ADR-099). A server without
                 // Docker still backs up its workers' databases with it.
                 .register_engine(Arc::new(PostgresWalgEngine::new(PostgresWalgDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                // MongoDB: here with this host's Docker, or on a worker
+                // through its agent (ADR-099), like PostgreSQL WAL-G.
+                .register_engine(Arc::new(MongodbEngine::new(MongodbDeps {
                     db: db.clone(),
                     encryption_service: encryption_service.clone(),
                     docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
@@ -384,11 +392,6 @@ impl TempsPlugin for BackupPlugin {
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
                     })))
-                    .register_engine(Arc::new(MongodbEngine::new(MongodbDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
                     .register_engine(Arc::new(MariadbPhysicalEngine::new(MariadbPhysicalDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
@@ -407,9 +410,9 @@ impl TempsPlugin for BackupPlugin {
 
                 info!(
                     "BackupExecutor: registered 11 engines: control_plane, \
-                     postgres_workload_job, worker_agent, postgres_walg, redis, \
-                     postgres_pgdump, postgres_cluster, mongodb, mariadb_physical, \
-                     mariadb_dump, s3_mirror",
+                     postgres_workload_job, worker_agent, postgres_walg, mongodb, redis, \
+                     postgres_pgdump, postgres_cluster, mariadb_physical, mariadb_dump, \
+                     s3_mirror",
                 );
             } else {
                 let reason = docker_engine_unavailable_reason(&docker_handle);
@@ -419,8 +422,8 @@ impl TempsPlugin for BackupPlugin {
                 warn!(
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
                     "BackupExecutor: registered only the engines that need no local Docker \
-                     (control_plane, and the worker engines postgres_workload_job, worker_agent \
-                     and postgres_walg for worker services) — {}. Backups requesting one of these \
+                     (control_plane, and the worker engines postgres_workload_job, worker_agent, \
+                     postgres_walg and mongodb for worker services) — {}. Backups requesting one of these \
                      engines fail immediately with that reason",
                     reason,
                 );
@@ -1074,6 +1077,10 @@ mod tests {
         assert!(
             !DOCKER_BACKED_ENGINES.contains(&crate::engines::postgres_walg::ENGINE_KEY),
             "the WAL-G engine backs up worker services without a local daemon",
+        );
+        assert!(
+            !DOCKER_BACKED_ENGINES.contains(&crate::engines::mongodb::ENGINE_KEY),
+            "the MongoDB engine backs up worker services without a local daemon",
         );
         assert_eq!(
             DOCKER_BACKED_ENGINES.len(),

@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `worker_agent`: backups of the MongoDB, Redis, MariaDB and managed S3
-//! services that run on worker nodes, taken by the worker's agent.
+//! `worker_agent`: backups of the Redis, MariaDB and managed S3 services that
+//! run on worker nodes, taken by the worker's agent.
 //!
-//! The local engines (`redis`, `mongodb`, `mariadb_*`, `s3_mirror`) drive
+//! The local engines (`redis`, `mariadb_*`, `s3_mirror`) drive
 //! this host's Docker, where a worker's container is not, and a
 //! `--profile control-plane` server has no Docker at all. So for a service on
 //! a worker this engine asks the node's agent to run the engine's own dump
@@ -14,13 +14,15 @@
 //! session token included. Nothing about the service changes; it is not
 //! stopped or restarted.
 //!
-//! The objects are the local engines' (`.../dump.archive`,
-//! `.../dump.rdb.gz`, `.../dump.sql.gz`, or a bucket mirror under
+//! The objects are the local engines' (`.../dump.rdb.gz`,
+//! `.../dump.sql.gz`, or a bucket mirror under
 //! `.../external_services/s3/<service>/<uuid>/<bucket>/`), so the providers'
 //! restores read them. A restore of one runs on the node too (see
 //! `services::restore::run_agent_restore`), in place.
 //!
-//! PostgreSQL on a worker takes the job path instead (`workload_job`).
+//! PostgreSQL and MongoDB on a worker take the control plane's own engines
+//! instead, whose container steps the node's agent runs (`postgres_walg`,
+//! `workload_job` without WAL-G, and `mongodb`; ADR-099).
 
 use std::sync::Arc;
 
@@ -45,8 +47,8 @@ use temps_providers::worker_s3_scope::{
 pub const ENGINE_KEY: &str = "worker_agent";
 
 /// Whether a backup (and an in-place restore) of `service` runs on its
-/// worker node through the agent: a standalone MongoDB, Redis, MariaDB or
-/// storage service whose node is a worker.
+/// worker node through the agent: a standalone Redis, MariaDB or storage
+/// service whose node is a worker.
 pub fn takes_agent_path(service: &temps_entities::external_services::Model) -> bool {
     worker_node(service).is_some()
         && service.topology.as_str() != "cluster"
@@ -63,7 +65,8 @@ pub enum WorkerServiceKind {
 }
 
 /// The kind of worker backup `service_type` takes, `None` for PostgreSQL
-/// (the job path) and unknown types.
+/// and MongoDB (the control plane's own engines, run by the node's agent)
+/// and unknown types.
 pub fn worker_service_kind(service_type: &str) -> Option<WorkerServiceKind> {
     let service_type = match service_type {
         "mongo" => ServiceType::Mongodb,
@@ -71,7 +74,7 @@ pub fn worker_service_kind(service_type: &str) -> Option<WorkerServiceKind> {
     };
     #[allow(deprecated, reason = "MinIO is matched so its refusal names it")]
     match service_type {
-        ServiceType::Postgres => None,
+        ServiceType::Postgres | ServiceType::Mongodb => None,
         ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs | ServiceType::Minio => {
             Some(WorkerServiceKind::Storage)
         }
@@ -118,6 +121,21 @@ pub fn backup_scope_prefix(key: &str, kind: WorkerServiceKind) -> String {
         WorkerServiceKind::Dump(_) => key_directory(key),
         WorkerServiceKind::Storage => temps_providers::worker_s3_scope::as_prefix(key),
     }
+}
+
+/// The prefix a worker restore reading `location` is granted (ADR-093): a
+/// WAL-G repository `s3://<bucket>/<prefix>` as that prefix, an object key as
+/// its own directory. `None` for a repository outside `bucket`, or a location
+/// with no directory, which would be the whole bucket. The scoper refuses
+/// anything outside the source's own path on top of this.
+pub fn restore_read_prefix(location: &str, bucket: &str) -> Option<String> {
+    let location = location.trim();
+    let prefix = if location.starts_with("s3://") {
+        temps_providers::worker_s3_scope::s3_url_prefix(location, bucket)?
+    } else {
+        key_directory(location)
+    };
+    (!prefix.is_empty()).then_some(prefix)
 }
 
 /// The S3 destination a worker job receives (ADR-093): a credential the
@@ -406,6 +424,44 @@ pub fn restore_location_matches(
 mod tests {
     use super::*;
 
+    /// A restore reads one backup: a WAL-G repository as its prefix, an
+    /// object as its own directory. Another bucket's repository, a key at the
+    /// bucket's root (whose directory is the whole bucket) and an empty
+    /// location are refused before any credential is asked for.
+    #[test]
+    fn a_restore_reads_only_its_own_backup() {
+        assert_eq!(
+            restore_read_prefix(
+                "s3://backups/base/external_services/mongodb/orders/walg",
+                "backups"
+            )
+            .as_deref(),
+            Some("base/external_services/mongodb/orders/walg/")
+        );
+        assert_eq!(
+            restore_read_prefix(
+                " base/external_services/redis/cache/2026/11/09/u-1/dump.rdb.gz ",
+                "backups"
+            )
+            .as_deref(),
+            Some("base/external_services/redis/cache/2026/11/09/u-1/")
+        );
+        assert_eq!(
+            restore_read_prefix("/base/x/dump.sql.gz", "backups").as_deref(),
+            Some("base/x/")
+        );
+        for refused in [
+            "s3://elsewhere/base/external_services/mongodb/orders/walg",
+            "s3://backups",
+            "s3://backups/",
+            "dump.archive",
+            "",
+            "   ",
+        ] {
+            assert_eq!(restore_read_prefix(refused, "backups"), None, "{refused:?}");
+        }
+    }
+
     fn service(
         service_type: &str,
         node_id: Option<i32>,
@@ -442,10 +498,8 @@ mod tests {
     }
 
     #[test]
-    fn every_non_postgres_engine_on_a_worker_takes_the_agent_path() {
-        for service_type in [
-            "mongodb", "mongo", "redis", "kv", "mariadb", "s3", "rustfs", "blob", "minio",
-        ] {
+    fn every_engine_without_its_own_on_a_worker_takes_the_agent_path() {
+        for service_type in ["redis", "kv", "mariadb", "s3", "rustfs", "blob", "minio"] {
             assert!(
                 takes_agent_path(&service(service_type, Some(3))),
                 "{service_type} on a worker"
@@ -463,6 +517,13 @@ mod tests {
             !takes_agent_path(&service("postgres", Some(3))),
             "the job path"
         );
+        for mongo in ["mongodb", "mongo"] {
+            assert!(
+                !takes_agent_path(&service(mongo, Some(3))),
+                "{mongo} on a worker takes the control plane's MongoDB engine"
+            );
+            assert_eq!(worker_service_kind(mongo), None);
+        }
         let mut cluster = service("redis", Some(3));
         cluster.topology = "cluster".to_string();
         assert!(!takes_agent_path(&cluster));
@@ -470,17 +531,6 @@ mod tests {
 
     #[test]
     fn backups_use_the_local_engines_keys() {
-        let mongo = backup_key(
-            "tenant",
-            &service("mongodb", Some(3)),
-            "u1",
-            WorkerServiceKind::Dump(DumpEngine::Mongodb),
-        );
-        assert!(
-            mongo.starts_with("tenant/external_services/mongodb/orders/"),
-            "{mongo}"
-        );
-        assert!(mongo.ends_with("/u1/dump.archive"), "{mongo}");
         let redis = backup_key(
             "",
             &service("redis", Some(3)),
@@ -526,7 +576,10 @@ mod tests {
             "s3://backups/redis/base_000000010000000000000002"
         ));
         let mongo = service("mongodb", Some(3));
-        assert!(restore_location_matches(&mongo, "x/dump.archive"));
+        assert!(
+            !restore_location_matches(&mongo, "x/dump.archive"),
+            "MongoDB restores take the control plane's restore, not this path"
+        );
         let maria = service("mariadb", Some(3));
         assert!(restore_location_matches(&maria, "x/dump.sql.gz"));
         assert!(!restore_location_matches(&maria, "x/base.xbstream"));

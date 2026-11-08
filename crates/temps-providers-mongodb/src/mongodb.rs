@@ -1545,8 +1545,10 @@ impl MongodbService {
         Ok(())
     }
 
-    /// Check if the WAL-G binary is available inside a container.
-    async fn container_has_walg(&self, container_name: &str) -> bool {
+    /// Check if the WAL-G binary is available inside a container: what a
+    /// backup checks to choose between a WAL-G stream and a mongodump
+    /// archive, on the control plane and on every worker.
+    pub async fn container_has_walg(&self, container_name: &str) -> bool {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
 
         let exec = match self

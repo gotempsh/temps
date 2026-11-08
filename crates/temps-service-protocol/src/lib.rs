@@ -663,6 +663,127 @@ pub enum PostgresWalgRestoreResult {
     Failed { reason: String },
 }
 
+/// `POST /agent/services/mongodb/backup`: a backup of a MongoDB service on
+/// the node that runs it, by the control plane's own engine (ADR-099). The
+/// control plane checks the service's image for WAL-G, as it does for a
+/// local one, and names the kind of backup in `mode`: `wal-g backup-push`
+/// streaming `mongodump --archive` into the service's WAL-G repository, or a
+/// pinned `mongodump --archive --gzip` helper writing one archive object at
+/// the key the control plane chose. `destination` is a credential scoped to
+/// exactly that repository or that archive's directory (ADR-093), so the node
+/// cannot pick another.
+///
+/// Names no command, image, host or path: the container follows from the
+/// service's name, the WAL-G prefix from the bucket, `bucket_path` and the
+/// service's name, and the commands are fixed in the engine. The archive key
+/// is checked against the same layout before anything is written.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MongodbBackupRequest {
+    pub service_id: i32,
+    /// The node the service runs on, for its messages.
+    pub node_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+    /// The backup's id, in WAL-G's sentinel and in the archive's key.
+    pub backup_uuid: String,
+    /// The backup the control plane granted `destination` for.
+    pub mode: MongodbBackupMode,
+}
+
+/// The kind of MongoDB backup a [`MongodbBackupRequest`] takes, chosen by
+/// the control plane so that its credential can be scoped to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MongodbBackupMode {
+    /// `wal-g backup-push` into the service's WAL-G repository. A container
+    /// without WAL-G fails the backup (retryable: the next attempt checks the
+    /// image again) instead of taking an archive it has no credential for.
+    WalgStream,
+    /// A mongodump archive uploaded to exactly `key`, which must be this
+    /// service's and backup's archive key.
+    Archive { key: String },
+}
+
+/// What a [`MongodbBackupRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MongodbBackupResult {
+    /// WAL-G streamed the dump into the service's WAL-G repository.
+    WalgStream {
+        /// The end of `wal-g backup-push`'s output.
+        stdout: String,
+        stderr: String,
+    },
+    /// The image has no WAL-G: a gzipped mongodump archive was uploaded to
+    /// `key`.
+    Archive { key: String, size_bytes: u64 },
+    /// Nothing was changed and retrying cannot change that.
+    Refused { reason: String },
+    /// The backup failed; a retry may succeed.
+    Failed { reason: String },
+}
+
+/// `POST /agent/services/mongodb/restore`: the control plane's in-place
+/// restore of a worker's MongoDB, run on its node against its container
+/// (ADR-099): a WAL-G repository (`s3://…`) is fetched by `wal-g
+/// backup-fetch` inside the container, a mongodump archive (an object key) is
+/// downloaded and replayed by a `mongorestore --drop` sidecar. No command
+/// comes from the caller.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MongodbRestoreRequest {
+    pub service_id: i32,
+    /// The node the service runs on, for its messages.
+    pub node_id: i32,
+    /// The target's own configuration: the login of the server running now.
+    pub service_config: ServiceConfig,
+    /// The backup origin's password, for another service's backup: tried
+    /// when the target's own is refused (an earlier restore already replaced
+    /// `admin.system.users`), as on the control plane.
+    #[serde(default)]
+    pub origin_password: Option<String>,
+    /// The S3 source holding the backup.
+    pub source: WorkerS3Destination,
+    /// The backup: a WAL-G repository `s3://<source's bucket>/…`, or a
+    /// mongodump archive's key in the source's bucket.
+    pub location: String,
+}
+
+impl MongodbRestoreRequest {
+    /// The configuration the engine restores with: the target's, with the
+    /// origin's password as its `_alt_password` fallback, exactly as the
+    /// control plane hands it to the provider.
+    pub fn engine_config(&self) -> ServiceConfig {
+        let mut config = self.service_config.clone();
+        if let (Some(origin), Some(parameters)) = (
+            self.origin_password.as_ref(),
+            config.parameters.as_object_mut(),
+        ) {
+            parameters.insert(
+                "_alt_password".to_string(),
+                serde_json::Value::String(origin.clone()),
+            );
+        }
+        config
+    }
+}
+
+/// What a [`MongodbRestoreRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MongodbRestoreResult {
+    /// The backup was restored into the running service.
+    Completed,
+    /// Nothing was changed: the request cannot run on this service.
+    Refused { reason: String },
+    /// The restore failed.
+    Failed { reason: String },
+}
+
 /// Runs once between creating a replacement container and starting it, with
 /// its id (the agent joins it to the overlay there). Shared, unlike
 /// [`AfterCreate`], because an engine may recreate more than once.
@@ -920,6 +1041,24 @@ pub trait NodeServiceRuntime: Send + Sync {
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
     ) -> Result<PostgresWalgRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's MongoDB backup on this node (see
+    /// [`MongodbBackupRequest`]).
+    async fn mongodb_backup(
+        &self,
+        request: MongodbBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbBackupResult, NodeServiceError>;
+
+    /// Run the control plane's in-place MongoDB restore on this node (see
+    /// [`MongodbRestoreRequest`]).
+    async fn mongodb_restore(
+        &self,
+        request: MongodbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbRestoreResult, NodeServiceError>;
 }
 
 #[cfg(test)]

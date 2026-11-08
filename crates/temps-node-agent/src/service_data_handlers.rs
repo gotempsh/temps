@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
+    MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
     PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
     PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook,
@@ -633,6 +634,176 @@ pub async fn postgres_walg_restore(
     AgentResponse::ok(outcome).into_response()
 }
 
+/// `POST /agent/services/mongodb/backup`: back up a MongoDB service this
+/// node runs with the control plane's own engine (ADR-099). The engine checks
+/// the image for WAL-G as on the control plane: with it, `wal-g backup-push`
+/// streams `mongodump --archive` into the service's WAL-G repository; without
+/// it, a pinned `mongodump --archive --gzip` helper uploads one archive. The
+/// service is never stopped. Engine outcomes come back as 200 with
+/// `walg_stream`, `archive`, `refused` (retrying cannot help) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/mongodb/backup",
+    request_body = MongodbBackupRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<MongodbBackupResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Backup deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn mongodb_backup(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<MongodbBackupRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("back up", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("back up", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.destination.bucket,
+        "Backing up a MongoDB service on this node with the control plane's engine"
+    );
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .mongodb_backup(request, engine_docker, published_address)
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "MongoDB backup could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB backup of service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "MongoDB backup panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB backup of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("MongoDB backup", &service),
+    };
+    match &outcome {
+        MongodbBackupResult::WalgStream { .. } => {
+            tracing::info!(service = %service, "MongoDB WAL-G stream backup completed");
+        }
+        MongodbBackupResult::Archive { key, size_bytes } => {
+            tracing::info!(service = %service, %key, size_bytes, "MongoDB archive backup completed");
+        }
+        MongodbBackupResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "MongoDB backup refused");
+        }
+        MongodbBackupResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "MongoDB backup failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// `POST /agent/services/mongodb/restore`: restore a MongoDB service this
+/// node runs, in place, with the control plane's own restore (the provider's
+/// `restore_in_place`): `wal-g backup-fetch` in the container for a WAL-G
+/// repository, a `mongorestore --drop` sidecar for an archive. Runs in a task
+/// of its own, so a control plane that stops waiting cannot interrupt it.
+/// Engine outcomes come back as 200 with `completed`, `refused` (nothing was
+/// changed) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/mongodb/restore",
+    request_body = MongodbRestoreRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<MongodbRestoreResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Restore deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn mongodb_restore(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<MongodbRestoreRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("restore", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("restore", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.source.bucket,
+        location = %request.location,
+        "Restoring a MongoDB service on this node with the control plane's restore"
+    );
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .mongodb_restore(request, engine_docker, published_address)
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "MongoDB restore could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB restore of service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "MongoDB restore panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB restore of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("MongoDB restore", &service),
+    };
+    match &outcome {
+        MongodbRestoreResult::Completed => {
+            tracing::info!(service = %service, "MongoDB restore completed");
+        }
+        MongodbRestoreResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "MongoDB restore refused");
+        }
+        MongodbRestoreResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "MongoDB restore failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +834,8 @@ mod tests {
                 "/agent/services/postgres/walg-credentials",
                 post(postgres_walg_credentials),
             )
+            .route("/agent/services/mongodb/backup", post(mongodb_backup))
+            .route("/agent/services/mongodb/restore", post(mongodb_restore))
             .with_state(state)
     }
 
@@ -978,6 +1151,154 @@ mod tests {
         assert_eq!(
             node.network.as_deref(),
             Some(temps_core::NETWORK_NAME.as_str())
+        );
+    }
+
+    fn mongodb_backup_body() -> serde_json::Value {
+        serde_json::json!({
+            "service_id": 8,
+            "node_id": 2,
+            "service_config": {
+                "name": "orders",
+                "service_type": "mongodb",
+                "version": null,
+                "parameters": {"host": "localhost", "port": "27017"}
+            },
+            "destination": backup_body(None)["destination"].clone(),
+            "bucket_path": "base",
+            "backup_uuid": "u-1",
+            "mode": {
+                "kind": "archive",
+                "key": "base/external_services/mongodb/orders/2026/11/09/u-1/dump.archive"
+            }
+        })
+    }
+
+    fn mongodb_restore_body() -> serde_json::Value {
+        serde_json::json!({
+            "service_id": 8,
+            "node_id": 2,
+            "service_config": mongodb_backup_body()["service_config"].clone(),
+            "origin_password": "origin",
+            "source": backup_body(None)["destination"].clone(),
+            "location": "s3://backups/external_services/mongodb/orders/walg"
+        })
+    }
+
+    /// A MongoDB backup names no command, image, path, key or attachment:
+    /// the engine runs on this node with the published address the node's
+    /// own probes use, and a failure to run names the service.
+    #[tokio::test]
+    async fn a_mongodb_backup_runs_the_engine_and_takes_nothing_to_run() {
+        for field in [
+            "command",
+            "image",
+            "key",
+            "walg_prefix",
+            "host_ip",
+            "container",
+        ] {
+            let mut body = mongodb_backup_body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/mongodb/backup",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+        // The control plane names the backup its credential was scoped to
+        // (ADR-099, ADR-093): a request without one, or with a kind the node
+        // does not know, is refused before anything runs.
+        for mode in [
+            serde_json::Value::Null,
+            serde_json::json!({"kind": "anything"}),
+            serde_json::json!({"kind": "archive"}),
+        ] {
+            let mut body = mongodb_backup_body();
+            if mode.is_null() {
+                body.as_object_mut().expect("an object").remove("mode");
+            } else {
+                body["mode"] = mode.clone();
+            }
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/mongodb/backup",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mode}");
+        }
+
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state),
+            "/agent/services/mongodb/backup",
+            mongodb_backup_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("MongoDB backup of service 'orders' could not run"),
+            "{error}"
+        );
+        let asked = runtime.mongodb_backups.lock().expect("mongodb_backups");
+        let [(request, _)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.service_id, 8);
+        assert_eq!(request.bucket_path, "base");
+        assert_eq!(request.backup_uuid, "u-1");
+        assert_eq!(
+            request.mode,
+            temps_service_protocol::MongodbBackupMode::Archive {
+                key: "base/external_services/mongodb/orders/2026/11/09/u-1/dump.archive".into()
+            }
+        );
+    }
+
+    /// A MongoDB restore takes a service, a source and a location only; the
+    /// origin's password arrives as sent, and a failure to run names the
+    /// service.
+    #[tokio::test]
+    async fn a_mongodb_restore_runs_the_engine_and_takes_nothing_to_run() {
+        for field in ["command", "image", "container", "host_ip", "sidecar_image"] {
+            let mut body = mongodb_restore_body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/mongodb/restore",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state),
+            "/agent/services/mongodb/restore",
+            mongodb_restore_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("MongoDB restore of service 'orders' could not run"),
+            "{error}"
+        );
+        let asked = runtime.mongodb_restores.lock().expect("mongodb_restores");
+        let [(request, _)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.origin_password.as_deref(), Some("origin"));
+        assert_eq!(
+            request.location,
+            "s3://backups/external_services/mongodb/orders/walg"
         );
     }
 

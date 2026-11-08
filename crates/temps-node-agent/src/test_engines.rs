@@ -50,6 +50,20 @@ pub(crate) struct StubRuntime {
             temps_service_protocol::NodeAttachment,
         )>,
     >,
+    /// The MongoDB backups asked for, with the published address.
+    pub(crate) mongodb_backups: Mutex<
+        Vec<(
+            temps_service_protocol::MongodbBackupRequest,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
+    /// The MongoDB restores asked for, with the published address.
+    pub(crate) mongodb_restores: Mutex<
+        Vec<(
+            temps_service_protocol::MongodbRestoreRequest,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
     /// The WAL-G restores asked for, with the attachment and published
     /// address.
     pub(crate) walg_restores: Mutex<
@@ -233,6 +247,32 @@ impl NodeServiceRuntime for StubRuntime {
             .expect("walg_restores")
             .push((request, node, published_address));
         Err(not_available("postgres_walg_restore"))
+    }
+
+    async fn mongodb_backup(
+        &self,
+        request: temps_service_protocol::MongodbBackupRequest,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MongodbBackupResult, NodeServiceError> {
+        self.mongodb_backups
+            .lock()
+            .expect("mongodb_backups")
+            .push((request, published_address));
+        Err(not_available("mongodb_backup"))
+    }
+
+    async fn mongodb_restore(
+        &self,
+        request: temps_service_protocol::MongodbRestoreRequest,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MongodbRestoreResult, NodeServiceError> {
+        self.mongodb_restores
+            .lock()
+            .expect("mongodb_restores")
+            .push((request, published_address));
+        Err(not_available("mongodb_restore"))
     }
 }
 

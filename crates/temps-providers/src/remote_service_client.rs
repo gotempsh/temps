@@ -17,10 +17,11 @@ pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCr
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
-    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
-    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
-    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget,
-    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    MongodbBackupMode, MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest,
+    MongodbRestoreResult, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
+    PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
+    RecoveryTarget, RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
     RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
     RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
     RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
@@ -567,6 +568,53 @@ impl RemoteServiceClient {
         );
         self.agent_post_with_timeout(
             "/agent/services/postgres/walg-restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Back up a worker's MongoDB with the control plane's own engine, run
+    /// by the node's agent (ADR-099): a WAL-G stream when the image has
+    /// WAL-G, else a mongodump archive. The destination's credentials and
+    /// the service's travel only in the sealed body; an agent without the
+    /// route is told to update.
+    pub async fn mongodb_backup(
+        &self,
+        request: &MongodbBackupRequest,
+    ) -> Result<MongodbBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Backing up a MongoDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mongodb/backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's MongoDB in place with the control plane's own
+    /// restore, run by the node's agent. The source's credentials and the
+    /// logins travel sealed; an agent without the route is told to update.
+    pub async fn mongodb_restore(
+        &self,
+        request: &MongodbRestoreRequest,
+    ) -> Result<MongodbRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            location = %request.location,
+            "Restoring a MongoDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mongodb/restore",
             request,
             DATA_OPERATION_TIMEOUT,
         )
@@ -1978,6 +2026,131 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A MongoDB backup and restore reach the node sealed, with the
+    /// destination's credentials and the origin's password unreadable on
+    /// the wire, and their outcomes come back as they are. An agent without
+    /// the routes is told to update, never served another path.
+    #[tokio::test]
+    async fn mongodb_backups_and_restores_are_sealed_to_the_node() {
+        async fn backup(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            for secret in ["destination-secret", "db-password"] {
+                assert!(
+                    !String::from_utf8_lossy(&sealed).contains(secret),
+                    "{secret} readable on the wire"
+                );
+            }
+            let request: MongodbBackupRequest =
+                open_for_test(&headers, "/agent/services/mongodb/backup", &sealed);
+            assert_eq!(request.service_id, 8);
+            assert_eq!(request.bucket_path, "base");
+            assert_eq!(request.backup_uuid, "u-1");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "walg_stream", "stdout": "", "stderr": "done"},
+                "error": null
+            }))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            assert!(!String::from_utf8_lossy(&sealed).contains("origin-password"));
+            let request: MongodbRestoreRequest =
+                open_for_test(&headers, "/agent/services/mongodb/restore", &sealed);
+            assert_eq!(request.origin_password.as_deref(), Some("origin-password"));
+            assert_eq!(request.location, "s3://backups/walg");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"status": "failed", "reason": "no backups"},
+                "error": null
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/mongodb/backup", post(backup))
+                    .route("/agent/services/mongodb/restore", post(restore)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "password": "db-password"}),
+        };
+        let backup_request = MongodbBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config.clone(),
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-1".to_string(),
+            mode: MongodbBackupMode::WalgStream,
+        };
+        let restore_request = MongodbRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config,
+            origin_password: Some("origin-password".to_string()),
+            source: worker_destination(),
+            location: "s3://backups/walg".to_string(),
+        };
+        assert_eq!(
+            client(address)
+                .mongodb_backup(&backup_request)
+                .await
+                .unwrap(),
+            MongodbBackupResult::WalgStream {
+                stdout: String::new(),
+                stderr: "done".to_string()
+            }
+        );
+        assert_eq!(
+            client(address)
+                .mongodb_restore(&restore_request)
+                .await
+                .unwrap(),
+            MongodbRestoreResult::Failed {
+                reason: "no backups".to_string()
+            }
+        );
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let backup_error = client(older)
+            .mongodb_backup(&backup_request)
+            .await
+            .expect_err("an older agent cannot back up MongoDB with the engine");
+        let restore_error = client(older)
+            .mongodb_restore(&restore_request)
+            .await
+            .expect_err("an older agent cannot restore MongoDB with the engine");
+        server.abort();
+        for (error, route) in [
+            (backup_error, "/agent/services/mongodb/backup"),
+            (restore_error, "/agent/services/mongodb/restore"),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains(route), "{message}");
+            assert!(message.contains("Update the node's agent"), "{message}");
+        }
     }
 
     /// An archive re-point reaches the node sealed, with the destination's
