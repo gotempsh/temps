@@ -12,6 +12,7 @@ import {
   outcomeTone,
   recordOwner,
   recordTarget,
+  resolverHealthMeta,
   resolverVerdict,
   trafficPoints,
   trafficTotals,
@@ -93,6 +94,22 @@ describe('resolverVerdict', () => {
     expect(
       resolverVerdict([resolver({ health: 'agent_too_old' })], true)
     ).toEqual({ tone: 'warn', label: '1 resolver needs attention' })
+  })
+
+  test('a control plane that runs no resolver is not a problem', () => {
+    // A hosted plane: no containers run on the control plane.
+    const controlPlane = resolver({
+      node_id: 0,
+      is_control_plane: true,
+      health: 'no_local_resolver',
+    })
+    expect(resolverHealthMeta('no_local_resolver')).toEqual({
+      label: 'No local resolver',
+      tone: 'idle',
+    })
+    expect(
+      resolverVerdict([controlPlane, resolver({ node_id: 1 })], true)
+    ).toEqual({ tone: 'ok', label: 'All resolvers healthy' })
   })
 
   test('off and unavailable nodes do not make the cluster unhealthy', () => {

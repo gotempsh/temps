@@ -58743,7 +58743,8 @@
           "off",
           "node_unavailable",
           "agent_too_old",
-          "not_reporting"
+          "not_reporting",
+          "no_local_resolver"
         ],
         "type": "string"
       },
