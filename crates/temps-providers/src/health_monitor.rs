@@ -94,6 +94,25 @@ pub enum HealthMonitorError {
     },
 }
 
+/// A worker MariaDB's binary-log archiving credential and what it was minted
+/// for.
+struct BinlogArchiveCredential {
+    s3_source_id: i32,
+    node_id: i32,
+    minted_at: Instant,
+    destination: crate::remote_service_client::WorkerS3Destination,
+}
+
+impl BinlogArchiveCredential {
+    /// Whether a run for `s3_source_id` on `node_id` may reuse it.
+    fn reusable_for(&self, s3_source_id: i32, node_id: i32) -> bool {
+        self.s3_source_id == s3_source_id
+            && self.node_id == node_id
+            && self.minted_at.elapsed()
+                < crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
+    }
+}
+
 /// Background loop that keeps `external_services.health_status` in sync with
 /// reality and sends alerts when a service stays down for 3+ consecutive checks.
 pub struct ExternalServiceHealthMonitor {
@@ -111,9 +130,13 @@ pub struct ExternalServiceHealthMonitor {
     /// service id. The health loop ticks every `poll_interval_secs`; we gate
     /// archiving so it only fires once per service's `binlog_archive_interval`.
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
-    /// MariaDB services on worker nodes whose missing binlog shipping has
-    /// been logged, so it is logged once per service, not every tick.
-    binlog_gap_logged: Arc<Mutex<std::collections::HashSet<i32>>>,
+    /// The scoped credential each worker MariaDB ships its binary logs with
+    /// (ADR-093), keyed by service id: reused across archive runs and minted
+    /// again every [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`], when the service
+    /// moves to another node or source, or after a run that failed.
+    ///
+    /// [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`]: crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
+    binlog_archive_credentials: Arc<Mutex<HashMap<i32, BinlogArchiveCredential>>>,
     /// Optional metrics store. When set, container CPU/memory samples for
     /// running services with `metrics_enabled` are written to it on every
     /// health tick (`container.cpu_percent`, `container.memory_used_bytes`,
@@ -144,7 +167,7 @@ impl ExternalServiceHealthMonitor {
             docker,
             encryption_service,
             last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
-            binlog_gap_logged: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            binlog_archive_credentials: Arc::new(Mutex::new(HashMap::new())),
             metrics_store: None,
             stats_baselines: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -414,22 +437,15 @@ impl ExternalServiceHealthMonitor {
         //    MariaDB services that have a backup schedule (→ S3 destination).
         //    Failures here never affect health monitoring of other services.
         //
-        //    Not for a MariaDB on a worker node: the shipper reads closed
-        //    binlog segments out of the container through this host's Docker,
-        //    and a worker's container is not on it. Shipping from the worker
-        //    needs an agent route that does not exist yet, so such a service
-        //    has no binlog archive and no point-in-time recovery beyond its
-        //    base backups. That is logged once per service per process, so it
-        //    is not a silent gap.
+        //    A MariaDB on a worker node is shipped by the same archiver, run
+        //    by its node's agent (ADR-099); the destination, its pin and the
+        //    cadence are decided here either way.
         if service.service_type == "mariadb"
             && service.topology == "standalone"
             && service.status == "running"
             && !matches!(status, HealthProbeStatus::Down)
         {
-            match service.node_id {
-                None => self.maybe_archive_mariadb_binlogs(service).await,
-                Some(node_id) => self.note_worker_binlog_gap(service, node_id).await,
-            }
+            self.maybe_archive_mariadb_binlogs(service).await;
         }
 
         // 5. Container resource metrics: sample docker stats for every
@@ -705,21 +721,30 @@ impl ExternalServiceHealthMonitor {
         };
         let s3_client = creds.build_s3_client().await;
 
-        let docker_client = match self.docker.get() {
-            Some(d) => d,
-            None => {
-                info!(
-                    service_id = service.id,
-                    "Docker unavailable on this process; skipping MariaDB binlog archiving"
-                );
-                return;
-            }
+        let worker_node = match crate::services::service_execution_route(service.node_id) {
+            crate::services::ServiceExecutionRoute::Remote(node_id) => Some(node_id),
+            _ => None,
         };
-        let mariadb = MariaDbService::new(service.name.clone(), docker_client.clone());
-        match mariadb
-            .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
-            .await
-        {
+        let shipped = match worker_node {
+            None => {
+                let Some(docker_client) = self.docker.get() else {
+                    info!(
+                        service_id = service.id,
+                        "Docker unavailable on this process; skipping MariaDB binlog archiving"
+                    );
+                    return;
+                };
+                MariaDbService::new(service.name.clone(), docker_client.clone())
+                    .archive_binlogs(&s3_client, &s3_source, &mariadb_config)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Some(node_id) => self
+                .archive_worker_mariadb_binlogs(service, node_id, &s3_source)
+                .await
+                .map_err(|reason| format!("on worker node {node_id}: {reason}")),
+        };
+        match shipped {
             Ok(shipped) => {
                 if shipped > 0 {
                     info!(
@@ -731,8 +756,21 @@ impl ExternalServiceHealthMonitor {
                     // Retention counterpart to the ship. Only after something
                     // new landed — a no-op tick cannot have made an older
                     // segment newly unreachable, so there is nothing to prune.
-                    self.prune_mariadb_binlogs(service, &mariadb, &s3_client, &s3_source)
-                        .await;
+                    // The prune reads and deletes S3 objects only; the engine
+                    // handle it goes through is built on this host's Docker.
+                    match self.docker.get() {
+                        Some(docker_client) => {
+                            let mariadb =
+                                MariaDbService::new(service.name.clone(), docker_client.clone());
+                            self.prune_mariadb_binlogs(service, &mariadb, &s3_client, &s3_source)
+                                .await;
+                        }
+                        None => debug!(
+                            service_id = service.id,
+                            "No Docker handle on this process; archived MariaDB binlogs are \
+                             pruned on a later run of a server that has one"
+                        ),
+                    }
                 }
             }
             Err(e) => {
@@ -984,20 +1022,81 @@ impl ExternalServiceHealthMonitor {
         })
     }
 
-    /// Log, once per service per process, that a MariaDB on a worker node
-    /// has no binlog shipping (see the gate in `check_service`).
-    async fn note_worker_binlog_gap(&self, service: &external_services::Model, node_id: i32) {
-        if !self.binlog_gap_logged.lock().await.insert(service.id) {
-            return;
+    /// Ship the closed binary logs of `service`, a MariaDB on worker
+    /// `node_id`, to `s3_source` with the control plane's archiver run by the
+    /// node's agent, under a credential scoped to the service's `binlog/`
+    /// prefix (ADR-093), never the source's own. Returns how many segments
+    /// were shipped.
+    async fn archive_worker_mariadb_binlogs(
+        &self,
+        service: &external_services::Model,
+        node_id: i32,
+        s3_source: &s3_sources::Model,
+    ) -> Result<usize, String> {
+        use crate::remote_service_client::MariadbBinlogArchiveResult;
+        let destination = self
+            .binlog_archive_destination(service, node_id, s3_source)
+            .await?;
+        let result = self
+            .manager
+            .mariadb_binlog_archive_worker(service.id, destination, s3_source.bucket_path.clone())
+            .await;
+        let shipped = match result {
+            Ok(MariadbBinlogArchiveResult::Completed { shipped }) => Ok(shipped),
+            Ok(
+                MariadbBinlogArchiveResult::Refused { reason }
+                | MariadbBinlogArchiveResult::Failed { reason },
+            ) => {
+                debug!(service_id = service.id, node_id, %reason, "Worker binlog archive did not complete");
+                Err(reason)
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if shipped.is_err() {
+            // The credential may be what failed (revoked, expired early):
+            // the next run mints another instead of repeating the failure
+            // for the rest of the refresh interval.
+            self.binlog_archive_credentials
+                .lock()
+                .await
+                .remove(&service.id);
         }
-        warn!(
-            service_id = service.id,
-            service = %service.name,
-            node_id,
-            "MariaDB binlog archiving is not run for databases on worker nodes yet: closed \
-             binlog segments of this service are not shipped to S3, so point-in-time recovery \
-             is limited to its base backups"
+        shipped
+    }
+
+    /// The cached binary-log archiving credential of `service` on `node_id`
+    /// for `s3_source`, or a new one from the manager when there is none,
+    /// it is due for refresh, or it was minted for another node or source.
+    async fn binlog_archive_destination(
+        &self,
+        service: &external_services::Model,
+        node_id: i32,
+        s3_source: &s3_sources::Model,
+    ) -> Result<crate::remote_service_client::WorkerS3Destination, String> {
+        if let Some(cached) = self
+            .binlog_archive_credentials
+            .lock()
+            .await
+            .get(&service.id)
+            .filter(|cached| cached.reusable_for(s3_source.id, node_id))
+        {
+            return Ok(cached.destination.clone());
+        }
+        let destination = self
+            .manager
+            .mariadb_binlog_archive_destination(service, node_id, s3_source)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.binlog_archive_credentials.lock().await.insert(
+            service.id,
+            BinlogArchiveCredential {
+                s3_source_id: s3_source.id,
+                node_id,
+                minted_at: Instant::now(),
+                destination: destination.clone(),
+            },
         );
+        Ok(destination)
     }
 
     /// Run the WAL/archive probe for a standalone Postgres service.
@@ -1222,5 +1321,33 @@ mod tests {
     fn failed_and_unknown_services_are_down() {
         assert_eq!(lifecycle_probe("failed"), LifecycleProbe::Down);
         assert_eq!(lifecycle_probe("something-new"), LifecycleProbe::Down);
+    }
+
+    /// A worker MariaDB's binary-log credential is reused only for the node
+    /// and source it was minted for, and only inside the refresh interval.
+    #[test]
+    fn a_binlog_credential_is_reused_only_where_and_while_it_was_minted() {
+        let credential = |minted_at: Instant| BinlogArchiveCredential {
+            s3_source_id: 4,
+            node_id: 2,
+            minted_at,
+            destination: crate::remote_service_client::WorkerS3Destination {
+                bucket: "b".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                force_path_style: true,
+                access_key_id: "scoped".to_string(),
+                secret_access_key: "scoped".to_string(),
+                session_token: Some("t".to_string()),
+            },
+        };
+        let fresh = credential(Instant::now());
+        assert!(fresh.reusable_for(4, 2));
+        assert!(!fresh.reusable_for(5, 2), "another source");
+        assert!(!fresh.reusable_for(4, 3), "another node");
+        let refresh = crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL;
+        if let Some(due) = Instant::now().checked_sub(refresh + Duration::from_secs(1)) {
+            assert!(!credential(due).reusable_for(4, 2), "due for refresh");
+        }
     }
 }

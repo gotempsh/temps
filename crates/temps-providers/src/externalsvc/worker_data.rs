@@ -55,12 +55,11 @@ use temps_service_protocol::{
 use tracing::{info, warn};
 
 use super::managed_s3::S3Location;
-use super::naming::shell_escape;
 use super::{
     managed_instance_name, resolve_runtime_target, EngineError, ExternalService, GarageService,
     ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection, ManagedS3Error,
-    MariaDbService, MongodbService, RuntimeProvisioningError, RustfsService, S3Credentials,
-    SensitiveValues, ServiceConfig, ServiceType,
+    MongodbService, RuntimeProvisioningError, RustfsService, S3Credentials, SensitiveValues,
+    ServiceConfig, ServiceType,
 };
 
 /// Size of one uploaded part, and so the memory one dump holds. S3 allows
@@ -92,7 +91,6 @@ fn helper_host_config() -> HostConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DumpEngine {
     Mongodb,
-    Mariadb,
 }
 
 impl DumpEngine {
@@ -101,7 +99,9 @@ impl DumpEngine {
     pub fn for_service_type(service_type: ServiceType) -> Option<Self> {
         match service_type {
             ServiceType::Mongodb => Some(Self::Mongodb),
-            ServiceType::Mariadb => Some(Self::Mariadb),
+            // Redis and MariaDB on a worker take the control plane's own
+            // engines, run by the agent (`redis_node`, `mariadb_node`), never a
+            // dump helper.
             _ => None,
         }
     }
@@ -111,21 +111,18 @@ impl DumpEngine {
     pub fn file_suffix(self) -> &'static str {
         match self {
             Self::Mongodb => "dump.archive",
-            Self::Mariadb => "dump.sql.gz",
         }
     }
 
     fn tool(self) -> &'static str {
         match self {
             Self::Mongodb => "mongodump",
-            Self::Mariadb => "mariadb-dump",
         }
     }
 
     fn internal_port(self) -> u16 {
         match self {
             Self::Mongodb => 27017,
-            Self::Mariadb => 3306,
         }
     }
 }
@@ -413,7 +410,6 @@ fn dump_instance(
     let name = managed_instance_name(&config.name, config.service_type);
     match engine {
         DumpEngine::Mongodb => Box::new(MongodbService::new(name, docker)),
-        DumpEngine::Mariadb => Box::new(MariaDbService::new(name, docker)),
     }
 }
 
@@ -450,9 +446,14 @@ fn storage_backend(
                     .to_string(),
             ))
         }
-        ServiceType::Mongodb | ServiceType::Mariadb => {
-            return Err(unsupported("the service is not storage".to_string()))
+        ServiceType::Mariadb => {
+            return Err(unsupported(
+                "MariaDB on a worker is backed up and restored by the control plane's MariaDB \
+                 engines through the agent's /agent/services/mariadb routes"
+                    .to_string(),
+            ))
         }
+        ServiceType::Mongodb => return Err(unsupported("the service is not storage".to_string())),
     };
     // The providers need an encryption service at construction; the mirror
     // never uses it, so a fresh request-local key is enough.
@@ -652,27 +653,12 @@ pub(crate) fn dump_credentials(
             }
             DumpCredentials { username, password }
         }
-        DumpEngine::Mariadb => {
-            let configured = text("root_password");
-            let password = if configured.is_empty() {
-                env("MARIADB_ROOT_PASSWORD")
-                    .or_else(|| env("MYSQL_ROOT_PASSWORD"))
-                    .unwrap_or_default()
-            } else {
-                configured
-            };
-            DumpCredentials {
-                username: "root".to_string(),
-                password,
-            }
-        }
     }
 }
 
 /// The dump of `engine` against `host` (the service's container on the
 /// shared network), written to stdout.
 pub(crate) fn dump_plan(engine: DumpEngine, host: &str, credentials: &DumpCredentials) -> DumpPlan {
-    let quoted_host = shell_escape(host);
     let port = engine.internal_port();
     match engine {
         // The URI is one token that cannot be read as a flag, and keeps the
@@ -685,30 +671,6 @@ pub(crate) fn dump_plan(engine: DumpEngine, host: &str, credentials: &DumpCreden
                 urlencoding::encode(&credentials.password),
                 host,
             )],
-        },
-        // The local engine's dump (every user database, one transaction),
-        // over the network. POSIX `sh` has no `pipefail`, so the dump's own
-        // status is carried out of the pipeline in a file. Schema names are
-        // data a database user controls: each is one argument (split on
-        // newlines only, `set -f`: never globbed) after `--`, so one named
-        // like an option cannot redirect the dump and the password with it.
-        DumpEngine::Mariadb => DumpPlan {
-            script: format!(
-                "set -f\n\
-                 if command -v mariadb-dump >/dev/null 2>&1; then dump=mariadb-dump; else dump=mysqldump; fi\n\
-                 if command -v mariadb >/dev/null 2>&1; then client=mariadb; else client=mysql; fi\n\
-                 dbs=$($client -h {quoted_host} -P {port} -N -B -u{user} -e \"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys') ORDER BY SCHEMA_NAME\") || exit 3\n\
-                 if [ -z \"$dbs\" ]; then echo '-- No user databases to dump' | gzip; exit 0; fi\n\
-                 IFS='\n'; set -- $dbs; unset IFS\n\
-                 rc=\"${{TMPDIR:-/tmp}}/temps-backup.rc\"\n\
-                 {{ $dump -h {quoted_host} -P {port} --single-transaction --quick -u{user} --databases -- \"$@\"; echo $? > \"$rc\"; }} | gzip\n\
-                 [ \"$(cat \"$rc\")\" = 0 ]",
-                user = shell_escape(&credentials.username),
-            ),
-            env: vec![
-                format!("MYSQL_PWD={}", credentials.password),
-                format!("MARIADB_PWD={}", credentials.password),
-            ],
         },
     }
 }
@@ -1021,7 +983,7 @@ pub(crate) async fn stream_helper_to_s3(
 
 /// An S3 multipart upload fed one buffered part at a time. Aborted when
 /// dropped before it completed, so a cancelled dump leaves no parts behind.
-struct MultipartUpload {
+pub(crate) struct MultipartUpload {
     client: aws_sdk_s3::Client,
     bucket: String,
     key: String,
@@ -1039,16 +1001,34 @@ impl MultipartUpload {
         key: &str,
         service: &str,
     ) -> Result<Self, WorkerDataError> {
+        Self::start_in(
+            client,
+            &destination.bucket,
+            key,
+            service,
+            "application/octet-stream",
+        )
+        .await
+    }
+
+    /// Start an upload of `key` in `bucket`, stored as `content_type`.
+    pub(crate) async fn start_in(
+        client: aws_sdk_s3::Client,
+        bucket: &str,
+        key: &str,
+        service: &str,
+        content_type: &str,
+    ) -> Result<Self, WorkerDataError> {
         let created = client
             .create_multipart_upload()
-            .bucket(&destination.bucket)
+            .bucket(bucket)
             .key(key)
-            .content_type("application/octet-stream")
+            .content_type(content_type)
             .send()
             .await
             .map_err(|error| WorkerDataError::Upload {
                 service: service.to_string(),
-                bucket: destination.bucket.clone(),
+                bucket: bucket.to_string(),
                 key: key.to_string(),
                 reason: format!(
                     "starting the upload: {}",
@@ -1057,13 +1037,13 @@ impl MultipartUpload {
             })?;
         let upload_id = created.upload_id.ok_or_else(|| WorkerDataError::Upload {
             service: service.to_string(),
-            bucket: destination.bucket.clone(),
+            bucket: bucket.to_string(),
             key: key.to_string(),
             reason: "the storage returned no upload id".to_string(),
         })?;
         Ok(Self {
             client,
-            bucket: destination.bucket.clone(),
+            bucket: bucket.to_string(),
             key: key.to_string(),
             service: service.to_string(),
             upload_id: Some(upload_id),
@@ -1082,7 +1062,12 @@ impl MultipartUpload {
         }
     }
 
-    async fn write(&mut self, bytes: &[u8]) -> Result<(), WorkerDataError> {
+    /// Bytes written so far.
+    pub(crate) fn written(&self) -> u64 {
+        self.total
+    }
+
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<(), WorkerDataError> {
         self.buffer.extend_from_slice(bytes);
         self.total += bytes.len() as u64;
         if self.buffer.len() >= PART_SIZE {
@@ -1130,7 +1115,7 @@ impl MultipartUpload {
         Ok(())
     }
 
-    async fn finish(mut self) -> Result<u64, WorkerDataError> {
+    pub(crate) async fn finish(mut self) -> Result<u64, WorkerDataError> {
         let result = self.complete().await;
         if result.is_err() {
             self.abort().await;
@@ -1165,7 +1150,7 @@ impl MultipartUpload {
         Ok(self.total)
     }
 
-    async fn abort(&mut self) {
+    pub(crate) async fn abort(&mut self) {
         let Some(upload_id) = self.upload_id.take() else {
             return;
         };
@@ -1225,11 +1210,13 @@ mod tests {
             Some("dump.archive")
         );
         assert_eq!(
-            DumpEngine::for_service_type(ServiceType::Mariadb).map(DumpEngine::file_suffix),
-            Some("dump.sql.gz")
+            DumpEngine::for_service_type(ServiceType::Mongodb),
+            Some(DumpEngine::Mongodb)
         );
-        // Redis takes the control plane's engine on the node, never a dump.
+        // Redis and MariaDB take the control plane's engines on the node,
+        // never a dump.
         for storage in [
+            ServiceType::Mariadb,
             ServiceType::S3,
             ServiceType::Rustfs,
             ServiceType::Blob,
@@ -1262,27 +1249,21 @@ mod tests {
         );
     }
 
-    /// No password reaches argv: each engine's credential travels in the
-    /// helper's environment, and the dump connects to the service's
-    /// container by name on the shared network.
+    /// No password reaches argv: the credential travels in the helper's
+    /// environment, and the dump connects to the service's container by
+    /// name on the shared network.
     #[test]
     fn dump_plans_keep_credentials_out_of_the_script() {
-        for engine in [DumpEngine::Mongodb, DumpEngine::Mariadb] {
-            let plan = dump_plan(engine, "temps-svc-orders", &credentials());
-            assert!(
-                !plan.script.contains(PASSWORD),
-                "{engine:?}: {}",
-                plan.script
-            );
-            assert!(!plan.script.contains("--password"), "{engine:?}");
-            assert!(
-                plan.env
-                    .iter()
-                    .any(|entry| entry.contains("temps-svc-orders")
-                        || plan.script.contains("temps-svc-orders")),
-                "{engine:?} must target the container: {plan:?}"
-            );
-        }
+        let plan = dump_plan(DumpEngine::Mongodb, "temps-svc-orders", &credentials());
+        assert!(!plan.script.contains(PASSWORD), "{}", plan.script);
+        assert!(!plan.script.contains("--password"));
+        assert!(
+            plan.env
+                .iter()
+                .any(|entry| entry.contains("temps-svc-orders")
+                    || plan.script.contains("temps-svc-orders")),
+            "the dump must target the container: {plan:?}"
+        );
         let mongo = dump_plan(DumpEngine::Mongodb, "temps-mongodb-orders", &credentials());
         assert!(mongo.script.contains("--archive --gzip"));
         assert_eq!(mongo.env.len(), 1);
@@ -1292,26 +1273,6 @@ mod tests {
             !mongo.env[0].contains(PASSWORD),
             "the URI percent-encodes it"
         );
-
-        let maria = dump_plan(DumpEngine::Mariadb, "temps-mariadb-shop", &credentials());
-        assert!(
-            maria.script.starts_with("set -f\n"),
-            "no globbing of database names"
-        );
-        assert!(
-            maria.script.contains("--databases -- \"$@\""),
-            "schema names are arguments after `--`, never options"
-        );
-        assert!(!maria.script.contains("$dbs --"), "{}", maria.script);
-        assert_eq!(
-            maria.env,
-            vec![
-                format!("MYSQL_PWD={PASSWORD}"),
-                format!("MARIADB_PWD={PASSWORD}")
-            ]
-        );
-        assert!(maria.script.contains("--single-transaction"));
-        assert!(maria.script.contains("echo $? > \"$rc\""));
     }
 
     #[test]
@@ -1328,22 +1289,6 @@ mod tests {
         );
         let configured = dump_credentials(DumpEngine::Mongodb, &parameters, &[]);
         assert_eq!(configured.username, "app");
-
-        let maria = dump_credentials(
-            DumpEngine::Mariadb,
-            &serde_json::json!({}),
-            &["MARIADB_ROOT_PASSWORD=from-env".to_string()],
-        );
-        assert_eq!(
-            (maria.username.as_str(), maria.password.as_str()),
-            ("root", "from-env")
-        );
-        let maria = dump_credentials(
-            DumpEngine::Mariadb,
-            &serde_json::json!({ "root_password": "configured" }),
-            &["MARIADB_ROOT_PASSWORD=from-env".to_string()],
-        );
-        assert_eq!(maria.password, "configured");
     }
 
     fn config(service_type: ServiceType, parameters: serde_json::Value) -> ServiceConfig {
@@ -1428,10 +1373,11 @@ mod tests {
         assert_eq!(mirror.session_token.as_deref(), Some("token"));
     }
 
-    /// A backup or restore of a dump engine refuses a key in another format
-    /// before touching Docker.
+    /// MariaDB and Redis on a worker run the control plane's own engines
+    /// (ADR-099): the generic dump routes refuse both, before any container
+    /// call, whatever key they are given.
     #[tokio::test]
-    async fn a_key_in_another_format_is_refused_before_any_container_call() {
+    async fn mariadb_and_redis_are_refused_by_the_generic_dump_routes() {
         let destination = WorkerS3Destination {
             bucket: "b".to_string(),
             region: "us-east-1".to_string(),
@@ -1441,31 +1387,36 @@ mod tests {
             secret_access_key: "s".to_string(),
             session_token: None,
         };
-        let backup = backup_service_on_node(
-            RemoteServiceBackupRequest {
-                service_config: config(ServiceType::Mongodb, serde_json::json!({})),
-                destination: destination.clone(),
-                key: "mongodb/store/1/dump.sql.gz".to_string(),
-            },
-            docker(),
-            None,
-        )
-        .await;
-        assert!(matches!(backup, Err(WorkerDataError::Unsupported { .. })));
-        let restore = restore_service_on_node(
-            RemoteServiceRestoreRequest {
-                service_config: config(ServiceType::Mariadb, serde_json::json!({})),
-                source: destination,
-                location: "mariadb/store/1/dump.rdb.gz".to_string(),
-            },
-            docker(),
-            None,
-        )
-        .await;
-        let Err(error) = restore else {
-            panic!("a Redis dump must not be applied to MariaDB");
-        };
-        assert!(error.to_string().contains("dump.sql.gz"), "{error}");
+        for service_type in [ServiceType::Mariadb, ServiceType::Redis] {
+            let backup = backup_service_on_node(
+                RemoteServiceBackupRequest {
+                    service_config: config(service_type, serde_json::json!({})),
+                    destination: destination.clone(),
+                    key: "store/1/dump.sql.gz".to_string(),
+                },
+                docker(),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(backup, Err(WorkerDataError::Unsupported { .. })),
+                "{service_type:?}"
+            );
+            let restore = restore_service_on_node(
+                RemoteServiceRestoreRequest {
+                    service_config: config(service_type, serde_json::json!({})),
+                    source: destination.clone(),
+                    location: "store/1/dump.sql.gz".to_string(),
+                },
+                docker(),
+                None,
+            )
+            .await;
+            let Err(error) = restore else {
+                panic!("a {service_type:?} restore must not take the generic dump route");
+            };
+            assert!(error.to_string().contains("/agent/services/"), "{error}");
+        }
     }
 
     /// MongoDB on a worker runs the control plane's own engine (ADR-099):
@@ -1562,6 +1513,40 @@ mod tests {
         }
     }
 
+    /// The worker-only MariaDB dump is gone: the generic data routes refuse
+    /// a MariaDB, naming the routes that run the control plane's engines.
+    #[tokio::test]
+    async fn a_mariadb_is_not_handled_by_the_generic_data_routes() {
+        let destination = WorkerS3Destination {
+            bucket: "b".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: true,
+            access_key_id: "a".to_string(),
+            secret_access_key: "s".to_string(),
+            session_token: None,
+        };
+        let error = backup_service_on_node(
+            RemoteServiceBackupRequest {
+                service_config: config(
+                    ServiceType::Mariadb,
+                    serde_json::json!({ "host": "localhost" }),
+                ),
+                destination,
+                key: "external_services/mariadb/store/1/dump.sql.gz".to_string(),
+            },
+            docker(),
+            None,
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            matches!(error, WorkerDataError::Unsupported { .. })
+                && error.to_string().contains("/agent/services/mariadb"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn a_non_loopback_service_host_is_refused() {
         let destination = WorkerS3Destination {
@@ -1576,11 +1561,11 @@ mod tests {
         let result = backup_service_on_node(
             RemoteServiceBackupRequest {
                 service_config: config(
-                    ServiceType::Mariadb,
+                    ServiceType::Redis,
                     serde_json::json!({ "host": "db.example.test" }),
                 ),
                 destination,
-                key: "mariadb/store/1/dump.sql.gz".to_string(),
+                key: "redis/store/1/dump.rdb.gz".to_string(),
             },
             docker(),
             None,
@@ -1807,97 +1792,6 @@ mod docker_tests {
             .read_to_end(&mut out)
             .unwrap();
         out
-    }
-
-    /// MariaDB on a worker: the dump is the local engine's gzipped SQL of
-    /// every user database.
-    #[tokio::test]
-    async fn a_mariadb_on_a_worker_is_dumped_as_gzipped_sql() {
-        let Some(docker) = docker_or_skip().await else {
-            return;
-        };
-        if !pull(&docker, "mariadb:11.4").await || !pull(&docker, RUSTFS_IMAGE).await {
-            return;
-        }
-        let id = format!("{:08x}", rand::random::<u32>());
-        let mut created = Created {
-            docker: Arc::clone(&docker),
-            containers: vec![],
-            network: None,
-        };
-        ensure_network(&docker, &mut created).await;
-        let destination = destination(&docker, &mut created, &id).await;
-        let service = format!("wdtest{id}");
-        let container =
-            MariaDbService::new(service.clone(), Arc::clone(&docker)).get_docker_container_name();
-        let password = "-maria p@ss";
-        run(
-            &docker,
-            &mut created,
-            &container,
-            ContainerCreateBody {
-                image: Some("mariadb:11.4".to_string()),
-                env: Some(vec![
-                    format!("MARIADB_ROOT_PASSWORD={password}"),
-                    "MARIADB_DATABASE=shop".to_string(),
-                ]),
-                host_config: Some(HostConfig {
-                    network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await;
-        let auth = vec![format!("MYSQL_PWD={password}")];
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
-        while !exec(
-            &docker,
-            &container,
-            auth.clone(),
-            &["mariadb", "-uroot", "-e", "CREATE TABLE IF NOT EXISTS shop.orders (id INT); INSERT INTO shop.orders VALUES (42); SELECT 'seeded'"],
-        )
-        .await
-        .contains("seeded")
-        {
-            assert!(tokio::time::Instant::now() < deadline, "MariaDB never started");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-
-        let key = format!("mariadb/{service}/{id}/dump.sql.gz");
-        let outcome = backup_service_on_node(
-            RemoteServiceBackupRequest {
-                service_config: ServiceConfig {
-                    name: service,
-                    service_type: ServiceType::Mariadb,
-                    version: None,
-                    parameters: serde_json::json!({ "host": "localhost", "port": "3306" }),
-                },
-                destination: destination.clone(),
-                key: key.clone(),
-            },
-            Arc::clone(&docker),
-            None,
-        )
-        .await;
-        let stored = match outcome {
-            Ok(_) => object(&destination, &key).await,
-            Err(error) => {
-                created.cleanup().await;
-                panic!("backup failed: {error}");
-            }
-        };
-        created.cleanup().await;
-        let sql = String::from_utf8_lossy(&gunzip(&stored)).to_string();
-        assert!(
-            sql.contains("CREATE DATABASE"),
-            "{}",
-            &sql[..sql.len().min(400)]
-        );
-        // The seeding loop may run its insert more than once before MariaDB
-        // answers, so the row can appear repeatedly.
-        assert!(sql.contains("INSERT INTO `orders` VALUES"), "{sql}");
-        assert!(sql.contains("(42)"), "{sql}");
     }
 
     /// A stopped service is refused before any helper or upload starts.

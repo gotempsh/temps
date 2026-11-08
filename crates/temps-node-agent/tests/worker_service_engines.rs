@@ -3876,3 +3876,969 @@ async fn a_control_plane_redis_is_backed_up_and_restored_by_the_same_node_half()
     assert_eq!(leftovers(&docker, &container).await, "");
     drop(s3);
 }
+
+// ── MariaDB (ADR-099): the control plane's engines, run by the agent ────────
+
+/// `mariadb` as root in `container`, batch output without a header.
+async fn mariadb_sql(docker: &Docker, container: &str, root: &str, sql: &str) -> (i64, String) {
+    let password = format!("-p{root}");
+    exec(
+        docker,
+        container,
+        &[
+            "mariadb",
+            "-uroot",
+            &password,
+            "-h127.0.0.1",
+            "-N",
+            "-B",
+            "-e",
+            sql,
+        ],
+    )
+    .await
+}
+
+/// The rows of the proof table, in order, comma-separated.
+async fn mariadb_rows(docker: &Docker, container: &str, root: &str) -> String {
+    let (code, rows) = mariadb_sql(
+        docker,
+        container,
+        root,
+        "SELECT IFNULL(GROUP_CONCAT(tag ORDER BY tag), '') FROM app.proof",
+    )
+    .await;
+    assert_eq!(code, 0, "reading the proof rows: {rows}");
+    rows
+}
+
+/// The server's clock, as a recovery target: binary-log timestamps are the
+/// server's, at second precision.
+async fn mariadb_now(
+    docker: &Docker,
+    container: &str,
+    root: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    let (code, now) = mariadb_sql(docker, container, root, "SELECT UTC_TIMESTAMP()").await;
+    assert_eq!(code, 0, "reading the server's clock: {now}");
+    chrono::NaiveDateTime::parse_from_str(now.trim(), "%Y-%m-%d %H:%M:%S")
+        .unwrap_or_else(|e| panic!("the server's clock '{now}': {e}"))
+        .and_utc()
+}
+
+/// The `data` of a MariaDB agent operation that ran (200). A node already
+/// running its two data operations answers 429; the control plane waits for
+/// a slot and asks again, and so does this, since the other proofs in this
+/// process share the node's slots.
+async fn mariadb_outcome<T, F, Fut>(call: F, what: &str) -> T
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
+{
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let (status, body) = envelope(call().await).await;
+        if status == 429 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        assert_eq!(status, 200, "the MariaDB {what} did not run: {body}");
+        return serde_json::from_value(body["data"].clone())
+            .unwrap_or_else(|e| panic!("a MariaDB {what} result: {e}: {body}"));
+    }
+}
+
+/// Whether the data directory still holds the original kept aside by a
+/// restore.
+async fn kept_original(docker: &Docker, container: &str) -> bool {
+    exec(
+        docker,
+        container,
+        &["test", "-e", "/var/lib/mysql/.temps-restore-original"],
+    )
+    .await
+    .0 == 0
+}
+
+/// A worker's MariaDB created by the agent as a control-plane-profile
+/// server asks (the managed WAL-G image by default), healthy, seeded, with
+/// an S3 bucket on its network.
+struct MariadbFixture {
+    docker: Docker,
+    agent: Arc<AgentState>,
+    name: String,
+    container: String,
+    root: String,
+    config: ServiceConfig,
+    s3: aws_sdk_s3::Client,
+    s3_port: u16,
+    bucket: String,
+    _cleanup: Cleanup,
+}
+
+impl MariadbFixture {
+    async fn start(tag: &str, bucket: &str) -> Option<Self> {
+        let docker = match Docker::connect_with_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => docker,
+            _ => {
+                println!("Docker not available (set DOCKER_HOST), skipping the worker MariaDB {tag} proof");
+                return None;
+            }
+        };
+        let agent = agent_state(docker.clone());
+        let suffix = std::process::id();
+        let name = format!("{tag}{suffix}");
+        let s3_name = format!("{tag}s3{suffix}");
+        let mut parameters = control_plane_parameters(&Engine {
+            label: "mariadb",
+            service_type: ServiceType::Mariadb,
+            strategy: "mariadb",
+            parameters: json!({}),
+            expected_env: &[],
+        });
+        parameters.insert("port".into(), json!(free_port().to_string()));
+        let params = ExternalServiceManager::remote_create_params(
+            8,
+            &name,
+            &ServiceType::Mariadb,
+            &as_strings(&parameters),
+            false,
+        )
+        .expect("the create request");
+        for image in [params.image.as_str(), RUSTFS_IMAGE] {
+            if docker.inspect_image(image).await.is_err() {
+                println!(
+                    "image {image} is not present locally, skipping the worker MariaDB {tag} proof"
+                );
+                return None;
+            }
+        }
+        let network = params
+            .network
+            .clone()
+            .expect("worker services join a network");
+        let cleanup = Cleanup {
+            docker: docker.clone(),
+            containers: vec![params.name.clone(), s3_name.clone()],
+            volumes: params.volumes.keys().cloned().collect(),
+        };
+        let s3_port = free_port();
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                        .name(&s3_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(RUSTFS_IMAGE.to_string()),
+                    env: Some(vec![
+                        format!("RUSTFS_ACCESS_KEY={WALG_S3_KEY}"),
+                        format!("RUSTFS_SECRET_KEY={WALG_S3_KEY}"),
+                    ]),
+                    host_config: Some(bollard::models::HostConfig {
+                        network_mode: Some(network.clone()),
+                        port_bindings: Some(HashMap::from([(
+                            "9000/tcp".to_string(),
+                            Some(vec![bollard::models::PortBinding {
+                                host_ip: Some("127.0.0.1".to_string()),
+                                host_port: Some(s3_port.to_string()),
+                            }]),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the bucket container");
+        let (status, created) = envelope(
+            create_service(
+                State(agent.clone()),
+                Json(ServiceCreateRequest {
+                    name: params.name.clone(),
+                    service_type: params.service_type.clone(),
+                    image: params.image.clone(),
+                    environment: params.environment.clone(),
+                    port_mappings: params
+                        .port_mappings
+                        .iter()
+                        .map(|p| ServicePortMapping {
+                            host_port: p.host_port,
+                            container_port: p.container_port,
+                        })
+                        .collect(),
+                    volumes: params.volumes.clone(),
+                    network: params.network.clone(),
+                    command: params.command.clone(),
+                    resource_limits: None,
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, 200, "create failed: {created}");
+        let container = created["data"]["container_name"]
+            .as_str()
+            .expect("the created container's name")
+            .to_string();
+        let host_port = created["data"]["host_port"]
+            .as_u64()
+            .expect("the published host port");
+        docker
+            .start_container(
+                &s3_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("start the bucket");
+        let mut stored = parameters.clone();
+        stored.insert("port".into(), json!(host_port.to_string()));
+        stored.insert("container_name".into(), json!(container.clone()));
+        let root = stored["root_password"]
+            .as_str()
+            .expect("a generated root password")
+            .to_string();
+        let config = ServiceConfig {
+            name: name.clone(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::to_value(&stored).expect("stored parameters"),
+        };
+        wait_healthy(&agent, &config, "mariadb").await;
+        // The health probe answers before the entrypoint's init has
+        // created the application's user; wait for the real server.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while mariadb_sql(&docker, &container, &root, "SELECT 1").await.0 != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker MariaDB never answered as root"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let s3 = temps_providers::externalsvc::S3Credentials {
+            access_key_id: WALG_S3_KEY.to_string(),
+            secret_key: WALG_S3_KEY.to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
+            bucket_name: bucket.to_string(),
+            bucket_path: WALG_BUCKET_PATH.to_string(),
+            force_path_style: true,
+        }
+        .build_s3_client()
+        .await;
+        let mut made = Err(String::new());
+        for _ in 0..60 {
+            made = s3
+                .create_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"));
+            if made.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        made.expect("creating the bucket");
+        Some(Self {
+            docker,
+            agent,
+            name,
+            container,
+            root,
+            config,
+            s3,
+            s3_port,
+            bucket: bucket.to_string(),
+            _cleanup: cleanup,
+        })
+    }
+
+    /// The bucket as the control plane sends it: an endpoint the node
+    /// reaches, which the engine resolves for the containers on its network.
+    fn destination(&self) -> temps_service_protocol::WorkerS3Destination {
+        temps_service_protocol::WorkerS3Destination {
+            bucket: self.bucket.clone(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{}", self.s3_port)),
+            force_path_style: true,
+            access_key_id: WALG_S3_KEY.to_string(),
+            secret_access_key: WALG_S3_KEY.to_string(),
+            session_token: None,
+        }
+    }
+
+    /// What the control plane sends for one MariaDB job (ADR-093): a
+    /// credential RustFS mints for `prefixes` alone.
+    async fn scoped(
+        &self,
+        prefixes: &[String],
+        access: temps_core::ScopedS3Access,
+    ) -> temps_service_protocol::WorkerS3Destination {
+        scoped_destination(&self.destination(), WALG_BUCKET_PATH, prefixes, access).await
+    }
+
+    /// The read grant of a restore of `location`, as the control plane
+    /// derives it: the backup's own location (a WAL-G repository, or a
+    /// dump's directory) and, for a point-in-time recovery, the binary logs
+    /// the replay reads.
+    async fn restore_source(
+        &self,
+        location: &str,
+        pitr: bool,
+    ) -> temps_service_protocol::WorkerS3Destination {
+        use temps_providers::externalsvc::mariadb_node::binlog_read_prefix;
+        use temps_providers::worker_s3_scope::{key_directory, s3_url_prefix};
+        let mut prefixes = vec![match location.strip_prefix("s3://") {
+            Some(_) => s3_url_prefix(location, &self.bucket).expect("a repository in the bucket"),
+            None => key_directory(location),
+        }];
+        if pitr {
+            prefixes.push(binlog_read_prefix(
+                location,
+                &self.bucket,
+                WALG_BUCKET_PATH,
+                &self.name,
+            ));
+        }
+        self.scoped(&prefixes, temps_core::ScopedS3Access::Read)
+            .await
+    }
+}
+
+/// ADR-099 for MariaDB: a worker's MariaDB, created by the agent as a
+/// control-plane-profile server asks, is backed up, shipped, restored and
+/// recovered by the control plane's own MariaDB engines through the agent's
+/// sealed operations.
+///
+/// 1. The agent's MariaDB runs with binary logging, as the control plane's.
+/// 2. A WAL-G physical base lands under the control plane's repository and
+///    reports its binary-log position.
+/// 3. Rows written after it are shipped as binary logs by the archiver.
+/// 4. A restore in place brings back the base exactly, keeps the restart
+///    policy, deletes the kept original, and the service's own login still
+///    reads its database (the base carries the `mysql` schema, grants
+///    included).
+/// 5. A point-in-time recovery replays up to the target and no further.
+/// 6. A restore that fails before the swap (no such base) and one that fails
+///    after it (an archived segment is gone) both leave the original data
+///    running, unchanged.
+/// 7. A logical dump is streamed to S3 and restored in place.
+///
+/// Every request carries what the control plane now sends (ADR-093): a
+/// credential RustFS mints for that job's prefixes alone, write for the
+/// base, the binary logs and the dump, read for a restore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_mariadb_is_backed_up_restored_and_recovered_by_the_control_plane_engines() {
+    use temps_core::ScopedS3Access::Write;
+    use temps_node_agent::service_mariadb_handlers as handlers;
+    use temps_providers::externalsvc::mariadb_node::{
+        binlog_key_prefix, service_root, walg_key_prefix, walg_prefix,
+    };
+    use temps_service_protocol::{
+        MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbDumpBackupRequest,
+        MariadbDumpBackupResult, MariadbPhysicalBackupRequest, MariadbPhysicalBackupResult,
+        MariadbRestoreRequest, MariadbRestoreResult, RecoveryTarget,
+    };
+
+    let Some(fixture) = MariadbFixture::start("wsemaria", "maria-proof").await else {
+        return;
+    };
+    let docker = &fixture.docker;
+    let container = fixture.container.as_str();
+    let root = fixture.root.as_str();
+    let sql = |statement: &'static str| async move {
+        let (code, out) = mariadb_sql(docker, container, root, statement).await;
+        assert_eq!(code, 0, "{statement}: {out}");
+        out
+    };
+    assert_eq!(container, format!("mariadb-{}", fixture.name));
+
+    // 1. Binary logging, from creation.
+    let created = docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the agent's container");
+    let command = created
+        .config
+        .as_ref()
+        .and_then(|c| c.cmd.clone())
+        .unwrap_or_default();
+    assert!(
+        command.iter().any(|arg| arg == "--log-bin=mysql-bin"),
+        "{command:?}"
+    );
+    assert!(
+        created
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .is_some_and(|env| env.iter().any(|e| e == "TZ=UTC")),
+        "the server runs in UTC, as on the control plane"
+    );
+    let policy_before = restart_policy(&created);
+    assert_eq!(sql("SELECT @@log_bin").await, "1");
+
+    sql("CREATE TABLE app.proof (tag VARCHAR(32) PRIMARY KEY); INSERT INTO app.proof VALUES ('base')").await;
+
+    // 2. The physical base.
+    let request = MariadbPhysicalBackupRequest {
+        service_id: 8,
+        node_id: 2,
+        service_config: fixture.config.clone(),
+        destination: fixture
+            .scoped(&[walg_key_prefix(WALG_BUCKET_PATH, &fixture.name)], Write)
+            .await,
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+        backup_uuid: "maria-base-1".to_string(),
+    };
+    let backup: MariadbPhysicalBackupResult = mariadb_outcome(
+        || handlers::mariadb_physical_backup(State(fixture.agent.clone()), Json(request.clone())),
+        "physical backup",
+    )
+    .await;
+    let MariadbPhysicalBackupResult::Completed { binlog } = backup else {
+        panic!("the physical backup did not complete: {backup:?}");
+    };
+    let binlog = binlog.expect("binary logging is on, so the base has a position");
+    assert!(binlog.file.starts_with("mysql-bin."), "{binlog:?}");
+    let repository = walg_prefix(&fixture.bucket, WALG_BUCKET_PATH, &fixture.name);
+    let base_keys = keys(
+        &fixture.s3,
+        &fixture.bucket,
+        &walg_key_prefix(WALG_BUCKET_PATH, &fixture.name),
+    )
+    .await;
+    assert!(
+        base_keys.iter().any(|k| k.contains("basebackups_005/")),
+        "the base is in the control plane's repository: {base_keys:?}"
+    );
+
+    // 3. Writes after the base, around a recovery point, shipped.
+    sql("INSERT INTO app.proof VALUES ('before-target')").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let target_time = mariadb_now(docker, container, root).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sql("INSERT INTO app.proof VALUES ('after-target')").await;
+    let request = MariadbBinlogArchiveRequest {
+        service_id: 8,
+        node_id: 2,
+        service_config: fixture.config.clone(),
+        destination: fixture
+            .scoped(&[binlog_key_prefix(WALG_BUCKET_PATH, &fixture.name)], Write)
+            .await,
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+    };
+    let archived: MariadbBinlogArchiveResult = mariadb_outcome(
+        || handlers::mariadb_binlog_archive(State(fixture.agent.clone()), Json(request.clone())),
+        "binlog archive",
+    )
+    .await;
+    assert!(
+        matches!(archived, MariadbBinlogArchiveResult::Completed { shipped } if shipped >= 1),
+        "{archived:?}"
+    );
+    let binlog_prefix = format!("{}/binlog/", service_root(WALG_BUCKET_PATH, &fixture.name));
+    let shipped = keys(&fixture.s3, &fixture.bucket, &binlog_prefix).await;
+    assert!(
+        shipped.iter().any(|k| k.ends_with("manifest.json")),
+        "{shipped:?}"
+    );
+
+    let restore = |location: &str, recovery_target: Option<RecoveryTarget>| {
+        let (fixture, location) = (&fixture, location.to_string());
+        async move {
+            MariadbRestoreRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: fixture.config.clone(),
+                source: fixture
+                    .restore_source(&location, recovery_target.is_some())
+                    .await,
+                bucket_path: WALG_BUCKET_PATH.to_string(),
+                location,
+                recovery_target,
+                target_user_data: None,
+            }
+        }
+    };
+    let run_restore = |request: MariadbRestoreRequest| {
+        let agent = fixture.agent.clone();
+        async move {
+            mariadb_outcome::<MariadbRestoreResult, _, _>(
+                || handlers::mariadb_restore(State(agent.clone()), Json(request.clone())),
+                "restore",
+            )
+            .await
+        }
+    };
+
+    // 4. In place: the base, exactly.
+    assert_eq!(
+        run_restore(restore(&repository, None).await).await,
+        MariadbRestoreResult::Completed
+    );
+    assert_eq!(mariadb_rows(docker, container, root).await, "base");
+    assert!(
+        !kept_original(docker, container).await,
+        "the kept original is deleted"
+    );
+    let restored = docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the restored container");
+    assert_eq!(
+        restart_policy(&restored),
+        policy_before,
+        "the restart policy is kept"
+    );
+    assert_eq!(
+        restored.id, created.id,
+        "the agent's container is restored, not replaced"
+    );
+    let login = |user: &str, password: &str| {
+        let (user, password) = (format!("-u{user}"), format!("-p{password}"));
+        async move {
+            exec(
+                docker,
+                container,
+                &[
+                    "mariadb",
+                    &user,
+                    &password,
+                    "-h127.0.0.1",
+                    "-N",
+                    "-B",
+                    "-e",
+                    "SELECT COUNT(*) FROM app.proof",
+                ],
+            )
+            .await
+        }
+    };
+    let parameters = &fixture.config.parameters;
+    let (code, out) = login(
+        parameters["username"].as_str().expect("username"),
+        parameters["password"].as_str().expect("password"),
+    )
+    .await;
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "1"),
+        "the service's own login reads its database after the restore (grants restored)"
+    );
+
+    // 5. To a point in time: up to the target, not beyond.
+    assert_eq!(
+        run_restore(
+            restore(
+                &repository,
+                Some(RecoveryTarget::Time { time: target_time })
+            )
+            .await
+        )
+        .await,
+        MariadbRestoreResult::Completed
+    );
+    assert_eq!(
+        mariadb_rows(docker, container, root).await,
+        "base,before-target"
+    );
+    assert!(!kept_original(docker, container).await);
+
+    // 6a. Fails before the swap: no base under that repository.
+    sql("INSERT INTO app.proof VALUES ('live')").await;
+    let missing = walg_prefix(&fixture.bucket, WALG_BUCKET_PATH, "no-such-service");
+    let failed = run_restore(restore(&missing, None).await).await;
+    assert!(
+        matches!(&failed, MariadbRestoreResult::Failed { reason } if reason.contains("left in place")),
+        "{failed:?}"
+    );
+    assert!(
+        is_running(docker, container).await,
+        "the original is running again"
+    );
+    assert_eq!(
+        mariadb_rows(docker, container, root).await,
+        "base,before-target,live"
+    );
+
+    // 6b. Fails after the swap: the archived segments the replay needs are
+    // gone, though the manifest still lists them.
+    let segments: Vec<&String> = shipped
+        .iter()
+        .filter(|k| !k.ends_with("manifest.json"))
+        .collect();
+    assert!(!segments.is_empty(), "a shipped segment: {shipped:?}");
+    for segment in segments {
+        fixture
+            .s3
+            .delete_object()
+            .bucket(&fixture.bucket)
+            .key(segment)
+            .send()
+            .await
+            .expect("delete a segment");
+    }
+    let failed = run_restore(
+        restore(
+            &repository,
+            Some(RecoveryTarget::Time { time: target_time }),
+        )
+        .await,
+    )
+    .await;
+    assert!(
+        matches!(&failed, MariadbRestoreResult::Failed { reason } if reason.contains("put back")),
+        "{failed:?}"
+    );
+    assert!(
+        is_running(docker, container).await,
+        "the original is running again"
+    );
+    assert_eq!(
+        mariadb_rows(docker, container, root).await,
+        "base,before-target,live",
+        "the original data, unchanged"
+    );
+    assert!(
+        !kept_original(docker, container).await,
+        "the original is back in place"
+    );
+    let after = docker
+        .inspect_container(
+            container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the container");
+    assert_eq!(restart_policy(&after), policy_before);
+
+    // 7. A logical dump, streamed to S3 and applied in place.
+    let dump_key = format!(
+        "{}/2026/11/08/maria-dump-1/dump.sql.gz",
+        service_root(WALG_BUCKET_PATH, &fixture.name)
+    );
+    let request = MariadbDumpBackupRequest {
+        service_id: 8,
+        node_id: 2,
+        service_config: fixture.config.clone(),
+        destination: fixture
+            .scoped(
+                &[temps_providers::worker_s3_scope::key_directory(&dump_key)],
+                Write,
+            )
+            .await,
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+        key: dump_key.clone(),
+    };
+    let dumped: MariadbDumpBackupResult = mariadb_outcome(
+        || handlers::mariadb_dump_backup(State(fixture.agent.clone()), Json(request.clone())),
+        "dump",
+    )
+    .await;
+    assert!(
+        matches!(dumped, MariadbDumpBackupResult::Completed { size_bytes } if size_bytes > 0),
+        "{dumped:?}"
+    );
+    sql("DELETE FROM app.proof WHERE tag = 'live'").await;
+    assert_eq!(
+        run_restore(restore(&dump_key, None).await).await,
+        MariadbRestoreResult::Completed
+    );
+    assert_eq!(
+        mariadb_rows(docker, container, root).await,
+        "base,before-target,live"
+    );
+    // A dump cannot anchor a point-in-time recovery, refused before
+    // anything is touched.
+    let refused =
+        run_restore(restore(&dump_key, Some(RecoveryTarget::Time { time: target_time })).await)
+            .await;
+    assert!(
+        matches!(refused, MariadbRestoreResult::Refused { .. }),
+        "{refused:?}"
+    );
+}
+
+/// The same engines on the control plane: a MariaDB the provider creates on
+/// this host is backed up by the very function the agent ran above, and
+/// restored and recovered by the very restore, with this host's Docker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_plane_mariadb_is_backed_up_and_restored_by_the_same_engines() {
+    use temps_providers::externalsvc::mariadb::{
+        MariaDbInPlaceRestore, MariaDbService, MARIADB_DEFAULT_IMAGE,
+    };
+    use temps_providers::externalsvc::mariadb_node::{
+        physical_backup, walg_prefix, MariadbPhysicalBackup,
+    };
+    use temps_providers::externalsvc::{ExternalService, RecoveryTarget, S3Credentials};
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!("Docker not available (set DOCKER_HOST), skipping the local MariaDB proof");
+            return;
+        }
+    };
+    for image in [MARIADB_DEFAULT_IMAGE, RUSTFS_IMAGE] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the local MariaDB proof");
+            return;
+        }
+    }
+    let suffix = std::process::id();
+    let name = format!("cplmaria{suffix}");
+    let container = format!("mariadb-{name}");
+    let s3_name = format!("cplmarias3{suffix}");
+    let bucket = "maria-local-proof";
+    let mut cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![container.clone(), s3_name.clone()],
+        volumes: Vec::new(),
+    };
+    let shared = Arc::new(docker.clone());
+    let root = "local-root-password";
+    let config = ServiceConfig {
+        name: name.clone(),
+        service_type: ServiceType::Mariadb,
+        version: None,
+        parameters: json!({
+            "host": "localhost",
+            "port": free_port().to_string(),
+            "database": "app",
+            "username": "app",
+            "password": "local-app-password",
+            "root_password": root,
+            "docker_image": MARIADB_DEFAULT_IMAGE,
+        }),
+    };
+    let mariadb = MariaDbService::new(name.clone(), shared.clone());
+    let runtime = mariadb
+        .init(config.clone())
+        .await
+        .expect("the provider creates the service");
+    let created = docker
+        .inspect_container(
+            &container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the provider's container");
+    cleanup.volumes = created
+        .mounts
+        .iter()
+        .flatten()
+        .filter_map(|m| m.name.clone())
+        .collect();
+    let config = ServiceConfig {
+        parameters: serde_json::to_value(&runtime).expect("runtime parameters"),
+        ..config
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while mariadb_sql(&docker, &container, root, "SELECT 1").await.0 != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the local MariaDB never answered"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let s3_port = free_port();
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(&s3_name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(RUSTFS_IMAGE.to_string()),
+                env: Some(vec![
+                    format!("RUSTFS_ACCESS_KEY={WALG_S3_KEY}"),
+                    format!("RUSTFS_SECRET_KEY={WALG_S3_KEY}"),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(temps_core::NETWORK_NAME.to_string()),
+                    port_bindings: Some(HashMap::from([(
+                        "9000/tcp".to_string(),
+                        Some(vec![bollard::models::PortBinding {
+                            host_ip: Some("127.0.0.1".to_string()),
+                            host_port: Some(s3_port.to_string()),
+                        }]),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the bucket container");
+    docker
+        .start_container(
+            &s3_name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("start the bucket");
+    let credentials = S3Credentials {
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+        region: "us-east-1".to_string(),
+        endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
+        bucket_name: bucket.to_string(),
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+        force_path_style: true,
+    };
+    let s3 = credentials.build_s3_client().await;
+    let mut made = Err(String::new());
+    for _ in 0..60 {
+        made = s3
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"));
+        if made.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    made.expect("creating the bucket");
+
+    let sql = |statement: &'static str| {
+        let docker = docker.clone();
+        let container = container.clone();
+        async move {
+            let (code, out) = mariadb_sql(&docker, &container, root, statement).await;
+            assert_eq!(code, 0, "{statement}: {out}");
+            out
+        }
+    };
+    sql("CREATE TABLE app.proof (tag VARCHAR(32) PRIMARY KEY); INSERT INTO app.proof VALUES ('base')").await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let binlog = physical_backup(
+        &docker,
+        &MariadbPhysicalBackup {
+            service_id: 9,
+            container_name: container.clone(),
+            root_password: root.to_string(),
+            s3: credentials.clone(),
+            backup_uuid: "local-base-1".to_string(),
+        },
+        &name,
+        &cancel,
+    )
+    .await
+    .expect("the local physical backup")
+    .expect("a binary-log position");
+    assert!(binlog.file.starts_with("mysql-bin."), "{binlog:?}");
+    sql("INSERT INTO app.proof VALUES ('before-target')").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let target_time = mariadb_now(&docker, &container, root).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    sql("INSERT INTO app.proof VALUES ('after-target')").await;
+
+    let mariadb_config = MariaDbService::parse_config(&name, &config).expect("the config");
+    let source = temps_entities::s3_sources::Model {
+        id: 1,
+        name: "local".to_string(),
+        bucket_name: bucket.to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: credentials.endpoint.clone(),
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+        credentials_expire_at: None,
+        force_path_style: Some(true),
+        is_default: false,
+        managed_by_cloud: false,
+        lifecycle_reconcile_failed_at: None,
+        lifecycle_reconcile_generation: 0,
+        worker_credentials: temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        backing_service_id: None,
+    };
+    let shipped = mariadb
+        .archive_binlogs(&s3, &source, &mariadb_config)
+        .await
+        .expect("the local archiver");
+    assert!(shipped >= 1);
+
+    let repository = walg_prefix(bucket, WALG_BUCKET_PATH, &name);
+    fn restore<'a>(
+        s3_client: &'a aws_sdk_s3::Client,
+        s3_credentials: &'a S3Credentials,
+        location: &'a str,
+        recovery_target: Option<&'a RecoveryTarget>,
+    ) -> MariaDbInPlaceRestore<'a> {
+        MariaDbInPlaceRestore {
+            s3_client,
+            s3_credentials,
+            location,
+            target_user_data: None,
+            recovery_target,
+        }
+    }
+    mariadb
+        .restore_in_place_on_this_node(
+            &mariadb_config,
+            restore(&s3, &credentials, &repository, None),
+        )
+        .await
+        .expect("the local in-place restore");
+    assert_eq!(mariadb_rows(&docker, &container, root).await, "base");
+    assert!(!kept_original(&docker, &container).await);
+    let target = RecoveryTarget::Time { time: target_time };
+    mariadb
+        .restore_in_place_on_this_node(
+            &mariadb_config,
+            restore(&s3, &credentials, &repository, Some(&target)),
+        )
+        .await
+        .expect("the local point-in-time recovery");
+    assert_eq!(
+        mariadb_rows(&docker, &container, root).await,
+        "base,before-target"
+    );
+    let restored = docker
+        .inspect_container(
+            &container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the restored container");
+    assert_eq!(
+        restart_policy(&restored),
+        restart_policy(&created),
+        "the provider's restart policy is kept"
+    );
+
+    // A failed restore leaves the original running, unchanged.
+    let missing = walg_prefix(bucket, WALG_BUCKET_PATH, "no-such-service");
+    let error = mariadb
+        .restore_in_place_on_this_node(&mariadb_config, restore(&s3, &credentials, &missing, None))
+        .await
+        .expect_err("no such base");
+    assert!(error.to_string().contains("left in place"), "{error}");
+    assert!(is_running(&docker, &container).await);
+    assert_eq!(
+        mariadb_rows(&docker, &container, root).await,
+        "base,before-target"
+    );
+}

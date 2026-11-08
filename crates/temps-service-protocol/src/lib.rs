@@ -21,6 +21,9 @@ use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+mod mariadb;
+pub use mariadb::*;
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServiceConfig {
     pub name: String,
@@ -1182,6 +1185,42 @@ pub trait NodeServiceRuntime: Send + Sync {
         request: RedisRestoreRequest,
         docker: Arc<Docker>,
     ) -> Result<RedisRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's MariaDB physical (WAL-G) base backup on this
+    /// node (see [`MariadbPhysicalBackupRequest`]).
+    async fn mariadb_physical_backup(
+        &self,
+        request: MariadbPhysicalBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbPhysicalBackupResult, NodeServiceError>;
+
+    /// Run the control plane's MariaDB logical dump on this node (see
+    /// [`MariadbDumpBackupRequest`]).
+    async fn mariadb_dump_backup(
+        &self,
+        request: MariadbDumpBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbDumpBackupResult, NodeServiceError>;
+
+    /// Run the control plane's in-place MariaDB restore on this node (see
+    /// [`MariadbRestoreRequest`]).
+    async fn mariadb_restore(
+        &self,
+        request: MariadbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's binary-log archiver on this node (see
+    /// [`MariadbBinlogArchiveRequest`]).
+    async fn mariadb_binlog_archive(
+        &self,
+        request: MariadbBinlogArchiveRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbBinlogArchiveResult, NodeServiceError>;
 }
 
 #[cfg(test)]

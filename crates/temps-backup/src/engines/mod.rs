@@ -33,7 +33,6 @@ pub mod dispatch;
 pub mod dump_capture;
 pub mod image_pull;
 pub mod mariadb_dump;
-pub mod mariadb_exec;
 pub mod mariadb_physical;
 pub mod mongodb;
 pub mod oneshot;

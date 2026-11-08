@@ -47,11 +47,9 @@ use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 /// Sourced from each engine's own `ENGINE_KEY` rather than re-spelled here, so
 /// a renamed engine cannot silently drop out of the unavailable set and start
 /// failing backups on a Dockerless control plane again.
-const DOCKER_BACKED_ENGINES: [&str; 5] = [
+const DOCKER_BACKED_ENGINES: [&str; 3] = [
     crate::engines::postgres_pgdump::ENGINE_KEY,
     crate::engines::postgres_cluster::ENGINE_KEY,
-    crate::engines::mariadb_physical::ENGINE_KEY,
-    crate::engines::mariadb_dump::ENGINE_KEY,
     crate::engines::s3_mirror::ENGINE_KEY,
 ];
 
@@ -333,8 +331,8 @@ impl TempsPlugin for BackupPlugin {
                         worker_credentials: worker_credentials.clone(),
                     },
                 )))
-                // MariaDB and storage services on worker nodes, backed up
-                // by their node's agent. Needs no local
+                // Storage services on worker nodes, backed up by their
+                // node's agent. Needs no local
                 // Docker either (see `engines::worker_agent`).
                 .register_engine(Arc::new(WorkerAgentEngine::new(WorkerAgentDeps {
                     db: db.clone(),
@@ -369,6 +367,22 @@ impl TempsPlugin for BackupPlugin {
                     docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
                     manager: external_service_manager.clone(),
                     worker_credentials: worker_credentials.clone(),
+                })))
+                // MariaDB physical (WAL-G) and dump: likewise here or on a
+                // worker through its agent (ADR-099).
+                .register_engine(Arc::new(MariadbPhysicalEngine::new(MariadbPhysicalDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
+                })))
+                .register_engine(Arc::new(MariadbDumpEngine::new(MariadbDumpDeps {
+                    db: db.clone(),
+                    encryption_service: encryption_service.clone(),
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
+                    manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
                 })));
 
             // Every other engine drives a local Docker container end to end
@@ -395,16 +409,6 @@ impl TempsPlugin for BackupPlugin {
                         encryption_service: encryption_service.clone(),
                         docker: docker.as_ref().clone(),
                     })))
-                    .register_engine(Arc::new(MariadbPhysicalEngine::new(MariadbPhysicalDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
-                    .register_engine(Arc::new(MariadbDumpEngine::new(MariadbDumpDeps {
-                        db: db.clone(),
-                        encryption_service: encryption_service.clone(),
-                        docker: docker.as_ref().clone(),
-                    })))
                     .register_engine(Arc::new(S3MirrorEngine::new(S3MirrorDeps {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
@@ -414,7 +418,7 @@ impl TempsPlugin for BackupPlugin {
                 info!(
                     "BackupExecutor: registered 11 engines: control_plane, \
                      postgres_workload_job, worker_agent, postgres_walg, mongodb, redis, \
-                     postgres_pgdump, postgres_cluster, mariadb_physical, mariadb_dump, \
+                     mariadb_physical, mariadb_dump, postgres_pgdump, postgres_cluster, \
                      s3_mirror",
                 );
             } else {
@@ -426,7 +430,7 @@ impl TempsPlugin for BackupPlugin {
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
                     "BackupExecutor: registered only the engines that need no local Docker \
                      (control_plane, and the worker engines postgres_workload_job, worker_agent, \
-                     postgres_walg, mongodb and redis for worker services) — {}. Backups requesting one of these \
+                     postgres_walg, mongodb, redis, mariadb_physical and mariadb_dump for worker services) — {}. Backups requesting one of these \
                      engines fail immediately with that reason",
                     reason,
                 );
@@ -1089,6 +1093,15 @@ mod tests {
             !DOCKER_BACKED_ENGINES.contains(&crate::engines::redis::ENGINE_KEY),
             "the Redis engine backs up worker services without a local daemon",
         );
+        for engine in [
+            crate::engines::mariadb_physical::ENGINE_KEY,
+            crate::engines::mariadb_dump::ENGINE_KEY,
+        ] {
+            assert!(
+                !DOCKER_BACKED_ENGINES.contains(&engine),
+                "{engine} backs up worker MariaDB services without a local daemon",
+            );
+        }
         assert_eq!(
             DOCKER_BACKED_ENGINES.len(),
             DOCKER_BACKED_ENGINES

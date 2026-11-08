@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+pub mod mariadb_node;
 pub mod mongodb_backup;
 pub mod postgres_role_reconciler;
 pub mod postgres_walg_backup;

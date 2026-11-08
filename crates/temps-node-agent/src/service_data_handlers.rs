@@ -39,15 +39,15 @@ pub const MAX_DATA_OPERATIONS: usize = 2;
 /// Upper bound of one backup or restore; the control plane waits as long.
 pub const DATA_OPERATION_DEADLINE: Duration = Duration::from_secs(6 * 3600);
 
-static DATA_OPERATIONS: Semaphore = Semaphore::const_new(MAX_DATA_OPERATIONS);
+pub(crate) static DATA_OPERATIONS: Semaphore = Semaphore::const_new(MAX_DATA_OPERATIONS);
 
 /// A slot among the node's [`MAX_DATA_OPERATIONS`], or `None` when every
 /// slot is taken and the request is refused as [`busy`].
-fn admit(slots: &Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
+pub(crate) fn admit(slots: &Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
     slots.try_acquire().ok()
 }
 
-fn busy(operation: &str, service: &str) -> axum::response::Response {
+pub(crate) fn busy(operation: &str, service: &str) -> axum::response::Response {
     error_response(
         StatusCode::TOO_MANY_REQUESTS,
         format!(
@@ -58,7 +58,7 @@ fn busy(operation: &str, service: &str) -> axum::response::Response {
     .into_response()
 }
 
-fn docker_missing(operation: &str, service: &str) -> axum::response::Response {
+pub(crate) fn docker_missing(operation: &str, service: &str) -> axum::response::Response {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         format!("Docker is not available on this agent to {operation} service '{service}'"),
@@ -66,7 +66,7 @@ fn docker_missing(operation: &str, service: &str) -> axum::response::Response {
     .into_response()
 }
 
-fn deadline_exceeded(operation: &str, service: &str) -> axum::response::Response {
+pub(crate) fn deadline_exceeded(operation: &str, service: &str) -> axum::response::Response {
     error_response(
         StatusCode::GATEWAY_TIMEOUT,
         format!(
@@ -296,7 +296,7 @@ pub async fn postgres_walg_backup(
 }
 
 /// What [`run_detached`] returns: the engine's outcome, or why it has none.
-enum Detached<T> {
+pub(crate) enum Detached<T> {
     Done(Result<T, temps_service_protocol::NodeServiceError>),
     DeadlineExceeded,
     Panicked(String),
@@ -308,7 +308,10 @@ enum Detached<T> {
 /// between moving the data directory aside and starting the server again
 /// would leave the service down. Detached, it finishes, putting the
 /// original back if it must.
-async fn run_detached<T, F>(permit: tokio::sync::SemaphorePermit<'static>, engine: F) -> Detached<T>
+pub(crate) async fn run_detached<T, F>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    engine: F,
+) -> Detached<T>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, temps_service_protocol::NodeServiceError>>

@@ -250,53 +250,8 @@ pub fn build_router(
         .route(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
-        )
-        // Backups and in-place restores of a worker's services, with the
-        // engine's own tools on this node (sealed: they carry credentials).
-        .route(
-            "/agent/services/data-backup",
-            post(crate::service_data_handlers::data_backup),
-        )
-        .route(
-            "/agent/services/data-restore",
-            post(crate::service_data_handlers::data_restore),
-        )
-        .route(
-            "/agent/services/postgres/walg-backup",
-            post(crate::service_data_handlers::postgres_walg_backup),
-        )
-        .route(
-            "/agent/services/postgres/walg-restore",
-            post(crate::service_data_handlers::postgres_walg_restore),
-        )
-        .route(
-            "/agent/services/postgres/walg-archive",
-            post(crate::service_data_handlers::postgres_walg_archive),
-        )
-        .route(
-            "/agent/services/postgres/walg-credentials",
-            post(crate::service_data_handlers::postgres_walg_credentials),
-        )
-        .route(
-            "/agent/services/mongodb/backup",
-            post(crate::service_data_handlers::mongodb_backup),
-        )
-        .route(
-            "/agent/services/mongodb/restore",
-            post(crate::service_data_handlers::mongodb_restore),
-        )
-        .route(
-            "/agent/services/redis/walg-backup",
-            post(crate::service_data_handlers::redis_walg_backup),
-        )
-        .route(
-            "/agent/services/redis/rdb-backup",
-            post(crate::service_data_handlers::redis_rdb_backup),
-        )
-        .route(
-            "/agent/services/redis/restore",
-            post(crate::service_data_handlers::redis_restore),
-        )
+        );
+    let api_routes = service_data_routes(api_routes)
         .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
@@ -355,6 +310,74 @@ pub fn build_router(
         .merge(runtime_health_routes)
         .merge(worker_metrics_routes)
         .merge(swagger_ui)
+}
+
+/// The agent's backup and in-place restore routes of a worker's services:
+/// the control plane's own engines run on this node (ADR-099). Every body is
+/// sealed, because it carries a credential (one scoped to the job, ADR-093).
+fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState>> {
+    router
+        .route(
+            "/agent/services/data-backup",
+            post(crate::service_data_handlers::data_backup),
+        )
+        .route(
+            "/agent/services/data-restore",
+            post(crate::service_data_handlers::data_restore),
+        )
+        .route(
+            "/agent/services/postgres/walg-backup",
+            post(crate::service_data_handlers::postgres_walg_backup),
+        )
+        .route(
+            "/agent/services/postgres/walg-restore",
+            post(crate::service_data_handlers::postgres_walg_restore),
+        )
+        .route(
+            "/agent/services/postgres/walg-archive",
+            post(crate::service_data_handlers::postgres_walg_archive),
+        )
+        // The control plane's MariaDB engines, run on this node (ADR-099).
+        .route(
+            "/agent/services/mariadb/physical-backup",
+            post(crate::service_mariadb_handlers::mariadb_physical_backup),
+        )
+        .route(
+            "/agent/services/mariadb/dump-backup",
+            post(crate::service_mariadb_handlers::mariadb_dump_backup),
+        )
+        .route(
+            "/agent/services/mariadb/restore",
+            post(crate::service_mariadb_handlers::mariadb_restore),
+        )
+        .route(
+            "/agent/services/mariadb/binlog-archive",
+            post(crate::service_mariadb_handlers::mariadb_binlog_archive),
+        )
+        .route(
+            "/agent/services/postgres/walg-credentials",
+            post(crate::service_data_handlers::postgres_walg_credentials),
+        )
+        .route(
+            "/agent/services/mongodb/backup",
+            post(crate::service_data_handlers::mongodb_backup),
+        )
+        .route(
+            "/agent/services/mongodb/restore",
+            post(crate::service_data_handlers::mongodb_restore),
+        )
+        .route(
+            "/agent/services/redis/walg-backup",
+            post(crate::service_data_handlers::redis_walg_backup),
+        )
+        .route(
+            "/agent/services/redis/rdb-backup",
+            post(crate::service_data_handlers::redis_rdb_backup),
+        )
+        .route(
+            "/agent/services/redis/restore",
+            post(crate::service_data_handlers::redis_restore),
+        )
 }
 
 /// ADR-048 sandbox host API — same auth as every other agent route. File
@@ -2056,6 +2079,10 @@ pub(crate) mod tests {
             "/agent/services/wal-health",
             "/agent/services/data-backup",
             "/agent/services/data-restore",
+            "/agent/services/mariadb/physical-backup",
+            "/agent/services/mariadb/dump-backup",
+            "/agent/services/mariadb/restore",
+            "/agent/services/mariadb/binlog-archive",
             "/agent/sandboxes",
             "/agent/sandboxes/exec",
             "/agent/sandboxes/write-file",

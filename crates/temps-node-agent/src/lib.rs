@@ -49,6 +49,7 @@ pub mod sealed_requests;
 pub mod server;
 pub mod service_data_handlers;
 pub mod service_handlers;
+pub mod service_mariadb_handlers;
 pub mod service_observe_handlers;
 pub mod shield;
 pub mod tailnet_identity;

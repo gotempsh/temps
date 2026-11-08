@@ -160,6 +160,7 @@ pub enum RestoreError {
     Internal { reason: String },
 }
 
+mod worker_mariadb;
 mod worker_mongodb;
 mod worker_redis;
 mod worker_walg;
@@ -1114,6 +1115,11 @@ impl RestoreService {
         if worker_mongodb::takes_path(&service) {
             return Ok((worker_mongodb::capabilities(), identity));
         }
+        // A MariaDB on a worker node is restored by the control plane's own
+        // MariaDB restore on its node (see `worker_mariadb`).
+        if worker_mariadb::takes_mariadb_path(&service) {
+            return Ok((worker_mariadb::capabilities(), identity));
+        }
         // The other services on a worker node are restored on that node, in
         // place only (see `agent_restore_supported`). Their engine is not on
         // this host, which may have no Docker at all.
@@ -1251,6 +1257,8 @@ impl RestoreService {
         // now, not after the run started.
         if worker_walg::takes_walg_path(&target, &backup_location) {
             worker_walg::walg_restore_supported(&target, &mode)?;
+        } else if worker_mariadb::takes_mariadb_path(&target) {
+            worker_mariadb::restore_supported(&target, &mode)?;
         } else if crate::engines::workload_job::takes_job_path(&target) {
             job_restore_supported(&target, &backup_location, &mode)?;
         } else if worker_mongodb::takes_path(&target) {
@@ -1956,6 +1964,18 @@ fn worker_restore_plan(
                 .map(|e| e.to_string()),
         });
     }
+    if worker_mariadb::takes_mariadb_path(target) {
+        let (steps, mut refusals) = worker_mariadb::steps(node, location, mode, container);
+        refusals.extend(
+            worker_mariadb::restore_supported(target, mode)
+                .err()
+                .map(|e| e.to_string()),
+        );
+        return Some(WorkerRestorePlan {
+            steps,
+            refusal: (!refusals.is_empty()).then(|| refusals.join(" ")),
+        });
+    }
     if crate::engines::workload_job::takes_job_path(target) {
         let mut steps = vec![
             format!(
@@ -2018,16 +2038,13 @@ fn worker_restore_plan(
         use crate::engines::worker_agent::{worker_service_kind, WorkerServiceKind};
         use temps_providers::externalsvc::worker_data::DumpEngine;
         let applies = match worker_service_kind(&target.service_type) {
-            Some(WorkerServiceKind::Dump(DumpEngine::Mariadb)) => format!(
-                "The agent applies the SQL dump {location} into {container} with MariaDB's own \
-                 restore (existing data in the dumped databases is replaced)"
-            ),
             Some(WorkerServiceKind::Storage) => format!(
                 "The agent mirrors each bucket under {location} into {container} with \
                  `rc mirror --overwrite --remove`: missing objects are added, changed ones \
                  overwritten, and objects the backup does not have are deleted"
             ),
-            // MongoDB and Redis take `worker_mongodb` and `worker_redis` above.
+            // MongoDB, Redis and MariaDB take `worker_mongodb`, `worker_redis` and
+            // `worker_mariadb` above.
             Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) | None => {
                 format!(
                 "The agent applies {location} in place with {}'s own restore (existing data is \
@@ -2158,6 +2175,18 @@ fn credential_propagation_gates(target_service_type: &str, backup_location: &str
         }
         _ => (false, false),
     }
+}
+
+/// The origin's login an offline restore (PostgreSQL, a physical MariaDB
+/// base) runs with, merged over the target's configuration: the restored
+/// auth catalog (`pg_authid`, `mysql.user`) answers to it. `root_password`
+/// is MariaDB's admin credential, the one the binary-log replay and every
+/// post-restore admin exec use; PostgreSQL configs have no such key.
+fn origin_login_merge(origin: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    ["password", "root_password", "username", "database"]
+        .into_iter()
+        .filter_map(|key| Some((key.to_string(), origin.get(key)?.clone())))
+        .collect()
 }
 
 /// Worker: marks the run through phases, dispatches to the trait, and
@@ -2407,6 +2436,23 @@ async fn run_restore_inner(
         )
         .await;
     }
+    // ADR-099: a MariaDB on a worker node is restored by the control
+    // plane's own MariaDB restore, run by its agent.
+    if worker_mariadb::takes_mariadb_path(&target_service) {
+        return worker_mariadb::run(
+            WorkerRestoreDeps {
+                db: &db,
+                enc: &enc,
+                scoper: &scoper,
+                mgr: &mgr,
+            },
+            run_id,
+            &backup_model,
+            &target_service,
+            &mode,
+        )
+        .await;
+    }
     // ADR-055 Phase 9: a database on a worker node is restored by a job on
     // its node. Every other target takes the path below, unchanged.
     if crate::engines::workload_job::takes_job_path(&target_service) {
@@ -2596,22 +2642,8 @@ async fn run_restore_inner(
                             // The restore replaces the auth catalog wholesale
                             // (pg_authid / mysql.user), so the merged creds are
                             // exactly what the restored server will expect.
-                            if let (Some(target_params), Some(origin_params)) = (
-                                source_config.parameters.as_object_mut(),
-                                origin_cfg.parameters.as_object(),
-                            ) {
-                                // `root_password` is MariaDB's admin credential
-                                // — the one `mariadb-binlog` replay and every
-                                // post-restore admin exec authenticate with —
-                                // and it lives in the restored `mysql.user`
-                                // table just like `password` does. Postgres
-                                // configs have no such key, so the lookup is a
-                                // no-op there rather than a behavior change.
-                                for key in ["password", "root_password", "username", "database"] {
-                                    if let Some(v) = origin_params.get(key).cloned() {
-                                        target_params.insert(key.to_string(), v);
-                                    }
-                                }
+                            if let Some(target_params) = source_config.parameters.as_object_mut() {
+                                target_params.extend(origin_login_merge(&origin_cfg.parameters));
                             }
                             info!(
                                 "Merged origin service ({}) credentials into restore config for target service {}",
@@ -4344,7 +4376,29 @@ fn build_mariadb_steps(
     // The physical restore sequence, shared by in-place, new-service, and the
     // base half of PITR. Kept in one place so the three previews can't drift
     // from each other (they all run `physical_restore_into_container`).
+    let walg = temps_providers::externalsvc::mariadb::MariaDbService::is_walg_repository_location(
+        resolved_location,
+    );
     let physical_sequence = |target: &str, steps: &mut Vec<String>| {
+        if walg {
+            steps.push(format!(
+                "Disable {target}'s restart policy and stop it so the datadir volume is free"
+            ));
+            steps.push(format!(
+                "A helper sharing {target}'s volume runs `wal-g backup-fetch` from {resolved_location} into a staging directory on the volume and prepares it with `mariadb-backup --prepare`; nothing in the live datadir is touched yet"
+            ));
+            steps.push(
+                "Swap the prepared base in, keeping the original datadir aside on the same volume"
+                    .into(),
+            );
+            steps.push(format!(
+                "Start {target} on the restored datadir, give it back its restart policy, and wait until it answers"
+            ));
+            steps.push(format!(
+                "On success delete the kept original; if anything after the swap fails, put the original back and start {target} on it as it was"
+            ));
+            return;
+        }
         steps.push(format!(
             "Download {} from S3 and gunzip it to a raw mbstream on the host",
             resolved_location
@@ -7340,20 +7394,22 @@ mod tests {
         assert!(takes_job_path(&worker_postgres()));
     }
 
-    /// MariaDB and storage services on a worker restore in place through the
-    /// node's agent, from their own backup format; another mode is refused
-    /// explicitly, naming the node, never silently. (MongoDB and Redis run the
-    /// control plane's own restores on the node: `worker_mongodb`,
-    /// `worker_redis`.)
+    /// Storage services on a worker restore in place through the node's
+    /// agent, from their own backup format; another mode is refused
+    /// explicitly, naming the node, never silently. (MongoDB, Redis and
+    /// MariaDB run the control plane's own restores on the node:
+    /// `worker_mongodb`, `worker_redis`, `worker_mariadb`.)
     #[test]
     fn a_worker_service_restores_only_in_place_from_its_own_format() {
-        let cases = [
-            (
-                "mariadb",
-                "external_services/mariadb/cache/2026/01/01/u/dump.sql.gz",
-            ),
-            ("rustfs", "external_services/s3/cache/u"),
-        ];
+        let mariadb = temps_entities::external_services::Model {
+            service_type: "mariadb".to_string(),
+            node_id: Some(4),
+            ..crashed_run_service()
+        };
+        assert!(!crate::engines::worker_agent::takes_agent_path(&mariadb));
+        assert!(worker_mariadb::takes_mariadb_path(&mariadb));
+
+        let cases = [("rustfs", "external_services/s3/cache/u")];
         for (service_type, key) in cases {
             let target = temps_entities::external_services::Model {
                 service_type: service_type.to_string(),
@@ -7436,9 +7492,10 @@ mod tests {
 
     /// The restore page of a database on a worker node, read from a server
     /// that runs no containers: answered without an engine, for every worker
-    /// engine; in place only, and to a point in time for PostgreSQL (its
-    /// WAL-G restore runs on the node). Before, the engine lookup needed this
-    /// server's Docker and the page failed with a generic 500.
+    /// engine; in place only, and to a point in time for PostgreSQL and
+    /// MariaDB (their control-plane restores run on the node). Before, the
+    /// engine lookup needed this server's Docker and the page failed with a
+    /// generic 500.
     #[tokio::test]
     async fn a_worker_service_reports_its_restore_options_on_a_control_plane_profile() {
         for service_type in ["postgres", "mongodb", "redis", "mariadb", "s3"] {
@@ -7456,7 +7513,7 @@ mod tests {
             assert!(!capabilities.restore_to_new_service, "{service_type}");
             assert_eq!(
                 capabilities.pitr,
-                service_type == "postgres",
+                matches!(service_type, "postgres" | "mariadb"),
                 "{service_type}"
             );
         }

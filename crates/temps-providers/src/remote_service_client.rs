@@ -17,16 +17,19 @@ pub use temps_providers_core::remote_params::{RemotePortMapping, RemoteServiceCr
 use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
-    MongodbBackupMode, MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest,
-    MongodbRestoreResult, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
-    PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
-    RecoveryTarget, RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest,
-    RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult, RemoteHealthProbeRequest,
-    RemoteHealthProbeResponse, RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse,
-    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
-    RemoteServiceRestoreResponse, RemoteWalHealthRequest, RemoteWalHealthResponse,
-    ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
+    MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbBinlogCoordinate,
+    MariadbDumpBackupRequest, MariadbDumpBackupResult, MariadbPhysicalBackupRequest,
+    MariadbPhysicalBackupResult, MariadbRestoreRequest, MariadbRestoreResult, MongodbBackupMode,
+    MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
+    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest,
+    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
+    RedisWalgBackupResult, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
+    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthRequest, RemoteWalHealthResponse, ServiceContainerRuntime,
+    ServiceContainerStats, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -684,6 +687,87 @@ impl RemoteServiceClient {
         );
         self.agent_post_with_timeout(
             "/agent/services/redis/restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Push a WAL-G physical base backup of a worker's MariaDB with the
+    /// control plane's own engine, run by the node's agent. The S3 source's
+    /// credentials travel sealed; an agent without the route is told to
+    /// update.
+    pub async fn mariadb_physical_backup(
+        &self,
+        request: &MariadbPhysicalBackupRequest,
+    ) -> Result<MariadbPhysicalBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Backing up a MariaDB service on its remote node with WAL-G"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/physical-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Dump a worker's MariaDB to S3 with the control plane's own dump,
+    /// run by the node's agent.
+    pub async fn mariadb_dump_backup(
+        &self,
+        request: &MariadbDumpBackupRequest,
+    ) -> Result<MariadbDumpBackupResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            key = %request.key,
+            "Dumping a MariaDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/dump-backup",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Restore a worker's MariaDB in place, or to a point in time, with the
+    /// control plane's own restore run by the node's agent.
+    pub async fn mariadb_restore(
+        &self,
+        request: &MariadbRestoreRequest,
+    ) -> Result<MariadbRestoreResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.source.bucket,
+            pitr = request.recovery_target.is_some(),
+            "Restoring a MariaDB service on its remote node"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/restore",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Ship a worker's MariaDB binary logs to its S3 source with the
+    /// control plane's own archiver, run by the node's agent.
+    pub async fn mariadb_binlog_archive(
+        &self,
+        request: &MariadbBinlogArchiveRequest,
+    ) -> Result<MariadbBinlogArchiveResult, ExternalServiceError> {
+        self.agent_post_with_timeout(
+            "/agent/services/mariadb/binlog-archive",
             request,
             DATA_OPERATION_TIMEOUT,
         )
@@ -2366,6 +2450,170 @@ mod tests {
             assert!(message.contains("Update the node's agent"), "{message}");
             assert!(!message.contains("redis-password"), "{message}");
         }
+    }
+
+    /// Every MariaDB operation reaches the node sealed, on its own route,
+    /// and returns the node's outcome; an older agent is told to update.
+    #[tokio::test]
+    async fn mariadb_operations_are_sealed_to_the_node_and_their_outcomes_returned() {
+        async fn physical(
+            headers: HeaderMap,
+            sealed: axum::body::Bytes,
+        ) -> Json<serde_json::Value> {
+            let request: MariadbPhysicalBackupRequest =
+                open_for_test(&headers, "/agent/services/mariadb/physical-backup", &sealed);
+            assert_eq!((request.service_id, request.node_id), (8, 2));
+            assert_eq!(request.backup_uuid, "u-1");
+            assert_eq!(
+                request.destination.session_token.as_deref(),
+                Some("destination-session")
+            );
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "completed",
+                "binlog": {"file": "mysql-bin.000002", "position": "385", "gtid": "0-1-4"}
+            }}))
+        }
+        async fn dump(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: MariadbDumpBackupRequest =
+                open_for_test(&headers, "/agent/services/mariadb/dump-backup", &sealed);
+            assert!(request.key.ends_with("dump.sql.gz"));
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "completed", "size_bytes": 512
+            }}))
+        }
+        async fn restore(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: MariadbRestoreRequest =
+                open_for_test(&headers, "/agent/services/mariadb/restore", &sealed);
+            assert!(request.recovery_target.is_some());
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "failed", "reason": "the original data was put back"
+            }}))
+        }
+        async fn archive(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let _: MariadbBinlogArchiveRequest =
+                open_for_test(&headers, "/agent/services/mariadb/binlog-archive", &sealed);
+            Json(serde_json::json!({"success": true, "error": null, "data": {
+                "status": "completed", "shipped": 3
+            }}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/agent/services/mariadb/physical-backup", post(physical))
+                    .route("/agent/services/mariadb/dump-backup", post(dump))
+                    .route("/agent/services/mariadb/restore", post(restore))
+                    .route("/agent/services/mariadb/binlog-archive", post(archive)),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "shop".to_string(),
+            service_type: ServiceType::Mariadb,
+            version: None,
+            parameters: serde_json::json!({"root_password": "root-password"}),
+        };
+        let physical_request = MariadbPhysicalBackupRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: config.clone(),
+            destination: worker_destination(),
+            bucket_path: "base".to_string(),
+            backup_uuid: "u-1".to_string(),
+        };
+        assert_eq!(
+            client(address)
+                .mariadb_physical_backup(&physical_request)
+                .await
+                .unwrap(),
+            MariadbPhysicalBackupResult::Completed {
+                binlog: Some(MariadbBinlogCoordinate {
+                    file: "mysql-bin.000002".into(),
+                    position: "385".into(),
+                    gtid: "0-1-4".into(),
+                })
+            }
+        );
+        let dumped = client(address)
+            .mariadb_dump_backup(&MariadbDumpBackupRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config.clone(),
+                destination: worker_destination(),
+                bucket_path: "base".to_string(),
+                key: "base/external_services/mariadb/shop/u/dump.sql.gz".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            dumped,
+            MariadbDumpBackupResult::Completed { size_bytes: 512 }
+        );
+        let restored = client(address)
+            .mariadb_restore(&MariadbRestoreRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config.clone(),
+                source: worker_destination(),
+                bucket_path: "base".to_string(),
+                location: "s3://b/base/external_services/mariadb/shop/walg".to_string(),
+                recovery_target: Some(RecoveryTarget::Time {
+                    time: "2026-11-08T10:00:00Z".parse().unwrap(),
+                }),
+                target_user_data: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            restored,
+            MariadbRestoreResult::Failed {
+                reason: "the original data was put back".into()
+            }
+        );
+        let archived = client(address)
+            .mariadb_binlog_archive(&MariadbBinlogArchiveRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config,
+                destination: worker_destination(),
+                bucket_path: "base".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            archived,
+            MariadbBinlogArchiveResult::Completed { shipped: 3 }
+        );
+        server.abort();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let older = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()).await.unwrap();
+        });
+        let message = client(older)
+            .mariadb_physical_backup(&physical_request)
+            .await
+            .expect_err("an older agent has no MariaDB route")
+            .to_string();
+        server.abort();
+        assert!(
+            message.contains("/agent/services/mariadb/physical-backup"),
+            "{message}"
+        );
+        assert!(message.contains("Update the node's agent"), "{message}");
     }
 
     /// An archive re-point reaches the node sealed, with the destination's
