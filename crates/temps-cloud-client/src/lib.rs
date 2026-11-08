@@ -45,6 +45,7 @@ pub use console_proxy::{
     ConsoleDispatchSlot, ConsoleDispatchTarget, ConsoleOidcSink, ConsoleProxyWorker,
     ConsoleRouterHandle, NoopConsoleOidcSink,
 };
+pub use heartbeat::{ConsoleLogoutOutcome, ConsoleLogoutSink};
 pub use link::{
     CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FirstLinkEnrollment,
     FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,

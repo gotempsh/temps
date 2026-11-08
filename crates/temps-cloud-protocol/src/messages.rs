@@ -1251,9 +1251,77 @@ pub struct StatusRequest {
     pub instance_id: Option<Uuid>,
 }
 
+// ---------------------------------------------------------------------------
+// Console session logout — ADR-094
+//
+// The one backend → instance message that makes the instance act. It is safe
+// because the action only ever *removes* access, and because the instance
+// acts on a token signed by the identity provider it already trusts to sign
+// users in, never on the channel's say-so.
+// ---------------------------------------------------------------------------
+
+/// Envelope kind of [`ConsoleLogout`].
+pub const CONSOLE_LOGOUT_KIND: &str = "console_logout";
+/// Envelope kind of [`ConsoleLogoutAck`].
+pub const CONSOLE_LOGOUT_ACK_KIND: &str = "console_logout_ack";
+/// Envelope kind of [`ConsoleLogoutRejected`].
+pub const CONSOLE_LOGOUT_REJECTED_KIND: &str = "console_logout_rejected";
+/// Longest [`ConsoleLogoutRejected::reason`] an instance sends.
+pub const MAX_CONSOLE_LOGOUT_REJECTION_CHARS: usize = 256;
+
+/// End one user's console sessions issued through the backend-managed OIDC
+/// provider. Sent only to an instance that advertised
+/// [`crate::Capability::ConsoleSessionLogout`].
+///
+/// `logout_token` is an OpenID Connect Back-Channel Logout 1.0 logout token
+/// (JOSE `typ` `logout+jwt`, RS256), signed by the same keys as the
+/// provider's ID tokens. Its `jti` identifies the request in the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLogout {
+    pub logout_token: String,
+}
+
+/// The instance verified the token and ended `sessions_ended` sessions (zero
+/// is normal: the user may have had none here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLogoutAck {
+    pub jti: Uuid,
+    pub sessions_ended: u32,
+}
+
+/// The instance refused the token. `reason` is a short, fixed description,
+/// never token contents. Sent only when the token's `jti` could be read;
+/// anything less is dropped silently, since there is nothing to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLogoutRejected {
+    pub jti: Uuid,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_logout_frames_keep_their_wire_shape() {
+        let logout: ConsoleLogout =
+            serde_json::from_value(serde_json::json!({"logout_token": "a.b.c"})).unwrap();
+        assert_eq!(logout.logout_token, "a.b.c");
+        let ack = ConsoleLogoutAck {
+            jti: Uuid::nil(),
+            sessions_ended: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(ack).unwrap(),
+            serde_json::json!({"jti": Uuid::nil(), "sessions_ended": 2})
+        );
+        let envelope = Envelope::new(CONSOLE_LOGOUT_KIND, &logout).unwrap();
+        assert_eq!(envelope.kind, "console_logout");
+        assert_eq!(
+            envelope.decode::<ConsoleLogout>(CONSOLE_LOGOUT_KIND),
+            Some(logout)
+        );
+    }
 
     #[test]
     fn envelope_round_trips() {
