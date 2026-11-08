@@ -7615,7 +7615,7 @@ async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
     )
     .await?;
     db.execute_unprepared("INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES ('00000000-0000-4000-8000-000000000001','reports','fixture','fixture',true)").await?;
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, None).await?;
     let migration = Migrator::migrations()
         .into_iter()
         .find(|migration| migration.name() == target)
@@ -7635,7 +7635,7 @@ async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
     .await?;
     let approval_columns = db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Postgres, "SELECT column_name FROM information_schema.columns WHERE table_name='ai_pending_actions' AND column_name='plugin_revision' AND is_nullable='YES'")).await?;
     assert_eq!(approval_columns.len(), 1);
-    Migrator::down(&db, Some(1)).await?;
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
     migration.down(&SchemaManager::new(&db)).await?;
     let approval_columns = db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Postgres, "SELECT column_name FROM information_schema.columns WHERE table_name='ai_pending_actions' AND column_name='plugin_revision'")).await?;
     assert!(approval_columns.is_empty());

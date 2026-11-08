@@ -3857,6 +3857,24 @@ async fn write_tool_dispatch_refreshes_plugin_publications_within_the_turn() {
     );
     let first = router.dispatch(&call, &test_auth()).await;
     assert!(first.contains("Report before reload"), "{first}");
+    let completed = tool_call(
+        "core-write",
+        "temps_write",
+        r#"{"command":"create_project --name reports"}"#,
+    );
+    let completed_key = format!("{}|{}", completed.name, completed.arguments);
+    {
+        let mut state = router.state.lock().await;
+        state.seen_calls.insert(
+            completed_key.clone(),
+            r#"{"status":"executed","operation":"create_project","action_id":"completed-action"}"#
+                .into(),
+        );
+        state.seen_calls.insert(
+            "temps|preview".into(),
+            r#"{"status":200,"operation":"preview_alert","data":{}}"#.into(),
+        );
+    }
     assert!(router
         .dispatch(&call, &test_auth())
         .await
@@ -3866,6 +3884,11 @@ async fn write_tool_dispatch_refreshes_plugin_publications_within_the_turn() {
     let next = router.dispatch(&call, &test_auth()).await;
     assert!(next.contains("Report after reload"), "{next}");
     assert!(!next.contains("Report before reload"));
+    assert!(router
+        .dispatch(&completed, &test_auth())
+        .await
+        .starts_with("You already ran"));
+    assert!(missing_backtest("create_alert", &router.state.lock().await.seen_calls).is_none());
 }
 
 #[tokio::test]
@@ -3919,6 +3942,11 @@ async fn read_tool_dispatch_refreshes_disabled_calls_and_help_within_the_turn() 
     let enabled = router.dispatch(&call, &test_auth()).await;
     assert!(enabled.contains("reports_ready"), "{enabled}");
     assert!(!enabled.starts_with("You already ran"));
+    assert!(router
+        .dispatch(&call, &test_auth())
+        .await
+        .starts_with("You already ran"));
+    registry.publish(PluginToolsIndex::from_openapi("reports", &after, false).unwrap());
     assert!(router
         .dispatch(&call, &test_auth())
         .await

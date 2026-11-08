@@ -361,12 +361,9 @@ impl ToolRouter {
         if state.api_tools_revision != revision {
             // Discovery and refusals from an old publication cannot prevent a
             // fresh proposal. Execution still requires its normal approval.
-            state.seen_calls.retain(|key, _| {
-                !key.starts_with("temps|")
-                    && !key.starts_with("mcp__temps-chat__temps|")
-                    && !key.starts_with("temps_write|")
-                    && !key.starts_with("mcp__temps-chat__temps_write|")
-            });
+            for key in std::mem::take(&mut state.refreshable_api_calls) {
+                state.seen_calls.remove(&key);
+            }
             state.api_tools_revision = revision;
         }
         dispatch_conversation_tool(
