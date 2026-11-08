@@ -538,16 +538,7 @@ fn build_request_parts_scoped(
                 path = path.replace(&placeholder, &urlencoding::encode(&str_val));
             }
             ParamLocation::Query => {
-                let str_val = if param.ty == "json" {
-                    value.to_string()
-                } else {
-                    value_to_string(&value)
-                };
-                query_parts.push(format!(
-                    "{}={}",
-                    urlencoding::encode(&param.name),
-                    urlencoding::encode(&str_val),
-                ));
+                query_parts.extend(crate::query::serialize(op, param, &value)?);
             }
             ParamLocation::Body => {
                 body_map.insert(param.name.clone(), value);
@@ -1843,6 +1834,7 @@ mod tests {
 
     fn path_param(name: &str) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Path,
             required: true,
@@ -1856,6 +1848,7 @@ mod tests {
 
     fn query_param(name: &str, required: bool) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Query,
             required,
@@ -1869,6 +1862,7 @@ mod tests {
 
     fn body_param(name: &str, required: bool) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required,
@@ -1882,6 +1876,7 @@ mod tests {
 
     fn body_enum_param(name: &str, values: &[&str], required: bool) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required,
@@ -1964,6 +1959,7 @@ mod tests {
 
     fn enum_query_param(name: &str, values: &[&str]) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Query,
             required: false,

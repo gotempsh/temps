@@ -904,6 +904,7 @@ mod tests {
             description: None,
             tags: vec!["External Services".to_string()],
             params: vec![ParamSpec {
+                query_serialization: None,
                 name: "project_id".to_string(),
                 location: ParamLocation::Body,
                 required: false,
@@ -1059,6 +1060,7 @@ mod tests {
             description: None,
             tags: vec!["External Services".to_string()],
             params: vec![crate::index::ParamSpec {
+                query_serialization: None,
                 name: "version".to_string(),
                 location: ParamLocation::Body,
                 required: true,
@@ -1205,6 +1207,7 @@ mod tests {
 
     fn array_param(name: &str, item_ty: Option<&str>) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required: true,
@@ -1218,6 +1221,7 @@ mod tests {
 
     fn env_var_operation() -> ApiOperation {
         let scalar = |name: &str, ty: &str| ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required: true,
@@ -1419,6 +1423,7 @@ mod tests {
             has_json_body: false,
             plugin_enabled: None,
             params: vec![ParamSpec {
+                query_serialization: None,
                 name: "name".to_string(),
                 location: ParamLocation::Body,
                 required: true,

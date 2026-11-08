@@ -126,7 +126,9 @@ export function createToolPlugin(base: TempsPlugin) {
                   name,
                   in: "query",
                   required: schema.required?.includes(name) ?? false,
-                  schema: property,
+                  ...(queryEncoding(property, definitions).jsonEncoded
+                    ? { content: { "application/json": { schema: property } } }
+                    : { schema: property }),
                 }),
               ),
             }

@@ -42,6 +42,8 @@ mod cli;
 mod error;
 mod handle;
 mod index;
+mod query;
+pub use query::QuerySerialization;
 mod integration_tests;
 mod plugin_registry;
 mod secrets;

@@ -34,6 +34,20 @@ async function request(
   return res;
 }
 describe("endpoint AI tools", () => {
+  it("declares JSON query content explicitly for structured inputs", () => {
+    const p = plugin().tool({
+      name: "list", description: "List reports", method: "GET",
+      input: z.object({ ids: z.array(z.string()), search: z.string(), count: z.number().nullable() }),
+      handler: (value) => value,
+    });
+    const spec = p.openapi!() as any;
+    const [ids, search, count] = spec.paths["/tools/list"].get.parameters;
+    expect(ids.content["application/json"].schema).toMatchObject({type: "array", items: {type: "string"}});
+    expect(ids.schema).toBeUndefined();
+    expect(search.schema).toMatchObject({type: "string"});
+    expect(search.content).toBeUndefined();
+    expect(count.content["application/json"].schema).toBeDefined();
+  });
   it("awaits async refinements before invoking the handler", async () => {
     const handler = vi.fn((input) => input);
     const p = plugin().tool({
@@ -346,11 +360,11 @@ describe("endpoint AI tools", () => {
     const spec = p.openapi!() as {
       paths: Record<
         string,
-        { get?: { parameters: Array<{ schema: { $ref: string } }> } }
+        { get?: { parameters: Array<{ content: { "application/json": { schema: { $ref: string } } } }> } }
       >;
       components: { schemas: Record<string, unknown> };
     };
-    const ref = spec.paths["/tools/named"].get!.parameters[0].schema.$ref;
+    const ref = spec.paths["/tools/named"].get!.parameters[0].content["application/json"].schema.$ref;
     expect(
       spec.components.schemas[ref.replace("#/components/schemas/", "")],
     ).toMatchObject({ type: "object" });

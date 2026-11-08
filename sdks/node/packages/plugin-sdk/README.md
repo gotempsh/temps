@@ -27,7 +27,9 @@ GET input comes from query parameters. Non-string schemas decode JSON values,
 including numbers, booleans, nullable values, arrays and objects. Plain string
 schemas preserve query text. Composite schemas use explicit JSON: `2` is a
 number, `"2"` is a string, and `null` differs from `"null"`. The generic API
-caller applies this encoding automatically. Named Zod schemas
+caller applies this encoding automatically from the parameter’s OpenAPI
+`content: { "application/json": { schema: … } }` declaration. Plain string
+parameters use the standard `schema` representation. Named Zod schemas
 and recursive Zod schemas are published as OpenAPI components. Other methods accept a JSON object capped
 at 128 KiB. Inputs are validated before the
 handler runs. Non-GET methods cannot declare `access: 'read'`; GET can declare

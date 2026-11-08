@@ -35,6 +35,14 @@ pub struct PluginToolsIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginToolsError {
+    #[error(
+        "Cannot index plugin query parameter '{parameter}' in operation '{operation_id}': {reason}"
+    )]
+    QuerySerialization {
+        operation_id: String,
+        parameter: String,
+        reason: String,
+    },
     #[error("Cannot index AI tools for plugin '{plugin}': name overlaps the host plugin management namespace")]
     ReservedPluginName { plugin: String },
     #[error("Cannot index AI operation '{operation_id}' for plugin '{plugin}': parameter '{parameter}' occurs in multiple locations")]
@@ -257,7 +265,7 @@ impl PluginToolsIndex {
                         parameter: parameter.name.clone(),
                     });
                 }
-                preserve_query_input_types(&mut operation, &effective, openapi);
+                preserve_query_input_types(&mut operation, &effective, openapi)?;
                 operation.has_json_body = effective
                     .request_body
                     .as_ref()
@@ -386,7 +394,7 @@ fn preserve_query_input_types(
     operation: &mut ApiOperation,
     declaration: &Operation,
     openapi: &utoipa::openapi::OpenApi,
-) {
+) -> Result<(), PluginToolsError> {
     for parameter in declaration.parameters.iter().flatten() {
         let Some(parameter) = resolve_component(
             parameter,
@@ -398,18 +406,77 @@ fn preserve_query_input_types(
         if parameter.parameter_in != ParameterIn::Query {
             continue;
         }
-        let Some(schema) = parameter
-            .schema
-            .as_ref()
-            .and_then(|schema| deref_schema(schema, openapi))
-        else {
-            continue;
+        use crate::QuerySerialization;
+        use utoipa::openapi::path::ParameterStyle;
+        let invalid = |reason: &str| PluginToolsError::QuerySerialization {
+            operation_id: operation.operation_id.clone(),
+            parameter: parameter.name.clone(),
+            reason: reason.into(),
         };
+        let json = !parameter.content.is_empty();
+        let schema_ref = if json {
+            if parameter.content.len() != 1
+                || parameter.schema.is_some()
+                || parameter.style.is_some()
+                || parameter.explode.is_some()
+            {
+                return Err(invalid(
+                    "JSON query content cannot be combined with schema/style/explode",
+                ));
+            }
+            let Some(RefOr::T(content)) = parameter.content.get("application/json") else {
+                return Err(invalid(
+                    "Only inline application/json query content is supported",
+                ));
+            };
+            content.schema.as_ref()
+        } else {
+            parameter.schema.as_ref()
+        };
+        let schema = schema_ref
+            .and_then(|schema| deref_schema(schema, openapi))
+            .ok_or_else(|| invalid("Query schema is missing or unresolved"))?;
+        if parameter.allow_reserved == Some(true) {
+            return Err(invalid("allowReserved query values are unsupported"));
+        }
+        let encoding = if json {
+            QuerySerialization::Json
+        } else {
+            match parameter.style.as_ref().unwrap_or(&ParameterStyle::Form) {
+                ParameterStyle::Form => QuerySerialization::Form {
+                    explode: parameter.explode.unwrap_or(true),
+                },
+                ParameterStyle::DeepObject if parameter.explode != Some(false) => {
+                    QuerySerialization::DeepObject
+                }
+                ParameterStyle::SpaceDelimited if parameter.explode != Some(true) => {
+                    QuerySerialization::SpaceDelimited
+                }
+                ParameterStyle::PipeDelimited if parameter.explode != Some(true) => {
+                    QuerySerialization::PipeDelimited
+                }
+                _ => return Err(invalid("Unsupported query style/explode combination")),
+            }
+        };
+        let (ty, _) = extract_schema_type_and_enum(schema);
+        if !json {
+            let compatible = match &encoding {
+                QuerySerialization::DeepObject => ty == "object",
+                QuerySerialization::SpaceDelimited | QuerySerialization::PipeDelimited => {
+                    ty == "array"
+                }
+                _ => ty != "object",
+            };
+            if !compatible || needs_json_input(schema, openapi, 0) {
+                return Err(invalid("Use application/json content for composite values; objects require deepObject or JSON content"));
+            }
+        }
         if let Some(param) = operation.params.iter_mut().find(|param| {
             param.name == parameter.name && matches!(param.location, ParamLocation::Query)
         }) {
             let (ty, enum_values) = extract_schema_type_and_enum(schema);
             param.ty = ty;
+            param.query_serialization = Some(encoding);
             param.enum_values = enum_values;
             if needs_json_input(schema, openapi, 0) {
                 param.ty = "json".into();
@@ -421,6 +488,7 @@ fn preserve_query_input_types(
             }
         }
     }
+    Ok(())
 }
 
 /// Composite plugin inputs require an explicit JSON value, not scalar guessing.
@@ -981,7 +1049,7 @@ mod tests {
             let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
             assert_eq!(
                 urlencoding::decode(&request.query).unwrap(),
-                "ids=[\"123\",\"true\"]"
+                "ids=123&ids=true"
             );
         }
     }
@@ -993,7 +1061,7 @@ mod tests {
             json!({"anyOf":[{"type":"string"},{"type":"number"},{"type":"null"}]}),
             json!({"$ref":"#/components/schemas/Choice"}),
         ] {
-            let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"schemas":{"Choice":{"type":["string","number","null"]}}},"paths":{"/filter":{"get":{"operationId":"filter","x-temps-ai-tool":{},"parameters":[{"in":"query","name":"choice","required":true,"schema":schema}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"schemas":{"Choice":{"type":["string","number","null"]}}},"paths":{"/filter":{"get":{"operationId":"filter","x-temps-ai-tool":{},"parameters":[{"in":"query","name":"choice","required":true,"content":{"application/json":{"schema":schema}}}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
             let plugin = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
             let mut index = ReadOnlyApiIndex::from_openapi_allowlist(&spec, &[]);
             plugin.append_to(&mut index, PluginToolAccess::Read);

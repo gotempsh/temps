@@ -87,5 +87,9 @@ unsupported root shapes and media types fail indexing with
 a contextual error instead of exposing an operation with unusable body inputs.
 Composite property values use explicit JSON encoding; the endpoint validates
 their constraints. Recursive SDK references are rooted in OpenAPI components.
-Composite query inputs also use explicit JSON encoding to preserve the
-difference between numbers, numeric-looking strings and null.
+SDK query inputs that need JSON encoding declare parameter `content` with
+`application/json`, preserving numbers, numeric-looking strings and null.
+Existing marked endpoints retain their OpenAPI query serialization: form arrays
+use repeated keys by default, non-exploded arrays use the declared delimiter,
+and flat objects support deepObject. Unsupported serialization declarations fail
+indexing rather than silently using the SDK encoding.

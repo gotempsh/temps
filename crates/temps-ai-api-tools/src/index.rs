@@ -185,6 +185,9 @@ impl ObjectShape {
 /// Compact description of a single parameter, extracted from the utoipa schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSpec {
+    /// Plugin query wire format. None preserves the curated core API behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_serialization: Option<crate::QuerySerialization>,
     /// Parameter name as it appears in the path template, query string, or
     /// request body JSON object.
     pub name: String,
@@ -872,6 +875,7 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         };
 
         params.push(ParamSpec {
+            query_serialization: None,
             name: prop_name.clone(),
             location: ParamLocation::Body,
             required,
@@ -1078,6 +1082,7 @@ fn build_param_spec(param: &utoipa::openapi::path::Parameter) -> Option<ParamSpe
     let (ty, enum_values) = extract_type_and_enum(param.schema.as_ref());
 
     Some(ParamSpec {
+        query_serialization: None,
         name: param.name.clone(),
         location,
         required,
