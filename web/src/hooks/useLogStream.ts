@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { connectLogStream } from './logStreamConnection'
 import { useVirtualizer } from '@tanstack/react-virtual'
 
 export type LiveLogLevel = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'TRACE'
@@ -68,6 +69,7 @@ export interface UseLogStreamReturn {
   handleScroll: (event: React.UIEvent<HTMLDivElement>) => void
   handleNextMatch: () => void
   handlePrevMatch: () => void
+  retry: () => void
 }
 
 // Detect a leading ISO-8601 timestamp the server prepended when the client
@@ -132,7 +134,9 @@ export function useLogStream({
   const [selectedLevels, setSelectedLevels] = useState<LiveLogLevel[]>([])
   const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
   const [autoScroll, setAutoScroll] = useState(true)
-  const [showTimestamps, setShowTimestamps] = useState(false)
+  const [showTimestamps, setShowTimestamps] = useState(true)
+  const [retryGeneration, setRetryGeneration] = useState(0)
+  const retry = useCallback(() => setRetryGeneration((n) => n + 1), [])
   // Paused = freeze the visible rope and keep accumulating in a background
   // buffer. Implemented as both a ref (read inside the WS onmessage closure
   // without re-subscribing) and a state (so React re-renders the toolbar
@@ -141,8 +145,6 @@ export function useLogStream({
   const pausedRef = useRef(false)
   const [bufferedCount, setBufferedCount] = useState(0)
   const parentRef = useRef<HTMLDivElement>(null)
-  const wsRef = useRef<WebSocket | null>(null)
-  const isConnectingRef = useRef(false)
   // Buffer incoming WS frames and flush once per animation frame. Without this,
   // a high-volume log source produces one setState per line, which makes React
   // re-render the virtualizer for every byte and freezes the tab.
@@ -176,12 +178,10 @@ export function useLogStream({
 
   // WebSocket connection effect
   useEffect(() => {
-    if (isConnectingRef.current) return
-
     setLogs([])
     setErrorMessage('')
     setBufferedCount(0)
-    isConnectingRef.current = true
+    setConnectionStatus('connecting')
     pendingLogsRef.current = []
 
     const scheduleFlush = () => {
@@ -217,25 +217,22 @@ export function useLogStream({
       scheduleFlush()
     }
 
-    try {
-      // Add timestamps query parameter to request server-side timestamps
-      const url = buildLogStreamUrl(
-        wsUrl,
-        typeof window !== 'undefined'
-          ? window.location.origin
-          : 'http://localhost',
-        showTimestamps,
-        maxLogs
-      )
-
-      const ws = new WebSocket(url)
-
-      ws.onopen = () => {
-        setConnectionStatus('connected')
-        setErrorMessage('')
-      }
-
-      ws.onmessage = (event) => {
+    const disconnect = connectLogStream(
+      () =>
+        new WebSocket(
+          buildLogStreamUrl(
+            wsUrl,
+            window.location.origin,
+            showTimestamps,
+            maxLogs
+          )
+        ),
+      (status, message = '') => {
+        setConnectionStatus(status)
+        setErrorMessage(message)
+        if (message) onError?.(message)
+      },
+      (event) => {
         try {
           const parsed = JSON.parse(event.data)
 
@@ -255,46 +252,17 @@ export function useLogStream({
           }
         }
       }
-
-      ws.onerror = () => {
-        setConnectionStatus('error')
-        const msg = 'Failed to connect to logs stream'
-        setErrorMessage(msg)
-        onError?.(msg)
-      }
-
-      ws.onclose = (event) => {
-        setConnectionStatus(event.code === 1000 ? 'complete' : 'error')
-        if (event.code !== 1000) {
-          const msg =
-            event.reason || `Log stream closed unexpectedly (${event.code})`
-          setErrorMessage(msg)
-          onError?.(msg)
-        }
-        isConnectingRef.current = false
-      }
-
-      wsRef.current = ws
-    } catch (error) {
-      setConnectionStatus('error')
-      const msg = error instanceof Error ? error.message : 'Connection failed'
-      setErrorMessage(msg)
-      onError?.(msg)
-      isConnectingRef.current = false
-    }
+    )
 
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close()
-      }
+      disconnect()
       if (flushHandleRef.current != null) {
         cancelAnimationFrame(flushHandleRef.current)
         flushHandleRef.current = null
       }
       pendingLogsRef.current = []
-      isConnectingRef.current = false
     }
-  }, [wsUrl, onError, showTimestamps, maxLogs])
+  }, [wsUrl, onError, showTimestamps, maxLogs, retryGeneration])
 
   // Auto-scroll effect with proper timing for virtualizer. Disabled while
   // paused so the user's read position is preserved.
@@ -381,6 +349,7 @@ export function useLogStream({
   }
 
   return {
+    retry,
     logs,
     filteredLogs,
     connectionStatus,
