@@ -175,3 +175,67 @@ impl AuditOperation for GitConnectionReauthorizationAudit {
         temps_core::serialize_audit_operation(self)
     }
 }
+
+/// An operator started creating a GitHub App from a manifest, which is what
+/// lets the callback accept the resulting code. Records who and from where,
+/// never the state that was issued.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubAppSetupStartedAudit {
+    pub context: AuditContext,
+}
+
+impl AuditOperation for GithubAppSetupStartedAudit {
+    fn operation_type(&self) -> String {
+        "GITHUB_APP_SETUP_STARTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// A GitHub App was created from a manifest and registered as a git provider.
+/// The callback carries no session, so the operator is the one the
+/// server-issued setup state was issued to. Records the provider and the app,
+/// never the app's credentials.
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubAppCreatedAudit {
+    pub context: AuditContext,
+    pub provider_id: i32,
+    pub app_id: i32,
+    pub app_name: String,
+}
+
+impl AuditOperation for GithubAppCreatedAudit {
+    fn operation_type(&self) -> String {
+        "GITHUB_APP_CREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}

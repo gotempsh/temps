@@ -15795,6 +15795,17 @@ export type GitSourcePlan = {
     repo: string;
 };
 
+/**
+ * Response of [`start_github_manifest_flow`].
+ */
+export type GithubManifestStartResponse = {
+    /**
+     * Single-use token to send to GitHub with the manifest. GitHub returns it
+     * to the callback, which accepts the manifest code only together with it.
+     */
+    state: string;
+};
+
 export type GlobalAnalyticsResponse = {
     rows: Array<GlobalAnalyticsRow>;
     total: number;
@@ -56394,6 +56405,37 @@ export type CreateGiteaPatProviderResponses = {
 };
 
 export type CreateGiteaPatProviderResponse = CreateGiteaPatProviderResponses[keyof CreateGiteaPatProviderResponses];
+
+export type StartGithubManifestFlowData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/git-providers/github/manifest/start';
+};
+
+export type StartGithubManifestFlowErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StartGithubManifestFlowResponses = {
+    /**
+     * State issued
+     */
+    200: GithubManifestStartResponse;
+};
+
+export type StartGithubManifestFlowResponse = StartGithubManifestFlowResponses[keyof StartGithubManifestFlowResponses];
 
 export type CreateGithubPatProviderData = {
     body: CreateGitHubPatRequest;

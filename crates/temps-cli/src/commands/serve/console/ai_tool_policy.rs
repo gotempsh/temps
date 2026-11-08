@@ -687,6 +687,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "starts a browser flow: the state it issues is a credential for the setup flow, so it must not pass through the assistant",
+        &["start_github_manifest_flow"],
+    ),
+    (
         "static bundles and image archives need an upload the assistant cannot perform",
         &[
             "deploy_from_image_upload",

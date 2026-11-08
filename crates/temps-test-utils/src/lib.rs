@@ -353,6 +353,12 @@ fn external_database_url() -> Option<String> {
         .filter(|url| !url.trim().is_empty())
 }
 
+/// Whether `TEMPS_TEST_DATABASE_URL` points tests at an existing database, so
+/// they can run without Docker.
+pub fn external_database_configured() -> bool {
+    external_database_url().is_some()
+}
+
 /// Replaces the database name in a `postgresql://` URL, keeping its query
 /// string (`sslmode` and the like apply to every database on the server).
 fn with_database_name(url: &str, database: &str) -> anyhow::Result<String> {

@@ -31,6 +31,7 @@ mod git_push;
 mod health;
 mod installations;
 mod manager_trait;
+mod manifest_state;
 mod oauth;
 mod presets;
 mod providers;
