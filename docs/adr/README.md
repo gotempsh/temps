@@ -85,7 +85,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [064](./064-making-a-project-reachable.md) | Making a project reachable: who first, then how | Proposed |  |
 | [065](./065-tailnet-names-and-signed-in-addresses.md) | Tailnet names, tailnet users and signed-in addresses | Proposed |  |
 | [066](./066-shield-reputation-and-challenges.md) | Shield: reputation, fingerprints and challenges at every ingress | Proposed |  |
-| [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed |  |
+| [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed | amended by [096](./096-worker-health-for-environments-without-ingress.md) |
 | [069](./069-make-it-reachable-is-a-page.md) | *Make it reachable* is a page, and asks what is possible first | Proposed |  |
 | [070](./070-https-only-tunnel-addresses.md) | HTTPS only, on standard ports, for addresses published through a Cloudflare tunnel | Proposed |  |
 | [071](./071-git-provider-expansion.md) | Git Provider Expansion — Gitea, Bitbucket, and Generic Providers | Proposed |  |
@@ -109,6 +109,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [089](./089-project-edge-rules.md) | Project Edge Rules — the Engine for the Request-Level Firewall | Accepted |  |
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
 | [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
+| [096](./096-worker-health-for-environments-without-ingress.md) | Worker health for environments without ingress | Proposed | amends [068](./068-environment-addresses-without-a-public-preview-domain.md) |
 
 ## Supporting documents
 
