@@ -108,7 +108,8 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [088](./088-workers-join-with-no-public-address.md) | Workers Join With No Public Address | Proposed |  |
 | [089](./089-project-edge-rules.md) | Project Edge Rules — the Engine for the Request-Level Firewall | Accepted |  |
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
-| [092](./092-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md) |
+| [092](./092-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [093](./093-scoped-s3-credentials-for-worker-jobs.md) |
+| [093](./093-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [092](./092-worker-backups-run-the-local-engines.md) |
 
 ## Supporting documents
 
