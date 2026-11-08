@@ -38,6 +38,8 @@ These are library components, not a completed product path. They are not yet wir
 
 ### Latest Tokenless changes and remaining caveats
 
+Current integration pin: `03c94edcd6ec214164863540d7b372dac219b3ac`. This includes the maintained YAML parser and additional revocation-race fixes. The dependency blocker described in the historical assessment below is resolved: all 600 Temps core tests, including the unchanged dependency guard, pass. Service-access has 41 passing library tests; the runtime has 14, including idle pre-TLS tunnel closure on revocation, policy-lease expiry without control-plane contact, and worker shutdown. All 14 runtime tests also passed inside a disposable Linux Docker container. The runner is `python3 scripts/test_service_access_runtime_docker.py`; it skips when Docker is unavailable and cleans up its own resources. This is runtime contract coverage, not the multi-worker Docker cluster acceptance gate or end-to-end credential injection.
+
 The new SDK implements strict sessions, per-rule deadlines, version-fenced binding updates, whole-session/binding revocation receipts, Git smart-HTTP scopes, secret-safe Debug implementations, credential rotation generations/idempotency and capability checks. These materially unblock implementation.
 
 Validation during the initial upstream assessment:

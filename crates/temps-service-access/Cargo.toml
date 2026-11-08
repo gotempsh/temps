@@ -25,7 +25,7 @@ sea-orm.workspace = true
 async-trait.workspace = true
 url.workspace = true
 # Pin the audited SDK contract while upstream enforcement work continues.
-tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "88b66cb0dc00c5262525f9ba7d8b881066e60718" }
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

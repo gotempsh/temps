@@ -416,3 +416,84 @@ async fn worker_releases_admission_after_binding_drop() {
     drop(binding);
     assert!(f.proxy.bind(f.spec(token), version).await.is_ok());
 }
+
+#[cfg(unix)]
+async fn idle_guest_tunnel(attachment: &UnixAttachment) -> tokio::net::UnixStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut guest = tokio::net::UnixStream::connect(attachment.directory().join("proxy.sock"))
+        .await
+        .unwrap();
+    guest
+        .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            assert!(response.len() < 4096);
+            response.push(guest.read_u8().await.unwrap());
+        }
+        response
+    })
+    .await
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    guest
+}
+
+#[cfg(unix)]
+async fn assert_guest_closed(mut guest: tokio::net::UnixStream) {
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0];
+    let result = tokio::time::timeout(Duration::from_secs(4), guest.read(&mut byte))
+        .await
+        .expect("idle guest tunnel outlived its enforcement deadline");
+    assert!(
+        matches!(result, Ok(0)) || result.is_err(),
+        "guest received unexpected traffic"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn revocation_receipt_cuts_a_guest_stalled_before_tls() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
+    let guest = idle_guest_tunnel(&attachment).await;
+    attachment
+        .revoke_and_wait(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_guest_closed(guest).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_policy_lease_cuts_a_guest_without_a_control_plane() {
+    let f = Fixture::with_lease(2).await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
+    let guest = idle_guest_tunnel(&attachment).await;
+    assert_guest_closed(guest).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_the_worker_cuts_guest_attachments() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
+    let guest = idle_guest_tunnel(&attachment).await;
+    drop(f.proxy);
+    assert_guest_closed(guest).await;
+}
