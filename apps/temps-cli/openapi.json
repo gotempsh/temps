@@ -52979,6 +52979,20 @@
             "format": "int32",
             "type": "integer"
           },
+          "runtime_reason": {
+            "description": "Short, credential-free explanation of the worker observation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_status": {
+            "description": "Worker runtime health when external uptime has no address to check.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status": {
             "description": "Overall status: \"operational\", \"degraded\", \"down\", \"not_deployed\"\n(monitors exist but the environment has no deployment to check yet),\nor \"no_monitors\"",
             "type": "string"
@@ -121130,6 +121144,19 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Select one environment within the authorized projects; defaults to production.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           }
         ],

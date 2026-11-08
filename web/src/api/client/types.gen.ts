@@ -24996,6 +24996,14 @@ export type ProjectLimitsResponse = {
 export type ProjectMonitorHealth = {
     project_id: number;
     /**
+     * Short, credential-free explanation of the worker observation.
+     */
+    runtime_reason?: string | null;
+    /**
+     * Worker runtime health when external uptime has no address to check.
+     */
+    runtime_status?: string | null;
+    /**
      * Overall status: "operational", "degraded", "down", "not_deployed"
      * (monitors exist but the environment has no deployment to check yet),
      * or "no_monitors"
@@ -62308,6 +62316,10 @@ export type GetProjectsMonitorHealthData = {
          * Comma-separated list of project IDs
          */
         project_ids: string;
+        /**
+         * Select one environment within the authorized projects; defaults to production.
+         */
+        environment_id?: number | null;
     };
     url: '/monitors-health/projects';
 };

@@ -85,7 +85,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [064](./064-making-a-project-reachable.md) | Making a project reachable: who first, then how | Proposed |  |
 | [065](./065-tailnet-names-and-signed-in-addresses.md) | Tailnet names, tailnet users and signed-in addresses | Proposed |  |
 | [066](./066-shield-reputation-and-challenges.md) | Shield: reputation, fingerprints and challenges at every ingress | Proposed |  |
-| [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed |  |
+| [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed | amended by [096](./096-worker-health-for-environments-without-ingress.md) |
 | [069](./069-make-it-reachable-is-a-page.md) | *Make it reachable* is a page, and asks what is possible first | Proposed |  |
 | [070](./070-https-only-tunnel-addresses.md) | HTTPS only, on standard ports, for addresses published through a Cloudflare tunnel | Proposed |  |
 | [071](./071-git-provider-expansion.md) | Git Provider Expansion — Gitea, Bitbucket, and Generic Providers | Proposed |  |
@@ -113,6 +113,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [093](./093-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [092](./092-worker-backups-run-the-local-engines.md) |
 | [094](./094-cloud-console-session-revocation.md) | Temps Cloud console sessions end when Cloud revokes the user | Accepted |  |
 | [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed | amended by [097](./097-internal-dns-canary-corrections.md) |
+| [096](./096-worker-health-for-environments-without-ingress.md) | Worker health for environments without ingress | Accepted | amends [068](./068-environment-addresses-without-a-public-preview-domain.md) |
 | [097](./097-internal-dns-canary-corrections.md) | Internal DNS canary corrections | Accepted | amends [011](./011-internal-dns-ha-databases.md); amends [024](./024-control-plane-dns-resolver.md); amends [095](./095-internal-dns-observability.md) |
 
 ## Supporting documents
