@@ -7602,8 +7602,16 @@ async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> an
     ))
     .await?;
     let name = "m20261108_000001_sandbox_service_access";
+    // Invoke the migration directly as well: the ledger would skip a second up.
+    let migrations = Migrator::migrations();
+    let migration = migrations
+        .iter()
+        .find(|migration| migration.name() == name)
+        .unwrap();
+    let manager = SchemaManager::new(&db);
     let before = Migrator::migrations().len() as u32 - steps_back_to(name);
     Migrator::up(&db, Some(before)).await?;
+    migration.down(&manager).await?;
     db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9201,'Access test','repo','owner','/','main','nodejs','access-test',now(),now()), (9202,'Other project','repo','owner','/','main','nodejs','other-access-test',now(),now())").await?;
     Migrator::up(&db, Some(1)).await?;
     assert!(table_exists(&db, "sandbox_access_services").await?);
@@ -7617,6 +7625,18 @@ async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> an
     assert!(db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('cross-project',9202,'svc_test',9201,1,'{}',now()+interval '15 minutes')").await.is_err());
     assert!(db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('too-long',9201,'svc_test',9201,1,'{}',now()+interval '25 hours')").await.is_err());
     assert!(db.execute_unprepared("INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('already-expired',9201,'svc_test',9201,1,'{}',now()-interval '1 second')").await.is_err());
+    // Reapplying DDL must preserve saved services and requests.
+    migration.up(&manager).await?;
+    for table in ["sandbox_access_services", "sandbox_service_grants"] {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT count(*) AS count FROM {table}"),
+            ))
+            .await?
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "count")?, 1, "{table}");
+    }
     let error = Migrator::down(&db, Some(steps_back_to(name)))
         .await
         .expect_err("populated tables must not be discarded");
@@ -7630,6 +7650,16 @@ async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> an
     Migrator::down(&db, Some(steps_back_to(name))).await?;
     assert!(!table_exists(&db, "sandbox_access_services").await?);
     assert!(!table_exists(&db, "sandbox_service_grants").await?);
+    migration.down(&manager).await?;
+    // A partially removed schema is also safe to downgrade when empty.
+    for missing in ["sandbox_service_grants", "sandbox_access_services"] {
+        migration.up(&manager).await?;
+        db.execute_unprepared(&format!("DROP TABLE {missing} CASCADE"))
+            .await?;
+        migration.down(&manager).await?;
+        assert!(!table_exists(&db, "sandbox_access_services").await?);
+        assert!(!table_exists(&db, "sandbox_service_grants").await?);
+    }
     Migrator::up(&db, None).await?;
     assert!(table_exists(&db, "sandbox_access_services").await?);
     Ok(())

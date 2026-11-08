@@ -9,7 +9,7 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.get_connection().execute_unprepared(r#"CREATE TABLE sandbox_access_services (
+        manager.get_connection().execute_unprepared(r#"CREATE TABLE IF NOT EXISTS sandbox_access_services (
     id TEXT PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
@@ -22,8 +22,8 @@ impl MigrationTrait for Migration {
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (id, project_id)
 );
-CREATE INDEX sandbox_access_services_project ON sandbox_access_services (project_id, created_at DESC, id DESC);
-CREATE TABLE sandbox_service_grants (
+CREATE INDEX IF NOT EXISTS sandbox_access_services_project ON sandbox_access_services (project_id, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS sandbox_service_grants (
     id TEXT PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     service_id TEXT NOT NULL,
@@ -37,18 +37,25 @@ CREATE TABLE sandbox_service_grants (
     revoked_at TIMESTAMPTZ,
     FOREIGN KEY (service_id, project_id) REFERENCES sandbox_access_services(id, project_id) ON DELETE CASCADE
 );
-CREATE INDEX sandbox_service_grants_scope ON sandbox_service_grants (project_id, sandbox_id, created_at DESC, id DESC);"#).await?;
+CREATE INDEX IF NOT EXISTS sandbox_service_grants_scope ON sandbox_service_grants (project_id, sandbox_id, created_at DESC, id DESC);"#).await?;
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager.get_connection().execute_unprepared(r#"
             DO $$ BEGIN
-                IF EXISTS (SELECT 1 FROM sandbox_access_services) OR EXISTS (SELECT 1 FROM sandbox_service_grants) THEN
-                    RAISE EXCEPTION 'Cannot remove sandbox service access: remove saved services and requests explicitly before downgrading';
+                IF to_regclass('sandbox_access_services') IS NOT NULL THEN
+                    IF EXISTS (SELECT 1 FROM sandbox_access_services) THEN
+                        RAISE EXCEPTION 'Cannot remove sandbox service access: remove saved services and requests explicitly before downgrading';
+                    END IF;
+                END IF;
+                IF to_regclass('sandbox_service_grants') IS NOT NULL THEN
+                    IF EXISTS (SELECT 1 FROM sandbox_service_grants) THEN
+                        RAISE EXCEPTION 'Cannot remove sandbox service access: remove saved services and requests explicitly before downgrading';
+                    END IF;
                 END IF;
             END $$;
-            DROP TABLE sandbox_service_grants;
-            DROP TABLE sandbox_access_services;
+            DROP TABLE IF EXISTS sandbox_service_grants;
+            DROP TABLE IF EXISTS sandbox_access_services;
         "#).await?;
         Ok(())
     }
