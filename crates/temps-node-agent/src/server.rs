@@ -286,6 +286,18 @@ pub fn build_router(
             post(crate::service_data_handlers::mongodb_restore),
         )
         .route(
+            "/agent/services/redis/walg-backup",
+            post(crate::service_data_handlers::redis_walg_backup),
+        )
+        .route(
+            "/agent/services/redis/rdb-backup",
+            post(crate::service_data_handlers::redis_rdb_backup),
+        )
+        .route(
+            "/agent/services/redis/restore",
+            post(crate::service_data_handlers::redis_restore),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )

@@ -16,9 +16,10 @@ use temps_service_protocol::{
     NodeServiceError, NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
     PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
     PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
-    RecreateHook, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthResponse,
-    ServiceConfig, ServiceType,
+    RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest,
+    RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthResponse, ServiceConfig, ServiceType,
 };
 
 use crate::externalsvc;
@@ -283,6 +284,30 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             )
             .await,
         )
+    }
+
+    async fn redis_walg_backup(
+        &self,
+        request: RedisWalgBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisWalgBackupResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::walg_backup_on_node(request, docker).await)
+    }
+
+    async fn redis_rdb_backup(
+        &self,
+        request: RedisRdbBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRdbBackupResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::rdb_backup_on_node(request, docker).await)
+    }
+
+    async fn redis_restore(
+        &self,
+        request: RedisRestoreRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRestoreResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::restore_on_node(request, docker).await)
     }
 }
 

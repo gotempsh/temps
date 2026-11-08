@@ -347,11 +347,10 @@ fn worker_capability(
             WorkerServiceKind::Storage => {
                 return Some(compatible(worker_agent::ENGINE_KEY, "object_set", false))
             }
-            // MongoDB takes the control plane's engine on a worker, checked
-            // in its container like a local one (`worker_service_kind` never
-            // returns it).
+            // MongoDB and Redis take the control plane's engines on a worker,
+            // checked in their container like local ones (`worker_service_kind`
+            // never returns them).
             WorkerServiceKind::Dump(DumpEngine::Mongodb) => return None,
-            WorkerServiceKind::Dump(DumpEngine::Redis) => (worker_agent::ENGINE_KEY, "redis_rdb"),
             WorkerServiceKind::Dump(DumpEngine::Mariadb) => {
                 (worker_agent::ENGINE_KEY, "logical_mariadb_dump")
             }
@@ -519,15 +518,17 @@ fn recommended_image(service_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    /// A worker's services report the dump their node writes, without a
-    /// probe; a storage service's mirror stays an object set.
+    /// A worker's MariaDB reports the dump its node writes, without a
+    /// probe; a storage service's mirror stays an object set. MongoDB and
+    /// Redis take the control plane's engines (ADR-099) and are probed like
+    /// local ones, so neither is described here.
     #[test]
     fn worker_services_report_the_dump_taken_on_their_node() {
-        let mut redis = service("redis", "standalone");
-        redis.node_id = Some(3);
-        let capability = worker_capability(&redis).expect("a worker service");
+        let mut mariadb = service("mariadb", "standalone");
+        mariadb.node_id = Some(3);
+        let capability = worker_capability(&mariadb).expect("a worker service");
         assert_eq!(capability.engine, "worker_agent");
-        assert_eq!(capability.artifact, "redis_rdb");
+        assert_eq!(capability.artifact, "logical_mariadb_dump");
         assert!(!capability.cloud_backup_compatible);
         assert!(capability.verified);
         assert!(capability
@@ -544,10 +545,12 @@ mod tests {
             .unwrap_or_default()
             .contains("control plane"));
 
-        // A worker PostgreSQL is probed, not described here.
-        let mut postgres = service("postgres", "standalone");
-        postgres.node_id = Some(3);
-        assert!(worker_capability(&postgres).is_none());
+        // A worker PostgreSQL, MongoDB or Redis is probed, not described.
+        for service_type in ["postgres", "mongodb", "redis"] {
+            let mut worker = service(service_type, "standalone");
+            worker.node_id = Some(3);
+            assert!(worker_capability(&worker).is_none(), "{service_type}");
+        }
 
         let mut storage = service("rustfs", "standalone");
         storage.node_id = Some(3);
@@ -555,7 +558,37 @@ mod tests {
         assert!(capability.cloud_backup_compatible);
         assert_eq!(capability.artifact, "object_set");
 
-        assert!(worker_capability(&service("redis", "standalone")).is_none());
+        assert!(worker_capability(&service("mariadb", "standalone")).is_none());
+    }
+
+    /// Parity (ADR-099): a worker Redis is probed through its agent and
+    /// reports exactly what a local Redis on the same image reports, for
+    /// every outcome of the probe.
+    #[test]
+    fn a_worker_redis_reports_what_a_local_redis_reports() {
+        let local = service("redis", "standalone");
+        let mut worker = local.clone();
+        worker.node_id = Some(3);
+        assert!(
+            worker_capability(&worker).is_none(),
+            "probed, not described"
+        );
+        for probe in [
+            ToolProbe::Available,
+            ToolProbe::Missing,
+            ToolProbe::Unverified(UnverifiedCause::Unavailable),
+            ToolProbe::Unverified(UnverifiedCause::TimedOut {
+                stage: "backup tool check",
+            }),
+        ] {
+            let on_worker = classify_capability(&worker, probe);
+            let here = classify_capability(&local, probe);
+            assert_eq!(on_worker, here);
+        }
+        assert_eq!(
+            classify_capability(&worker, ToolProbe::Available).engine,
+            "redis"
+        );
     }
 
     /// Parity (ADR-099): a worker PostgreSQL whose agent finds WAL-G reports

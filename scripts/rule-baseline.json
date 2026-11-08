@@ -301,8 +301,7 @@
       "functions_over_300_lines": 1
     },
     "temps-providers-redis": {
-      "files_over_3000_lines": 1,
-      "functions_over_300_lines": 1
+      "files_over_3000_lines": 1
     },
     "temps-providers-s3": {
       "files_over_3000_lines": 2,

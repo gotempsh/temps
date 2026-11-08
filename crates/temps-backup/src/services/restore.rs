@@ -161,6 +161,7 @@ pub enum RestoreError {
 }
 
 mod worker_mongodb;
+mod worker_redis;
 mod worker_walg;
 
 fn selected_walg_target_user_data(
@@ -960,6 +961,9 @@ impl RestoreService {
                         &mut destructive,
                         &mut errors,
                     );
+                    if origin_binding.cross_service && matches!(mode, RestoreRequestMode::InPlace) {
+                        steps.push(redis_bookkeeping_step());
+                    }
                 }
                 "mongodb" => {
                     if let Some(warning) = build_mongodb_steps(
@@ -1104,15 +1108,18 @@ impl RestoreService {
             .await;
             return Ok((capabilities, identity));
         }
-        // A MongoDB on a worker node restores with the control plane's own
-        // restore on its node, in place (see `worker_mongodb`).
+        // A MongoDB or a Redis on a worker node restores with the control
+        // plane's own restore on its node, in place (see `worker_mongodb`,
+        // `worker_redis`).
         if worker_mongodb::takes_path(&service) {
             return Ok((worker_mongodb::capabilities(), identity));
         }
         // The other services on a worker node are restored on that node, in
         // place only (see `agent_restore_supported`). Their engine is not on
         // this host, which may have no Docker at all.
-        if crate::engines::worker_agent::takes_agent_path(&service) {
+        if worker_redis::takes_redis_path(&service)
+            || crate::engines::worker_agent::takes_agent_path(&service)
+        {
             return Ok((worker_restore_capabilities(), identity));
         }
         let service_type =
@@ -1248,6 +1255,8 @@ impl RestoreService {
             job_restore_supported(&target, &backup_location, &mode)?;
         } else if worker_mongodb::takes_path(&target) {
             worker_mongodb::supported(&target, &mode)?;
+        } else if worker_redis::takes_redis_path(&target) {
+            worker_redis::restore_supported(&target, &backup_location, &mode)?;
         } else if crate::engines::worker_agent::takes_agent_path(&target) {
             agent_restore_supported(&target, &backup_location, &mode)?;
         }
@@ -1997,14 +2006,18 @@ fn worker_restore_plan(
             refusal: (!errors.is_empty()).then(|| errors.join("; ")),
         });
     }
+    if worker_redis::takes_redis_path(target) {
+        return Some(WorkerRestorePlan {
+            steps: worker_redis::steps(node, location, mode, container, cross_service),
+            refusal: worker_redis::restore_supported(target, location, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
     if crate::engines::worker_agent::takes_agent_path(target) {
         use crate::engines::worker_agent::{worker_service_kind, WorkerServiceKind};
         use temps_providers::externalsvc::worker_data::DumpEngine;
         let applies = match worker_service_kind(&target.service_type) {
-            Some(WorkerServiceKind::Dump(DumpEngine::Redis)) => format!(
-                "The agent installs the RDB snapshot {location} into {container} with Redis's \
-                 own restore, which stops and starts the container (existing data is replaced)"
-            ),
             Some(WorkerServiceKind::Dump(DumpEngine::Mariadb)) => format!(
                 "The agent applies the SQL dump {location} into {container} with MariaDB's own \
                  restore (existing data in the dumped databases is replaced)"
@@ -2014,12 +2027,14 @@ fn worker_restore_plan(
                  `rc mirror --overwrite --remove`: missing objects are added, changed ones \
                  overwritten, and objects the backup does not have are deleted"
             ),
-            // MongoDB takes `worker_mongodb` above.
-            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) | None => format!(
+            // MongoDB and Redis take `worker_mongodb` and `worker_redis` above.
+            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) | None => {
+                format!(
                 "The agent applies {location} in place with {}'s own restore (existing data is \
                  overwritten)",
                 target.service_type
-            ),
+            )
+            }
         };
         return Some(WorkerRestorePlan {
             steps: vec![
@@ -2425,6 +2440,20 @@ async fn run_restore_inner(
         )
         .await;
     }
+    // A Redis on a worker node is restored in place by the provider's own
+    // restore, run on its node by the agent.
+    if worker_redis::takes_redis_path(&target_service) {
+        return worker_redis::run(
+            &db,
+            &scoper,
+            &mgr,
+            run_id,
+            &backup_model,
+            &target_service,
+            &mode,
+        )
+        .await;
+    }
     // The other services on a worker node are restored in place by the
     // node's agent, with the engine's own restore.
     if crate::engines::worker_agent::takes_agent_path(&target_service) {
@@ -2542,6 +2571,18 @@ async fn run_restore_inner(
     // per-FORMAT) reasoning; it is a free function so the matrix is unit-tested.
     let (engine_preserves_source_credentials, engine_wants_pre_restore_credential_merge) =
         credential_propagation_gates(&target_service.service_type, &backup_model.s3_location);
+
+    // Redis keeps Temps' own bookkeeping (`_temps:*` in database 0) in the
+    // data: another service's backup must not bring its database mappings
+    // and owners into the target. The restore keeps the target's.
+    if matches!(mode, RestoreRequestMode::InPlace)
+        && worker_redis::is_redis(&target_service.service_type)
+        && worker_redis::keeps_target_bookkeeping(origin_service_id, target_service.id)
+    {
+        temps_providers::externalsvc::redis::restore_swap::keep_target_bookkeeping(
+            &mut source_config,
+        );
+    }
 
     let mut origin_credentials_for_post_restore_patch = None;
     if engine_preserves_source_credentials {
@@ -4467,6 +4508,32 @@ fn build_mariadb_steps(
     }
 }
 
+/// The in-place swap every Redis restore ends with, here or on a worker
+/// (`restore_swap` in the Redis provider).
+fn push_redis_swap_steps(container_name: &str, steps: &mut Vec<String>) {
+    steps.push(
+        "Move the current dump.rdb and appendonlydir aside on the same volume, move the staged RDB in, and write the Redis 7+ appendonlydir manifest that loads it as the base file"
+            .into(),
+    );
+    steps.push(format!(
+        "Start {} with its own restart policy and wait for it to answer. Redis keeps its EXISTING requirepass (auth is not part of the dump).",
+        container_name
+    ));
+    steps.push(
+        "Delete the kept original once the restored server answers; if any step fails, the original is moved back and started as it was"
+            .into(),
+    );
+}
+
+/// The step a Redis restore of another service's backup adds: Temps' own
+/// `_temps:*` keys stay the target's.
+fn redis_bookkeeping_step() -> String {
+    "Keep the target's own Temps bookkeeping (`_temps:*` keys in database 0: database \
+     mappings, owners, import claims) instead of the backup's: they are read before the \
+     restore and written back after it"
+        .into()
+}
+
 /// Redis restore plan. RDB dumps via WAL-G stream, or legacy tar. Redis
 /// auth (`requirepass`) is NOT inside the data, so the container's
 /// existing password is preserved across the restore — no credential
@@ -4489,18 +4556,10 @@ fn build_redis_steps(
                     container_name
                 ));
                 steps.push(format!(
-                    "Run `wal-g backup-fetch LATEST` inside a helper container to stream the RDB base file onto {}'s volume",
+                    "Run `wal-g backup-fetch LATEST` inside a helper container to stage the RDB base file beside {}'s data; nothing is replaced until it is whole",
                     container_name
                 ));
-                steps.push(
-                    "Write an appendonlydir manifest pointing at the restored RDB as the base file (Redis 7+ multi-part AOF layout)"
-                        .into(),
-                );
-                steps.push(format!(
-                    "Start {}. Redis loads the RDB on boot and accepts connections with the EXISTING requirepass (auth is not part of the dump).",
-                    container_name
-                ));
-                steps.push("Wait for container to report healthy".into());
+                push_redis_swap_steps(container_name, steps);
             }
             RestoreRequestMode::NewService { name, .. } => {
                 steps.push(format!(
@@ -4529,16 +4588,10 @@ fn build_redis_steps(
                     resolved_location
                 ));
                 steps.push(format!(
-                    "Stop {} and install the RDB into its data volume",
+                    "Stop {} and stage the RDB beside its data; nothing is replaced until it is whole",
                     container_name
                 ));
-                steps.push(
-                    "Rebuild the Redis 7+ appendonlydir manifest from the restored RDB".into(),
-                );
-                steps.push(format!(
-                    "Restart {} and wait for it to report healthy",
-                    container_name
-                ));
+                push_redis_swap_steps(container_name, steps);
             }
             RestoreRequestMode::NewService { name, .. } => {
                 steps.push(format!(
@@ -7287,17 +7340,14 @@ mod tests {
         assert!(takes_job_path(&worker_postgres()));
     }
 
-    /// Redis, MariaDB and storage services on a worker restore in place
-    /// through the node's agent, from their own backup format; another mode
-    /// is refused explicitly, naming the node, never silently. (MongoDB runs
-    /// the control plane's own restore on the node: `worker_mongodb`.)
+    /// MariaDB and storage services on a worker restore in place through the
+    /// node's agent, from their own backup format; another mode is refused
+    /// explicitly, naming the node, never silently. (MongoDB and Redis run the
+    /// control plane's own restores on the node: `worker_mongodb`,
+    /// `worker_redis`.)
     #[test]
     fn a_worker_service_restores_only_in_place_from_its_own_format() {
         let cases = [
-            (
-                "redis",
-                "external_services/redis/cache/2026/01/01/u/dump.rdb.gz",
-            ),
             (
                 "mariadb",
                 "external_services/mariadb/cache/2026/01/01/u/dump.sql.gz",
@@ -7328,12 +7378,13 @@ mod tests {
                 other => panic!("{service_type}: expected a refusal, got {other:?}"),
             }
         }
-        let redis = temps_entities::external_services::Model {
+        let mariadb = temps_entities::external_services::Model {
+            service_type: "mariadb".to_string(),
             node_id: Some(4),
             ..crashed_run_service()
         };
         match agent_restore_supported(
-            &redis,
+            &mariadb,
             "external_services/mongodb/x/dump.archive",
             &RestoreRequestMode::InPlace,
         ) {
@@ -7677,6 +7728,14 @@ mod tests {
         )
         .expect("a worker cache");
         assert!(plan.steps[0].contains("worker node 2, through its agent"));
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| s.contains("original is moved back")),
+            "a worker Redis restore is the control plane's: {:?}",
+            plan.steps
+        );
+        assert!(plan.refusal.is_none());
 
         // A control-plane target keeps the control plane's steps.
         database.node_id = None;

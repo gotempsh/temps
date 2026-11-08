@@ -1050,6 +1050,83 @@ impl ExternalServiceManager {
             .await
     }
 
+    /// Push a WAL-G stream backup of Redis service `service_id`, which runs on
+    /// a worker node, with the control plane's own Redis engine on that node
+    /// (ADR-099). Credentials travel sealed.
+    pub async fn walg_backup_worker_redis(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::RedisWalgBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "Redis WAL-G backup")
+            .await?;
+        refuse_loopback_source(service_id, node_id, &destination)?;
+        self.get_remote_client(node_id)
+            .await?
+            .redis_walg_backup(&crate::remote_service_client::RedisWalgBackupRequest {
+                service_id,
+                service_config,
+                destination,
+                bucket_path,
+                backup_uuid,
+            })
+            .await
+    }
+
+    /// Take an RDB backup of Redis service `service_id`, which runs on a
+    /// worker node, into `key` of `destination`, with the control plane's own
+    /// pinned helper on that node.
+    pub async fn rdb_backup_worker_redis(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        key: String,
+    ) -> Result<crate::remote_service_client::RedisRdbBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "Redis RDB backup")
+            .await?;
+        refuse_loopback_source(service_id, node_id, &destination)?;
+        self.get_remote_client(node_id)
+            .await?
+            .redis_rdb_backup(&crate::remote_service_client::RedisRdbBackupRequest {
+                service_id,
+                service_config,
+                destination,
+                key,
+            })
+            .await
+    }
+
+    /// Restore Redis service `service_id`, which runs on a worker node, in
+    /// place from `location` in `source`, with the provider's own restore run
+    /// by the node's agent. `keep_target_bookkeeping` keeps the service's own
+    /// `_temps:*` keys over the backup's (a backup of another service).
+    pub async fn restore_worker_redis(
+        &self,
+        service_id: i32,
+        source: crate::remote_service_client::WorkerS3Destination,
+        location: String,
+        keep_target_bookkeeping: bool,
+    ) -> Result<crate::remote_service_client::RedisRestoreResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "Redis restore")
+            .await?;
+        refuse_loopback_source(service_id, node_id, &source)?;
+        self.get_remote_client(node_id)
+            .await?
+            .redis_restore(&crate::remote_service_client::RedisRestoreRequest {
+                service_id,
+                service_config,
+                source,
+                location,
+                keep_target_bookkeeping,
+            })
+            .await
+    }
+
     /// Restore service `service_id`, which runs on a worker node, in place on
     /// that node from the backup at `location` in `source`.
     pub async fn restore_worker_service(
@@ -1068,6 +1145,29 @@ impl ExternalServiceManager {
                 location,
             })
             .await
+    }
+}
+
+/// Refuse an S3 source at this server's loopback for an operation a worker
+/// node runs: the node would reach itself, not the source.
+fn refuse_loopback_source(
+    service_id: i32,
+    node_id: i32,
+    source: &crate::remote_service_client::WorkerS3Destination,
+) -> Result<(), ExternalServiceError> {
+    match source
+        .endpoint
+        .as_deref()
+        .filter(|endpoint| is_loopback_endpoint(endpoint))
+    {
+        Some(endpoint) => Err(ExternalServiceError::ParameterValidationFailed {
+            service_id,
+            reason: format!(
+                "the S3 source's endpoint {endpoint} is this server's loopback address, which \
+                 worker node {node_id} cannot reach; use an address the node can reach"
+            ),
+        }),
+        None => Ok(()),
     }
 }
 

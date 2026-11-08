@@ -24,6 +24,7 @@ pub mod mongodb_backup;
 pub mod postgres_role_reconciler;
 pub mod postgres_walg_backup;
 pub mod postgres_walg_restore;
+pub mod redis_node;
 pub mod worker_data;
 
 #[cfg(test)]

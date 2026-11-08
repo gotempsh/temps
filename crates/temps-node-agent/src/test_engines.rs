@@ -75,6 +75,10 @@ pub(crate) struct StubRuntime {
     >,
     /// The WAL-G archiving credential refreshes asked for.
     pub(crate) walg_credentials: Mutex<Vec<temps_service_protocol::PostgresWalgCredentialsRequest>>,
+    /// The Redis operations asked for, by route.
+    pub(crate) redis_walg_backups: Mutex<Vec<temps_service_protocol::RedisWalgBackupRequest>>,
+    pub(crate) redis_rdb_backups: Mutex<Vec<temps_service_protocol::RedisRdbBackupRequest>>,
+    pub(crate) redis_restores: Mutex<Vec<temps_service_protocol::RedisRestoreRequest>>,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -273,6 +277,42 @@ impl NodeServiceRuntime for StubRuntime {
             .expect("mongodb_restores")
             .push((request, published_address));
         Err(not_available("mongodb_restore"))
+    }
+
+    async fn redis_walg_backup(
+        &self,
+        request: temps_service_protocol::RedisWalgBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisWalgBackupResult, NodeServiceError> {
+        self.redis_walg_backups
+            .lock()
+            .expect("redis_walg_backups")
+            .push(request);
+        Err(not_available("redis_walg_backup"))
+    }
+
+    async fn redis_rdb_backup(
+        &self,
+        request: temps_service_protocol::RedisRdbBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisRdbBackupResult, NodeServiceError> {
+        self.redis_rdb_backups
+            .lock()
+            .expect("redis_rdb_backups")
+            .push(request);
+        Err(not_available("redis_rdb_backup"))
+    }
+
+    async fn redis_restore(
+        &self,
+        request: temps_service_protocol::RedisRestoreRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisRestoreResult, NodeServiceError> {
+        self.redis_restores
+            .lock()
+            .expect("redis_restores")
+            .push(request);
+        Err(not_available("redis_restore"))
     }
 }
 

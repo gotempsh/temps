@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `worker_agent`: backups of the Redis, MariaDB and managed S3 services that
-//! run on worker nodes, taken by the worker's agent.
+//! `worker_agent`: backups of the MariaDB and managed S3 services that run on
+//! worker nodes, taken by the worker's agent.
 //!
-//! The local engines (`redis`, `mariadb_*`, `s3_mirror`) drive
+//! The local engines (`mariadb_*`, `s3_mirror`) drive
 //! this host's Docker, where a worker's container is not, and a
 //! `--profile control-plane` server has no Docker at all. So for a service on
 //! a worker this engine asks the node's agent to run the engine's own dump
@@ -14,15 +14,16 @@
 //! session token included. Nothing about the service changes; it is not
 //! stopped or restarted.
 //!
-//! The objects are the local engines' (`.../dump.rdb.gz`,
-//! `.../dump.sql.gz`, or a bucket mirror under
+//! The objects are the local engines' (`.../dump.sql.gz`, or a bucket
+//! mirror under
 //! `.../external_services/s3/<service>/<uuid>/<bucket>/`), so the providers'
 //! restores read them. A restore of one runs on the node too (see
 //! `services::restore::run_agent_restore`), in place.
 //!
-//! PostgreSQL and MongoDB on a worker take the control plane's own engines
-//! instead, whose container steps the node's agent runs (`postgres_walg`,
-//! `workload_job` without WAL-G, and `mongodb`; ADR-099).
+//! PostgreSQL, MongoDB and Redis on a worker take the control plane's own
+//! engines instead, whose container steps the node's agent runs
+//! (`postgres_walg`, `workload_job` without WAL-G, `mongodb` and `redis`;
+//! ADR-099).
 
 use std::sync::Arc;
 
@@ -47,8 +48,8 @@ use temps_providers::worker_s3_scope::{
 pub const ENGINE_KEY: &str = "worker_agent";
 
 /// Whether a backup (and an in-place restore) of `service` runs on its
-/// worker node through the agent: a standalone Redis, MariaDB or storage
-/// service whose node is a worker.
+/// worker node through the agent: a standalone MariaDB or storage service
+/// whose node is a worker.
 pub fn takes_agent_path(service: &temps_entities::external_services::Model) -> bool {
     worker_node(service).is_some()
         && service.topology.as_str() != "cluster"
@@ -64,9 +65,9 @@ pub enum WorkerServiceKind {
     Storage,
 }
 
-/// The kind of worker backup `service_type` takes, `None` for PostgreSQL
-/// and MongoDB (the control plane's own engines, run by the node's agent)
-/// and unknown types.
+/// The kind of worker backup `service_type` takes, `None` for PostgreSQL,
+/// MongoDB and Redis (the control plane's own engines, run by the node's
+/// agent) and unknown types.
 pub fn worker_service_kind(service_type: &str) -> Option<WorkerServiceKind> {
     let service_type = match service_type {
         "mongo" => ServiceType::Mongodb,
@@ -109,7 +110,6 @@ pub fn backup_key(
 fn dump_engine_label(engine: DumpEngine) -> &'static str {
     match engine {
         DumpEngine::Mongodb => "mongodb",
-        DumpEngine::Redis => "redis",
         DumpEngine::Mariadb => "mariadb",
     }
 }
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn every_engine_without_its_own_on_a_worker_takes_the_agent_path() {
-        for service_type in ["redis", "kv", "mariadb", "s3", "rustfs", "blob", "minio"] {
+        for service_type in ["mariadb", "s3", "rustfs", "blob", "minio"] {
             assert!(
                 takes_agent_path(&service(service_type, Some(3))),
                 "{service_type} on a worker"
@@ -513,35 +513,32 @@ mod tests {
                 "node 0 is the control plane"
             );
         }
-        assert!(
-            !takes_agent_path(&service("postgres", Some(3))),
-            "the job path"
-        );
-        for mongo in ["mongodb", "mongo"] {
+        for engine_on_the_node in ["postgres", "redis", "kv", "mongodb", "mongo"] {
             assert!(
-                !takes_agent_path(&service(mongo, Some(3))),
-                "{mongo} on a worker takes the control plane's MongoDB engine"
+                !takes_agent_path(&service(engine_on_the_node, Some(3))),
+                "{engine_on_the_node} takes the control plane's engine on its node"
             );
-            assert_eq!(worker_service_kind(mongo), None);
         }
-        let mut cluster = service("redis", Some(3));
+        for engine_on_the_node in ["redis", "kv", "mongodb", "mongo"] {
+            assert_eq!(worker_service_kind(engine_on_the_node), None);
+        }
+        let mut cluster = service("mariadb", Some(3));
         cluster.topology = "cluster".to_string();
         assert!(!takes_agent_path(&cluster));
     }
 
     #[test]
     fn backups_use_the_local_engines_keys() {
-        let redis = backup_key(
-            "",
-            &service("redis", Some(3)),
+        let tenant_maria = backup_key(
+            "tenant",
+            &service("mariadb", Some(3)),
             "u1",
-            WorkerServiceKind::Dump(DumpEngine::Redis),
+            WorkerServiceKind::Dump(DumpEngine::Mariadb),
         );
         assert!(
-            redis.starts_with("external_services/redis/orders/"),
-            "{redis}"
+            tenant_maria.starts_with("tenant/external_services/mariadb/orders/"),
+            "{tenant_maria}"
         );
-        assert!(redis.ends_with("/u1/dump.rdb.gz"));
         let maria = backup_key(
             "",
             &service("mariadb", Some(3)),
@@ -562,24 +559,15 @@ mod tests {
 
     #[test]
     fn restores_apply_only_their_own_backup_format() {
-        let redis = service("redis", Some(3));
-        assert!(restore_location_matches(
-            &redis,
-            "external_services/redis/orders/2026/01/01/u/dump.rdb.gz"
-        ));
-        assert!(!restore_location_matches(
-            &redis,
-            "external_services/mongodb/orders/2026/01/01/u/dump.archive"
-        ));
-        assert!(!restore_location_matches(
-            &redis,
-            "s3://backups/redis/base_000000010000000000000002"
-        ));
         let mongo = service("mongodb", Some(3));
         assert!(
             !restore_location_matches(&mongo, "x/dump.archive"),
             "MongoDB restores take the control plane's restore, not this path"
         );
+        assert!(!restore_location_matches(
+            &service("redis", Some(3)),
+            "external_services/redis/orders/2026/01/01/u/dump.rdb.gz"
+        ));
         let maria = service("mariadb", Some(3));
         assert!(restore_location_matches(&maria, "x/dump.sql.gz"));
         assert!(!restore_location_matches(&maria, "x/base.xbstream"));
@@ -603,10 +591,10 @@ mod tests {
         use temps_providers::externalsvc::worker_data::DumpEngine;
         assert_eq!(
             backup_scope_prefix(
-                "base/external_services/redis/cache/2026/11/08/u-1/dump.rdb.gz",
-                WorkerServiceKind::Dump(DumpEngine::Redis)
+                "base/external_services/mariadb/shop/2026/11/08/u-1/dump.sql.gz",
+                WorkerServiceKind::Dump(DumpEngine::Mariadb)
             ),
-            "base/external_services/redis/cache/2026/11/08/u-1/"
+            "base/external_services/mariadb/shop/2026/11/08/u-1/"
         );
         assert_eq!(
             backup_scope_prefix(

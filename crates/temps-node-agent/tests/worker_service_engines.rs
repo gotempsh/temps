@@ -3176,3 +3176,703 @@ async fn another_services_mongodb_backup_is_restored_into_a_worker_mongodb_throu
     .await
     .unwrap_or_else(|e| panic!("the retried cross-service restore failed: {e}"));
 }
+
+const REDIS_WALG_BUCKET: &str = "redis-parity";
+
+/// `redis-cli` in `container`, authenticated: its trimmed stdout.
+async fn redis_cli(docker: &Docker, container: &str, password: &str, args: &[&str]) -> String {
+    let mut cmd = vec!["redis-cli", "--no-auth-warning", "-a", password];
+    cmd.extend_from_slice(args);
+    let (code, out) = exec(docker, container, &cmd).await;
+    assert_eq!(code, 0, "redis-cli {args:?} in {container}: {out}");
+    out
+}
+
+/// Wait until `container` answers `PING` (after a restore restarts it).
+async fn wait_redis(docker: &Docker, container: &str, password: &str) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (code, out) = exec(
+            docker,
+            container,
+            &["redis-cli", "--no-auth-warning", "-a", password, "PING"],
+        )
+        .await;
+        if code == 0 && out == "PONG" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Redis in {container} never answered: {code} {out}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The files a restore may leave on the data volume besides Redis's own.
+async fn leftovers(docker: &Docker, container: &str) -> String {
+    exec(
+        docker,
+        container,
+        &["sh", "-c", "ls -a /data | grep '^\\.temps-' || true"],
+    )
+    .await
+    .1
+}
+
+/// A RustFS bucket on `network`, published on a local port: the client
+/// for this test, the port, and the bucket's name on the network.
+async fn redis_bucket(docker: &Docker, s3_name: &str, network: &str) -> (aws_sdk_s3::Client, u16) {
+    let s3_port = free_port();
+    docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::default()
+                    .name(s3_name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some(RUSTFS_IMAGE.to_string()),
+                env: Some(vec![
+                    format!("RUSTFS_ACCESS_KEY={WALG_S3_KEY}"),
+                    format!("RUSTFS_SECRET_KEY={WALG_S3_KEY}"),
+                ]),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some(network.to_string()),
+                    port_bindings: Some(HashMap::from([(
+                        "9000/tcp".to_string(),
+                        Some(vec![bollard::models::PortBinding {
+                            host_ip: Some("127.0.0.1".to_string()),
+                            host_port: Some(s3_port.to_string()),
+                        }]),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the bucket container");
+    docker
+        .start_container(
+            s3_name,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .expect("start the bucket");
+    let s3 = temps_providers::externalsvc::S3Credentials {
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+        region: "us-east-1".to_string(),
+        endpoint: Some(format!("http://127.0.0.1:{s3_port}")),
+        bucket_name: REDIS_WALG_BUCKET.to_string(),
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+        force_path_style: true,
+    }
+    .build_s3_client()
+    .await;
+    let mut made = Err(String::new());
+    for _ in 0..60 {
+        made = s3
+            .create_bucket()
+            .bucket(REDIS_WALG_BUCKET)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"));
+        if made.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    made.expect("creating the bucket");
+    (s3, s3_port)
+}
+
+/// The bucket as a node reaches it: on the network (for WAL-G, which runs
+/// in the container) or on the published port (for the RDB upload and
+/// download, which the node's process does).
+fn redis_destination(endpoint: String) -> temps_service_protocol::WorkerS3Destination {
+    temps_service_protocol::WorkerS3Destination {
+        bucket: REDIS_WALG_BUCKET.to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: Some(endpoint),
+        force_path_style: true,
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_access_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+    }
+}
+
+/// What the control plane sends for one Redis job (ADR-093): a credential
+/// RustFS mints for `prefix` alone, through the port this process reaches,
+/// handed to the node with the endpoint it reaches the bucket at.
+async fn redis_scoped(
+    reached_at: &temps_service_protocol::WorkerS3Destination,
+    minted_through: &temps_service_protocol::WorkerS3Destination,
+    prefix: String,
+    access: temps_core::ScopedS3Access,
+) -> temps_service_protocol::WorkerS3Destination {
+    temps_service_protocol::WorkerS3Destination {
+        endpoint: reached_at.endpoint.clone(),
+        ..scoped_destination(minted_through, WALG_BUCKET_PATH, &[prefix], access).await
+    }
+}
+
+/// The read grant of a Redis restore of `location`, as the control plane
+/// derives it: a WAL-G repository as its prefix, a snapshot as its
+/// directory.
+fn redis_read_prefix(location: &str) -> String {
+    match location.strip_prefix("s3://") {
+        Some(_) => temps_providers::worker_s3_scope::s3_url_prefix(location, REDIS_WALG_BUCKET)
+            .expect("a repository in the bucket"),
+        None => temps_providers::worker_s3_scope::key_directory(location),
+    }
+}
+
+/// One Redis agent route, called as the agent serves it: the engine's
+/// outcome, from a 200.
+async fn redis_route<Request, Outcome, Handler, Fut>(
+    agent: &Arc<AgentState>,
+    handler: Handler,
+    request: Request,
+) -> Outcome
+where
+    Handler: FnOnce(State<Arc<AgentState>>, Json<Request>) -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
+    Outcome: serde::de::DeserializeOwned,
+{
+    let (status, body) = envelope(handler(State(agent.clone()), Json(request)).await).await;
+    assert_eq!(status, 200, "the Redis operation did not run: {body}");
+    serde_json::from_value(body["data"].clone())
+        .unwrap_or_else(|e| panic!("a Redis outcome ({e}): {body}"))
+}
+
+/// ADR-099 for Redis: a worker's Redis, created by the agent as a
+/// control-plane-profile server asks, is backed up and restored by the
+/// control plane's own Redis engine through the agent's sealed routes.
+///
+/// 1. A WAL-G stream backup lands in the repository the control plane uses,
+///    and an RDB backup (the fallback for an image without WAL-G) in the
+///    local engine's `dump.rdb.gz` key.
+/// 2. Each is restored in place after the data changed: the data is the
+///    backup's again, in the same container with its own restart policy,
+///    and no staged or kept file is left on the volume.
+/// 3. A restore that cannot fetch its backup leaves the running Redis and
+///    its data exactly as they were.
+/// 4. Restoring another service's backup keeps the target's own Temps
+///    bookkeeping (`_temps:*`); the target's own backup brings its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_redis_is_backed_up_and_restored_by_the_control_plane_engine_through_its_agent() {
+    use temps_node_agent::service_data_handlers::{
+        redis_rdb_backup, redis_restore, redis_walg_backup,
+    };
+    use temps_providers::externalsvc::redis_node::{walg_key_prefix, walg_prefix};
+    use temps_service_protocol::{
+        RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult,
+        RedisWalgBackupRequest, RedisWalgBackupResult,
+    };
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!("Docker not available (set DOCKER_HOST), skipping the worker Redis proof");
+            return;
+        }
+    };
+    let agent = agent_state(docker.clone());
+    let suffix = std::process::id();
+    let name = format!("wredis{suffix}");
+    let s3_name = format!("wredis3{suffix}");
+    let engine = engines()
+        .into_iter()
+        .find(|engine| engine.label == "redis")
+        .expect("the Redis engine");
+    let mut parameters = control_plane_parameters(&engine);
+    parameters.insert("port".into(), json!(free_port().to_string()));
+    // `requirepass`, so every step authenticates as the engine does.
+    parameters.insert("password".into(), json!("worker-redis-proof"));
+    let params = ExternalServiceManager::remote_create_params(
+        9,
+        &name,
+        &ServiceType::Redis,
+        &as_strings(&parameters),
+        false,
+    )
+    .expect("the create request");
+    for image in [
+        params.image.as_str(),
+        RUSTFS_IMAGE,
+        temps_providers::externalsvc::redis_node::RDB_HELPER_IMAGE,
+    ] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the worker Redis proof");
+            return;
+        }
+    }
+    let network = params
+        .network
+        .clone()
+        .expect("worker services join a network");
+    let _cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![params.name.clone(), s3_name.clone()],
+        volumes: params.volumes.keys().cloned().collect(),
+    };
+    let (status, created) = envelope(
+        create_service(
+            State(agent.clone()),
+            Json(ServiceCreateRequest {
+                name: params.name.clone(),
+                service_type: params.service_type.clone(),
+                image: params.image.clone(),
+                environment: params.environment.clone(),
+                port_mappings: params
+                    .port_mappings
+                    .iter()
+                    .map(|p| ServicePortMapping {
+                        host_port: p.host_port,
+                        container_port: p.container_port,
+                    })
+                    .collect(),
+                volumes: params.volumes.clone(),
+                network: params.network.clone(),
+                command: params.command.clone(),
+                resource_limits: None,
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, 200, "create failed: {created}");
+    let container = created["data"]["container_name"]
+        .as_str()
+        .expect("the created container's name")
+        .to_string();
+    let host_port = created["data"]["host_port"]
+        .as_u64()
+        .expect("the published host port");
+    let mut stored = parameters.clone();
+    stored.insert("port".into(), json!(host_port.to_string()));
+    stored.insert("container_name".into(), json!(container.clone()));
+    let config = ServiceConfig {
+        name: name.clone(),
+        service_type: ServiceType::Redis,
+        version: None,
+        parameters: serde_json::to_value(&stored).expect("stored parameters"),
+    };
+    wait_healthy(&agent, &config, "redis").await;
+    let password = stored["password"].as_str().expect("a password").to_string();
+    let (s3, s3_port) = redis_bucket(&docker, &s3_name, &network).await;
+    let in_network = redis_destination(format!("http://{s3_name}:9000"));
+    let published = redis_destination(format!("http://127.0.0.1:{s3_port}"));
+    let policy_before = restart_policy(
+        &docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("the agent's container"),
+    );
+    let cli = |args: &'static [&'static str]| {
+        let docker = docker.clone();
+        let container = container.clone();
+        let password = password.clone();
+        async move { redis_cli(&docker, &container, &password, args).await }
+    };
+
+    // ── 1. Back up, both ways ────────────────────────────────────────────
+    // Every request carries what the control plane sends: a credential
+    // scoped to the job's own prefix (ADR-093), never the bucket's key.
+    use temps_core::ScopedS3Access::{Read, Write};
+    cli(&["SET", "proof", "before-backup"]).await;
+    cli(&["SET", "_temps:redis_db_mapping:shop", "1"]).await;
+    let walg_grant = redis_scoped(
+        &in_network,
+        &published,
+        walg_key_prefix(WALG_BUCKET_PATH, &name),
+        Write,
+    )
+    .await;
+    let outcome: RedisWalgBackupResult = redis_route(
+        &agent,
+        |s, j| async move { redis_walg_backup(s, j).await },
+        RedisWalgBackupRequest {
+            service_id: 9,
+            service_config: config.clone(),
+            destination: walg_grant,
+            bucket_path: WALG_BUCKET_PATH.to_string(),
+            backup_uuid: format!("walg-{suffix}"),
+        },
+    )
+    .await;
+    assert_eq!(outcome, RedisWalgBackupResult::Completed);
+    let repository = walg_prefix(REDIS_WALG_BUCKET, WALG_BUCKET_PATH, &name);
+    let pushed = keys(
+        &s3,
+        REDIS_WALG_BUCKET,
+        &walg_key_prefix(WALG_BUCKET_PATH, &name),
+    )
+    .await;
+    assert!(
+        pushed.iter().any(|k| k.contains("basebackups_005/")),
+        "the stream backup is in the control plane's repository: {pushed:?}"
+    );
+
+    let rdb_key = format!(
+        "{WALG_BUCKET_PATH}/external_services/redis/{name}/2026/11/08/rdb-{suffix}/dump.rdb.gz"
+    );
+    let rdb_grant = redis_scoped(
+        &published,
+        &published,
+        temps_providers::worker_s3_scope::key_directory(&rdb_key),
+        Write,
+    )
+    .await;
+    let outcome: RedisRdbBackupResult = redis_route(
+        &agent,
+        |s, j| async move { redis_rdb_backup(s, j).await },
+        RedisRdbBackupRequest {
+            service_id: 9,
+            service_config: config.clone(),
+            destination: rdb_grant.clone(),
+            key: rdb_key.clone(),
+        },
+    )
+    .await;
+    let RedisRdbBackupResult::Completed { size_bytes } = outcome else {
+        panic!("the RDB backup failed: {outcome:?}");
+    };
+    assert!(size_bytes > 0);
+    assert!(keys(&s3, REDIS_WALG_BUCKET, &rdb_key)
+        .await
+        .contains(&rdb_key));
+    // A key outside the service's own dumps is refused before anything runs.
+    let outcome: RedisRdbBackupResult = redis_route(
+        &agent,
+        |s, j| async move { redis_rdb_backup(s, j).await },
+        RedisRdbBackupRequest {
+            service_id: 9,
+            service_config: config.clone(),
+            destination: rdb_grant,
+            key: "external_services/redis/another/x/dump.rdb.gz".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(outcome, RedisRdbBackupResult::Refused { .. }),
+        "{outcome:?}"
+    );
+
+    // ── 2. Restore each in place ─────────────────────────────────────────
+    let restore = |location: String, source, keep: bool| RedisRestoreRequest {
+        service_id: 9,
+        service_config: config.clone(),
+        source,
+        location,
+        keep_target_bookkeeping: keep,
+    };
+    for (location, reached_at) in [
+        (repository.clone(), in_network.clone()),
+        (rdb_key.clone(), published.clone()),
+    ] {
+        let source =
+            redis_scoped(&reached_at, &published, redis_read_prefix(&location), Read).await;
+        cli(&["SET", "proof", "after-backup"]).await;
+        cli(&["SET", "added-after", "x"]).await;
+        let outcome: RedisRestoreResult = redis_route(
+            &agent,
+            |s, j| async move { redis_restore(s, j).await },
+            restore(location.clone(), source, false),
+        )
+        .await;
+        assert_eq!(outcome, RedisRestoreResult::Completed, "{location}");
+        wait_redis(&docker, &container, &password).await;
+        assert_eq!(cli(&["GET", "proof"]).await, "before-backup", "{location}");
+        assert_eq!(cli(&["EXISTS", "added-after"]).await, "0", "{location}");
+        let after = docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("the same container");
+        assert_eq!(restart_policy(&after), policy_before, "{location}");
+        assert_eq!(leftovers(&docker, &container).await, "", "{location}");
+    }
+
+    // ── 3. A restore that cannot fetch its backup changes nothing ────────
+    cli(&["SET", "proof", "kept-on-failure"]).await;
+    let missing = walg_prefix(REDIS_WALG_BUCKET, WALG_BUCKET_PATH, "no-such-service");
+    let outcome: RedisRestoreResult = redis_route(
+        &agent,
+        |s, j| async move { redis_restore(s, j).await },
+        restore(
+            missing.clone(),
+            redis_scoped(&in_network, &published, redis_read_prefix(&missing), Read).await,
+            false,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(&outcome, RedisRestoreResult::Failed { reason } if reason.contains(&name)),
+        "{outcome:?}"
+    );
+    assert!(!format!("{outcome:?}").contains(WALG_S3_KEY));
+    wait_redis(&docker, &container, &password).await;
+    assert!(is_running(&docker, &container).await);
+    assert_eq!(cli(&["GET", "proof"]).await, "kept-on-failure");
+    assert_eq!(leftovers(&docker, &container).await, "");
+
+    // ── 4. Another service's backup keeps the target's bookkeeping ───────
+    cli(&["SET", "_temps:redis_db_mapping:shop", "2"]).await;
+    cli(&["SET", "_temps:redis_db_owner:2", "target"]).await;
+    let outcome: RedisRestoreResult = redis_route(
+        &agent,
+        |s, j| async move { redis_restore(s, j).await },
+        restore(
+            rdb_key.clone(),
+            redis_scoped(&published, &published, redis_read_prefix(&rdb_key), Read).await,
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(outcome, RedisRestoreResult::Completed);
+    wait_redis(&docker, &container, &password).await;
+    assert_eq!(cli(&["GET", "proof"]).await, "before-backup");
+    assert_eq!(cli(&["GET", "_temps:redis_db_mapping:shop"]).await, "2");
+    assert_eq!(cli(&["GET", "_temps:redis_db_owner:2"]).await, "target");
+    // Its own backup brings its own bookkeeping back with the data.
+    let outcome: RedisRestoreResult = redis_route(
+        &agent,
+        |s, j| async move { redis_restore(s, j).await },
+        restore(
+            rdb_key.clone(),
+            redis_scoped(&published, &published, redis_read_prefix(&rdb_key), Read).await,
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(outcome, RedisRestoreResult::Completed);
+    wait_redis(&docker, &container, &password).await;
+    assert_eq!(cli(&["GET", "_temps:redis_db_mapping:shop"]).await, "1");
+    assert_eq!(cli(&["EXISTS", "_temps:redis_db_owner:2"]).await, "0");
+}
+
+/// The same node half on the control plane (ADR-099: one implementation,
+/// the transport alone differs): a Redis the provider created is backed up
+/// with `redis_walg_backup`, as the backup engine calls it for a Redis on
+/// this host, restored in place by the provider's `restore_from_s3`, as a
+/// local restore calls it, and left as it was by a restore that fails, its
+/// container keeping the provider's restart policy (`always`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_plane_redis_is_backed_up_and_restored_by_the_same_node_half() {
+    use bollard::models::RestartPolicyNameEnum;
+    use temps_providers::externalsvc::redis::RedisService;
+    use temps_providers::externalsvc::redis_node::{
+        redis_rdb_backup, redis_walg_backup, walg_prefix, RedisRdbBackup, RedisWalgBackup,
+    };
+    use temps_providers::externalsvc::{ExternalService, S3Credentials};
+
+    let docker = match Docker::connect_with_defaults() {
+        Ok(docker) if docker.ping().await.is_ok() => docker,
+        _ => {
+            println!("Docker not available (set DOCKER_HOST), skipping the local Redis proof");
+            return;
+        }
+    };
+    const IMAGE: &str = "gotempsh/redis-walg:8-bookworm";
+    for image in [
+        IMAGE,
+        RUSTFS_IMAGE,
+        temps_providers::externalsvc::redis_node::RDB_HELPER_IMAGE,
+    ] {
+        if docker.inspect_image(image).await.is_err() {
+            println!("image {image} is not present locally, skipping the local Redis proof");
+            return;
+        }
+    }
+    let suffix = std::process::id();
+    let name = format!("cplredis{suffix}");
+    let container = format!("redis-{name}");
+    let s3_name = format!("cplredis3{suffix}");
+    let password = "local-redis-proof";
+    let mut cleanup = Cleanup {
+        docker: docker.clone(),
+        containers: vec![container.clone(), s3_name.clone()],
+        volumes: Vec::new(),
+    };
+    let shared = Arc::new(docker.clone());
+    let config = ServiceConfig {
+        name: name.clone(),
+        service_type: ServiceType::Redis,
+        version: None,
+        parameters: json!({
+            "host": "localhost",
+            "port": free_port().to_string(),
+            "password": password,
+            "docker_image": IMAGE,
+        }),
+    };
+    let redis = RedisService::new(name.clone(), shared.clone());
+    let runtime = redis
+        .init(config.clone())
+        .await
+        .expect("the provider creates the service");
+    let config = ServiceConfig {
+        parameters: serde_json::to_value(&runtime).expect("runtime parameters"),
+        ..config
+    };
+    let created = docker
+        .inspect_container(
+            &container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the provider's container");
+    cleanup.volumes = created
+        .mounts
+        .iter()
+        .flatten()
+        .filter_map(|m| m.name.clone())
+        .collect();
+    let (s3, s3_port) = redis_bucket(&docker, &s3_name, temps_core::NETWORK_NAME.as_str()).await;
+    let credentials = |endpoint: String| S3Credentials {
+        access_key_id: WALG_S3_KEY.to_string(),
+        secret_key: WALG_S3_KEY.to_string(),
+        session_token: None,
+        region: "us-east-1".to_string(),
+        endpoint: Some(endpoint),
+        bucket_name: REDIS_WALG_BUCKET.to_string(),
+        bucket_path: WALG_BUCKET_PATH.to_string(),
+        force_path_style: true,
+    };
+    let in_network = credentials(format!("http://{s3_name}:9000"));
+    let published = credentials(format!("http://127.0.0.1:{s3_port}"));
+    let s3_source = |c: &S3Credentials| temps_entities::s3_sources::Model {
+        id: 1,
+        name: "proof".to_string(),
+        bucket_name: c.bucket_name.clone(),
+        region: c.region.clone(),
+        endpoint: c.endpoint.clone(),
+        bucket_path: c.bucket_path.clone(),
+        access_key_id: c.access_key_id.clone(),
+        secret_key: c.secret_key.clone(),
+        session_token: None,
+        credentials_expire_at: None,
+        force_path_style: Some(true),
+        is_default: false,
+        managed_by_cloud: false,
+        lifecycle_reconcile_failed_at: None,
+        lifecycle_reconcile_generation: 0,
+        worker_credentials: temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        backing_service_id: None,
+    };
+    wait_redis(&docker, &container, password).await;
+    let cli = |args: &'static [&'static str]| {
+        let docker = docker.clone();
+        let container = container.clone();
+        async move { redis_cli(&docker, &container, password, args).await }
+    };
+
+    cli(&["SET", "proof", "before-backup"]).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    redis_walg_backup(
+        &docker,
+        RedisWalgBackup {
+            service_id: 1,
+            service: name.clone(),
+            container_name: container.clone(),
+            password: password.to_string(),
+            s3: in_network.clone(),
+            backup_uuid: format!("local-{suffix}"),
+        },
+        &cancel,
+    )
+    .await
+    .expect("the WAL-G stream backup on this host");
+    let rdb_key = format!(
+        "{WALG_BUCKET_PATH}/external_services/redis/{name}/2026/11/08/local-{suffix}/dump.rdb.gz"
+    );
+    let size = redis_rdb_backup(
+        shared.clone(),
+        RedisRdbBackup {
+            service_id: 1,
+            service: name.clone(),
+            container_name: container.clone(),
+            password: password.to_string(),
+            destination: temps_service_protocol::WorkerS3Destination {
+                bucket: REDIS_WALG_BUCKET.to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: published.endpoint.clone(),
+                force_path_style: true,
+                access_key_id: WALG_S3_KEY.to_string(),
+                secret_access_key: WALG_S3_KEY.to_string(),
+                session_token: None,
+            },
+            key: rdb_key.clone(),
+        },
+    )
+    .await
+    .expect("the RDB backup on this host");
+    assert!(size > 0);
+
+    let repository = walg_prefix(REDIS_WALG_BUCKET, WALG_BUCKET_PATH, &name);
+    for (location, source) in [(repository, &in_network), (rdb_key, &published)] {
+        cli(&["SET", "proof", "after-backup"]).await;
+        let client = source.build_s3_client().await;
+        redis
+            .restore_from_s3(
+                &client,
+                source,
+                &location,
+                &s3_source(source),
+                config.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("restore {location}: {e}"));
+        wait_redis(&docker, &container, password).await;
+        assert_eq!(cli(&["GET", "proof"]).await, "before-backup", "{location}");
+        let after = docker
+            .inspect_container(
+                &container,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .expect("the same container");
+        assert_eq!(restart_policy(&after), Some(RestartPolicyNameEnum::ALWAYS));
+        assert_eq!(leftovers(&docker, &container).await, "");
+    }
+
+    cli(&["SET", "proof", "kept-on-failure"]).await;
+    let missing = walg_prefix(REDIS_WALG_BUCKET, WALG_BUCKET_PATH, "no-such-service");
+    let client = in_network.build_s3_client().await;
+    let error = redis
+        .restore_from_s3(
+            &client,
+            &in_network,
+            &missing,
+            &s3_source(&in_network),
+            config,
+        )
+        .await
+        .expect_err("nothing to fetch");
+    assert!(!error.to_string().contains(WALG_S3_KEY), "{error}");
+    wait_redis(&docker, &container, password).await;
+    assert_eq!(cli(&["GET", "proof"]).await, "kept-on-failure");
+    let after = docker
+        .inspect_container(
+            &container,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .expect("the same container");
+    assert_eq!(restart_policy(&after), Some(RestartPolicyNameEnum::ALWAYS));
+    assert_eq!(leftovers(&docker, &container).await, "");
+    drop(s3);
+}
