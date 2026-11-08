@@ -195,7 +195,7 @@ describe("endpoint AI tools", () => {
     const first = await request(
       p,
       "GET",
-      "/tools/composite?count=7&active=false&choice=true&label=123",
+      "/tools/composite?count=7&active=false&choice=true&label=%22123%22",
     );
     expect(JSON.parse(first.end.mock.calls[0][0])).toEqual({
       count: 7,
@@ -214,6 +214,44 @@ describe("endpoint AI tools", () => {
       choice: 2,
       label: "report",
     });
+  });
+  it("preserves numbers, strings and null in mixed GET alternatives", async () => {
+    const p = plugin().tool({
+      name: "filter",
+      description: "Filter reports",
+      method: "GET",
+      input: z.object({
+        choice: z.union([z.literal("all"), z.number()]),
+        label: z.string().nullable(),
+        identifier: z.string(),
+      }),
+      handler: (input) => input,
+    });
+    for (const input of [
+      { choice: 2, label: null, identifier: "123" },
+      { choice: "all", label: "null", identifier: "123" },
+      { choice: 3, label: "123", identifier: "123" },
+    ]) {
+      const query = new URLSearchParams({
+        choice: JSON.stringify(input.choice),
+        label: JSON.stringify(input.label),
+        identifier: input.identifier,
+      });
+      const response = await request(p, "GET", `/tools/filter?${query}`);
+      expect(response.writeHead).toHaveBeenCalledWith(200, {
+        "Content-Type": "application/json",
+      });
+      expect(JSON.parse(response.end.mock.calls[0][0])).toEqual(input);
+    }
+    expect(
+      (
+        await request(
+          p,
+          "GET",
+          "/tools/filter?choice=invalid&label=null&identifier=123",
+        )
+      ).writeHead,
+    ).toHaveBeenCalledWith(400);
   });
   it("publishes and resolves named schemas for GET and POST tools", async () => {
     const item = z.object({ id: z.number() }).meta({ id: "ReportsItem" });

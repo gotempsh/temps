@@ -146,14 +146,19 @@ export function createToolPlugin(base: TempsPlugin) {
                 ([name, value]) => {
                   const property = schema.properties?.[name];
                   const types = querySchemaTypes(property, definitions);
-                  // The generic API caller serializes non-string query values as JSON.
-                  // Preserve string fields (including numeric-looking identifiers).
-                  return [
-                    name,
-                    types.length > 0 && !types.includes("string")
-                      ? JSON.parse(value)
-                      : value,
-                  ];
+                  // Composite inputs use JSON to distinguish a number from a
+                  // numeric-looking string. Plain string fields stay unchanged.
+                  if (
+                    types.length > 1 ||
+                    types.some((type) => type !== "string")
+                  ) {
+                    try {
+                      return [name, JSON.parse(value)];
+                    } catch (error) {
+                      if (!types.includes("string")) throw error;
+                    }
+                  }
+                  return [name, value];
                 },
               ),
             );

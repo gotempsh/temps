@@ -530,7 +530,11 @@ fn build_request_parts_scoped(
                 path = path.replace(&placeholder, &urlencoding::encode(&str_val));
             }
             ParamLocation::Query => {
-                let str_val = value_to_string(&value);
+                let str_val = if param.ty == "json" {
+                    value.to_string()
+                } else {
+                    value_to_string(&value)
+                };
                 query_parts.push(format!(
                     "{}={}",
                     urlencoding::encode(&param.name),

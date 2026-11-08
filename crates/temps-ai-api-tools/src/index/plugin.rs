@@ -49,7 +49,7 @@ pub enum PluginToolsError {
         operation_id: String,
         path: String,
     },
-    #[error("Cannot index AI operation '{operation_id}' for plugin '{plugin}': request body must declare an application/json object schema, inline or through a component reference")]
+    #[error("Cannot index AI operation '{operation_id}' for plugin '{plugin}': request body must declare an application/json object schema with named properties, inline or through a component reference; root maps and catch-all properties are unsupported")]
     UnsupportedRequestBody {
         plugin: String,
         operation_id: String,
@@ -217,7 +217,7 @@ impl PluginToolsIndex {
                     &resolve_body_params(&effective, openapi),
                     openapi,
                 );
-                preserve_query_array_items(&mut operation, &effective, openapi);
+                preserve_query_input_types(&mut operation, &effective, openapi);
                 operation.has_json_body = effective
                     .request_body
                     .as_ref()
@@ -298,7 +298,7 @@ fn validate_body_schema(
     operation: &Operation,
     openapi: &utoipa::openapi::OpenApi,
 ) -> Result<(), PluginToolsError> {
-    use utoipa::openapi::schema::{SchemaType, Type};
+    use utoipa::openapi::schema::{AdditionalProperties, SchemaType, Type};
     let Some(body) = operation.request_body.as_ref() else {
         return Ok(());
     };
@@ -313,7 +313,11 @@ fn validate_body_schema(
         RefOr::Ref(_) => None,
     })
     .and_then(|schema| deref_schema(schema, openapi));
-    if matches!(schema, Some(Schema::Object(object)) if matches!(object.schema_type, SchemaType::Type(Type::Object)))
+    if matches!(schema, Some(Schema::Object(object))
+        if matches!(object.schema_type, SchemaType::Type(Type::Object))
+            && object.additional_properties.as_deref().is_none_or(|additional|
+                matches!(additional, AdditionalProperties::FreeForm(false)))
+            && object.min_properties.unwrap_or(0) <= object.properties.len())
     {
         return Ok(());
     }
@@ -323,7 +327,7 @@ fn validate_body_schema(
     })
 }
 
-fn preserve_query_array_items(
+fn preserve_query_input_types(
     operation: &mut ApiOperation,
     declaration: &Operation,
     openapi: &utoipa::openapi::OpenApi,
@@ -346,16 +350,14 @@ fn preserve_query_array_items(
         else {
             continue;
         };
-        let Some(item_ty) = array_item_type(schema, openapi) else {
-            continue;
-        };
         if let Some(param) = operation.params.iter_mut().find(|param| {
             param.name == parameter.name && matches!(param.location, ParamLocation::Query)
         }) {
             if needs_json_input(schema, openapi, 0) {
                 param.ty = "json".into();
                 param.item_ty = None;
-            } else {
+                param.enum_values.clear();
+            } else if let Some(item_ty) = array_item_type(schema, openapi) {
                 param.ty = "array".into();
                 param.item_ty = Some(item_ty);
             }
@@ -773,6 +775,9 @@ mod tests {
             json!({"oneOf":[{"type":"object"},{"type":"array","items":{"type":"string"}}]}),
             json!({"type":"array","items":{"type":"string"}}),
             json!({"type":"string"}),
+            json!({"type":"object","additionalProperties":{"type":"string"},"minProperties":1}),
+            json!({"type":"object","additionalProperties":true}),
+            json!({"type":"object","minProperties":1}),
             json!({"$ref":"#/components/schemas/Missing"}),
         ] {
             let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"requestBody":{"content":{"application/json":{"schema":schema}}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
@@ -818,6 +823,38 @@ mod tests {
                 urlencoding::decode(&request.query).unwrap(),
                 "ids=[\"123\",\"true\"]"
             );
+        }
+    }
+
+    #[test]
+    fn composite_query_values_preserve_json_types_through_cli_and_url_encoding() {
+        use crate::cli::{resolve, CliAction, CliMode};
+        for schema in [
+            json!({"anyOf":[{"type":"string"},{"type":"number"},{"type":"null"}]}),
+            json!({"$ref":"#/components/schemas/Choice"}),
+        ] {
+            let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"schemas":{"Choice":{"type":["string","number","null"]}}},"paths":{"/filter":{"get":{"operationId":"filter","x-temps-ai-tool":{},"parameters":[{"in":"query","name":"choice","required":true,"schema":schema}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let plugin = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut index = ReadOnlyApiIndex::from_openapi_allowlist(&spec, &[]);
+            plugin.append_to(&mut index, PluginToolAccess::Read);
+            for value in [
+                json!(2),
+                json!("2"),
+                json!("all"),
+                json!(null),
+                json!("null"),
+            ] {
+                let command = format!("plugin.reports.filter --choice '{value}'");
+                let (op, params) = match resolve(&index, &command, &|_| true, CliMode::ReadOnly) {
+                    CliAction::Execute(op, params) => (op, params),
+                    CliAction::Terminal(error) => panic!("{error}"),
+                };
+                let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
+                assert_eq!(
+                    urlencoding::decode(&request.query).unwrap(),
+                    format!("choice={value}")
+                );
+            }
         }
     }
 }

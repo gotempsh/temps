@@ -24,8 +24,10 @@ runPlugin(plugin);
 
 `method` defaults to POST and `path` to `/tools/<name>`. Paths are static;
 GET input comes from query parameters. Non-string schemas decode JSON values,
-including numbers, booleans, nullable values, arrays and objects; string schemas
-and unions with string alternatives preserve the query text. Named Zod schemas
+including numbers, booleans, nullable values, arrays and objects. Plain string
+schemas preserve query text. Composite schemas use explicit JSON: `2` is a
+number, `"2"` is a string, and `null` differs from `"null"`. The generic API
+caller applies this encoding automatically. Named Zod schemas
 and recursive Zod schemas are published as OpenAPI components. Other methods accept a JSON object capped
 at 128 KiB. Inputs are validated before the
 handler runs. Non-GET methods cannot declare `access: 'read'`; GET can declare
@@ -33,8 +35,9 @@ handler runs. Non-GET methods cannot declare `access: 'read'`; GET can declare
 characters. Names and routes must be unique. Do not register a tool over an
 existing route in the base plugin.
 
-Marked request bodies must declare an `application/json` object schema, inline
-or through a component reference. Other root shapes and media types are rejected
+Marked request bodies must declare an `application/json` object schema with
+named properties, inline or through a component reference. Root maps, catch-all
+properties, other root shapes and media types are rejected
 during indexing. Put nullable or union values in object properties; the chat CLI
 accepts these composite values as explicit JSON, including `null`.
 
