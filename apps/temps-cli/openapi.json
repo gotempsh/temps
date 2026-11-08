@@ -10904,6 +10904,46 @@
         ],
         "type": "object"
       },
+      "ClusterDnsResolversResponse": {
+        "description": "`GET /cluster/dns/resolvers`.",
+        "properties": {
+          "cluster_dns_enabled": {
+            "type": "boolean"
+          },
+          "open_alerts": {
+            "items": {
+              "$ref": "#/components/schemas/DnsAlertEntry"
+            },
+            "type": "array"
+          },
+          "report_interval_secs": {
+            "description": "How often resolvers report, in seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resolvers": {
+            "description": "Control plane first, then workers by id.",
+            "items": {
+              "$ref": "#/components/schemas/DnsResolverEntry"
+            },
+            "type": "array"
+          },
+          "zone_record_count": {
+            "description": "Records in the zone (`service_endpoints`).",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cluster_dns_enabled",
+          "zone_record_count",
+          "report_interval_secs",
+          "resolvers",
+          "open_alerts"
+        ],
+        "type": "object"
+      },
       "ClusterDnsSettings": {
         "description": "Cluster-DNS resolver settings (ADR-024, experimental beta).\n\nWhen `enabled`, the Temps control plane starts a Hickory DNS resolver and\ninjects it as the first nameserver into every deployed container via\n`HostConfig.Dns` — giving containers the ability to resolve `*.temps.local`\nFQDNs for service-to-service communication. Worker nodes pick this flag up\nfrom the `/api/internal/nodes/{id}/network/peers` wire response and gate\ntheir own per-node resolver the same way.\n\n**Default: `false` (disabled).**\n\nWhy disabled by default: a production incident showed that when the injected\nHickory resolver was slow or transiently unresponsive for a non-`*.temps.local`\n(external) hostname, glibc's resolver cycled through all three nameservers\n(`172.20.0.1`, `1.1.1.1`, `8.8.8.8`) at ~5 s timeout × 2 attempts each,\ncausing 22–27 s delays for outbound TCP connections. Disabling the injection\nrestores Docker's embedded DNS as the sole resolver, eliminating that failure\nmode. Operators running single/multi-node installs that depend on\n`*.temps.local` resolution must explicitly opt in by setting `enabled: true`.\n\n`bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the\nsafe-off behaviour is automatic for new installs and legacy settings rows.",
         "properties": {
@@ -22381,6 +22421,54 @@
         ],
         "type": "object"
       },
+      "DnsAlertEntry": {
+        "description": "An open DNS alarm.",
+        "properties": {
+          "alarm_type": {
+            "description": "`dns_resolver_down`, `dns_sync_stale`, `dns_query_failures` or\n`dns_internal_proxy_down`.",
+            "type": "string"
+          },
+          "fired_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "severity": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "alarm_type",
+          "severity",
+          "status",
+          "title",
+          "fired_at"
+        ],
+        "type": "object"
+      },
       "DnsChallengeRecordResult": {
         "description": "Result of a single DNS TXT record creation for ACME challenge",
         "properties": {
@@ -22585,6 +22673,44 @@
           "holder_id",
           "first_seen_at",
           "last_seen_at"
+        ],
+        "type": "object"
+      },
+      "DnsOutcomeCounts": {
+        "description": "Queries per outcome in one bucket.",
+        "properties": {
+          "error": {
+            "format": "double",
+            "type": "number"
+          },
+          "nodata": {
+            "format": "double",
+            "type": "number"
+          },
+          "noerror": {
+            "format": "double",
+            "type": "number"
+          },
+          "nxdomain": {
+            "format": "double",
+            "type": "number"
+          },
+          "refused": {
+            "format": "double",
+            "type": "number"
+          },
+          "servfail": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "noerror",
+          "nodata",
+          "nxdomain",
+          "servfail",
+          "refused",
+          "error"
         ],
         "type": "object"
       },
@@ -22919,6 +23045,144 @@
           "pebble"
         ],
         "type": "string"
+      },
+      "DnsQueryLogEntry": {
+        "description": "One logged query.",
+        "properties": {
+          "answer_count": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "latency_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "qname": {
+            "description": "The name asked; `None` for a forwarded (outside-zone) name, which is\nnever stored.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "qtype": {
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_ip": {
+            "type": "string"
+          },
+          "zone": {
+            "description": "`internal` or `external`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "node_id",
+          "node_name",
+          "observed_at",
+          "qtype",
+          "zone",
+          "outcome",
+          "latency_us",
+          "answer_count",
+          "source_ip"
+        ],
+        "type": "object"
+      },
+      "DnsQueryLogResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DnsQueryLogEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "retention_hours": {
+            "description": "How long entries are kept, in hours.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size",
+          "retention_hours"
+        ],
+        "type": "object"
       },
       "DnsRecord": {
         "description": "A DNS record",
@@ -23362,6 +23626,122 @@
           }
         ]
       },
+      "DnsRecordEntry": {
+        "description": "One record of the internal zone.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fqdn": {
+            "type": "string"
+          },
+          "generation": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "owner_kind": {
+            "description": "What published it: `environment`, `service_member`, `service_role`,\n`node`, `static`.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_port": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ttl": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "fqdn",
+          "record_type",
+          "ttl",
+          "owner_kind",
+          "owner_id",
+          "generation",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "DnsRecordInstruction": {
         "description": "A DNS record the operator must create.",
         "properties": {
@@ -23387,6 +23767,38 @@
           "name",
           "value",
           "purpose"
+        ],
+        "type": "object"
+      },
+      "DnsRecordListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DnsRecordEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -23539,6 +23951,257 @@
         ],
         "type": "string"
       },
+      "DnsResolveRequest": {
+        "description": "`POST /cluster/dns/resolve`.",
+        "properties": {
+          "name": {
+            "description": "The name, e.g. `production.shop.temps.local`.",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The node whose resolver answers; 0 is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "description": "Answer as one of this project's containers on that node would be\nanswered, its network policy included.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "record_type": {
+            "description": "`A` (default), `AAAA`, `CNAME`, `SRV` or `TXT`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "DnsResolveResponse": {
+        "properties": {
+          "answers": {
+            "items": {
+              "$ref": "#/components/schemas/DnsResolvedRecord"
+            },
+            "type": "array"
+          },
+          "asked_as": {
+            "description": "The container address the query was answered as.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authoritative": {
+            "description": "Answered from the internal zone.",
+            "type": "boolean"
+          },
+          "latency_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "note": {
+            "description": "A caveat about how the answer was obtained.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`noerror`, `nodata`, `nxdomain`, `servfail`, `error`.",
+            "type": "string"
+          },
+          "rcode": {
+            "description": "`NOERROR`, `NXDOMAIN`, `SERVFAIL`...",
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "name",
+          "record_type",
+          "rcode",
+          "outcome",
+          "authoritative",
+          "answers",
+          "latency_ms"
+        ],
+        "type": "object"
+      },
+      "DnsResolvedRecord": {
+        "description": "One answer record.",
+        "properties": {
+          "data": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "ttl": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "record_type",
+          "ttl",
+          "data"
+        ],
+        "type": "object"
+      },
+      "DnsResolverEntry": {
+        "description": "One node's resolver, as last reported.",
+        "properties": {
+          "build_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consecutive_sync_failures": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "dropped_log_entries": {
+            "description": "Query-log entries the resolver dropped under load.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "health": {
+            "$ref": "#/components/schemas/ResolverHealth"
+          },
+          "health_reason": {
+            "description": "Why the resolver is not healthy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalProxyState",
+                "description": "The worker's internal edge proxy, which serves the HTTP behind every\n`<env>.<project>.temps.local` name on that node. `None` for the\ncontrol plane, whose main proxy does this."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_control_plane": {
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_sync_age_secs": {
+            "description": "Seconds since the zone last synced; `None` for the control plane,\nwhose zone is fed locally.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "listen_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "0 is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "node_status": {
+            "description": "`active`, `draining`, `offline`...; `active` for the control plane.",
+            "type": "string"
+          },
+          "record_count": {
+            "description": "Records the resolver serves.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "report_state": {
+            "description": "`ok`, `agent_too_old`, `unreachable`, `rejected` or `invalid`;\n`None` before the first report.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "tasks_alive": {
+            "type": "boolean"
+          },
+          "zone_generation": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "node_status",
+          "is_control_plane",
+          "health",
+          "running",
+          "tasks_alive",
+          "consecutive_sync_failures",
+          "dropped_log_entries"
+        ],
+        "type": "object"
+      },
       "DnsResolverHeartbeat": {
         "description": "Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors\n`temps_node_agent::network_sync::DnsResolverHeartbeat` field-for-field, but\ndeclared separately rather than shared: the agent and control-plane\ncrates don't depend on each other (the agent avoids pulling in\n`temps-deployments`' sea-orm dependency tree), matching the existing\n`WirePeerListResponse` pattern in `temps-node-agent::network_sync`.",
         "properties": {
@@ -23574,6 +24237,74 @@
             "type": "boolean"
           }
         },
+        "type": "object"
+      },
+      "DnsTrafficBucket": {
+        "properties": {
+          "external": {
+            "$ref": "#/components/schemas/DnsOutcomeCounts",
+            "description": "Forwarded queries."
+          },
+          "internal": {
+            "$ref": "#/components/schemas/DnsOutcomeCounts",
+            "description": "`*.temps.local` queries."
+          },
+          "internal_latency_ms": {
+            "description": "Mean latency of internal queries, in milliseconds.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "time",
+          "internal",
+          "external"
+        ],
+        "type": "object"
+      },
+      "DnsTrafficResponse": {
+        "properties": {
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/DnsTrafficBucket"
+            },
+            "type": "array"
+          },
+          "from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "range": {
+            "type": "string"
+          },
+          "step_secs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "to": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "range",
+          "from",
+          "to",
+          "step_secs",
+          "buckets"
+        ],
         "type": "object"
       },
       "DnsZone": {
@@ -38637,6 +39368,33 @@
           }
         ]
       },
+      "InternalProxyState": {
+        "description": "A worker's internal edge proxy, from its heartbeat's\n`capacity.internal_proxy`. Every `<env>.<project>.temps.local` name\npoints at the node's bridge, port 80, where this proxy listens: the\nresolver can be healthy while the proxy is not, and then the names\nresolve and every call to them fails.",
+        "properties": {
+          "address": {
+            "description": "The address it binds, e.g. `10.205.0.1:80`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why the last bind failed; `None` while it listens.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listening": {
+            "description": "`None` when the agent does not report it (an older agent, or no\noverlay bridge yet): unknown, never \"not listening\".",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "IpAccessCidrEntry": {
         "description": "One CIDR in a policy, in canonical form (network address, explicit prefix).",
         "properties": {
@@ -44414,6 +45172,27 @@
             ]
           },
           "dns_resolver_tasks_alive": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "internal_proxy_address": {
+            "description": "The address the proxy binds, e.g. `10.205.0.1:80`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy_error": {
+            "description": "Why the last bind failed, written for the operator; `None` while it\nlistens.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy_listening": {
+            "description": "Whether the node's internal edge proxy listens on its bridge address\n(port 80), which is where every `<env>.<project>.temps.local` name\npoints. The resolver can be healthy while this is `false`: the names\nresolve and every call fails. `None` = not reported (older agent, or\nno overlay bridge yet).",
             "type": [
               "boolean",
               "null"
@@ -57916,6 +58695,19 @@
           "node_name"
         ],
         "type": "object"
+      },
+      "ResolverHealth": {
+        "description": "What a resolver looks like right now.",
+        "enum": [
+          "healthy",
+          "stale",
+          "down",
+          "off",
+          "node_unavailable",
+          "agent_too_old",
+          "not_reporting"
+        ],
+        "type": "string"
       },
       "ResourceCounts": {
         "description": "Quick count of resources involved in the migration",
@@ -99671,6 +100463,297 @@
         ]
       }
     },
+    "/cluster/dns/queries": {
+      "get": {
+        "operationId": "list_dns_queries",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page, at most 100. Defaults to 20.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Queries answered by this node's resolver (0 is the control plane).",
+            "in": "query",
+            "name": "node_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`noerror`, `nodata`, `nxdomain`, `servfail`, `refused` or `error`.",
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`internal` or `external`.",
+            "in": "query",
+            "name": "zone",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Substring of the name asked.",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Queries from this project's containers.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsQueryLogResponse"
+                }
+              }
+            },
+            "description": "Recent DNS queries"
+          },
+          "400": {
+            "description": "Invalid filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent queries answered by the internal resolvers, newest first. Kept\nfor 24 hours; forwarded names are never stored.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/records": {
+      "get": {
+        "operationId": "list_dns_records",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Records per page, at most 100. Defaults to 20.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Substring of the name or target address.",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Records pinned to this node.",
+            "in": "query",
+            "name": "node_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`environment`, `service_member`, `service_role`, `node` or `static`.",
+            "in": "query",
+            "name": "owner_kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsRecordListResponse"
+                }
+              }
+            },
+            "description": "Records of the internal zone"
+          },
+          "400": {
+            "description": "Invalid filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The internal zone's records with their owners, newest first.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/resolve": {
+      "post": {
+        "operationId": "resolve_dns_name",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DnsResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsResolveResponse"
+                }
+              }
+            },
+            "description": "The answer"
+          },
+          "400": {
+            "description": "Invalid name or record type"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "The resolver is not running, the agent is too old, or the project has no container on that node"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "The resolver could not be reached"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Resolve a name from one node's resolver and show the answer.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/resolvers": {
+      "get": {
+        "operationId": "list_dns_resolvers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterDnsResolversResponse"
+                }
+              }
+            },
+            "description": "Resolver health per node"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Each node's resolver: health, version, records served, last sync, and\nthe open DNS alarms.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/cluster/dns/status": {
       "get": {
         "description": "Same permission as the other node visibility endpoints in this file\n(`admin_list_nodes`, `admin_get_node`) — this is operational/infra\nvisibility, not a new privilege tier.",
@@ -99702,6 +100785,65 @@
           }
         ],
         "summary": "Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is\nenabled, the total record count, and per-node resolver status as last\nreported by each node's heartbeat. Lets an operator answer \"is cluster\nDNS actually healthy right now\" without SSHing into a node to read logs.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/cluster/dns/traffic": {
+      "get": {
+        "operationId": "dns_traffic",
+        "parameters": [
+          {
+            "description": "The node whose resolver to chart; 0 (the default) is the control\nplane.",
+            "in": "query",
+            "name": "node_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`1h` (default), `6h`, `24h` or `7d`.",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsTrafficResponse"
+                }
+              }
+            },
+            "description": "DNS traffic over time"
+          },
+          "400": {
+            "description": "Invalid range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Queries per outcome over time for one node's resolver.",
         "tags": [
           "Nodes"
         ]
