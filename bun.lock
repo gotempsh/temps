@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "temps-playground",
+      "dependencies": {
+        "@temps-sdk/plugin": "0.1.0-beta.1",
+      },
+    },
+  },
+  "packages": {
+    "@temps-sdk/plugin": ["@temps-sdk/plugin@0.1.0-beta.1", "", {}, "sha512-mvadvLOj7UNtXy9+p+eJv+c+p2cbOZh62I5NnKwl+aUkCuKk7Np0PZEKwdftiziO2+4SY2SbMG6A7Q7a56QiMw=="],
+  }
+}
