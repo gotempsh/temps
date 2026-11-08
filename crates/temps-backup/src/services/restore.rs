@@ -561,6 +561,9 @@ pub struct RestoreService {
     /// of a database on a worker node run as a job through it (ADR-055
     /// Phase 9); an empty slot refuses them with the reason.
     workload_plane: Arc<temps_workload_plane::PlaneSlot>,
+    /// Derives the S3 credential a restore on a worker node receives
+    /// (ADR-093).
+    worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 impl RestoreService {
@@ -569,6 +572,14 @@ impl RestoreService {
         external_service_manager: Arc<ExternalServiceManager>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
+        // Without the shared scoper a worker restore still never receives a
+        // source's own credential: this one scopes through STS and refuses
+        // a managed source (it has no Cloud minter).
+        let worker_credentials = Arc::new(
+            temps_providers::worker_s3_scope::WorkerCredentialScoper::new(
+                encryption_service.clone(),
+            ),
+        );
         Self {
             db,
             external_service_manager,
@@ -576,7 +587,18 @@ impl RestoreService {
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             cancellations: super::restore_cancel::RestoreCancellations::default(),
             workload_plane: Arc::new(temps_workload_plane::PlaneSlot::new()),
+            worker_credentials,
         }
+    }
+
+    /// Derive worker restores' S3 credentials with `scoper`, the process's
+    /// shared one (it holds the Temps Cloud minter).
+    pub fn with_worker_credentials(
+        mut self,
+        scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
+    ) -> Self {
+        self.worker_credentials = scoper;
+        self
     }
 
     /// Restore databases on worker nodes through `plane` (ADR-055 Phase 9).
@@ -1371,12 +1393,23 @@ impl RestoreService {
         let enc = self.encryption_service.clone();
         let telemetry = self.telemetry.clone();
         let plane = self.workload_plane.clone();
+        let scoper = self.worker_credentials.clone();
         // Registered before the worker starts so a cancellation that arrives
         // immediately still reaches it.
         let registration = self.cancellations.register(run_id);
         tokio::spawn(async move {
-            if let Err(e) =
-                run_restore_worker(db, mgr, enc, plane, telemetry, run_id, mode, registration).await
+            if let Err(e) = run_restore_worker(
+                db,
+                mgr,
+                enc,
+                plane,
+                scoper,
+                telemetry,
+                run_id,
+                mode,
+                registration,
+            )
+            .await
             {
                 error!("Restore run {} failed: {}", run_id, e);
             }
@@ -2098,6 +2131,7 @@ async fn run_restore_worker(
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
     plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     run_id: i32,
     mode: RestoreRequestMode,
@@ -2115,6 +2149,7 @@ async fn run_restore_worker(
         mgr,
         enc,
         plane,
+        scoper,
         run_id,
         mode,
         registration.token(),
@@ -2231,11 +2266,16 @@ fn restore_outcome_event(
     event.with("mode", mode).with_duration(elapsed)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's owned dependencies, one per argument"
+)]
 async fn run_restore_inner(
     db: Arc<DatabaseConnection>,
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
     plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
     run_id: i32,
     mode: RestoreRequestMode,
     cancel: tokio_util::sync::CancellationToken,
@@ -2321,6 +2361,7 @@ async fn run_restore_inner(
         return worker_walg::run(
             &db,
             &enc,
+            &scoper,
             &mgr,
             run_id,
             &backup_model,
@@ -2335,6 +2376,7 @@ async fn run_restore_inner(
         return run_job_restore(
             &db,
             &enc,
+            &scoper,
             &mgr,
             &plane,
             run_id,
@@ -2350,6 +2392,7 @@ async fn run_restore_inner(
         return run_agent_restore(
             &db,
             &enc,
+            &scoper,
             &mgr,
             run_id,
             &backup_model,
@@ -3624,9 +3667,14 @@ fn agent_restore_supported(
 /// Restore `backup` in place into `target`, a MongoDB, Redis, MariaDB or
 /// storage service on a worker node, through the node's agent, which runs the
 /// engine's own restore there.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's dependencies and the run's inputs"
+)]
 async fn run_agent_restore(
     db: &Arc<DatabaseConnection>,
     enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     mgr: &Arc<ExternalServiceManager>,
     run_id: i32,
     backup: &temps_entities::backups::Model,
@@ -3646,25 +3694,42 @@ async fn run_agent_restore(
     // carries its origin's users (MongoDB) leaves the target with the
     // origin's credentials, which its stored config is patched to below.
     let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
-    let s3 = workload_job::s3_target(
-        db.as_ref(),
-        enc,
-        backup.s3_source_id,
-        target.id,
-        node_id,
-        "restore",
-    )
-    .await
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id}: {e}"),
-    })?;
-    let bucket_prefix = format!("s3://{}/", s3.bucket);
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+    let bucket_prefix = format!("s3://{}/", s3_source.bucket_name);
     let location = backup
         .s3_location
         .strip_prefix(&bucket_prefix)
         .unwrap_or(&backup.s3_location)
         .trim_start_matches('/')
         .to_string();
+    // The worker can read this one backup and nothing else (ADR-093).
+    let read_prefix = match worker_agent::worker_service_kind(&target.service_type) {
+        Some(worker_agent::WorkerServiceKind::Storage) => {
+            temps_providers::worker_s3_scope::as_prefix(&location)
+        }
+        _ => temps_providers::worker_s3_scope::key_directory(&location),
+    };
+    let destination = worker_agent::scoped_destination(
+        scoper,
+        db.as_ref(),
+        backup.s3_source_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            target.id,
+            node_id,
+            read_prefix,
+            temps_core::ScopedS3Access::Read,
+            "restore",
+        ),
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
 
     // The last safe point: once the node starts writing, the run can no
     // longer be cancelled.
@@ -3681,7 +3746,7 @@ async fn run_agent_restore(
     // for, visibly and cancellably, instead of failing the run.
     crate::node_busy::retry_while_node_busy(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
-        || mgr.restore_worker_service(target.id, worker_agent::destination(&s3), location.clone()),
+        || mgr.restore_worker_service(target.id, destination.clone(), location.clone()),
         |wait| wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
     )
     .await?
@@ -3704,6 +3769,7 @@ async fn run_agent_restore(
 async fn run_job_restore(
     db: &Arc<DatabaseConnection>,
     enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
     mgr: &Arc<ExternalServiceManager>,
     plane: &temps_workload_plane::PlaneSlot,
     run_id: i32,
@@ -3752,21 +3818,14 @@ async fn run_job_restore(
             == job_target.username)
             .then(|| origin.password.clone())
     });
-    let s3 = workload_job::s3_target(
-        db.as_ref(),
-        enc,
-        backup.s3_source_id,
-        target.id,
-        node_id,
-        "restore",
-    )
-    .await
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id}: {e}"),
-    })?;
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
 
     // `wal-g st cat` reads keys relative to the bucket (`WALG_S3_PREFIX`).
-    let bucket_prefix = format!("s3://{}/", s3.bucket);
+    let bucket_prefix = format!("s3://{}/", s3_source.bucket_name);
     let object_key = backup
         .s3_location
         .strip_prefix(&bucket_prefix)
@@ -3777,10 +3836,28 @@ async fn run_job_restore(
         return Err(RestoreError::Validation {
             message: format!(
                 "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
-                backup.id, backup.s3_location, s3.bucket, backup.s3_source_id
+                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
             ),
         });
     }
+    // The job can read this one dump's directory and nothing else.
+    let s3 = workload_job::s3_target(
+        scoper,
+        db.as_ref(),
+        backup.s3_source_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            target.id,
+            node_id,
+            temps_providers::worker_s3_scope::key_directory(&object_key),
+            temps_core::ScopedS3Access::Read,
+            "restore",
+        ),
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
 
     // The last safe point: once the job starts writing, the run can no
     // longer be cancelled (`restore` is not a cancellable phase).
@@ -6330,6 +6407,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

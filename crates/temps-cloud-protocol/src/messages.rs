@@ -822,6 +822,40 @@ impl std::fmt::Debug for ManagedBackupCapability {
     }
 }
 
+/// `POST /v1/backups/managed/scoped-credentials` (ADR-093): a credential for
+/// one worker job, minted by Cloud from the tenant's token and limited to
+/// `prefixes` of the managed bucket, to `access`, and to `ttl_seconds`.
+/// Cloud refuses a prefix outside the tenant's `bucket_path`, and a `write`
+/// for a tenant that may not write (unpaid, quota revoked).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBackupScopedCredentialsRequest {
+    /// Object-key prefixes inside the managed bucket, each ending in `/`.
+    pub prefixes: Vec<String>,
+    /// `read` (restore) or `write` (backup, archiving).
+    pub access: String,
+    pub ttl_seconds: u64,
+}
+
+/// The credential Cloud minted. `Debug` redacts the secret and the token.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ManagedBackupScopedCredentials {
+    pub access_key_id: String,
+    pub secret_key: String,
+    pub session_token: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for ManagedBackupScopedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedBackupScopedCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// One OpenAI-compatible completion proxied by Cloud for a connected OSS
 /// instance. The body remains opaque at the control-plane protocol layer so
 /// OpenAI-compatible additive fields do not require a protocol-version bump.

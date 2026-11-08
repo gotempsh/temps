@@ -22,7 +22,8 @@ use std::time::Duration;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
-    PostgresWalgBackupResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook,
     RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
     RemoteServiceRestoreResponse,
 };
@@ -465,6 +466,70 @@ pub async fn postgres_walg_archive(
     AgentResponse::ok(outcome).into_response()
 }
 
+/// `POST /agent/services/postgres/walg-credentials`: replace the credential
+/// a PostgreSQL service's continuous archiving reads (`walg.env`) with the
+/// request's, scoped by the control plane to the service's own WAL-G
+/// repository (ADR-093). Nothing else changes: no restart, no setting.
+/// Outcomes come back as 200 with `refreshed`, `refused` (archiving is not
+/// set up here; nothing was written) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/postgres/walg-credentials",
+    request_body = PostgresWalgCredentialsRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<PostgresWalgCredentialsResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn postgres_walg_credentials(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<PostgresWalgCredentialsRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("refresh the archiving credential of", &service);
+    };
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    // A file write, not a data operation: it takes no slot, so a node busy
+    // with backups still keeps its archiving credential fresh.
+    match state
+        .service_runtime
+        .postgres_walg_credentials(request, Arc::new(docker.clone()), published_address)
+        .await
+    {
+        Ok(outcome) => {
+            match &outcome {
+                PostgresWalgCredentialsResult::Refreshed => {
+                    tracing::info!(service = %service, "WAL-G archiving credential refreshed");
+                }
+                PostgresWalgCredentialsResult::Refused { reason } => {
+                    tracing::info!(service = %service, %reason, "WAL-G archiving credential not refreshed");
+                }
+                PostgresWalgCredentialsResult::Failed { reason } => {
+                    tracing::error!(service = %service, %reason, "WAL-G archiving credential refresh failed");
+                }
+            }
+            AgentResponse::ok(outcome).into_response()
+        }
+        Err(error) => {
+            tracing::error!(service = %service, %error, "WAL-G archiving credential could not be refreshed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "the WAL-G archiving credential of service '{service}' could not be \
+                     refreshed: {error}"
+                ),
+            )
+            .into_response()
+        }
+    }
+}
+
 /// `POST /agent/services/postgres/walg-restore`: the control plane's WAL-G
 /// restore (in place, or to a point in time) of a PostgreSQL service on
 /// this node, run by the same engine as on the control plane.
@@ -593,6 +658,10 @@ mod tests {
             .route(
                 "/agent/services/postgres/walg-archive",
                 post(postgres_walg_archive),
+            )
+            .route(
+                "/agent/services/postgres/walg-credentials",
+                post(postgres_walg_credentials),
             )
             .with_state(state)
     }
@@ -795,6 +864,53 @@ mod tests {
         assert_eq!(request.service_id, 8);
         assert_eq!(request.bucket_path, "base");
         assert_eq!(node.host_ip, state.host_bind_address());
+    }
+
+    #[tokio::test]
+    async fn an_archive_credential_refresh_runs_only_the_credential_engine() {
+        let body = || {
+            let mut body = walg_body();
+            let object = body.as_object_mut().expect("an object");
+            object.remove("backup_uuid");
+            object.remove("allow_restart");
+            object.remove("node_id");
+            body
+        };
+        // Nothing a caller could steer the node with is accepted: no
+        // command, prefix, restart or node.
+        for field in ["command", "walg_prefix", "allow_restart", "node_id"] {
+            let mut body = body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/postgres/walg-credentials",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state),
+            "/agent/services/postgres/walg-credentials",
+            body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["status"], "refreshed", "{json}");
+        let asked = runtime.walg_credentials.lock().expect("walg_credentials");
+        let [request] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.service_id, 8);
+        assert_eq!(request.bucket_path, "base");
+        // A refresh never recreates: it asked for no archive re-point.
+        assert!(runtime
+            .walg_archives
+            .lock()
+            .expect("walg_archives")
+            .is_empty());
     }
 
     fn walg_restore_body() -> serde_json::Value {

@@ -15,6 +15,7 @@ mod console_oidc_bootstrap;
 mod handler;
 mod lifecycle_notify;
 mod plugin;
+mod scoped_credentials;
 mod service;
 
 pub use console_oidc::ConsoleOidcAdapter;
@@ -32,6 +33,7 @@ pub use handler::{
     CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP, UNATTENDED_ENROLLMENT_USER_AGENT,
 };
 pub use plugin::CloudPlugin;
+pub use scoped_credentials::{CloudScopedCredentialMinter, MAX_SCOPED_CREDENTIAL_LIFETIME};
 pub use service::{
     BootstrapBackendUrlOutcome, CloudAiCapability, CloudCapability, CloudService,
     CloudServiceError, CloudStatus, ManagedBackupOutcome, ManagedBackupSetup,

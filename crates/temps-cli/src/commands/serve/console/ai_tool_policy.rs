@@ -656,7 +656,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_or_create_dsn",
             "get_provider_key",
             "get_resolved_environment_variable_value",
-            "get_s3_credentials",
             "get_service_environment_variable",
             "get_settings",
             "issue_runtime_credentials",

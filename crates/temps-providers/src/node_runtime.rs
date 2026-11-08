@@ -13,10 +13,11 @@ use bollard::Docker;
 use temps_service_protocol::{
     AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, NodeAttachment,
     NodeServiceError, NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
-    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecreateHook, RemoteServiceBackupRequest,
-    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
-    RemoteWalHealthResponse, ServiceConfig, ServiceType,
+    PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
+    PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
+    RecreateHook, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthResponse,
+    ServiceConfig, ServiceType,
 };
 
 use crate::externalsvc;
@@ -213,6 +214,20 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             request,
             docker,
             recreate,
+            published_address,
+        )
+        .await)
+    }
+
+    async fn postgres_walg_credentials(
+        &self,
+        request: PostgresWalgCredentialsRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<PostgresWalgCredentialsResult, NodeServiceError> {
+        Ok(externalsvc::postgres_walg_backup::walg_credentials_on_node(
+            request,
+            docker,
             published_address,
         )
         .await)

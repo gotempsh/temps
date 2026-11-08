@@ -59,6 +59,8 @@ pub(crate) struct StubRuntime {
             Option<std::net::IpAddr>,
         )>,
     >,
+    /// The WAL-G archiving credential refreshes asked for.
+    pub(crate) walg_credentials: Mutex<Vec<temps_service_protocol::PostgresWalgCredentialsRequest>>,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -203,6 +205,19 @@ impl NodeServiceRuntime for StubRuntime {
             .expect("walg_archives")
             .push((request, node));
         Err(not_available("postgres_walg_archive"))
+    }
+
+    async fn postgres_walg_credentials(
+        &self,
+        request: temps_service_protocol::PostgresWalgCredentialsRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::PostgresWalgCredentialsResult, NodeServiceError> {
+        self.walg_credentials
+            .lock()
+            .expect("walg_credentials")
+            .push(request);
+        Ok(temps_service_protocol::PostgresWalgCredentialsResult::Refreshed)
     }
 
     async fn postgres_walg_restore(

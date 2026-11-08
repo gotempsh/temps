@@ -497,6 +497,7 @@ fn s3_source_row(destination: &WorkerS3Destination) -> temps_entities::s3_source
         managed_by_cloud: false,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: now,
         updated_at: now,
         backing_service_id: None,

@@ -290,6 +290,41 @@ pub struct CreateS3SourceRequest {
     /// Managed RustFS/S3 service that supplies this destination. When set,
     /// schedules using this source can never target that service itself.
     pub backing_service_id: Option<i32>,
+    /// What a worker node receives when it backs up or restores one of its
+    /// services into this source. Default `scoped`.
+    #[serde(default)]
+    pub worker_credentials: Option<WorkerCredentialsPolicy>,
+}
+
+/// What a worker node may receive from an S3 source (ADR-093).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCredentialsPolicy {
+    /// Only a credential limited to the job's own backup and operations.
+    /// A source that cannot mint one (no STS) refuses worker jobs.
+    Scoped,
+    /// The source's own credential when it cannot mint a scoped one. The
+    /// worker can then read and delete every object in the bucket.
+    AllowFull,
+}
+
+impl WorkerCredentialsPolicy {
+    pub fn as_column(self) -> &'static str {
+        match self {
+            Self::Scoped => temps_entities::s3_sources::WORKER_CREDENTIALS_SCOPED,
+            Self::AllowFull => temps_entities::s3_sources::WORKER_CREDENTIALS_ALLOW_FULL,
+        }
+    }
+
+    /// The stored value; anything but `allow_full` reads as `scoped`, the
+    /// safe one.
+    pub fn from_column(value: &str) -> Self {
+        if value == temps_entities::s3_sources::WORKER_CREDENTIALS_ALLOW_FULL {
+            Self::AllowFull
+        } else {
+            Self::Scoped
+        }
+    }
 }
 
 #[derive(Deserialize, ToSchema, Clone)]
@@ -312,6 +347,9 @@ pub struct UpdateS3SourceRequest {
     /// Optional new path-style addressing setting
     #[schema(example = true)]
     pub force_path_style: Option<bool>,
+    /// Optional new worker credentials policy.
+    #[serde(default)]
+    pub worker_credentials: Option<WorkerCredentialsPolicy>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -633,6 +671,8 @@ pub struct S3SourceResponse {
     /// rather than entered by an operator. Managed sources cannot be edited
     /// or deleted from this API; disconnect Temps Cloud to remove one.
     pub managed_by_cloud: bool,
+    /// What a worker node receives from this source (ADR-093).
+    pub worker_credentials: WorkerCredentialsPolicy,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -842,6 +882,7 @@ impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
             force_path_style: source.force_path_style,
             is_default: source.is_default,
             managed_by_cloud: source.managed_by_cloud,
+            worker_credentials: WorkerCredentialsPolicy::from_column(&source.worker_credentials),
             created_at: source.created_at.timestamp_millis(),
             updated_at: source.updated_at.timestamp_millis(),
         }
@@ -1656,6 +1697,7 @@ async fn create_s3_source(
         source_id: source.id,
         name: source.name.clone(),
         bucket_name: source.bucket_name.clone(),
+        worker_credentials: source.worker_credentials.clone(),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -1725,7 +1767,31 @@ async fn update_s3_source(
         .await
         .map_err(Problem::from)?;
 
-    // Create audit log with changed fields
+    let updated_fields = s3_source_updated_fields(&request);
+
+    let audit = S3SourceUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        source_id: source.id,
+        name: source.name.clone(),
+        bucket_name: source.bucket_name.clone(),
+        updated_fields,
+    };
+
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(S3SourceResponse::from(source)))
+}
+
+/// What an S3 source update changed, for its audit entry. Credentials are
+/// only ever "updated"; the worker credentials policy is recorded with its
+/// new value, since allowing full credentials is the change to audit.
+fn s3_source_updated_fields(request: &UpdateS3SourceRequest) -> HashMap<String, String> {
     let mut updated_fields = HashMap::new();
     if request.name.is_some() {
         updated_fields.insert("name".to_string(), "updated".to_string());
@@ -1750,23 +1816,13 @@ async fn update_s3_source(
         updated_fields.insert("region".to_string(), "updated".to_string());
     }
 
-    let audit = S3SourceUpdatedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        source_id: source.id,
-        name: source.name.clone(),
-        bucket_name: source.bucket_name.clone(),
-        updated_fields,
-    };
-
-    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
+    if let Some(policy) = request.worker_credentials {
+        updated_fields.insert(
+            "worker_credentials".to_string(),
+            policy.as_column().to_string(),
+        );
     }
-
-    Ok(Json(S3SourceResponse::from(source)))
+    updated_fields
 }
 
 /// Delete an S3 source
@@ -3510,6 +3566,49 @@ async fn list_backup_alerts(
 mod tests {
     use super::*;
 
+    /// ADR-093: the worker credentials policy is a snake_case enum on the
+    /// wire, absent means unchanged, the stored column reads back safely, and
+    /// allowing full credentials is audited with its value.
+    #[test]
+    fn the_worker_credentials_policy_round_trips_and_is_audited() {
+        let update: UpdateS3SourceRequest =
+            serde_json::from_value(serde_json::json!({ "worker_credentials": "allow_full" }))
+                .expect("a policy-only update decodes");
+        assert_eq!(
+            update.worker_credentials,
+            Some(WorkerCredentialsPolicy::AllowFull)
+        );
+        let fields = s3_source_updated_fields(&update);
+        assert_eq!(
+            fields.get("worker_credentials").map(String::as_str),
+            Some("allow_full")
+        );
+        assert_eq!(fields.len(), 1, "{fields:?}");
+
+        let unchanged: UpdateS3SourceRequest =
+            serde_json::from_value(serde_json::json!({ "name": "renamed" })).expect("decodes");
+        assert_eq!(unchanged.worker_credentials, None);
+        assert!(!s3_source_updated_fields(&unchanged).contains_key("worker_credentials"));
+        assert!(serde_json::from_value::<UpdateS3SourceRequest>(
+            serde_json::json!({ "worker_credentials": "full" })
+        )
+        .is_err());
+
+        for policy in [
+            WorkerCredentialsPolicy::Scoped,
+            WorkerCredentialsPolicy::AllowFull,
+        ] {
+            assert_eq!(
+                WorkerCredentialsPolicy::from_column(policy.as_column()),
+                policy
+            );
+        }
+        assert_eq!(
+            WorkerCredentialsPolicy::from_column("unexpected"),
+            WorkerCredentialsPolicy::Scoped
+        );
+    }
+
     #[test]
     fn refused_backup_delete_problem_hides_the_audit_failure_text() {
         let audit_error =
@@ -3582,6 +3681,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
             backing_service_id: None,

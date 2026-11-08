@@ -37,6 +37,8 @@ pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.
 pub mod log_transitions;
 pub mod managed_backup_schedule;
+/// Cloud-minted, job-scoped credentials for worker nodes (ADR-093).
+pub mod managed_backup_scoped_credentials;
 pub mod node_address;
 pub mod node_pki;
 pub mod notifications;
@@ -145,6 +147,10 @@ pub use managed_backup_schedule::{
     ManagedBackupScheduleError, ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
     DEFAULT_MANAGED_BACKUP_RETENTION_DAYS, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
     MANAGED_BACKUP_SCHEDULE_NAME,
+};
+pub use managed_backup_scoped_credentials::{
+    ManagedBackupScopedCredentials, ScopedS3Access, ScopedS3Credential, ScopedS3CredentialError,
+    ScopedS3CredentialRequest, MANAGED_SCOPED_CREDENTIAL_MAX_LIFETIME,
 };
 pub use on_demand::*;
 pub use project_access::{

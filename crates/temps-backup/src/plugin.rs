@@ -253,6 +253,12 @@ impl TempsPlugin for BackupPlugin {
                 .get_service::<temps_workload_plane::PlaneSlot>()
                 .unwrap_or_else(|| Arc::new(temps_workload_plane::PlaneSlot::new()));
 
+            // ADR-093: the one place a worker job's S3 credential is derived,
+            // registered by the providers plugin.
+            let worker_credentials = context
+                .require_service::<temps_providers::worker_s3_scope::WorkerCredentialScoper>(
+            );
+
             // Create RestoreService — orchestrates generic restore across all
             // engines via the ExternalService trait.
             let restore_service = Arc::new(
@@ -262,7 +268,8 @@ impl TempsPlugin for BackupPlugin {
                     encryption_service.clone(),
                 )
                 .with_telemetry(Arc::clone(&telemetry))
-                .with_workload_plane(plane_slot.clone()),
+                .with_workload_plane(plane_slot.clone())
+                .with_worker_credentials(worker_credentials.clone()),
             );
             context.register_service(restore_service.clone());
 
@@ -325,6 +332,7 @@ impl TempsPlugin for BackupPlugin {
                         db: db.clone(),
                         encryption_service: encryption_service.clone(),
                         plane: plane_slot.clone(),
+                        worker_credentials: worker_credentials.clone(),
                     },
                 )))
                 // MongoDB, Redis, MariaDB and storage services on worker
@@ -334,6 +342,7 @@ impl TempsPlugin for BackupPlugin {
                     db: db.clone(),
                     encryption_service: encryption_service.clone(),
                     manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
                 })))
                 // PostgreSQL WAL-G: here with this host's Docker, or on a
                 // worker through its agent (ADR-092). A server without
@@ -343,6 +352,7 @@ impl TempsPlugin for BackupPlugin {
                     encryption_service: encryption_service.clone(),
                     docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
                     manager: external_service_manager.clone(),
+                    worker_credentials: worker_credentials.clone(),
                 })));
 
             // Every other engine drives a local Docker container end to end

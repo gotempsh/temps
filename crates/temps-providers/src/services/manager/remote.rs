@@ -13,10 +13,10 @@ use crate::remote_service_client::{
     RemotePortMapping, RemoteServiceClient, RemoteServiceCreateParams,
 };
 use crate::services::*;
-use sea_orm::EntityTrait;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
 use temps_entities::{nodes, settings};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// The container to address on a node that has no persisted name for it: the
 /// canonical name, unless only the legacy one (the bare instance name an
@@ -743,6 +743,158 @@ impl ExternalServiceManager {
             }
         }
         Ok(restarted)
+    }
+
+    /// Give the continuous archiving of PostgreSQL service `service_id`, on a
+    /// worker node, a fresh credential for its own WAL-G repository in the
+    /// S3 source it is pinned to (ADR-093). Rewrites `walg.env` on the node
+    /// and nothing else. `Ok(false)`: the service does not archive on a
+    /// worker (not pinned, not PostgreSQL, or archiving not set up there).
+    pub async fn refresh_worker_archive_credentials(
+        &self,
+        service_id: i32,
+    ) -> Result<bool, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
+        else {
+            return Ok(false);
+        };
+        let (Some(s3_source_id), true) = (
+            service.continuous_archive_s3_source_id,
+            matches!(
+                service.service_type.as_str(),
+                "postgres" | "postgresql" | "timescale" | "timescaledb"
+            ),
+        ) else {
+            return Ok(false);
+        };
+        let s3_source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "continuous archiving is pinned to S3 source {s3_source_id}, which no \
+                     longer exists"
+                ),
+            })?;
+        let scoped = self
+            .worker_credentials
+            .destination(
+                &s3_source,
+                crate::worker_s3_scope::WorkerS3Grant::archive(
+                    service_id,
+                    node_id,
+                    crate::externalsvc::postgres_walg_backup::walg_key_prefix(
+                        &s3_source.bucket_path,
+                        &service.name,
+                    ),
+                ),
+            )
+            .await
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: format!(
+                    "could not refresh the WAL archiving credential of service {service_id} on \
+                     node {node_id}: {error}"
+                ),
+            })?;
+        if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
+            warn!(service_id, node_id, "{warning}");
+        }
+        let service_config = self.get_service_config(service_id).await?;
+        let result = self
+            .get_remote_client(node_id)
+            .await?
+            .postgres_walg_credentials(
+                &crate::remote_service_client::PostgresWalgCredentialsRequest {
+                    service_id,
+                    service_config,
+                    destination: scoped.destination,
+                    bucket_path: s3_source.bucket_path.clone(),
+                },
+            )
+            .await?;
+        use crate::remote_service_client::PostgresWalgCredentialsResult;
+        match result {
+            PostgresWalgCredentialsResult::Refreshed => Ok(true),
+            PostgresWalgCredentialsResult::Refused { reason } => {
+                tracing::debug!(service_id, node_id, %reason, "archive credential not refreshed");
+                Ok(false)
+            }
+            PostgresWalgCredentialsResult::Failed { reason } => {
+                Err(ExternalServiceError::DockerError {
+                    id: service_id,
+                    reason: format!(
+                        "failed to refresh the WAL archiving credential on worker node \
+                         {node_id}: {reason}"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Keep every worker PostgreSQL's archiving credential fresh: each one
+    /// is refreshed every [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`], well inside
+    /// its lifetime, and retried on the next tick when that fails. O(worker
+    /// PostgreSQL services) per tick, sequential.
+    ///
+    /// [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`]: crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
+    pub fn spawn_worker_archive_credential_refresh(self: &std::sync::Arc<Self>) {
+        const TICK: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        let manager = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let mut refreshed: HashMap<i32, std::time::Instant> = HashMap::new();
+            let mut interval = tokio::time::interval(TICK);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let services = match temps_entities::external_services::Entity::find()
+                    .filter(
+                        temps_entities::external_services::Column::ContinuousArchiveS3SourceId
+                            .is_not_null(),
+                    )
+                    .filter(temps_entities::external_services::Column::NodeId.is_not_null())
+                    .all(manager.db.as_ref())
+                    .await
+                {
+                    Ok(services) => services,
+                    Err(error) => {
+                        warn!(%error, "could not list worker services to refresh their WAL archiving credentials");
+                        continue;
+                    }
+                };
+                let live: std::collections::HashSet<i32> =
+                    services.iter().map(|service| service.id).collect();
+                refreshed.retain(|id, _| live.contains(id));
+                for service in services {
+                    let due = refreshed.get(&service.id).is_none_or(|at| {
+                        at.elapsed() >= crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
+                    });
+                    if !due {
+                        continue;
+                    }
+                    match manager.refresh_worker_archive_credentials(service.id).await {
+                        Ok(true) => {
+                            info!(
+                                service_id = service.id,
+                                "refreshed the WAL archiving credential of a worker PostgreSQL"
+                            );
+                            refreshed.insert(service.id, std::time::Instant::now());
+                        }
+                        // Nothing to refresh: look again after a full interval.
+                        Ok(false) => {
+                            refreshed.insert(service.id, std::time::Instant::now());
+                        }
+                        Err(error) => warn!(
+                            service_id = service.id,
+                            %error,
+                            "could not refresh a worker PostgreSQL's WAL archiving credential; \
+                             retrying on the next tick"
+                        ),
+                    }
+                }
+            }
+        });
     }
 
     /// Restore PostgreSQL service `service_id`, which runs on a worker node,

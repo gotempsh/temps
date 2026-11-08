@@ -28,7 +28,8 @@ use temps_docker_util::{
 };
 use temps_service_protocol::{
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
-    PostgresWalgBackupResult, WorkerS3Destination,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    WorkerS3Destination,
 };
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -582,6 +583,55 @@ pub async fn walg_archive_on_node(
             reason: format!(
                 "WAL-G archiving of service {service_id} ('{service}') could not be pointed at \
                  {prefix}: {error}"
+            ),
+        },
+    }
+}
+
+/// The agent's side of `POST /agent/services/postgres/walg-credentials`:
+/// rewrite `walg.env` with the request's credential for the service's own
+/// WAL-G repository, and nothing else (ADR-093).
+pub async fn walg_credentials_on_node(
+    request: PostgresWalgCredentialsRequest,
+    docker: Arc<Docker>,
+    published_address: Option<IpAddr>,
+) -> PostgresWalgCredentialsResult {
+    let PostgresWalgCredentialsRequest {
+        service_id,
+        service_config,
+        destination,
+        bucket_path,
+    } = request;
+    let (service_config, _container) = match node_service_config(
+        service_id,
+        service_config,
+        published_address,
+        "refreshing WAL-G archiving credentials",
+    ) {
+        Ok(target) => target,
+        Err(reason) => return PostgresWalgCredentialsResult::Refused { reason },
+    };
+    let service = service_config.name.clone();
+    let s3 = node_s3(destination, bucket_path);
+    let prefix = walg_prefix(&s3.bucket_name, &s3.bucket_path, &service);
+    match PostgresService::new(service.clone(), docker)
+        .refresh_archive_credentials(service_config, &s3, &prefix)
+        .await
+    {
+        Ok(true) => {
+            info!(service_id, service = %service, prefix = %prefix, "Refreshed the WAL-G archiving credential");
+            PostgresWalgCredentialsResult::Refreshed
+        }
+        Ok(false) => PostgresWalgCredentialsResult::Refused {
+            reason: format!(
+                "continuous archiving is not set up for service {service_id} ('{service}') on \
+                 this node (no walg.env); a base backup sets it up"
+            ),
+        },
+        Err(error) => PostgresWalgCredentialsResult::Failed {
+            reason: format!(
+                "the WAL-G archiving credential of service {service_id} ('{service}') could not \
+                 be refreshed: {error}"
             ),
         },
     }

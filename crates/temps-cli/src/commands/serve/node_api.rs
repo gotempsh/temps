@@ -423,11 +423,10 @@ fn is_node_route(path: &str) -> bool {
                 | "dns/ack"
                 | "state"
                 | "state/ack"
-        ) || route.strip_prefix("s3-credentials/").is_some_and(is_id)
-            || route
-                .strip_prefix("instances/")
-                .and_then(|rest| rest.strip_suffix("/env"))
-                .is_some_and(is_big_id))
+        ) || route
+            .strip_prefix("instances/")
+            .and_then(|rest| rest.strip_suffix("/env"))
+            .is_some_and(is_big_id))
 }
 
 /// A database id as it appears in a path: ASCII digits that fit an `i32`
@@ -606,7 +605,6 @@ mod tests {
             (Method::POST, "/api/internal/nodes/register"),
             (Method::POST, "/api/internal/nodes/7/heartbeat"),
             (Method::PUT, "/api/internal/nodes/7/network/wireguard"),
-            (Method::GET, "/api/internal/nodes/7/s3-credentials/2"),
             (
                 Method::POST,
                 "/api/internal/nodes/7/heartbeat?after=../drain",
@@ -629,6 +627,8 @@ mod tests {
             (Method::DELETE, "/api/internal/nodes/8"),
             (Method::POST, "/api/internal/nodes/8/drain"),
             (Method::GET, "/api/settings"),
+            // ADR-093: a node never fetches a source's own S3 credential.
+            (Method::GET, "/api/internal/nodes/7/s3-credentials/2"),
             // Dotted and encoded escapes from an allowed prefix.
             (Method::POST, "/api/internal/nodes/7/../8/drain"),
             (
@@ -794,7 +794,6 @@ mod tests {
             "/api/internal/nodes/7/routes/snapshot",
             "/api/internal/nodes/7/routes/ack",
             "/api/internal/nodes/7/acme-challenge",
-            "/api/internal/nodes/7/s3-credentials/2",
             "/api/internal/nodes/7/network-policy",
             "/api/internal/nodes/7/dns/changes",
             "/api/internal/nodes/7/dns/ack",
@@ -808,6 +807,8 @@ mod tests {
             assert!(is_node_route(allowed), "{allowed}");
         }
         for denied in [
+            // ADR-093: removed; a worker only receives scoped credentials.
+            "/api/internal/nodes/7/s3-credentials/2",
             "/api/internal/nodes",
             "/api/internal/nodes/7",
             "/api/internal/nodes/7/drain",

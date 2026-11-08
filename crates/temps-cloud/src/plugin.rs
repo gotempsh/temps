@@ -100,6 +100,10 @@ impl TempsPlugin for CloudPlugin {
                 encryption.clone(),
                 self.allow_loopback_development,
             ));
+            // ADR-093: worker jobs get credentials Cloud scopes for them.
+            let scoped_credentials: Arc<dyn temps_core::ManagedBackupScopedCredentials> =
+                Arc::new(crate::CloudScopedCredentialMinter::new(link.clone()));
+            context.register_service(scoped_credentials);
             context.register_service(link);
             context.register_service(service);
             // ADR-045 §3: the console router does not exist yet at this point

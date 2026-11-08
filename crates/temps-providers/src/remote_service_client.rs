@@ -18,8 +18,9 @@ use crate::services::ExternalServiceError;
 use crate::workload::ServiceWorkloadError;
 pub use temps_service_protocol::{
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
-    PostgresWalgBackupResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
-    RecoveryTarget, RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget,
+    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
     RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
     RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
     RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
@@ -520,6 +521,28 @@ impl RemoteServiceClient {
         );
         self.agent_post_with_timeout(
             "/agent/services/postgres/walg-archive",
+            request,
+            DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Refresh the credential a worker PostgreSQL's continuous archiving
+    /// reads (ADR-093). Travels sealed; an agent without the route is told
+    /// to update.
+    pub async fn postgres_walg_credentials(
+        &self,
+        request: &PostgresWalgCredentialsRequest,
+    ) -> Result<PostgresWalgCredentialsResult, ExternalServiceError> {
+        info!(
+            service = %request.service_config.name,
+            service_id = request.service_id,
+            node = %self.node_name,
+            bucket = %request.destination.bucket,
+            "Refreshing a remote PostgreSQL service's WAL-G archiving credential"
+        );
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-credentials",
             request,
             DATA_OPERATION_TIMEOUT,
         )

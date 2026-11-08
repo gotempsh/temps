@@ -403,20 +403,39 @@ impl ExternalServiceManager {
                 parameters: serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null),
             };
 
-            if let ServiceExecutionRoute::Remote(_) = service_execution_route(service.node_id) {
+            if let ServiceExecutionRoute::Remote(node_id) = service_execution_route(service.node_id)
+            {
                 // A worker's container is on its node: its agent runs the
-                // same re-point there, with the node's recreate.
+                // same re-point there, with the node's recreate, holding a
+                // credential for the service's own WAL-G repository only
+                // (ADR-093).
+                let scoped = self
+                    .worker_credentials
+                    .destination(
+                        &s3_source,
+                        crate::worker_s3_scope::WorkerS3Grant::archive(
+                            service_id,
+                            node_id,
+                            crate::externalsvc::postgres_walg_backup::walg_key_prefix(
+                                &s3_source.bucket_path,
+                                &service.name,
+                            ),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| ExternalServiceError::InternalError {
+                        reason: format!(
+                            "could not re-point continuous archiving of service {service_id} \
+                             to S3 source {}: {error}",
+                            s3_source.id
+                        ),
+                    })?;
+                if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
+                    tracing::warn!(service_id, node_id, "{warning}");
+                }
                 self.walg_archive_worker_postgres(
                     service_id,
-                    crate::remote_service_client::WorkerS3Destination {
-                        bucket: s3_credentials.bucket_name.clone(),
-                        region: s3_credentials.region.clone(),
-                        endpoint: s3_credentials.endpoint.clone(),
-                        force_path_style: s3_credentials.force_path_style,
-                        access_key_id: s3_credentials.access_key_id.clone(),
-                        secret_access_key: s3_credentials.secret_key.clone(),
-                        session_token: s3_credentials.session_token.clone(),
-                    },
+                    scoped.destination,
                     s3_credentials.bucket_path.clone(),
                 )
                 .await?;
@@ -641,6 +660,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: now,
             updated_at: now,
         }

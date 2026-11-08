@@ -7358,3 +7358,89 @@ async fn test_git_connection_refresh_lease_migration_up_and_down() -> anyhow::Re
     assert_eq!(survivors.len(), 1, "down must keep the connection row");
     Ok(())
 }
+
+/// ADR-093: every existing S3 source becomes `scoped` (worker nodes never
+/// receive its own credential), the column takes only `scoped` or
+/// `allow_full`, and down removes it without touching the source.
+#[tokio::test]
+async fn test_s3_sources_worker_credentials_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping worker credentials migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping worker credentials migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261108_000001_add_s3_sources_worker_credentials";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared(
+        "INSERT INTO s3_sources (id, name, bucket_name, bucket_path, region, access_key_id, \
+         secret_key, created_at, updated_at) VALUES (7201, 'existing', 'bucket', '/', \
+         'us-east-1', 'k', 's', now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT worker_credentials FROM s3_sources WHERE id = 7201".to_string(),
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "worker_credentials")?, "scoped");
+    db.execute_unprepared(
+        "UPDATE s3_sources SET worker_credentials = 'allow_full' WHERE id = 7201",
+    )
+    .await?;
+    assert!(
+        db.execute_unprepared("UPDATE s3_sources SET worker_credentials = 'full' WHERE id = 7201")
+            .await
+            .is_err(),
+        "the CHECK must refuse anything but scoped or allow_full"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 's3_sources' \
+             AND column_name = 'worker_credentials'"
+                .to_string(),
+        ))
+        .await?;
+    assert!(columns.is_empty(), "down must remove worker_credentials");
+    let survivors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM s3_sources WHERE id = 7201".to_string(),
+        ))
+        .await?;
+    assert_eq!(survivors.len(), 1, "down must keep the source");
+    Ok(())
+}

@@ -50,6 +50,8 @@ pub struct PostgresWalgDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
+    /// Derives a worker's S3 credential (ADR-093).
+    pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 pub struct PostgresWalgEngine {
@@ -302,14 +304,22 @@ async fn backup_on_worker(
     backup_uuid: &str,
     allow_restart: bool,
 ) -> Result<WalgBaseBackupOutcome, BackupError> {
-    // Refuses an endpoint on this host's loopback, which the node cannot
-    // reach.
-    let target = super::workload_job::s3_target(
+    // The base backup writes this credential into `walg.env`, where
+    // `archive_command` keeps using it: it is the archiving credential,
+    // limited to the service's own WAL-G repository and refreshed by the
+    // control plane (ADR-093).
+    let destination = super::worker_agent::scoped_destination(
+        &deps.worker_credentials,
         deps.db.as_ref(),
-        &deps.encryption_service,
         s3_source_id,
-        service.id,
-        node_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::archive(
+            service.id,
+            node_id,
+            temps_providers::externalsvc::postgres_walg_backup::walg_key_prefix(
+                bucket_path,
+                &service.name,
+            ),
+        ),
         "backup",
     )
     .await?;
@@ -321,7 +331,7 @@ async fn backup_on_worker(
         || {
             deps.manager.walg_backup_worker_postgres(
                 service.id,
-                super::worker_agent::destination(&target),
+                destination.clone(),
                 bucket_path.to_string(),
                 backup_uuid.to_string(),
                 allow_restart,

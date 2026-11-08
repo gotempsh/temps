@@ -36,6 +36,7 @@ pub mod sandbox_redis;
 pub mod sandbox_s3;
 pub mod service_dns;
 pub mod services;
+pub mod worker_s3_scope;
 pub use services::*;
 pub mod plugin;
 mod types;

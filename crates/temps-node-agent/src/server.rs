@@ -274,6 +274,10 @@ pub fn build_router(
             post(crate::service_data_handlers::postgres_walg_archive),
         )
         .route(
+            "/agent/services/postgres/walg-credentials",
+            post(crate::service_data_handlers::postgres_walg_credentials),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )
