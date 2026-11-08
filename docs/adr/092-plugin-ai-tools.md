@@ -72,3 +72,9 @@ The Node SDK's `createToolPlugin(plugin).tool(...)` registers a route and emits
 its declaration in the existing OpenAPI ready payload. The console exposes the
 catalogue and consent on each plugin page. The migration defaults existing and
 new plugin actors to disabled; no operator action is required during upgrade.
+
+Marked request bodies must declare JSON object schemas, inline or through a
+component reference. Unsupported root shapes and media types fail indexing with
+a contextual error instead of exposing an operation with unusable body inputs.
+Composite property values use explicit JSON encoding; the endpoint validates
+their constraints. Recursive SDK references are rooted in OpenAPI components.

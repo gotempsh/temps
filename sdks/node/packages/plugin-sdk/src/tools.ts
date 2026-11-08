@@ -248,14 +248,40 @@ function promoteDefinitions<T extends Record<string, unknown>>(
       name,
     );
   });
+  const hasRootReference = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(hasRootReference);
+    if (!value || typeof value !== "object") return false;
+    return Object.entries(value).some(([key, child]) =>
+      key === "$ref" && typeof child === "string"
+        ? (child === "#" || child.startsWith("#/")) &&
+          !child.startsWith("#/$defs/")
+        : hasRootReference(child),
+    );
+  };
+  const rootName = `TempsAiTool_${tool}_root`;
+  const promoteRoot = hasRootReference(schema);
+  if (
+    promoteRoot &&
+    (existing?.[rootName] !== undefined || definitions[rootName] !== undefined)
+  )
+    throw new Error(`Tool ${tool} schema conflicts with component ${rootName}`);
+  const rewriteReference = (reference: string): string => {
+    for (const [prefix, name] of names) {
+      if (reference === prefix || reference.startsWith(`${prefix}/`))
+        return `#/components/schemas/${name}${reference.slice(prefix.length)}`;
+    }
+    if (reference === "#" || reference.startsWith("#/"))
+      return `#/components/schemas/${rootName}${reference.slice(1)}`;
+    return reference;
+  };
   const rewrite = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(rewrite);
     if (!value || typeof value !== "object") return value;
     return Object.fromEntries(
       Object.entries(value).map(([key, child]) => [
         key,
-        key === "$ref" && typeof child === "string" && names.has(child)
-          ? `#/components/schemas/${names.get(child)}`
+        key === "$ref" && typeof child === "string"
+          ? rewriteReference(child)
           : rewrite(child),
       ]),
     );
@@ -268,5 +294,7 @@ function promoteDefinitions<T extends Record<string, unknown>>(
   }
   const root = { ...schema };
   delete root.$defs;
-  return rewrite(root) as T;
+  const rewritten = rewrite(root) as T;
+  if (promoteRoot) definitions[rootName] = rewritten;
+  return rewritten;
 }

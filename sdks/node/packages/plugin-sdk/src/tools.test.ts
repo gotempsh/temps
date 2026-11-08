@@ -258,4 +258,66 @@ describe("endpoint AI tools", () => {
         .writeHead,
     ).toHaveBeenCalledWith(200, { "Content-Type": "application/json" });
   });
+  it("rebases recursive root references into OpenAPI components", async () => {
+    const node = z.object({
+      name: z.string(),
+      get children() {
+        return z.array(node);
+      },
+    });
+    const p = plugin().tool({
+      name: "tree",
+      description: "Save tree",
+      input: node,
+      handler: (input) => input,
+    });
+    const spec = p.openapi!() as {
+      paths: Record<
+        string,
+        {
+          post: {
+            requestBody: {
+              content: Record<
+                string,
+                {
+                  schema: {
+                    properties: { children: { items: { $ref: string } } };
+                  };
+                }
+              >;
+            };
+          };
+        }
+      >;
+      components: {
+        schemas: Record<
+          string,
+          { properties: { children: { items: { $ref: string } } } }
+        >;
+      };
+    };
+    const schema =
+      spec.paths["/tools/tree"].post.requestBody.content["application/json"]
+        .schema;
+    const reference = "#/components/schemas/TempsAiTool_tree_root";
+    expect(schema.properties.children.items.$ref).toBe(reference);
+    expect(
+      spec.components.schemas.TempsAiTool_tree_root.properties.children.items
+        .$ref,
+    ).toBe(reference);
+    const payload = {
+      name: "root",
+      children: [{ name: "leaf", children: [] }],
+    };
+    const response = await request(
+      p,
+      "POST",
+      "/tools/tree",
+      JSON.stringify(payload),
+    );
+    expect(response.writeHead).toHaveBeenCalledWith(200, {
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(response.end.mock.calls[0][0])).toEqual(payload);
+  });
 });

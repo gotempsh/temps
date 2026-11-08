@@ -48,6 +48,11 @@ pub enum PluginToolsError {
         operation_id: String,
         path: String,
     },
+    #[error("Cannot index AI operation '{operation_id}' for plugin '{plugin}': request body must declare an application/json object schema, inline or through a component reference")]
+    UnsupportedRequestBody {
+        plugin: String,
+        operation_id: String,
+    },
 }
 
 impl PluginToolsIndex {
@@ -140,6 +145,7 @@ impl PluginToolsIndex {
                         operation_id: id.into(),
                     });
                 }
+                validate_body_schema(plugin, id, op, openapi)?;
                 let access = if method == "GET"
                     && mark
                         .get("access")
@@ -239,6 +245,37 @@ impl PluginToolsIndex {
             .find(|t| t.enabled && t.access == access && t.operation.operation_id == id)
             .map(|t| &t.operation)
     }
+}
+
+fn validate_body_schema(
+    plugin: &str,
+    operation_id: &str,
+    operation: &Operation,
+    openapi: &utoipa::openapi::OpenApi,
+) -> Result<(), PluginToolsError> {
+    use utoipa::openapi::schema::{SchemaType, Type};
+    let Some(body) = operation.request_body.as_ref() else {
+        return Ok(());
+    };
+    let schema = resolve_component(
+        body,
+        openapi.components.as_ref().map(|c| &c.request_bodies),
+        "#/components/requestBodies/",
+    )
+    .and_then(|body| body.content.get("application/json"))
+    .and_then(|content| match content {
+        RefOr::T(content) => content.schema.as_ref(),
+        RefOr::Ref(_) => None,
+    })
+    .and_then(|schema| deref_schema(schema, openapi));
+    if matches!(schema, Some(Schema::Object(object)) if matches!(object.schema_type, SchemaType::Type(Type::Object)))
+    {
+        return Ok(());
+    }
+    Err(PluginToolsError::UnsupportedRequestBody {
+        plugin: plugin.into(),
+        operation_id: operation_id.into(),
+    })
 }
 
 /// Composite plugin inputs require an explicit JSON value, not scalar guessing.
@@ -642,5 +679,31 @@ mod tests {
                 Err(crate::ApiToolError::MissingParam { .. })
             ));
         }
+    }
+
+    #[test]
+    fn unsupported_root_bodies_are_rejected_and_object_components_are_preserved() {
+        for schema in [
+            json!({"allOf":[{"type":"object","properties":{"report_name":{"type":"string"}},"required":["report_name"]}]}),
+            json!({"oneOf":[{"type":"object"},{"type":"array","items":{"type":"string"}}]}),
+            json!({"type":"array","items":{"type":"string"}}),
+            json!({"type":"string"}),
+            json!({"$ref":"#/components/schemas/Missing"}),
+        ] {
+            let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"requestBody":{"content":{"application/json":{"schema":schema}}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let error = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap_err();
+            assert!(
+                matches!(error, PluginToolsError::UnsupportedRequestBody { ref plugin, ref operation_id } if plugin == "reports" && operation_id == "create")
+            );
+            assert!(error.to_string().contains("application/json object schema"));
+        }
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"schemas":{"Input":{"type":"object","properties":{"report_name":{"type":"string"}},"required":["report_name"]}}},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Input"}}}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+        let operation = index
+            .callable("plugin.reports.create", PluginToolAccess::Write)
+            .unwrap();
+        assert_eq!(operation.params.len(), 1);
+        assert_eq!(operation.params[0].name, "report_name");
+        assert!(operation.params[0].required);
     }
 }
