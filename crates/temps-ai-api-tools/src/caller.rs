@@ -260,6 +260,18 @@ fn validate_plugin_path_value(
     Ok(())
 }
 
+fn parameter_is_supplied(
+    param: &ParamSpec,
+    params: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    params
+        .and_then(|object| object.get(&param.name))
+        .is_some_and(|value| {
+            !value.is_null()
+                || (param.ty == "json" && matches!(param.location, ParamLocation::Body))
+        })
+}
+
 /// Policy-aware request builder used by chat tool calls. Unlike the public
 /// convenience wrapper, this preserves `Allowed([])` as an explicit deny-all
 /// project-selector boundary for an application with no selected project.
@@ -320,10 +332,7 @@ fn build_request_parts_scoped(
         .params
         .iter()
         .filter(|param| {
-            if params_obj
-                .and_then(|o| o.get(&param.name))
-                .is_some_and(|v| !v.is_null())
-            {
+            if parameter_is_supplied(param, params_obj) {
                 return false;
             }
             if is_project_scope_param(op, param)

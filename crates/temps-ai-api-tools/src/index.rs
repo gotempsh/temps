@@ -193,7 +193,8 @@ pub struct ParamSpec {
     /// Whether the parameter must be supplied (path params are always required).
     pub required: bool,
     /// JSON Schema type as a short string ("string", "integer", "number",
-    /// "boolean", "array", "object", or "any").  Derived from the utoipa
+    /// "boolean", "array", "object", "any", or "json" for composite plugin
+    /// inputs requiring explicit JSON encoding). Derived from the utoipa
     /// `SchemaType`; defaults to "string" when the schema is absent or
     /// is a `$ref` (the full schema is not resolved here — Phase 2).
     pub ty: String,

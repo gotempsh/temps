@@ -350,17 +350,24 @@ impl ToolRouter {
     pub(super) async fn dispatch(&self, call: &ToolCall, auth: &AuthContext) -> String {
         let mut state = self.state.lock().await;
         let write_caller = self.write_handle.as_ref().and_then(|handle| handle.get());
-        let revision = write_caller
-            .as_ref()
-            .and_then(|caller| caller.plugin_tools_revision());
-        if state.write_tools_revision != revision {
+        let revision = (
+            self.api_tools
+                .as_ref()
+                .and_then(|provider| provider.api_tools_revision()),
+            write_caller
+                .as_ref()
+                .and_then(|caller| caller.plugin_tools_revision()),
+        );
+        if state.api_tools_revision != revision {
             // Discovery and refusals from an old publication cannot prevent a
             // fresh proposal. Execution still requires its normal approval.
             state.seen_calls.retain(|key, _| {
-                !key.starts_with("temps_write|")
+                !key.starts_with("temps|")
+                    && !key.starts_with("mcp__temps-chat__temps|")
+                    && !key.starts_with("temps_write|")
                     && !key.starts_with("mcp__temps-chat__temps_write|")
             });
-            state.write_tools_revision = revision;
+            state.api_tools_revision = revision;
         }
         dispatch_conversation_tool(
             call,

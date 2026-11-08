@@ -2913,12 +2913,24 @@ mod tests {
                         StatusCode::FORBIDDEN
                     }
                 );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/problem+json"
+                );
+                let body: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 8192)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(body["title"].is_string());
             }
         }
     }
 
     #[tokio::test]
     async fn plugin_ai_tools_toggle_returns_current_consent_and_audits() {
+        use tower::ServiceExt;
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results([
                 vec![ai_actor(false)],
@@ -2941,20 +2953,124 @@ mod tests {
             audit_service: audit.clone(),
             sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
         };
-        let Json(response) = put_plugin_ai_tools(
-            user_auth(Role::PlatformAdmin),
-            State(state),
-            metadata(),
-            Path("reports".into()),
-            Json(crate::ai_tools::UpdatePluginAiTools {
-                actor_id: uuid::Uuid::from_u128(1).to_string(),
-                enabled: true,
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(response.enabled);
-        assert!(response.tools.is_empty());
+        let app = configure_routes()
+            .with_state(state)
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0));
+        for method in ["PUT", "GET"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"enabled":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["enabled"], true);
+            assert_eq!(body["actor_id"], uuid::Uuid::from_u128(1).to_string());
+            assert_eq!(body["tools"], serde_json::json!([]));
+        }
         assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_errors_are_problem_details_without_success_audits() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        use tower::ServiceExt;
+        for (method, db, status, title) in [
+            (
+                "GET",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([
+                        Vec::<temps_entities::external_plugin_actors::Model>::new(),
+                    ]),
+                StatusCode::NOT_FOUND,
+                "Plugin Actor Not Found",
+            ),
+            (
+                "PUT",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![ai_actor(false)]]),
+                StatusCode::CONFLICT,
+                "Plugin Actor Changed",
+            ),
+            (
+                "GET",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("private diagnostic".into())]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Plugin Grants Unavailable",
+            ),
+            (
+                "PUT",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("private diagnostic".into())]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Plugin Grants Unavailable",
+            ),
+        ] {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let state = ExternalPluginsAppState {
+                service: Arc::new(ExternalPluginsService::new_empty(
+                    ExternalPluginConfig::new(
+                        std::env::temp_dir().join("plugin-ai-contract-test"),
+                        "postgres://localhost/test".into(),
+                    ),
+                    None,
+                    Arc::new(db.into_connection()),
+                )),
+                audit_service: audit.clone(),
+                sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            };
+            let response = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(Role::PlatformAdmin).0))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(2),"enabled":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["title"], title);
+            assert!(body["detail"].is_string());
+            assert!(!body.to_string().contains("private diagnostic"));
+            if status != StatusCode::INTERNAL_SERVER_ERROR {
+                assert!(body["detail"].as_str().unwrap().contains("reports"));
+            }
+            assert!(audit.operations.lock().unwrap().is_empty());
+        }
     }
 }

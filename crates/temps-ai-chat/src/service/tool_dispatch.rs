@@ -298,7 +298,7 @@ pub(super) fn missing_backtest(
 
 #[derive(Default)]
 pub(super) struct ToolExecutionState {
-    pub(super) write_tools_revision: Option<String>,
+    pub(super) api_tools_revision: (Option<String>, Option<String>),
     pub(super) goals: Option<crate::goals::GoalToolSupport>,
     pub(super) secrets: Option<crate::secret_slots::SecretToolSupport>,
     /// Present for assistant chats on a server with a sandbox backend.

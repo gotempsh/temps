@@ -203,6 +203,7 @@ impl PluginToolsIndex {
                         )
                     })
                     .is_some_and(|body| body.content.contains_key("application/json"));
+                preserve_composite_body_inputs(&mut operation, &effective, openapi);
                 operation.summary = Some(description.clone());
                 operation.description = Some(description);
                 // Do not let plugin-supplied tags impersonate core permission groups.
@@ -237,6 +238,74 @@ impl PluginToolsIndex {
             .iter()
             .find(|t| t.enabled && t.access == access && t.operation.operation_id == id)
             .map(|t| &t.operation)
+    }
+}
+
+/// Composite plugin inputs require an explicit JSON value, not scalar guessing.
+/// The endpoint retains validation of alternatives and their constraints.
+fn preserve_composite_body_inputs(
+    operation: &mut ApiOperation,
+    declaration: &Operation,
+    openapi: &utoipa::openapi::OpenApi,
+) {
+    let Some(body) = declaration.request_body.as_ref().and_then(|body| {
+        resolve_component(
+            body,
+            openapi.components.as_ref().map(|c| &c.request_bodies),
+            "#/components/requestBodies/",
+        )
+    }) else {
+        return;
+    };
+    let Some(RefOr::T(content)) = body.content.get("application/json") else {
+        return;
+    };
+    let Some(Schema::Object(schema)) = content
+        .schema
+        .as_ref()
+        .and_then(|s| deref_schema(s, openapi))
+    else {
+        return;
+    };
+    for param in &mut operation.params {
+        if matches!(param.location, ParamLocation::Body)
+            && schema
+                .properties
+                .get(&param.name)
+                .and_then(|s| deref_schema(s, openapi))
+                .is_some_and(|s| needs_json_input(s, openapi, 0))
+        {
+            param.ty = "json".into();
+            param.item_ty = None;
+            param.enum_values.clear();
+            param.object_shape = None;
+        }
+    }
+}
+
+fn needs_json_input(schema: &Schema, openapi: &utoipa::openapi::OpenApi, depth: usize) -> bool {
+    use utoipa::openapi::schema::{ArrayItems, SchemaType, Type};
+    if depth >= 16 {
+        return true;
+    }
+    match schema {
+        Schema::AnyOf(_) | Schema::OneOf(_) | Schema::AllOf(_) => true,
+        Schema::Object(object) => {
+            matches!(
+                object.schema_type,
+                SchemaType::Array(_) | SchemaType::Type(Type::Null)
+            ) || object.properties.values().any(|property| {
+                deref_schema(property, openapi)
+                    .is_some_and(|s| needs_json_input(s, openapi, depth + 1))
+            })
+        }
+        Schema::Array(array) => match &array.items {
+            ArrayItems::RefOrSchema(item) => {
+                deref_schema(item, openapi).is_some_and(|s| needs_json_input(s, openapi, depth + 1))
+            }
+            ArrayItems::False => false,
+        },
+        _ => false,
     }
 }
 
@@ -511,6 +580,67 @@ mod tests {
             let request =
                 crate::build_request_parts(op, &serde_json::json!({}), &[], 20, 100).unwrap();
             assert_eq!(request.body, Some(serde_json::json!({})));
+        }
+    }
+
+    #[test]
+    fn composite_plugin_body_inputs_keep_json_types_through_cli_and_request_building() {
+        use crate::cli::{resolve, CliAction, CliMode};
+        for (schema, values) in [
+            (
+                json!({"anyOf":[{"type":"number"},{"type":"null"}]}),
+                vec![json!(7), json!(null)],
+            ),
+            (
+                json!({"oneOf":[{"type":"number"},{"type":"boolean"}]}),
+                vec![json!(7), json!(true)],
+            ),
+            (
+                json!({"type":["string","null"]}),
+                vec![json!("7"), json!(null)],
+            ),
+            (
+                json!({"type":"array","items":{"anyOf":[{"type":"number"},{"type":"null"}]}}),
+                vec![json!([7, null])],
+            ),
+            (
+                json!({"$ref":"#/components/schemas/Count"}),
+                vec![json!(7), json!(null)],
+            ),
+            (
+                json!({"type":"object","required":["count"],"properties":{"count":{"anyOf":[{"type":"number"},{"type":"null"}]}}}),
+                vec![json!({"count":7}), json!({"count":null})],
+            ),
+        ] {
+            let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"schemas":{"Count":{"anyOf":[{"type":"number"},{"type":"null"}]}}},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","required":["value"],"properties":{"value":schema}}}}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let plugin = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut index = ReadOnlyApiIndex::from_openapi_allowlist(&spec, &[]);
+            plugin.append_to(&mut index, PluginToolAccess::Write);
+            for value in values {
+                let command = format!("plugin.reports.create --value '{value}'");
+                let (op, params) = match resolve(&index, &command, &|_| true, CliMode::Write) {
+                    CliAction::Execute(op, params) => (op, params),
+                    CliAction::Terminal(error) => panic!("{error}"),
+                };
+                let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
+                assert_eq!(request.body, Some(json!({"value": value})), "{command}");
+            }
+            assert!(matches!(
+                resolve(
+                    &index,
+                    "plugin.reports.create --value invalid-json",
+                    &|_| true,
+                    CliMode::Write
+                ),
+                CliAction::Terminal(_)
+            ));
+            let op = plugin
+                .callable("plugin.reports.create", PluginToolAccess::Write)
+                .unwrap();
+            assert!(matches!(
+                crate::build_request_parts(op, &json!({}), &[], 20, 100),
+                Err(crate::ApiToolError::MissingParam { .. })
+            ));
         }
     }
 }

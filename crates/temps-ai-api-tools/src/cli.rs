@@ -750,6 +750,11 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
     // turned `--version 18` into JSON number 18 and made a human-approved
     // create-service proposal fail only after confirmation.
     match expected_type {
+        Some("json") => {
+            return serde_json::from_str(s.trim()).map_err(|error| {
+                format!("Invalid JSON value for `--{flag}`: {error}. Use a JSON number, boolean, null, object, array or double-quoted string.")
+            });
+        }
         Some("string") => {
             let trimmed = s.trim();
             if trimmed.starts_with('"') && trimmed.ends_with('"') {
