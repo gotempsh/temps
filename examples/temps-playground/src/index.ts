@@ -13,15 +13,15 @@ const messageSchema = { type: 'string', minLength: 1, maxLength: 200 };
 const responses = { '200': { description: 'Echoed message' }, '400': { description: 'Invalid input' }, '401': { description: 'Authentication required' } };
 
 export const plugin: TempsPlugin = {
-  manifest: () => createManifest('temps-playground', '0.1.0')
+  manifest: () => createManifest('temps-playground', '0.1.1')
     .displayName('Temps Playground')
     .description('Explore plugin AI tools and project chat in Temps')
     .addNav('Temps Playground', 'flask-conical', '/ui/', { section: 'platform', order: 50 })
     .ui({ entry_js: '/ui/app.js', css: [], routes: [{ path: '/ui/', title: 'Temps Playground' }] })
     .build(),
   embeddedUiAssets: () => assets,
-  openapi: () => ({
-    openapi: '3.1.0', info: { title: 'Temps Playground', version: '0.1.0' },
+  openapiSchema: () => ({
+    openapi: '3.1.0', info: { title: 'Temps Playground', version: '0.1.1' },
     paths: {
       '/tools/echo': { get: { operationId: 'echo', summary: 'Echo a short message to verify plugin reads', 'x-temps-ai-tool': {}, parameters: [{ name: 'message', in: 'query', required: true, schema: messageSchema }], responses } },
       '/tools/acknowledge': { post: { operationId: 'acknowledge', summary: 'Acknowledge a short message to test write approval; no data is stored', 'x-temps-ai-tool': { access: 'write' }, requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['message'], properties: { message: messageSchema }, additionalProperties: false } } } }, responses } },
@@ -43,14 +43,18 @@ export const plugin: TempsPlugin = {
       let message: unknown;
       if (read) message = url.searchParams.get('message');
       else {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        for await (const chunk of req) {
-          size += chunk.length;
-          if (size > 2048) return send(413, { error: 'Request exceeds 2048 bytes' });
-          chunks.push(Buffer.from(chunk));
-        }
-        try { message = JSON.parse(Buffer.concat(chunks).toString()).message; }
+        const body = await new Promise<{ text: string; oversized: boolean }>((resolve, reject) => {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          req.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            if (size <= 2048) chunks.push(Buffer.from(chunk));
+          });
+          req.on('end', () => resolve({ text: Buffer.concat(chunks).toString(), oversized: size > 2048 }));
+          req.on('error', reject);
+        });
+        if (body.oversized) return send(413, { error: 'Request exceeds 2048 bytes' });
+        try { message = JSON.parse(body.text).message; }
         catch { return send(400, { error: 'Expected a JSON object with message' }); }
       }
       if (typeof message !== 'string' || message.length < 1 || message.length > 200)
