@@ -703,15 +703,8 @@ pub struct NodeDnsStatusEntry {
 fn internal_proxy_from_capacity(
     capacity: &serde_json::Value,
 ) -> (Option<bool>, Option<String>, Option<String>) {
-    let proxy = &capacity["internal_proxy"];
-    let text = |key: &str| {
-        proxy[key]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    (proxy["listening"].as_bool(), text("address"), text("error"))
+    let proxy = crate::services::cluster_dns::internal_proxy_state(capacity);
+    (proxy.listening, proxy.address, proxy.error)
 }
 
 /// An internal DNS name two owners publish (ADR-055 §10). The holder's
@@ -984,6 +977,27 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
         .route("/cluster/dns/status", get(cluster_dns_status))
+        // ADR-095: the Settings → DNS page.
+        .route(
+            "/cluster/dns/resolvers",
+            get(crate::handlers::cluster_dns::list_dns_resolvers),
+        )
+        .route(
+            "/cluster/dns/records",
+            get(crate::handlers::cluster_dns::list_dns_records),
+        )
+        .route(
+            "/cluster/dns/queries",
+            get(crate::handlers::cluster_dns::list_dns_queries),
+        )
+        .route(
+            "/cluster/dns/traffic",
+            get(crate::handlers::cluster_dns::dns_traffic),
+        )
+        .route(
+            "/cluster/dns/resolve",
+            post(crate::handlers::cluster_dns::resolve_dns_name),
+        )
         // Literal segment, so it can never be shadowed by the `{node_id}`
         // routes below it.
         .route("/nodes/capability", get(node_capability))

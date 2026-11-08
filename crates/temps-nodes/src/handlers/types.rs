@@ -29,4 +29,7 @@ pub struct NodeAdminState {
     pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
     /// Step-up check for sensitive node operations.
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// Internal DNS observability: resolver health, records, queries,
+    /// traffic, test resolution (ADR-095).
+    pub cluster_dns: Arc<crate::services::cluster_dns::ClusterDnsService>,
 }

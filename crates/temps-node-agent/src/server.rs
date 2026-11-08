@@ -1274,13 +1274,23 @@ pub async fn start_agent_server_with(
         platform.clone(),
         options.engines.clone(),
     );
+    // ADR-095: the resolver's report and test resolution. The same slot
+    // goes to the network-sync loop, which starts the resolver.
+    let agent_dns: crate::dns_report::SharedAgentDns = Arc::default();
+    let router = router.merge(crate::dns_report::router(
+        agent_dns.clone(),
+        Arc::new(AgentAuth::new(&config.token)),
+    ));
 
     // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
     // slots. Written by the network-sync loop below on every tick, read by
     // the heartbeat loop so the control plane learns resolver and overlay
     // health without an operator SSHing in to read logs. Live for the
     // agent's process lifetime, same as `platform`.
-    let health = crate::network_sync::HealthSlots::default();
+    let health = crate::network_sync::HealthSlots {
+        dns_report: agent_dns,
+        ..Default::default()
+    };
 
     // This node's mesh address (published by the network-sync loop) and the
     // address the agent API is served on over the mesh (reported by the

@@ -19,6 +19,7 @@ mod build_admission;
 pub mod build_handler;
 pub mod compose_handlers;
 pub mod connectors;
+pub mod dns_report;
 mod exec_timeout;
 pub mod gate;
 pub mod handlers;

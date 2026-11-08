@@ -37,6 +37,7 @@ use tracing::{debug, trace, warn};
 use arc_swap::ArcSwap;
 use temps_workload_netpol::dns::{DnsDecision, DnsPolicy};
 
+use crate::observe::{DnsObserver, QueryObservation, QueryOutcome, ZoneClass};
 use crate::record::ZoneRecord;
 use crate::upstream::UpstreamResolver;
 use crate::zone_store::ZoneStore;
@@ -54,6 +55,22 @@ pub struct ZoneAuthority {
     /// Per-source answers for restricted workloads (ADR-055 §9). `None`
     /// (and an open snapshot) is today's resolver.
     policy: Option<Arc<ArcSwap<DnsPolicy>>>,
+    /// Counts every answered query and logs the internal ones (ADR-095).
+    observer: Option<Arc<DnsObserver>>,
+}
+
+/// What one answered query was, for the observer.
+pub(crate) enum Observed {
+    /// Malformed or non-query messages, and the resolver's own readiness
+    /// probe: not traffic anyone asked about.
+    Unobserved,
+    Query {
+        name: String,
+        qtype: RecordType,
+        zone: ZoneClass,
+        /// Answered NXDOMAIN because the network policy refuses the name.
+        refused: bool,
+    },
 }
 
 impl ZoneAuthority {
@@ -62,7 +79,14 @@ impl ZoneAuthority {
             zone,
             upstream: None,
             policy: None,
+            observer: None,
         }
+    }
+
+    /// Record every answered query into `observer` (ADR-095 §1).
+    pub fn with_observer(mut self, observer: Arc<DnsObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Answers restricted sources from the policy snapshot: the names
@@ -92,11 +116,49 @@ impl RequestHandler for ZoneAuthority {
         request: &Request,
         mut response_handle: R,
     ) -> ResponseInfo {
+        let started = std::time::Instant::now();
+        let (info, observed) = self.answer(request, &mut response_handle).await;
+        if let (
+            Some(observer),
+            Observed::Query {
+                name,
+                qtype,
+                zone,
+                refused,
+            },
+        ) = (&self.observer, observed)
+        {
+            let answers = info.counts().answers;
+            observer.record(QueryObservation {
+                name: &name,
+                qtype,
+                zone,
+                outcome: QueryOutcome::classify(info.response_code, answers, refused),
+                latency: started.elapsed(),
+                answers,
+                source: request.src().ip(),
+            });
+        }
+        info
+    }
+}
+
+impl ZoneAuthority {
+    /// Answer `request` and say what it was. Not observed: the caller
+    /// records it, or (a test resolution from the console) does not.
+    pub(crate) async fn answer<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response_handle: &mut R,
+    ) -> (ResponseInfo, Observed) {
+        let unobserved = |info| (info, Observed::Unobserved);
         let info = match request.request_info() {
             Ok(i) => i,
             Err(e) => {
                 warn!(error = %e, "failed to parse DNS request");
-                return reply_error(request, &mut response_handle, ResponseCode::FormErr).await;
+                return unobserved(
+                    reply_error(request, response_handle, ResponseCode::FormErr).await,
+                );
             }
         };
 
@@ -109,7 +171,7 @@ impl RequestHandler for ZoneAuthority {
                 ty = ?info.metadata.message_type,
                 "rejecting non-Query DNS message"
             );
-            return reply_error(request, &mut response_handle, ResponseCode::NotImp).await;
+            return unobserved(reply_error(request, response_handle, ResponseCode::NotImp).await);
         }
 
         let qname: Name = info.query.name().into();
@@ -137,14 +199,27 @@ impl RequestHandler for ZoneAuthority {
                 std::iter::empty::<&Record>(),
                 std::iter::empty::<&Record>(),
             );
-            return response_handle
-                .send_response(response)
-                .await
-                .unwrap_or_else(|_| error_info(request, ResponseCode::ServFail));
+            return unobserved(
+                response_handle
+                    .send_response(response)
+                    .await
+                    .unwrap_or_else(|_| error_info(request, ResponseCode::ServFail)),
+            );
         }
         if is_marker {
-            return reply_nodata(request, &mut response_handle, info.metadata).await;
+            return unobserved(reply_nodata(request, response_handle, info.metadata).await);
         }
+        let asked_zone = if in_zone {
+            ZoneClass::Internal
+        } else {
+            ZoneClass::External
+        };
+        let observed = |name: String, zone: ZoneClass, refused: bool| Observed::Query {
+            name,
+            qtype,
+            zone,
+            refused,
+        };
 
         // Policy: who is asking decides what they may learn. A refused
         // name is NXDOMAIN, not REFUSED, so a stub resolver does not move
@@ -164,7 +239,8 @@ impl RequestHandler for ZoneAuthority {
                     source = %request.src().ip(),
                     "DNS query refused by network policy"
                 );
-                return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+                let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+                return (info, observed(qname_str, asked_zone, true));
             }
         };
         let in_zone = in_zone || is_internal_zone(&lookup_name);
@@ -175,19 +251,22 @@ impl RequestHandler for ZoneAuthority {
         // outbound API calls, …
         if !in_zone {
             if restricted {
-                return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+                let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+                return (info, observed(qname_str, ZoneClass::External, true));
             }
             if let Some(upstream) = &self.upstream {
                 trace!(qname = %qname_str, qtype = ?qtype, "forwarding to upstream");
-                return upstream
-                    .forward(request, &mut response_handle)
+                let info = upstream
+                    .forward(request, response_handle)
                     .await
                     .unwrap_or_else(|info| info);
+                return (info, observed(qname_str, ZoneClass::External, false));
             }
             // No upstream configured — degrade to NXDOMAIN as the old
             // behaviour did, which keeps strict authoritative-only
             // deployments compatible.
-            return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+            let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+            return (info, observed(qname_str, ZoneClass::External, false));
         }
 
         let snapshot = self.zone.snapshot();
@@ -225,17 +304,20 @@ impl RequestHandler for ZoneAuthority {
             if any_match {
                 // NODATA: name exists, just not for this qtype. Reply
                 // NoError with no answer rrs and the AA bit set.
-                return reply_nodata(request, &mut response_handle, info.metadata).await;
+                let info = reply_nodata(request, response_handle, info.metadata).await;
+                return (info, observed(qname_str, ZoneClass::Internal, false));
             }
             // Genuine NXDOMAIN.
-            return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+            let info = reply_error(request, response_handle, ResponseCode::NXDomain).await;
+            return (info, observed(qname_str, ZoneClass::Internal, false));
         }
 
         if answers.is_empty() {
             // We had matching FQDN+type rows but none were valid (e.g. all
             // had garbage IPs). Treat as SERVFAIL — the data is broken
             // upstream and the resolver shouldn't lie to the client.
-            return reply_error(request, &mut response_handle, ResponseCode::ServFail).await;
+            let info = reply_error(request, response_handle, ResponseCode::ServFail).await;
+            return (info, observed(qname_str, ZoneClass::Internal, false));
         }
 
         let mut metadata = Metadata::response_from_request(info.metadata);
@@ -251,13 +333,14 @@ impl RequestHandler for ZoneAuthority {
             std::iter::empty::<&Record>(),
         );
 
-        match response_handle.send_response(resp).await {
+        let info = match response_handle.send_response(resp).await {
             Ok(info) => info,
             Err(e) => {
                 warn!(error = %e, "failed to send DNS response");
                 error_info(request, ResponseCode::ServFail)
             }
-        }
+        };
+        (info, observed(qname_str, ZoneClass::Internal, false))
     }
 }
 
