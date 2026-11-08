@@ -35,6 +35,12 @@ pub struct PluginToolsIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginToolsError {
+    #[error("Cannot index path parameter '{parameter}' in operation '{operation_id}' for plugin '{plugin}': only simple path serialization is supported")]
+    PathSerialization {
+        plugin: String,
+        operation_id: String,
+        parameter: String,
+    },
     #[error("Cannot index operation '{operation_id}' for plugin '{plugin}': required {location} parameter '{parameter}' is unsupported")]
     UnsupportedParameter {
         plugin: String,
@@ -412,6 +418,17 @@ fn validate_required_parameters(
         ) else {
             continue;
         };
+        if parameter.parameter_in == ParameterIn::Path
+            && parameter.style.as_ref().is_some_and(|style| {
+                !matches!(style, utoipa::openapi::path::ParameterStyle::Simple)
+            })
+        {
+            return Err(PluginToolsError::PathSerialization {
+                plugin: plugin.into(),
+                operation_id: operation_id.into(),
+                parameter: parameter.name.clone(),
+            });
+        }
         if matches!(parameter.required, utoipa::openapi::Required::True)
             && !matches!(
                 parameter.parameter_in,
@@ -628,6 +645,34 @@ mod tests {
             }}}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn path_serialization_rejects_matrix_and_label_including_inherited_references() {
+        for style in ["matrix", "label", "simple"] {
+            for inherited in [false, true] {
+                let parameter = json!({"name":"id","in":"path","required":true,"style":style,"schema":{"type":"string"}});
+                let mut spec = json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"components":{"parameters":{"Id":parameter.clone()}},"paths":{"/reports/{id}":{"get":{"operationId":"get","x-temps-ai-tool":{},"parameters":[parameter],"responses":{"200":{"description":"ok"}}}}}});
+                if inherited {
+                    spec["paths"]["/reports/{id}"]["parameters"] =
+                        json!([{"$ref":"#/components/parameters/Id"}]);
+                    spec["paths"]["/reports/{id}"]["get"]["parameters"] = json!([]);
+                }
+                let result = PluginToolsIndex::from_openapi(
+                    "reports",
+                    &serde_json::from_value(spec).unwrap(),
+                    true,
+                );
+                if style == "simple" {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(PluginToolsError::PathSerialization { .. })
+                    ));
+                }
+            }
+        }
     }
 
     #[test]
