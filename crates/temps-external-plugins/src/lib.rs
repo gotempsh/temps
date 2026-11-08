@@ -21,6 +21,7 @@ pub mod handler;
 pub mod host_api;
 pub mod install;
 pub mod install_progress;
+pub mod launcher;
 pub mod manager;
 pub mod plugin;
 pub mod proxy;
