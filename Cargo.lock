@@ -265,6 +265,18 @@ dependencies = [
 
 [[package]]
 name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2 0.10.6",
+ "cpufeatures 0.2.17",
+ "password-hash 0.5.0",
+]
+
+[[package]]
+name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
@@ -272,7 +284,7 @@ dependencies = [
  "base64ct",
  "blake2 0.11.0",
  "cpufeatures 0.3.0",
- "password-hash",
+ "password-hash 0.6.1",
 ]
 
 [[package]]
@@ -2468,6 +2480,12 @@ dependencies = [
  "quote",
  "unicode-xid",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "constant_time_eq"
@@ -7444,7 +7462,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.5.0",
@@ -8073,6 +8091,17 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
+name = "password-hash"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
@@ -8634,7 +8663,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.17.1",
+ "hashbrown 0.12.3",
  "log",
  "parking_lot 0.13.0",
  "rand 0.8.7",
@@ -9147,7 +9176,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -11478,7 +11507,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -12000,7 +12029,7 @@ version = "0.7.0-rc.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3"
 dependencies = [
- "argon2",
+ "argon2 0.6.0",
  "bcrypt-pbkdf",
  "ctutils",
  "ed25519-dalek 3.0.0",
@@ -12808,7 +12837,7 @@ dependencies = [
 name = "temps-auth"
 version = "0.1.0-beta.61"
 dependencies = [
- "argon2",
+ "argon2 0.6.0",
  "async-trait",
  "axum",
  "axum-macros",
@@ -12834,7 +12863,7 @@ dependencies = [
  "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
- "totp-rs",
+ "totp-rs 6.0.0",
  "tower",
  "tracing",
  "urlencoding",
@@ -12999,7 +13028,7 @@ name = "temps-cli"
 version = "0.1.0-beta.61"
 dependencies = [
  "anyhow",
- "argon2",
+ "argon2 0.6.0",
  "async-trait",
  "aws-sdk-s3",
  "axum",
@@ -13291,7 +13320,7 @@ dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
  "arc-swap",
- "argon2",
+ "argon2 0.6.0",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -13821,7 +13850,7 @@ dependencies = [
 name = "temps-environments"
 version = "0.1.0-beta.61"
 dependencies = [
- "argon2",
+ "argon2 0.6.0",
  "axum",
  "chrono",
  "http 1.5.0",
@@ -15384,7 +15413,7 @@ version = "0.1.0-beta.61"
 dependencies = [
  "anyhow",
  "arc-swap",
- "argon2",
+ "argon2 0.6.0",
  "async-trait",
  "axum",
  "bytes",
@@ -15567,7 +15596,7 @@ dependencies = [
 name = "temps-sandbox"
 version = "0.1.0-beta.61"
 dependencies = [
- "argon2",
+ "argon2 0.6.0",
  "async-stream",
  "async-trait",
  "axum",
@@ -15718,6 +15747,23 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "temps-service-access-runtime"
+version = "0.1.0-beta.61"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ed25519-dalek 2.2.0",
+ "rand 0.8.7",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokenless-control",
+ "tokenless-core",
+ "tokenless-dataplane",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -16308,9 +16354,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenless-auth"
+version = "0.1.0"
+source = "git+https://github.com/gotempsh/tokenless?rev=88b66cb0dc00c5262525f9ba7d8b881066e60718#88b66cb0dc00c5262525f9ba7d8b881066e60718"
+dependencies = [
+ "argon2 0.5.3",
+ "base64 0.22.1",
+ "hex",
+ "hmac 0.12.1",
+ "rand 0.8.7",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.21",
+ "totp-rs 5.7.2",
+ "zeroize",
+]
+
+[[package]]
+name = "tokenless-control"
+version = "0.1.0"
+source = "git+https://github.com/gotempsh/tokenless?rev=88b66cb0dc00c5262525f9ba7d8b881066e60718#88b66cb0dc00c5262525f9ba7d8b881066e60718"
+dependencies = [
+ "aes-gcm 0.10.3",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand 0.8.7",
+ "rcgen",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "time",
+ "tokenless-auth",
+ "tokenless-core",
+ "tokio",
+ "tracing",
+ "uuid",
+ "x25519-dalek 2.0.1",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "tokenless-core"
 version = "0.1.0"
-source = "git+https://github.com/gotempsh/tokenless?rev=bd4ca27af474592b60354fc7343b3a9b1153f3c1#bd4ca27af474592b60354fc7343b3a9b1153f3c1"
+source = "git+https://github.com/gotempsh/tokenless?rev=88b66cb0dc00c5262525f9ba7d8b881066e60718#88b66cb0dc00c5262525f9ba7d8b881066e60718"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",
@@ -16324,6 +16416,40 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "uuid",
+ "x25519-dalek 2.0.1",
+ "zeroize",
+]
+
+[[package]]
+name = "tokenless-dataplane"
+version = "0.1.0"
+source = "git+https://github.com/gotempsh/tokenless?rev=88b66cb0dc00c5262525f9ba7d8b881066e60718#88b66cb0dc00c5262525f9ba7d8b881066e60718"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand 0.8.7",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "time",
+ "tokenless-core",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 1.0.11",
  "x25519-dalek 2.0.1",
  "zeroize",
 ]
@@ -16612,6 +16738,22 @@ dependencies = [
 
 [[package]]
 name = "totp-rs"
+version = "5.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50e69a15e21b2ff22c415446983978bded3244195f17d59cb113551c1e806f91"
+dependencies = [
+ "base32",
+ "constant_time_eq 0.3.1",
+ "hmac 0.12.1",
+ "rand 0.9.4",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "url",
+ "urlencoding",
+]
+
+[[package]]
+name = "totp-rs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49d0f9b7aa5def86d3a8d8ba926fe8c1990924dd715d2b5fc54a4aa3788c11c1"
@@ -16837,7 +16979,7 @@ version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 dependencies = [
- "rand 0.10.3",
+ "rand 0.9.4",
 ]
 
 [[package]]

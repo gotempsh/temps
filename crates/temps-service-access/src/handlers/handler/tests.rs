@@ -230,6 +230,8 @@ async fn capability_explains_missing_integration_without_claiming_connection() {
         serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
     assert!(!cap.configured);
     assert!(cap.can_save_requests);
+    assert!(cap.can_manage_services);
+    assert!(cap.can_manage_requests);
     assert_eq!(cap.state, AccessCapabilityState::IntegrationUnavailable);
 }
 #[tokio::test]
@@ -561,4 +563,65 @@ async fn single_service_read_is_masked_and_missing_is_a_problem() {
             assert!(body.contains("detail"));
         }
     }
+}
+
+#[tokio::test]
+async fn capability_reports_effective_write_permissions() {
+    for (role, manage_services, manage_requests) in [
+        (Role::Reader, false, false),
+        (Role::User, true, true),
+        (Role::PlatformAdmin, false, false),
+        (Role::Admin, true, true),
+    ] {
+        let response = send(
+            "GET",
+            "/projects/7/service-access/capability",
+            "",
+            Some(AuthContext::new_session(test_user(), role.clone())),
+            state(
+                MockDatabase::new(DatabaseBackend::Postgres),
+                Arc::new(Audit::default()),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cap: AccessCapability =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(cap.can_manage_services, manage_services, "{role:?}");
+        assert_eq!(cap.can_manage_requests, manage_requests, "{role:?}");
+    }
+    for (sandbox_access, fail) in [(false, false), (true, false), (true, true)] {
+        let mut state = state(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            Arc::new(Audit::default()),
+        );
+        Arc::get_mut(&mut state).unwrap().project_access_checker =
+            Some(Arc::new(ProjectPermissions {
+                sandbox_access,
+                fail,
+            }));
+        let response = send(
+            "GET",
+            "/projects/7/service-access/capability",
+            "",
+            Some(AuthContext::new_session(test_user(), Role::User)),
+            state,
+        )
+        .await;
+        if fail {
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let cap: AccessCapability =
+                serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
+                    .unwrap();
+            assert!(cap.can_manage_services);
+            assert_eq!(cap.can_manage_requests, sandbox_access);
+        }
+    }
+    let problem = permission_available(Err(temps_core::problemdetails::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )))
+    .unwrap_err();
+    assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
 }

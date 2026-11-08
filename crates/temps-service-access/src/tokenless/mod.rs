@@ -4,6 +4,8 @@
 //! Pure SDK translation. This module cannot sign tokens, open listeners or
 //! activate saved intents. A future control-plane coordinator must reauthorize
 //! fresh consent and resolve the current node/incarnation before calling it.
+mod binding;
+pub use binding::PreparedBinding;
 mod policy;
 pub use policy::compile_policy;
 
@@ -22,7 +24,7 @@ use crate::{error::AccessError, types::SandboxAccessPolicy};
 
 /// The immutable SDK contract this adapter is compiled against. Upgrading the
 /// dependency does not by itself enable live access.
-pub const SDK_REVISION: &str = "bd4ca27af474592b60354fc7343b3a9b1153f3c1";
+pub const SDK_REVISION: &str = "88b66cb0dc00c5262525f9ba7d8b881066e60718";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationBlocker {
@@ -186,6 +188,7 @@ impl PreparedSession {
             86400,
         )
         .map_err(|source| sdk("claims compilation", source))?
+        .strict()
         .for_node(NodeId(request.target.node_id))
         // The incarnation is already part of the binding ID, so generation
         // is fixed within that incarnation; it is never reused on restart.

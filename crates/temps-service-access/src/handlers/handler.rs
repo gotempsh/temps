@@ -123,6 +123,16 @@ async fn audit(
     }
 }
 
+// A denied write is a read-only capability, not a failed capability read.
+// Infrastructure failures must remain errors rather than claiming a restriction.
+fn permission_available(result: Result<(), Problem>) -> Result<bool, Problem> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(problem) if problem.status_code == StatusCode::FORBIDDEN => Ok(false),
+        Err(problem) => Err(problem),
+    }
+}
+
 #[utoipa::path(get, path="/projects/{project_id}/service-access/capability", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID")),
 responses((status=200, description="Success", body=AccessCapability), (status=400, description="Invalid request"), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=409, description="Version conflict"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
 pub async fn access_capability(
@@ -138,7 +148,33 @@ pub async fn access_capability(
         project_id,
         &state.project_access_checker
     );
-    Ok(Json(state.service.capability()))
+    let mut capability = state.service.capability();
+    capability.can_manage_services = permission_available(
+        async {
+            project_permission_guard!(
+                auth,
+                ProjectsWrite,
+                project_id,
+                &state.project_access_checker
+            );
+            Ok(())
+        }
+        .await,
+    )?;
+    capability.can_manage_requests = capability.can_manage_services
+        && permission_available(
+            async {
+                project_permission_guard!(
+                    auth,
+                    SandboxesWrite,
+                    project_id,
+                    &state.project_access_checker
+                );
+                Ok(())
+            }
+            .await,
+        )?;
+    Ok(Json(capability))
 }
 
 #[utoipa::path(get, path="/projects/{project_id}/access-services", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), AccessPageQuery),

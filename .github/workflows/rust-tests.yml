@@ -1137,7 +1137,7 @@ jobs:
               package(temps-cloud-client) or package(temps-config-handlers) or
               package(temps-credential-checks) or package(temps-edge) or
               package(temps-edge-rules) or package(temps-email-tracking) or
-              package(temps-file-store) or package(temps-flags) or package(temps-service-access) or
+              package(temps-file-store) or package(temps-flags) or package(temps-service-access) or package(temps-service-access-runtime) or
               package(temps-log-aggregator) or package(temps-mcp-server) or
               package(temps-memory) or package(temps-observability) or
               package(temps-product-telemetry) or package(temps-project-groups) or

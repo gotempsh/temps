@@ -65,6 +65,7 @@ pub fn compile_policy(
         paths,
         methods,
         mcp_tools: Some(Vec::new()),
+        git: None,
     };
     scope.validate("sandbox service access").map_err(|_| {
         invalid(

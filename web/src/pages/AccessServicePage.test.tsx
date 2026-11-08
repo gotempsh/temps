@@ -13,6 +13,7 @@ import {
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { AccessServiceResponse } from '@/api/client'
+import { accessCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import AccessServicePage from './AccessServicePage'
@@ -37,10 +38,26 @@ const service: AccessServiceResponse = {
   updated_at: '2026-01-01T00:00:00Z',
 }
 
-function mount(entry: string) {
+function mount(entry: string, canManage = true) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
+  client.setQueryData(
+    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
+    {
+      configured: false,
+      can_save_requests: true,
+      can_manage_services: canManage,
+      can_manage_requests: canManage,
+      state: 'integration_unavailable',
+      reason: 'Integration unavailable.',
+      setup_path: null,
+    }
+  )
+  client.setQueryDefaults(
+    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
+    { staleTime: Infinity }
+  )
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[entry]}>
@@ -155,4 +172,75 @@ test('invalid project URL is explained before any editor is displayed', () => {
   )
   expect(within(document.body).queryByLabelText('Name')).toBeNull()
   client.clear()
+})
+
+test('a read-only caller cannot open the creation editor by URL', () => {
+  const client = mount('/projects/7/access-services/new', false)
+  expect(document.body.textContent).toContain('Service policies are read-only')
+  expect(within(document.body).queryByLabelText('Name')).toBeNull()
+  expect(
+    within(document.body).queryByRole('button', { name: 'Save service' })
+  ).toBeNull()
+  client.clear()
+})
+
+test('a failed capability refresh preserves edits through retry', async () => {
+  let unavailable = true
+  const api = mockApi({
+    'GET /projects/7/access-services/svc_test': () => jsonResponse(service),
+    'GET /projects/7/service-access/capability': () =>
+      unavailable
+        ? jsonResponse({ detail: 'Permissions temporarily unavailable' }, 503)
+        : jsonResponse({
+            configured: false,
+            can_save_requests: true,
+            can_manage_services: true,
+            can_manage_requests: true,
+            state: 'integration_unavailable',
+            reason: 'Integration unavailable.',
+            setup_path: null,
+          }),
+  })
+  try {
+    const client = mount('/projects/7/access-services/svc_test/edit')
+    await waitFor(() =>
+      expect(within(document.body).getByLabelText('Name')).toBeTruthy()
+    )
+    const field = within(document.body).getByLabelText(
+      'Name'
+    ) as HTMLInputElement
+    await act(async () =>
+      fireEvent.change(field, { target: { value: 'Unsaved edit' } })
+    )
+    await act(async () => {
+      await client.invalidateQueries({
+        queryKey: [{ _id: 'accessCapability' }],
+      })
+    })
+    await waitFor(() =>
+      expect(document.body.textContent).toContain('Your edits are preserved')
+    )
+    expect(within(document.body).getByLabelText('Name')).toBe(field)
+    expect(field.value).toBe('Unsaved edit')
+    expect(field.closest('fieldset[disabled]')).not.toBeNull()
+    unavailable = false
+    await act(async () =>
+      fireEvent.click(
+        within(document.body).getByRole('button', { name: 'Retry permissions' })
+      )
+    )
+    await waitFor(() =>
+      expect(
+        within(document.body).queryByRole('button', {
+          name: 'Retry permissions',
+        })
+      ).toBeNull()
+    )
+    expect(within(document.body).getByLabelText('Name')).toBe(field)
+    expect(field.value).toBe('Unsaved edit')
+    expect(field.closest('fieldset[disabled]')).toBeNull()
+    client.clear()
+  } finally {
+    api.restore()
+  }
 })

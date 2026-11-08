@@ -1,9 +1,20 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { expect, test } from 'bun:test'
+import { afterEach, expect, test } from 'bun:test'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as mount,
+  within,
+} from '@testing-library/react'
+import { installBrowserWindow } from '@/test/dom'
+
+installBrowserWindow()
+afterEach(cleanup)
 import { renderToStaticMarkup } from 'react-dom/server'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
   accessCapabilityOptions,
@@ -11,6 +22,7 @@ import {
   listServiceGrantsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { SandboxServiceAccess } from './SandboxServiceAccess'
+import type { AccessServiceResponse } from '@/api/client'
 
 function client() {
   return new QueryClient({
@@ -53,6 +65,8 @@ test('unavailable integration remains discoverable and allows saving intents', (
   c.setQueryData(capabilityKey, {
     configured: false,
     can_save_requests: true,
+    can_manage_services: true,
+    can_manage_requests: true,
     state: 'integration_unavailable',
     reason: 'The Tokenless integration is not installed.',
     setup_path: null,
@@ -89,6 +103,8 @@ test('a stale-policy request displays its reason and absolute expiry', () => {
   c.setQueryData(capabilityKey, {
     configured: false,
     can_save_requests: true,
+    can_manage_services: true,
+    can_manage_requests: true,
     state: 'integration_unavailable',
     reason: 'Integration unavailable.',
     setup_path: null,
@@ -155,3 +171,170 @@ test.each([0, 1])(
     c.clear()
   }
 )
+
+const testService: AccessServiceResponse = {
+  id: 'svc_test',
+  project_id: 7,
+  name: 'Example API',
+  version: 1,
+  enabled: true,
+  has_credential: true,
+  max_ttl_seconds: 1800,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+  policy: {
+    origin: 'https://api.example.com',
+    path_prefixes: ['/v1'],
+    methods: ['GET'],
+  },
+}
+function seed(
+  c: QueryClient,
+  manageServices: boolean,
+  manageRequests: boolean
+) {
+  c.setQueryData(capabilityKey, {
+    configured: false,
+    can_save_requests: true,
+    can_manage_services: manageServices,
+    can_manage_requests: manageRequests,
+    state: 'integration_unavailable',
+    reason: 'Integration unavailable.',
+    setup_path: null,
+  })
+  c.setQueryData(serviceKey, {
+    items: [testService],
+    total: 1,
+    page: 1,
+    page_size: 20,
+  })
+  c.setQueryData(grantKey, { items: [], total: 0, page: 1, page_size: 20 })
+}
+
+test.each([
+  [false, false],
+  [true, false],
+  [true, true],
+])(
+  'write actions follow effective permissions (%s, %s)',
+  async (services, requests) => {
+    const c = client()
+    seed(c, services, requests)
+    mount(
+      <QueryClientProvider client={c}>
+        <MemoryRouter>
+          <SandboxServiceAccess projectId={7} sandboxId="sbx_test" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(
+      (
+        within(document.body).getByRole('button', {
+          name: 'Add service',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(!services)
+    expect(
+      (
+        within(document.body).getByRole('button', {
+          name: 'Request access',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(!requests)
+    if (!requests)
+      expect(document.body.textContent).toContain(
+        'Access requests are read-only'
+      )
+    expect(
+      within(document.body).queryByRole('button', { name: 'Edit' })
+    ).toBeNull()
+    await act(async () => {
+      fireEvent.pointerDown(
+        within(document.body).getByRole('button', {
+          name: 'Actions for Example API',
+        }),
+        { button: 0, ctrlKey: false }
+      )
+    })
+    expect(
+      within(document.body)
+        .getByRole('menuitem', { name: 'Edit service' })
+        .getAttribute('aria-disabled') === 'true'
+    ).toBe(!services)
+    c.clear()
+  }
+)
+
+test('the secondary service action opens the routed editor from its menu', async () => {
+  const c = client()
+  seed(c, true, true)
+  function Location() {
+    const location = useLocation()
+    return (
+      <output aria-label="Location">
+        {location.pathname}
+        {location.search}
+      </output>
+    )
+  }
+  mount(
+    <QueryClientProvider client={c}>
+      <MemoryRouter>
+        <SandboxServiceAccess projectId={7} sandboxId="sbx_test" />
+        <Location />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  expect(
+    within(document.body).queryByRole('menuitem', { name: 'Edit service' })
+  ).toBeNull()
+  await act(async () => {
+    fireEvent.pointerDown(
+      within(document.body).getByRole('button', {
+        name: 'Actions for Example API',
+      }),
+      { button: 0, ctrlKey: false }
+    )
+  })
+  await act(async () => {
+    fireEvent.click(
+      within(document.body).getByRole('menuitem', { name: 'Edit service' })
+    )
+  })
+  expect(within(document.body).getByLabelText('Location').textContent).toBe(
+    '/projects/7/access-services/svc_test/edit?sandbox=sbx_test'
+  )
+  c.clear()
+})
+
+test('changing to a cached sandbox closes the old request dialog', async () => {
+  const c = client()
+  seed(c, true, true)
+  c.setQueryData(
+    listServiceGrantsOptions({
+      path: { project_id: 7, sandbox_id: 'sbx_other' },
+      query: { page: 1, page_size: 20 },
+    }).queryKey,
+    { items: [], total: 0, page: 1, page_size: 20 }
+  )
+  const view = (sandboxId: string) => (
+    <QueryClientProvider client={c}>
+      <MemoryRouter>
+        <SandboxServiceAccess projectId={7} sandboxId={sandboxId} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const rendered = mount(view('sbx_test'))
+  await act(async () =>
+    fireEvent.click(
+      within(document.body).getByRole('button', { name: 'Request access' })
+    )
+  )
+  expect(within(document.body).getByRole('dialog')).toBeTruthy()
+  await act(async () => rendered.rerender(view('sbx_other')))
+  expect(within(document.body).queryByRole('dialog')).toBeNull()
+  expect(
+    within(document.body).queryByRole('button', { name: 'Save access request' })
+  ).toBeNull()
+  c.clear()
+})

@@ -24,6 +24,14 @@
       },
       "AccessCapability": {
         "properties": {
+          "can_manage_requests": {
+            "description": "Caller has project and sandbox write permissions. Ownership is still\nchecked on each sandbox mutation.",
+            "type": "boolean"
+          },
+          "can_manage_services": {
+            "description": "Caller may edit service policies in this project. Set by the handler.",
+            "type": "boolean"
+          },
           "can_save_requests": {
             "type": "boolean"
           },
@@ -47,6 +55,8 @@
           "state",
           "configured",
           "can_save_requests",
+          "can_manage_services",
+          "can_manage_requests",
           "reason"
         ],
         "type": "object"

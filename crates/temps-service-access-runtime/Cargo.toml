@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-service-access-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Worker-local credential proxy with strict sandbox bindings and signed policy delivery"
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+ed25519-dalek = "2"
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "88b66cb0dc00c5262525f9ba7d8b881066e60718" }
+tokenless-dataplane = { git = "https://github.com/gotempsh/tokenless", rev = "88b66cb0dc00c5262525f9ba7d8b881066e60718" }
+
+[dev-dependencies]
+async-trait.workspace = true
+tokenless-control = { git = "https://github.com/gotempsh/tokenless", rev = "88b66cb0dc00c5262525f9ba7d8b881066e60718" }
+rand08 = { package = "rand", version = "0.8" }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

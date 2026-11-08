@@ -25,6 +25,11 @@ pub struct AccessCapability {
     pub state: AccessCapabilityState,
     pub configured: bool,
     pub can_save_requests: bool,
+    /// Caller may edit service policies in this project. Set by the handler.
+    pub can_manage_services: bool,
+    /// Caller has project and sandbox write permissions. Ownership is still
+    /// checked on each sandbox mutation.
+    pub can_manage_requests: bool,
     pub reason: String,
     pub setup_path: Option<String>,
 }
@@ -47,6 +52,8 @@ impl ServiceAccessBroker for UnavailableTokenlessBroker {
             state: AccessCapabilityState::IntegrationUnavailable,
             configured: false,
             can_save_requests: true,
+            can_manage_services: false,
+            can_manage_requests: false,
             reason: UNAVAILABLE_REASON.into(),
             setup_path: None,
         }

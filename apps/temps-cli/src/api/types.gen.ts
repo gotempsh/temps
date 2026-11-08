@@ -18,6 +18,15 @@ export type AccessBinding = {
 };
 
 export type AccessCapability = {
+    /**
+     * Caller has project and sandbox write permissions. Ownership is still
+     * checked on each sandbox mutation.
+     */
+    can_manage_requests: boolean;
+    /**
+     * Caller may edit service policies in this project. Set by the handler.
+     */
+    can_manage_services: boolean;
     can_save_requests: boolean;
     configured: boolean;
     reason: string;

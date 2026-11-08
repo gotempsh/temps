@@ -4,11 +4,14 @@
 import { useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { PageContainer, PageState } from '@temps-sdk/ds'
+import { Callout, PageContainer, PageState } from '@temps-sdk/ds'
 import { Button, Skeleton } from '@temps-sdk/ui'
 import { PlugZap } from 'lucide-react'
 import type { AccessServiceResponse } from '@/api/client'
-import { getAccessServiceOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  accessCapabilityOptions,
+  getAccessServiceOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { AccessServiceEditor } from '@/components/service-access/AccessServiceEditor'
 import { problemDetail } from '@/lib/api-problem'
 
@@ -44,6 +47,11 @@ export default function AccessServicePage() {
   const projectId = Number(rawProjectId)
   const valid =
     Number.isInteger(projectId) && projectId > 0 && projectId <= 2147483647
+  const capability = useQuery({
+    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    enabled: valid,
+    retry: false,
+  })
   const service = useQuery({
     ...getAccessServiceOptions({
       path: { project_id: projectId, service_id: serviceId ?? '' },
@@ -88,20 +96,57 @@ export default function AccessServicePage() {
             </div>
           }
         />
-      ) : serviceId && !service.data ? (
+      ) : capability.isError && !capability.data ? (
+        <PageState
+          variant="failed"
+          icon={PlugZap}
+          title="Could not check service permissions"
+          description="Retry to verify project write permission before editing."
+          action={
+            <Button onClick={() => void capability.refetch()}>Retry</Button>
+          }
+        />
+      ) : capability.isPending || (serviceId && !service.data) ? (
         <Skeleton
           className="h-48 w-full"
           role="status"
           aria-label="Loading service"
         />
-      ) : (
-        <Editor
-          key={`${projectId}:${serviceId ?? 'new'}`}
-          projectId={projectId}
-          service={service.data}
-          onClose={back}
-          onSaved={saved}
+      ) : !capability.data?.can_manage_services ? (
+        <PageState
+          variant="failed"
+          icon={PlugZap}
+          title="Service policies are read-only"
+          description="Editing services requires project write permission. Ask a project administrator for access."
+          action={
+            <Button variant="outline" onClick={back}>
+              Back to sandboxes
+            </Button>
+          }
         />
+      ) : (
+        <>
+          {capability.isError && (
+            <Callout tone="error" title="Could not refresh service permissions">
+              Your edits are preserved. Retry before saving.
+              <Button
+                variant="outline"
+                onClick={() => void capability.refetch()}
+              >
+                Retry permissions
+              </Button>
+            </Callout>
+          )}
+          <fieldset disabled={capability.isError} className="min-w-0">
+            <Editor
+              key={`${projectId}:${serviceId ?? 'new'}`}
+              projectId={projectId}
+              service={service.data}
+              onClose={back}
+              onSaved={saved}
+            />
+          </fieldset>
+        </>
       )}
     </PageContainer>
   )

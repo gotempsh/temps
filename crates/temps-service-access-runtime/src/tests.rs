@@ -1,0 +1,418 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use super::*;
+use tokenless_control::service::{
+    policy::{CreateCredential, CreateRule},
+    sessions::{MintSession, SessionBinding},
+};
+use tokenless_control::{
+    cipher::AesGcmCipher, envelope::Envelope, memory::MemoryStore, model::Node,
+    probe::DisabledProber, store::RbacAuthorizer, Caller, ControlConfig, ControlServices,
+    ServiceStores,
+};
+use tokenless_core::{
+    audit::AuditEvent,
+    authz::{Principal, Role},
+    ids::{RuleId, VaultId},
+    seal::{encode_public_key, SealPublicKey, SealSecretKey},
+};
+
+struct Audit;
+#[async_trait::async_trait]
+impl AuditShipper for Audit {
+    async fn ship(&self, _: &[AuditEvent]) -> Result<(), DataPlaneError> {
+        Ok(())
+    }
+}
+struct Fixture {
+    control: ControlServices,
+    caller: Caller,
+    node: Node,
+    vault: VaultId,
+    rule: RuleId,
+    proxy: WorkerProxy,
+}
+impl Fixture {
+    async fn new() -> Self {
+        Self::with_lease(30).await
+    }
+    async fn with_lease(lease_secs: u32) -> Self {
+        let store = Arc::new(MemoryStore::new());
+        let cipher = Arc::new(
+            Envelope::open(&AesGcmCipher::generate_key(), store.clone())
+                .await
+                .unwrap(),
+        );
+        let control = ControlServices::new(
+            ServiceStores {
+                credentials: store.clone(),
+                policy: store.clone(),
+                audit: store.clone(),
+                nodes: store,
+            },
+            Arc::new(RbacAuthorizer),
+            cipher,
+            Arc::new(DisabledProber),
+            ControlConfig {
+                lease_secs,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let caller = Caller::service(Principal::service("test-host", Role::Admin, None));
+        let mut settings = control.policy.get_settings(&caller).await.unwrap();
+        settings.unmatched_host_policy = UnmatchedHostPolicy::Deny;
+        control
+            .policy
+            .put_settings(&caller, settings)
+            .await
+            .unwrap();
+        let vault = control
+            .policy
+            .create_vault(&caller, "test-project")
+            .await
+            .unwrap();
+        let credential = control
+            .policy
+            .create_credential(
+                &caller,
+                &vault.id,
+                CreateCredential {
+                    name: "test-service".into(),
+                    template_id: "generic-bearer".into(),
+                    template_version: None,
+                    host_override: vec!["api.example.com".into()],
+                    fields: [("token".into(), "test-credential".into())].into(),
+                    custom_headers: vec![],
+                    substitutions: vec![],
+                    not_after: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rule = control
+            .policy
+            .create_rule(
+                &caller,
+                &vault.id,
+                CreateRule {
+                    name: "test-rule".into(),
+                    credential_id: credential.id,
+                    hosts: None,
+                    paths: None,
+                    methods: None,
+                    mcp_tools: None,
+                    git: None,
+                },
+            )
+            .await
+            .unwrap();
+        let seal_secret = SealSecretKey::random_from_rng(rand08::rngs::OsRng);
+        let registration = control
+            .nodes
+            .register_embedded(
+                &caller,
+                "test-worker",
+                &encode_public_key(&SealPublicKey::from(&seal_secret)),
+            )
+            .await
+            .unwrap();
+        let proxy = WorkerProxy::start(
+            NodeKeys {
+                node_id: registration.node.id,
+                seal_secret,
+                snapshot_key: registration.snapshot_verify_key,
+            },
+            Arc::new(Audit),
+        )
+        .await
+        .unwrap();
+        Self {
+            control,
+            caller,
+            node: registration.node,
+            vault: vault.id,
+            rule: rule.id,
+            proxy,
+        }
+    }
+    async fn mint(&self, strict: bool) -> String {
+        self.control
+            .sessions
+            .mint(
+                &self.caller,
+                &self.vault,
+                MintSession {
+                    rule_ids: vec![self.rule],
+                    node_id: Some(self.node.id),
+                    binding: Some(SessionBinding {
+                        id: "sandbox:test-incarnation".into(),
+                        generation: 1,
+                    }),
+                    strict,
+                    ttl_secs: Some(60),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .token
+    }
+    fn spec(&self, token: String) -> BindingSpec {
+        BindingSpec {
+            binding_id: "sandbox:test-incarnation".into(),
+            generation: 1,
+            sessions: vec![token],
+            version: 1,
+            max_connections: 8,
+        }
+    }
+    async fn install(&self) -> u64 {
+        self.proxy
+            .install(&self.control.nodes.build_snapshot(&self.node).await.unwrap())
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn worker_binds_only_strict_sessions_and_acknowledges_revocation() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let receipt = binding
+        .revoke_and_wait(Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(receipt.snapshot_version, Some(version));
+    assert_eq!(receipt.connections_closed, 0);
+}
+
+#[tokio::test]
+async fn worker_refuses_grace_period_and_spoofed_incarnation() {
+    let f = Fixture::new().await;
+    let token = f.mint(false).await;
+    let version = f.install().await;
+    assert!(matches!(
+        f.proxy.bind(f.spec(token), version).await,
+        Err(RuntimeError::Invalid { .. })
+    ));
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let mut spec = f.spec(token);
+    spec.generation = 2;
+    assert!(matches!(
+        f.proxy.bind(spec, version).await,
+        Err(RuntimeError::DataPlane { .. })
+    ));
+}
+
+#[tokio::test]
+async fn worker_refuses_missing_policy_bad_signature_and_stale_snapshots() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    assert!(f.proxy.bind(f.spec(token), 1).await.is_err());
+    let snapshot = f.control.nodes.build_snapshot(&f.node).await.unwrap();
+    f.proxy.install(&snapshot).await.unwrap();
+    assert!(f.proxy.install(&snapshot).await.is_err());
+    let mut forged = snapshot;
+    forged.body.push(' ');
+    assert!(matches!(
+        f.proxy.install(&forged).await,
+        Err(RuntimeError::Snapshot(_))
+    ));
+}
+
+#[tokio::test]
+async fn worker_bounds_connection_admission() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    for limit in [0, MAX_SANDBOX_CONNECTIONS + 1] {
+        let mut spec = f.spec(token.clone());
+        spec.max_connections = limit;
+        assert!(matches!(
+            f.proxy.bind(spec, version).await,
+            Err(RuntimeError::Invalid { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn updates_cannot_weaken_expiry_or_cross_workers() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let nonstrict = f.mint(false).await;
+    assert!(f
+        .proxy
+        .update(
+            &binding,
+            BindingUpdate {
+                version: 2,
+                sessions: vec![nonstrict]
+            }
+        )
+        .await
+        .is_err());
+    let other = Fixture::new().await;
+    let token = f.mint(true).await;
+    assert!(other
+        .proxy
+        .update(
+            &binding,
+            BindingUpdate {
+                version: 2,
+                sessions: vec![token.clone()]
+            }
+        )
+        .await
+        .is_err());
+    f.proxy
+        .update(
+            &binding,
+            BindingUpdate {
+                version: 2,
+                sessions: vec![token.clone()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(binding.inner.version(), 2);
+    assert!(f
+        .proxy
+        .update(
+            &binding,
+            BindingUpdate {
+                version: 2,
+                sessions: vec![token]
+            }
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn worker_refuses_unrestricted_proxy_policy() {
+    let f = Fixture::new().await;
+    let mut settings = f.control.policy.get_settings(&f.caller).await.unwrap();
+    settings.unmatched_host_policy = UnmatchedHostPolicy::Passthrough;
+    f.control
+        .policy
+        .put_settings(&f.caller, settings)
+        .await
+        .unwrap();
+    let snapshot = f.control.nodes.build_snapshot(&f.node).await.unwrap();
+    assert!(matches!(
+        f.proxy.install(&snapshot).await,
+        Err(RuntimeError::Invalid { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attachment_is_isolated_and_removes_only_its_owned_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let untouched = root.path().join("existing");
+    std::fs::write(&untouched, "keep").unwrap();
+    let attachment = UnixAttachment::bind(root.path(), Arc::clone(&binding)).unwrap();
+    let path = attachment.directory().join("proxy.sock");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o666
+    );
+    let mut guest = tokio::net::UnixStream::connect(&path).await.unwrap();
+    guest
+        .write_all(b"CONNECT other.example.com:443 HTTP/1.1\r\nHost: other.example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = [0u8; 1024];
+    let count = tokio::time::timeout(Duration::from_secs(2), guest.read(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&response[..count]).contains("403"));
+    attachment
+        .revoke_and_wait(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(binding.status().revoked);
+    drop(attachment);
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_to_string(untouched).unwrap(), "keep");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn attachment_drop_cuts_access_and_creation_failure_preserves_parent() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(UnixAttachment::bind(&root.path().join("missing"), Arc::clone(&binding)).is_err());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    let attachment = UnixAttachment::bind(root.path(), Arc::clone(&binding)).unwrap();
+    drop(attachment);
+    assert!(binding.status().revoked);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn worker_bounds_policy_lease_and_snapshot_size() {
+    let f = Fixture::with_lease(MAX_POLICY_LEASE_SECONDS + 1).await;
+    let mut snapshot = f.control.nodes.build_snapshot(&f.node).await.unwrap();
+    assert!(matches!(
+        f.proxy.install(&snapshot).await,
+        Err(RuntimeError::Invalid { .. })
+    ));
+    snapshot.body = " ".repeat(MAX_SNAPSHOT_BYTES + 1);
+    assert!(matches!(
+        f.proxy.install(&snapshot).await,
+        Err(RuntimeError::Invalid { .. })
+    ));
+}
+
+#[tokio::test]
+async fn worker_rejects_empty_multiple_and_oversized_sessions() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    for sessions in [
+        vec![],
+        vec![token.clone(), token.clone()],
+        vec!["x".repeat(32 * 1024 + 1)],
+    ] {
+        let mut spec = f.spec(token.clone());
+        spec.sessions = sessions;
+        assert!(matches!(
+            f.proxy.bind(spec, version).await,
+            Err(RuntimeError::Invalid { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn worker_releases_admission_after_binding_drop() {
+    let mut f = Fixture::new().await;
+    f.proxy.bindings = Arc::new(Semaphore::new(1));
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token.clone()), version).await.unwrap();
+    assert!(matches!(
+        f.proxy.bind(f.spec(token.clone()), version).await,
+        Err(RuntimeError::Invalid { .. })
+    ));
+    drop(binding);
+    assert!(f.proxy.bind(f.spec(token), version).await.is_ok());
+}

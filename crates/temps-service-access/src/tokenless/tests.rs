@@ -236,3 +236,55 @@ fn pinned_sdk_cannot_be_mistaken_for_live_enforcement() {
     assert!(BLOCKERS.contains(&IntegrationBlocker::RevocationAcknowledgement));
     assert!(BLOCKERS.contains(&IntegrationBlocker::TrustedHostTransport));
 }
+
+#[test]
+fn prepared_sessions_require_hard_expiry_without_traffic_grace() {
+    let session = prepared_session();
+    assert!(session.claims().strict);
+    assert_eq!(
+        session.claims().open_traffic_deadline(),
+        session.claims().exp
+    );
+    assert!(session.rule().git.is_none());
+}
+
+#[test]
+fn binding_preserves_independent_same_host_grant_deadlines() {
+    let now = Utc::now();
+    let a = request(now);
+    let mut b = a.clone();
+    b.grant_id = format!("grant_{}", Uuid::new_v4().simple());
+    b.policy = policy("/v2");
+    b.expires_at = now + chrono::Duration::seconds(120);
+    b.max_ttl_seconds = 120;
+    let plan = PreparedBinding::prepare(vec![a, b], 1, now).unwrap();
+    assert!(plan.claims().strict);
+    assert_eq!(plan.claims().exp, now + chrono::Duration::seconds(120));
+    for grant in plan.grants() {
+        assert_eq!(
+            plan.claims().rule_deadline(&grant.claims().rules[0]),
+            grant.claims().exp
+        );
+    }
+}
+
+#[test]
+fn binding_rejects_duplicates_limits_and_identity_mixing() {
+    let now = Utc::now();
+    let a = request(now);
+    assert!(PreparedBinding::prepare(vec![], 1, now).is_err());
+    assert!(PreparedBinding::prepare(vec![a.clone()], 0, now).is_err());
+    assert!(PreparedBinding::prepare(vec![a.clone(); 17], 1, now).is_err());
+    assert!(PreparedBinding::prepare(vec![a.clone(), a.clone()], 1, now).is_err());
+    for index in 0..4 {
+        let mut b = a.clone();
+        b.grant_id = format!("grant_{}", Uuid::new_v4().simple());
+        match index {
+            0 => b.target.project_id += 1,
+            1 => b.target.sandbox_id += 1,
+            2 => b.target.node_id = Uuid::new_v4(),
+            _ => b.target.incarnation_id = Uuid::new_v4(),
+        }
+        assert!(PreparedBinding::prepare(vec![a.clone(), b], 1, now).is_err());
+    }
+}

@@ -4,7 +4,7 @@
 import { useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { PlugZap } from 'lucide-react'
+import { MoreHorizontal, PlugZap } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button, Skeleton } from '@temps-sdk/ui'
 import {
@@ -26,6 +26,12 @@ import {
 } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { ServiceGrantEditor } from './ServiceGrantEditor'
 import { grantLabels } from './service-access-form'
 
@@ -34,13 +40,18 @@ function pageNumber(raw: string | null) {
   return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 1000000) : 1
 }
 
-export function SandboxServiceAccess({
-  projectId,
-  sandboxId,
-}: {
-  projectId?: number | null
-  sandboxId: string
-}) {
+type PanelProps = { projectId?: number | null; sandboxId: string }
+
+export function SandboxServiceAccess(props: PanelProps) {
+  return (
+    <ServiceAccessPanel
+      key={`${props.projectId ?? 'none'}:${props.sandboxId}`}
+      {...props}
+    />
+  )
+}
+
+function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
   const client = useQueryClient()
   const [params, setParams] = useSearchParams()
   const servicePage = pageNumber(params.get('accessServicesPage'))
@@ -110,6 +121,9 @@ export function SandboxServiceAccess({
       return next
     })
   const maySave = capability.data?.can_save_requests === true
+  const mayEdit = maySave && capability.data?.can_manage_services === true
+  const mayRequest = maySave && capability.data?.can_manage_requests === true
+  const mayRevoke = capability.data?.can_manage_requests === true
   const serviceRows = services.data?.items ?? []
   const grantRows = grants.data?.items ?? []
   const readError = capability.error || services.error || grants.error
@@ -144,6 +158,18 @@ export function SandboxServiceAccess({
               )}
             </Callout>
           )}
+          {capability.data && !capability.data.can_manage_services && (
+            <Callout title="Service policies are read-only">
+              Editing services requires project write permission. Ask a project
+              administrator for access.
+            </Callout>
+          )}
+          {capability.data && !capability.data.can_manage_requests && (
+            <Callout title="Access requests are read-only">
+              Saving or revoking requests requires project and sandbox write
+              permission. Ask a project administrator for access.
+            </Callout>
+          )}
           {readError && (
             <Callout tone="error" title="Could not load service access">
               {problemDetail(
@@ -157,7 +183,7 @@ export function SandboxServiceAccess({
           )}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h4 className="text-sm font-medium">Project services</h4>
-            <Button size="sm" disabled={!maySave} onClick={() => openEditor()}>
+            <Button size="sm" disabled={!mayEdit} onClick={() => openEditor()}>
               Add service
             </Button>
           </div>
@@ -210,23 +236,37 @@ export function SandboxServiceAccess({
                   key: 'actions',
                   header: 'Actions',
                   render: (row) => (
-                    <div className="flex flex-wrap gap-2">
+                    <div className="flex flex-wrap justify-end gap-2">
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={!maySave}
-                        onClick={() => openEditor(row.id)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={!maySave || !row.enabled}
+                        disabled={!mayRequest || !row.enabled}
                         onClick={() => setRequesting(row)}
                       >
                         Request access
                       </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            aria-label={`Actions for ${row.name}`}
+                          >
+                            <MoreHorizontal
+                              className="size-4"
+                              aria-hidden="true"
+                            />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            disabled={!mayEdit}
+                            onSelect={() => openEditor(row.id)}
+                          >
+                            Edit service
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                     </div>
                   ),
                 },
@@ -299,7 +339,11 @@ export function SandboxServiceAccess({
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={row.status === 'revoked' || revoke.isPending}
+                      disabled={
+                        !mayRevoke ||
+                        row.status === 'revoked' ||
+                        revoke.isPending
+                      }
                       onClick={() => setRevokeTarget(row)}
                     >
                       Revoke request
@@ -333,13 +377,13 @@ export function SandboxServiceAccess({
         consequences="This cancels the saved request. Create a new request if you need access later."
         isPending={revoke.isPending}
         onConfirm={() => {
-          if (revokeTarget) revoke.mutate(revokeTarget)
+          if (mayRevoke && revokeTarget) revoke.mutate(revokeTarget)
         }}
       />
       <ServiceGrantEditor
         projectId={projectId}
         sandboxId={sandboxId}
-        service={requesting}
+        service={mayRequest ? requesting : undefined}
         onClose={() => setRequesting(undefined)}
         onSaved={refresh}
       />
