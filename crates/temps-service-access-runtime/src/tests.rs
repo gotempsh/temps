@@ -497,3 +497,53 @@ async fn stopping_the_worker_cuts_guest_attachments() {
     drop(f.proxy);
     assert_guest_closed(guest).await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reserved_attachment_denies_until_activation_then_closes_permanently() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let attachment = UnixAttachment::reserve(root.path(), binding.id().into()).unwrap();
+    let path = attachment.directory().join("proxy.sock");
+    let guest = tokio::net::UnixStream::connect(&path).await.unwrap();
+    assert_guest_closed(guest).await;
+    attachment.activate(Arc::clone(&binding)).unwrap();
+    attachment.activate(Arc::clone(&binding)).unwrap(); // idempotent delivery
+    let guest = idle_guest_tunnel(&attachment).await;
+    attachment
+        .revoke_and_wait(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_guest_closed(guest).await;
+    assert!(attachment.activate(binding).is_err());
+    drop(attachment);
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reserved_attachment_rejects_another_sandbox_and_closed_pending_activation() {
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let binding = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let other = UnixAttachment::reserve(root.path(), "sandbox:other-incarnation".into()).unwrap();
+    assert!(other.activate(Arc::clone(&binding)).is_err());
+    let guest = tokio::net::UnixStream::connect(other.directory().join("proxy.sock"))
+        .await
+        .unwrap();
+    assert_guest_closed(guest).await;
+    let pending = UnixAttachment::reserve(root.path(), binding.id().into()).unwrap();
+    let cut = pending
+        .revoke_and_wait(Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(cut.connections_closed, 0);
+    assert!(pending.activate(binding).is_err());
+    assert!(UnixAttachment::reserve(root.path(), String::new()).is_err());
+    assert!(UnixAttachment::reserve(root.path(), "x".repeat(257)).is_err());
+}

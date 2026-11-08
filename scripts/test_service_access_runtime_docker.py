@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Run worker runtime contracts on Linux in an isolated, disposable Docker container.
+"""Run worker and guest relay contracts in a disposable Linux Docker container.
 
 This exercises Unix attachments and SDK enforcement, not the full Temps cluster.
 Only this invocation's container is removed, including on failure.
@@ -41,14 +41,15 @@ def main():
     name = 'temps-access-contract-' + uuid.uuid4().hex
     with tempfile.TemporaryDirectory(prefix='temps-access-contract-') as scratch:
         workspace = Path(scratch)
-        relative = Path('crates/temps-service-access-runtime')
-        shutil.copytree(root / relative, workspace / relative)
+        for crate in ('temps-service-access-runtime', 'temps-pty-agent'):
+            relative = Path('crates') / crate
+            shutil.copytree(root / relative, workspace / relative)
         shutil.copy2(root / 'Cargo.lock', workspace / 'Cargo.lock')
         shutil.copy2(root / 'clippy.toml', workspace / 'clippy.toml')
         shutil.copy2(root / 'rust-toolchain.toml', workspace / 'rust-toolchain.toml')
         source = (root / 'Cargo.toml').read_text()
         sections = re.findall(r'^\[([^\n]+)\]\n(.*?)(?=^\[|\Z)', source, re.M | re.S)
-        manifest = '[workspace]\nresolver = "2"\nmembers = ["crates/temps-service-access-runtime"]\n'
+        manifest = '[workspace]\nresolver = "2"\nmembers = ["crates/temps-service-access-runtime", "crates/temps-pty-agent"]\n'
         for section, body in sections:
             if section in ('workspace.package', 'workspace.dependencies') or section.startswith('workspace.lints.'):
                 manifest += f'\n[{section}]\n{body}'
@@ -57,7 +58,8 @@ def main():
             run(['docker', 'create', '--name', name,
                  '--memory', '2g', '--cpus', '2', '--pids-limit', '256',
                  '--workdir', '/workspace', args.image,
-                 'cargo', 'test', '--lib', '-p', 'temps-service-access-runtime', '-j', '2'])
+                 'cargo', 'test', '--all-targets', '-p', 'temps-service-access-runtime',
+                 '-p', 'temps-pty-agent', '-j', '2'])
             # Copy rather than bind-mount: also works with a remote Docker host.
             run(['docker', 'cp', str(workspace) + '/.', name + ':/workspace'])
             run(['docker', 'start', '--attach', name])

@@ -28,6 +28,7 @@ url.workspace = true
 tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true, features = ["util"] }
 

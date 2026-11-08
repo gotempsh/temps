@@ -30,6 +30,11 @@ struct Args {
     /// otherwise. Does not start anything.
     #[arg(long)]
     probe: bool,
+
+    /// Forward loopback HTTPS proxy connections to the host-owned service
+    /// access socket. This mode carries no service credentials.
+    #[arg(long, conflicts_with_all = ["relay", "probe", "socket"])]
+    service_proxy: bool,
 }
 
 fn init_logging(client_mode: bool) {
@@ -61,6 +66,12 @@ fn main() -> std::io::Result<()> {
         .thread_name("pty-agent")
         .build()?;
 
+    if args.service_proxy {
+        return rt
+            .block_on(temps_pty_agent::service_proxy::run())
+            .map_err(std::io::Error::other);
+    }
+
     if args.probe {
         let code = match rt.block_on(temps_pty_agent::relay::probe(&args.socket)) {
             Ok(()) => 0,
@@ -90,4 +101,30 @@ fn main() -> std::io::Result<()> {
     }
 
     rt.block_on(async move { temps_pty_agent::server::run(&args.socket).await })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_proxy_is_an_exclusive_mode_with_a_host_assigned_socket() {
+        assert!(
+            Args::try_parse_from(["temps-pty-agent", "--service-proxy"])
+                .unwrap()
+                .service_proxy
+        );
+        for conflicting in ["--relay", "--probe"] {
+            assert!(
+                Args::try_parse_from(["temps-pty-agent", "--service-proxy", conflicting]).is_err()
+            );
+        }
+        assert!(Args::try_parse_from([
+            "temps-pty-agent",
+            "--service-proxy",
+            "--socket",
+            "/tmp/other.sock"
+        ])
+        .is_err());
+    }
 }

@@ -7664,3 +7664,92 @@ async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> an
     assert!(table_exists(&db, "sandbox_access_services").await?);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downgrade(
+) -> anyhow::Result<()> {
+    use sea_orm::EntityTrait;
+    use temps_entities::{
+        sandbox_access_delivery as delivery, sandbox_access_runtimes as runtimes,
+    };
+    let container = start_pg_container!("sandbox access durable delivery");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261109_000001_sandbox_access_delivery";
+    let migrations = Migrator::migrations();
+    let migration = migrations.iter().find(|m| m.name() == target).unwrap();
+    let manager = SchemaManager::new(&db);
+    let before = migrations.len() as u32 - steps_back_to(target);
+    Migrator::up(&db, Some(before)).await?;
+    migration.down(&manager).await?; // absence is safe
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9301,'Delivery test','repo','owner','/','main','nodejs','delivery-test',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id) VALUES (9301,'sbx_delivery_test','delivery-test',NULL,9301)").await?;
+    db.execute_unprepared("INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000101',9301,9301,'container:test-generation')").await?;
+    migration.up(&manager).await?; // preserves state, one retirement trigger
+    let runtime = runtimes::Entity::find().one(&db).await?.unwrap();
+    assert_eq!(runtime.desired_version, 0);
+    assert_eq!(runtime.applied_version, 0);
+    assert!(runtime.closed_at.is_none());
+    assert!(runtime.node_id.is_none());
+    assert!(db
+        .execute_unprepared("UPDATE sandbox_access_runtimes SET applied_version=1")
+        .await
+        .is_err());
+    assert!(db
+        .execute_unprepared("UPDATE sandbox_access_runtimes SET desired_version=-1")
+        .await
+        .is_err());
+    assert!(db.execute_unprepared("INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000102',9301,9301,'duplicate')").await.is_err());
+    assert!(migration
+        .down(&manager)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("runtime incarnations"));
+    // Deletion and the retirement are one transaction, including rollback.
+    let txn = db.begin().await?;
+    txn.execute_unprepared("DELETE FROM sandbox_access_runtimes")
+        .await?;
+    assert_eq!(delivery::Entity::find().all(&txn).await?.len(), 1);
+    txn.rollback().await?;
+    assert!(delivery::Entity::find().all(&db).await?.is_empty());
+    assert!(runtimes::Entity::find().one(&db).await?.is_some());
+    // Cascade project deletion must leave enough information to cut the old
+    // worker binding even though all project and sandbox rows are gone.
+    db.execute_unprepared("DELETE FROM projects WHERE id=9301")
+        .await?;
+    assert!(runtimes::Entity::find().all(&db).await?.is_empty());
+    let commands = delivery::Entity::find().all(&db).await?;
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].runtime_id, runtime.id);
+    assert_eq!(commands[0].operation, delivery::DeliveryOperation::Retire);
+    assert_eq!(commands[0].desired_version, 0);
+    assert!(commands[0].completed_at.is_none());
+    assert!(db
+        .execute_unprepared(
+            "UPDATE sandbox_access_delivery SET claim_id='00000000-0000-4000-8000-000000000103'"
+        )
+        .await
+        .is_err());
+    assert!(db
+        .execute_unprepared("UPDATE sandbox_access_delivery SET operation='activate'")
+        .await
+        .is_err());
+    assert!(migration
+        .down(&manager)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("worker commands are pending"));
+    db.execute_unprepared("UPDATE sandbox_access_delivery SET completed_at=now()")
+        .await?;
+    migration.down(&manager).await?;
+    migration.down(&manager).await?;
+    assert!(!table_exists(&db, "sandbox_access_delivery").await?);
+    migration.up(&manager).await?;
+    assert!(delivery::Entity::find().all(&db).await?.is_empty());
+    Ok(())
+}

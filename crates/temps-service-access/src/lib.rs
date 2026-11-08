@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod broker;
+pub mod delivery;
 pub mod error;
 pub mod handlers;
 mod plugin;

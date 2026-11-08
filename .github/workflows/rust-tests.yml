@@ -1221,7 +1221,7 @@ jobs:
               or (kind(=bin) and (package(temps-example-plugin) or
               package(temps-git-credential) or package(temps-google-indexing-plugin) or
               package(temps-indexnow-plugin) or package(temps-lighthouse-plugin) or
-              package(temps-preview-gateway) or package(temps-vm-agent)))
+              package(temps-preview-gateway) or package(temps-pty-agent) or package(temps-vm-agent)))
               or (kind(=example) and package(temps-plugin-sdk))
 
     steps:

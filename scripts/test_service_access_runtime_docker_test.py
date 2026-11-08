@@ -19,6 +19,8 @@ class DockerContracts(unittest.TestCase):
                 source = Path(args[2])
                 self.assertTrue((source / 'rust-toolchain.toml').exists())
                 self.assertIn('temps-service-access-runtime', (source / 'Cargo.toml').read_text())
+                self.assertIn('temps-pty-agent', (source / 'Cargo.toml').read_text())
+                self.assertTrue((source / 'crates/temps-pty-agent/src/service_proxy.rs').exists())
             if fail and args[:3] == ['docker', 'start', '--attach']:
                 raise subprocess.CalledProcessError(1, args)
             return subprocess.CompletedProcess(args, 0)
@@ -34,6 +36,8 @@ class DockerContracts(unittest.TestCase):
         created = next(c for c in calls if c[:2] == ['docker', 'create'])
         name = created[created.index('--name') + 1]
         self.assertRegex(name, r'^temps-access-contract-[0-9a-f]{32}$')
+        self.assertIn('--all-targets', created)
+        self.assertIn('temps-pty-agent', created)
         self.assertEqual(calls[-1], ['docker', 'rm', '-f', name])
         self.assertFalse(any('prune' in c for c in calls))
 

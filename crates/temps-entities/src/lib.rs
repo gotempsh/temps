@@ -264,6 +264,8 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_access_delivery;
+pub mod sandbox_access_runtimes;
 pub mod sandbox_access_services;
 pub mod sandbox_events;
 pub mod sandbox_service_grants;

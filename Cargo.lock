@@ -15739,6 +15739,7 @@ dependencies = [
  "temps-authz",
  "temps-core",
  "temps-entities",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokenless-core",
  "tokio",

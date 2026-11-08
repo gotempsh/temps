@@ -59,6 +59,11 @@ pub const BUNDLE: &[BundleFile] = &[
         mode: 0o644,
     },
     BundleFile {
+        path: "pty-agent/src/service_proxy.rs",
+        contents: include_bytes!("../../temps-pty-agent/src/service_proxy.rs"),
+        mode: 0o644,
+    },
+    BundleFile {
         path: "pty-agent/sandbox-entrypoint.sh",
         contents: include_bytes!("../../temps-pty-agent/docker/sandbox-entrypoint.sh"),
         mode: 0o755,
