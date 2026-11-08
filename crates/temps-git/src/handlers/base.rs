@@ -2689,6 +2689,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         (path = "/", api = crate::handlers::repositories::RepositoriesApiDoc)
     ),
     paths(
+        crate::handlers::github::start_github_manifest_flow,
         crate::handlers::reauthorize::reauthorize_connection,
         crate::handlers::reauthorize::complete_connection_reauthorization,
         create_git_provider,
@@ -2735,6 +2736,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
     ),
     components(
         schemas(
+            crate::handlers::github::GithubManifestStartResponse,
             crate::handlers::reauthorize::ReauthorizationResponse,
             crate::handlers::reauthorize::CompleteReauthorizationRequest,
             CreateProviderRequest,

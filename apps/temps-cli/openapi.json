@@ -33322,6 +33322,19 @@
         ],
         "type": "object"
       },
+      "GithubManifestStartResponse": {
+        "description": "Response of [`start_github_manifest_flow`].",
+        "properties": {
+          "state": {
+            "description": "Single-use token to send to GitHub with the manifest. GitHub returns it\nto the callback, which accepts the manifest code only together with it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
       "GlobalAnalyticsResponse": {
         "properties": {
           "rows": {
@@ -111737,6 +111750,42 @@
           }
         ],
         "summary": "Create a Gitea Personal Access Token provider",
+        "tags": [
+          "Git Providers"
+        ]
+      }
+    },
+    "/git-providers/github/manifest/start": {
+      "post": {
+        "description": "Issues the `state` the console sends to GitHub along with the manifest. The\ncallback GitHub redirects back to carries no session cookie (it is\n`SameSite=Strict`), so this state is what proves an operator started the\nflow. It works once and expires after 15 minutes.",
+        "operationId": "start_github_manifest_flow",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubManifestStartResponse"
+                }
+              }
+            },
+            "description": "State issued"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Start creating a GitHub App from a manifest.",
         "tags": [
           "Git Providers"
         ]

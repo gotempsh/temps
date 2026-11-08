@@ -7444,3 +7444,127 @@ async fn test_ingress_connector_host_suffix_migration_up_and_down() -> anyhow::R
     assert_eq!(survivors.len(), 1, "down must keep the tunnel");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_github_manifest_states_migration_is_single_use_and_reversible() -> anyhow::Result<()>
+{
+    if external_db_configured() {
+        println!("Skipping manifest state migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            // Only a missing Docker skips the test; any other startup failure
+            // is a broken setup and must stay visible.
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping manifest state migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261107_000007_create_github_manifest_states";
+    let steps = steps_back_to(target);
+
+    Migrator::up(&db, Some(Migrator::migrations().len() as u32 - steps)).await?;
+    let table_exists = || {
+        db.query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'github_manifest_states'"
+                .to_string(),
+        ))
+    };
+    assert!(table_exists().await?.is_empty());
+    let user = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO users (name, email, created_at, updated_at) \
+             VALUES ('Manifest state user', 'manifest-state@example.test', now(), now()) \
+             RETURNING id"
+                .to_string(),
+        ))
+        .await?
+        .expect("inserted user row");
+    let user_id: i32 = user.try_get("", "id")?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(table_exists().await?.len(), 1, "the table exists after up");
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO github_manifest_states (state_hash, user_id, expires_at) \
+         VALUES ('pending', {user_id}, now() + interval '15 minutes')"
+    ))
+    .await?;
+    // A state is unique: a second row cannot carry the same value.
+    assert!(
+        db.execute_unprepared(&format!(
+            "INSERT INTO github_manifest_states (state_hash, user_id, expires_at) \
+             VALUES ('pending', {user_id}, now() + interval '15 minutes')"
+        ))
+        .await
+        .is_err(),
+        "a duplicate state must be refused"
+    );
+
+    // Claiming a state deletes it as it is read: the first claim gets the
+    // row and a second finds nothing, so one callback cannot be replayed.
+    let claim = || {
+        db.query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM github_manifest_states WHERE state_hash = 'pending' RETURNING user_id"
+                .to_string(),
+        ))
+    };
+    let first = claim().await?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].try_get::<i32>("", "user_id")?, user_id);
+    assert!(claim().await?.is_empty(), "a state works only once");
+
+    // Removing the operator removes their pending states.
+    db.execute_unprepared(&format!(
+        "INSERT INTO github_manifest_states (state_hash, user_id, expires_at) \
+         VALUES ('orphan', {user_id}, now() + interval '15 minutes')"
+    ))
+    .await?;
+    db.execute_unprepared(&format!("DELETE FROM users WHERE id = {user_id}"))
+        .await?;
+    let left = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 FROM github_manifest_states".to_string(),
+        ))
+        .await?;
+    assert!(left.is_empty(), "states follow their operator on delete");
+
+    // The target is the last migration applied here (`up` above stopped at
+    // it), so one step back reverts it and nothing else.
+    Migrator::down(&db, Some(1)).await?;
+    assert!(
+        table_exists().await?.is_empty(),
+        "the table is gone after down"
+    );
+    Migrator::up(&db, None).await?;
+    assert_eq!(table_exists().await?.len(), 1);
+    Ok(())
+}
