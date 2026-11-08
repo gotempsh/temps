@@ -421,7 +421,19 @@ async fn reply_error<R: ResponseHandler>(
 ) -> ResponseInfo {
     let builder = MessageResponseBuilder::from_message_request(request);
     // `Request` derefs to `Metadata`; `error_msg` wants `&Metadata`.
-    let resp = builder.error_msg(&request.metadata, code);
+    let mut metadata = Metadata::response_from_request(&request.metadata);
+    metadata.response_code = code;
+    metadata.authoritative = code == ResponseCode::NXDomain
+        && request.request_info().is_ok_and(|info| {
+            is_internal_zone(&info.query.name().to_string().to_ascii_lowercase())
+        });
+    let resp = builder.build(
+        metadata,
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+    );
     match response_handle.send_response(resp).await {
         Ok(info) => info,
         Err(e) => {

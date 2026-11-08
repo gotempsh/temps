@@ -311,22 +311,26 @@ impl ExternalServiceManager {
         };
 
         let target_port = internal_port.parse::<i32>().ok();
-        let draft = temps_dns::EndpointDraft {
-            fqdn: fqdn.clone(),
-            record_type: temps_dns::InternalRecordType::A,
-            target_ip: Some(ip.clone()),
-            target_port,
-            ttl: STANDALONE_SERVICE_DNS_TTL,
-            owner_kind: temps_dns::InternalOwnerKind::ServiceRole,
-            owner_id: service_id as i64,
-            node_id: service.node_id,
-        };
+        let drafts: Vec<_> =
+            crate::service_dns::standalone_service_names(&service.name, service.slug.as_deref())
+                .into_iter()
+                .map(|fqdn| temps_dns::EndpointDraft {
+                    fqdn,
+                    record_type: temps_dns::InternalRecordType::A,
+                    target_ip: Some(ip.clone()),
+                    target_port,
+                    ttl: STANDALONE_SERVICE_DNS_TTL,
+                    owner_kind: temps_dns::InternalOwnerKind::ServiceRole,
+                    owner_id: service_id as i64,
+                    node_id: service.node_id,
+                })
+                .collect();
 
         self.dns_registry
             .replace_endpoints_for_owner(
                 temps_dns::InternalOwnerKind::ServiceRole,
                 service_id as i64,
-                &[draft],
+                &drafts,
             )
             .await
             .map_err(|e| ExternalServiceError::InternalError {

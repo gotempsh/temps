@@ -1232,6 +1232,9 @@ impl ExternalServiceManager {
         let mut cluster_host_config = HostConfig {
             binds: Some(vec![format!("{}:{}", volume_name, params.volume_path)]),
             port_bindings: Some(port_bindings),
+            dns_search: dns_servers
+                .as_ref()
+                .map(|_| vec!["temps.local".to_string()]),
             dns: dns_servers,
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

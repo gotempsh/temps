@@ -415,6 +415,9 @@ pub async fn create_service(
         binds: Some(binds),
         port_bindings: Some(port_bindings),
         network_mode: request.network.clone(),
+        dns_search: dns_servers
+            .as_ref()
+            .map(|_| vec!["temps.local".to_string()]),
         dns: dns_servers,
         restart_policy: Some(bollard::models::RestartPolicy {
             name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
