@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
 import { PageTitle } from '@temps-sdk/ds'
 import {
   getEnvironmentOptions,
+  getDeploymentOptions,
   listContainersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -77,6 +79,17 @@ export function EnvironmentDashboard({
     enabled: !!project?.id && !!environmentId,
   })
 
+  const deployment = useQuery({
+    ...getDeploymentOptions({
+      path: {
+        project_id: project.id,
+        deployment_id: environment?.current_deployment_id ?? 0,
+      },
+    }),
+    enabled: Boolean(environment?.current_deployment_id),
+    staleTime: 30_000,
+  })
+
   if (environmentError) {
     return (
       <div>
@@ -113,6 +126,11 @@ export function EnvironmentDashboard({
 
   return (
     <div className="min-w-0 space-y-6">
+      <ReachabilityWarningBanner
+        warning={deployment.data?.reachability_warning}
+        projectId={project.id}
+        projectSlug={project.slug}
+      />
       {/* The project bar already shows the environment's name. */}
       <PageTitle className="sr-only">{environment.name}</PageTitle>
       <div className="flex items-center gap-3 border-b">

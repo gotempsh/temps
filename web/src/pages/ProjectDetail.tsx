@@ -133,6 +133,7 @@ import { toast } from 'sonner'
 
 export function ProjectDetail() {
   const { slug } = useParams()
+  const showOverviewWarning = Boolean(useMatch('/projects/:slug/project'))
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const variableRoute = useMatch('/projects/:slug/environment-variables/*')
@@ -755,8 +756,11 @@ export function ProjectDetail() {
               </Alert>
             )}
             <ReachabilityWarningBanner
-              warning={project.reachability_warning}
+              warning={
+                showOverviewWarning ? project.reachability_warning : null
+              }
               projectSlug={project.slug}
+              projectId={project.id}
               className="mb-4"
             />
             <ProjectTour />
