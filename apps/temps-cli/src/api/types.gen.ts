@@ -68867,6 +68867,50 @@ export type CreateAccessServiceResponses = {
 
 export type CreateAccessServiceResponse = CreateAccessServiceResponses[keyof CreateAccessServiceResponses];
 
+export type GetAccessServiceData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Service ID
+         */
+        service_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-services/{service_id}';
+};
+
+export type GetAccessServiceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type GetAccessServiceResponses = {
+    /**
+     * Service policy without stored credential
+     */
+    200: AccessServiceResponse;
+};
+
+export type GetAccessServiceResponse = GetAccessServiceResponses[keyof GetAccessServiceResponses];
+
 export type UpdateAccessServiceData = {
     body: SaveAccessServiceWritable;
     path: {

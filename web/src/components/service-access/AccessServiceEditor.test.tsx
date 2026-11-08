@@ -75,7 +75,6 @@ test('saving an edit sends the pinned version without resending a stored credent
   render(
     provider(
       <AccessServiceEditor
-        open
         projectId={7}
         service={service}
         onClose={() => {}}
@@ -105,7 +104,6 @@ test('a version conflict stays visible and does not report a successful save', a
   render(
     provider(
       <AccessServiceEditor
-        open
         projectId={7}
         service={service}
         onClose={() => {}}
@@ -216,7 +214,6 @@ test.each(['service', 'grant'] as const)(
         provider(
           kind === 'service' ? (
             <AccessServiceEditor
-              open
               projectId={7}
               service={service}
               {...callbacks}
@@ -268,7 +265,6 @@ test.each(['service', 'grant'] as const)(
       provider(
         kind === 'service' ? (
           <AccessServiceEditor
-            open
             projectId={7}
             service={service}
             onClose={() => {}}
@@ -312,3 +308,42 @@ test.each(['service', 'grant'] as const)(
     )
   }
 )
+
+test('a save finishing after leaving refreshes data without navigating', async () => {
+  let resolve: (response: Response) => void = () => {}
+  const response = new Promise<Response>((done) => {
+    resolve = done
+  })
+  const api = mockApi({
+    'PUT /projects/7/access-services/svc_test': () => response,
+  })
+  let saved = 0
+  let closed = 0
+  try {
+    const view = render(
+      provider(
+        <AccessServiceEditor
+          projectId={7}
+          service={service}
+          onClose={() => {
+            closed++
+          }}
+          onSaved={() => {
+            saved++
+          }}
+        />
+      )
+    )
+    await editName()
+    await click('Save service')
+    view.unmount()
+    await act(async () => {
+      resolve(jsonResponse(service))
+      await response
+    })
+    expect(closed).toBe(0)
+    expect(saved).toBe(1)
+  } finally {
+    api.restore()
+  }
+})

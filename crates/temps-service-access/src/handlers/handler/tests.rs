@@ -101,6 +101,7 @@ fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
             "/projects/7/sandboxes/sbx_test/service-grants/grant_test/revoke",
             r#"{"expected_version":1}"#,
         ),
+        ("GET", "/projects/7/access-services/svc_test", ""),
     ]
 }
 async fn send(
@@ -519,6 +520,45 @@ async fn grant_routes_honor_project_permission_narrowing_and_checker_failures() 
                 assert!(problem["detail"].as_str().unwrap().contains("sandboxes:"));
             }
             assert!(audit.0.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_service_read_is_masked_and_missing_is_a_problem() {
+    for found in [true, false] {
+        let mut model = row();
+        model.credential_encrypted = Some("ciphertext-must-not-escape".into());
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![std::collections::BTreeMap::from([(
+                "id".to_string(),
+                sea_orm::Value::Int(Some(7)),
+            )])]])
+            .append_query_results([if found { vec![model] } else { vec![] }]);
+        let response = send(
+            "GET",
+            "/projects/7/access-services/svc_test",
+            "",
+            Some(AuthContext::new_session(test_user(), Role::Admin)),
+            state(db, Arc::new(Audit::default())),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if found {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+        let body = String::from_utf8(to_bytes(response.into_body(), 8192).await.unwrap().to_vec())
+            .unwrap();
+        assert!(!body.contains("ciphertext-must-not-escape"));
+        if found {
+            assert!(body.contains("has_credential"));
+        } else {
+            assert!(body.contains("svc_test"));
+            assert!(body.contains("detail"));
         }
     }
 }

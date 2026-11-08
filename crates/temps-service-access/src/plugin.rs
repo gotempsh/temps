@@ -85,6 +85,11 @@ mod tests {
             .expect("service-access plugin must expose an OpenAPI schema");
         for (path, method, operation_id) in [
             (
+                "/projects/{project_id}/access-services/{service_id}",
+                "GET",
+                "get_access_service",
+            ),
+            (
                 "/projects/{project_id}/service-access/capability",
                 "GET",
                 "access_capability",

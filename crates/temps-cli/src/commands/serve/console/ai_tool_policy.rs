@@ -25,6 +25,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &[
             "access_capability",
             "create_access_service",
+            "get_access_service",
             "list_access_services",
             "list_service_grants",
             "request_service_grant",

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
-import { Link, useSearchParams } from 'react-router'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { PlugZap } from 'lucide-react'
 import { toast } from 'sonner'
@@ -26,7 +26,6 @@ import {
 } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { AccessServiceEditor } from './AccessServiceEditor'
 import { ServiceGrantEditor } from './ServiceGrantEditor'
 import { grantLabels } from './service-access-form'
 
@@ -47,8 +46,12 @@ export function SandboxServiceAccess({
   const servicePage = pageNumber(params.get('accessServicesPage'))
   const grantPage = pageNumber(params.get('accessRequestsPage'))
   const [revokeTarget, setRevokeTarget] = useState<ServiceGrantResponse>()
-  const [editorOpen, setEditorOpen] = useState(false)
-  const [editing, setEditing] = useState<AccessServiceResponse>()
+  const navigate = useNavigate()
+  const openEditor = (serviceId?: string) => {
+    const suffix = serviceId ? `${encodeURIComponent(serviceId)}/edit` : 'new'
+    const query = new URLSearchParams({ sandbox: sandboxId })
+    navigate(`/projects/${projectId}/access-services/${suffix}?${query}`)
+  }
   const [requesting, setRequesting] = useState<AccessServiceResponse>()
   const capability = useQuery({
     ...accessCapabilityOptions({ path: { project_id: projectId ?? 0 } }),
@@ -154,14 +157,7 @@ export function SandboxServiceAccess({
           )}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h4 className="text-sm font-medium">Project services</h4>
-            <Button
-              size="sm"
-              disabled={!maySave}
-              onClick={() => {
-                setEditing(undefined)
-                setEditorOpen(true)
-              }}
-            >
+            <Button size="sm" disabled={!maySave} onClick={() => openEditor()}>
               Add service
             </Button>
           </div>
@@ -219,10 +215,7 @@ export function SandboxServiceAccess({
                         size="sm"
                         variant="outline"
                         disabled={!maySave}
-                        onClick={() => {
-                          setEditing(row)
-                          setEditorOpen(true)
-                        }}
+                        onClick={() => openEditor(row.id)}
                       >
                         Edit
                       </Button>
@@ -342,13 +335,6 @@ export function SandboxServiceAccess({
         onConfirm={() => {
           if (revokeTarget) revoke.mutate(revokeTarget)
         }}
-      />
-      <AccessServiceEditor
-        projectId={projectId}
-        open={editorOpen}
-        service={editing}
-        onClose={() => setEditorOpen(false)}
-        onSaved={refresh}
       />
       <ServiceGrantEditor
         projectId={projectId}

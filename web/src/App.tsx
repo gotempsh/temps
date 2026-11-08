@@ -130,6 +130,7 @@ const StatusPageDetailPage = lazy(() =>
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
 const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
+const AccessServicePage = lazy(() => import('./pages/AccessServicePage'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
 )
@@ -770,6 +771,14 @@ const FullAppRoutes = () => {
                         <Route
                           path="/status-pages/:statusPageId"
                           element={<StatusPageDetailPage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
                         />
                         <Route path="/sandboxes" element={<Sandboxes />} />
                         <Route

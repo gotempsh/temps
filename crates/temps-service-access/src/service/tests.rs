@@ -540,3 +540,36 @@ fn corrupted_policy_is_a_contextual_error_instead_of_an_empty_scope() {
         matches!(service_response(service), Err(AccessError::StoredPolicy { project_id: 7, id, .. }) if id == "svc_test")
     );
 }
+
+#[tokio::test]
+async fn single_service_read_scopes_query_and_handles_storage_errors() {
+    let svc = service(
+        db().append_query_results([vec![project_row()]])
+            .append_query_results([vec![row()]]),
+    );
+    assert_eq!(svc.get_service(7, "svc_test").await.unwrap().id, "svc_test");
+    let log = format!(
+        "{:?}",
+        Arc::try_unwrap(svc.db).unwrap().into_transaction_log()
+    );
+    assert!(log.contains("project_id"));
+    assert!(log.contains("svc_test"));
+    let svc = service(
+        db().append_query_results([vec![project_row()]])
+            .append_query_results([Vec::<services::Model>::new()]),
+    );
+    assert!(
+        matches!(svc.get_service(7, "missing").await, Err(AccessError::NotFound { id, project_id: 7, .. }) if id == "missing")
+    );
+    let svc = service(
+        db().append_query_results([vec![project_row()]])
+            .append_query_errors([DbErr::Custom("private driver details".into())]),
+    );
+    assert!(matches!(
+        svc.get_service(7, "svc_test").await,
+        Err(AccessError::Database {
+            operation: "read service",
+            ..
+        })
+    ));
+}

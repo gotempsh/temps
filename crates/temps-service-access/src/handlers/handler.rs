@@ -11,7 +11,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{get, post},
     Json, Router,
 };
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use temps_core::{
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
-#[openapi(paths(access_capability, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
+#[openapi(paths(access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
     components(schemas(AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
     tags((name="Sandbox service access", description="Saved service policies and time-limited access requests; runtime integration is not installed")))]
 pub struct ServiceAccessApiDoc;
@@ -42,7 +42,7 @@ pub fn configure_routes() -> Router<Arc<AccessAppState>> {
         )
         .route(
             "/projects/{project_id}/access-services/{service_id}",
-            put(update_access_service),
+            get(get_access_service).put(update_access_service),
         )
         .route(
             "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants",
@@ -158,6 +158,26 @@ pub async fn list_access_services(
         &state.project_access_checker
     );
     Ok(Json(state.service.list_services(project_id, query).await?))
+}
+
+#[utoipa::path(get, path="/projects/{project_id}/access-services/{service_id}", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID"), ("service_id" = String, Path, description="Service ID")),
+responses((status=200, description="Service policy without stored credential", body=AccessServiceResponse), (status=401, description="Unauthorized"), (status=403, description="Forbidden"), (status=404, description="Resource not found"), (status=500, description="Storage failure")), security(("bearer_auth"=[])))]
+pub async fn get_access_service(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Path((project_id, service_id)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_permission_guard!(
+        auth,
+        ProjectsRead,
+        project_id,
+        &state.project_access_checker
+    );
+    Ok(Json(
+        state.service.get_service(project_id, &service_id).await?,
+    ))
 }
 
 #[utoipa::path(post, path="/projects/{project_id}/access-services", tag="Sandbox service access", params(("project_id" = i32, Path, description="Project ID")),

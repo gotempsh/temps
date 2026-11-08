@@ -132918,6 +132918,62 @@
       }
     },
     "/projects/{project_id}/access-services/{service_id}": {
+      "get": {
+        "operationId": "get_access_service",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Service ID",
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            },
+            "description": "Service policy without stored credential"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      },
       "put": {
         "operationId": "update_access_service",
         "parameters": [

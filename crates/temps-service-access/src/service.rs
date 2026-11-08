@@ -59,6 +59,21 @@ impl ServiceAccessService {
         Ok(())
     }
 
+    pub async fn get_service(
+        &self,
+        project_id: i32,
+        service_id: &str,
+    ) -> Result<AccessServiceResponse, AccessError> {
+        self.project(self.db.as_ref(), project_id).await?;
+        let model = services::Entity::find_by_id(service_id)
+            .filter(services::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| AccessError::database("read service", project_id, e))?
+            .ok_or_else(|| not_found("service", service_id.into(), project_id))?;
+        service_response(model)
+    }
+
     pub async fn list_services(
         &self,
         project_id: i32,
