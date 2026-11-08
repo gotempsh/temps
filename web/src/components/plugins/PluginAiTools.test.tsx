@@ -32,7 +32,7 @@ const settings = {
     },
   ],
 }
-function mount() {
+function mount(open = true) {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -46,12 +46,35 @@ function mount() {
       },
     },
   })
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <PluginAiTools name="reports" />
     </QueryClientProvider>
   )
+  if (open) fireEvent.click(view.getByRole('button', { name: 'AI chat tools' }))
+  return view
 }
+
+test('keeps an always-visible compact entry point without opening optional settings', async () => {
+  mockApi({ 'GET /x/plugins/reports/ai-tools': () => jsonResponse(settings) })
+  const view = mount(false)
+  expect(await view.findByText('AI access off · 2 tools')).toBeTruthy()
+  expect(view.queryByRole('dialog')).toBeNull()
+  expect(view.queryByRole('switch')).toBeNull()
+  fireEvent.click(view.getByRole('button', { name: 'AI chat tools' }))
+  expect(await view.findByRole('dialog')).toBeTruthy()
+  expect(view.getByText('List reports')).toBeTruthy()
+})
+
+test('keeps the empty state discoverable before opening settings', async () => {
+  mockApi({
+    'GET /x/plugins/reports/ai-tools': () =>
+      jsonResponse({ ...settings, tools: [] }),
+  })
+  const view = mount(false)
+  expect(await view.findByText('No AI tools declared')).toBeTruthy()
+  expect(view.getByRole('button', { name: 'AI chat tools' })).toBeTruthy()
+})
 
 test('lists read/write tools and saves consent with actor identity and success feedback', async () => {
   const success = spyOn(toast, 'success').mockImplementation(() => 'id')
