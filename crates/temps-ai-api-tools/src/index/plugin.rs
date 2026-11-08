@@ -121,12 +121,32 @@ impl PluginToolsIndex {
                     .chars()
                     .take(500)
                     .collect();
+                let mut effective = op.clone();
+                let parameters = effective.parameters.get_or_insert_with(Vec::new);
+                for inherited in item.parameters.iter().flatten() {
+                    let overridden =
+                        parameters
+                            .iter()
+                            .any(|parameter| match (parameter, inherited) {
+                                (RefOr::T(local), RefOr::T(shared)) => {
+                                    local.name == shared.name
+                                        && local.parameter_in == shared.parameter_in
+                                }
+                                (RefOr::Ref(local), RefOr::Ref(shared)) => {
+                                    local.ref_location == shared.ref_location
+                                }
+                                _ => false,
+                            });
+                    if !overridden {
+                        parameters.push(inherited.clone());
+                    }
+                }
                 let mut operation = build_api_operation(
                     format!("plugin.{plugin}.{id}"),
                     format!("/x/{plugin}{path}"),
                     method,
-                    op,
-                    &resolve_body_params(op, openapi),
+                    &effective,
+                    &resolve_body_params(&effective, openapi),
                     openapi,
                 );
                 operation.summary = Some(description.clone());
@@ -280,6 +300,32 @@ mod tests {
             .unwrap()
             .tools()
             .is_empty());
+    }
+
+    #[test]
+    fn inherited_parameters_are_preserved_and_operation_parameters_override() {
+        let api = serde_json::from_value(json!({
+            "openapi": "3.1.0", "info": {"title":"Reports", "version":"1"},
+            "paths": {"/reports/{report_id}": {
+                "parameters": [
+                    {"name":"report_id", "in":"path", "required":true, "schema":{"type":"integer"}},
+                    {"name":"limit", "in":"query", "required":false, "schema":{"type":"string"}}
+                ],
+                "get": {"operationId":"report", "x-temps-ai-tool":{},
+                    "parameters":[{"name":"limit", "in":"query", "required":false, "schema":{"type":"integer"}}],
+                    "responses":{"200":{"description":"OK"}}}
+            }}
+        }))
+        .unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &api, true).unwrap();
+        let op = &index.tools()[0].operation;
+        assert_eq!(op.params.len(), 2);
+        assert_eq!(
+            op.params.iter().find(|p| p.name == "limit").unwrap().ty,
+            "integer"
+        );
+        let built = crate::build_request_parts(op, &json!({"report_id":7}), &[], 20, 100).unwrap();
+        assert_eq!(built.path, "/x/reports/reports/7");
     }
 
     #[test]
