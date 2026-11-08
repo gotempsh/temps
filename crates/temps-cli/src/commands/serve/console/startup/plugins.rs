@@ -441,6 +441,18 @@ fn external_plugins_plugin(
     .with_proxy_address(&config.address)
     .with_registry(registry);
     external_plugin_config.persistent_installations = persistent_installations;
+    // `--plugin-launcher`, bridged into the environment by `serve`.
+    if let Some(launcher) =
+        std::env::var_os("TEMPS_PLUGIN_LAUNCHER").filter(|value| !value.is_empty())
+    {
+        tracing::info!(
+            launcher = %std::path::Path::new(&launcher).display(),
+            "External plugins run as a separate user through the plugin launcher"
+        );
+        external_plugin_config = external_plugin_config.with_launcher(
+            temps_external_plugins::launcher::PluginLauncher::new(launcher),
+        );
+    }
     temps_external_plugins::ExternalPluginsPlugin::new(external_plugin_config)
 }
 

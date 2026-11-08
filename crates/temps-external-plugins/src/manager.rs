@@ -55,6 +55,9 @@ pub struct ExternalPluginProcess {
     pid_file_path: PathBuf,
     /// The child process handle
     child: Child,
+    /// The launcher that started the plugin as another user, which is then
+    /// also the only way to stop it.
+    launcher: Option<crate::launcher::PluginLauncher>,
     /// Whether the plugin has UI assets
     pub has_ui: bool,
     /// Bidirectional channel for platform queries and event delivery
@@ -90,6 +93,15 @@ impl ExternalPluginProcess {
     pub fn kill(&mut self) {
         if let Some(id) = self.child.id() {
             debug!(plugin = %self.manifest.name, pid = id, "Killing plugin process");
+            if let Some(launcher) = &self.launcher {
+                // Another user's process: only the launcher can signal it. The
+                // pid can't have been reused, because the plugin is our direct
+                // child and is not reaped until `child` is waited on.
+                if let Err(e) = launcher.kill(id) {
+                    warn!(plugin = %self.manifest.name, "Failed to stop plugin process: {e}");
+                }
+                return;
+            }
             if let Err(e) = self.child.start_kill() {
                 warn!(
                     plugin = %self.manifest.name,
@@ -120,6 +132,22 @@ impl Drop for ExternalPluginProcess {
     fn drop(&mut self) {
         self.kill();
         self.cleanup_files();
+    }
+}
+
+/// Stops a plugin started through a launcher unless it was handed over.
+struct LaunchedPlugin<'a> {
+    launcher: Option<&'a crate::launcher::PluginLauncher>,
+    pid: Option<u32>,
+}
+
+impl Drop for LaunchedPlugin<'_> {
+    fn drop(&mut self) {
+        if let (Some(launcher), Some(pid)) = (self.launcher, self.pid) {
+            if let Err(error) = launcher.kill(pid) {
+                warn!("Failed to stop a plugin that did not finish starting: {error}");
+            }
+        }
     }
 }
 
@@ -155,6 +183,10 @@ pub struct ExternalPluginConfig {
     pub health_check_timeout: Duration,
     /// Signed registry trust and network policy used for installed receipts.
     pub registry: crate::catalog::RegistryConfig,
+    /// When set, plugins run as another user through this launcher, and
+    /// Temps refuses to start them unless that user provably can't read its
+    /// secrets. See [`crate::launcher`].
+    pub launcher: Option<crate::launcher::PluginLauncher>,
 }
 
 /// Maximum length of a Unix socket path on this platform.
@@ -257,12 +289,12 @@ async fn read_handshake_frame<R: AsyncBufRead + Unpin>(
 }
 
 #[cfg(unix)]
-fn secure_socket_directory(path: &Path) -> Result<(), std::io::Error> {
+fn secure_socket_directory(path: &Path, mode: u32) -> Result<(), std::io::Error> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::DirBuilderExt;
 
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+    match std::fs::DirBuilder::new().mode(mode).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
@@ -290,7 +322,7 @@ fn secure_socket_directory(path: &Path) -> Result<(), std::io::Error> {
     let directory = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     // SAFETY: fchmod operates on the live directory descriptor and does not
     // dereference the path again, closing the symlink-swap race.
-    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+    if unsafe { libc::fchmod(directory.as_raw_fd(), mode as libc::mode_t) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -329,7 +361,14 @@ impl ExternalPluginConfig {
             handshake_timeout: Duration::from_secs(30),
             health_check_timeout: Duration::from_secs(5),
             registry: crate::catalog::RegistryConfig::default(),
+            launcher: None,
         }
+    }
+
+    /// Run plugins as another user through `launcher` (see [`crate::launcher`]).
+    pub fn with_launcher(mut self, launcher: crate::launcher::PluginLauncher) -> Self {
+        self.launcher = Some(launcher);
+        self
     }
 
     /// Inject an authenticated registry configuration. The default has no
@@ -387,6 +426,10 @@ pub struct ExternalPluginManager {
     actor_crypto: crate::proxy::ActorCryptoSlot,
     ai_service: Arc<RwLock<Option<Arc<dyn temps_ai::AiService>>>>,
     audit_service: Arc<RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
+    /// The launcher's isolation probe, once it has passed. Until then it runs
+    /// before every plugin start, and a failure keeps the plugin from
+    /// starting, so fixing the host and reloading plugins is enough.
+    isolation: tokio::sync::OnceCell<crate::launcher::IsolationReport>,
 }
 
 impl ExternalPluginManager {
@@ -399,7 +442,79 @@ impl ExternalPluginManager {
             actor_crypto: crate::proxy::ActorCryptoSlot::default(),
             ai_service: Arc::new(RwLock::new(None)),
             audit_service: Arc::new(RwLock::new(None)),
+            isolation: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Paths a plugin must never be able to open: this process's environment
+    /// and memory, and the installation's secret files. The launcher adds
+    /// whatever its host keeps besides.
+    fn protected_paths(&self) -> Vec<PathBuf> {
+        let pid = std::process::id();
+        let mut paths = vec![
+            PathBuf::from(format!("/proc/{pid}/environ")),
+            PathBuf::from(format!("/proc/{pid}/mem")),
+        ];
+        let data = &self.config.host_data_dir;
+        for (variable, default) in [
+            ("TEMPS_ENCRYPTION_KEY_FILE", "encryption_key"),
+            ("TEMPS_AUTH_SECRET_FILE", "auth_secret"),
+        ] {
+            paths.push(data.join(default));
+            if let Some(file) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+                paths.push(PathBuf::from(file));
+            }
+        }
+        if let Some(file) =
+            std::env::var_os("TEMPS_ADMIN_PASSWORD_FILE").filter(|value| !value.is_empty())
+        {
+            paths.push(PathBuf::from(file));
+        }
+        paths.push(data.join("cloud-link").join("state.json"));
+        paths.dedup();
+        paths
+    }
+
+    /// What a plugin running as the launcher's user needs of Temps' files:
+    /// to reach and execute its binary, and to own its data. The sockets
+    /// directory is shared when it is created.
+    #[cfg(unix)]
+    fn share_with_plugin_user(
+        &self,
+        binary_path: &Path,
+        plugin_data_dir: &Path,
+    ) -> std::io::Result<()> {
+        use crate::launcher::access;
+        let binary_dir = binary_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "plugin binary has no directory",
+            )
+        })?;
+        access::grant_traverse(&self.config.host_data_dir, binary_dir)?;
+        access::grant_exec(binary_path)?;
+        access::grant_traverse(&self.config.host_data_dir, &self.config.data_dir)?;
+        access::share_dir(plugin_data_dir)
+    }
+
+    /// The launcher's isolation probe, once. `Ok(None)` without a launcher.
+    async fn verified_isolation(&self) -> Result<Option<&crate::launcher::PluginLauncher>, String> {
+        let Some(launcher) = self.config.launcher.as_ref() else {
+            return Ok(None);
+        };
+        self.isolation
+            .get_or_try_init(|| async {
+                let report = launcher.probe(&self.protected_paths()).await?;
+                report.verify(crate::launcher::temps_uid())?;
+                info!("Plugin isolation verified: {}", report.summary());
+                Ok::<_, String>(report)
+            })
+            .await
+            .map_err(|error| {
+                error!("Plugin isolation check failed: {error}");
+                error
+            })?;
+        Ok(Some(launcher))
     }
 
     /// Install the bridge plugins use to call the platform's own HTTP API.
@@ -449,7 +564,14 @@ impl ExternalPluginManager {
         }
 
         #[cfg(unix)]
-        if let Err(error) = secure_socket_directory(&self.config.sockets_dir) {
+        // Under a launcher the plugin user (Temps' group) creates its socket
+        // here and Temps connects to it: group read-write, still no other.
+        let socket_mode = if self.config.launcher.is_some() {
+            0o770
+        } else {
+            0o700
+        };
+        if let Err(error) = secure_socket_directory(&self.config.sockets_dir, socket_mode) {
             error!(
                 directory = %self.config.sockets_dir.display(),
                 "Failed to create a secure 0700 plugin socket directory: {error}"
@@ -498,6 +620,13 @@ impl ExternalPluginManager {
         // Kill any stale plugin processes left over from a previous run
         // (e.g. if the server was killed without graceful shutdown).
         self.kill_stale_processes().await;
+
+        // Under a launcher, prove the isolation at every start, plugins or
+        // not, so the log says whether it holds before anything is installed.
+        // A failure is logged here and stops each plugin from starting below.
+        if self.config.launcher.is_some() {
+            let _ = self.verified_isolation().await;
+        }
 
         let (binaries, mut failures) = self.scan_plugins_dir().await;
 
@@ -684,6 +813,20 @@ impl ExternalPluginManager {
 
         let pid_file_path = self.config.pids_dir.join(format!("{}.pid", instance_name));
 
+        // Under a launcher, nothing starts until the plugin user is proven
+        // unable to read this process's secrets.
+        let launcher = self.verified_isolation().await?.cloned();
+        #[cfg(unix)]
+        if launcher.is_some() {
+            self.share_with_plugin_user(binary_path, &plugin_data_dir)
+                .map_err(|error| {
+                    format!(
+                        "Could not give the plugin account access to {binary_name}'s files: \
+                         {error}"
+                    )
+                })?;
+        }
+
         let executable = open_verified_executable(
             binary_name,
             &self.config.plugins_dir,
@@ -692,16 +835,25 @@ impl ExternalPluginManager {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let command_path = executable
-            .command_path(binary_name)
-            .map_err(|error| error.to_string())?;
-        let mut command = Command::new(command_path);
+        let mut command = match &launcher {
+            // The launcher checks the digest again as the plugin user and
+            // execs the binary by path: descriptors above 2 don't survive the
+            // change of user, and the plugin user can't write the binary.
+            Some(launcher) => launcher.exec_command(binary_path, expected_sha256),
+            None => Command::new(
+                executable
+                    .command_path(binary_name)
+                    .map_err(|error| error.to_string())?,
+            ),
+        };
         scrub_plugin_environment(&mut command);
         command
             // Registry plugins are host code, but they do not need the Temps
             // process's secrets. Required non-secret paths and URLs are
-            // passed explicitly below.
-            .kill_on_drop(true)
+            // passed explicitly below. Another user's process can't be
+            // signalled from here: `ExternalPluginProcess::kill` asks the
+            // launcher instead.
+            .kill_on_drop(launcher.is_none())
             .arg("--socket-path")
             .arg(socket_path.to_str().unwrap_or_default())
             .arg("--data-dir")
@@ -717,7 +869,20 @@ impl ExternalPluginManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Failed to spawn {}: {}", binary_name, e))?;
+            .map_err(|e| match &launcher {
+                Some(launcher) => format!(
+                    "Failed to start {binary_name} through the plugin launcher {}: {e}",
+                    launcher.program().display()
+                ),
+                None => format!("Failed to spawn {}: {}", binary_name, e),
+            })?;
+        // `kill_on_drop` can't signal another user's process, so every early
+        // return below stops a launched plugin through this guard instead.
+        // Declared after `child`, it drops first: the pid is still unreaped.
+        let mut launched = LaunchedPlugin {
+            launcher: launcher.as_ref(),
+            pid: child.id(),
+        };
         // Keep the verified executable descriptor alive until spawn has
         // completed and the child has inherited it.
         drop(executable);
@@ -857,6 +1022,23 @@ impl ExternalPluginManager {
         }
 
         debug!(plugin = %manifest.name, "Received manifest from plugin");
+
+        // The plugin is running its own code by now. Before it is sent the
+        // launch configuration, confirm it really is another user.
+        if launcher.is_some() {
+            let verified = match child.id() {
+                Some(pid) => {
+                    crate::launcher::verify_plugin_process(pid, crate::launcher::temps_uid())
+                }
+                None => Err(format!("{binary_name} exited during its handshake")),
+            };
+            if let Err(error) = verified {
+                if let Some(task) = stderr_task {
+                    task.abort();
+                }
+                return Err(format!("Plugin {binary_name} was not started: {error}"));
+            }
+        }
 
         // Stage 2: send one typed line to this same child. The manifest flags
         // control disclosure/routing for trusted installed code; they do not
@@ -1007,7 +1189,10 @@ impl ExternalPluginManager {
             }
         };
 
+        // Handed over: from here `ExternalPluginProcess` stops it.
+        launched.pid = None;
         Ok(ExternalPluginProcess {
+            launcher: launcher.clone(),
             manifest,
             binary_path: binary_path.to_path_buf(),
             sha256: expected_sha256.to_string(),
@@ -1405,6 +1590,7 @@ mod tests {
                 auth_secret: "fixture-auth".to_string(),
                 pid_file_path: root.join(format!("{name}-{version}.pid")),
                 child,
+                launcher: None,
                 has_ui: false,
                 channel: None,
                 openapi_schema: None,
@@ -1974,7 +2160,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join("sockets");
-        secure_socket_directory(&socket_dir).expect("secure socket directory");
+        secure_socket_directory(&socket_dir, 0o700).expect("secure socket directory");
 
         let mode = std::fs::metadata(socket_dir)
             .expect("socket directory metadata")
