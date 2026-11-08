@@ -442,7 +442,25 @@ pub(crate) fn scrub(value: &mut Value, secrets: &[SecretString]) {
             }
         }
         Value::Array(items) => items.iter_mut().for_each(|item| scrub(item, secrets)),
-        Value::Object(map) => map.values_mut().for_each(|item| scrub(item, secrets)),
+        Value::Object(map) => {
+            let original = std::mem::take(map);
+            for (key, mut item) in original {
+                let mut masked = Value::String(key);
+                scrub(&mut masked, secrets);
+                let Value::String(mut key) = masked else {
+                    continue;
+                };
+                scrub(&mut item, secrets);
+                // Preserve every value when masking makes distinct keys equal.
+                let base = key.clone();
+                let mut suffix = 2;
+                while map.contains_key(&key) {
+                    key = format!("{base} ({suffix})");
+                    suffix += 1;
+                }
+                map.insert(key, item);
+            }
+        }
         _ => {}
     }
 }
@@ -538,6 +556,28 @@ mod tests {
             &json!({"$ref": "#/components/schemas/CreateSource"}),
             &components(),
         )
+    }
+
+    #[test]
+    fn scrub_masks_object_keys_without_losing_colliding_values() {
+        let mut value = json!({"credential-one":1,"credential-two":2,"***":3,"nested":{"credential-one":"credential-two"}});
+        scrub(
+            &mut value,
+            &[
+                SecretString::new("credential-one"),
+                SecretString::new("credential-two"),
+            ],
+        );
+        assert!(!value.to_string().contains("credential-"));
+        let values: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_i64)
+            .collect();
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&1) && values.contains(&2) && values.contains(&3));
+        assert_eq!(value["nested"]["***"], "***");
     }
 
     #[test]

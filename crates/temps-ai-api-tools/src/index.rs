@@ -224,6 +224,9 @@ pub struct ApiOperation {
     /// Plugin JSON body metadata, including schemas with no flattened fields.
     #[serde(default)]
     pub has_json_body: bool,
+    /// Host-owned plugin consent; never inferred from untrusted descriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_enabled: Option<bool>,
     /// Stable identifier for this operation, used as the tool call name.
     pub operation_id: String,
     /// URL path template, e.g. `/projects/{project_id}/deployments/{id}`.
@@ -272,10 +275,7 @@ impl From<&ApiOperation> for OperationSummary {
                 .as_ref()
                 .map(|name| format!("/plugins/{name}")),
             source_plugin,
-            enabled: !op
-                .summary
-                .as_deref()
-                .is_some_and(|summary| summary.starts_with("[disabled;")),
+            enabled: op.plugin_enabled.unwrap_or(true),
             operation_id: op.operation_id.clone(),
             method: op.method.clone(),
             path: op.path.clone(),
@@ -749,6 +749,7 @@ fn build_api_operation(
 
     ApiOperation {
         has_json_body: false,
+        plugin_enabled: None,
         operation_id,
         path,
         method: method.to_string(),

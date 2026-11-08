@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   getProjectsInfiniteOptions,
   listGlobalMcpsOptions,
@@ -1326,6 +1327,7 @@ export function projectNavItemsFor(project: {
 }
 
 export function CommandPalette() {
+  const isAdmin = useIsInstanceAdmin()
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   // The highlighted row, controlled so it always matches the ranked list.
@@ -1525,7 +1527,7 @@ export function CommandPalette() {
         icon: resolvePluginIcon(entry.icon),
         keywords: ['plugin', entry.pluginName, entry.label.toLowerCase()],
       })),
-      ...plugins.map((plugin) => {
+      ...(isAdmin ? plugins : []).map((plugin) => {
         const setting = pluginAiToolSetting(plugin.name)
         return {
           title: setting.title,
@@ -1535,7 +1537,7 @@ export function CommandPalette() {
         }
       }),
     ],
-    [platformNavEntries, settingsNavEntries, plugins]
+    [platformNavEntries, settingsNavEntries, plugins, isAdmin]
   )
 
   // Project-scoped plugin nav entries (relative URLs, prefixed at render time)

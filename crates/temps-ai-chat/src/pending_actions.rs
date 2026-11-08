@@ -1184,6 +1184,41 @@ mod tests {
         assert!(log.contains("***"));
     }
 
+    #[tokio::test]
+    async fn standalone_and_plan_inserts_bind_plugin_revision() {
+        for plan in [false, true] {
+            let row = make_proposed(1, "approval", 7);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![row]])
+                    .into_connection(),
+            );
+            let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+            let mut prepared = make_prepared();
+            let revision = "00000000-0000-4000-8000-000000000123";
+            prepared.plugin_revision = Some(revision.into());
+            if plan {
+                svc.create_plan(1, Some(7), &[(prepared, None)], 1)
+                    .await
+                    .unwrap();
+            } else {
+                svc.create(1, Some(7), &prepared, None, 1).await.unwrap();
+            }
+            drop(svc);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let insert = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .find(|s| s.sql.starts_with("INSERT"))
+                .unwrap();
+            assert!(insert.sql.contains("plugin_revision"));
+            assert!(
+                format!("{:?}", insert.values).contains(revision),
+                "{insert:?}"
+            );
+        }
+    }
+
     // get: not-found returns NotFound.
     #[tokio::test]
     async fn test_get_not_found_returns_error() {

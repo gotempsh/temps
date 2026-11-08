@@ -75474,6 +75474,7 @@
       "UpdatePluginAiTools": {
         "properties": {
           "actor_id": {
+            "description": "Current actor_id returned by GET; replacing the installation requires fresh consent.",
             "type": "string"
           },
           "enabled": {
@@ -169821,10 +169822,29 @@
           "401": {},
           "403": {},
           "404": {},
-          "409": {},
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Plugin actor replaced; reload current actor_id before choosing consent again"
+          },
           "413": {},
           "415": {},
           "422": {},
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
           "500": {}
         },
         "security": [

@@ -905,8 +905,9 @@ mod tests {
             .await
             .unwrap();
         let entries = audit.0.lock().unwrap().clone();
-        assert_eq!(entries.len(), 1);
-        let entry: Value = serde_json::from_str(&entries[0]).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(serde_json::from_str::<Value>(&entries[0]).unwrap()["succeeded"].is_null());
+        let entry: Value = serde_json::from_str(&entries[1]).unwrap();
         assert_eq!(entry["plugin"], "reports");
         assert_eq!(entry["user_id"], 7);
         assert_eq!(entry["succeeded"], true);
@@ -935,7 +936,7 @@ mod tests {
             .is_err());
         assert_eq!(
             audit.0.lock().unwrap().len(),
-            1,
+            2,
             "a stale approval never executes"
         );
         // Uninstall removes discovery and revokes an already prepared writer.
@@ -950,6 +951,55 @@ mod tests {
             .await
             .is_err());
     }
+    #[tokio::test]
+    async fn cancelled_plugin_writes_leave_an_audit_attempt() {
+        use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};
+        use std::sync::Arc;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let router = Router::new().route(
+            "/x/reports/create",
+            axum::routing::post(move || {
+                let notify = notify.clone();
+                async move {
+                    notify.notify_one();
+                    std::future::pending::<String>().await
+                }
+            }),
+        );
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}}}})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        let audit = Arc::new(PluginAudit::default());
+        registry.bind(
+            InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Write,
+            audit.clone(),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let caller = handle.get().unwrap();
+        let task = tokio::spawn(async move {
+            caller
+                .execute_write("plugin.reports.create", json!({}), &secrets_scope(None))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event: Value = serde_json::from_str(&events[0]).unwrap();
+        assert!(
+            event["succeeded"].is_null(),
+            "unknown outcome must not be reported as failure or success"
+        );
+        assert_eq!(event["operation_id"], "plugin.reports.create");
+    }
+
     #[tokio::test]
     async fn plugin_responses_keep_size_caps_secret_scrubbing_and_failure_audits() {
         use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};
@@ -1005,15 +1055,14 @@ mod tests {
                 &scope,
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            response,
-            crate::ApiToolError::BodyReadError { .. }
-        ));
+            .unwrap();
+        assert!(response.truncated);
+        assert!(response.body.as_str().unwrap().len() <= 256);
+        assert!(!response.body.to_string().contains(SECRET_VALUE));
         let events = audit.0.lock().unwrap();
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 6);
         assert_eq!(
-            serde_json::from_str::<Value>(&events[1]).unwrap()["succeeded"],
+            serde_json::from_str::<Value>(&events[3]).unwrap()["succeeded"],
             false
         );
     }

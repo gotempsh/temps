@@ -92,9 +92,11 @@ export function createToolPlugin(base: TempsPlugin) {
       const key = `${method} ${path}`;
       if (
         routes.has(key) ||
-        Object.values(paths).some((item) =>
-          Object.values(item).some(
+        Object.values({ ...originalPaths, ...paths }).some((item) =>
+          Object.values(item as Record<string, unknown>).some(
             (op) =>
+              op !== null &&
+              typeof op === "object" &&
               (op as { operationId?: string }).operationId === options.name,
           ),
         )
@@ -174,7 +176,7 @@ export function createToolPlugin(base: TempsPlugin) {
             }
             input = JSON.parse(Buffer.concat(chunks).toString() || "{}");
           }
-          input = options.input.parse(input);
+          input = await options.input.parseAsync(input);
         } catch {
           res.writeHead(400);
           res.end("Invalid tool input");

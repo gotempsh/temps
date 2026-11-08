@@ -276,7 +276,7 @@ fn parameter_is_supplied(
         .and_then(|object| object.get(&param.name))
         .is_some_and(|value| {
             !value.is_null()
-                || (param.ty == "json" && matches!(param.location, ParamLocation::Body))
+                || (param.ty == "json" && !matches!(param.location, ParamLocation::Path))
         })
 }
 
@@ -334,8 +334,8 @@ fn build_request_parts_scoped(
     // time, and never reaches a valid call. Collecting them means one round.
     //
     // The rules mirror the loop exactly — auto-filled project selectors and the
-    // injected `limit` are not "missing", and absent query params are left to the
-    // router (OpenAPI required-ness is frequently wrong for those).
+    // injected core `limit` are not "missing". Core query metadata retains its
+    // compatibility exception; required plugin query inputs are enforced.
     let missing: Vec<&str> = op
         .params
         .iter()
@@ -354,7 +354,7 @@ fn build_request_parts_scoped(
             match param.location {
                 ParamLocation::Path => true,
                 ParamLocation::Body => param.required,
-                ParamLocation::Query => false,
+                ParamLocation::Query => op.operation_id.starts_with("plugin.") && param.required,
             }
         })
         .map(|param| param.name.as_str())
@@ -1099,6 +1099,17 @@ impl InternalApiCaller {
                     "AI access is disabled; enable it in plugin settings",
                 ));
             }
+            if binding.access == crate::PluginToolAccess::Write {
+                let event = crate::plugin_registry::PluginWriteAudit {
+                    plugin,
+                    operation_id,
+                    user_id: scope.auth.user_id_opt(),
+                    succeeded: None,
+                };
+                if let Err(error) = binding.audit.create_audit_log(&event).await {
+                    tracing::error!(plugin, operation_id, %error, "Failed to audit plugin AI write attempt");
+                }
+            }
             let result = match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 self.call_inner(operation_id, params, scope),
@@ -1116,7 +1127,7 @@ impl InternalApiCaller {
                     plugin,
                     operation_id,
                     user_id: scope.auth.user_id_opt(),
-                    succeeded: result.is_ok(),
+                    succeeded: Some(result.is_ok()),
                 };
                 if let Err(error) = binding.audit.create_audit_log(&event).await {
                     tracing::error!(plugin, operation_id, %error, "Failed to audit plugin AI write");
@@ -1684,21 +1695,25 @@ async fn collect_body(
     max_bytes: usize,
     operation_id: &str,
 ) -> Result<(Value, bool), ApiToolError> {
-    // We collect up to max_bytes + 1 so we can detect truncation.
-    let cap = max_bytes + 1;
-    let bytes = axum::body::to_bytes(body, cap)
-        .await
-        .map_err(|e| ApiToolError::BodyReadError {
+    use http_body_util::BodyExt;
+    let mut body = body;
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| ApiToolError::BodyReadError {
             operation_id: operation_id.to_string(),
-            reason: format!("Failed to read response body bytes: {}", e),
+            reason: format!("Failed to read response body bytes: {e}"),
         })?;
-
-    let truncated = bytes.len() > max_bytes;
-    let slice = if truncated {
-        &bytes[..max_bytes]
-    } else {
-        &bytes[..]
-    };
+        if let Ok(data) = frame.into_data() {
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&data[..data.len().min(remaining)]);
+            if data.len() > remaining {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    let slice = &bytes;
 
     let text = String::from_utf8_lossy(slice);
 
@@ -1780,6 +1795,7 @@ mod tests {
     fn make_op(operation_id: &str, path: &str, params: Vec<ParamSpec>) -> ApiOperation {
         ApiOperation {
             has_json_body: false,
+            plugin_enabled: None,
             operation_id: operation_id.to_string(),
             path: path.to_string(),
             method: "GET".to_string(),
@@ -1799,6 +1815,7 @@ mod tests {
     ) -> ApiOperation {
         ApiOperation {
             has_json_body: false,
+            plugin_enabled: None,
             operation_id: operation_id.to_string(),
             path: path.to_string(),
             method: method.to_string(),
@@ -1868,6 +1885,7 @@ mod tests {
     fn op_tagged(tag: &str) -> ApiOperation {
         ApiOperation {
             has_json_body: false,
+            plugin_enabled: None,
             tags: if tag.is_empty() {
                 vec![]
             } else {
@@ -1880,6 +1898,7 @@ mod tests {
     fn op_tagged_with_method(tag: &str, method: &str) -> ApiOperation {
         ApiOperation {
             has_json_body: false,
+            plugin_enabled: None,
             method: method.to_string(),
             tags: if tag.is_empty() {
                 vec![]

@@ -7082,8 +7082,9 @@ async fn plugin_write_waits_for_approval_then_executes_and_audits() {
     let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
     assert_eq!(calls.load(Ordering::SeqCst), 1, "{result} {transactions:?}");
     let events = audit.0.lock().unwrap();
-    assert_eq!(events.len(), 1);
-    let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(serde_json::from_str::<serde_json::Value>(&events[0]).unwrap()["succeeded"].is_null());
+    let event: serde_json::Value = serde_json::from_str(&events[1]).unwrap();
     assert_eq!(event["plugin"], "reports");
     assert_eq!(event["user_id"], auth.user_id());
     assert_eq!(event["succeeded"], true);

@@ -34,6 +34,53 @@ async function request(
   return res;
 }
 describe("endpoint AI tools", () => {
+  it("awaits async refinements before invoking the handler", async () => {
+    const handler = vi.fn((input) => input);
+    const p = plugin().tool({
+      name: "create",
+      description: "Create report",
+      input: z.object({
+        name: z.string().refine(async (value) => value.length > 0),
+      }),
+      handler,
+    });
+    const valid = await request(
+      p,
+      "POST",
+      "/tools/create",
+      '{"name":"report"}',
+    );
+    expect(valid.writeHead).toHaveBeenCalledWith(200, {
+      "Content-Type": "application/json",
+    });
+    const invalid = await request(p, "POST", "/tools/create", '{"name":""}');
+    expect(invalid.writeHead).toHaveBeenCalledWith(400);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+  it("rejects operation IDs already declared by the base plugin", () => {
+    const base = plugin();
+    const original = base.openapi!();
+    base.openapi = () => ({
+      ...original,
+      paths: {
+        "/original": {
+          get: {
+            operationId: "list",
+            "x-temps-ai-tool": {},
+            responses: { "200": { description: "OK" } },
+          },
+        },
+      },
+    });
+    expect(() =>
+      createToolPlugin(base).tool({
+        name: "list",
+        description: "List",
+        input: z.object({}),
+        handler: () => ({}),
+      }),
+    ).toThrow("Duplicate tool name or route");
+  });
   it("decodes single-string composite query schemas including references", async () => {
     for (const value of [
       z.union([z.string()]),

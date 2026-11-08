@@ -35284,6 +35284,9 @@ export type UpdatePermissionModeRequest = {
 };
 
 export type UpdatePluginAiTools = {
+    /**
+     * Current actor_id returned by GET; replacing the installation requires fresh consent.
+     */
     actor_id: string;
     enabled: boolean;
 };
@@ -91708,12 +91711,21 @@ export type PutPluginAiToolsErrors = {
     401: unknown;
     403: unknown;
     404: unknown;
-    409: unknown;
+    /**
+     * Plugin actor replaced; reload current actor_id before choosing consent again
+     */
+    409: ProblemDetails;
     413: unknown;
     415: unknown;
     422: unknown;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
     500: unknown;
 };
+
+export type PutPluginAiToolsError = PutPluginAiToolsErrors[keyof PutPluginAiToolsErrors];
 
 export type PutPluginAiToolsResponses = {
     200: PluginAiToolsResponse;

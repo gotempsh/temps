@@ -8,7 +8,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { z } from 'zod'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { SaveRow, SettingsSection } from '@temps-sdk/ds'
-import { Switch } from '@/components/ui/switch'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Button } from '@/components/ui/button'
@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/dialog'
 import { Bot } from 'lucide-react'
 import { toast } from 'sonner'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 const consentSchema = z.object({
@@ -30,6 +31,7 @@ const consentSchema = z.object({
 })
 
 export function PluginAiTools({ name }: { name: string }) {
+  const isAdmin = useIsInstanceAdmin()
   const [open, setOpen] = useState(false)
   const client = useQueryClient()
   const queryKey = ['plugin-ai-tools', name]
@@ -40,6 +42,7 @@ export function PluginAiTools({ name }: { name: string }) {
     queryFn: async () =>
       (await getPluginAiTools({ path: { name }, throwOnError: true })).data,
     retry: false,
+    enabled: isAdmin,
   })
   const form = useForm({
     defaultValues: { enabled: false, actor_id: '' },
@@ -86,6 +89,7 @@ export function PluginAiTools({ name }: { name: string }) {
       save.reset()
     }
   }
+  if (!isAdmin) return null
   return (
     <>
       <section
@@ -132,13 +136,15 @@ export function PluginAiTools({ name }: { name: string }) {
             ) : tools.data ? (
               <div className="space-y-3">
                 <div className="flex items-center gap-3">
-                  <Switch
+                  <Checkbox
                     id={`plugin-ai-${name}`}
                     checked={enabled}
                     aria-disabled={save.isPending}
                     onCheckedChange={(value) => {
                       if (!save.isPending)
-                        form.setValue('enabled', value, { shouldDirty: true })
+                        form.setValue('enabled', value === true, {
+                          shouldDirty: true,
+                        })
                     }}
                   />
                   <Label htmlFor={`plugin-ai-${name}`}>

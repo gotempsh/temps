@@ -35,6 +35,7 @@ axum = { workspace = true }
 matchit = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
 
 # API documentation
 utoipa = { workspace = true }

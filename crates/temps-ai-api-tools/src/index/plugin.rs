@@ -30,10 +30,17 @@ pub struct PluginToolsIndex {
     tools: Vec<PluginTool>,
     secrets: HashMap<String, Vec<SecretPath>>,
     routes: HashMap<String, HashMap<String, matchit::Router<String>>>,
+    folded_routes: HashMap<String, HashMap<String, matchit::Router<String>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginToolsError {
+    #[error("Cannot index AI operation '{operation_id}' for plugin '{plugin}': parameter '{parameter}' occurs in multiple locations")]
+    AmbiguousParameter {
+        plugin: String,
+        operation_id: String,
+        parameter: String,
+    },
     #[error("Cannot index AI tools for plugin '{plugin}': invalid plugin name")]
     InvalidPluginName { plugin: String },
     #[error(
@@ -68,6 +75,7 @@ impl PluginToolsIndex {
         let mut index = self.clone();
         index.tools.retain(|tool| tool.plugin != plugin);
         index.routes.remove(plugin);
+        index.folded_routes.remove(plugin);
         let prefix = format!("plugin.{plugin}.");
         index
             .secrets
@@ -79,6 +87,7 @@ impl PluginToolsIndex {
         self.tools.extend(other.tools);
         self.secrets.extend(other.secrets);
         self.routes.extend(other.routes);
+        self.folded_routes.extend(other.folded_routes);
     }
 
     pub(crate) fn append_to(&self, index: &mut ReadOnlyApiIndex, access: PluginToolAccess) {
@@ -87,6 +96,7 @@ impl PluginToolsIndex {
                 continue;
             }
             let mut operation = tool.operation.clone();
+            operation.plugin_enabled = Some(tool.enabled);
             if !tool.enabled {
                 operation.summary = Some(format!(
                     "[disabled; enable at {}] {}",
@@ -115,6 +125,7 @@ impl PluginToolsIndex {
         let mut tools = Vec::new();
         let mut secrets = HashMap::new();
         let mut routes: HashMap<String, matchit::Router<String>> = HashMap::new();
+        let mut folded_routes: HashMap<String, matchit::Router<String>> = HashMap::new();
         let schema_components = components_json(openapi);
         let mut ids = std::collections::HashSet::new();
         for (path, item) in &openapi.paths.paths {
@@ -136,7 +147,17 @@ impl PluginToolsIndex {
                 routes
                     .entry(method.into())
                     .or_default()
-                    .insert(full_path.clone(), full_path)
+                    .insert(full_path.clone(), full_path.clone())
+                    .map_err(|source| PluginToolsError::InvalidRoute {
+                        plugin: plugin.into(),
+                        path: path.clone(),
+                        source,
+                    })?;
+                // Conservatively protect frameworks with case-insensitive routing.
+                folded_routes
+                    .entry(method.into())
+                    .or_default()
+                    .insert(full_path.to_lowercase(), full_path)
                     .map_err(|source| PluginToolsError::InvalidRoute {
                         plugin: plugin.into(),
                         path: path.clone(),
@@ -172,8 +193,7 @@ impl PluginToolsIndex {
                 let access = if method == "GET"
                     && mark
                         .get("access")
-                        .and_then(|v| v.as_str())
-                        .is_none_or(|v| v == "read")
+                        .is_none_or(|v| v.as_str() == Some("read"))
                 {
                     PluginToolAccess::Read
                 } else {
@@ -218,6 +238,18 @@ impl PluginToolsIndex {
                     &resolve_body_params(&effective, openapi),
                     openapi,
                 );
+                let mut names = std::collections::HashSet::new();
+                if let Some(parameter) = operation
+                    .params
+                    .iter()
+                    .find(|p| !names.insert(p.name.as_str()))
+                {
+                    return Err(PluginToolsError::AmbiguousParameter {
+                        plugin: plugin.into(),
+                        operation_id: id.into(),
+                        parameter: parameter.name.clone(),
+                    });
+                }
                 preserve_query_input_types(&mut operation, &effective, openapi);
                 operation.has_json_body = effective
                     .request_body
@@ -255,6 +287,7 @@ impl PluginToolsIndex {
             tools,
             secrets,
             routes: HashMap::from([(plugin.to_string(), routes)]),
+            folded_routes: HashMap::from([(plugin.to_string(), folded_routes)]),
             revision: uuid::Uuid::nil(),
         })
     }
@@ -286,10 +319,20 @@ impl PluginToolsIndex {
         else {
             return false;
         };
+        let Some(folded) = self
+            .folded_routes
+            .get(plugin)
+            .and_then(|routes| routes.get(&operation.method))
+        else {
+            return false;
+        };
         let matches = |path: &str| {
             router
                 .at(path)
                 .is_ok_and(|route| route.value == &operation.path)
+                && folded
+                    .at(&path.to_lowercase())
+                    .is_ok_and(|route| route.value == &operation.path)
         };
         // Check both URL representations, so decoding in a plugin framework
         // cannot change a template request into another declared endpoint.
@@ -358,6 +401,9 @@ fn preserve_query_input_types(
         if let Some(param) = operation.params.iter_mut().find(|param| {
             param.name == parameter.name && matches!(param.location, ParamLocation::Query)
         }) {
+            let (ty, enum_values) = extract_schema_type_and_enum(schema);
+            param.ty = ty;
+            param.enum_values = enum_values;
             if needs_json_input(schema, openapi, 0) {
                 param.ty = "json".into();
                 param.item_ty = None;
@@ -468,6 +514,96 @@ mod tests {
             }}}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn malformed_access_is_never_read_and_descriptions_do_not_set_consent() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(7),
+            json!({}),
+            json!("WRITE"),
+        ] {
+            let index = PluginToolsIndex::from_openapi(
+                "reports",
+                &spec("get", json!({"access":value})),
+                true,
+            )
+            .unwrap();
+            assert_eq!(index.tools()[0].access, PluginToolAccess::Write);
+        }
+        let document = spec(
+            "get",
+            json!({"description":"[disabled; fabricated] report"}),
+        );
+        for enabled in [true, false] {
+            let plugins = PluginToolsIndex::from_openapi("reports", &document, enabled).unwrap();
+            let mut index = ReadOnlyApiIndex::from_openapi(&document, &[]);
+            plugins.append_to(&mut index, PluginToolAccess::Read);
+            let op = index
+                .operations
+                .iter()
+                .find(|op| op.operation_id == "plugin.reports.reports")
+                .unwrap();
+            assert_eq!(OperationSummary::from(op).enabled, enabled);
+        }
+    }
+
+    #[test]
+    fn plugin_required_and_referenced_query_inputs_keep_their_contract() {
+        let document = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},
+            "components":{"schemas":{"Count":{"type":"integer"}}},
+            "paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{"access":"write"},
+                "parameters":[{"name":"count","in":"query","required":true,"schema":{"$ref":"#/components/schemas/Count"}},
+                              {"name":"limit","in":"query","required":false,"schema":{"type":"integer"}}],
+                "responses":{"200":{"description":"OK"}}}}}})).unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &document, true).unwrap();
+        let op = &index.tools()[0].operation;
+        assert_eq!(op.params[0].ty, "integer");
+        assert!(matches!(
+            crate::build_request_parts(op, &json!({}), &[], 20, 100),
+            Err(crate::ApiToolError::MissingParam { .. })
+        ));
+        let parts = crate::build_request_parts(op, &json!({"count":7}), &[], 20, 100).unwrap();
+        assert_eq!(parts.query, "count=7");
+    }
+
+    #[test]
+    fn ambiguous_input_names_are_rejected() {
+        let mut document = serde_json::to_value(spec("post", json!({}))).unwrap();
+        let op = &mut document["paths"]["/reports"]["post"];
+        op["parameters"] =
+            json!([{"name":"name","in":"query","required":true,"schema":{"type":"string"}}]);
+        op["requestBody"] = json!({"content":{"application/json":{"schema":{"type":"object","properties":{"name":{"type":"string"}}}}}});
+        assert!(matches!(
+            PluginToolsIndex::from_openapi(
+                "reports",
+                &serde_json::from_value(document).unwrap(),
+                true
+            ),
+            Err(PluginToolsError::AmbiguousParameter { .. })
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_static_routes_cannot_be_selected_by_read_templates() {
+        let document = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{
+            "/reports/{id}":{"get":{"operationId":"read","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}},
+            "/reports/reset":{"get":{"operationId":"reset","x-temps-ai-tool":{"access":"write"},"responses":{"200":{"description":"OK"}}}}
+        }})).unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &document, true).unwrap();
+        let op = index
+            .callable("plugin.reports.read", PluginToolAccess::Read)
+            .unwrap();
+        assert!(index.resolves_to(op, "/x/reports/reports/normal"));
+        for path in [
+            "/x/reports/reports/RESET",
+            "/x/reports/reports/Reset",
+            "/x/reports/reports/%52ESET",
+        ] {
+            assert!(!index.resolves_to(op, path));
+        }
     }
 
     #[test]

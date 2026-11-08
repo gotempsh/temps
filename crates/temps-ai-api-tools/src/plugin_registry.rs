@@ -80,7 +80,8 @@ pub(crate) struct PluginWriteAudit<'a> {
     pub plugin: &'a str,
     pub operation_id: &'a str,
     pub user_id: Option<i32>,
-    pub succeeded: bool,
+    /// None records an attempt before dispatch; cancellation may leave outcome unknown.
+    pub succeeded: Option<bool>,
 }
 
 impl temps_core::audit::AuditOperation for PluginWriteAudit<'_> {

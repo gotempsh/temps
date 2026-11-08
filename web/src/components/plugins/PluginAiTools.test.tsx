@@ -8,6 +8,8 @@ import { toast } from 'sonner'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { announceMutationFailure } from '@/lib/mutation-error-toast'
+import { AuthContext } from '@/contexts/AuthContext-shared'
+import type { UserResponse } from '@/api/client/types.gen'
 import { PluginAiTools } from './PluginAiTools'
 
 installBrowserWindow()
@@ -32,7 +34,7 @@ const settings = {
     },
   ],
 }
-function mount(open = true) {
+function mount(open = true, role = 'admin') {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false },
@@ -48,7 +50,17 @@ function mount(open = true) {
   })
   const view = render(
     <QueryClientProvider client={client}>
-      <PluginAiTools name="reports" />
+      <AuthContext.Provider
+        value={{
+          user: { role } as UserResponse,
+          isLoading: false,
+          error: null,
+          logout: async () => {},
+          refetch: () => {},
+        }}
+      >
+        <PluginAiTools name="reports" />
+      </AuthContext.Provider>
     </QueryClientProvider>
   )
   if (open) fireEvent.click(view.getByRole('button', { name: 'AI chat tools' }))
@@ -60,7 +72,7 @@ test('keeps an always-visible compact entry point without opening optional setti
   const view = mount(false)
   expect(await view.findByText('AI access off · 2 tools')).toBeTruthy()
   expect(view.queryByRole('dialog')).toBeNull()
-  expect(view.queryByRole('switch')).toBeNull()
+  expect(view.queryByRole('checkbox')).toBeNull()
   fireEvent.click(view.getByRole('button', { name: 'AI chat tools' }))
   expect(await view.findByRole('dialog')).toBeTruthy()
   expect(view.getByText('List reports')).toBeTruthy()
@@ -89,7 +101,7 @@ test('lists read/write tools and saves consent with actor identity and success f
   const view = mount()
   expect(await view.findByText('List reports')).toBeTruthy()
   expect(view.getByText('write')).toBeTruthy()
-  const toggle = view.getByRole('switch', {
+  const toggle = view.getByRole('checkbox', {
     name: 'Allow AI chat to use these tools',
   })
   expect(toggle.getAttribute('aria-checked')).toBe('false')
@@ -111,7 +123,7 @@ test('always renders the AI tools section and empty state', async () => {
     await view.findByText('This plugin declares no AI tools.')
   ).toBeTruthy()
   expect(view.getByText('AI chat tools')).toBeTruthy()
-  expect(view.getByRole('switch')).toBeTruthy()
+  expect(view.getByRole('checkbox')).toBeTruthy()
 })
 
 test('failed toggle preserves consent and shows an error toast and retry guidance', async () => {
@@ -125,7 +137,7 @@ test('failed toggle preserves consent and shows an error toast and retry guidanc
       ),
   })
   const view = mount()
-  const toggle = await view.findByRole('switch')
+  const toggle = await view.findByRole('checkbox')
   fireEvent.click(toggle)
   fireEvent.click(view.getByRole('button', { name: 'Save' }))
   expect(await view.findByRole('alert')).toBeTruthy()
@@ -167,7 +179,7 @@ test('reloads a replacement identity and requires a new consent choice after con
     },
   })
   const view = mount()
-  const toggle = await view.findByRole('switch')
+  const toggle = await view.findByRole('checkbox')
   await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
   fireEvent.click(toggle)
   fireEvent.click(view.getByRole('button', { name: 'Save' }))
@@ -185,4 +197,18 @@ test('reloads a replacement identity and requires a new consent choice after con
       { actor_id: replacement.actor_id, enabled: true },
     ])
   )
+})
+
+test('does not request or show admin consent settings for non-administrators', async () => {
+  let requests = 0
+  mockApi({
+    'GET /x/plugins/reports/ai-tools': () => {
+      requests++
+      return jsonResponse(settings)
+    },
+  })
+  const view = mount(false, 'user')
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  expect(view.queryByRole('button', { name: 'AI chat tools' })).toBeNull()
+  expect(requests).toBe(0)
 })
