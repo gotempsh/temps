@@ -29,6 +29,7 @@ import { ScrollRegion } from '@/components/ui/scroll-region'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
+import { openExternal } from '@/lib/open-external'
 import { isGitHubApp } from '@/lib/provider'
 import { Button as AsyncButton, Callout, Status } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -558,7 +559,7 @@ export function GitProviderFlow({
     // GitLab doesn't support automatic app creation like GitHub
     // We need to show the user the information and open the settings page
     const gitlabUrl = gitlabBaseUrl || 'https://gitlab.com'
-    window.open(`${gitlabUrl}/-/user_settings/applications`, '_blank')
+    openExternal(`${gitlabUrl}/-/user_settings/applications`)
 
     toast.success('Opening GitLab Applications page...', {
       description: 'Please fill in the form with the information shown below',
@@ -1635,9 +1636,8 @@ export function GitProviderFlow({
                     variant="link"
                     className="p-0 h-auto font-normal text-sm"
                     onClick={() =>
-                      window.open(
-                        'https://github.com/settings/tokens/new?description=Temps%20Platform&scopes=repo,read:user,read:org',
-                        '_blank'
+                      openExternal(
+                        'https://github.com/settings/tokens/new?description=Temps%20Platform&scopes=repo,read:user,read:org'
                       )
                     }
                   >
@@ -1676,10 +1676,7 @@ export function GitProviderFlow({
                       variant="outline"
                       size="sm"
                       onClick={() =>
-                        window.open(
-                          'https://github.com/settings/apps/new',
-                          '_blank'
-                        )
+                        openExternal('https://github.com/settings/apps/new')
                       }
                     >
                       <ExternalLink className="mr-2 h-3 w-3" />
@@ -1989,9 +1986,8 @@ export function GitProviderFlow({
                     variant="link"
                     className="p-0 h-auto font-normal text-sm"
                     onClick={() =>
-                      window.open(
-                        `${gitlabBaseUrl || 'https://gitlab.com'}/-/profile/personal_access_tokens`,
-                        '_blank'
+                      openExternal(
+                        `${gitlabBaseUrl || 'https://gitlab.com'}/-/profile/personal_access_tokens`
                       )
                     }
                   >
