@@ -348,15 +348,14 @@ fn render_operation_help(op: &ApiOperation) -> String {
     } else {
         out.push_str("Flags:\n");
         for p in flags {
-            // Path params are structurally required, and so are body fields the
-            // schema marks required — a write call fails without them, so the
-            // help has to say which ones they are. (Query params stay unmarked:
-            // they're optional filters, and OpenAPI required-ness is frequently
-            // wrong for them, so claiming "required" would send the model
-            // inventing values for filters it should simply omit.)
+            // Plugin query contracts are authoritative. Curated core queries
+            // retain their compatibility exception for inaccurate required flags.
             let req = match p.location {
                 ParamLocation::Path => " (required)",
                 ParamLocation::Body if p.required => " (required)",
+                ParamLocation::Query if p.required && op.operation_id.starts_with("plugin.") => {
+                    " (required)"
+                }
                 _ => "",
             };
             out.push_str(&format!("  --{} {}{}", p.name, flag_value_label(p), req));
@@ -891,6 +890,31 @@ mod tests {
     }
 
     use crate::index::ParamSpec;
+
+    #[test]
+    fn operation_help_marks_required_plugin_queries_but_preserves_core_compatibility() {
+        for method in ["get", "post"] {
+            let spec = serde_json::from_value(serde_json::json!({
+                "openapi":"3.1.0", "info":{"title":"Reports","version":"1"},
+                "paths":{"/reports":{method:{
+                    "operationId":"list", "x-temps-ai-tool":{},
+                    "parameters":[
+                        {"name":"report_name","in":"query","required":true,"schema":{"type":"string"}},
+                        {"name":"filter","in":"query","required":false,"schema":{"type":"string"}}
+                    ],
+                    "responses":{"200":{"description":"OK"}}
+                }}}
+            })).unwrap();
+            let plugin = crate::PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut operation = plugin.tools()[0].operation.clone();
+            let help = render_operation_help(&operation);
+            assert!(help.contains("--report_name <string> (required)"), "{help}");
+            assert!(help.contains("--filter <string>\n"), "{help}");
+            operation.operation_id = "list_reports".into();
+            let core_help = render_operation_help(&operation);
+            assert!(!core_help.contains("(required)"), "{core_help}");
+        }
+    }
 
     #[test]
     fn operation_help_explains_optional_project_linkage() {

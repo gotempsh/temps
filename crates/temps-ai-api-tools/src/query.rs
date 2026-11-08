@@ -162,7 +162,7 @@ mod tests {
             let router = Router::new().route(
                 "/x/reports/list",
                 get(|request: Request| async move {
-                    let pairs: Vec<_> = request
+                    let mut pairs: Vec<_> = request
                         .uri()
                         .query()
                         .unwrap_or("")
@@ -175,6 +175,9 @@ mod tests {
                             ]
                         })
                         .collect();
+                    // Object fields have no wire order. Stable sorting preserves
+                    // the order of repeated array values under the same key.
+                    pairs.sort_by(|left, right| left[0].cmp(&right[0]));
                     Json(pairs)
                 }),
             );
