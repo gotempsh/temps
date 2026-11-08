@@ -1036,6 +1036,11 @@ impl ExternalPluginsService {
                 }))
             }
         }
+        // Invalidate before the cancellable write: a lost acknowledgement can
+        // mean revocation committed. Recovery reloads authoritative consent.
+        self.ai_tools
+            .publish(self.ai_tools.snapshot().without_plugin(name));
+        self.schedule_consent_recovery();
         // Persist revocation before removing the installation. A database failure
         // leaves the installation intact so reinstall cannot inherit stale consent.
         crate::grants::PluginGrantService::new(self.db.clone())
@@ -1049,8 +1054,6 @@ impl ExternalPluginsService {
                 })
             })?;
 
-        self.ai_tools
-            .publish(self.ai_tools.snapshot().without_plugin(name));
         if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
             return Err(ExternalPluginsError::NotInstalled {
                 name: name.to_string(),
@@ -2304,7 +2307,10 @@ except Exception:
             active.is_file(),
             "a failed revocation must not remove the active installation"
         );
-        assert!(Arc::ptr_eq(&before, &service.ai_tools.snapshot()));
+        assert!(
+            !Arc::ptr_eq(&before, &service.ai_tools.snapshot()),
+            "an uncertain revocation must invalidate the prior AI snapshot"
+        );
         service.uninstall_plugin("reports").await.unwrap();
         assert!(
             !active.exists(),

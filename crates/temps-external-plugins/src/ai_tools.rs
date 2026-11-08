@@ -163,7 +163,7 @@ impl ExternalPluginsService {
 
     // One worker per service, also armed before a cancellable consent write.
     // It reloads authoritative state, never retries a potentially committed write.
-    fn schedule_consent_recovery(&self) {
+    pub(crate) fn schedule_consent_recovery(&self) {
         if self.closing.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
@@ -564,8 +564,8 @@ mod tests {
         shutdown.await.unwrap();
         assert!(service.ai_tools.snapshot().tools().is_empty());
     }
-    #[tokio::test]
-    async fn failed_uninstall_revocation_retains_other_plugins_tools() {
+    #[tokio::test(start_paused = true)]
+    async fn failed_uninstall_revocation_disables_target_and_recovers_authoritative_consent() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("plugins/reports")).unwrap();
         std::fs::write(directory.path().join("plugins/reports/active.json"), "{}").unwrap();
@@ -578,6 +578,7 @@ mod tests {
             Arc::new(
                 MockDatabase::new(DatabaseBackend::Postgres)
                     .append_exec_errors([DbErr::Custom("revocation unavailable".into())])
+                    .append_query_results([Vec::<actors::Model>::new()])
                     .into_connection(),
             ),
         );
@@ -591,16 +592,42 @@ mod tests {
             "{error}"
         );
         let remaining = service.ai_tools.snapshot();
-        assert_eq!(remaining.tools().len(), 2);
+        assert_eq!(remaining.tools().len(), 1);
         assert!(remaining
             .callable("plugin.metrics.list", PluginToolAccess::Read)
             .is_some());
         assert!(remaining
             .callable("plugin.reports.list", PluginToolAccess::Read)
-            .is_some());
+            .is_none());
+        assert!(service
+            .ai_recovery
+            .task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()));
         assert!(directory
             .path()
             .join("plugins/reports/active.json")
             .is_file());
+        // Model an uncertain revocation that committed: the authoritative
+        // reload finds no active actor and must not restore the old snapshot.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!Arc::ptr_eq(&remaining, &service.ai_tools.snapshot()));
+        assert!(service
+            .ai_tools
+            .snapshot()
+            .callable("plugin.reports.list", PluginToolAccess::Read)
+            .is_none());
+        assert!(service
+            .ai_recovery
+            .task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_finished());
     }
 }

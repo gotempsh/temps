@@ -30,12 +30,12 @@ pub struct PluginToolsIndex {
     tools: Vec<PluginTool>,
     secrets: HashMap<String, Vec<SecretPath>>,
     routes: HashMap<String, HashMap<String, matchit::Router<String>>>,
-    folded_routes: HashMap<String, HashMap<String, matchit::Router<String>>>,
+    folded_routes: HashMap<String, HashMap<String, matchit::Router<Vec<String>>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginToolsError {
-    #[error("Cannot index path parameter '{parameter}' in operation '{operation_id}' for plugin '{plugin}': only simple path serialization is supported")]
+    #[error("Cannot index path parameter '{parameter}' in operation '{operation_id}' for plugin '{plugin}': only simple scalar path serialization is supported")]
     PathSerialization {
         plugin: String,
         operation_id: String,
@@ -153,7 +153,7 @@ impl PluginToolsIndex {
         let mut tools = Vec::new();
         let mut secrets = HashMap::new();
         let mut routes: HashMap<String, matchit::Router<String>> = HashMap::new();
-        let mut folded_routes: HashMap<String, matchit::Router<String>> = HashMap::new();
+        let mut folded_routes: HashMap<String, matchit::Router<Vec<String>>> = HashMap::new();
         let schema_components = components_json(openapi);
         let mut ids = std::collections::HashSet::new();
         for (path, item) in &openapi.paths.paths {
@@ -181,16 +181,35 @@ impl PluginToolsIndex {
                         path: path.clone(),
                         source,
                     })?;
-                // Conservatively protect frameworks with case-insensitive routing.
-                folded_routes
-                    .entry(method.into())
-                    .or_default()
-                    .insert(full_path.to_lowercase(), full_path)
-                    .map_err(|source| PluginToolsError::InvalidRoute {
-                        plugin: plugin.into(),
-                        path: path.clone(),
-                        source,
-                    })?;
+                // Retain all case variants so valid case-sensitive routes remain
+                // discoverable, without losing conservative dispatch checks.
+                let folded = folded_routes.entry(method.into()).or_default();
+                let folded_path = full_path.to_lowercase();
+                if let Ok(route) = folded.at_mut(&folded_path) {
+                    if route
+                        .value
+                        .iter()
+                        .any(|path| path.to_lowercase() == folded_path)
+                    {
+                        route.value.push(full_path.clone());
+                    } else {
+                        folded
+                            .insert(folded_path, vec![full_path.clone()])
+                            .map_err(|source| PluginToolsError::InvalidRoute {
+                                plugin: plugin.into(),
+                                path: path.clone(),
+                                source,
+                            })?;
+                    }
+                } else {
+                    folded
+                        .insert(folded_path, vec![full_path.clone()])
+                        .map_err(|source| PluginToolsError::InvalidRoute {
+                            plugin: plugin.into(),
+                            path: path.clone(),
+                            source,
+                        })?;
+                }
                 let Some(mark) = op
                     .extensions
                     .as_ref()
@@ -359,9 +378,23 @@ impl PluginToolsIndex {
             router
                 .at(path)
                 .is_ok_and(|route| route.value == &operation.path)
-                && folded
-                    .at(&path.to_lowercase())
-                    .is_ok_and(|route| route.value == &operation.path)
+                && folded.at(&path.to_lowercase()).is_ok_and(|route| {
+                    // Case-only alternatives are safe for declared reads. An
+                    // unmarked endpoint or any write keeps dispatch ambiguous.
+                    route.value.iter().all(|candidate| {
+                        candidate == &operation.path
+                            || (candidate.to_lowercase() == operation.path.to_lowercase()
+                                && self.tools.iter().any(|tool| {
+                                    tool.operation.operation_id == operation.operation_id
+                                        && tool.access == PluginToolAccess::Read
+                                })
+                                && self.tools.iter().any(|tool| {
+                                    tool.operation.path == *candidate
+                                        && tool.operation.method == operation.method
+                                        && tool.access == PluginToolAccess::Read
+                                }))
+                    })
+                })
         };
         // Check both URL representations, so decoding in a plugin framework
         // cannot change a template request into another declared endpoint.
@@ -419,9 +452,13 @@ fn validate_required_parameters(
             continue;
         };
         if parameter.parameter_in == ParameterIn::Path
-            && parameter.style.as_ref().is_some_and(|style| {
+            && (parameter.style.as_ref().is_some_and(|style| {
                 !matches!(style, utoipa::openapi::path::ParameterStyle::Simple)
-            })
+            }) || !parameter.schema.as_ref().and_then(|schema| deref_schema(schema, openapi))
+                .is_some_and(|schema| matches!(schema, Schema::Object(object)
+                    if matches!(object.schema_type, utoipa::openapi::schema::SchemaType::Type(
+                        utoipa::openapi::schema::Type::String | utoipa::openapi::schema::Type::Integer
+                        | utoipa::openapi::schema::Type::Number | utoipa::openapi::schema::Type::Boolean)))))
         {
             return Err(PluginToolsError::PathSerialization {
                 plugin: plugin.into(),
@@ -671,6 +708,67 @@ mod tests {
                         Err(PluginToolsError::PathSerialization { .. })
                     ));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn simple_path_inputs_reject_composites_inline_and_referenced() {
+        for schema in [
+            json!({"type":"array","items":{"type":"integer"}}),
+            json!({"type":"object","properties":{"id":{"type":"integer"}}}),
+            json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
+            json!({"type":"string"}),
+            json!({"type":"integer"}),
+            json!({"type":"number"}),
+            json!({"type":"boolean"}),
+        ] {
+            for referenced in [false, true] {
+                for explicit_style in [false, true] {
+                    let mut parameter = json!({"name":"id","in":"path","required":true,
+                        "schema": if referenced { json!({"$ref":"#/components/schemas/Id"}) } else { schema.clone() }});
+                    if explicit_style {
+                        parameter["style"] = json!("simple");
+                    }
+                    let document = json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},
+                        "components":{"schemas":{"Id":schema}},"paths":{"/reports/{id}":{
+                            "parameters":[parameter],"get":{"operationId":"read","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}}}});
+                    let result = PluginToolsIndex::from_openapi(
+                        "reports",
+                        &serde_json::from_value(document).unwrap(),
+                        true,
+                    );
+                    if matches!(
+                        schema["type"].as_str(),
+                        Some("string" | "integer" | "number" | "boolean")
+                    ) {
+                        assert!(result.is_ok(), "{result:?}");
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Err(PluginToolsError::PathSerialization { .. })
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn case_distinct_read_routes_remain_callable_without_weakening_write_guards() {
+        for elevated in [false, true] {
+            let document = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{
+                "/tools/List":{"get":{"operationId":"List","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}},
+                "/tools/list":{"get":{"operationId":"list","x-temps-ai-tool":if elevated {json!({"access":"write"})} else {json!({})},"responses":{"200":{"description":"OK"}}}},
+                "/tools/other":{"get":{"operationId":"other","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}}
+            }})).unwrap();
+            let index = PluginToolsIndex::from_openapi("reports", &document, true).unwrap();
+            assert_eq!(index.tools().len(), 3);
+            for tool in index.tools() {
+                assert_eq!(
+                    index.resolves_to(&tool.operation, &tool.operation.path),
+                    !elevated || tool.operation.operation_id.ends_with(".other")
+                );
             }
         }
     }
