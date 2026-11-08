@@ -347,3 +347,48 @@ test('a save finishing after leaving refreshes data without navigating', async (
     api.restore()
   }
 })
+
+test('invalid path prefixes stay beside the field and block the request until corrected', async () => {
+  const api = mockApi({
+    'PUT /projects/7/access-services/svc_test': () => jsonResponse(service),
+  })
+  let saved = false
+  try {
+    render(
+      provider(
+        <AccessServiceEditor
+          projectId={7}
+          service={service}
+          onClose={() => {}}
+          onSaved={() => {
+            saved = true
+          }}
+        />
+      )
+    )
+    await act(async () => {
+      fireEvent.change(
+        within(document.body).getByLabelText('Allowed path prefixes'),
+        { target: { value: '/v1/*' } }
+      )
+    })
+    await click('Save service')
+    expect(api.called('PUT', '/projects/7/access-services/svc_test')).toBe(
+      false
+    )
+    expect(document.body.textContent).toContain(
+      'without encoding, traversal, query strings or wildcards'
+    )
+    expect(document.body.textContent).toContain('Allowed path prefixes:')
+    await act(async () => {
+      fireEvent.change(
+        within(document.body).getByLabelText('Allowed path prefixes'),
+        { target: { value: '/v2' } }
+      )
+    })
+    await click('Save service')
+    await waitFor(() => expect(saved).toBe(true))
+  } finally {
+    api.restore()
+  }
+})

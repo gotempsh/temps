@@ -8,6 +8,13 @@ import type {
   ServiceGrantStatus,
 } from '@/api/client'
 
+function pathPrefixes(value: string): string[] {
+  return value
+    .split('\n')
+    .map((path) => path.trim())
+    .filter(Boolean)
+}
+
 export const accessServiceSchema = z
   .object({
     name: z.string().trim().min(1).max(80),
@@ -27,7 +34,37 @@ export const accessServiceSchema = z
         return false
       }
     }, 'Use an HTTPS origin without a path or credentials'),
-    paths: z.string().trim().min(1),
+    paths: z
+      .string()
+      .trim()
+      .superRefine((value, context) => {
+        const prefixes = pathPrefixes(value)
+        if (prefixes.length < 1 || prefixes.length > 32) {
+          context.addIssue({
+            code: 'custom',
+            message: 'Provide between 1 and 32 path prefixes',
+          })
+          return
+        }
+        if (
+          prefixes.some(
+            (path) =>
+              !path.startsWith('/') ||
+              path.length > 512 ||
+              path.includes('//') ||
+              path
+                .split('/')
+                .some((segment) => segment === '.' || segment === '..') ||
+              !/^[a-zA-Z0-9/_.~-]+$/.test(path)
+          )
+        ) {
+          context.addIssue({
+            code: 'custom',
+            message:
+              'Use absolute paths of at most 512 characters, without encoding, traversal, query strings or wildcards',
+          })
+        }
+      }),
     methods: z
       .array(z.enum(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']))
       .min(1),
@@ -64,10 +101,7 @@ export function serviceBody(
     name: values.name,
     policy: {
       origin: values.origin,
-      path_prefixes: values.paths
-        .split('\n')
-        .map((path) => path.trim())
-        .filter(Boolean),
+      path_prefixes: pathPrefixes(values.paths),
       methods: values.methods,
     },
     max_ttl_seconds: values.maxTtl,

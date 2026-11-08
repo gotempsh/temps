@@ -92,3 +92,34 @@ test('all current grant statuses avoid claiming a connection', () => {
   expect(grantLabels.integration_unavailable).toBe('Not connected')
   expect(Object.values(grantLabels)).not.toContain('Connected')
 })
+
+test('path validation rejects backend-invalid prefixes before submission', () => {
+  const defaults = serviceDefaults(service)
+  for (const paths of [
+    '/v1/*',
+    'v1',
+    '/a/../b',
+    '/%2fadmin',
+    '/a//b',
+    '/x?query',
+    '/' + 'a'.repeat(512),
+    Array.from({ length: 33 }, (_, i) => `/v${i}`).join('\n'),
+  ]) {
+    const parsed = accessServiceSchema.safeParse({ ...defaults, paths })
+    expect(parsed.success).toBe(false)
+    if (!parsed.success)
+      expect(
+        parsed.error.issues.some((issue) => issue.path[0] === 'paths')
+      ).toBe(true)
+  }
+  for (const paths of [
+    '/',
+    '/v1\n/v2/',
+    '/' + 'a'.repeat(511),
+    Array.from({ length: 32 }, (_, i) => `/v${i}`).join('\n'),
+  ]) {
+    expect(accessServiceSchema.safeParse({ ...defaults, paths }).success).toBe(
+      true
+    )
+  }
+})
