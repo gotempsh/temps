@@ -123,6 +123,8 @@ pub struct ApiToolResponse {
 /// [`InternalApiCaller::execute_write`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PreparedWrite {
+    /// Immutable plugin publication approved by the user; absent for core operations.
+    pub plugin_revision: Option<String>,
     /// The `operation_id` of the operation to execute.
     pub operation_id: String,
     /// Uppercase HTTP method, e.g. `"POST"`.
@@ -171,9 +173,18 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
     if param.name == "project_id" {
         return true;
     }
+    let local_path = if op.operation_id.starts_with("plugin.") {
+        op.path
+            .strip_prefix("/x/")
+            .and_then(|path| path.split_once('/'))
+            .map(|(_, path)| path)
+    } else {
+        op.path.strip_prefix('/')
+    };
     matches!(param.location, ParamLocation::Path)
         && param.name == "id"
-        && op.path.starts_with("/projects/{id}")
+        && local_path
+            .is_some_and(|path| path == "projects/{id}" || path.starts_with("projects/{id}/"))
 }
 
 /// Route a flat `params` JSON object into a substituted path, query string, and
@@ -483,6 +494,18 @@ fn build_request_parts_scoped(
         match param.location {
             ParamLocation::Path => {
                 let str_val = value_to_string(&value);
+                if op.operation_id.starts_with("plugin.")
+                    && (str_val.is_empty()
+                        || matches!(str_val.as_str(), "." | "..")
+                        || str_val.contains(['/', '\\', '%']))
+                {
+                    return Err(ApiToolError::BadParamType {
+                        name: param.name.clone(),
+                        problem: "path value could change the declared plugin endpoint".into(),
+                        expected: "a nonempty path segment without dot traversal, separators or percent escapes".into(),
+                        operation_id: op.operation_id.clone(),
+                    });
+                }
                 let placeholder = format!("{{{}}}", param.name);
                 path = path.replace(&placeholder, &urlencoding::encode(&str_val));
             }
@@ -541,6 +564,7 @@ fn build_request_parts_scoped(
 #[derive(Clone)]
 pub struct InternalApiCaller {
     router: axum::Router,
+    plugins: Option<crate::plugin_registry::PluginBinding>,
     index: ReadOnlyApiIndex,
     default_limit: i64,
     max_limit: i64,
@@ -548,6 +572,15 @@ pub struct InternalApiCaller {
 }
 
 impl InternalApiCaller {
+    pub(crate) fn with_plugin_snapshot(
+        mut self,
+        binding: crate::plugin_registry::PluginBinding,
+    ) -> Self {
+        binding.snapshot.append_to(&mut self.index, binding.access);
+        self.plugins = Some(binding);
+        self
+    }
+
     /// Construct a new caller.
     ///
     /// - `router`: the full (or filtered) Axum router to replay calls through.
@@ -562,6 +595,7 @@ impl InternalApiCaller {
         let index = ReadOnlyApiIndex::from_openapi(openapi, &denylist_refs);
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -584,6 +618,7 @@ impl InternalApiCaller {
         let index = ReadOnlyApiIndex::from_openapi_allowlist(openapi, &allowlist_refs);
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -613,6 +648,7 @@ impl InternalApiCaller {
         );
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -635,6 +671,7 @@ impl InternalApiCaller {
         let index = ReadOnlyApiIndex::from_openapi_write_allowlist(openapi, &allowlist_refs);
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -864,6 +901,18 @@ impl InternalApiCaller {
         match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
             crate::cli::CliAction::Execute(op, params) => {
+                if op.operation_id.starts_with("plugin.")
+                    && self.plugins.as_ref().is_none_or(|binding| {
+                        binding
+                            .snapshot
+                            .callable(&op.operation_id, crate::PluginToolAccess::Write)
+                            .is_none()
+                    })
+                {
+                    return WritePrepareOutcome::Invalid(
+                        "Plugin AI access is disabled; enable it in plugin settings.".into(),
+                    );
+                }
                 // Validate by running build_request_parts but discarding the
                 // built request — we only care whether it succeeds or errors.
                 match build_request_parts_scoped(
@@ -905,6 +954,11 @@ impl InternalApiCaller {
                         let required_permission =
                             required_write_permission(op).map(|p| p.to_string());
                         WritePrepareOutcome::Prepared(PreparedWrite {
+                            plugin_revision: self
+                                .plugins
+                                .as_ref()
+                                .filter(|_| op.operation_id.starts_with("plugin."))
+                                .map(|binding| binding.snapshot.revision.to_string()),
                             operation_id: op.operation_id.clone(),
                             method: op.method.clone(),
                             path: op.path.clone(),
@@ -916,6 +970,30 @@ impl InternalApiCaller {
                 }
             }
         }
+    }
+
+    /// Execute only the plugin declaration that was recorded with the approval.
+    /// Any lifecycle/consent publication (including restart) requires a fresh proposal.
+    pub async fn execute_approved_write(
+        &self,
+        operation_id: &str,
+        params: Value,
+        scope: &ApiCallScope,
+        plugin_revision: Option<&str>,
+    ) -> Result<ApiToolResponse, ApiToolError> {
+        if let Some(plugin) = operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|pair| pair.0))
+        {
+            let current = self
+                .plugins
+                .as_ref()
+                .map(|binding| binding.snapshot.revision.to_string());
+            if plugin_revision.is_none() || plugin_revision != current.as_deref() {
+                return Err(ApiToolError::PluginOperation {plugin:plugin.into(),operation_id:operation_id.into(),reason:"Plugin declaration changed since approval was requested; propose the operation again".into()});
+            }
+        }
+        self.execute_write(operation_id, params, scope).await
     }
 
     /// Execute a previously-prepared write operation.
@@ -946,6 +1024,68 @@ impl InternalApiCaller {
     /// 5. Collect the response body up to `max_response_bytes` (truncate if over).
     /// 6. Attempt to parse the body as JSON; fall back to a string value.
     pub async fn call(
+        &self,
+        operation_id: &str,
+        params: Value,
+        scope: &ApiCallScope,
+    ) -> Result<ApiToolResponse, ApiToolError> {
+        if let Some(plugin) = operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|p| p.0))
+        {
+            let failure = |reason: &str| ApiToolError::PluginOperation {
+                plugin: plugin.into(),
+                operation_id: operation_id.into(),
+                reason: reason.into(),
+            };
+            let binding = self
+                .plugins
+                .as_ref()
+                .ok_or_else(|| failure("tools are unavailable"))?;
+            let registry = binding
+                .registry
+                .upgrade()
+                .ok_or_else(|| failure("plugin registry is unavailable"))?;
+            let current = registry.snapshot();
+            if !std::sync::Arc::ptr_eq(&current, &binding.snapshot) {
+                return Err(failure(
+                    "plugin tools changed; discover the operation again",
+                ));
+            }
+            if current.callable(operation_id, binding.access).is_none() {
+                return Err(failure(
+                    "AI access is disabled; enable it in plugin settings",
+                ));
+            }
+            let result = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.call_inner(operation_id, params, scope),
+            )
+            .await
+            {
+                Ok(Err(ApiToolError::Upstream { status, .. })) if status >= 500 => {
+                    Err(failure(&format!("plugin unavailable (HTTP {status})")))
+                }
+                Ok(result) => result,
+                Err(_) => Err(failure("request timed out after 30 seconds")),
+            };
+            if binding.access == crate::PluginToolAccess::Write {
+                let event = crate::plugin_registry::PluginWriteAudit {
+                    plugin,
+                    operation_id,
+                    user_id: scope.auth.user_id_opt(),
+                    succeeded: result.is_ok(),
+                };
+                if let Err(error) = binding.audit.create_audit_log(&event).await {
+                    tracing::error!(plugin, operation_id, %error, "Failed to audit plugin AI write");
+                }
+            }
+            return result;
+        }
+        self.call_inner(operation_id, params, scope).await
+    }
+
+    async fn call_inner(
         &self,
         operation_id: &str,
         params: Value,
@@ -1036,6 +1176,15 @@ impl InternalApiCaller {
             .insert(temps_core::ai_tool_call::AiToolCall);
         if let Some(origin) = &scope.origin {
             req.extensions_mut().insert(origin.clone());
+        }
+
+        if operation_id.starts_with("plugin.") {
+            if let Some(binding) = &self.plugins {
+                req.extensions_mut().insert(crate::PluginDispatchGuard {
+                    binding: binding.clone(),
+                    operation_id: operation_id.to_owned(),
+                });
+            }
         }
 
         // Step 4: replay through the router.
@@ -1338,6 +1487,7 @@ fn parse_http_method(method: &str) -> http::Method {
         "PUT" => http::Method::PUT,
         "PATCH" => http::Method::PATCH,
         "DELETE" => http::Method::DELETE,
+        "TRACE" => http::Method::TRACE,
         "HEAD" => http::Method::HEAD,
         "OPTIONS" => http::Method::OPTIONS,
         // Unknown method — fall back to GET (safe: the router will 404/405).
@@ -1351,6 +1501,9 @@ fn parse_http_method(method: &str) -> http::Method {
 /// tag so related tags (e.g. the several OTel telemetry tags) collapse onto one
 /// permission; `None` means "no known mapping → show it".
 fn required_read_permission(op: &ApiOperation) -> Option<Permission> {
+    if op.operation_id.starts_with("plugin.") {
+        return None;
+    }
     let tag = op.tags.first()?.to_ascii_lowercase();
     // Order matters: more specific keywords first (e.g. telemetry before metrics).
     let perm = if tag.contains("telemetry")
@@ -1410,6 +1563,9 @@ fn required_read_permission(op: &ApiOperation) -> Option<Permission> {
 /// Only the domains that have an explicit write variant are mapped; everything
 /// else returns `None` (shown by default, router still guards).
 pub(crate) fn required_write_permission(op: &ApiOperation) -> Option<Permission> {
+    if op.operation_id.starts_with("plugin.") {
+        return None;
+    }
     let tag = op.tags.first()?.to_ascii_lowercase();
     let method = op.method.as_str();
 
@@ -1655,6 +1811,14 @@ mod tests {
             },
             ..make_op("x", "/x", vec![])
         }
+    }
+
+    #[test]
+    fn plugin_names_do_not_inherit_core_permission_hints() {
+        let mut op = op_tagged("plugin.deployments");
+        op.operation_id = "plugin.deployments.list".into();
+        assert_eq!(required_read_permission(&op), None);
+        assert_eq!(required_write_permission(&op), None);
     }
 
     #[test]

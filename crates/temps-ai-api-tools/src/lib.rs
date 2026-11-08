@@ -43,7 +43,9 @@ mod error;
 mod handle;
 mod index;
 mod integration_tests;
+mod plugin_registry;
 mod secrets;
+pub use plugin_registry::{PluginDispatchGuard, PluginToolsRegistry};
 
 pub use caller::{
     ApiCallScope, ApiToolResponse, BuiltRequest, InternalApiCaller, PreparedWrite,

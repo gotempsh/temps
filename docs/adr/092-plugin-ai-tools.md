@@ -1,6 +1,6 @@
 # ADR-092: Plugin AI tools are marked API operations
 
-**Status:** Proposed — implementation in progress
+**Status:** Accepted
 **Date:** 2026-11-08
 
 ## Decision
@@ -53,9 +53,20 @@ in prompts and risks accepting plugin-claimed read/write classification.
 Indexing existing endpoints preserves the generic API tools and the platform's
 authorization and approval boundaries.
 
-## Implementation status
+## Implementation
 
-The initial change supplies declaration parsing and swappable caller handles.
-Runtime lifecycle wiring, execution-time revocation, persisted opt-in, audit
-integration, SDK registration and console controls are still required before
-this decision can be marked implemented.
+The external plugin service owns the index and republishes it after lifecycle
+changes and persisted consent updates. Core callers subscribe once at startup;
+ArcSwap handles publish rebuilt callers for both chat and the per-turn MCP bridge.
+Execution rejects revoked or replaced snapshots. The caller carries an in-process
+publication guard through the router; the proxy checks it after connecting and
+before sending credentials or request bytes. The connected socket pins the plugin
+instance, so a suspended call cannot resume against a replacement. Pending actions persist the plugin
+publication revision and require a new proposal after any plugin lifecycle or
+consent publication, including a server restart. The actor ID accompanies toggle
+requests to prevent a stale console from enabling a replacement installation.
+
+The Node SDK's `createToolPlugin(plugin).tool(...)` registers a route and emits
+its declaration in the existing OpenAPI ready payload. The console exposes the
+catalogue and consent on each plugin page. The migration defaults existing and
+new plugin actors to disabled; no operator action is required during upgrade.

@@ -286,6 +286,7 @@ fn with_status(mut conversation: ai_conversations::Model, status: &str) -> ai_co
 fn proposed_action(required_permission: Option<&str>) -> ai_pending_actions::Model {
     let now = chrono::Utc::now();
     ai_pending_actions::Model {
+        plugin_revision: None,
         id: 20,
         public_id: "act_1".to_string(),
         conversation_id: 10,

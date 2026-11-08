@@ -247,6 +247,7 @@ impl PendingActionService {
             message_id: Set(None),
             project_id: Set(project_id),
             operation_id: Set(prepared.operation_id.clone()),
+            plugin_revision: Set(prepared.plugin_revision.clone()),
             method: Set(prepared.method.clone()),
             summary: Set(prepared.summary.clone()),
             params: Set(
@@ -347,6 +348,7 @@ impl PendingActionService {
                 plan_public_id: Set(Some(plan_public_id.clone())),
                 step_index: Set(idx as i32),
                 operation_id: Set(prepared.operation_id.clone()),
+                plugin_revision: Set(prepared.plugin_revision.clone()),
                 method: Set(prepared.method.clone()),
                 summary: Set(prepared.summary.clone()),
                 params: Set(encrypted_params),
@@ -614,7 +616,12 @@ impl PendingActionService {
             }),
         };
         let exec_result = caller
-            .execute_write(&action.operation_id, executable_params, &scope)
+            .execute_approved_write(
+                &action.operation_id,
+                executable_params,
+                &scope,
+                action.plugin_revision.as_deref(),
+            )
             .await;
 
         // 8. Persist outcome regardless of success/failure.
@@ -883,6 +890,7 @@ mod tests {
 
     fn make_prepared() -> PreparedWrite {
         PreparedWrite {
+            plugin_revision: None,
             operation_id: "redeploy_deployment".to_string(),
             method: "POST".to_string(),
             path: "/projects/{project_id}/deployments/redeploy".to_string(),
@@ -896,6 +904,7 @@ mod tests {
     fn make_proposed(id: i64, public_id: &str, project_id: i32) -> ai_pending_actions::Model {
         let now = Utc::now();
         ai_pending_actions::Model {
+            plugin_revision: None,
             id,
             public_id: public_id.to_string(),
             conversation_id: 1,

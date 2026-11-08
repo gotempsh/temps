@@ -4254,6 +4254,14 @@
               "null"
             ]
           },
+          "expose_platform_identity": {
+            "default": null,
+            "description": "Opt in to platform identity in proxy responses. Missing values preserve the stored choice.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "external_url": {
             "default": null,
             "type": [
@@ -4632,6 +4640,10 @@
             "$ref": "#/components/schemas/MetricsStoreKind",
             "description": "Storage backend actually used for proxy logs, OTel spans, and OTel\nmetrics. OTel logs remain TimescaleDB-backed. Unlike resource metrics,\nthese domains switch to ClickHouse whenever the server-level ClickHouse\nconnection is configured; they do not use the monitoring store toggle."
           },
+          "expose_platform_identity": {
+            "description": "Opt in to proxy-added platform branding in public application responses.",
+            "type": "boolean"
+          },
           "external_url": {
             "type": [
               "string",
@@ -4785,6 +4797,7 @@
           "security_headers",
           "rate_limiting",
           "trust_loopback_forwarded_ip",
+          "expose_platform_identity",
           "docker_registry",
           "disk_space_alert",
           "container_logs",

@@ -3,6 +3,9 @@
 
 //! HTTP handlers for external plugin management endpoints.
 
+mod ai_tools;
+use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
+
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
@@ -1651,6 +1654,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
         .route(
+            "/x/plugins/{name}/ai-tools",
+            get(get_plugin_ai_tools).put(put_plugin_ai_tools),
+        )
+        .route(
             "/x/plugins/{name}/grants",
             get(get_plugin_grants).put(put_plugin_grants),
         )
@@ -1670,6 +1677,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         update_repository,
         uninstall_plugin,
         get_plugin_status,
+        ai_tools::get_plugin_ai_tools,
+        ai_tools::put_plugin_ai_tools,
         get_plugin_grants,
         put_plugin_grants,
     ),
@@ -1696,6 +1705,9 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::source_catalog::RepositoryScreenshot,
             crate::source_catalog::RepositoryValidation,
             PluginStatusResponse,
+            crate::ai_tools::PluginAiToolsResponse,
+            crate::ai_tools::UpdatePluginAiTools,
+            crate::ai_tools::AiToolInfo,
             PluginGrantsResponse,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
@@ -2855,5 +2867,94 @@ mod tests {
         .expect_err("grant mutation must require sensitive verification");
         assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
         assert!(audit.operations.lock().expect("audit lock").is_empty());
+    }
+    fn ai_actor(enabled: bool) -> temps_entities::external_plugin_actors::Model {
+        temps_entities::external_plugin_actors::Model {
+            id: uuid::Uuid::from_u128(1),
+            plugin_name: "reports".into(),
+            binary_sha256: "fixture".into(),
+            source_identity: "fixture".into(),
+            active: true,
+            ai_tools_enabled: enabled,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_routes_enforce_auth_and_permissions() {
+        use tower::ServiceExt;
+        for method in ["GET", "PUT"] {
+            for role in [None, Some(Role::User)] {
+                let mut app = configure_routes()
+                    .with_state(test_state())
+                    .layer(Extension(metadata().0));
+                if let Some(role) = role.clone() {
+                    app = app.layer(Extension(user_auth(role).0));
+                }
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/x/plugins/reports/ai-tools")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"actor_id":"fixture","enabled":true}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if role.is_none() {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_toggle_returns_current_consent_and_audits() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![ai_actor(false)],
+                vec![ai_actor(true)],
+                vec![ai_actor(true)],
+                vec![ai_actor(true)],
+            ])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let config = ExternalPluginConfig::new(
+            std::env::temp_dir().join("plugin-ai-test"),
+            "postgres://localhost/test".into(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(
+                config,
+                None,
+                Arc::new(db),
+            )),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let Json(response) = put_plugin_ai_tools(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            Path("reports".into()),
+            Json(crate::ai_tools::UpdatePluginAiTools {
+                actor_id: uuid::Uuid::from_u128(1).to_string(),
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response.enabled);
+        assert!(response.tools.is_empty());
+        assert_eq!(audit.operations.lock().unwrap().len(), 1);
     }
 }

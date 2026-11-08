@@ -1287,6 +1287,12 @@ export type AiSummaryPreferenceDto = {
     thinking_level?: string | null;
 };
 
+export type AiToolInfo = {
+    access: string;
+    description: string;
+    name: string;
+};
+
 /**
  * Runtime limits for workspace file transfer and browser previews.
  *
@@ -2078,6 +2084,10 @@ export type AppSettings = {
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
+    /**
+     * Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+     */
+    expose_platform_identity?: boolean | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -2341,6 +2351,10 @@ export type AppSettingsResponse = {
      * connection is configured; they do not use the monitoring store toggle.
      */
     effective_observability_store: MetricsStoreKind;
+    /**
+     * Opt in to proxy-added platform branding in public application responses.
+     */
+    expose_platform_identity: boolean;
     external_url?: string | null;
     /**
      * Geolocation refresh policy and freshness, with the MaxMind license key
@@ -23634,6 +23648,12 @@ export type PluginAiCapability = {
     setup_path: string;
 };
 
+export type PluginAiToolsResponse = {
+    actor_id: string;
+    enabled: boolean;
+    tools: Array<AiToolInfo>;
+};
+
 /**
  * What a plugin is allowed to do with the platform API over the channel.
  *
@@ -35643,6 +35663,11 @@ export type UpdatePermissionModeRequest = {
     permission_mode: string;
 };
 
+export type UpdatePluginAiTools = {
+    actor_id: string;
+    enabled: boolean;
+};
+
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
 };
@@ -37844,6 +37869,10 @@ export type AppSettingsWritable = {
      * environments created after it is set; existing ones keep their names.
      */
     environment_hostname_template?: string | null;
+    /**
+     * Opt in to platform identity in proxy responses. Missing values preserve the stored choice.
+     */
+    expose_platform_identity?: boolean | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -92174,6 +92203,51 @@ export type ReloadPluginsResponses = {
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
+
+export type GetPluginAiToolsData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/ai-tools';
+};
+
+export type GetPluginAiToolsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetPluginAiToolsResponses = {
+    200: PluginAiToolsResponse;
+};
+
+export type GetPluginAiToolsResponse = GetPluginAiToolsResponses[keyof GetPluginAiToolsResponses];
+
+export type PutPluginAiToolsData = {
+    body: UpdatePluginAiTools;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/ai-tools';
+};
+
+export type PutPluginAiToolsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type PutPluginAiToolsResponses = {
+    200: PluginAiToolsResponse;
+};
+
+export type PutPluginAiToolsResponse = PutPluginAiToolsResponses[keyof PutPluginAiToolsResponses];
 
 export type GetPluginGrantsData = {
     body?: never;

@@ -12381,6 +12381,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -13848,6 +13849,7 @@ dependencies = [
  "tar",
  "tempfile",
  "temps-ai",
+ "temps-ai-api-tools",
  "temps-auth",
  "temps-config",
  "temps-core",

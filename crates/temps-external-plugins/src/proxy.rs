@@ -336,6 +336,19 @@ async fn forward_to_unix_socket(
         .await
         .map_err(|e| format!("HTTP handshake failed: {}", e))?;
 
+    // The stream pins a particular process even if its socket path is replaced.
+    // Validate after all connection awaits and before transmitting any credentials.
+    if original_request
+        .extensions()
+        .get::<temps_ai_api_tools::PluginDispatchGuard>()
+        .is_some_and(|guard| !guard.is_current())
+    {
+        return Err(format!(
+            "AI tool publication for plugin '{}' changed before dispatch",
+            proxy.plugin_name
+        ));
+    }
+
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             // hyper reports "error shutting down connection" when the Unix
@@ -1102,5 +1115,152 @@ mod tests {
         tokio::fs::remove_file(&socket_path)
             .await
             .expect("test UDS socket should be removed");
+    }
+    #[tokio::test]
+    async fn ai_plugin_read_replays_through_proxy_with_signed_user_identity() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope,
+        };
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let root = std::env::temp_dir();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let socket = directory.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            assert_eq!(request.uri().path(), "/reports");
+                            assert_eq!(request.headers()[headers::USER_ID], "42");
+                            assert_eq!(request.headers()[headers::PLUGIN_NAME], "reports");
+                            assert_eq!(
+                                request.headers()[headers::AUTH_SIGNATURE],
+                                "fixture-signature"
+                            );
+                            Ok::<_, std::convert::Infallible>(Response::new(Body::from(
+                                "{\"ok\":true}",
+                            )))
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        });
+        let router = Router::new().nest(
+            "/x/reports",
+            create_plugin_proxy_router(PluginProxy::new(
+                socket,
+                "reports".into(),
+                "fixture-signature".into(),
+            )),
+        );
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        registry.bind(
+            InternalApiCaller::new_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Read,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(test_user(42, "reader@example.test"), Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let response = handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .unwrap();
+        assert_eq!(response.body["ok"], true);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ai_write_revoked_during_router_dispatch_sends_no_bytes_to_plugin() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope, WriteApiToolsHandle,
+        };
+        use tokio::io::AsyncReadExt;
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let root = std::env::temp_dir();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let socket = directory.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let revoke = registry.clone();
+        let router = Router::new()
+            .nest(
+                "/x/reports",
+                create_plugin_proxy_router(PluginProxy::new(
+                    socket,
+                    "reports".into(),
+                    "fixture-signature".into(),
+                )),
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: Request, next: axum::middleware::Next| {
+                    let revoke = revoke.clone();
+                    async move {
+                        // Initial approval validation has passed; replace the publication
+                        // before the dynamic proxy can connect to the replacement process.
+                        revoke.publish(PluginToolsIndex::default());
+                        next.run(request).await
+                    }
+                },
+            ));
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let handle = WriteApiToolsHandle::new();
+        let target = handle.clone();
+        registry.bind(
+            InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Write,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(test_user(42, "reader@example.test"), Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let result = handle
+            .get()
+            .unwrap()
+            .execute_write("plugin.reports.create", serde_json::json!({}), &scope)
+            .await;
+        assert!(
+            matches!(result, Err(temps_ai_api_tools::ApiToolError::PluginOperation { plugin, operation_id, .. }) if plugin == "reports" && operation_id == "plugin.reports.create")
+        );
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "no identity, credential or mutation reaches a replaced plugin"
+        );
     }
 }

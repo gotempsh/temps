@@ -26,7 +26,9 @@ pub struct PluginTool {
 /// Separate snapshot of plugin operations; curated core indexes are untouched.
 #[derive(Debug, Clone, Default)]
 pub struct PluginToolsIndex {
+    pub(crate) revision: uuid::Uuid,
     tools: Vec<PluginTool>,
+    secrets: HashMap<String, Vec<SecretPath>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +51,40 @@ pub enum PluginToolsError {
 }
 
 impl PluginToolsIndex {
+    /// Remove one stopped plugin while retaining unrelated healthy declarations.
+    pub fn without_plugin(&self, plugin: &str) -> Self {
+        let mut index = self.clone();
+        index.tools.retain(|tool| tool.plugin != plugin);
+        let prefix = format!("plugin.{plugin}.");
+        index
+            .secrets
+            .retain(|operation, _| !operation.starts_with(&prefix));
+        index
+    }
+
+    pub fn extend(&mut self, other: Self) {
+        self.tools.extend(other.tools);
+        self.secrets.extend(other.secrets);
+    }
+
+    pub(crate) fn append_to(&self, index: &mut ReadOnlyApiIndex, access: PluginToolAccess) {
+        for tool in &self.tools {
+            if tool.access != access && (tool.enabled || access == PluginToolAccess::Write) {
+                continue;
+            }
+            let mut operation = tool.operation.clone();
+            if !tool.enabled {
+                operation.summary = Some(format!(
+                    "[disabled; enable at {}] {}",
+                    tool.setup_path,
+                    operation.summary.as_deref().unwrap_or("")
+                ));
+            }
+            index.operations.push(operation);
+        }
+        index.secret_paths.extend(self.secrets.clone());
+    }
+
     /// Build from complete plugin-local documents, before the host prefixes paths.
     /// Invalid declarations fail closed; callers should publish an empty snapshot
     /// for that plugin on failure, never retain a formerly enabled version.
@@ -63,6 +99,8 @@ impl PluginToolsIndex {
             });
         }
         let mut tools = Vec::new();
+        let mut secrets = HashMap::new();
+        let schema_components = components_json(openapi);
         let mut ids = std::collections::HashSet::new();
         for (path, item) in &openapi.paths.paths {
             for (method, operation) in [
@@ -155,16 +193,24 @@ impl PluginToolsIndex {
                 operation.description = Some(description);
                 // Do not let plugin-supplied tags impersonate core permission groups.
                 operation.tags = vec![format!("plugin.{plugin}")];
+                secrets.insert(
+                    operation.operation_id.clone(),
+                    secret_paths_of(op, &schema_components),
+                );
                 tools.push(PluginTool {
                     plugin: plugin.into(),
                     operation,
                     access,
                     enabled,
-                    setup_path: format!("/settings/plugins/{plugin}"),
+                    setup_path: format!("/plugins/{plugin}"),
                 });
             }
         }
-        Ok(Self { tools })
+        Ok(Self {
+            tools,
+            secrets,
+            revision: uuid::Uuid::nil(),
+        })
     }
 
     pub fn tools(&self) -> &[PluginTool] {
@@ -397,5 +443,43 @@ mod tests {
             ));
         }
         assert!(PluginToolsIndex::from_openapi("../core", &spec("get", json!({})), true).is_err());
+    }
+    #[test]
+    fn plugin_project_path_id_preserves_scope_and_autofill() {
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/projects/{id}/reports":{"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer"}}],"get":{"operationId":"list","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+        let op = index
+            .callable("plugin.reports.list", PluginToolAccess::Read)
+            .unwrap();
+        let scope = [42];
+        let built = crate::caller::build_request_parts(op, &json!({}), &scope, 20, 100).unwrap();
+        assert_eq!(built.path, "/x/reports/projects/42/reports");
+        assert!(
+            crate::caller::build_request_parts(op, &json!({"id":43}), &scope, 20, 100).is_err()
+        );
+    }
+    #[test]
+    fn plugin_path_values_cannot_escape_the_declared_read_endpoint() {
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports/{id}/reset":{"get":{"operationId":"read","x-temps-ai-tool":{},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}},"/reset":{"get":{"operationId":"reset","x-temps-ai-tool":{"access":"write"},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let index = PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+        let op = index
+            .callable("plugin.reports.read", PluginToolAccess::Read)
+            .unwrap();
+        for id in [".", "..", "", "../reset", "a/b", "a\\b", "%2e%2e", "%2f"] {
+            assert!(
+                matches!(
+                    crate::build_request_parts(op, &serde_json::json!({"id":id}), &[], 20, 100),
+                    Err(crate::ApiToolError::BadParamType { .. })
+                ),
+                "{id}"
+            );
+        }
+        let request =
+            crate::build_request_parts(op, &serde_json::json!({"id":"report-1"}), &[], 20, 100)
+                .unwrap();
+        assert_eq!(request.path, "/x/reports/reports/report-1/reset");
+        assert!(index
+            .callable("plugin.reports.reset", PluginToolAccess::Read)
+            .is_none());
     }
 }

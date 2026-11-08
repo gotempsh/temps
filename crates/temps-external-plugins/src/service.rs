@@ -32,8 +32,9 @@ use crate::repository::{self, RepositoryError};
 /// Service that manages the external plugin lifecycle and provides data
 /// to the handler layer.
 pub struct ExternalPluginsService {
-    manager: Arc<ExternalPluginManager>,
-    db: Arc<sea_orm::DatabaseConnection>,
+    pub(crate) manager: Arc<ExternalPluginManager>,
+    pub(crate) db: Arc<sea_orm::DatabaseConnection>,
+    pub(crate) ai_tools: Arc<temps_ai_api_tools::PluginToolsRegistry>,
     /// Cached manifests from discovery — refreshed on reload.
     manifests: RwLock<Vec<PluginManifest>>,
     /// Event listener that delivers platform events to subscribing plugins
@@ -44,7 +45,7 @@ pub struct ExternalPluginsService {
     /// are reflected without restarting the server.
     proxy_router: Arc<RwLock<Router>>,
     /// Serializes discovery, reload, and install/promotion lifecycles.
-    lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) lifecycle: tokio::sync::Mutex<()>,
     /// Serializes every read/compare/write mutation of the persisted registry
     /// trust state. Catalogue requests can overlap on the network, but they
     /// must be committed in a single monotonic order with installations.
@@ -505,6 +506,8 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
         let actor_id = candidate_actor_id;
@@ -559,6 +562,7 @@ impl ExternalPluginsService {
             install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
             remote_builder: None,
+            ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         }
     }
 
@@ -612,6 +616,7 @@ impl ExternalPluginsService {
                 let mut cached = self.manifests.write().await;
                 *cached = manifests;
             }
+            self.rebuild_ai_tools().await;
         });
     }
 
@@ -647,7 +652,7 @@ impl ExternalPluginsService {
         // Build the initial proxy router
         let proxy_router = Self::build_proxy_router_from(&manager, &manifests).await;
 
-        Self {
+        let service = Self {
             manager,
             db,
             manifests: RwLock::new(manifests),
@@ -660,7 +665,10 @@ impl ExternalPluginsService {
             install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
             remote_builder: None,
-        }
+            ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
+        };
+        service.rebuild_ai_tools().await;
+        service
     }
 
     /// Get a snapshot of the current plugin manifests.
@@ -719,6 +727,8 @@ impl ExternalPluginsService {
             }
         }
 
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         // Reload all plugins via manager (shutdown + re-discover + re-start)
         let result = self.manager.reload_all().await;
         let new_manifests = &result.manifests;
@@ -754,6 +764,7 @@ impl ExternalPluginsService {
             *manifests = new_manifests.clone();
         }
 
+        self.rebuild_ai_tools().await;
         Ok(result)
     }
 
@@ -968,6 +979,8 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
         let actor_id = candidate_actor_id;
@@ -1006,6 +1019,8 @@ impl ExternalPluginsService {
                 name: name.to_string(),
             });
         }
+        self.ai_tools
+            .publish(self.ai_tools.snapshot().without_plugin(name));
         self.manager.shutdown_plugin(name).await;
         crate::grants::PluginGrantService::new(self.db.clone())
             .revoke_actor(name)
@@ -1024,8 +1039,14 @@ impl ExternalPluginsService {
 
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.closing.store(true, Ordering::Release);
         let _lifecycle = self.lifecycle.lock().await;
+        // A lifecycle operation already holding the lock may have published
+        // after the early revocation. Revoke its snapshot before stopping.
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         let mut listener = self.event_listener.write().await;
         if let Some(l) = listener.take() {
             l.stop().await;
@@ -1122,6 +1143,7 @@ impl ExternalPluginsService {
         *self.proxy_router.write().await = router;
         *self.event_listener.write().await = listener;
         *self.manifests.write().await = manifests;
+        self.rebuild_ai_tools().await;
     }
 
     /// Start event listener if any plugins subscribe to events.
@@ -2487,5 +2509,143 @@ except Exception:
             !plugins_dir.exists(),
             "a rejected queued install must not create plugin state"
         );
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn installed_plugin_tools_are_discoverable_gated_and_callable_over_http() {
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsRegistry,
+            ProjectSelectorScope,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let signing = SigningKey::from_bytes(&[63; 32]);
+        let spec = serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{"description":"List reports"},"responses":{"200":{"description":"ok"}}}}}});
+        let original = String::from_utf8(protocol_v2_fixture("reports", "1.0.0")).unwrap();
+        let (setup, worker) = original
+            .split_once("connection, _ = server.accept()\n")
+            .unwrap();
+        let setup = setup.replace(
+            "args = dict",
+            &format!(
+                "READY = json.dumps(dict(json.loads(READY), openapi=json.loads({})))\nargs = dict",
+                serde_json::to_string(&spec.to_string()).unwrap()
+            ),
+        );
+        let worker = worker.replace("websocket_key = headers[\"sec-websocket-key\"]", r#"if "sec-websocket-key" not in headers:
+    body = json.dumps({"reports": [], "user_id": headers.get("x-temps-user-id")}).encode()
+    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    connection.close()
+    return
+websocket_key = headers["sec-websocket-key"]"#);
+        let worker = worker
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+        let binary = format!("{setup}import threading\ndef respond(connection):\n{worker}\nwhile True:\n    connection, _ = server.accept()\n    threading.Thread(target=respond, args=(connection,), daemon=True).start()\n").into_bytes();
+        let url = serve_artifact_once(binary.clone()).await;
+        let registry_config = crate::catalog::RegistryConfig::local(
+            url.clone(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let mut config =
+            ExternalPluginConfig::new(temp.path().into(), "postgres://localhost/test".into())
+                .with_registry(registry_config);
+        // Keep Unix sockets short on every platform.
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        config.sockets_dir = sockets.path().into();
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping installed plugin AI tools test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let service = ExternalPluginsService::new_empty(config, None, database.connection_arc());
+        service
+            .install_selected(selected_plugin(
+                url, &binary, "reports", "1.0.0", 1, &signing,
+            ))
+            .await
+            .unwrap();
+        let settings = service.plugin_ai_tools("reports").await.unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.tools.len(), 1);
+        let registry: Arc<PluginToolsRegistry> = service.ai_tools.clone();
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        let spec = serde_json::from_value(spec).unwrap();
+        registry.bind(
+            InternalApiCaller::new_allowlisted(
+                service.proxy_router.read().await.clone(),
+                &spec,
+                vec![],
+            ),
+            PluginToolAccess::Read,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        let user = serde_json::from_value(serde_json::json!({"id":42,"name":"Reader","email":"reader@example.test","email_verified":true,"must_change_password":false,"mfa_enabled":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now()})).unwrap();
+        let scope = ApiCallScope {
+            auth: temps_auth::context::AuthContext::new_session(
+                user,
+                temps_auth::permissions::Role::Admin,
+            ),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        assert!(!handle.get().unwrap().search("plugin.reports", &scope)[0].enabled);
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id.clone(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let result = handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .unwrap();
+        assert_eq!(result.body["user_id"], "42");
+        service.reload_plugins().await.unwrap();
+        assert!(service.plugin_ai_tools("reports").await.unwrap().enabled);
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id,
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+        service.uninstall_plugin("reports").await.unwrap();
+        assert!(handle
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        service.shutdown_all().await;
     }
 }

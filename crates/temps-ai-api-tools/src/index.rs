@@ -245,6 +245,9 @@ pub struct ApiOperation {
 /// Compact view returned by [`ReadOnlyApiIndex::search`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationSummary {
+    pub source_plugin: Option<String>,
+    pub enabled: bool,
+    pub setup_path: Option<String>,
     pub operation_id: String,
     pub method: String,
     pub path: String,
@@ -255,7 +258,20 @@ pub struct OperationSummary {
 
 impl From<&ApiOperation> for OperationSummary {
     fn from(op: &ApiOperation) -> Self {
+        let source_plugin = op
+            .operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.'))
+            .map(|(name, _)| name.to_owned());
         Self {
+            setup_path: source_plugin
+                .as_ref()
+                .map(|name| format!("/plugins/{name}")),
+            source_plugin,
+            enabled: !op
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.starts_with("[disabled;")),
             operation_id: op.operation_id.clone(),
             method: op.method.clone(),
             path: op.path.clone(),

@@ -11,6 +11,12 @@ use thiserror::Error;
 /// All errors that can arise when searching, describing, or calling an API tool.
 #[derive(Error, Debug, Clone)]
 pub enum ApiToolError {
+    #[error("Plugin '{plugin}' operation '{operation_id}' failed: {reason}")]
+    PluginOperation {
+        plugin: String,
+        operation_id: String,
+        reason: String,
+    },
     /// A required parameter was absent from the supplied `params` object.
     #[error(
         "Required parameter '{name}' is missing for operation '{operation_id}'. \
