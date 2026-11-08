@@ -9,7 +9,7 @@ import { verifyProxyHeaders } from '@temps-sdk/plugin';
 import { attachVerifiedCaller } from '../node_modules/@temps-sdk/plugin/dist/auth.js';
 
 test('declares separate read and approval-gated write tools', () => {
-  const schema = plugin.openapi!() as any;
+  const schema = plugin.openapiSchema!() as any;
   expect(plugin.manifest().name).toBe('temps-playground');
   expect(schema.paths['/tools/echo'].get['x-temps-ai-tool']).toEqual({});
   expect(schema.paths['/tools/acknowledge'].post['x-temps-ai-tool']).toEqual({ access: 'write' });
