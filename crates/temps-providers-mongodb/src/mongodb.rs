@@ -1401,11 +1401,7 @@ impl MongodbService {
         // Non-zero exit. mongorestore can exit non-zero after warnings even
         // when every document landed. Look for its completion markers in the
         // captured tail and salvage success if present.
-        let looks_like_success = captured.contains("done restoring")
-            || captured.contains("finished restoring")
-            || captured.contains("0 document(s) failed to restore");
-
-        if looks_like_success {
+        if mongorestore_reported_success(&captured) {
             warn!(
                 "wal-g backup-fetch exited {} but mongorestore output indicates the restore completed. Treating as success. Output tail:\n{}",
                 exit_code,
@@ -1852,6 +1848,34 @@ fn build_mongodb_url(
 /// Pinned to the 7.0 minor series to prevent silent upgrades to 7.1+.
 /// Ideally this should be pinned to an immutable SHA-256 digest
 /// (e.g. `mongo@sha256:<hash>`); update when rotating the image version.
+/// The last ~500 bytes of mongorestore's output, on a character boundary:
+/// where its final outcome is printed.
+fn mongorestore_output_tail(output: &str) -> &str {
+    let cut = output.len().saturating_sub(500);
+    let cut = (cut..=cut.saturating_add(3))
+        .find(|&i| output.is_char_boundary(i))
+        .unwrap_or(output.len());
+    &output[cut..]
+}
+
+/// Whether mongorestore, which exited non-zero, still restored everything:
+/// it can exit 1 after warnings once every document landed. Only the tail
+/// counts, so an early "done restoring" of one collection cannot mask a
+/// later failure; and a `Failed:` line is never salvaged, because
+/// mongorestore prints its "0 document(s) failed to restore" summary after
+/// a fatal error too (a corrupt or non-archive input: nothing was restored,
+/// and nothing was changed).
+fn mongorestore_reported_success(output: &str) -> bool {
+    let tail = mongorestore_output_tail(output);
+    let failed = tail
+        .lines()
+        .any(|line| line.trim_start().starts_with("Failed:") || line.contains("\tFailed:"));
+    !failed
+        && (tail.contains("done restoring")
+            || tail.contains("finished restoring")
+            || tail.contains("0 document(s) failed to restore"))
+}
+
 const MONGO_SIDECAR_IMAGE: &str = "mongo:7.0";
 /// Directory inside the mongorestore sidecar that receives the uploaded
 /// archive and config file. Exists in every image; never bind-mounted.
@@ -2271,32 +2295,14 @@ impl MongodbService {
 
         if exit_code != 0 {
             // mongorestore can exit 1 after warnings even when every
-            // document restored successfully.  Salvage success on the same
-            // markers the WAL-G restore path uses — BUT only check the TAIL
-            // of the output (~500 bytes).  A large restore that partially
-            // fails after an earlier successful collection can emit "done
-            // restoring" early in the log; checking the full output would
-            // then mask the later failure.  Checking only the tail ensures
-            // the final outcome is what we act on.
-            let salvage_region: &str = {
-                // Advance the byte index to the next valid UTF-8 char boundary
-                // so the slice operation is always safe.
-                let cut = captured_output.len().saturating_sub(500);
-                let cut = (cut..=cut.saturating_add(3))
-                    .find(|&i| captured_output.is_char_boundary(i))
-                    .unwrap_or(captured_output.len());
-                &captured_output[cut..]
-            };
-            let looks_like_success = salvage_region.contains("done restoring")
-                || salvage_region.contains("finished restoring")
-                || salvage_region.contains("0 document(s) failed to restore");
-
-            if looks_like_success {
+            // document restored successfully; see
+            // `mongorestore_reported_success` for what is salvaged.
+            if mongorestore_reported_success(&captured_output) {
                 warn!(
                     "mongorestore sidecar exited {} but output tail indicates success. \
                      Treating as success. Output tail:\n{}",
                     exit_code,
-                    salvage_region.trim()
+                    mongorestore_output_tail(&captured_output).trim()
                 );
                 return Ok(());
             }
@@ -4538,13 +4544,7 @@ mod tests {
         output.push_str(&"x".repeat(600));
         output.push_str(tail_failure);
 
-        let salvage_region: &str = {
-            let cut = output.len().saturating_sub(500);
-            let cut = (cut..=cut.saturating_add(3))
-                .find(|&i| output.is_char_boundary(i))
-                .unwrap_or(output.len());
-            &output[cut..]
-        };
+        let salvage_region = mongorestore_output_tail(&output);
 
         assert!(
             !salvage_region.contains("done restoring"),
@@ -4556,6 +4556,31 @@ mod tests {
             salvage_region.contains(tail_failure),
             "Salvage region must include the tail failure message"
         );
+        assert!(!mongorestore_reported_success(&output));
+    }
+
+    /// mongorestore prints its "0 document(s) failed" summary after a fatal
+    /// error too: an input that is not an archive restored nothing and must
+    /// fail the restore, not be salvaged as a success.
+    #[test]
+    fn a_fatal_mongorestore_error_is_never_salvaged() {
+        for fatal in [
+            "Failed: gzip: invalid header",
+            "Failed: stream or file does not appear to be a mongodump archive",
+        ] {
+            let output = format!(
+                "2026-01-01T00:00:00.000+0000\t{fatal}\n\
+                 2026-01-01T00:00:00.000+0000\t0 document(s) restored successfully. 0 \
+                 document(s) failed to restore.\n"
+            );
+            assert!(!mongorestore_reported_success(&output), "{output}");
+        }
+        // A non-zero exit after warnings, with every document restored.
+        let warned = "2026-01-01T00:00:00.000+0000\tdone restoring shop.proof (2 documents, 0 \
+                      failures)\n2026-01-01T00:00:00.000+0000\t2 document(s) restored \
+                      successfully. 0 document(s) failed to restore.\n";
+        assert!(mongorestore_reported_success(warned));
+        assert!(!mongorestore_reported_success(""));
     }
 
     #[test]
