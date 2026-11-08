@@ -1220,6 +1220,9 @@ pub struct StatusReport {
     pub deployment_count: u32,
     pub service_count: u32,
     pub project_count: u32,
+    /// Active worker nodes, excluding the control plane; advisory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_node_count: Option<u32>,
     /// `None` when the instance cannot compute a resource summary at all
     /// (rather than reporting one with every field `None`, which the nested
     /// type already supports for a partial reading).
@@ -1907,6 +1910,7 @@ mod tests {
             uptime_seconds: 3_600,
             deployment_count: 4,
             service_count: 6,
+            worker_node_count: None,
             project_count: 2,
             resources: Some(StatusResourceSummary {
                 memory_used_mb: Some(1_024),
@@ -1962,6 +1966,7 @@ mod tests {
             uptime_seconds: 0,
             deployment_count: 0,
             service_count: 0,
+            worker_node_count: None,
             project_count: 0,
             resources: None,
             self_update: None,
@@ -2107,5 +2112,26 @@ mod tests {
         let error = attempt.error.expect("error must be set");
         assert!(error.chars().count() < raw_error.chars().count());
         assert!(error.chars().count() <= MAX_STATUS_TEXT_CHARS + " …[truncated]".chars().count());
+    }
+}
+
+#[cfg(test)]
+mod worker_count_tests {
+    use super::*;
+    #[test]
+    fn worker_count_round_trip_and_legacy() {
+        let old = serde_json::json!({"instance_id": Uuid::nil(), "temps_version": "test",
+            "uptime_seconds": 1, "deployment_count": 0, "service_count": 0, "project_count": 0});
+        let mut report: StatusReport = serde_json::from_value(old).unwrap();
+        assert_eq!(report.worker_node_count, None);
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("worker_node_count")
+            .is_none());
+        report.worker_node_count = Some(1);
+        assert_eq!(
+            serde_json::from_value::<StatusReport>(serde_json::to_value(&report).unwrap()).unwrap(),
+            report
+        );
     }
 }

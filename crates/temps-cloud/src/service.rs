@@ -675,13 +675,7 @@ impl CloudService {
     /// working the moment the instance links and goes quiet (cheaply) the
     /// moment it disconnects, with no separate start/stop wiring needed.
     ///
-    /// This same connection also negotiates `Capability::InstanceStatusReporting`
-    /// (ADR-039), but no `StatusProvider` is wired up here yet: counting
-    /// deployments/services/projects and reading resource usage needs
-    /// database and system access this crate does not have reason to hold
-    /// just for this. Passing `None` is a deliberately silent no-op — the
-    /// capability is still offered, and status reporting activates with no
-    /// further wiring once a provider is registered.
+    /// Reports the worker count from the local database in the background.
     pub fn start_heartbeat_sender(&self) {
         let mut task = self
             .heartbeat_task
@@ -691,6 +685,9 @@ impl CloudService {
             tracing::info!("Cloud service launching heartbeat sender task");
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
+            let provider = Arc::new(temps_cloud_client::status_provider::WorkerStatusProvider(
+                self.db.clone(),
+            ));
             // ADR-094: with an auth plugin, this instance applies Cloud's
             // signed console logouts and says so in its `Hello`.
             let console_logout = self.oidc_provisioner.get().map(|oidc| {
@@ -701,7 +698,7 @@ impl CloudService {
                 temps_cloud_client::heartbeat::run_with_console_logout(
                     link,
                     cancel,
-                    None,
+                    Some(provider),
                     console_logout,
                 )
                 .await;

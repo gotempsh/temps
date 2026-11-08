@@ -575,6 +575,7 @@ async fn send_status_report(
         deployment_count: snapshot.deployment_count,
         service_count: snapshot.service_count,
         project_count: snapshot.project_count,
+        worker_node_count: snapshot.worker_node_count,
         resources: snapshot.resources,
         self_update: snapshot.self_update.map(cap_self_update_text),
     };
@@ -1385,6 +1386,7 @@ mod tests {
         StatusSnapshot {
             deployment_count: 3,
             service_count: 5,
+            worker_node_count: None,
             project_count: 2,
             resources: None,
             self_update: None,
