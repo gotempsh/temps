@@ -34,6 +34,53 @@ describe('openGithubAppWindow', () => {
     expect(githubWindow.opener).toBeNull()
   })
 
+  test('a window already on GitHub is returned, not thrown on', () => {
+    // A cross-origin WindowProxy rejects writes to `opener`.
+    const crossOrigin = {
+      closed: false,
+      get opener(): unknown {
+        return null
+      },
+      set opener(_value: unknown) {
+        throw new DOMException('Blocked a frame', 'SecurityError')
+      },
+    }
+
+    expect(openGithubAppWindow('temps-github-app-abc', () => crossOrigin)).toBe(
+      crossOrigin
+    )
+  })
+
+  test('a reused cross-origin window does not break the next attempt', () => {
+    const tracker = createManifestSetupTracker<{
+      closed: boolean
+      opener: unknown
+      close(): void
+    }>()
+    const crossOrigin = {
+      closed: false,
+      get opener(): unknown {
+        return null
+      },
+      set opener(_value: unknown) {
+        throw new DOMException('Blocked a frame', 'SecurityError')
+      },
+      close() {},
+    }
+
+    const first = tracker.begin(() =>
+      openGithubAppWindow('temps-github-app-abc', () => crossOrigin)
+    )
+    tracker.manifestPosted()
+    const second = tracker.begin(() =>
+      openGithubAppWindow('temps-github-app-abc', () => crossOrigin)
+    )
+
+    expect(second.window).toBe(crossOrigin)
+    expect(tracker.isCurrent(second.attempt)).toBe(true)
+    expect(tracker.isCurrent(first.attempt)).toBe(false)
+  })
+
   test('a blocked popup is passed through as null', () => {
     expect(
       openGithubAppWindow<{ opener: unknown }>(

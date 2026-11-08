@@ -91,14 +91,25 @@ export function createManifestSetupTracker<W extends SetupWindow>() {
  * Passing `noopener` would also drop the handle the setup needs to post the
  * manifest and close a blank window, so the opener is cleared instead while
  * the window is still a same-origin blank page. It stays cleared when the
- * window navigates to GitHub.
+ * window navigates to GitHub. A window that is already cross-origin is
+ * returned as it is: its opener was cleared when it was opened.
  */
 export function openGithubAppWindow<W extends { opener: unknown }>(
   name: string,
   open: (url: string, target: string) => W | null
 ): W | null {
   const githubWindow = open('', name)
-  if (githubWindow) githubWindow.opener = null
+  if (githubWindow) {
+    try {
+      githubWindow.opener = null
+    } catch {
+      // A window that is already on GitHub is cross-origin, and its `opener`
+      // cannot be written from here: assigning it throws a SecurityError.
+      // That window had its opener cleared when it was first opened, while
+      // it was still a blank page, so there is nothing left to cut. Failing
+      // here would stop every later attempt until the window was closed.
+    }
+  }
   return githubWindow
 }
 
