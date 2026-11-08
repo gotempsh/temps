@@ -200,6 +200,7 @@ async fn a_code_without_a_state_the_server_issued_is_refused_before_github() {
         &state,
         "placeholder-manifest-code".to_string(),
         Some("state-the-server-did-not-issue".to_string()),
+        None,
     )
     .await
     .expect_err("an unknown state is refused");
@@ -216,6 +217,7 @@ async fn a_missing_or_empty_state_is_refused_without_touching_the_database() {
             &state,
             "code".to_string(),
             manifest_state.clone(),
+            None,
         )
         .await
         .expect_err("a request without a state is refused");
@@ -402,6 +404,69 @@ async fn starting_the_flow_is_audited_without_the_state() {
     );
 }
 
+fn created_app() -> crate::services::github::GitHubAppData {
+    crate::services::github::GitHubAppData {
+        provider_id: 12,
+        id: 12,
+        app_id: 3456,
+        name: "temps-example".to_string(),
+        slug: "temps-example".to_string(),
+        client_id: "Iv1.example-client".to_string(),
+        client_secret: "example-client-secret-value".to_string(),
+        private_key: "-----BEGIN RSA PRIVATE KEY-----example".to_string(),
+        webhook_secret: "example-webhook-secret-value".to_string(),
+        url: "https://github.com/apps/temps-example".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn creating_the_app_is_audited_for_the_operator_without_its_credentials() {
+    let recorder = Arc::new(RecordingAuditLogger::default());
+    let mut state = (*super::super::public_route_tests::state()).clone();
+    state.audit_service = recorder.clone();
+    let state = Arc::new(state);
+    let app = created_app();
+
+    record_github_app_created(&state, 7, Some(&test_metadata()), &app).await;
+
+    let recorded = recorder.operations.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    let (operation, payload) = &recorded[0];
+    assert_eq!(operation, "GITHUB_APP_CREATED");
+    for expected in [
+        "\"user_id\":7",
+        "\"provider_id\":12",
+        "\"app_id\":3456",
+        "\"app_name\":\"temps-example\"",
+        "127.0.0.1",
+    ] {
+        assert!(payload.contains(expected), "missing {expected}: {payload}");
+    }
+    for secret in [&app.client_secret, &app.private_key, &app.webhook_secret] {
+        assert!(
+            !payload.contains(secret.as_str()),
+            "a credential of the app was audited: {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn creating_the_app_is_audited_even_without_request_metadata() {
+    let recorder = Arc::new(RecordingAuditLogger::default());
+    let mut state = (*super::super::public_route_tests::state()).clone();
+    state.audit_service = recorder.clone();
+    let state = Arc::new(state);
+
+    record_github_app_created(&state, 7, None, &created_app()).await;
+
+    let recorded = recorder.operations.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].0, "GITHUB_APP_CREATED");
+    assert!(recorded[0].1.contains("\"user_id\":7"), "{}", recorded[0].1);
+}
+
 #[test]
 fn the_start_endpoint_is_in_the_openapi_document() {
     use utoipa::OpenApi;
@@ -583,7 +648,7 @@ async fn the_callback_never_logs_the_state_or_the_code() {
         ("code".to_string(), secret_code.to_string()),
         ("state".to_string(), secret_state.to_string()),
     ]);
-    let result = github_app_auth_callback(State(state), Query(params)).await;
+    let result = github_app_auth_callback(State(state), None, Query(params)).await;
     drop(guard);
 
     assert_eq!(

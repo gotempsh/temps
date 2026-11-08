@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
-use super::audit::{AuditContext, GithubAppSetupStartedAudit};
+use super::audit::{AuditContext, GithubAppCreatedAudit, GithubAppSetupStartedAudit};
 use super::types::GitAppState as AppState;
 use temps_auth::{permission_check, Permission, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
@@ -181,6 +181,7 @@ async fn handle_manifest_conversion_with_source(
     state: &Arc<AppState>,
     code: String,
     manifest_state: Option<String>,
+    metadata: Option<&RequestMetadata>,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     let user_id =
         require_manifest_state(&state.git_provider_manager, manifest_state.as_deref()).await?;
@@ -204,6 +205,7 @@ async fn handle_manifest_conversion_with_source(
                 "GitHub App created successfully: {} (provider_id: {})",
                 app.name, app.provider_id
             );
+            record_github_app_created(state, user_id, metadata, &app).await;
 
             // Use the operator-configured external URL — never reflect client headers.
             let external_url = state
@@ -239,6 +241,41 @@ async fn handle_manifest_conversion_with_source(
             Ok((response_headers, Redirect::to(&redirect_url)))
         }
         Err(e) => Err(app_creation_problem(e)),
+    }
+}
+
+/// Audit a GitHub App the manifest callback registered as a git provider.
+///
+/// The operator is the user the setup state was issued to: the callback has no
+/// session of its own. Only identifiers are recorded, never the app's client
+/// secret, private key or webhook secret. A failed write is logged and does
+/// not fail the setup, which has already succeeded.
+async fn record_github_app_created(
+    state: &Arc<AppState>,
+    user_id: i32,
+    metadata: Option<&RequestMetadata>,
+    app: &crate::services::github::GitHubAppData,
+) {
+    let audit = GithubAppCreatedAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: metadata.map(|metadata| metadata.ip_address.clone()),
+            user_agent: metadata
+                .map(|metadata| metadata.user_agent.clone())
+                .unwrap_or_default(),
+        },
+        provider_id: app.provider_id,
+        app_id: app.app_id,
+        app_name: app.name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            user_id,
+            provider_id = app.provider_id,
+            app_id = app.app_id,
+            error = %e,
+            "Failed to create audit log for a GitHub App created from a manifest"
+        );
     }
 }
 
@@ -1139,6 +1176,7 @@ async fn find_github_app_provider_for_installation(
 
 async fn github_app_auth_callback(
     State(state): State<Arc<AppState>>,
+    metadata: Option<Extension<RequestMetadata>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     let code = params.get("code").cloned().unwrap_or_default();
@@ -1261,7 +1299,13 @@ async fn github_app_auth_callback(
             "Detected manifest conversion flow"
         );
         // This is a manifest conversion - the code needs to be exchanged for a GitHub App
-        return handle_manifest_conversion_with_source(&state, code, state_param).await;
+        return handle_manifest_conversion_with_source(
+            &state,
+            code,
+            state_param,
+            metadata.as_ref().map(|Extension(metadata)| metadata),
+        )
+        .await;
     }
 
     // For auth-only flow (no installation_id yet), redirect and wait for webhook
