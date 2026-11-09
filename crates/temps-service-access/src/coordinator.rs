@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Control-plane orchestration. This is not yet a public API or a renewal job.
+//! Control-plane orchestration. This is not yet exposed as a public approval API.
 //! No queued intention is reported as connected; only exact worker ACKs write
 //! an applied version and the original signed policy lease deadline.
 use crate::{
@@ -20,7 +20,7 @@ use temps_core::{AuditLogger, AuditOperation, EncryptionService, ProjectAccessCh
 use temps_entities::{
     sandbox_access_delivery::DeliveryOperation, sandbox_access_runtimes as runtimes, sandboxes,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +77,7 @@ pub struct ServiceAccessCoordinator {
     queue: DeliveryQueue,
     audit: Arc<dyn AuditLogger>,
     admission: Semaphore,
+    wake: Notify,
 }
 impl ServiceAccessCoordinator {
     pub fn new(
@@ -96,6 +97,7 @@ impl ServiceAccessCoordinator {
             transport,
             audit,
             admission: Semaphore::new(2),
+            wake: Notify::new(),
         }
     }
 
@@ -126,7 +128,9 @@ impl ServiceAccessCoordinator {
         self.authority
             .register(observed.node_id, &observed.worker)
             .await?;
-        Ok(self.service.authorize_grant(consent, observed).await?)
+        let grant = self.service.authorize_grant(consent, observed).await?;
+        self.wake.notify_waiters();
+        Ok(grant)
     }
 
     /// One bounded command. The caller schedules subsequent ticks; there is no
@@ -144,6 +148,24 @@ impl ServiceAccessCoordinator {
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Bounded maintenance tick. Authorization changes wake their worker in the
+    /// database; periodic rechecks renew only still-authorized short leases.
+    pub async fn maintain(&self) -> Result<u64, CoordinatorError> {
+        let queued = self.queue.schedule_due(16).await?;
+        self.queue.prune_completed().await?;
+        if queued > 0 {
+            self.wake.notify_waiters();
+        }
+        Ok(queued)
+    }
+
+    pub(crate) async fn wait_for_work(&self) {
+        tokio::select! {
+            _ = self.wake.notified() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
         }
     }
 
@@ -277,6 +299,7 @@ impl ServiceAccessCoordinator {
         tx.commit()
             .await
             .map_err(|e| database(id, "commit retirement", e))?;
+        self.wake.notify_waiters();
         if let Err(error) = self
             .audit
             .create_audit_log(&RetirementAudit {

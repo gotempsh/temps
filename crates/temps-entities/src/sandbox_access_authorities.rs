@@ -22,6 +22,8 @@ pub struct Model {
     pub snapshot_version: i64,
     /// Fences issuance against authorization changes read by another dispatcher.
     pub desired_revision: i64,
+    /// Durable lease-recheck deadline. None means no active incarnation to renew.
+    pub next_reconcile_at: Option<temps_core::DBDateTime>,
     pub closed_at: Option<temps_core::DBDateTime>,
     pub created_at: temps_core::DBDateTime,
     pub updated_at: temps_core::DBDateTime,
@@ -70,6 +72,7 @@ mod tests {
             ca_key_encrypted: "ca-sentinel".into(),
             snapshot_version: 0,
             desired_revision: 0,
+            next_reconcile_at: None,
             closed_at: None,
             created_at: now,
             updated_at: now,

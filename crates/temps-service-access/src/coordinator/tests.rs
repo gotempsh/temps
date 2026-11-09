@@ -67,6 +67,49 @@ async fn coordinator_bounds_work_and_preserves_database_error_context() {
 }
 
 #[tokio::test]
+async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_drop() {
+    use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
+    let context = ServiceRegistrationContext::new();
+    context.register_service(Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors((0..8).map(|_| sea_orm::DbErr::Custom("offline".into())))
+            .into_connection(),
+    ));
+    context.register_service(Arc::new(EncryptionService::new(&"ab".repeat(32)).unwrap()));
+    let audit: Arc<dyn AuditLogger> = Arc::new(NoopAuditLogger);
+    context.register_service(audit);
+    let provider: Arc<dyn temps_sandbox_providers::SandboxProvider> = Provider::new();
+    context.register_service(provider);
+    let plugin = crate::ServiceAccessPlugin::new();
+    plugin.register_services(&context).await.unwrap();
+    let read_context = context.create_plugin_context();
+    let coordinator = context.require_service::<ServiceAccessCoordinator>();
+    let weak = Arc::downgrade(&coordinator);
+    let before = Arc::strong_count(&coordinator);
+    plugin
+        .initialize_plugin_services(&read_context)
+        .await
+        .unwrap();
+    plugin
+        .initialize_plugin_services(&read_context)
+        .await
+        .unwrap();
+    assert_eq!(Arc::strong_count(&coordinator), before + 3);
+    tokio::task::yield_now().await;
+    assert!(weak.upgrade().is_some());
+    drop(read_context);
+    drop(context);
+    drop(coordinator);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incarnations() {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
@@ -142,16 +185,8 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         .revoke_grant(9801, "sbx_dispatch", &first.grant_id, 9801, false, 1)
         .await
         .unwrap();
-    let tx = db.begin().await.unwrap();
-    DeliveryQueue::advance(
-        &tx,
-        first.runtime_id,
-        second.desired_version,
-        DeliveryOperation::Reconcile,
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
+    let (a, b) = tokio::join!(coordinator.maintain(), coordinator.maintain());
+    assert_eq!(a.unwrap() + b.unwrap(), 1);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Applied)
@@ -187,13 +222,13 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
     assert!(row.closed_at.is_some());
     assert_eq!(row.applied_version, 3);
     assert_eq!(row.desired_version, 5);
+    db.execute_unprepared("UPDATE sandbox_access_delivery SET available_at=now()-interval '1 second' WHERE completed_at IS NULL").await.unwrap();
     let binding = provider.binding.lock().unwrap().as_ref().unwrap().0.clone();
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Retired)
     );
     assert!(binding.ready(1).await.is_err());
-    db.execute_unprepared("UPDATE sandbox_access_delivery SET available_at=now()-interval '1 second' WHERE completed_at IS NULL").await.unwrap();
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Superseded)
@@ -257,21 +292,36 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
         .await
         .unwrap();
     let grant = coordinator.connect(consent(&service.id)).await.unwrap();
+    assert_eq!(coordinator.maintain().await.unwrap(), 0);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Applied)
     );
     let binding = provider.binding.lock().unwrap().as_ref().unwrap().0.clone();
+    assert_eq!(coordinator.maintain().await.unwrap(), 0);
+    db.execute_unprepared(
+        "UPDATE sandbox_access_authorities SET next_reconcile_at=now()-interval '1 second'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(coordinator.maintain().await.unwrap(), 1);
+    assert_eq!(coordinator.maintain().await.unwrap(), 0);
+    assert_eq!(
+        coordinator.dispatch_one().await.unwrap(),
+        Some(DispatchOutcome::Applied)
+    );
+    let renewed = temps_entities::sandbox_service_grants::Entity::find_by_id(&grant.grant_id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed.expires_at, grant.expires_at);
     coordinator
         .service
         .revoke_grant(9801, "sbx_dispatch", &grant.grant_id, 9801, false, 1)
         .await
         .unwrap();
-    let tx = db.begin().await.unwrap();
-    DeliveryQueue::advance(&tx, grant.runtime_id, 1, DeliveryOperation::Reconcile)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    assert_eq!(coordinator.maintain().await.unwrap(), 1);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Superseded)
@@ -282,8 +332,8 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
         .unwrap()
         .unwrap();
     assert!(pending.closed_at.is_some());
-    assert_eq!(pending.applied_version, 1);
-    assert_eq!(pending.desired_version, 3);
+    assert_eq!(pending.applied_version, 2);
+    assert_eq!(pending.desired_version, 4);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Retired)

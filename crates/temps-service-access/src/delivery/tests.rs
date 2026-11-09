@@ -89,6 +89,12 @@ async fn rejects_invalid_batches_and_preserves_database_failure_context() {
             Err(DeliveryError::Invalid { .. })
         ));
     }
+    for limit in [0, 17, u32::MAX] {
+        assert!(matches!(
+            queue.schedule_due(limit).await,
+            Err(DeliveryError::Invalid { .. })
+        ));
+    }
     let error = queue.claim(1).await.unwrap_err();
     assert!(error.to_string().contains("claim commands"));
     assert!(error.to_string().contains("pending queue"));
@@ -271,5 +277,18 @@ async fn postgres_delivery_fences_claims_versions_and_survives_runtime_deletion(
     assert!(commands
         .iter()
         .all(|c| c.completed_at.is_some() && c.claim_id.is_none() && c.claimed_until.is_none()));
+    db.execute_unprepared("INSERT INTO sandbox_access_delivery (runtime_id,desired_version,operation,completed_at) SELECT md5(i::text)::uuid,1,'reconcile',now()-interval '1 hour' FROM generate_series(1,260) i; INSERT INTO sandbox_access_delivery (runtime_id,desired_version,operation,created_at) VALUES ('00000000-0000-4000-8000-000000000001',1,'retire',now()-interval '1 hour')").await.unwrap();
+    assert_eq!(queue.prune_completed().await.unwrap(), 256);
+    assert_eq!(queue.prune_completed().await.unwrap(), 4);
+    assert_eq!(queue.prune_completed().await.unwrap(), 0);
+    let retained = delivery::Entity::find().all(db.as_ref()).await.unwrap();
+    assert_eq!(retained.len(), 4);
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|row| row.completed_at.is_none())
+            .count(),
+        1
+    );
     test.cleanup().await;
 }

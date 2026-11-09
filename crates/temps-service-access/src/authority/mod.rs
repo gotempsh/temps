@@ -268,6 +268,7 @@ impl AuthorityStore {
             ca_key_encrypted: encrypt(&Zeroizing::new(ca_key.serialize_der()))?,
             snapshot_version: 0,
             desired_revision: 0,
+            next_reconcile_at: None,
             closed_at: None,
             created_at: now,
             updated_at: now,

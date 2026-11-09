@@ -7949,3 +7949,75 @@ INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_
         .is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sandbox_access_reconciliation_wakes_changes_and_preserves_due_work(
+) -> anyhow::Result<()> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("sandbox access reconciliation");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261109_000004_sandbox_access_reconciliation";
+    let migrations = Migrator::migrations();
+    let migration = migrations.iter().find(|m| m.name() == target).unwrap();
+    let manager = SchemaManager::new(&db);
+    Migrator::up(&db, Some(migrations.len() as u32 - steps_back_to(target))).await?;
+    migration.down(&manager).await?;
+    db.execute_unprepared(r#"
+INSERT INTO users (id,name,email) VALUES (9901,'Test user','user@example.com');
+INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9901,'Schedule','repo','owner','/','main','nodejs','schedule',now(),now());
+INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9901,'sbx_schedule','schedule',9901,9901,'running','docker');
+INSERT INTO sandbox_access_authorities (id,sdk_node_id,seal_public_key,snapshot_key_encrypted,session_key_encrypted,ca_certificate,ca_key_encrypted) VALUES ('00000000-0000-4000-8000-000000000501','00000000-0000-4000-8000-000000000502',repeat('a',44),'encrypted-snapshot','encrypted-session','public-ca','encrypted-ca');
+INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name) VALUES ('00000000-0000-4000-8000-000000000503',9901,9901,'container','00000000-0000-4000-8000-000000000501','docker','temps-sandbox-sbx_schedule');
+"#).await?;
+    Migrator::up(&db, Some(1)).await?;
+    let due = || async {
+        db.query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT next_reconcile_at<=now() AS due FROM sandbox_access_authorities",
+        ))
+        .await?
+        .unwrap()
+        .try_get::<bool>("", "due")
+    };
+    assert!(due().await?);
+    db.execute_unprepared(
+        "UPDATE sandbox_access_authorities SET next_reconcile_at=now()+interval '10 seconds'",
+    )
+    .await?;
+    migration.up(&manager).await?;
+    assert!(!due().await?);
+    db.execute_unprepared(
+        "UPDATE sandbox_access_authorities SET snapshot_version=snapshot_version+1",
+    )
+    .await?;
+    assert!(!due().await?);
+    db.execute_unprepared(
+        "UPDATE sandbox_access_authorities SET desired_revision=desired_revision+1",
+    )
+    .await?;
+    assert!(due().await?);
+    assert!(migration
+        .down(&manager)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("active incarnations"));
+    db.execute_unprepared("UPDATE sandbox_access_runtimes SET closed_at=now()")
+        .await?;
+    migration.down(&manager).await?;
+    migration.down(&manager).await?;
+    migration.up(&manager).await?;
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT next_reconcile_at IS NULL AS inactive FROM sandbox_access_authorities",
+        ))
+        .await?
+        .unwrap();
+    assert!(row.try_get::<bool>("", "inactive")?);
+    Ok(())
+}

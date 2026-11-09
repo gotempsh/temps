@@ -236,7 +236,6 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // Feature flags (depends on database only: flags are control-plane
         // rows, no container and no background task).
         || Box::new(FlagsPlugin::new()),
-        || Box::new(temps_service_access::ServiceAccessPlugin::new()),
         // Ingress connectors such as Cloudflare Tunnel (ADR 058; depends on the
         // DNS plugin and the shared route table).
         || Box::new(temps_ingress::IngressPlugin::new()),
@@ -310,6 +309,9 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // control plane, and a create with no usable worker answers the
         // worker-node-required problem.
         || Box::new(SandboxPlugin::new()),
+        // Service grants consume the authenticated SandboxProvider registered
+        // by AgentsPlugin, and initialize delivery after sandbox recovery.
+        || Box::new(temps_service_access::ServiceAccessPlugin::new()),
     ]);
 
     // Structured log collection, storage, search, and streaming. Depends on
@@ -514,7 +516,6 @@ mod tests {
         "kv",
         "blob",
         "flags",
-        "service-access",
         "ingress",
         "environments",
         "projects",
@@ -528,6 +529,7 @@ mod tests {
         "deployments",
         "mcp-server",
         "sandbox",
+        "service-access",
         "log-aggregator",
         "import",
         "status-page",

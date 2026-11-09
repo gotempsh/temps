@@ -16,6 +16,10 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{configure_routes, AccessAppState, ServiceAccessApiDoc};
 use crate::service::ServiceAccessService;
+use crate::{
+    coordinator::ServiceAccessCoordinator, reconciler::ServiceAccessReconciler,
+    transport::WorkerTransport,
+};
 
 pub struct ServiceAccessPlugin;
 
@@ -42,13 +46,39 @@ impl TempsPlugin for ServiceAccessPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let db = context.require_service::<DatabaseConnection>();
-            context.register_service(Arc::new(ServiceAccessService::new(
-                db,
-                context.require_service::<temps_core::EncryptionService>(),
+            let encryption = context.require_service::<temps_core::EncryptionService>();
+            let service = Arc::new(ServiceAccessService::new(
+                Arc::clone(&db),
+                Arc::clone(&encryption),
                 Arc::new(crate::broker::UnavailableTokenlessBroker),
+            ));
+            let transport = Arc::new(WorkerTransport::new(
+                context.require_service::<dyn temps_sandbox_providers::SandboxProvider>(),
+            ));
+            context.register_service(Arc::new(ServiceAccessCoordinator::new(
+                db,
+                encryption,
+                context.require_service::<dyn AuditLogger>(),
+                Arc::clone(&service),
+                transport,
+                context.get_service::<dyn temps_core::ProjectAccessChecker>(),
             )));
+            context.register_service(service);
+            context.register_service(Arc::new(ServiceAccessReconciler::default()));
 
             debug!("Sandbox service access plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            context
+                .require_service::<ServiceAccessReconciler>()
+                .start(context.require_service::<ServiceAccessCoordinator>());
             Ok(())
         })
     }

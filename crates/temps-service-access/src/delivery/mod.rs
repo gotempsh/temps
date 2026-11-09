@@ -5,6 +5,7 @@
 //! bounded, leased and fenced. Callers must authenticate the worker and verify
 //! its enforcement receipt before completing a command. No credentials are
 //! persisted in this queue, and no database operation runs on the proxy path.
+mod schedule;
 use std::sync::Arc;
 
 use sea_orm::{
@@ -105,7 +106,7 @@ impl DeliveryQueue {
         }
         let claim_id = Uuid::new_v4();
         let rows = delivery::Entity::find().from_raw_sql(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "WITH next AS (SELECT id FROM sandbox_access_delivery WHERE completed_at IS NULL AND available_at<=now() AND (claimed_until IS NULL OR claimed_until<=now()) ORDER BY available_at,id LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE sandbox_access_delivery AS d SET claim_id=$2, claimed_until=now()+interval '30 seconds', attempts=LEAST(d.attempts,2147483646)+1 FROM next WHERE d.id=next.id RETURNING d.*",
+            "WITH next AS (SELECT id FROM sandbox_access_delivery WHERE completed_at IS NULL AND available_at<=now() AND (claimed_until IS NULL OR claimed_until<=now()) ORDER BY (operation='retire') DESC,available_at,id LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE sandbox_access_delivery AS d SET claim_id=$2, claimed_until=now()+interval '30 seconds', attempts=LEAST(d.attempts,2147483646)+1 FROM next WHERE d.id=next.id RETURNING d.*",
             [i64::from(limit).into(),claim_id.into()])).all(self.db.as_ref()).await
             .map_err(|e| database("claim commands", "pending queue", e))?;
         Ok(rows

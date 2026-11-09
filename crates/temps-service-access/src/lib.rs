@@ -9,6 +9,7 @@ pub mod error;
 pub mod handlers;
 pub mod planner;
 mod plugin;
+pub mod reconciler;
 pub mod service;
 pub mod tokenless;
 pub mod transport;
