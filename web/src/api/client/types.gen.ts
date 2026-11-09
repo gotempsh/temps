@@ -18368,27 +18368,49 @@ export type Intent = {
 };
 
 /**
- * A worker's internal edge proxy, from its heartbeat's
+ * A worker's internal routing, from its heartbeat's
  * `capacity.internal_proxy`. Every `<env>.<project>.temps.local` name
- * points at the node's bridge, port 80, where this proxy listens: the
- * resolver can be healthy while the proxy is not, and then the names
- * resolve and every call to them fails.
+ * points at the node's bridge, port 80: the resolver can be healthy while
+ * nothing serves those calls, and then the names resolve and every call to
+ * them fails.
  */
 export type InternalProxyState = {
     /**
-     * The address it binds, e.g. `10.205.0.1:80`.
+     * What containers call, e.g. `10.205.0.1:80`.
      */
     address?: string | null;
     /**
-     * Why the last bind failed; `None` while it listens.
+     * Why the calls are not served; `None` while they are.
      */
     error?: string | null;
     /**
-     * `None` when the agent does not report it (an older agent, or no
-     * overlay bridge yet): unknown, never "not listening".
+     * Whether containers' calls to port 80 of the bridge address are
+     * served. `None` when the agent does not report it (an older agent, or
+     * no overlay bridge yet): unknown, never "not listening".
      */
     listening?: boolean | null;
+    mode?: InternalRoutingMode | null;
+    /**
+     * The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+     * holds it.
+     */
+    proxy_address?: string | null;
+    redirect?: InternalRedirectState | null;
+    /**
+     * Why the redirect is missing, also while the fallback serves.
+     */
+    redirect_error?: string | null;
 };
+
+/**
+ * Whether a worker's port-80 redirect is in place.
+ */
+export type InternalRedirectState = 'installed' | 'missing' | 'unsupported';
+
+/**
+ * How a worker serves port 80 of its bridge address (ADR-098 D5).
+ */
+export type InternalRoutingMode = 'redirect' | 'direct' | 'down';
 
 /**
  * One CIDR in a policy, in canonical form (network address, explicit prefix).
@@ -21075,22 +21097,33 @@ export type NodeDnsStatusEntry = {
     dns_resolver_running?: boolean | null;
     dns_resolver_tasks_alive?: boolean | null;
     /**
-     * The address the proxy binds, e.g. `10.205.0.1:80`.
+     * What containers call, e.g. `10.205.0.1:80`.
      */
     internal_proxy_address?: string | null;
     /**
-     * Why the last bind failed, written for the operator; `None` while it
-     * listens.
+     * Why the calls are not served, written for the operator; `None` while
+     * they are.
      */
     internal_proxy_error?: string | null;
     /**
-     * Whether the node's internal edge proxy listens on its bridge address
-     * (port 80), which is where every `<env>.<project>.temps.local` name
-     * points. The resolver can be healthy while this is `false`: the names
-     * resolve and every call fails. `None` = not reported (older agent, or
-     * no overlay bridge yet).
+     * The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+     * holds it.
+     */
+    internal_proxy_listen_address?: string | null;
+    /**
+     * Whether containers' calls to port 80 of the node's bridge address,
+     * where every `<env>.<project>.temps.local` name points, are served.
+     * The resolver can be healthy while this is `false`: the names resolve
+     * and every call fails. `None` = not reported (older agent, or no
+     * overlay bridge yet).
      */
     internal_proxy_listening?: boolean | null;
+    internal_proxy_mode?: InternalRoutingMode | null;
+    internal_proxy_redirect?: InternalRedirectState | null;
+    /**
+     * Why the redirect is missing, also while the fallback serves.
+     */
+    internal_proxy_redirect_error?: string | null;
     node_id: number;
     node_name: string;
     /**
