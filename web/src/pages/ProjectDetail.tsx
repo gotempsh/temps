@@ -515,7 +515,10 @@ export function ProjectDetail() {
       <ProjectFrame project={project}>
         <div className="flex h-full min-w-0 flex-col overflow-hidden">
           <MonitoringProjectHeader project={project} />
-          <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+          <div
+            data-console-scroll
+            className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
+          >
             <PageWidthShell project={project}>
               <ProjectSectionChrome project={project}>
                 <Routes>
@@ -730,7 +733,10 @@ export function ProjectDetail() {
           }
           isLoading={createDeployment.isPending || deployImage.isPending}
         />
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div
+          data-console-scroll
+          className="flex-1 overflow-y-auto overflow-x-hidden"
+        >
           {/* One column, as wide as the page needs, holding the banners, the
               section tabs and the page so they line up. */}
           <PageWidthShell project={project}>

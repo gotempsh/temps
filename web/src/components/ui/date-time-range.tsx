@@ -30,12 +30,14 @@ export function DateTimeRange({
   maxRangeDays = 30,
   active = true,
   allowCustom = true,
+  customLabel = 'Custom',
 }: {
   value: DateTimeRangeValue
   onChange: (value: DateTimeRangeValue) => void
   maxRangeDays?: number
   active?: boolean
   allowCustom?: boolean
+  customLabel?: string
 }) {
   const [open, setOpen] = useState(false)
   const id = useId()
@@ -121,7 +123,7 @@ export function DateTimeRange({
             aria-pressed={active && value.preset === 'custom'}
           >
             <CalendarDays className="size-3.5" />
-            Custom
+            {customLabel}
           </Button>
         </PopoverTrigger>
         <PopoverContent

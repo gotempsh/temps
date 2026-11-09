@@ -712,6 +712,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div
+                  data-console-scroll
                   className={
                     focusMode
                       ? 'flex-1 min-h-0 overflow-hidden flex flex-col'
