@@ -29,6 +29,9 @@ use crate::handlers::audit::{
     NodeArchitectureChangedAudit, NodePublicIngressChangedAudit, NodeRemovalAudit,
 };
 use crate::handlers::types::NodeAdminState;
+use crate::services::cluster_dns::{
+    InternalProxyState, InternalRedirectState, InternalRoutingMode,
+};
 pub use crate::services::edge_routes::{EdgeCertBundle, EdgeCertificates, EdgeRouteEntry};
 use crate::services::edge_routes::{EdgeRouteError, EdgeRouteService};
 use crate::services::node_service::{
@@ -684,27 +687,34 @@ pub struct NodeDnsStatusEntry {
     pub dns_resolver_consecutive_failures: i32,
     pub dns_resolver_last_error: Option<String>,
     pub dns_resolver_record_count: Option<i32>,
-    /// Whether the node's internal edge proxy listens on its bridge address
-    /// (port 80), which is where every `<env>.<project>.temps.local` name
-    /// points. The resolver can be healthy while this is `false`: the names
-    /// resolve and every call fails. `None` = not reported (older agent, or
-    /// no overlay bridge yet).
+    /// Whether containers' calls to port 80 of the node's bridge address,
+    /// where every `<env>.<project>.temps.local` name points, are served.
+    /// The resolver can be healthy while this is `false`: the names resolve
+    /// and every call fails. `None` = not reported (older agent, or no
+    /// overlay bridge yet).
     pub internal_proxy_listening: Option<bool>,
-    /// The address the proxy binds, e.g. `10.205.0.1:80`.
+    /// What containers call, e.g. `10.205.0.1:80`.
     pub internal_proxy_address: Option<String>,
-    /// Why the last bind failed, written for the operator; `None` while it
-    /// listens.
+    /// Why the calls are not served, written for the operator; `None` while
+    /// they are.
     pub internal_proxy_error: Option<String>,
+    /// How the calls are served (ADR-098): `redirect` to the proxy's own
+    /// port, the `direct` fallback on port 80, or `down`. `None` from an
+    /// older agent.
+    pub internal_proxy_mode: Option<InternalRoutingMode>,
+    /// The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+    /// holds it.
+    pub internal_proxy_listen_address: Option<String>,
+    /// Whether the port-80 redirect is in place; `None` from an older agent.
+    pub internal_proxy_redirect: Option<InternalRedirectState>,
+    /// Why the redirect is missing, also while the fallback serves.
+    pub internal_proxy_redirect_error: Option<String>,
 }
 
-/// The internal proxy's state from a heartbeat's `capacity.internal_proxy`:
-/// `(listening, address, error)`, all `None` when the agent never reported
-/// it.
-fn internal_proxy_from_capacity(
-    capacity: &serde_json::Value,
-) -> (Option<bool>, Option<String>, Option<String>) {
-    let proxy = crate::services::cluster_dns::internal_proxy_state(capacity);
-    (proxy.listening, proxy.address, proxy.error)
+/// The internal routing state from a heartbeat's `capacity.internal_proxy`;
+/// every field `None` when the agent never reported it.
+fn internal_proxy_from_capacity(capacity: &serde_json::Value) -> InternalProxyState {
+    crate::services::cluster_dns::internal_proxy_state(capacity)
 }
 
 /// An internal DNS name two owners publish (ADR-055 §10). The holder's
@@ -838,6 +848,8 @@ pub struct ClusterDnsStatusResponse {
         NodePlacementReference,
         DrainStatusResponse,
         NodeDnsStatusEntry,
+        InternalRoutingMode,
+        InternalRedirectState,
         DnsNameConflictEntry,
         ClusterDnsStatusResponse,
         crate::services::DeploymentWithoutResolver,
@@ -3343,8 +3355,7 @@ async fn cluster_dns_status(
     let node_entries = nodes
         .into_iter()
         .map(|n| {
-            let (internal_proxy_listening, internal_proxy_address, internal_proxy_error) =
-                internal_proxy_from_capacity(&n.capacity);
+            let proxy = internal_proxy_from_capacity(&n.capacity);
             NodeDnsStatusEntry {
                 node_id: n.id,
                 node_name: n.name,
@@ -3358,9 +3369,13 @@ async fn cluster_dns_status(
                 dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
                 dns_resolver_last_error: n.dns_resolver_last_error,
                 dns_resolver_record_count: n.dns_resolver_record_count,
-                internal_proxy_listening,
-                internal_proxy_address,
-                internal_proxy_error,
+                internal_proxy_listening: proxy.listening,
+                internal_proxy_address: proxy.address,
+                internal_proxy_error: proxy.error,
+                internal_proxy_mode: proxy.mode,
+                internal_proxy_listen_address: proxy.proxy_address,
+                internal_proxy_redirect: proxy.redirect,
+                internal_proxy_redirect_error: proxy.redirect_error,
             }
         })
         .collect();
@@ -4731,22 +4746,42 @@ mod tests {
                 "attempts": 7,
             },
         });
+        let proxy = internal_proxy_from_capacity(&held);
         assert_eq!(
-            internal_proxy_from_capacity(&held),
+            (proxy.listening, proxy.address, proxy.error, proxy.mode),
             (
                 Some(false),
                 Some("10.205.0.1:80".to_string()),
                 Some("another program already listens on 10.205.0.1:80".to_string()),
+                None,
             )
         );
 
         let serving = serde_json::json!({
             "internal_proxy": {"address": "10.205.0.1:80", "listening": true, "error": null},
         });
+        let proxy = internal_proxy_from_capacity(&serving);
         assert_eq!(
-            internal_proxy_from_capacity(&serving),
+            (proxy.listening, proxy.address, proxy.error),
             (Some(true), Some("10.205.0.1:80".to_string()), None)
         );
+
+        // An ADR-098 agent serving through the fallback says why.
+        let fallback = serde_json::json!({
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": true,
+                "mode": "direct",
+                "proxy_address": "10.205.0.1:591",
+                "redirect": "missing",
+                "redirect_error": "nft (nftables) is not installed on this worker",
+            },
+        });
+        let proxy = internal_proxy_from_capacity(&fallback);
+        assert_eq!(proxy.mode, Some(InternalRoutingMode::Direct));
+        assert_eq!(proxy.redirect, Some(InternalRedirectState::Missing));
+        assert_eq!(proxy.proxy_address.as_deref(), Some("10.205.0.1:591"));
+        assert!(proxy.redirect_error.unwrap().contains("nftables"));
 
         // An agent from before this field, or a malformed value: unknown,
         // never "not listening".
@@ -4755,7 +4790,10 @@ mod tests {
             serde_json::json!({"internal_proxy": "yes"}),
             serde_json::Value::Null,
         ] {
-            assert_eq!(internal_proxy_from_capacity(&unknown), (None, None, None));
+            assert_eq!(
+                internal_proxy_from_capacity(&unknown),
+                InternalProxyState::default()
+            );
         }
     }
 

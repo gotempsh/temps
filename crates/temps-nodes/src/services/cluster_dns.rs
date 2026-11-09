@@ -245,20 +245,71 @@ pub fn resolver_health(input: &HealthInput<'_>) -> (ResolverHealth, Option<Strin
     (ResolverHealth::Healthy, None)
 }
 
-/// A worker's internal edge proxy, from its heartbeat's
+/// How a worker serves port 80 of its bridge address (ADR-098 D5).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalRoutingMode {
+    /// The internal proxy on its own port, and the nftables redirect of
+    /// containers' port-80 calls to it.
+    Redirect,
+    /// The fallback: the proxy bound on port 80 of the bridge address
+    /// itself, because the redirect is missing.
+    Direct,
+    /// Nothing serves the calls.
+    Down,
+}
+
+/// Whether a worker's port-80 redirect is in place.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalRedirectState {
+    Installed,
+    Missing,
+    /// The agent's operating system has no redirect (not Linux); it binds
+    /// port 80 directly.
+    Unsupported,
+}
+
+/// A worker's internal routing, from its heartbeat's
 /// `capacity.internal_proxy`. Every `<env>.<project>.temps.local` name
-/// points at the node's bridge, port 80, where this proxy listens: the
-/// resolver can be healthy while the proxy is not, and then the names
-/// resolve and every call to them fails.
+/// points at the node's bridge, port 80: the resolver can be healthy while
+/// nothing serves those calls, and then the names resolve and every call to
+/// them fails.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct InternalProxyState {
-    /// `None` when the agent does not report it (an older agent, or no
-    /// overlay bridge yet): unknown, never "not listening".
+    /// Whether containers' calls to port 80 of the bridge address are
+    /// served. `None` when the agent does not report it (an older agent, or
+    /// no overlay bridge yet): unknown, never "not listening".
     pub listening: Option<bool>,
-    /// The address it binds, e.g. `10.205.0.1:80`.
+    /// What containers call, e.g. `10.205.0.1:80`.
     pub address: Option<String>,
-    /// Why the last bind failed; `None` while it listens.
+    /// Why the calls are not served; `None` while they are.
     pub error: Option<String>,
+    /// How they are served. `None` from an agent older than ADR-098, which
+    /// only ever binds port 80 directly.
+    pub mode: Option<InternalRoutingMode>,
+    /// The proxy's own listener, e.g. `10.205.0.1:591`, while the agent
+    /// holds it.
+    pub proxy_address: Option<String>,
+    /// Whether the redirect is in place; `None` from an older agent.
+    pub redirect: Option<InternalRedirectState>,
+    /// Why the redirect is missing, also while the fallback serves.
+    pub redirect_error: Option<String>,
+}
+
+impl InternalProxyState {
+    /// Served, but through the fallback on port 80 because the redirect is
+    /// missing: the agent holds port 80 of the bridge address, which the
+    /// operator may need. Worth a warning, not an alarm.
+    pub fn redirect_missing(&self) -> bool {
+        self.listening == Some(true)
+            && self.mode == Some(InternalRoutingMode::Direct)
+            && self.redirect == Some(InternalRedirectState::Missing)
+    }
 }
 
 /// Read [`InternalProxyState`] from a heartbeat's capacity document.
@@ -271,10 +322,26 @@ pub fn internal_proxy_state(capacity: &serde_json::Value) -> InternalProxyState 
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    let mode = match text("mode").as_deref() {
+        Some("redirect") => Some(InternalRoutingMode::Redirect),
+        Some("direct") => Some(InternalRoutingMode::Direct),
+        Some("down") => Some(InternalRoutingMode::Down),
+        _ => None,
+    };
+    let redirect = match text("redirect").as_deref() {
+        Some("installed") => Some(InternalRedirectState::Installed),
+        Some("missing") => Some(InternalRedirectState::Missing),
+        Some("unsupported") => Some(InternalRedirectState::Unsupported),
+        _ => None,
+    };
     InternalProxyState {
         listening: proxy["listening"].as_bool(),
         address: text("address"),
         error: text("error"),
+        mode,
+        proxy_address: text("proxy_address"),
+        redirect,
+        redirect_error: text("redirect_error"),
     }
 }
 
@@ -296,8 +363,8 @@ pub fn internal_proxy_alert(
     }
     let address = proxy.address.as_deref().unwrap_or("its bridge address");
     Some(format!(
-        "The internal edge proxy cannot listen on {address}, so `*.temps.local` names resolve on \
-         this node but every HTTP call to them fails: {}",
+        "Internal routing is down: `*.temps.local` names resolve on this node but nothing serves \
+         the HTTP calls to them on {address}: {}",
         proxy.error.as_deref().unwrap_or("no error reported")
     ))
 }
@@ -1173,6 +1240,7 @@ impl ClusterDnsCollector {
 mod tests {
     use super::*;
 
+    /// What an agent from before ADR-098 reports when port 80 is held.
     fn held_proxy() -> InternalProxyState {
         internal_proxy_state(&serde_json::json!({
             "cpu_cores": 4,
@@ -1193,6 +1261,10 @@ mod tests {
                 listening: Some(false),
                 address: Some("10.205.0.1:80".into()),
                 error: Some("another program already listens on 10.205.0.1:80".into()),
+                mode: None,
+                proxy_address: None,
+                redirect: None,
+                redirect_error: None,
             }
         );
         let serving = internal_proxy_state(&serde_json::json!({
@@ -1212,6 +1284,68 @@ mod tests {
         }
     }
 
+    /// The heartbeat of an ADR-098 agent, in each of its states.
+    #[test]
+    fn redirect_states_are_read_from_the_heartbeat() {
+        let redirected = internal_proxy_state(&serde_json::json!({
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": true,
+                "error": null,
+                "attempts": 4,
+                "mode": "redirect",
+                "proxy_address": "10.205.0.1:591",
+                "redirect": "installed",
+                "redirect_error": null,
+            },
+        }));
+        assert_eq!(
+            redirected,
+            InternalProxyState {
+                listening: Some(true),
+                address: Some("10.205.0.1:80".into()),
+                error: None,
+                mode: Some(InternalRoutingMode::Redirect),
+                proxy_address: Some("10.205.0.1:591".into()),
+                redirect: Some(InternalRedirectState::Installed),
+                redirect_error: None,
+            }
+        );
+        assert!(!redirected.redirect_missing());
+
+        let direct = internal_proxy_state(&serde_json::json!({
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": true,
+                "mode": "direct",
+                "proxy_address": "10.205.0.1:591",
+                "redirect": "missing",
+                "redirect_error": "nft (nftables) is not installed on this worker",
+            },
+        }));
+        assert!(direct.redirect_missing());
+        assert_eq!(
+            direct.redirect_error.as_deref(),
+            Some("nft (nftables) is not installed on this worker")
+        );
+        assert_eq!(
+            internal_proxy_alert(true, "active", &direct, 9),
+            None,
+            "served: no alarm"
+        );
+
+        let not_linux = internal_proxy_state(&serde_json::json!({
+            "internal_proxy": {"listening": true, "mode": "direct", "redirect": "unsupported"},
+        }));
+        assert!(!not_linux.redirect_missing(), "nothing to fix there");
+
+        // A value this control plane does not know yet: unknown, not wrong.
+        let future = internal_proxy_state(&serde_json::json!({
+            "internal_proxy": {"listening": true, "mode": "tunnel", "redirect": "bpf"},
+        }));
+        assert_eq!((future.mode, future.redirect), (None, None));
+    }
+
     #[test]
     fn a_held_proxy_alarms_on_the_second_evaluation_with_its_reason() {
         let proxy = held_proxy();
@@ -1219,7 +1353,22 @@ mod tests {
         let reason = internal_proxy_alert(true, "active", &proxy, 2).expect("alarm");
         assert!(reason.contains("10.205.0.1:80"), "{reason}");
         assert!(reason.contains("already listens"), "{reason}");
+        assert!(reason.starts_with("Internal routing is down"), "{reason}");
+        assert!(!reason.contains("cannot listen"), "{reason}");
         assert!(internal_proxy_alert(true, "draining", &proxy, 3).is_some());
+
+        let down = internal_proxy_state(&serde_json::json!({
+            "internal_proxy": {
+                "address": "10.205.0.1:80",
+                "listening": false,
+                "mode": "down",
+                "redirect": "missing",
+                "error": "containers' calls to port 80 of 10.205.0.1 are not redirected",
+            },
+        }));
+        let reason = internal_proxy_alert(true, "active", &down, 2).expect("alarm");
+        assert!(reason.contains("are not redirected"), "{reason}");
+        assert!(!reason.to_lowercase().contains("free port"), "{reason}");
     }
 
     #[test]
