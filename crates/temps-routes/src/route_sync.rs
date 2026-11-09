@@ -111,6 +111,12 @@ pub struct RouteEntryDto {
     /// an agent that declared `shield-v1`; an older one never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
+    /// Callers from other projects this internal route admits (ADR 100 D5).
+    /// Set only on routes in `RouteSnapshot::routes`. An agent that predates
+    /// grants ignores it and admits its route's own project only, which is
+    /// the default; an empty list means the same, so it is not sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1079,6 +1085,15 @@ pub(crate) async fn build_snapshot(
             routes.push(entry);
         }
     }
+    // ADR 100 D5: who from other projects each internal route admits.
+    let grants = crate::internal_access_grants::load_live_grants(state.db.as_ref())
+        .await
+        .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "load internal access grants",
+            source,
+        })?;
+    crate::internal_access_grants::attach_allowed_callers(&mut routes, &grants);
     // A node running an ingress connector (ADR 058) serves public routes on
     // its loopback tunnel origin even without a public listener.
     let runs_connector = {
@@ -1547,6 +1562,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         environment_id: info.environment.as_ref().map(|e| e.id),
         gate: None,
         shield: None,
+        allowed_callers: Vec::new(),
     })
 }
 
@@ -1677,6 +1693,7 @@ pub(crate) mod tests {
             environment_id: None,
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         }
     }
 
@@ -2435,6 +2452,7 @@ mod gate_hold_back_tests {
                 access: None,
             }),
             shield: None,
+            allowed_callers: Vec::new(),
         }
     }
 

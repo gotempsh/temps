@@ -32,6 +32,8 @@ pub mod escape;
 pub mod feature_maturity;
 pub mod gate;
 pub mod gate_access;
+/// Internal access grants on the route-sync wire (ADR 100).
+pub mod internal_access;
 pub mod jobs;
 pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.
