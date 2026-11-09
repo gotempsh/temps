@@ -2355,7 +2355,7 @@ async fn run_restore_inner(
                 service_id: run.source_service_id,
             })?;
 
-    // ADR-092: a WAL-G backup is restored into a PostgreSQL on a worker
+    // ADR-099: a WAL-G backup is restored into a PostgreSQL on a worker
     // node by the control plane's own WAL-G restore, run by its agent.
     if worker_walg::takes_walg_path(&target_service, &backup_model.s3_location) {
         return worker_walg::run(

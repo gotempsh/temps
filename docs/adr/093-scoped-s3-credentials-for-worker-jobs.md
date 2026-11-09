@@ -7,11 +7,11 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 **Status:** Proposed
 **Date:** 2026-11-08
-**Amends:** [ADR-092](./092-worker-backups-run-the-local-engines.md) (its "scoping them per service is a follow-up")
+**Amends:** [ADR-099](./099-worker-backups-run-the-local-engines.md) (its "scoping them per service is a follow-up")
 
 ## Context
 
-ADR-092 moved worker backups and restores onto the local engines, run by
+ADR-099 moved worker backups and restores onto the local engines, run by
 the node's agent. Every one of those operations carries an S3 destination
 in its sealed body, and today that destination is the S3 source's own
 decrypted credential: the access key and secret the operator typed in, or,

@@ -345,7 +345,7 @@ impl TempsPlugin for BackupPlugin {
                     worker_credentials: worker_credentials.clone(),
                 })))
                 // PostgreSQL WAL-G: here with this host's Docker, or on a
-                // worker through its agent (ADR-092). A server without
+                // worker through its agent (ADR-099). A server without
                 // Docker still backs up its workers' databases with it.
                 .register_engine(Arc::new(PostgresWalgEngine::new(PostgresWalgDeps {
                     db: db.clone(),
@@ -1070,7 +1070,7 @@ mod tests {
             "the control-plane engine runs without a daemon and must stay available",
         );
         // Registered without a daemon too: a worker's PostgreSQL is backed up
-        // with it through its agent (ADR-092).
+        // with it through its agent (ADR-099).
         assert!(
             !DOCKER_BACKED_ENGINES.contains(&crate::engines::postgres_walg::ENGINE_KEY),
             "the WAL-G engine backs up worker services without a local daemon",

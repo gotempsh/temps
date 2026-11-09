@@ -880,7 +880,7 @@ impl WalgFixture {
     }
 }
 
-/// ADR-092, PostgreSQL step 1: a worker's WAL-G PostgreSQL, created by the
+/// ADR-099, PostgreSQL step 1: a worker's WAL-G PostgreSQL, created by the
 /// agent as a control-plane-profile server asks, is backed up by the control
 /// plane's own WAL-G engine through the agent's sealed operation.
 ///
@@ -1134,7 +1134,7 @@ async fn a_worker_postgres_is_backed_up_by_the_control_plane_walg_engine_through
     );
 }
 
-/// ADR-092, PostgreSQL step 2: a worker's archiving is turned on, then
+/// ADR-099, PostgreSQL step 2: a worker's archiving is turned on, then
 /// pointed at another S3 source, without a base backup, by the control
 /// plane's own `enable_continuous_archiving` through the agent.
 ///
@@ -1277,7 +1277,7 @@ async fn a_worker_postgres_archive_is_turned_on_and_repointed_through_its_agent(
     println!("worker WAL-G archive proof: on with a recreate, re-pointed, {landed} WAL objects under the second prefix");
 }
 
-/// ADR-092, PostgreSQL step 3: a worker's WAL-G PostgreSQL is restored in
+/// ADR-099, PostgreSQL step 3: a worker's WAL-G PostgreSQL is restored in
 /// place, and to a point in time, by the control plane's own WAL-G restore
 /// through the agent's sealed operation, and a restore that fails leaves the
 /// database it found.
@@ -1492,7 +1492,7 @@ async fn a_worker_postgres_is_restored_and_recovered_to_a_point_in_time_through_
     println!("worker WAL-G restore proof: PITR to {t}, in place, and a rolled-back failure");
 }
 
-/// ADR-092, PostgreSQL step 4: another service's WAL-G backup is restored
+/// ADR-099, PostgreSQL step 4: another service's WAL-G backup is restored
 /// into a worker's PostgreSQL through its agent, as a cross-service restore
 /// on the control plane: the restored data answers to the origin's login,
 /// which the control plane sends as the restored login, while the target's
@@ -1714,7 +1714,7 @@ async fn another_services_walg_backup_is_restored_into_a_worker_postgres_through
     println!("cross-service WAL-G restore proof: origin's backup recovered into the target to {t}");
 }
 
-/// The same WAL-G restore on the control plane (ADR-092: one implementation,
+/// The same WAL-G restore on the control plane (ADR-099: one implementation,
 /// the transport alone differs): a PostgreSQL the provider created and backs
 /// up is recovered to a point in time, restored in place, and left as it was
 /// by a restore that cannot promote, with the provider's own container

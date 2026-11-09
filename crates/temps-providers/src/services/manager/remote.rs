@@ -647,7 +647,7 @@ impl ExternalServiceManager {
 
     /// Take a WAL-G base backup of PostgreSQL service `service_id`, which runs
     /// on a worker node, with the control plane's own engine on that node
-    /// (ADR-092). Credentials travel sealed.
+    /// (ADR-099). Credentials travel sealed.
     pub async fn walg_backup_worker_postgres(
         &self,
         service_id: i32,
