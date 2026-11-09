@@ -109,8 +109,9 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [089](./089-project-edge-rules.md) | Project Edge Rules — the Engine for the Request-Level Firewall | Accepted |  |
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
 | [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
-| [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed | amended by [097](./097-internal-dns-canary-corrections.md) |
+| [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed | amended by [097](./097-internal-dns-canary-corrections.md); amended by [098](./098-internal-proxy-own-port.md) |
 | [097](./097-internal-dns-canary-corrections.md) | Internal DNS canary corrections | Accepted | amends [011](./011-internal-dns-ha-databases.md); amends [024](./024-control-plane-dns-resolver.md); amends [095](./095-internal-dns-observability.md) |
+| [098](./098-internal-proxy-own-port.md) | The worker's internal proxy listens on its own port, and containers' port 80 is redirected to it | Proposed | amends [095](./095-internal-dns-observability.md) |
 
 ## Supporting documents
 
