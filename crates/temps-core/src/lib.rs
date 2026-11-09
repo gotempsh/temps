@@ -407,6 +407,21 @@ mod unmaintained_dependency_guard_tests {
         );
     }
 
+    /// RUSTSEC-2026-0441: `pin-utils` is archived. The AWS smithy crates were
+    /// its only users and dropped it (aws-smithy-types 1.9.0, -runtime 1.16.1,
+    /// -http 0.64.2), so nothing needs it. Local pinning is `std::pin::pin!`;
+    /// projection is `pin-project-lite`, already in the graph.
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_pin_utils() {
+        let dependents = dependents_of(CARGO_LOCK, "pin-utils");
+        assert!(
+            dependents.is_empty(),
+            "{dependents:?} depend on pin-utils, which is unmaintained (RUSTSEC-2026-0441). \
+             Use `std::pin::pin!` instead of `pin_mut!`, or `pin-project-lite` for \
+             projection; for a transitive dependency, update the crate that pulls it in."
+        );
+    }
+
     #[test]
     fn workspace_does_not_depend_on_unmaintained_ttf_parser() {
         let dependents = dependents_of(CARGO_LOCK, "ttf-parser");
