@@ -15736,13 +15736,18 @@ version = "0.1.0-beta.61"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "chrono",
+ "ed25519-dalek 2.2.0",
+ "rand 0.8.7",
+ "rcgen",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
  "temps-authz",
  "temps-core",
  "temps-entities",
+ "temps-service-access-runtime",
  "temps-test-utils",
  "thiserror 2.0.21",
  "tokenless-core",
@@ -15752,6 +15757,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

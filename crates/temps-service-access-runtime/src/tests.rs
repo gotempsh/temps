@@ -751,3 +751,81 @@ async fn a_long_host_data_directory_binds_through_the_short_guest_mount_path() {
         .unwrap();
     assert_guest_closed(guest).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn worker_policy_replay_is_idempotent_without_renewing_lease_or_reinstalling_old_policy() {
+    let f = Fixture::new().await;
+    let worker = WorkerControl::new(Arc::new(Audit));
+    let identity = worker.identity();
+    let registered = f
+        .control
+        .nodes
+        .register_embedded(
+            &f.caller,
+            "replay-worker",
+            &encode_public_key(&SealPublicKey::from(identity.seal_public_key)),
+        )
+        .await
+        .unwrap();
+    worker
+        .configure(WorkerAuthority {
+            boot_id: identity.boot_id,
+            node_id: registered.node.id.0,
+            snapshot_verify_key: registered.snapshot_verify_key.to_bytes(),
+        })
+        .await
+        .unwrap();
+    let first = f
+        .control
+        .nodes
+        .build_snapshot(&registered.node)
+        .await
+        .unwrap();
+    let version = worker.install(identity.boot_id, &first).await.unwrap();
+    assert_eq!(
+        worker.install(identity.boot_id, &first).await.unwrap(),
+        version
+    );
+    let mut tampered = first.clone();
+    tampered.body.push(' ');
+    assert!(worker.install(identity.boot_id, &tampered).await.is_err());
+    let second = f
+        .control
+        .nodes
+        .build_snapshot(&registered.node)
+        .await
+        .unwrap();
+    let next = worker.install(identity.boot_id, &second).await.unwrap();
+    assert!(next > version);
+    assert!(worker.install(identity.boot_id, &first).await.is_err());
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(
+        worker.install(identity.boot_id, &second).await.unwrap(),
+        next
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    // Wall time has not advanced, but a replay cannot reset the host deadline.
+    assert!(worker.install(identity.boot_id, &second).await.is_err());
+}
+
+#[tokio::test]
+async fn worker_rejects_an_overflowing_signed_lease_without_panicking() {
+    let f = Fixture::new().await;
+    let snapshot = f.control.nodes.build_snapshot(&f.node).await.unwrap();
+    let mut body = snapshot.verify(&f.proxy.snapshot_key).unwrap();
+    body.issued_at = chrono::DateTime::<Utc>::MAX_UTC;
+    let key = ed25519_dalek::SigningKey::generate(&mut rand08::rngs::OsRng);
+    let worker = WorkerControl::new(Arc::new(Audit));
+    let identity = worker.identity();
+    worker
+        .configure(WorkerAuthority {
+            boot_id: identity.boot_id,
+            node_id: body.node_id.0,
+            snapshot_verify_key: key.verifying_key().to_bytes(),
+        })
+        .await
+        .unwrap();
+    let signed = tokenless_core::snapshot::SignedSnapshot::sign(&body, &key).unwrap();
+    let error = worker.install(identity.boot_id, &signed).await.unwrap_err();
+    assert!(error.to_string().contains("supported time range"));
+}

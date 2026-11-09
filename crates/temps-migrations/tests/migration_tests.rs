@@ -7753,3 +7753,54 @@ async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downg
     assert!(delivery::Entity::find().all(&db).await?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sandbox_access_authorities_preserve_registered_keys_on_reapply_and_downgrade(
+) -> anyhow::Result<()> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("sandbox access worker authority");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261109_000002_sandbox_access_authorities";
+    let migrations = Migrator::migrations();
+    let migration = migrations.iter().find(|m| m.name() == target).unwrap();
+    let manager = SchemaManager::new(&db);
+    let before = migrations.len() as u32 - steps_back_to(target);
+    Migrator::up(&db, Some(before)).await?;
+    migration.down(&manager).await?;
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared("INSERT INTO sandbox_access_authorities (id,sdk_node_id,seal_public_key,snapshot_key_encrypted,session_key_encrypted,ca_certificate,ca_key_encrypted) VALUES ('00000000-0000-4000-8000-000000000301','00000000-0000-4000-8000-000000000302',repeat('a',44),'encrypted-snapshot','encrypted-session','public-certificate','encrypted-ca')").await?;
+    migration.up(&manager).await?;
+    let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres, "SELECT snapshot_key_encrypted,snapshot_version,closed_at IS NULL AS open FROM sandbox_access_authorities")).await?.unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "snapshot_key_encrypted")?,
+        "encrypted-snapshot"
+    );
+    assert_eq!(row.try_get::<i64>("", "snapshot_version")?, 0);
+    assert!(row.try_get::<bool>("", "open")?);
+    for invalid in [
+        "UPDATE sandbox_access_authorities SET snapshot_version=-1",
+        "UPDATE sandbox_access_authorities SET seal_public_key='short'",
+        "UPDATE sandbox_access_authorities SET session_key_encrypted=''",
+        "UPDATE sandbox_access_authorities SET id='00000000-0000-0000-0000-000000000000'",
+    ] {
+        assert!(db.execute_unprepared(invalid).await.is_err());
+    }
+    assert!(migration
+        .down(&manager)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("worker registrations exist"));
+    db.execute_unprepared("DELETE FROM sandbox_access_authorities")
+        .await?;
+    migration.down(&manager).await?;
+    migration.down(&manager).await?;
+    assert!(!table_exists(&db, "sandbox_access_authorities").await?);
+    migration.up(&manager).await?;
+    assert!(table_exists(&db, "sandbox_access_authorities").await?);
+    Ok(())
+}

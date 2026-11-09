@@ -78,10 +78,7 @@ impl PreparedBinding {
         .map_err(|source| sdk("binding claims", source))?
         .strict()
         .for_node(NodeId(target.node_id))
-        .for_binding(
-            &format!("sandbox:{}:{}", target.sandbox_id, target.incarnation_id),
-            1,
-        )
+        .for_binding(&target.incarnation_id.to_string(), 1)
         .map_err(|source| sdk("binding identity", source))?
         .with_rule_deadlines(&deadlines, now)
         .map_err(|source| sdk("grant deadlines", source))?;

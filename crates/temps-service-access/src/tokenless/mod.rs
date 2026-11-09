@@ -166,10 +166,7 @@ impl PreparedSession {
         };
         let scope = Scope::parse(&format!("temps:project:{}", request.target.project_id))
             .map_err(|source| sdk("scope compilation", source))?;
-        let binding_id = format!(
-            "sandbox:{}:{}",
-            request.target.sandbox_id, request.target.incarnation_id
-        );
+        let binding_id = request.target.incarnation_id.to_string();
         let labels = BTreeMap::from([
             ("grant_id".into(), request.grant_id.to_string()),
             ("service_id".into(), request.service_id.to_string()),

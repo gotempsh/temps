@@ -129,13 +129,7 @@ fn prepared_claims_bind_project_node_incarnation_grant_and_service_version() {
     assert_eq!(claims.aud, Some(NodeId(input.target.node_id)));
     assert_eq!(
         claims.sub.as_deref(),
-        Some(
-            format!(
-                "sandbox:{}:{}/1",
-                input.target.sandbox_id, input.target.incarnation_id
-            )
-            .as_str()
-        )
+        Some(format!("{}/1", input.target.incarnation_id).as_str())
     );
     assert_eq!(
         claims.rules,

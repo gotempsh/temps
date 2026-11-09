@@ -14,7 +14,7 @@ use tokenless_core::{
     snapshot::SignedSnapshot,
 };
 use tokenless_dataplane::{audit::AuditShipper, state::NodeKeys, BindingSpec, BindingUpdate};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 /// Public material only. Read through the authenticated worker channel, never
@@ -43,6 +43,14 @@ pub struct WorkerAuthority {
 struct Initialized {
     authority: WorkerAuthority,
     proxy: WorkerProxy,
+    // Control-plane installs only, never held on the proxy request path.
+    installed: Mutex<Option<InstalledPolicy>>,
+}
+
+struct InstalledPolicy {
+    version: u64,
+    signature: String,
+    expires: tokio::time::Instant,
 }
 
 /// Constructed only from a verified, successfully installed SDK policy. The
@@ -117,6 +125,7 @@ impl WorkerControl {
                     )
                     .await?,
                     authority: authority.clone(),
+                    installed: Mutex::new(None),
                 })
             })
             .await?;
@@ -143,7 +152,9 @@ impl WorkerControl {
         boot_id: Uuid,
         snapshot: &SignedSnapshot,
     ) -> Result<u64, RuntimeError> {
-        self.initialized(boot_id)?.proxy.install(snapshot).await
+        self.install_with_certificate(boot_id, snapshot)
+            .await
+            .map(|(version, _)| version)
     }
 
     pub async fn install_with_certificate(
@@ -159,10 +170,47 @@ impl WorkerControl {
             .map_err(|_| self.invalid("install policy", "invalid pinned signing key"))?;
         let body = snapshot.verify(&key)?;
         let der = body.interception_ca.cert_der;
+        let now = chrono::Utc::now();
+        let lease_end = body
+            .issued_at
+            .checked_add_signed(chrono::Duration::seconds(i64::from(body.lease_secs)))
+            .ok_or_else(|| {
+                self.invalid(
+                    "install policy",
+                    "snapshot lease deadline is outside the supported time range",
+                )
+            })?;
+        let remaining = lease_end
+            .signed_duration_since(now)
+            .to_std()
+            .map_err(|_| self.invalid("install policy", "snapshot lease expired"))?;
+        // Cache only a verified signature (bound to exact bytes), version and
+        // monotonic deadline. Replaying an accepted snapshot cannot renew its
+        // lease, reinstall old rules or replace a newer snapshot.
+        let expires = tokio::time::Instant::now()
+            + remaining.min(std::time::Duration::from_secs(u64::from(
+                crate::MAX_POLICY_LEASE_SECONDS,
+            )));
+        let mut installed = initialized.installed.lock().await;
         if der.len() > 16 * 1024 {
             return Err(self.invalid("publish CA", "public certificate exceeds 16 KiB"));
         }
-        let version = initialized.proxy.install(snapshot).await?;
+        let version = if let Some(previous) = installed.as_ref().filter(|previous| {
+            previous.signature == snapshot.signature && previous.version == body.version
+        }) {
+            if tokio::time::Instant::now() >= previous.expires {
+                return Err(self.invalid("install policy", "snapshot lease expired"));
+            }
+            previous.version
+        } else {
+            let version = initialized.proxy.install(snapshot).await?;
+            *installed = Some(InstalledPolicy {
+                version,
+                signature: snapshot.signature.clone(),
+                expires,
+            });
+            version
+        };
         let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
         // The SDK has decoded and validated this certificate before success.
         for chunk in der.as_bytes().chunks(64) {
