@@ -247,6 +247,11 @@ mod unmaintained_dependency_guard_tests {
         "msb_krun_vmm",
     ];
 
+    /// The only packages allowed to depend on `astral-tokio-tar`; see the
+    /// RUSTSEC-2026-0440 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_ASTRAL_TOKIO_TAR_DEPENDENTS: &[&str] =
+        &["microsandbox", "microsandbox-image", "testcontainers"];
+
     /// The only package allowed to depend on `serde_yaml`; see the
     /// RUSTSEC-2024-0449 note in `.github/workflows/dependency-scan.yml`.
     const ALLOWED_SERDE_YAML_DEPENDENTS: &[&str] = &["pingora-core"];
@@ -270,6 +275,93 @@ mod unmaintained_dependency_guard_tests {
                 })
             })
             .collect()
+    }
+
+    /// Versions of every locked package named `name`, as `(major, minor, patch)`.
+    /// Pre-release and build suffixes are dropped; they don't occur on the
+    /// crates these guards check.
+    fn locked_versions(lock: &str, name: &str) -> Vec<(u64, u64, u64)> {
+        let name_line = format!("name = \"{name}\"");
+        lock.split("[[package]]")
+            .skip(1)
+            .filter(|block| block.lines().map(str::trim).any(|line| line == name_line))
+            .filter_map(|block| {
+                block.lines().map(str::trim).find_map(|line| {
+                    line.strip_prefix("version = \"")
+                        .and_then(|l| l.strip_suffix('"'))
+                })
+            })
+            .filter_map(|version| {
+                let core = version.split(['-', '+']).next()?;
+                let mut parts = core.split('.').map(str::parse::<u64>);
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => {
+                        Some((major, minor, patch))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether an `arrow-data` version has the RUSTSEC-2026-0442 fix (bounds
+    /// validation of RunEndEncoded arrays). Mirrors the advisory's
+    /// `patched`/`unaffected` ranges: each supported major got its own fix.
+    fn arrow_data_is_patched((major, minor, patch): (u64, u64, u64)) -> bool {
+        match major {
+            0..=32 => true,
+            57 => (minor, patch) >= (3, 2),
+            58 => (minor, patch) >= (4, 1),
+            59 => (minor, patch) >= (3, 2),
+            60 => (minor, patch) >= (1, 0),
+            61.. => true,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn locked_versions_reads_lockfile_entries() {
+        let lock = "[[package]]\nname = \"a\"\nversion = \"60.1.0\"\n\n[[package]]\n\
+                    name = \"a\"\nversion = \"2.0.0-rc.5\"\n\n[[package]]\nname = \"ab\"\n\
+                    version = \"9.9.9\"\n";
+        assert_eq!(locked_versions(lock, "a"), vec![(60, 1, 0), (2, 0, 0)]);
+        assert!(locked_versions(lock, "missing").is_empty());
+    }
+
+    #[test]
+    fn arrow_data_is_patched_follows_advisory_ranges() {
+        for unpatched in [(60, 0, 0), (59, 3, 1), (58, 4, 0), (57, 3, 1), (40, 0, 0)] {
+            assert!(!arrow_data_is_patched(unpatched), "{unpatched:?}");
+        }
+        for patched in [
+            (60, 1, 0),
+            (59, 3, 2),
+            (58, 4, 1),
+            (57, 3, 2),
+            (32, 0, 0),
+            (61, 0, 0),
+        ] {
+            assert!(arrow_data_is_patched(patched), "{patched:?}");
+        }
+    }
+
+    /// RUSTSEC-2026-0442: `ArrayData::validate_values` accepted RunEndEncoded
+    /// arrays whose run ends point past the values child, so a read such as
+    /// `TypedRunArray::value` could go out of bounds. arrow is only in the
+    /// graph through sea-orm 2's optional `sea-orm-arrow`, but the lockfile is
+    /// what `dependency-scan.yml` audits, and a feature flip would compile it.
+    #[test]
+    fn locked_arrow_data_has_run_end_encoding_fix() {
+        let unpatched: Vec<_> = locked_versions(CARGO_LOCK, "arrow-data")
+            .into_iter()
+            .filter(|version| !arrow_data_is_patched(*version))
+            .collect();
+        assert!(
+            unpatched.is_empty(),
+            "Cargo.lock pins arrow-data {unpatched:?}, which is affected by RUSTSEC-2026-0442 \
+             (out-of-bounds read via unvalidated RunEndEncoded arrays). Run \
+             `cargo update -p arrow-data` to move to a patched release (>= 60.1.0)."
+        );
     }
 
     #[test]
@@ -306,6 +398,35 @@ mod unmaintained_dependency_guard_tests {
         );
     }
 
+    /// RUSTSEC-2026-0440: `astral-tokio-tar` is unmaintained, but the
+    /// microsandbox SDK and testcontainers still require it. It must not gain
+    /// new dependents, and the lock must stay on 0.6.4 or later: 0.6.3 added
+    /// the parser hardening that matters for the OCI layers microsandbox-image
+    /// unpacks.
+    #[test]
+    fn astral_tokio_tar_is_only_reached_through_microsandbox_and_testcontainers() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "astral-tokio-tar")
+            .into_iter()
+            .filter(|name| !ALLOWED_ASTRAL_TOKIO_TAR_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on astral-tokio-tar, which is unmaintained \
+             (RUSTSEC-2026-0440). The dependency-scan.yml exception only covers the \
+             microsandbox SDK and testcontainers; use the `tar` crate (or `tar-codec`) instead."
+        );
+
+        let outdated: Vec<_> = locked_versions(CARGO_LOCK, "astral-tokio-tar")
+            .into_iter()
+            .filter(|version| *version < (0, 6, 4))
+            .collect();
+        assert!(
+            outdated.is_empty(),
+            "Cargo.lock pins astral-tokio-tar {outdated:?}; keep it at 0.6.4 or later \
+             (`cargo update -p astral-tokio-tar`) so the parser keeps 0.6.3's hardening."
+        );
+    }
+
     #[test]
     fn bincode_is_only_reached_through_microsandbox() {
         let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "bincode")
@@ -320,6 +441,21 @@ mod unmaintained_dependency_guard_tests {
         );
     }
 
+    /// RUSTSEC-2026-0441: `pin-utils` is archived. The AWS smithy crates were
+    /// its only users and dropped it (aws-smithy-types 1.9.0, -runtime 1.16.1,
+    /// -http 0.64.2), so nothing needs it. Local pinning is `std::pin::pin!`;
+    /// projection is `pin-project-lite`, already in the graph.
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_pin_utils() {
+        let dependents = dependents_of(CARGO_LOCK, "pin-utils");
+        assert!(
+            dependents.is_empty(),
+            "{dependents:?} depend on pin-utils, which is unmaintained (RUSTSEC-2026-0441). \
+             Use `std::pin::pin!` instead of `pin_mut!`, or `pin-project-lite` for \
+             projection; for a transitive dependency, update the crate that pulls it in."
+        );
+    }
+
     #[test]
     fn workspace_does_not_depend_on_unmaintained_ttf_parser() {
         let dependents = dependents_of(CARGO_LOCK, "ttf-parser");
@@ -329,6 +465,88 @@ mod unmaintained_dependency_guard_tests {
              lopdf 0.42 required it; lopdf 0.46+ only uses the maintained skrifa behind its \
              `font_embedding` feature. PDF text is read with lopdf directly in \
              temps-ai-chat's attachments.rs, not through pdf-extract, which pins lopdf 0.42."
+        );
+    }
+
+    const DENY_TOML: &str = include_str!("../../../deny.toml");
+    const DEPENDENCY_SCAN_WORKFLOW: &str =
+        include_str!("../../../.github/workflows/dependency-scan.yml");
+
+    /// Advisory IDs in `deny.toml`'s `[advisories] ignore` list
+    /// (`{ id = "RUSTSEC-...", reason = "..." }` entries).
+    fn deny_ignored_advisories(deny: &str) -> std::collections::BTreeSet<&str> {
+        deny.lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[advisories]")
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .filter_map(|line| line.strip_prefix("{ id = \""))
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    /// Advisory IDs in the cargo-audit step's `ignore:` input. Panics unless
+    /// the workflow has exactly one such line, so a second audit step or a
+    /// renamed input cannot make this guard compare the wrong list.
+    fn cargo_audit_ignored_advisories(workflow: &str) -> std::collections::BTreeSet<&str> {
+        let lines: Vec<_> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("ignore:"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one `ignore:` input in dependency-scan.yml, found {}",
+            lines.len()
+        );
+        lines[0]
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn advisory_ignore_parsers_read_both_formats() {
+        let deny = "[graph]\nall-features = true\n\n[advisories]\nignore = [\n    \
+                    { id = \"RUSTSEC-1\", reason = \"a\" },\n    { id = \"RUSTSEC-2\", reason = \"b\" },\n]\n\n\
+                    [bans]\nskip = [\n    { id = \"NOT-AN-ADVISORY\" },\n]\n";
+        assert_eq!(
+            deny_ignored_advisories(deny)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["RUSTSEC-1", "RUSTSEC-2"]
+        );
+        let workflow = "      # ignore: commented out\n        with:\n          \
+                        ignore: RUSTSEC-2,RUSTSEC-1\n";
+        assert_eq!(
+            cargo_audit_ignored_advisories(workflow)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["RUSTSEC-1", "RUSTSEC-2"]
+        );
+    }
+
+    /// `deny.toml` says its advisory ignore list mirrors the cargo-audit step's
+    /// in `dependency-scan.yml` so the two gates cannot disagree. Nothing else
+    /// checks that, and an exception added to one list only (RUSTSEC-2026-0440
+    /// was, at first) leaves cargo-deny and cargo-audit judging the same
+    /// lockfile differently.
+    #[test]
+    fn deny_toml_and_cargo_audit_ignore_the_same_advisories() {
+        let deny = deny_ignored_advisories(DENY_TOML);
+        let audit = cargo_audit_ignored_advisories(DEPENDENCY_SCAN_WORKFLOW);
+        assert!(
+            !deny.is_empty(),
+            "no `{{ id = ... }}` entries found in deny.toml"
+        );
+        let only_in_deny: Vec<_> = deny.difference(&audit).collect();
+        let only_in_audit: Vec<_> = audit.difference(&deny).collect();
+        assert!(
+            only_in_deny.is_empty() && only_in_audit.is_empty(),
+            "advisory ignore lists disagree: only in deny.toml {only_in_deny:?}, only in \
+             dependency-scan.yml's cargo-audit step {only_in_audit:?}. Add each exception, \
+             with its reason, to both."
         );
     }
 }
