@@ -410,3 +410,25 @@ async fn obsolete_boot_retirement_completes_without_cutting_current_binding() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn binding_renewal_can_reference_the_installed_policy_without_resending_it() {
+    let f = Fixture::new().await;
+    let (target, worker, _, _) = f.inspect().await;
+    let (delivery, _) = deliveries(&worker, &target.incarnation).await;
+    let mut reference = delivery.clone();
+    reference.policy.body.clear();
+    assert!(f.apply(&target, reference.clone()).await.is_err());
+    let ServiceAccessReply::Applied {
+        snapshot_version, ..
+    } = f.apply(&target, delivery).await.unwrap()
+    else {
+        panic!("expected apply receipt")
+    };
+    reference.version = 2;
+    assert!(matches!(f.apply(&target, reference).await.unwrap(),
+        ServiceAccessReply::Applied { snapshot_version: version, binding_version: 2, .. } if version == snapshot_version));
+    let (_, _, connected, version) = f.inspect().await;
+    assert!(connected);
+    assert_eq!(version, Some(2));
+}

@@ -12,12 +12,19 @@ use temps_sandbox_providers::{
 };
 use temps_service_access_runtime::{HostAudit, SandboxBinding, SessionDelivery, WorkerControl};
 
+type Binding = (Arc<SandboxBinding>, u64);
+
 pub(crate) struct Provider {
     pub worker: WorkerControl,
     pub incarnation: Uuid,
     pub binding: Mutex<Option<(Arc<SandboxBinding>, u64)>>,
     pub wrong_ack: AtomicBool,
     pub calls: AtomicUsize,
+    pub full_policies: AtomicUsize,
+    pub policy_references: AtomicUsize,
+    pub reject_reference: AtomicBool,
+    extra_targets: Mutex<HashMap<String, ServiceAccessTarget>>,
+    extra_bindings: Mutex<HashMap<String, Binding>>,
 }
 impl Provider {
     pub fn new() -> Arc<Self> {
@@ -27,7 +34,29 @@ impl Provider {
             binding: Mutex::new(None),
             wrong_ack: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            full_policies: AtomicUsize::new(0),
+            policy_references: AtomicUsize::new(0),
+            reject_reference: AtomicBool::new(false),
+            extra_targets: Mutex::new(HashMap::new()),
+            extra_bindings: Mutex::new(HashMap::new()),
         })
+    }
+    pub fn add_sandbox(&self, name: &str) {
+        self.extra_targets.lock().unwrap().insert(
+            format!("temps-sandbox-{name}"),
+            ServiceAccessTarget {
+                incarnation: Uuid::new_v4().to_string(),
+                container_id: format!("container-{name}"),
+            },
+        );
+    }
+    fn target_for(&self, handle: &SandboxHandle) -> ServiceAccessTarget {
+        self.extra_targets
+            .lock()
+            .unwrap()
+            .get(&handle.sandbox_name)
+            .cloned()
+            .unwrap_or_else(|| self.target())
     }
     fn handle(&self) -> SandboxHandle {
         SandboxHandle {
@@ -54,17 +83,28 @@ impl SandboxProvider for Provider {
         handle: &SandboxHandle,
         command: ServiceAccessCommand,
     ) -> Result<ServiceAccessReply, AgentError> {
-        assert_eq!(handle.sandbox_id, self.handle().sandbox_id);
+        let target = self.target_for(handle);
+        assert_eq!(handle.sandbox_id, target.container_id);
         self.calls.fetch_add(1, Ordering::SeqCst);
         match command {
             ServiceAccessCommand::Inspect => Ok(ServiceAccessReply::Inspect {
-                target: self.target(),
+                target: target.clone(),
                 worker: self.worker.identity(),
                 connected: false,
                 binding_version: None,
             }),
             ServiceAccessCommand::Apply { expected, delivery } => {
-                assert_eq!(expected, self.target());
+                assert_eq!(expected, target);
+                if delivery.policy.body.is_empty() {
+                    self.policy_references.fetch_add(1, Ordering::SeqCst);
+                    if self.reject_reference.load(Ordering::SeqCst) {
+                        return Err(AgentError::Validation {
+                            message: "referenced policy replaced".into(),
+                        });
+                    }
+                } else {
+                    self.full_policies.fetch_add(1, Ordering::SeqCst);
+                }
                 let boot = self.worker.identity().boot_id;
                 self.worker.configure(delivery.authority).await.unwrap();
                 let version = self
@@ -72,7 +112,16 @@ impl SandboxProvider for Provider {
                     .install(boot, &delivery.policy.into_snapshot().unwrap())
                     .await
                     .unwrap();
-                let previous = self.binding.lock().unwrap().clone();
+                let primary = expected == self.target();
+                let previous = if primary {
+                    self.binding.lock().unwrap().clone()
+                } else {
+                    self.extra_bindings
+                        .lock()
+                        .unwrap()
+                        .get(&expected.container_id)
+                        .cloned()
+                };
                 let binding = if let Some((binding, prior_version)) = previous {
                     assert!(delivery.version > prior_version);
                     self.worker
@@ -99,7 +148,14 @@ impl SandboxProvider for Provider {
                         .unwrap()
                 };
                 binding.ready(version).await.unwrap();
-                *self.binding.lock().unwrap() = Some((binding, delivery.version));
+                if primary {
+                    *self.binding.lock().unwrap() = Some((binding, delivery.version));
+                } else {
+                    self.extra_bindings
+                        .lock()
+                        .unwrap()
+                        .insert(expected.container_id.clone(), (binding, delivery.version));
+                }
                 Ok(ServiceAccessReply::Applied {
                     target: expected,
                     snapshot_version: version,
@@ -108,9 +164,16 @@ impl SandboxProvider for Provider {
                 })
             }
             ServiceAccessCommand::Retire { expected, boot_id } => {
-                assert_eq!(expected, self.target());
+                assert_eq!(expected, target);
                 assert_eq!(boot_id, self.worker.identity().boot_id);
-                let previous = self.binding.lock().unwrap().take();
+                let previous = if expected == self.target() {
+                    self.binding.lock().unwrap().take()
+                } else {
+                    self.extra_bindings
+                        .lock()
+                        .unwrap()
+                        .remove(&expected.container_id)
+                };
                 if let Some((binding, _)) = previous {
                     binding
                         .revoke_and_wait(std::time::Duration::from_secs(5))
@@ -127,7 +190,14 @@ impl SandboxProvider for Provider {
         name: &str,
     ) -> Result<Option<SandboxHandle>, AgentError> {
         assert_eq!(node, None);
-        assert_eq!(format!("temps-sandbox-{name}"), self.handle().sandbox_name);
+        let full_name = format!("temps-sandbox-{name}");
+        if let Some(target) = self.extra_targets.lock().unwrap().get(&full_name) {
+            let mut handle = self.handle();
+            handle.sandbox_name = full_name;
+            handle.sandbox_id = target.container_id.clone();
+            return Ok(Some(handle));
+        }
+        assert_eq!(full_name, self.handle().sandbox_name);
         Ok(Some(self.handle()))
     }
     async fn create(&self, _: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {

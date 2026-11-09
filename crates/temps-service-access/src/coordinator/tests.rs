@@ -611,3 +611,5 @@ async fn late_extension_checker_revokes_background_policy_permissions() {
     assert_eq!(denied.retire[0].id, grant.runtime_id);
     test.cleanup().await;
 }
+
+mod batches;

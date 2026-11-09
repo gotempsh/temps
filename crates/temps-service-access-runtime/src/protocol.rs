@@ -13,6 +13,7 @@ use tokenless_dataplane::{audit::AuditShipper, BindingSpec, BindingUpdate, DataP
 #[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyEnvelope {
+    // Empty only when referencing the exact signed policy already installed on this worker.
     pub body: String,
     pub signature: String,
     pub key_id: String,

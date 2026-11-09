@@ -4,6 +4,8 @@
 //! Control-plane orchestration for explicit operator approvals.
 //! No queued intention is reported as connected; only exact worker ACKs write
 //! an applied version and the original signed policy lease deadline.
+mod batches;
+
 use crate::{
     authority::{AuthorityError, AuthorityStore},
     delivery::{DeliveryClaim, DeliveryError, DeliveryQueue},
@@ -78,6 +80,7 @@ pub struct ServiceAccessCoordinator {
     audit: Arc<dyn AuditLogger>,
     admission: Semaphore,
     wake: Notify,
+    batches: batches::RenewalBatches,
 }
 impl ServiceAccessCoordinator {
     pub fn new(
@@ -99,6 +102,7 @@ impl ServiceAccessCoordinator {
             audit,
             admission: Semaphore::new(2),
             wake: Notify::new(),
+            batches: batches::RenewalBatches::default(),
         }
     }
 
@@ -307,6 +311,14 @@ impl ServiceAccessCoordinator {
             self.queue.supersede(claim).await?;
             return Ok(DispatchOutcome::Superseded);
         }
+        if let Some(batch) = self
+            .batches
+            .take(boot_id, command.runtime_id, command.desired_version)
+        {
+            if self.batch_is_current(&batch).await? {
+                return self.apply_batch_binding(claim, batch, true).await;
+            }
+        }
         let mut plan = self.planner.prepare(boot_id).await?;
         if !plan.retire.is_empty() {
             for retired in &plan.retire {
@@ -340,43 +352,57 @@ impl ServiceAccessCoordinator {
                 reason: "authorization changed during planning; retry with the current version",
             });
         }
-        let grant_ids: Vec<String> = selected
-            .map(|binding| {
-                binding
-                    .plan
-                    .grants()
-                    .iter()
-                    .map(|grant| grant.grant_id().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
         let revision = plan.expected_revision;
         let issued = self
             .authority
             .issue(plan.node_id, &plan.worker, revision, plan.bindings)
             .await?;
+        self.apply_batch_binding(
+            claim,
+            batches::RenewalBatch::new(boot_id, revision, issued),
+            false,
+        )
+        .await
+    }
+
+    async fn apply_batch_binding(
+        &self,
+        claim: &DeliveryClaim,
+        mut batch: batches::RenewalBatch,
+        reference: bool,
+    ) -> Result<DispatchOutcome, CoordinatorError> {
+        let command = claim.command();
         let target = StoredTarget::from_command(command)?;
         if let Err(error) = self
             .transport
             .apply(
                 &target,
-                issued.snapshot_version(),
-                issued.delivery(command.runtime_id)?,
+                batch.issued.snapshot_version(),
+                batch
+                    .issued
+                    .binding_delivery(command.runtime_id, reference)?,
             )
             .await
         {
-            if !matches!(error, TransportError::Busy { .. }) {
-                // A timed-out/failed apply may have partially installed policy.
-                // Invalidate all consent for this incarnation and durably cut
-                // it. Reconnecting requires a new host incarnation and consent;
-                // retry must never infer success from a queue or socket write.
+            // A reference can be rejected because another dispatcher installed a
+            // newer snapshot. Drop the batch and retry with a fresh version and
+            // full policy; an uncertain ACK must never retire valid consent.
+            if !reference && !matches!(error, TransportError::Busy { .. }) {
                 self.retire_runtime(command.runtime_id, None, "delivery_unconfirmed")
                     .await?;
             }
             return Err(error.into());
         }
+        let revision = batch.revision;
+        let deadline = batch.issued.lease_expires_at();
+        let grant_ids = batch.issued.grant_ids(command.runtime_id).to_vec();
+        batch.delivered.insert(command.runtime_id);
+        // Publish after the exact worker ACK, before receipt persistence releases
+        // the worker claim. Another dispatcher can then reuse this same snapshot.
+        // A lost receipt cannot extend its lease; retries still advance versions.
+        self.batches.put(batch);
         self.queue
-            .complete_applied(claim, revision, issued.lease_expires_at(), &grant_ids)
+            .complete_applied(claim, revision, deadline, &grant_ids)
             .await?;
         Ok(DispatchOutcome::Applied)
     }

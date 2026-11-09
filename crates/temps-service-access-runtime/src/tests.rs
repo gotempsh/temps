@@ -786,7 +786,28 @@ async fn worker_policy_replay_is_idempotent_without_renewing_lease_or_reinstalli
         .build_snapshot(&registered.node)
         .await
         .unwrap();
+    let mut reference = first.clone();
+    reference.body.clear();
+    assert!(
+        worker.install(identity.boot_id, &reference).await.is_err(),
+        "cannot reference an uninstalled policy"
+    );
     let version = worker.install(identity.boot_id, &first).await.unwrap();
+    assert_eq!(
+        worker.install(identity.boot_id, &reference).await.unwrap(),
+        version
+    );
+    let mut wrong_reference = reference.clone();
+    wrong_reference.signature.push('x');
+    assert!(worker
+        .install(identity.boot_id, &wrong_reference)
+        .await
+        .is_err());
+    assert!(worker
+        .install(uuid::Uuid::new_v4(), &reference)
+        .await
+        .is_err());
+
     assert_eq!(
         worker.install(identity.boot_id, &first).await.unwrap(),
         version
@@ -802,13 +823,27 @@ async fn worker_policy_replay_is_idempotent_without_renewing_lease_or_reinstalli
         .unwrap();
     let next = worker.install(identity.boot_id, &second).await.unwrap();
     assert!(next > version);
+    assert!(
+        worker.install(identity.boot_id, &reference).await.is_err(),
+        "a reference cannot restore a superseded snapshot"
+    );
+    reference = second.clone();
+    reference.body.clear();
     assert!(worker.install(identity.boot_id, &first).await.is_err());
     tokio::time::advance(Duration::from_secs(29)).await;
     assert_eq!(
         worker.install(identity.boot_id, &second).await.unwrap(),
         next
     );
+    assert_eq!(
+        worker.install(identity.boot_id, &reference).await.unwrap(),
+        next
+    );
     tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(
+        worker.install(identity.boot_id, &reference).await.is_err(),
+        "references cannot renew a lease"
+    );
     // Wall time has not advanced, but a replay cannot reset the host deadline.
     assert!(worker.install(identity.boot_id, &second).await.is_err());
 }

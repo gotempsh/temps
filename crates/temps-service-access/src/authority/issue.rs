@@ -32,10 +32,10 @@ pub struct AuthorizedBinding {
 }
 
 struct IssuedBinding {
-    incarnation: Uuid,
     version: u64,
     session: SecretString,
     github_git: bool,
+    grant_ids: Vec<String>,
 }
 
 /// One bounded snapshot shared by the worker's bindings. It deliberately has
@@ -46,7 +46,7 @@ pub struct IssuedPolicy {
     snapshot_version: u64,
     lease_expires_at: chrono::DateTime<chrono::Utc>,
     policy: PolicyEnvelope,
-    bindings: Vec<IssuedBinding>,
+    bindings: BTreeMap<Uuid, IssuedBinding>,
 }
 impl std::fmt::Debug for IssuedPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -65,21 +65,44 @@ impl IssuedPolicy {
     pub fn lease_expires_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.lease_expires_at
     }
+    pub(crate) fn binding_version(&self, incarnation: Uuid) -> Option<u64> {
+        self.bindings.get(&incarnation).map(|b| b.version)
+    }
+    pub(crate) fn grant_ids(&self, incarnation: Uuid) -> &[String] {
+        self.bindings
+            .get(&incarnation)
+            .map(|b| b.grant_ids.as_slice())
+            .unwrap_or_default()
+    }
+    pub(crate) fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
     pub fn delivery(&self, incarnation: Uuid) -> Result<SessionDelivery, AuthorityError> {
-        let binding = self
-            .bindings
-            .iter()
-            .find(|binding| binding.incarnation == incarnation)
-            .ok_or_else(|| {
-                invalid(
-                    self.authority.boot_id,
-                    "select binding delivery",
-                    "incarnation is not included in this policy",
-                )
-            })?;
+        self.binding_delivery(incarnation, false)
+    }
+    pub(crate) fn binding_delivery(
+        &self,
+        incarnation: Uuid,
+        reference: bool,
+    ) -> Result<SessionDelivery, AuthorityError> {
+        let binding = self.bindings.get(&incarnation).ok_or_else(|| {
+            invalid(
+                self.authority.boot_id,
+                "select binding delivery",
+                "incarnation is not included in this policy",
+            )
+        })?;
         Ok(SessionDelivery {
             authority: self.authority.clone(),
-            policy: self.policy.clone(),
+            policy: if reference {
+                PolicyEnvelope {
+                    body: String::new(),
+                    signature: self.policy.signature.clone(),
+                    key_id: self.policy.key_id.clone(),
+                }
+            } else {
+                self.policy.clone()
+            },
             version: binding.version,
             session: binding.session.expose().into(),
             github_git: binding.github_git,
@@ -157,7 +180,7 @@ impl AuthorityStore {
                 source,
             })?
             .len();
-        let mut issued = Vec::with_capacity(bindings.len());
+        let mut issued = BTreeMap::new();
         for binding in bindings {
             let mut rules = Vec::new();
             for grant in binding.plan.grants() {
@@ -244,12 +267,20 @@ impl AuthorityStore {
                     "session exceeds delivery limit",
                 ));
             }
-            issued.push(IssuedBinding {
-                github_git: binding.plan.grants().iter().any(|g| g.rule().git.is_some()),
-                incarnation: binding.plan.target().incarnation_id,
-                version: binding.plan.version(),
-                session: SecretString::new(session),
-            });
+            issued.insert(
+                binding.plan.target().incarnation_id,
+                IssuedBinding {
+                    grant_ids: binding
+                        .plan
+                        .grants()
+                        .iter()
+                        .map(|g| g.grant_id().to_owned())
+                        .collect(),
+                    github_git: binding.plan.grants().iter().any(|g| g.rule().git.is_some()),
+                    version: binding.plan.version(),
+                    session: SecretString::new(session),
+                },
+            );
         }
         body.format = format_for(&body.rules);
         let snapshot = SignedSnapshot::sign(&body, &snapshot_key)

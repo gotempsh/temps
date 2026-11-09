@@ -50,6 +50,8 @@ struct Initialized {
 struct InstalledPolicy {
     version: u64,
     signature: String,
+    key_id: String,
+    certificate: String,
     expires: tokio::time::Instant,
 }
 
@@ -166,6 +168,28 @@ impl WorkerControl {
         if snapshot.body.len() > crate::MAX_SNAPSHOT_BYTES {
             return Err(self.invalid("install policy", "snapshot exceeds delivery limit"));
         }
+        // An empty body references only the exact snapshot already verified on
+        // this boot. It cannot install rules or extend the original lease.
+        if snapshot.body.is_empty() {
+            let installed = initialized.installed.lock().await;
+            let previous = installed
+                .as_ref()
+                .filter(|previous| {
+                    previous.signature == snapshot.signature
+                        && previous.key_id == snapshot.kid
+                        && tokio::time::Instant::now() < previous.expires
+                })
+                .ok_or_else(|| {
+                    self.invalid(
+                        "reuse policy",
+                        "referenced policy is missing, replaced or expired",
+                    )
+                })?;
+            return Ok((
+                previous.version,
+                PublicCertificate(previous.certificate.clone()),
+            ));
+        }
         let key = VerifyingKey::from_bytes(&initialized.authority.snapshot_verify_key)
             .map_err(|_| self.invalid("install policy", "invalid pinned signing key"))?;
         let body = snapshot.verify(&key)?;
@@ -195,6 +219,15 @@ impl WorkerControl {
         if der.len() > 16 * 1024 {
             return Err(self.invalid("publish CA", "public certificate exceeds 16 KiB"));
         }
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        // The SDK has decoded and validated this certificate before success.
+        for chunk in der.as_bytes().chunks(64) {
+            let text = std::str::from_utf8(chunk)
+                .map_err(|_| self.invalid("publish CA", "certificate encoding is invalid"))?;
+            pem.push_str(text);
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
         let version = if let Some(previous) = installed.as_ref().filter(|previous| {
             previous.signature == snapshot.signature && previous.version == body.version
         }) {
@@ -207,19 +240,12 @@ impl WorkerControl {
             *installed = Some(InstalledPolicy {
                 version,
                 signature: snapshot.signature.clone(),
+                key_id: snapshot.kid.clone(),
+                certificate: pem.clone(),
                 expires,
             });
             version
         };
-        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-        // The SDK has decoded and validated this certificate before success.
-        for chunk in der.as_bytes().chunks(64) {
-            let text = std::str::from_utf8(chunk)
-                .map_err(|_| self.invalid("publish CA", "certificate encoding is invalid"))?;
-            pem.push_str(text);
-            pem.push('\n');
-        }
-        pem.push_str("-----END CERTIFICATE-----\n");
         Ok((version, PublicCertificate(pem)))
     }
 
