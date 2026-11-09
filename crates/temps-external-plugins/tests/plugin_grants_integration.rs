@@ -336,7 +336,16 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .into_iter()
         .find(|migration| migration.name() == "m20260916_000001_external_plugin_actors")
         .expect("actor migration must be registered");
+    let consent_migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261108_000001_external_plugin_ai_tools")
+        .expect("AI consent migration must be registered");
     let manager = SchemaManager::new(db.as_ref());
+    // Roll back dependent columns before dropping their owning table.
+    consent_migration
+        .down(&manager)
+        .await
+        .expect("rollback AI consent before actor tables");
     migration
         .down(&manager)
         .await
@@ -362,6 +371,10 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .up(&manager)
         .await
         .expect("reapply actor migration");
+    consent_migration
+        .up(&manager)
+        .await
+        .expect("reapply AI consent before using the current actor service");
     let recreated = service
         .ensure_actor(
             "rollback-plugin",
@@ -371,6 +384,7 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .await
         .expect("create actor after migration reapplication");
     assert_ne!(recreated.actor.id, grants.actor.id);
+    assert!(!recreated.actor.ai_tools_enabled);
     assert!(recreated.config.permissions.is_empty());
     eprintln!("Actor migration: populated up -> down (all three tables absent, users preserved) -> up passed");
 }
