@@ -336,6 +336,19 @@ async fn forward_to_unix_socket(
         .await
         .map_err(|e| format!("HTTP handshake failed: {}", e))?;
 
+    // The stream pins a particular process even if its socket path is replaced.
+    // Validate after all connection awaits and before transmitting any credentials.
+    if original_request
+        .extensions()
+        .get::<temps_ai_api_tools::PluginDispatchGuard>()
+        .is_some_and(|guard| !guard.is_current())
+    {
+        return Err(format!(
+            "AI tool publication for plugin '{}' changed before dispatch",
+            proxy.plugin_name
+        ));
+    }
+
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             // hyper reports "error shutting down connection" when the Unix
@@ -348,6 +361,21 @@ async fn forward_to_unix_socket(
     let (mut parts, body) = original_request.into_parts();
 
     inject_temps_headers(&mut parts.headers, proxy, auth);
+    if let Some(guard) = parts
+        .extensions
+        .get::<temps_ai_api_tools::PluginDispatchGuard>()
+    {
+        guard.record_response_credentials(
+            parts
+                .headers
+                .get(headers::AUTH_SIGNATURE)
+                .and_then(|value| value.to_str().ok()),
+            parts
+                .headers
+                .get(headers::ACTOR_TOKEN)
+                .and_then(|value| value.to_str().ok()),
+        );
+    }
 
     let target_uri: hyper::Uri = path_and_query
         .parse()
@@ -1102,5 +1130,303 @@ mod tests {
         tokio::fs::remove_file(&socket_path)
             .await
             .expect("test UDS socket should be removed");
+    }
+    #[tokio::test]
+    async fn ai_plugin_read_replays_through_proxy_with_signed_user_identity() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope,
+        };
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let root = std::env::temp_dir();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let socket = directory.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let result = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            assert_eq!(request.uri().path(), "/reports");
+                            assert_eq!(request.headers()[headers::USER_ID], "42");
+                            assert_eq!(request.headers()[headers::PLUGIN_NAME], "reports");
+                            assert_eq!(
+                                request.headers()[headers::AUTH_SIGNATURE],
+                                "fixture-signature"
+                            );
+                            Ok::<_, std::convert::Infallible>(Response::new(Body::from(
+                                "{\"ok\":true}",
+                            )))
+                        },
+                    ),
+                )
+                .await;
+            if let Err(error) = result {
+                // macOS UDS shutdown may report ENOTCONN after a successful response.
+                assert!(
+                    std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<std::io::Error>())
+                        .is_some_and(|source| source.kind() == std::io::ErrorKind::NotConnected),
+                    "{error}"
+                );
+            }
+        });
+        let router = Router::new().nest(
+            "/x/reports",
+            create_plugin_proxy_router(PluginProxy::new(
+                socket,
+                "reports".into(),
+                "fixture-signature".into(),
+            )),
+        );
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        registry.bind(
+            InternalApiCaller::new_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Read,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(test_user(42, "reader@example.test"), Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let response = handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .unwrap();
+        assert_eq!(response.body["ok"], true);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ai_write_revoked_during_router_dispatch_sends_no_bytes_to_plugin() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope, WriteApiToolsHandle,
+        };
+        use tokio::io::AsyncReadExt;
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let root = std::env::temp_dir();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let socket = directory.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let revoke = registry.clone();
+        let router = Router::new()
+            .nest(
+                "/x/reports",
+                create_plugin_proxy_router(PluginProxy::new(
+                    socket,
+                    "reports".into(),
+                    "fixture-signature".into(),
+                )),
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: Request, next: axum::middleware::Next| {
+                    let revoke = revoke.clone();
+                    async move {
+                        // Initial approval validation has passed; replace the publication
+                        // before the dynamic proxy can connect to the replacement process.
+                        revoke.publish(PluginToolsIndex::default());
+                        next.run(request).await
+                    }
+                },
+            ));
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let handle = WriteApiToolsHandle::new();
+        let target = handle.clone();
+        registry.bind(
+            InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Write,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(test_user(42, "reader@example.test"), Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let result = handle
+            .get()
+            .unwrap()
+            .execute_write("plugin.reports.create", serde_json::json!({}), &scope)
+            .await;
+        assert!(
+            matches!(result, Err(temps_ai_api_tools::ApiToolError::PluginOperation { plugin, operation_id, .. }) if plugin == "reports" && operation_id == "plugin.reports.create")
+        );
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "no identity, credential or mutation reaches a replaced plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_header_echoes_scrub_injected_credentials_from_success_and_errors() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope,
+        };
+        for method in ["GET", "TRACE"] {
+            for (status, cap) in [200, 400, 500]
+                .into_iter()
+                .flat_map(|status| [30, 70, 128 * 1024].map(|cap| (status, cap)))
+            {
+                #[cfg(target_os = "macos")]
+                let root = PathBuf::from("/private/tmp");
+                #[cfg(not(target_os = "macos"))]
+                let root = std::env::temp_dir();
+                let directory = tempfile::tempdir_in(root).unwrap();
+                let socket = directory.path().join("p.sock");
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+                let token_tx = Arc::new(std::sync::Mutex::new(Some(token_tx)));
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let result = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            hyper::service::service_fn(
+                                move |request: hyper::Request<hyper::body::Incoming>| {
+                                    let token_tx = token_tx.clone();
+                                    async move {
+                                        assert_eq!(request.method().as_str(), method);
+                                        let signature = request.headers()[headers::AUTH_SIGNATURE]
+                                            .to_str()
+                                            .unwrap();
+                                        let token = request.headers()[headers::ACTOR_TOKEN]
+                                            .to_str()
+                                            .unwrap();
+                                        assert_eq!(signature, "fixture-signature");
+                                        assert!(!token.is_empty());
+                                        token_tx
+                                            .lock()
+                                            .unwrap()
+                                            .take()
+                                            .unwrap()
+                                            .send(token.to_owned())
+                                            .unwrap();
+                                        Ok::<_, std::convert::Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .header("content-type", "text/plain")
+                                                .body(Body::from(format!(
+                                                    "echo signature={signature} actor={token}"
+                                                )))
+                                                .unwrap(),
+                                        )
+                                    }
+                                },
+                            ),
+                        )
+                        .await;
+                    if let Err(error) = result {
+                        assert!(
+                            std::error::Error::source(&error)
+                                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                                .is_some_and(
+                                    |source| source.kind() == std::io::ErrorKind::NotConnected
+                                ),
+                            "{error}"
+                        );
+                    }
+                });
+                let crypto = ActorCryptoSlot::default();
+                crypto.set(Arc::new(
+                    temps_core::CookieCrypto::new("0123456789abcdef0123456789abcdef").unwrap(),
+                ));
+                let proxy = PluginProxy::new(socket, "reports".into(), "fixture-signature".into())
+                    .with_actor_minting(crypto, true);
+                let router = Router::new().nest("/x/reports", create_plugin_proxy_router(proxy));
+                let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/echo":{(method.to_lowercase()):{"operationId":"echo","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+                let registry = Arc::new(PluginToolsRegistry::default());
+                let handle = ApiToolsHandle::new();
+                let target = handle.clone();
+                registry.bind(
+                    InternalApiCaller::new_allowlisted(router, &spec, vec![])
+                        .with_max_response_bytes(cap),
+                    if method == "GET" {
+                        PluginToolAccess::Read
+                    } else {
+                        PluginToolAccess::Write
+                    },
+                    Arc::new(temps_core::audit::NoopAuditLogger),
+                    move |caller| target.set(caller),
+                );
+                registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+                let scope = ApiCallScope {
+                    auth: AuthContext::new_persisted_session(
+                        test_user(42, "reader@example.test"),
+                        Role::Admin,
+                        7,
+                    ),
+                    project_scope: ProjectSelectorScope::Unrestricted,
+                    origin: None,
+                    secrets: None,
+                };
+                let caller = handle.get().unwrap();
+                let revision = caller.plugin_tools_revision();
+                let result = if method == "GET" {
+                    caller
+                        .call("plugin.reports.echo", serde_json::json!({}), &scope)
+                        .await
+                } else {
+                    caller
+                        .execute_approved_write(
+                            "plugin.reports.echo",
+                            serde_json::json!({}),
+                            &scope,
+                            revision.as_deref(),
+                        )
+                        .await
+                };
+                let output = if status == 200 {
+                    result.unwrap().body.to_string()
+                } else {
+                    result.unwrap_err().to_string()
+                };
+                let token = token_rx.await.unwrap();
+                assert!(!output.contains("fixture-signature"), "{output}");
+                assert!(!output.contains("fixture-signatur"), "{output}");
+                assert!(!output.contains(&token));
+                assert!(!output.contains(&token[..20]), "{output}");
+                if status != 500 && cap == 128 * 1024 {
+                    assert!(output.contains("signature=*** actor=***"), "{output}");
+                } else if status != 500 {
+                    assert!(
+                        output.contains("omitted to protect credentials"),
+                        "{output}"
+                    );
+                }
+                server.await.unwrap();
+            }
+        }
     }
 }

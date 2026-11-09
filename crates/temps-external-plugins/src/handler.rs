@@ -3,6 +3,9 @@
 
 //! HTTP handlers for external plugin management endpoints.
 
+mod ai_tools;
+use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
+
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
@@ -22,6 +25,12 @@ use temps_plugin_protocol::channel::{PluginActorInfo, PluginAiCapability, Plugin
 
 fn grant_problem(error: crate::grants::GrantError) -> Problem {
     match error {
+        crate::grants::GrantError::AiToolsPublication { .. } => {
+            tracing::error!(error = %error, "Saved plugin AI consent could not be published");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Plugin AI Tools Unavailable")
+                .with_detail("Consent was saved, but AI tools could not be refreshed and remain unavailable. Retry saving this setting or reload plugins after the database recovers.")
+        }
         crate::grants::GrantError::NotFound { .. } => {
             temps_core::problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Plugin Actor Not Found")
@@ -1651,6 +1660,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
         .route(
+            "/x/plugins/{name}/ai-tools",
+            get(get_plugin_ai_tools).put(put_plugin_ai_tools),
+        )
+        .route(
             "/x/plugins/{name}/grants",
             get(get_plugin_grants).put(put_plugin_grants),
         )
@@ -1670,6 +1683,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         update_repository,
         uninstall_plugin,
         get_plugin_status,
+        ai_tools::get_plugin_ai_tools,
+        ai_tools::put_plugin_ai_tools,
         get_plugin_grants,
         put_plugin_grants,
     ),
@@ -1696,6 +1711,9 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::source_catalog::RepositoryScreenshot,
             crate::source_catalog::RepositoryValidation,
             PluginStatusResponse,
+            crate::ai_tools::PluginAiToolsResponse,
+            crate::ai_tools::UpdatePluginAiTools,
+            crate::ai_tools::AiToolInfo,
             PluginGrantsResponse,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
@@ -2855,5 +2873,323 @@ mod tests {
         .expect_err("grant mutation must require sensitive verification");
         assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
         assert!(audit.operations.lock().expect("audit lock").is_empty());
+    }
+    fn ai_actor(enabled: bool) -> temps_entities::external_plugin_actors::Model {
+        temps_entities::external_plugin_actors::Model {
+            id: uuid::Uuid::from_u128(1),
+            plugin_name: "reports".into(),
+            binary_sha256: "fixture".into(),
+            source_identity: "fixture".into(),
+            active: true,
+            ai_tools_enabled: enabled,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_routes_enforce_auth_and_permissions() {
+        use tower::ServiceExt;
+        for method in ["GET", "PUT"] {
+            for role in [None, Some(Role::User)] {
+                let mut app = configure_routes()
+                    .with_state(test_state())
+                    .layer(Extension(metadata().0));
+                if let Some(role) = role.clone() {
+                    app = app.layer(Extension(user_auth(role).0));
+                }
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/x/plugins/reports/ai-tools")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"actor_id":"fixture","enabled":true}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if role.is_none() {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/problem+json"
+                );
+                let body: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 8192)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(body["title"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_toggle_returns_current_consent_and_audits() {
+        use tower::ServiceExt;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![ai_actor(false)],
+                vec![ai_actor(true)],
+                vec![ai_actor(true)],
+                vec![ai_actor(true)],
+            ])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let config = ExternalPluginConfig::new(
+            std::env::temp_dir().join("plugin-ai-test"),
+            "postgres://localhost/test".into(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(
+                config,
+                None,
+                Arc::new(db),
+            )),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let app = configure_routes()
+            .with_state(state)
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0));
+        for method in ["PUT", "GET"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"installation_revision":"fixture","enabled":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["enabled"], true);
+            assert_eq!(body["actor_id"], uuid::Uuid::from_u128(1).to_string());
+            assert_eq!(body["tools"], serde_json::json!([]));
+        }
+        assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn saved_ai_consent_publication_failure_is_audited_and_explains_recovery() {
+        use tower::ServiceExt;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![ai_actor(false)], vec![ai_actor(true)]])
+            .append_query_errors([sea_orm::DbErr::Custom("private diagnostic".into())])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(
+                ExternalPluginConfig::new(
+                    std::env::temp_dir().join("plugin-ai-publication-test"),
+                    "postgres://localhost/test".into(),
+                ),
+                None,
+                Arc::new(db),
+            )),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let response = configure_routes()
+            .with_state(state)
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/x/plugins/reports/ai-tools")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"installation_revision":"fixture","enabled":true})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["title"], "Plugin AI Tools Unavailable");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Consent was saved"));
+        assert!(body["detail"].as_str().unwrap().contains("Retry saving"));
+        assert!(!body.to_string().contains("private diagnostic"));
+        assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_errors_are_problem_details_without_success_audits() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        use tower::ServiceExt;
+        for (method, db, status, title) in [
+            (
+                "GET",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([
+                        Vec::<temps_entities::external_plugin_actors::Model>::new(),
+                    ]),
+                StatusCode::NOT_FOUND,
+                "Plugin Actor Not Found",
+            ),
+            (
+                "PUT",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![ai_actor(false)]]),
+                StatusCode::CONFLICT,
+                "Plugin Actor Changed",
+            ),
+            (
+                "GET",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("private diagnostic".into())]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Plugin Grants Unavailable",
+            ),
+            (
+                "PUT",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("private diagnostic".into())]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Plugin Grants Unavailable",
+            ),
+        ] {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let state = ExternalPluginsAppState {
+                service: Arc::new(ExternalPluginsService::new_empty(
+                    ExternalPluginConfig::new(
+                        std::env::temp_dir().join("plugin-ai-contract-test"),
+                        "postgres://localhost/test".into(),
+                    ),
+                    None,
+                    Arc::new(db.into_connection()),
+                )),
+                audit_service: audit.clone(),
+                sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            };
+            let response = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(Role::PlatformAdmin).0))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(2),"installation_revision":"fixture","enabled":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["title"], title);
+            assert!(body["detail"].is_string());
+            assert!(!body.to_string().contains("private diagnostic"));
+            if status != StatusCode::INTERNAL_SERVER_ERROR {
+                assert!(body["detail"].as_str().unwrap().contains("reports"));
+            }
+            assert!(audit.operations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_invalid_json_and_media_type_are_problem_details() {
+        use tower::ServiceExt;
+        for (body, content_type, status) in [
+            (
+                "untrusted-payload",
+                "application/json",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"actor_id":"fixture","enabled":"untrusted-payload"}"#,
+                "application/json",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "untrusted-payload",
+                "text/plain",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut state = test_state();
+            state.audit_service = audit.clone();
+            let response = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(Role::PlatformAdmin).0))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            let problem: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(problem["title"], "Invalid Plugin AI Access Request");
+            assert!(problem["detail"].as_str().unwrap().contains("reports"));
+            assert!(!problem.to_string().contains("untrusted-payload"));
+            assert!(audit.operations.lock().unwrap().is_empty());
+        }
     }
 }

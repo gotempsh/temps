@@ -38,6 +38,14 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "plugin AI consent is inspected in the operator console; assistant discovery already lists declared tools and disabled access",
+        &["get_plugin_ai_tools"],
+    ),
+    (
+        "granting plugin AI access is an operator decision behind step-up; the assistant must not enable its own tools",
+        &["put_plugin_ai_tools"],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),

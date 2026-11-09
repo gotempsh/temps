@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { Readable } from "node:stream";
+
 /**
  * Plugin runtime -- handles the full lifecycle of a Temps external plugin.
  *
@@ -25,10 +27,20 @@ import { dirname } from "node:path";
 import type { TempsPlugin, PluginArgs, PluginEvent } from "./types.js";
 import { TempsClient, type WsLike } from "./client.js";
 import { PluginContext } from "./context.js";
-import { emitManifest, emitReady, PLUGIN_CHANNEL_PATH, extractAuthContext } from "./protocol.js";
+import {
+  emitManifest,
+  emitReady,
+  PLUGIN_CHANNEL_PATH,
+  extractAuthContext,
+} from "./protocol.js";
 import { createEmbeddedUiHandler, type EmbeddedAssets } from "./ui.js";
 import { ArgsError, InitializationError } from "./errors.js";
-import { readLaunchConfig, authenticatedHostRequest, requiresHostAuthentication, validateHealthPath } from "./launch.js";
+import {
+  readLaunchConfig,
+  authenticatedHostRequest,
+  requiresHostAuthentication,
+  validateHealthPath,
+} from "./launch.js";
 
 /**
  * Run a Temps plugin. This is the main entry point.
@@ -84,7 +96,8 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
 
   // Embedded UI
   const embeddedAssets = plugin.embeddedUiAssets?.();
-  const hasUi = embeddedAssets !== undefined || plugin.uiDistPath?.() !== undefined;
+  const hasUi =
+    embeddedAssets !== undefined || plugin.uiDistPath?.() !== undefined;
 
   // Build embedded UI handler if available
   const embeddedUiHandler = embeddedAssets
@@ -107,14 +120,17 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
 
       // Health discloses no caller data. Every other route, including public
       // plugin routes forwarded by Temps, must carry the host assertion.
-      if (requiresHostAuthentication(url.pathname, manifest.health_path) &&
-          !authenticatedHostRequest(req.headers, launch.auth_secret)) {
+      if (
+        requiresHostAuthentication(url.pathname, manifest.health_path) &&
+        !authenticatedHostRequest(req.headers, launch.auth_secret)
+      ) {
         return new Response("Unauthorized", { status: 401 });
       }
 
       // WebSocket upgrade for platform channel
       if (url.pathname === PLUGIN_CHANNEL_PATH) {
-        if (channelAccepted) return new Response("Channel already connected", { status: 409 });
+        if (channelAccepted)
+          return new Response("Channel already connected", { status: 409 });
         if (server.upgrade(req)) {
           channelAccepted = true;
           return undefined as unknown as Response;
@@ -152,12 +168,17 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
         wsMessageListeners.set(ws, new Set());
         wsCloseListeners.set(ws, new Set());
 
-        const adapter = createWsAdapter(ws, wsMessageListeners, wsCloseListeners);
+        const adapter = createWsAdapter(
+          ws,
+          wsMessageListeners,
+          wsCloseListeners,
+        );
         const client = new TempsClient(adapter);
         resolveChannel?.(client);
       },
       message(ws, message) {
-        const msgStr = typeof message === "string" ? message : message.toString();
+        const msgStr =
+          typeof message === "string" ? message : message.toString();
         const listeners = wsMessageListeners.get(ws);
         if (listeners) {
           for (const fn of listeners) fn(msgStr);
@@ -175,7 +196,7 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   });
 
   // 4. Emit ready (handshake phase 2)
-  emitReady(hasUi);
+  emitReady(hasUi, plugin.openapi?.());
 
   // 5. Wait for the host to connect via WebSocket channel (with timeout)
   const channelTimeoutMs = 30_000;
@@ -186,13 +207,13 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
       new Promise<never>((_, reject) =>
         setTimeout(
           () => reject(new Error("Channel connection timeout")),
-          channelTimeoutMs
-        )
+          channelTimeoutMs,
+        ),
       ),
     ]);
   } catch {
     console.error(
-      "[temps-plugin] Warning: platform channel not connected, running without platform data access"
+      "[temps-plugin] Warning: platform channel not connected, running without platform data access",
     );
     client = null as unknown as TempsClient;
   }
@@ -218,7 +239,7 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   } catch (err) {
     throw new InitializationError(
       manifest.name,
-      err instanceof Error ? err.message : String(err)
+      err instanceof Error ? err.message : String(err),
     );
   }
 
@@ -241,7 +262,11 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
     server.stop();
 
     if (existsSync(args.socketPath)) {
-      try { unlinkSync(args.socketPath); } catch { /* ignore */ }
+      try {
+        unlinkSync(args.socketPath);
+      } catch {
+        /* ignore */
+      }
     }
     process.exit(0);
   };
@@ -250,7 +275,7 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   process.on("SIGINT", shutdown);
 
   console.error(
-    `[temps-plugin] ${manifest.display_name ?? manifest.name} v${manifest.version} running on ${args.socketPath}`
+    `[temps-plugin] ${manifest.display_name ?? manifest.name} v${manifest.version} running on ${args.socketPath}`,
   );
 }
 
@@ -260,7 +285,7 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
 
 function handleEmbeddedUi(
   url: URL,
-  assets: EmbeddedAssets
+  assets: EmbeddedAssets,
 ): Response | undefined {
   const pathname = url.pathname;
 
@@ -321,7 +346,7 @@ function handleEmbeddedUi(
 function createWsAdapter(
   ws: { send: (msg: string | Buffer) => void; close: () => void },
   messageListeners: Map<unknown, Set<(data: string) => void>>,
-  closeListeners: Map<unknown, Set<() => void>>
+  closeListeners: Map<unknown, Set<() => void>>,
 ): WsLike {
   return {
     on(event: string, fn: (...args: unknown[]) => void) {
@@ -353,34 +378,36 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 async function nodeRequestBridge(
   req: Request,
-  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>,
 ): Promise<Response> {
   const url = new URL(req.url);
 
-  // Read body upfront
-  let bodyBuffer = Buffer.alloc(0);
-  if (req.body) {
-    bodyBuffer = Buffer.from(await req.arrayBuffer());
-  }
-
   return new Promise<Response>((resolve) => {
-    // Build a minimal IncomingMessage shim
-    const fakeReq = Object.create(null) as IncomingMessage;
+    // A real readable supports both event-based plugins and async iteration.
+    const fakeReq = Readable.from(
+      (async function* () {
+        const reader = req.body?.getReader();
+        if (!reader) return;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            yield Buffer.from(value);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      })(),
+    ) as IncomingMessage;
     fakeReq.url = url.pathname + url.search;
     fakeReq.method = req.method;
-
-    const hdrs: Record<string, string> = {};
-    req.headers.forEach((v, k) => { hdrs[k] = v; });
-    fakeReq.headers = hdrs;
-
-    // Body event emitter shim
-    const dataFns: Array<(chunk: Buffer) => void> = [];
-    const endFns: Array<() => void> = [];
-    fakeReq.on = ((event: string, fn: (...a: unknown[]) => void) => {
-      if (event === "data") dataFns.push(fn as (c: Buffer) => void);
-      if (event === "end") endFns.push(fn as () => void);
-      return fakeReq;
-    }) as typeof fakeReq.on;
+    fakeReq.headers = {};
+    req.headers.forEach((value, name) => {
+      fakeReq.headers[name] = value;
+    });
+    fakeReq.on("error", () =>
+      resolve(new Response("Plugin request failed", { status: 500 })),
+    );
 
     // Response collector shim
     let statusCode = 200;
@@ -395,12 +422,15 @@ async function nodeRequestBridge(
     }) as typeof fakeRes.writeHead;
 
     fakeRes.end = ((data?: string | Buffer) => {
-      if (data) chunks.push(typeof data === "string" ? Buffer.from(data) : data);
+      if (data)
+        chunks.push(typeof data === "string" ? Buffer.from(data) : data);
       const body = Buffer.concat(chunks);
-      resolve(new Response(body.length > 0 ? body : null, {
-        status: statusCode,
-        headers: resHeaders,
-      }));
+      resolve(
+        new Response(body.length > 0 ? body : null, {
+          status: statusCode,
+          headers: resHeaders,
+        }),
+      );
     }) as typeof fakeRes.end;
 
     fakeRes.write = ((data: string | Buffer) => {
@@ -408,16 +438,12 @@ async function nodeRequestBridge(
       return true;
     }) as typeof fakeRes.write;
 
-    // Call the handler
-    handler(fakeReq, fakeRes);
-
-    // Deliver body
-    queueMicrotask(() => {
-      if (bodyBuffer.length > 0) {
-        for (const fn of dataFns) fn(bodyBuffer);
-      }
-      for (const fn of endFns) fn();
-    });
+    // Catch asynchronous plugin failures as well as synchronous exceptions.
+    Promise.resolve()
+      .then(() => handler(fakeReq, fakeRes))
+      .catch(() => {
+        resolve(new Response("Plugin handler failed", { status: 500 }));
+      });
   });
 }
 
@@ -428,7 +454,7 @@ async function nodeRequestBridge(
 async function handleEventDelivery(
   req: Request,
   plugin: TempsPlugin,
-  ctx?: PluginContext
+  ctx?: PluginContext,
 ): Promise<Response> {
   try {
     const event = (await req.json()) as PluginEvent;
@@ -442,7 +468,7 @@ async function handleEventDelivery(
         error: "Invalid event payload",
         detail: err instanceof Error ? err.message : String(err),
       },
-      { status: 400 }
+      { status: 400 },
     );
   }
 }
@@ -465,7 +491,9 @@ function parseArgs(argv: string[]): Pick<PluginArgs, "socketPath" | "dataDir"> {
         break;
       case "--database-url":
       case "--auth-secret":
-        throw new ArgsError("Privileged launch values must arrive over the protocol 2 stdin handshake; update Temps");
+        throw new ArgsError(
+          "Privileged launch values must arrive over the protocol 2 stdin handshake; update Temps",
+        );
       case "--data-dir":
         args.dataDir = next;
         i++;

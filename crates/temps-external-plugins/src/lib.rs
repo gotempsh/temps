@@ -34,3 +34,5 @@ pub use channel::PluginChannel;
 pub use event_listener::PluginEventListener;
 pub use plugin::ExternalPluginsPlugin;
 pub use service::ExternalPluginsService;
+
+pub mod ai_tools;

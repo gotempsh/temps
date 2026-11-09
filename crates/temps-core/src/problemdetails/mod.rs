@@ -42,6 +42,7 @@ pub struct ProblemDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     /// Additional properties of the problem
+    #[serde(flatten)]
     #[schema(additional_properties = true)]
     pub extensions: BTreeMap<String, Value>,
 }
@@ -215,6 +216,28 @@ impl IntoResponse for Problem {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[test]
+    fn problem_schema_and_serialization_flatten_extension_members() {
+        let schema =
+            serde_json::to_value(<ProblemDetails as utoipa::PartialSchema>::schema()).unwrap();
+        assert!(schema["properties"].get("extensions").is_none());
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("extensions")));
+        let problem = ProblemDetails {
+            type_url: None,
+            title: "Conflict".into(),
+            status: Some(409),
+            detail: None,
+            instance: None,
+            extensions: BTreeMap::from([("code".into(), serde_json::json!("ACTOR_CHANGED"))]),
+        };
+        let value = serde_json::to_value(problem).unwrap();
+        assert_eq!(value["code"], "ACTOR_CHANGED");
+        assert!(value.get("extensions").is_none());
+    }
 
     #[tokio::test]
     async fn permission_denial_marker_is_internal_and_preserves_body() {

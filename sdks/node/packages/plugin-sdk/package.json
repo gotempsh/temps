@@ -16,9 +16,9 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "vitest",
-    "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage",
+    "test": "bun run test:run",
+    "test:run": "vitest run --exclude src/tools.test.ts && bun test src/tools.test.ts",
+    "test:coverage": "vitest run --coverage --exclude src/tools.test.ts && bun test --coverage src/tools.test.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
   },
@@ -42,5 +42,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "zod": "^4.0.0"
   }
 }

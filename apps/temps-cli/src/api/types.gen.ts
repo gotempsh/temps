@@ -1332,6 +1332,12 @@ export type AiSummaryPreferenceDto = {
     thinking_level?: string | null;
 };
 
+export type AiToolInfo = {
+    access: string;
+    description: string;
+    name: string;
+};
+
 /**
  * Runtime limits for workspace file transfer and browser previews.
  *
@@ -23631,6 +23637,16 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
+export type PluginAiToolsResponse = {
+    actor_id: string;
+    enabled: boolean;
+    /**
+     * Binary revision returned by GET; a changed binary requires fresh consent.
+     */
+    installation_revision: string;
+    tools: Array<AiToolInfo>;
+};
+
 export type PluginGrantConfig = {
     ai_daily_call_limit: number;
     ai_max_output_tokens: number;
@@ -24035,12 +24051,6 @@ export type ProblemDetails = {
      */
     detail?: string | null;
     /**
-     * Additional properties of the problem
-     */
-    extensions: {
-        [key: string]: unknown;
-    };
-    /**
      * A URI reference that identifies the specific occurrence of the problem
      */
     instance?: string | null;
@@ -24056,6 +24066,7 @@ export type ProblemDetails = {
      * A URI reference that identifies the problem type
      */
     type?: string | null;
+    [key: string]: unknown;
 };
 
 export type ProfileResponse = {
@@ -35429,6 +35440,18 @@ export type UpdatePermissionModeRequest = {
      * be safely reduced after the process has started.
      */
     permission_mode: string;
+};
+
+export type UpdatePluginAiTools = {
+    /**
+     * Current actor_id returned by GET; replacing the installation requires fresh consent.
+     */
+    actor_id: string;
+    enabled: boolean;
+    /**
+     * Binary revision returned by GET; a changed binary requires fresh consent.
+     */
+    installation_revision: string;
 };
 
 export type UpdatePreferencesRequest = {
@@ -92295,6 +92318,64 @@ export type TriggerWeeklyDigestResponses = {
 };
 
 export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
+
+export type GetPluginAiToolsData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/ai-tools';
+};
+
+export type GetPluginAiToolsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetPluginAiToolsResponses = {
+    200: PluginAiToolsResponse;
+};
+
+export type GetPluginAiToolsResponse = GetPluginAiToolsResponses[keyof GetPluginAiToolsResponses];
+
+export type PutPluginAiToolsData = {
+    body: UpdatePluginAiTools;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/ai-tools';
+};
+
+export type PutPluginAiToolsErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    /**
+     * Plugin actor replaced; reload current actor_id before choosing consent again
+     */
+    409: ProblemDetails;
+    413: unknown;
+    415: unknown;
+    422: unknown;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    500: unknown;
+};
+
+export type PutPluginAiToolsError = PutPluginAiToolsErrors[keyof PutPluginAiToolsErrors];
+
+export type PutPluginAiToolsResponses = {
+    200: PluginAiToolsResponse;
+};
+
+export type PutPluginAiToolsResponse = PutPluginAiToolsResponses[keyof PutPluginAiToolsResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

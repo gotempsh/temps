@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   PLATFORM_SETTINGS_INDEX,
+  pluginAiToolSetting,
   PROJECT_SETTINGS_INDEX,
   projectHasSetting,
   projectSettingUrl,
@@ -38,7 +39,11 @@ function combinedPage(page: string): CombinedSettingsPage | undefined {
     : undefined
 }
 
-const ALL_SETTINGS = [...PROJECT_SETTINGS_INDEX, ...PLATFORM_SETTINGS_INDEX]
+const ALL_SETTINGS = [
+  ...PROJECT_SETTINGS_INDEX,
+  ...PLATFORM_SETTINGS_INDEX,
+  pluginAiToolSetting('reports'),
+]
 
 describe('settings indexes', () => {
   test('every anchor is rendered by some component', async () => {
@@ -153,4 +158,14 @@ describe('projectHasSetting', () => {
       'Container startup',
     ])
   })
+})
+
+test('plugin AI tools have a searchable direct link for each installation', () => {
+  const entry = pluginAiToolSetting('reports')
+  expect(projectSettingUrl(entry)).toBe(
+    '/plugins/reports#setting-plugin-ai-tools'
+  )
+  expect(entry.keywords).toContain('plugin AI access')
+  expect(entry.keywords).toContain('AI tools')
+  expect(entry.keywords).toContain('reports')
 })

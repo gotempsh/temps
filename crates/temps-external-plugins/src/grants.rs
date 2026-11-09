@@ -38,6 +38,10 @@ pub struct PluginGrants {
 
 #[derive(Debug, Error)]
 pub enum GrantError {
+    #[error(
+        "AI consent was saved for plugin '{plugin_name}', but publishing tools failed: {source}"
+    )]
+    AiToolsPublication { plugin_name: String, source: DbErr },
     #[error("Plugin actor for '{plugin_name}' was not found or is inactive")]
     NotFound { plugin_name: String },
     #[error("Invalid grant configuration for plugin '{plugin_name}': {reason}")]
@@ -114,7 +118,9 @@ impl PluginGrantService {
         let id = uuid::Uuid::new_v4();
         // A reinstallation never inherits the previous actor's authority.
         // Active, authenticated upgrades retain the actor but cannot expand
-        // its grants; source-conflict checks happen before activation.
+        // its grants; source-conflict checks happen before activation. Startup
+        // also reconciles a verified binary activated before a crash: AI consent
+        // belongs to that binary, even if activation's database commit was lost.
         let transaction = self
             .db
             .begin()
@@ -149,7 +155,7 @@ impl PluginGrantService {
                 source,
             })?;
         transaction.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors (id, plugin_name, binary_sha256, source_identity, active) VALUES ($1,$2,$3,$4,TRUE) ON CONFLICT (plugin_name) DO NOTHING",
+            "INSERT INTO external_plugin_actors (id, plugin_name, binary_sha256, source_identity, active) VALUES ($1,$2,$3,$4,TRUE) ON CONFLICT (plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW()",
             [id.into(), plugin_name.into(), sha256.into(), source_identity.into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "ensure actor", source })?;
         let bound_id: String = transaction
@@ -191,7 +197,7 @@ impl PluginGrantService {
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE external_plugin_actors SET binary_sha256=$2,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                "UPDATE external_plugin_actors SET ai_tools_enabled=CASE WHEN binary_sha256 IS DISTINCT FROM $2 THEN FALSE ELSE ai_tools_enabled END,binary_sha256=$2,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
                 [plugin_name.into(), sha256.into()],
             ))
             .await
@@ -243,7 +249,7 @@ impl PluginGrantService {
         )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "rotate activated actor", source })?;
         let result = transaction.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
+            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
             [actor_id.into(), plugin_name.into(), sha256.into(), source_identity.into()],
         )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "commit activated actor", source })?;
         if result.rows_affected() != 1 {
@@ -405,6 +411,122 @@ fn parse_permission(value: &str) -> Option<PluginHostPermission> {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[tokio::test]
+    async fn changed_binary_resets_only_ai_consent_and_stale_forms_cannot_enable_it() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use temps_entities::external_plugin_actors as actors;
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping binary consent test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let db = database.connection_arc();
+        let grants = PluginGrantService::new(db.clone());
+        let candidate = grants
+            .prepare_actor("reports", "fixture-source")
+            .await
+            .unwrap();
+        let id = candidate.actor.id.clone();
+        grants
+            .commit_actor("reports", &id, "binary-one", "fixture-source")
+            .await
+            .unwrap();
+        let actor_id = uuid::Uuid::parse_str(&id).unwrap();
+        for activation in ["binary", "actor", "startup"] {
+            let actor = actors::Entity::find_by_id(actor_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            let old_hash = actor.binary_sha256.clone();
+            let mut active: actors::ActiveModel = actor.into();
+            active.ai_tools_enabled = Set(true);
+            active.update(db.as_ref()).await.unwrap();
+            grants
+                .commit_binary_hash("reports", &old_hash)
+                .await
+                .unwrap();
+            assert!(
+                actors::Entity::find_by_id(actor_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ai_tools_enabled
+            );
+            // Same-binary restart preserves consent and actor identity.
+            let rebound = grants
+                .ensure_actor("reports", &old_hash, "fixture-source")
+                .await
+                .unwrap();
+            assert_eq!(rebound.actor.id, id);
+            assert!(
+                actors::Entity::find_by_id(actor_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ai_tools_enabled
+            );
+            let next_hash = match activation {
+                "actor" => "binary-three",
+                "startup" => "binary-four",
+                _ => "binary-two",
+            };
+            if activation == "startup" {
+                // The installation already selects the new verified binary,
+                // but the previous actor commit did not run before restart.
+                let rebound = grants
+                    .ensure_actor("reports", next_hash, "fixture-source")
+                    .await
+                    .unwrap();
+                assert_eq!(rebound.actor.id, id);
+            } else if activation == "actor" {
+                grants
+                    .commit_actor("reports", &id, next_hash, "fixture-source")
+                    .await
+                    .unwrap();
+            } else {
+                grants
+                    .commit_binary_hash("reports", next_hash)
+                    .await
+                    .unwrap();
+            }
+            let changed = actors::Entity::find_by_id(actor_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!changed.ai_tools_enabled);
+            assert_eq!(changed.binary_sha256, next_hash);
+            let service = crate::service::ExternalPluginsService::new_empty(
+                crate::manager::ExternalPluginConfig::new(
+                    std::env::temp_dir().join("binary-consent-test"),
+                    "postgres://localhost/test".into(),
+                ),
+                None,
+                db.clone(),
+            );
+            let error = service
+                .update_plugin_ai_tools(
+                    "reports",
+                    crate::ai_tools::UpdatePluginAiTools {
+                        actor_id: id.clone(),
+                        installation_revision: old_hash,
+                        enabled: true,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, GrantError::ActorChanged { .. }));
+        }
+    }
 
     #[tokio::test]
     async fn commit_binary_hash_requires_one_active_actor() {
