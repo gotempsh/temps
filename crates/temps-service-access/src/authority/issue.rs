@@ -82,16 +82,20 @@ impl IssuedPolicy {
 
 impl AuthorityStore {
     /// All active bindings for ONE authenticated worker, from a consistent
-    /// authorization read. Omitted rules disappear on installation. This signs
+    /// authorization read. `expected_revision` must be read in the same
+    /// database snapshot as the grants, so concurrent revocation rejects a
+    /// stale plan before it can reserve a newer signing version.
+    /// Omitted rules disappear on installation. This signs
     /// policy, not a connected receipt; the dispatcher must verify worker ACKs.
     pub async fn issue(
         &self,
         node_id: Option<i32>,
         identity: &WorkerIdentity,
+        expected_revision: i64,
         bindings: Vec<AuthorizedBinding>,
     ) -> Result<IssuedPolicy, AuthorityError> {
         validate_bindings(identity.boot_id, &bindings, chrono::Utc::now())?;
-        let row = self.reserve(node_id, identity).await?;
+        let row = self.reserve(node_id, identity, expected_revision).await?;
         let authority = self.public_authority(&row, node_id, identity)?;
         if bindings
             .iter()

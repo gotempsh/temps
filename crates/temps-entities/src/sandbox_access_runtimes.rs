@@ -15,6 +15,11 @@ pub struct Model {
     pub node_id: Option<i32>,
     /// Immutable provider identity including its start/restore generation.
     pub provider_identity: String,
+    /// None identifies an old, never-authorized runtime intent.
+    pub authority_id: Option<Uuid>,
+    pub provider_backend: Option<String>,
+    pub provider_name: Option<String>,
+    pub lease_expires_at: Option<temps_core::DBDateTime>,
     pub desired_version: i64,
     pub applied_version: i64,
     /// Closed incarnations never accept further grants.

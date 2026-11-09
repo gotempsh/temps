@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod consent;
+pub use consent::{AuthorizedGrant, FreshConsent, HostObservation};
+
 use crate::{
     broker::{AccessCapability, ServiceAccessBroker},
     error::AccessError,

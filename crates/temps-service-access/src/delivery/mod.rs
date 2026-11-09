@@ -84,7 +84,7 @@ impl DeliveryQueue {
         }
         let retire = operation == DeliveryOperation::Retire;
         let row = txn.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "WITH changed AS (UPDATE sandbox_access_runtimes SET desired_version=desired_version+1, updated_at=now(), closed_at=CASE WHEN $3 THEN now() ELSE closed_at END WHERE id=$1 AND desired_version=$2 AND closed_at IS NULL RETURNING id,node_id,desired_version) INSERT INTO sandbox_access_delivery (runtime_id,node_id,desired_version,operation) SELECT id,node_id,desired_version,CASE WHEN $3 THEN 'retire' ELSE 'reconcile' END FROM changed RETURNING desired_version",
+            "WITH changed AS (UPDATE sandbox_access_runtimes SET desired_version=desired_version+1, updated_at=now(), closed_at=CASE WHEN $3 THEN now() ELSE closed_at END WHERE id=$1 AND desired_version=$2 AND closed_at IS NULL RETURNING id,node_id,desired_version,authority_id,provider_identity,provider_backend,provider_name) INSERT INTO sandbox_access_delivery (runtime_id,node_id,desired_version,operation,worker_boot_id,provider_identity,provider_backend,provider_name) SELECT id,node_id,desired_version,CASE WHEN $3 THEN 'retire' ELSE 'reconcile' END,authority_id,CASE WHEN authority_id IS NOT NULL THEN provider_identity ELSE NULL END,provider_backend,provider_name FROM changed RETURNING desired_version",
             [runtime_id.into(),expected_version.into(),retire.into()])).await
             .map_err(|e| database("advance runtime", runtime_id, e))?
             .ok_or(DeliveryError::RuntimeChanged { runtime_id, version: expected_version })?;

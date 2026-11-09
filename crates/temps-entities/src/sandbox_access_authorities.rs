@@ -20,6 +20,8 @@ pub struct Model {
     pub ca_key_encrypted: String,
     /// Monotonic across control-plane restarts and concurrent dispatchers.
     pub snapshot_version: i64,
+    /// Fences issuance against authorization changes read by another dispatcher.
+    pub desired_revision: i64,
     pub closed_at: Option<temps_core::DBDateTime>,
     pub created_at: temps_core::DBDateTime,
     pub updated_at: temps_core::DBDateTime,
@@ -67,6 +69,7 @@ mod tests {
             ca_certificate: "public-ca".into(),
             ca_key_encrypted: "ca-sentinel".into(),
             snapshot_version: 0,
+            desired_revision: 0,
             closed_at: None,
             created_at: now,
             updated_at: now,

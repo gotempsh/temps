@@ -236,21 +236,34 @@ async fn capability_explains_missing_integration_without_claiming_connection() {
 }
 #[tokio::test]
 async fn problem_mapping_never_leaks_database_sources() {
-    let problem: Problem = AccessError::Database {
-        operation: "save service",
-        project_id: 7,
-        source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
+    for error in [
+        AccessError::Database {
+            operation: "save service",
+            project_id: 7,
+            source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
+        },
+        AccessError::Delivery {
+            project_id: 7,
+            sandbox_id: "sbx_test".into(),
+            source: Box::new(crate::delivery::DeliveryError::Database {
+                operation: "enqueue policy",
+                subject: "test runtime".into(),
+                source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
+            }),
+        },
+    ] {
+        let problem: Problem = error.into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let encoded = String::from_utf8(
+            to_bytes(problem.into_response().into_body(), 8192)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(encoded.contains("project 7"));
+        assert!(!encoded.contains("secret-driver-payload"));
     }
-    .into();
-    assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
-    let encoded = String::from_utf8(
-        to_bytes(problem.into_response().into_body(), 8192)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(!encoded.contains("secret-driver-payload"));
 }
 #[tokio::test]
 async fn create_returns_masked_service_and_audits_only_metadata() {

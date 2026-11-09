@@ -165,13 +165,14 @@ impl AuthorityStore {
         &self,
         node_id: Option<i32>,
         identity: &WorkerIdentity,
+        expected_revision: i64,
     ) -> Result<authorities::Model, AuthorityError> {
         validate_identity(node_id, identity)?;
         authorities::Entity::find().from_raw_sql(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE sandbox_access_authorities SET snapshot_version=snapshot_version+1, updated_at=now() WHERE id=$1 AND node_id IS NOT DISTINCT FROM $2 AND seal_public_key=$3 AND closed_at IS NULL AND snapshot_version < 9223372036854775807 RETURNING *",
-            [identity.boot_id.into(), node_id.into(), STANDARD.encode(identity.seal_public_key).into()])).one(self.db.as_ref()).await
+            "UPDATE sandbox_access_authorities SET snapshot_version=snapshot_version+1, updated_at=now() WHERE id=$1 AND node_id IS NOT DISTINCT FROM $2 AND seal_public_key=$3 AND closed_at IS NULL AND snapshot_version < 9223372036854775807 AND desired_revision=$4 RETURNING *",
+            [identity.boot_id.into(), node_id.into(), STANDARD.encode(identity.seal_public_key).into(), expected_revision.into()])).one(self.db.as_ref()).await
             .map_err(|source| database(identity.boot_id, "reserve snapshot version", source))?
-            .ok_or_else(|| invalid(identity.boot_id, "reserve snapshot version", "registration is missing, closed, exhausted or identity changed"))
+            .ok_or_else(|| invalid(identity.boot_id, "reserve snapshot version", "registration is missing, closed, exhausted or its identity or authorization revision changed"))
     }
 
     fn public_authority(
@@ -266,6 +267,7 @@ impl AuthorityStore {
             ca_certificate: STANDARD.encode(ca.der()),
             ca_key_encrypted: encrypt(&Zeroizing::new(ca_key.serialize_der()))?,
             snapshot_version: 0,
+            desired_revision: 0,
             closed_at: None,
             created_at: now,
             updated_at: now,

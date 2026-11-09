@@ -5,7 +5,7 @@
 //! activate saved intents. A future control-plane coordinator must reauthorize
 //! fresh consent and resolve the current node/incarnation before calling it.
 mod binding;
-pub use binding::PreparedBinding;
+pub use binding::{PreparedBinding, MAX_BINDING_GRANTS};
 mod policy;
 pub use policy::compile_policy;
 

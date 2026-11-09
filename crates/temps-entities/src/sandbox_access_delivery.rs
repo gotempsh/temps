@@ -21,6 +21,11 @@ pub struct Model {
     pub id: i64,
     pub runtime_id: Uuid,
     pub node_id: Option<i32>,
+    /// Immutable retirement target retained after the runtime row is deleted.
+    pub worker_boot_id: Option<Uuid>,
+    pub provider_identity: Option<String>,
+    pub provider_backend: Option<String>,
+    pub provider_name: Option<String>,
     pub desired_version: i64,
     pub operation: DeliveryOperation,
     pub attempts: i32,

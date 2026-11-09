@@ -7668,9 +7668,49 @@ async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> an
 #[tokio::test]
 async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downgrade(
 ) -> anyhow::Result<()> {
-    use sea_orm::EntityTrait;
+    use sea_orm::{EntityTrait, FromQueryResult, QuerySelect};
     use temps_entities::{
         sandbox_access_delivery as delivery, sandbox_access_runtimes as runtimes,
+    };
+    // Project only this historical migration's columns, independently of
+    // additive fields in the current entities.
+    #[derive(FromQueryResult)]
+    struct Runtime {
+        id: sea_orm::prelude::Uuid,
+        desired_version: i64,
+        applied_version: i64,
+        closed_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+        node_id: Option<i32>,
+    }
+    #[derive(FromQueryResult)]
+    struct Delivery {
+        runtime_id: sea_orm::prelude::Uuid,
+        desired_version: i64,
+        operation: delivery::DeliveryOperation,
+        completed_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    }
+    let runtime_rows = || {
+        runtimes::Entity::find()
+            .select_only()
+            .columns([
+                runtimes::Column::Id,
+                runtimes::Column::DesiredVersion,
+                runtimes::Column::AppliedVersion,
+                runtimes::Column::ClosedAt,
+                runtimes::Column::NodeId,
+            ])
+            .into_model::<Runtime>()
+    };
+    let delivery_rows = || {
+        delivery::Entity::find()
+            .select_only()
+            .columns([
+                delivery::Column::RuntimeId,
+                delivery::Column::DesiredVersion,
+                delivery::Column::Operation,
+                delivery::Column::CompletedAt,
+            ])
+            .into_model::<Delivery>()
     };
     let container = start_pg_container!("sandbox access durable delivery");
     let port = container.get_host_port_ipv4(5432).await?;
@@ -7689,7 +7729,7 @@ async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downg
     db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9301,'Delivery test','repo','owner','/','main','nodejs','delivery-test',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id) VALUES (9301,'sbx_delivery_test','delivery-test',NULL,9301)").await?;
     db.execute_unprepared("INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000101',9301,9301,'container:test-generation')").await?;
     migration.up(&manager).await?; // preserves state, one retirement trigger
-    let runtime = runtimes::Entity::find().one(&db).await?.unwrap();
+    let runtime = runtime_rows().one(&db).await?.unwrap();
     assert_eq!(runtime.desired_version, 0);
     assert_eq!(runtime.applied_version, 0);
     assert!(runtime.closed_at.is_none());
@@ -7713,16 +7753,16 @@ async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downg
     let txn = db.begin().await?;
     txn.execute_unprepared("DELETE FROM sandbox_access_runtimes")
         .await?;
-    assert_eq!(delivery::Entity::find().all(&txn).await?.len(), 1);
+    assert_eq!(delivery_rows().all(&txn).await?.len(), 1);
     txn.rollback().await?;
-    assert!(delivery::Entity::find().all(&db).await?.is_empty());
-    assert!(runtimes::Entity::find().one(&db).await?.is_some());
+    assert!(delivery_rows().all(&db).await?.is_empty());
+    assert!(runtime_rows().one(&db).await?.is_some());
     // Cascade project deletion must leave enough information to cut the old
     // worker binding even though all project and sandbox rows are gone.
     db.execute_unprepared("DELETE FROM projects WHERE id=9301")
         .await?;
-    assert!(runtimes::Entity::find().all(&db).await?.is_empty());
-    let commands = delivery::Entity::find().all(&db).await?;
+    assert!(runtime_rows().all(&db).await?.is_empty());
+    let commands = delivery_rows().all(&db).await?;
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].runtime_id, runtime.id);
     assert_eq!(commands[0].operation, delivery::DeliveryOperation::Retire);
@@ -7750,7 +7790,7 @@ async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downg
     migration.down(&manager).await?;
     assert!(!table_exists(&db, "sandbox_access_delivery").await?);
     migration.up(&manager).await?;
-    assert!(delivery::Entity::find().all(&db).await?.is_empty());
+    assert!(delivery_rows().all(&db).await?.is_empty());
     Ok(())
 }
 
@@ -7802,5 +7842,110 @@ async fn test_sandbox_access_authorities_preserve_registered_keys_on_reapply_and
     assert!(!table_exists(&db, "sandbox_access_authorities").await?);
     migration.up(&manager).await?;
     assert!(table_exists(&db, "sandbox_access_authorities").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sandbox_access_authorization_fences_and_retirement_targets() -> anyhow::Result<()> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("sandbox access authorization fences");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261109_000003_sandbox_access_authorizations";
+    let migrations = Migrator::migrations();
+    let migration = migrations.iter().find(|m| m.name() == target).unwrap();
+    let manager = SchemaManager::new(&db);
+    Migrator::up(&db, Some(migrations.len() as u32 - steps_back_to(target))).await?;
+    migration.down(&manager).await?;
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared(r#"
+INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9501,'Access','repo','owner','/','main','nodejs','access',now(),now());
+INSERT INTO sandboxes (id,public_id,name,project_id) VALUES (9501,'sbx_access_one','one',9501),(9502,'sbx_access_two','two',9501);
+INSERT INTO sandbox_access_authorities (id,sdk_node_id,seal_public_key,snapshot_key_encrypted,session_key_encrypted,ca_certificate,ca_key_encrypted) VALUES ('00000000-0000-4000-8000-000000000401','00000000-0000-4000-8000-000000000402',repeat('a',44),'encrypted-snapshot','encrypted-session','public-ca','encrypted-ca');
+INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name) VALUES ('00000000-0000-4000-8000-000000000403',9501,9501,'immutable-container','00000000-0000-4000-8000-000000000401','docker','sandbox-one');
+INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000404',9501,9502,'legacy');
+INSERT INTO sandbox_access_services (id,project_id,name,policy,max_ttl_seconds) VALUES ('service',9501,'API','{}',60);
+INSERT INTO sandbox_service_grants (id,project_id,service_id,sandbox_id,service_version,policy_snapshot,expires_at) VALUES ('grant',9501,'service',9501,1,'{}',now()+interval '60 seconds');
+"#).await?;
+    migration.up(&manager).await?;
+    assert!(db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT grant_id FROM sandbox_access_authorizations"
+        ))
+        .await?
+        .is_none());
+    // A same-project grant still cannot be associated with another sandbox.
+    assert!(db.execute_unprepared("INSERT INTO sandbox_access_authorizations (grant_id,request_id,requested_ttl,runtime_id,project_id,sandbox_id) VALUES ('grant','00000000-0000-4000-8000-000000000405',60,'00000000-0000-4000-8000-000000000404',9501,9501)").await.is_err());
+    db.execute_unprepared("INSERT INTO sandbox_access_authorizations (grant_id,request_id,requested_ttl,runtime_id,project_id,sandbox_id) VALUES ('grant','00000000-0000-4000-8000-000000000405',60,'00000000-0000-4000-8000-000000000403',9501,9501)").await?;
+    let revision = || async {
+        db.query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT desired_revision FROM sandbox_access_authorities",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "desired_revision")
+        .unwrap()
+    };
+    assert_eq!(revision().await, 1);
+    assert!(db
+        .execute_unprepared("UPDATE sandbox_access_authorizations SET approved_at=now()")
+        .await
+        .is_err());
+    db.execute_unprepared("UPDATE sandbox_access_services SET enabled=false,version=version+1")
+        .await?;
+    assert_eq!(revision().await, 2);
+    db.execute_unprepared("UPDATE sandbox_service_grants SET revoked_at=now(),version=version+1")
+        .await?;
+    assert_eq!(revision().await, 3);
+    assert!(migration
+        .down(&manager)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("live sandbox authorizations"));
+    db.execute_unprepared("DELETE FROM projects WHERE id=9501")
+        .await?;
+    let retirement = db.query_one(Statement::from_string(DatabaseBackend::Postgres, "SELECT worker_boot_id::text AS worker_boot_id,provider_identity,provider_backend,provider_name FROM sandbox_access_delivery WHERE runtime_id='00000000-0000-4000-8000-000000000403'")).await?.unwrap();
+    assert_eq!(
+        retirement.try_get::<String>("", "provider_identity")?,
+        "immutable-container"
+    );
+    assert_eq!(
+        retirement.try_get::<String>("", "provider_backend")?,
+        "docker"
+    );
+    assert_eq!(
+        retirement.try_get::<String>("", "provider_name")?,
+        "sandbox-one"
+    );
+    assert_eq!(
+        retirement.try_get::<String>("", "worker_boot_id")?,
+        "00000000-0000-4000-8000-000000000401"
+    );
+    assert!(revision().await > 3);
+    assert!(migration
+        .down(&manager)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("pending worker retirements"));
+    db.execute_unprepared("UPDATE sandbox_access_delivery SET completed_at=now()")
+        .await?;
+    migration.down(&manager).await?;
+    migration.down(&manager).await?;
+    migration.up(&manager).await?;
+    assert!(db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT grant_id FROM sandbox_access_authorizations"
+        ))
+        .await?
+        .is_none());
     Ok(())
 }

@@ -180,7 +180,7 @@ async fn missing_closed_or_changed_boot_cannot_issue_or_close_another_authority(
             .into_connection(),
     );
     assert!(store
-        .issue(None, &identity, vec![])
+        .issue(None, &identity, 0, vec![])
         .await
         .unwrap_err()
         .to_string()
@@ -218,7 +218,10 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
             .append_query_results([vec![row]])
             .into_connection(),
     );
-    let issued = store.issue(None, &identity, vec![binding]).await.unwrap();
+    let issued = store
+        .issue(None, &identity, 0, vec![binding])
+        .await
+        .unwrap();
     assert_eq!(issued.snapshot_version(), 7);
     assert!(issued.delivery(Uuid::new_v4()).is_err());
     let delivery = issued.delivery(incarnation).unwrap();
@@ -268,7 +271,10 @@ async fn invalid_credential_and_duplicate_incarnation_fail_before_version_reserv
     for value in ["", "line\nbreak", "white space", &"a".repeat(8193)] {
         let mut binding = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
         *binding.credentials.values_mut().next().unwrap() = SecretString::new(value);
-        assert!(store.issue(None, &identity, vec![binding]).await.is_err());
+        assert!(store
+            .issue(None, &identity, 0, vec![binding])
+            .await
+            .is_err());
     }
     let incarnation = Uuid::new_v4();
     let node = Uuid::new_v4();
@@ -276,6 +282,7 @@ async fn invalid_credential_and_duplicate_incarnation_fail_before_version_reserv
         .issue(
             None,
             &identity,
+            0,
             vec![
                 input(node, incarnation, &["https://api.example.com"]),
                 input(node, incarnation, &["https://api.example.com"])
@@ -285,7 +292,10 @@ async fn invalid_credential_and_duplicate_incarnation_fail_before_version_reserv
         .is_err());
     let mut binding = input(node, incarnation, &["https://api.example.com"]);
     binding.credentials = BTreeMap::new();
-    assert!(store.issue(None, &identity, vec![binding]).await.is_err());
+    assert!(store
+        .issue(None, &identity, 0, vec![binding])
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -315,12 +325,24 @@ async fn postgres_registration_races_restart_versions_and_real_worker_binding() 
         authority,
         restarted.register(None, &identity).await.unwrap()
     );
+    db.execute_unprepared(
+        "UPDATE sandbox_access_authorities SET desired_revision=desired_revision+1",
+    )
+    .await
+    .unwrap();
+    assert!(restarted
+        .issue(None, &identity, 0, vec![])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("authorization revision changed"));
     let incarnation = Uuid::new_v4();
     let second_incarnation = Uuid::new_v4();
     let policy = restarted
         .issue(
             None,
             &identity,
+            1,
             vec![
                 input(
                     authority.node_id,
@@ -377,8 +399,8 @@ async fn postgres_registration_races_restart_versions_and_real_worker_binding() 
     second_binding.ready(version).await.unwrap();
     // Concurrent versions never collide, including across control-plane instances.
     let (a, b) = tokio::join!(
-        store.reserve(None, &identity),
-        restarted.reserve(None, &identity)
+        store.reserve(None, &identity, 1),
+        restarted.reserve(None, &identity, 1)
     );
     let a = a.unwrap().snapshot_version;
     let b = b.unwrap().snapshot_version;
@@ -397,7 +419,7 @@ async fn postgres_registration_races_restart_versions_and_real_worker_binding() 
     drop(second_binding);
     store.close(None, &identity).await.unwrap();
     assert!(restarted.register(None, &identity).await.is_err());
-    assert!(restarted.issue(None, &identity, vec![]).await.is_err());
+    assert!(restarted.issue(None, &identity, 0, vec![]).await.is_err());
     // New worker boot has independent authority; old consent is not inherited.
     let next = WorkerControl::new(Arc::new(HostAudit));
     let fresh = restarted.register(None, &next.identity()).await.unwrap();
@@ -426,7 +448,7 @@ async fn issuance_rejects_wrong_node_expiry_duplicates_and_limits() {
     );
     let wrong = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
     assert!(store
-        .issue(None, &identity, vec![wrong])
+        .issue(None, &identity, 0, vec![wrong])
         .await
         .unwrap_err()
         .to_string()
@@ -464,7 +486,7 @@ async fn version_reservation_and_close_database_failures_are_contextual() {
             .into_connection(),
     );
     for error in [
-        store.issue(None, &identity, vec![]).await.unwrap_err(),
+        store.issue(None, &identity, 0, vec![]).await.unwrap_err(),
         store.close(None, &identity).await.unwrap_err(),
     ] {
         assert!(matches!(error, AuthorityError::Database { .. }));

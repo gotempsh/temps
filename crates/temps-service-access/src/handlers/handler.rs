@@ -66,6 +66,10 @@ impl From<AccessError> for Problem {
             AccessError::Conflict { .. } => {
                 (StatusCode::CONFLICT, "Service access version changed")
             }
+            AccessError::Delivery { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Service access delivery could not be queued",
+            ),
             AccessError::Database { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Service access storage failed",

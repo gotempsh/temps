@@ -265,6 +265,7 @@ pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
 pub mod sandbox_access_authorities;
+pub mod sandbox_access_authorizations;
 pub mod sandbox_access_delivery;
 pub mod sandbox_access_runtimes;
 pub mod sandbox_access_services;

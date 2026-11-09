@@ -5,6 +5,13 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AccessError {
+    #[error("Cannot queue service access for sandbox {sandbox_id} in project {project_id}")]
+    Delivery {
+        project_id: i32,
+        sandbox_id: String,
+        #[source]
+        source: Box<crate::delivery::DeliveryError>,
+    },
     #[error("Service access {kind} {id} was not found in project {project_id}")]
     NotFound {
         kind: &'static str,
