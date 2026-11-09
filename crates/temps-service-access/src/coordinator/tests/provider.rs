@@ -23,6 +23,9 @@ pub(crate) struct Provider {
     pub full_policies: AtomicUsize,
     pub policy_references: AtomicUsize,
     pub reject_reference: AtomicBool,
+    pub hold_ack: AtomicBool,
+    pub ack_ready: tokio::sync::Notify,
+    pub release_ack: tokio::sync::Notify,
     extra_targets: Mutex<HashMap<String, ServiceAccessTarget>>,
     extra_bindings: Mutex<HashMap<String, Binding>>,
 }
@@ -37,6 +40,9 @@ impl Provider {
             full_policies: AtomicUsize::new(0),
             policy_references: AtomicUsize::new(0),
             reject_reference: AtomicBool::new(false),
+            hold_ack: AtomicBool::new(false),
+            ack_ready: tokio::sync::Notify::new(),
+            release_ack: tokio::sync::Notify::new(),
             extra_targets: Mutex::new(HashMap::new()),
             extra_bindings: Mutex::new(HashMap::new()),
         })
@@ -155,6 +161,15 @@ impl SandboxProvider for Provider {
                         .lock()
                         .unwrap()
                         .insert(expected.container_id.clone(), (binding, delivery.version));
+                }
+                if self.hold_ack.load(Ordering::SeqCst) {
+                    self.ack_ready.notify_one();
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        self.release_ack.notified(),
+                    )
+                    .await
+                    .unwrap();
                 }
                 Ok(ServiceAccessReply::Applied {
                     target: expected,

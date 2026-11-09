@@ -322,12 +322,8 @@ impl ServiceAccessCoordinator {
         let mut plan = self.planner.prepare(boot_id).await?;
         if !plan.retire.is_empty() {
             for retired in &plan.retire {
-                self.retire_runtime(
-                    retired.id,
-                    Some(retired.desired_version),
-                    "authorization_ended",
-                )
-                .await?;
+                self.retire_runtime(retired.id, retired.desired_version, "authorization_ended")
+                    .await?;
             }
             if plan.retire.iter().any(|row| row.id == command.runtime_id) {
                 self.queue.supersede(claim).await?;
@@ -373,8 +369,10 @@ impl ServiceAccessCoordinator {
     ) -> Result<DispatchOutcome, CoordinatorError> {
         let command = claim.command();
         let target = StoredTarget::from_command(command)?;
-        if let Err(error) = self
-            .transport
+        // Delivery failures do not revoke consent. A retry allocates a fresh
+        // version and rechecks authorization; the signed lease fails closed
+        // meanwhile. Only observed authorization changes can retire a runtime.
+        self.transport
             .apply(
                 &target,
                 batch.issued.snapshot_version(),
@@ -382,17 +380,7 @@ impl ServiceAccessCoordinator {
                     .issued
                     .binding_delivery(command.runtime_id, reference)?,
             )
-            .await
-        {
-            // A reference can be rejected because another dispatcher installed a
-            // newer snapshot. Drop the batch and retry with a fresh version and
-            // full policy; an uncertain ACK must never retire valid consent.
-            if !reference && !matches!(error, TransportError::Busy { .. }) {
-                self.retire_runtime(command.runtime_id, None, "delivery_unconfirmed")
-                    .await?;
-            }
-            return Err(error.into());
-        }
+            .await?;
         let revision = batch.revision;
         let deadline = batch.issued.lease_expires_at();
         let grant_ids = batch.issued.grant_ids(command.runtime_id).to_vec();
@@ -410,7 +398,7 @@ impl ServiceAccessCoordinator {
     async fn retire_runtime(
         &self,
         id: Uuid,
-        expected_version: Option<i64>,
+        expected_version: i64,
         reason: &'static str,
     ) -> Result<(), CoordinatorError> {
         let tx = self
@@ -426,7 +414,7 @@ impl ServiceAccessCoordinator {
         let Some(runtime) = runtime.filter(|row| row.closed_at.is_none()) else {
             return Ok(());
         };
-        if expected_version.is_some_and(|version| version != runtime.desired_version) {
+        if expected_version != runtime.desired_version {
             return Err(DeliveryError::RuntimeChanged {
                 runtime_id: id,
                 version: runtime.desired_version,

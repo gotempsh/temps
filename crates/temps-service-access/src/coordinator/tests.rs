@@ -131,7 +131,7 @@ async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_
 }
 
 #[tokio::test]
-async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incarnations() {
+async fn postgres_coordinator_delivers_approved_scope_and_recovers_unconfirmed_delivery() {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
     {
@@ -302,8 +302,8 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         second.grant_id
     );
 
-    // The worker installs policy but supplies a mismatched ACK. Never mark it
-    // connected: close consent and queue an exact, durable retirement.
+    // A mismatched ACK is not proof that authorization ended. Preserve consent,
+    // leave the receipt unchanged, and recover with a fresh binding version.
     provider.wrong_ack.store(true, Ordering::SeqCst);
     let tx = db.begin().await.unwrap();
     DeliveryQueue::advance(&tx, first.runtime_id, 3, DeliveryOperation::Reconcile)
@@ -319,19 +319,18 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         .await
         .unwrap()
         .unwrap();
-    assert!(row.closed_at.is_some());
+    assert!(row.closed_at.is_none());
     assert_eq!(row.applied_version, 3);
-    assert_eq!(row.desired_version, 5);
+    assert_eq!(row.desired_version, 4);
+    provider.wrong_ack.store(false, Ordering::SeqCst);
     db.execute_unprepared("UPDATE sandbox_access_delivery SET available_at=now()-interval '1 second' WHERE completed_at IS NULL").await.unwrap();
-    let binding = provider.binding.lock().unwrap().as_ref().unwrap().0.clone();
-    assert_eq!(
-        coordinator.dispatch_one().await.unwrap(),
-        Some(DispatchOutcome::Retired)
-    );
-    assert!(binding.ready(1).await.is_err());
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Superseded)
+    );
+    assert_eq!(
+        coordinator.dispatch_one().await.unwrap(),
+        Some(DispatchOutcome::Applied)
     );
     assert_eq!(coordinator.dispatch_one().await.unwrap(), None);
     let row = runtimes::Entity::find_by_id(first.runtime_id)
@@ -339,16 +338,19 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         .await
         .unwrap()
         .unwrap();
-    assert!(row.lease_expires_at.is_none());
+    assert!(row.closed_at.is_none());
+    assert!(row.lease_expires_at.is_some());
     assert_eq!(row.applied_version, 5);
-    assert!(coordinator
+    let policy = coordinator
         .planner
         .prepare(provider.worker.identity().boot_id)
         .await
-        .unwrap()
-        .bindings
-        .is_empty());
-    drop(binding);
+        .unwrap();
+    assert_eq!(policy.bindings.len(), 1);
+    assert_eq!(
+        policy.bindings[0].plan.grants()[0].grant_id(),
+        second.grant_id
+    );
     drop(coordinator);
     drop(provider);
     drop(db);
@@ -613,3 +615,5 @@ async fn late_extension_checker_revokes_background_policy_permissions() {
 }
 
 mod batches;
+
+mod failure_recovery;
