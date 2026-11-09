@@ -159,6 +159,7 @@ struct Fixture {
     handle: SandboxHandle,
     _docker: FakeDocker,
     _root: tempfile::TempDir,
+    info: bollard::models::ContainerInspectResponse,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -184,7 +185,7 @@ impl Fixture {
             Method::GET,
             "/containers/owned-container/json",
             200,
-            serde_json::to_value(info).unwrap(),
+            serde_json::to_value(&info).unwrap(),
         );
         Self {
             provider,
@@ -199,6 +200,7 @@ impl Fixture {
             },
             _docker: docker,
             _root: root,
+            info,
         }
     }
     async fn inspect(&self) -> (ServiceAccessTarget, WorkerIdentity, bool, Option<u64>) {
@@ -327,12 +329,47 @@ async fn worker_command_applies_only_current_identity_and_retires_before_receipt
 }
 
 #[tokio::test]
-async fn abandoned_delivery_revokes_binding_and_forces_fresh_incarnation() {
+async fn unpublished_binding_is_revoked_when_delivery_is_abandoned() {
     let f = Fixture::new().await;
     let (target, worker, _, _) = f.inspect().await;
-    f.apply(&target, deliveries(&worker, &target.incarnation).await.0)
+    let (delivery, _) = deliveries(&worker, &target.incarnation).await;
+    let mounts = f.provider.service_access.as_ref().unwrap();
+    mounts.control.configure(delivery.authority).await.unwrap();
+    let version = mounts
+        .control
+        .install(worker.boot_id, &delivery.policy.into_snapshot().unwrap())
         .await
         .unwrap();
+    let binding = mounts
+        .control
+        .bind(
+            worker.boot_id,
+            SessionDelivery::binding_spec(target.incarnation, delivery.session, delivery.version),
+            version,
+        )
+        .await
+        .unwrap();
+    let guard = DeliveryGuard(Some(Arc::clone(&binding)));
+    drop(guard);
+    assert!(binding.status().revoked);
+    assert!(!f.inspect().await.2);
+}
+
+#[tokio::test]
+async fn failed_final_inspect_preserves_binding_and_allows_a_fresh_version() {
+    interrupted_renewal(false).await;
+}
+
+#[tokio::test]
+async fn cancelled_renewal_preserves_binding_and_allows_a_fresh_version() {
+    interrupted_renewal(true).await;
+}
+
+async fn interrupted_renewal(cancel: bool) {
+    let f = Fixture::new().await;
+    let (target, worker, _, _) = f.inspect().await;
+    let (first, second) = deliveries(&worker, &target.incarnation).await;
+    f.apply(&target, first).await.unwrap();
     let mounts = f.provider.service_access.as_ref().unwrap();
     let binding = mounts
         .entries()
@@ -343,28 +380,90 @@ async fn abandoned_delivery_revokes_binding_and_forces_fresh_incarnation() {
         .unwrap()
         .0
         .clone();
-    let guard = DeliveryGuard(Some(binding.clone()));
-    drop(guard);
-    assert!(binding.status().revoked);
-    let (fresh, _, connected, version) = f.inspect().await;
-    assert_ne!(fresh.incarnation, target.incarnation);
-    assert!(!connected);
-    assert_eq!(version, None);
+    // Enter after the initial container check so the injected error is the
+    // final inspect, after the signed session update has reached the binding.
+    f._docker.respond(
+        Method::GET,
+        "/containers/owned-container/json",
+        500,
+        json!({"message": "temporary Docker inspect failure"}),
+    );
+    {
+        let calls_before = f._docker.calls().len();
+        let mut delivery = Box::pin(f.provider.apply_service_access(
+            mounts,
+            &f.handle,
+            target.clone(),
+            second.clone(),
+        ));
+        if cancel {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| {
+                    use std::future::Future;
+                    if f._docker.calls().len() > calls_before {
+                        return std::task::Poll::Ready(());
+                    }
+                    assert!(
+                        delivery.as_mut().poll(cx).is_pending(),
+                        "must cancel before the final inspect completes"
+                    );
+                    std::task::Poll::Pending
+                }),
+            )
+            .await
+            .unwrap();
+            // Dropping the in-flight future models the transport timeout.
+        } else {
+            assert!(delivery.await.is_err());
+        }
+    }
+    assert!(!binding.status().revoked);
+    f._docker.respond(
+        Method::GET,
+        "/containers/owned-container/json",
+        200,
+        serde_json::to_value(&f.info).unwrap(),
+    );
+    let (current, _, connected, version) = f.inspect().await;
+    assert_eq!(current, target);
+    assert!(connected);
+    assert_eq!(version, Some(1), "unconfirmed delivery is not a receipt");
+    assert!(
+        f.apply(&target, second.clone()).await.is_err(),
+        "cannot replay the installed binding version"
+    );
+    let mut retry = second;
+    retry.version = 3;
+    assert!(matches!(
+        f.apply(&target, retry).await.unwrap(),
+        ServiceAccessReply::Applied {
+            binding_version: 3,
+            ..
+        }
+    ));
+    let (current, _, connected, version) = f.inspect().await;
+    assert_eq!(current, target);
+    assert!(connected);
+    assert_eq!(version, Some(3));
 }
 
 #[tokio::test]
-async fn invalid_session_update_closes_previously_active_binding() {
+async fn invalid_session_update_cannot_destroy_previously_authorized_binding() {
     let f = Fixture::new().await;
     let (target, worker, _, _) = f.inspect().await;
     let (first, mut second) = deliveries(&worker, &target.incarnation).await;
     f.apply(&target, first).await.unwrap();
-    second.session = "invalid-session-sentinel".into();
-    let error = f.apply(&target, second).await.unwrap_err().to_string();
+    let mut invalid = second.clone();
+    invalid.session = "invalid-session-sentinel".into();
+    let error = f.apply(&target, invalid).await.unwrap_err().to_string();
     assert!(!error.contains("invalid-session-sentinel"));
     let (current, _, connected, version) = f.inspect().await;
-    assert_ne!(current, target);
-    assert!(!connected);
-    assert_eq!(version, None);
+    assert_eq!(current, target);
+    assert!(connected);
+    assert_eq!(version, Some(1));
+    second.version = 3;
+    assert!(f.apply(&target, second).await.is_ok());
 }
 
 #[tokio::test]

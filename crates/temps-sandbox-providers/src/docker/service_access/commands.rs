@@ -5,9 +5,10 @@ use super::*;
 use crate::service_access::{ServiceAccessCommand, ServiceAccessReply};
 use temps_service_access_runtime::SessionDelivery;
 
-/// A timeout or cancellation during delivery must not leave an unacknowledged
-/// binding serving requests. Revocation is synchronous; recovery needs a fresh
-/// incarnation rather than silently reusing the interrupted authorization.
+/// An unpublished new binding must be cut if delivery is cancelled. Existing
+/// bindings retain their signed authorization on renewal failure: revoking one
+/// would permanently poison the incarnation and prevent version-fenced retries.
+/// Their session deadlines and the shared policy lease continue to fail closed.
 struct DeliveryGuard(Option<Arc<SandboxBinding>>);
 impl Drop for DeliveryGuard {
     fn drop(&mut self) {
@@ -136,7 +137,8 @@ impl DockerSandboxProvider {
             .install_with_certificate(boot, &snapshot)
             .await
             .map_err(|_| rejected("install policy"))?;
-        let mut guard = DeliveryGuard(previous.as_ref().map(|(binding, _)| Arc::clone(binding)));
+        let creating = previous.is_none();
+        let mut guard = DeliveryGuard(None);
         let binding = match previous {
             Some((binding, _)) => {
                 mounts
@@ -164,7 +166,9 @@ impl DockerSandboxProvider {
                 .await
                 .map_err(|_| rejected("create binding"))?,
         };
-        guard.0 = Some(Arc::clone(&binding));
+        if creating {
+            guard.0 = Some(Arc::clone(&binding));
+        }
         // Re-inspect after asynchronous policy preparation. Do not publish a
         // successful receipt for a container stopped or replaced in the meantime.
         let result = async {
