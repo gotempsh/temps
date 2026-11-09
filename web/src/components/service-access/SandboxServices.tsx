@@ -36,6 +36,7 @@ import {
   type SandboxServiceResponse,
 } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   approvalExpirySchema,
   serviceAccessLabel,
@@ -52,6 +53,8 @@ export function SandboxServices({
   const client = useQueryClient()
   const [page, setPage] = useState(1)
   const [servicePage, setServicePage] = useState(1)
+  const [revokeTarget, setRevokeTarget] =
+    useState<SandboxServiceResponse | null>(null)
   const approvalForm = useForm<z.infer<typeof approvalExpirySchema>>({
     resolver: zodResolver(approvalExpirySchema),
     defaultValues: { deadline: '' },
@@ -120,7 +123,10 @@ export function SandboxServices({
         body: { expected_version: row.version },
         throwOnError: true,
       }),
-    onSuccess: refresh,
+    onSuccess: () => {
+      setRevokeTarget(null)
+      return refresh()
+    },
   })
   const error =
     access.error ??
@@ -132,6 +138,7 @@ export function SandboxServices({
     <div className="space-y-4">
       {capability.isPending && (
         <Skeleton
+          role="status"
           className="h-20 w-full"
           aria-label="Checking service access support"
         />
@@ -335,7 +342,10 @@ export function SandboxServices({
                     variant="outline"
                     aria-disabled={revoke.isPending}
                     onClick={() => {
-                      if (!revoke.isPending) revoke.mutate(row)
+                      if (!revoke.isPending) {
+                        revoke.reset()
+                        setRevokeTarget(row)
+                      }
                     }}
                   >
                     Revoke
@@ -351,6 +361,36 @@ export function SandboxServices({
           total: access.data?.total ?? 0,
           totalPages: Math.max(1, Math.ceil((access.data?.total ?? 0) / 20)),
           onPageChange: setPage,
+        }}
+      />
+      <ConfirmDeleteDialog
+        open={revokeTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !revoke.isPending) setRevokeTarget(null)
+        }}
+        resourceType="service access"
+        resourceName={revokeTarget?.service_name ?? ''}
+        verb="Revoke"
+        irreversible={false}
+        isPending={revoke.isPending}
+        consequences={
+          <>
+            <p>
+              Remove this service approval from sandbox {sandboxId}. Active work
+              using it may be interrupted. Access can be approved again later.
+            </p>
+            {revoke.isError && (
+              <p role="alert">
+                {problemDetail(
+                  revoke.error,
+                  'Could not revoke access. Retry or cancel.'
+                )}
+              </p>
+            )}
+          </>
+        }
+        onConfirm={() => {
+          if (revokeTarget && !revoke.isPending) revoke.mutate(revokeTarget)
         }}
       />
     </div>

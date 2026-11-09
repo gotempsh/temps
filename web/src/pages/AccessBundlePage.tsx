@@ -105,7 +105,11 @@ function BundlePage({
           )}
           {!snapshot || capability.isPending ? (
             !error && (
-              <Skeleton className="h-64" aria-label="Loading access bundle" />
+              <Skeleton
+                role="status"
+                className="h-64"
+                aria-label="Loading access bundle"
+              />
             )
           ) : (
             <>

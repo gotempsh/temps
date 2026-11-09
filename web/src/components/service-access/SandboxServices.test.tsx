@@ -125,6 +125,27 @@ test('sandbox lifetime approval and revocation use exact versions without claimi
         within(view.container).getByRole('button', { name: 'Revoke' })
       )
     })
+    const dialog = within(document.body).getByRole('alertdialog')
+    expect(dialog.textContent).toContain('Example API')
+    expect(dialog.textContent).toContain('sbx_test')
+    expect(revocation).toBeUndefined()
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    })
+    expect(revocation).toBeUndefined()
+    await act(async () => {
+      fireEvent.click(
+        within(view.container).getByRole('button', { name: 'Revoke' })
+      )
+    })
+    await act(async () => {
+      fireEvent.click(
+        within(within(document.body).getByRole('alertdialog')).getByRole(
+          'button',
+          { name: 'Revoke' }
+        )
+      )
+    })
     await waitFor(() =>
       expect(within(view.container).getByText('Revoked')).toBeTruthy()
     )

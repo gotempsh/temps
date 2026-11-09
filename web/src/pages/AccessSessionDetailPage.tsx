@@ -8,7 +8,6 @@ import {
   Callout,
   DataTable,
   Detail,
-  EchoDialog,
   PageContainer,
   Status,
 } from '@temps-sdk/ds'
@@ -22,6 +21,7 @@ import { useSessionClock } from '@/components/service-access/session-navigation'
 import { SessionStatus } from '@/components/service-access/AccessSessionsList'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 export default function AccessSessionDetailPage() {
   const { projectId = '', vaultId = '', sessionId = '' } = useParams()
@@ -133,7 +133,10 @@ function SessionDetail({
                       capability.isError ||
                       query.isError
                     }
-                    onClick={() => setConfirming(true)}
+                    onClick={() => {
+                      revoke.reset()
+                      setConfirming(true)
+                    }}
                   >
                     Revoke session
                   </Button>
@@ -262,20 +265,40 @@ function SessionDetail({
               }
             />
           )}
-          <EchoDialog
+          <ConfirmDeleteDialog
             open={confirming}
             onOpenChange={(next) => {
               if (!revoke.isPending) setConfirming(next)
             }}
-            title="Revoke session"
-            description="Remove every service authorization in this session. Other sessions keep their own access and deadlines."
-            phrase={session?.bundle_name ?? 'session'}
+            resourceType="session"
+            resourceName={session?.bundle_name ?? sessionId}
+            verb="Revoke"
+            requireTypedName
+            consequences={
+              <>
+                <p>
+                  Remove every service authorization in session {sessionId} for
+                  sandbox {session?.consumer.sandbox_id}. Other sessions keep
+                  their own access and deadlines.
+                </p>
+                {revoke.isError && (
+                  <p role="alert">
+                    {problemDetail(
+                      revoke.error,
+                      'Could not revoke session. Retry or cancel.'
+                    )}
+                  </p>
+                )}
+              </>
+            }
             confirmLabel="Revoke session"
-            busy={revoke.isPending}
+            isPending={revoke.isPending}
             onConfirm={() => {
               if (
                 issued &&
                 capability.data?.can_manage_requests &&
+                !capability.isError &&
+                !query.isError &&
                 !revoke.isPending
               )
                 revoke.mutate()

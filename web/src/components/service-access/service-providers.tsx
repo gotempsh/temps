@@ -26,7 +26,11 @@ export function ServiceLogoStrip({
 }) {
   return (
     <div className="space-y-2">
-      <div className="flex items-center gap-2" aria-label="Services">
+      <div
+        role="group"
+        className="flex items-center gap-2"
+        aria-label="Services"
+      >
         {services.slice(0, 4).map((s) => (
           <span
             key={s.id}

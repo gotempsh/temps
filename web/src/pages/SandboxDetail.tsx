@@ -1089,6 +1089,7 @@ export default function SandboxDetail() {
                     )}
                     {(jobsState.isLoading || eventsState.isLoading) && (
                       <Skeleton
+                        role="status"
                         aria-label="Loading activity"
                         className="h-32 w-full"
                       />
