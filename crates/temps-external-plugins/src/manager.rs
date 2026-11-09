@@ -449,6 +449,10 @@ impl ExternalPluginManager {
     /// Paths a plugin must never be able to open: this process's environment
     /// and memory, and the installation's secret files. The launcher adds
     /// whatever its host keeps besides.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: the secret-file path variables are read only to deny plugins access to those files, never to decide runtime behaviour"
+    )]
     fn protected_paths(&self) -> Vec<PathBuf> {
         let pid = std::process::id();
         let mut paths = vec![
