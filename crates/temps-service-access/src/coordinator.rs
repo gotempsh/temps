@@ -4,6 +4,7 @@
 //! Control-plane orchestration for explicit operator approvals.
 //! No queued intention is reported as connected; only exact worker ACKs write
 //! an applied version and the original signed policy lease deadline.
+mod assignments;
 mod batches;
 
 use crate::{
@@ -220,30 +221,34 @@ impl ServiceAccessCoordinator {
     pub(crate) async fn maintain_assignments(&self) -> Result<usize, CoordinatorError> {
         let assignments = self.service.due_assignments().await?;
         let count = assignments.processed;
+        let mut groups = std::collections::BTreeMap::new();
         for assignment in assignments.assignments {
+            groups
+                .entry((assignment.project_id, assignment.sandbox_id))
+                .or_insert_with(Vec::new)
+                .push(assignment);
+        }
+        assignments::run_pairs(groups.into_values().collect(), |group| async move {
+            let Some(first) = group.first() else { return; };
             let result = async {
-                let Some(sandbox) = self.service.assignment_sandbox(&assignment).await? else {
+                let Some(sandbox) = self.service.assignment_sandbox(first).await? else {
                     return Ok::<_, CoordinatorError>(());
                 };
                 let observed = self.transport.inspect(&sandbox).await?;
-                self.authority
-                    .register(observed.node_id, &observed.worker)
-                    .await?;
-                self.service
-                    .renew_assignment(
-                        &assignment.id,
-                        assignment.project_id,
-                        assignment.sandbox_id,
-                        observed,
-                    )
-                    .await?;
+                self.authority.register(observed.node_id, &observed.worker).await?;
+                for assignment in &group {
+                    if let Err(error) = self.service.renew_assignment(
+                        &assignment.id, assignment.project_id, assignment.sandbox_id, observed.clone(),
+                    ).await {
+                        tracing::warn!(assignment_id=%assignment.id, %error, "Service access renewal unavailable");
+                    }
+                }
                 Ok(())
-            }
-            .await;
+            }.await;
             if let Err(error) = result {
-                tracing::warn!(assignment_id=%assignment.id, %error, "Service access renewal unavailable; existing short leases fail closed");
+                tracing::warn!(sandbox_id=first.sandbox_id, %error, "Service access renewal unavailable; existing short leases fail closed");
             }
-        }
+        }).await;
         Ok(count)
     }
 

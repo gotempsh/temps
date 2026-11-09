@@ -7089,3 +7089,22 @@ async fn plugin_write_waits_for_approval_then_executes_and_audits() {
     assert_eq!(event["user_id"], auth.user_id());
     assert_eq!(event["succeeded"], true);
 }
+
+#[test]
+fn sandbox_access_approval_requires_a_human_in_writes_and_plans() {
+    for kind in [PermissionKind::ToolApproval, PermissionKind::PlanApproval] {
+        let approval = serde_json::json!({"operation":"approve_sandbox_service","method":"POST","carries_handle":false});
+        let input = if kind == PermissionKind::PlanApproval {
+            serde_json::json!({"steps":[{"operation":"request_sandbox_service","method":"POST"},approval]})
+        } else {
+            approval
+        };
+        let request = PermissionRequest {
+            id: "approval".into(),
+            kind,
+            tool_name: TEMPS_WRITE_TOOL_NAME.into(),
+            input: redact_value(&input),
+        };
+        assert!(automatic_platform_decision(&request).is_none());
+    }
+}
