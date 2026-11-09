@@ -15,6 +15,7 @@ use temps_authz::{
 };
 use temps_entities::users;
 use tower::ServiceExt;
+mod session_success;
 #[derive(Default)]
 struct Audit(Mutex<Vec<String>>);
 #[async_trait::async_trait]
