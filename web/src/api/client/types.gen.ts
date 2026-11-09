@@ -2720,6 +2720,17 @@ export type ApplyRequest = {
     plan_id: string;
 };
 
+/**
+ * Explicit operator approval, separate from a saved request. Reuse request_id
+ * only when retrying this exact approval; it never extends an existing grant.
+ */
+export type ApproveServiceGrant = {
+    request_id: string;
+    service_id: string;
+    service_version: number;
+    ttl_seconds: number;
+};
+
 export type ArchiveFlagResponse = {
     archived_at?: string | null;
     key: string;
@@ -30108,6 +30119,15 @@ export type ServiceDownAlertResponse = {
      * that time is still in the future.
      */
     silenced_until?: string | null;
+};
+
+/**
+ * Durable approval receipt. HTTP 202 does not mean the worker is connected.
+ */
+export type ServiceGrantApproval = {
+    expires_at: string;
+    grant_id: string;
+    sandbox_id: string;
 };
 
 export type ServiceGrantList = {
@@ -82229,6 +82249,62 @@ export type RequestServiceGrantResponses = {
 };
 
 export type RequestServiceGrantResponse = RequestServiceGrantResponses[keyof RequestServiceGrantResponses];
+
+export type ApproveServiceGrantData = {
+    body: ApproveServiceGrant;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Sandbox ID
+         */
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve';
+};
+
+export type ApproveServiceGrantErrors = {
+    /**
+     * Invalid consent
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy or sandbox changed
+     */
+    409: unknown;
+    /**
+     * Approval storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type ApproveServiceGrantResponses = {
+    /**
+     * Fresh approval persisted; worker enforcement is asynchronous
+     */
+    202: ServiceGrantApproval;
+};
+
+export type ApproveServiceGrantResponse = ApproveServiceGrantResponses[keyof ApproveServiceGrantResponses];
 
 export type RevokeServiceGrantData = {
     body: RevokeServiceGrant;

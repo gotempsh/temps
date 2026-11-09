@@ -91,6 +91,7 @@ impl TempsPlugin for ServiceAccessPlugin {
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
         let app_state = Arc::new(AccessAppState {
+            coordinator: context.require_service::<ServiceAccessCoordinator>(),
             service,
             audit_service,
             project_access_checker,
@@ -114,6 +115,11 @@ mod tests {
             .openapi_schema()
             .expect("service-access plugin must expose an OpenAPI schema");
         for (path, method, operation_id) in [
+            (
+                "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve",
+                "POST",
+                "approve_service_grant",
+            ),
             (
                 "/projects/{project_id}/access-services/{service_id}",
                 "GET",

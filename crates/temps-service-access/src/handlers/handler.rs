@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::{audit::AccessAudit, AccessAppState};
+use super::{approval::approve_service_grant, audit::AccessAudit, AccessAppState};
 use crate::{
     broker::{AccessCapability, AccessCapabilityState},
     error::AccessError,
@@ -25,13 +25,17 @@ use temps_core::{
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
-#[openapi(paths(access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
-    components(schemas(AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
+#[openapi(paths(super::approval::approve_service_grant, access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
+    components(schemas(ApproveServiceGrant, ServiceGrantApproval, AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
     tags((name="Sandbox service access", description="Saved service policies and time-limited access requests; runtime integration is not installed")))]
 pub struct ServiceAccessApiDoc;
 
 pub fn configure_routes() -> Router<Arc<AccessAppState>> {
     Router::new()
+        .route(
+            "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve",
+            post(approve_service_grant),
+        )
         .route(
             "/projects/{project_id}/service-access/capability",
             get(access_capability),
@@ -97,7 +101,7 @@ impl From<AccessError> for Problem {
     }
 }
 
-async fn audit(
+pub(super) async fn audit(
     state: &AccessAppState,
     auth: &temps_authz::AuthContext,
     metadata: RequestMetadata,

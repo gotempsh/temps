@@ -72,6 +72,27 @@ pub struct RequestServiceGrant {
     pub ttl_seconds: i32,
 }
 
+/// Explicit operator approval, separate from a saved request. Reuse request_id
+/// only when retrying this exact approval; it never extends an existing grant.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveServiceGrant {
+    #[schema(value_type = String, format = "uuid")]
+    pub request_id: uuid::Uuid,
+    pub service_id: String,
+    pub service_version: i32,
+    pub ttl_seconds: i32,
+}
+
+/// Durable approval receipt. HTTP 202 does not mean the worker is connected.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ServiceGrantApproval {
+    pub grant_id: String,
+    pub sandbox_id: String,
+    #[schema(value_type = String, format = DateTime)]
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeServiceGrant {

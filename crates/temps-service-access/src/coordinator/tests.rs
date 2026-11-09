@@ -9,7 +9,7 @@ use crate::{
 use sea_orm::{ConnectionTrait, DatabaseBackend, MockDatabase};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use temps_core::{secret_string::SecretString, NoopAuditLogger};
-mod provider;
+pub(crate) mod provider;
 use provider::Provider;
 
 fn coordinator(db: Arc<DatabaseConnection>, provider: Arc<Provider>) -> ServiceAccessCoordinator {

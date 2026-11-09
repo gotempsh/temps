@@ -66,12 +66,28 @@ fn test_metadata() -> RequestMetadata {
 }
 
 fn state(db: MockDatabase, audit: Arc<Audit>) -> Arc<AccessAppState> {
-    Arc::new(AccessAppState {
-        service: Arc::new(ServiceAccessService::new(
-            Arc::new(db.into_connection()),
-            Arc::new(temps_core::EncryptionService::new(&"ab".repeat(32)).unwrap()),
-            Arc::new(UnavailableTokenlessBroker),
+    state_with_db(Arc::new(db.into_connection()), audit)
+}
+fn state_with_db(db: Arc<sea_orm::DatabaseConnection>, audit: Arc<Audit>) -> Arc<AccessAppState> {
+    let encryption = Arc::new(temps_core::EncryptionService::new(&"ab".repeat(32)).unwrap());
+    let service = Arc::new(ServiceAccessService::new(
+        db.clone(),
+        encryption.clone(),
+        Arc::new(UnavailableTokenlessBroker),
+    ));
+    let coordinator = Arc::new(crate::coordinator::ServiceAccessCoordinator::new(
+        db,
+        encryption,
+        audit.clone(),
+        service.clone(),
+        Arc::new(crate::transport::WorkerTransport::new(
+            crate::coordinator::tests::provider::Provider::new(),
         )),
+        None,
+    ));
+    Arc::new(AccessAppState {
+        coordinator,
+        service,
         audit_service: audit,
         project_access_checker: None,
     })
@@ -102,6 +118,11 @@ fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
             r#"{"expected_version":1}"#,
         ),
         ("GET", "/projects/7/access-services/svc_test", ""),
+        (
+            "POST",
+            "/projects/7/sandboxes/sbx_test/service-grants/approve",
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","service_id":"svc_test","service_version":1,"ttl_seconds":900}"#,
+        ),
     ]
 }
 async fn send(
@@ -637,4 +658,252 @@ async fn capability_reports_effective_write_permissions() {
     )))
     .unwrap_err();
     assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn assistant_cannot_approve_access_even_with_admin_permissions() {
+    let audit = Arc::new(Audit::default());
+    let response = configure_routes()
+        .with_state(state(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            audit.clone(),
+        ))
+        .layer(Extension(test_metadata()))
+        .layer(Extension(AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "key".into(),
+            1,
+        )))
+        .layer(Extension(temps_core::ai_tool_call::AiToolCall))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/7/sandboxes/sbx_test/service-grants/approve")
+                .header("content-type", "application/json")
+                .body(Body::from(routes().last().unwrap().2))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body = to_bytes(response.into_body(), 8192).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem["error_code"], "HUMAN_CALLER_REQUIRED");
+    assert!(audit.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn approval_rejects_invalid_consent_before_contacting_a_worker() {
+    let response = send(
+        "POST", "/projects/7/sandboxes/sbx_test/service-grants/approve",
+        r#"{"request_id":"00000000-0000-0000-0000-000000000000","service_id":"svc_test","service_version":1,"ttl_seconds":900}"#,
+        Some(AuthContext::new_api_key(test_user(), Some(Role::Admin), None, "key".into(), 1)),
+        state(MockDatabase::new(DatabaseBackend::Postgres), Arc::new(Audit::default())),
+    ).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 8192).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(problem["detail"]
+        .as_str()
+        .unwrap()
+        .contains("non-nil request ID"));
+}
+
+#[tokio::test]
+async fn coordinator_problem_mapping_preserves_context_and_redacts_driver_sources() {
+    use crate::{
+        coordinator::CoordinatorError, delivery::DeliveryError, transport::TransportError,
+    };
+    for (error, expected) in [
+        (
+            CoordinatorError::Database {
+                sandbox_id: "sbx_test".into(),
+                operation: "approve",
+                source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            CoordinatorError::Delivery(DeliveryError::Database {
+                subject: "sbx_test".into(),
+                operation: "queue approval",
+                source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
+            }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            CoordinatorError::Invalid {
+                sandbox_id: "sbx_test".into(),
+                operation: "approve",
+                reason: "sandbox changed",
+            },
+            StatusCode::CONFLICT,
+        ),
+        (
+            CoordinatorError::Transport(TransportError::Timeout {
+                sandbox_id: "sbx_test".into(),
+                operation: "inspect",
+                seconds: 10,
+            }),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            CoordinatorError::Access(AccessError::NotFound {
+                kind: "sandbox",
+                id: "sbx_test".into(),
+                project_id: 7,
+            }),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let problem: Problem = error.into();
+        assert_eq!(problem.status_code, expected);
+        let body = String::from_utf8(
+            to_bytes(problem.into_response().into_body(), 8192)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("sbx_test"));
+        assert!(!body.contains("secret-driver-payload"));
+    }
+}
+
+#[tokio::test]
+async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
+    use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait};
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping sandbox approval API: Docker unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO users (id,name,email) VALUES (9801,'Test user','user@example.com'); INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9801,'Approval','repo','owner','/','main','nodejs','approval',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9801,'sbx_dispatch','approval',9801,9801,'running','docker')").await.unwrap();
+    let audit = Arc::new(Audit::default());
+    let state = state_with_db(db.clone(), audit.clone());
+    let service = state
+        .service
+        .save_service(
+            9801,
+            None,
+            SaveAccessService {
+                name: "API".into(),
+                policy: SandboxAccessPolicy {
+                    origin: "https://api.example.com".into(),
+                    path_prefixes: vec!["/user".into()],
+                    methods: vec![AccessMethod::Get],
+                },
+                max_ttl_seconds: 900,
+                enabled: true,
+                credential: Some(temps_core::secret_string::SecretString::new(
+                    "fixture-credential",
+                )),
+                clear_credential: false,
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    let body = serde_json::json!({"request_id": uuid::Uuid::new_v4(), "service_id": service.id, "service_version": 1, "ttl_seconds": 900}).to_string();
+    let path = "/projects/9801/sandboxes/sbx_dispatch/service-grants/approve";
+    let actor = || {
+        let mut user = test_user();
+        user.id = 9801;
+        AuthContext::new_api_key(
+            user,
+            None,
+            Some(vec![Permission::ProjectsWrite, Permission::SandboxesWrite]),
+            "key".into(),
+            1,
+        )
+    };
+    let mut receipt = None;
+    for _ in 0..2 {
+        let response = send("POST", path, &body, Some(actor()), state.clone()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("fixture-credential"));
+        let received: ServiceGrantApproval = serde_json::from_slice(&raw).unwrap();
+        if let Some((id, expiry)) = &receipt {
+            assert_eq!(&received.grant_id, id);
+            assert_eq!(&received.expires_at, expiry);
+        } else {
+            receipt = Some((received.grant_id, received.expires_at));
+        }
+    }
+    assert_eq!(
+        temps_entities::sandbox_service_grants::Entity::find()
+            .count(db.as_ref())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        temps_entities::sandbox_access_authorizations::Entity::find()
+            .count(db.as_ref())
+            .await
+            .unwrap(),
+        1
+    );
+    let runtime = temps_entities::sandbox_access_runtimes::Entity::find()
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.applied_version, 0,
+        "an accepted approval is not an enforcement receipt"
+    );
+    assert!(runtime.lease_expires_at.is_none());
+    assert_eq!(
+        state.coordinator.dispatch_one().await.unwrap(),
+        Some(crate::coordinator::DispatchOutcome::Applied)
+    );
+    // Neither another project nor another owner can use this sandbox.
+    for (path, auth) in [
+        (
+            "/projects/9802/sandboxes/sbx_dispatch/service-grants/approve",
+            actor(),
+        ),
+        (
+            path,
+            AuthContext::new_api_key(
+                test_user(),
+                None,
+                Some(vec![Permission::ProjectsWrite, Permission::SandboxesWrite]),
+                "other-key".into(),
+                2,
+            ),
+        ),
+    ] {
+        assert_eq!(
+            send("POST", path, &body, Some(auth), state.clone())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    {
+        let events = audit.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.contains("SANDBOX_SERVICE_GRANT_APPROVED"))
+                .count(),
+            2
+        );
+        assert!(events.iter().all(|e| !e.contains("fixture-credential")));
+    }
+    test.cleanup().await;
 }

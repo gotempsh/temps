@@ -21,6 +21,10 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
+        "live sandbox service grants require direct operator consent; assistants cannot approve their own access",
+        &["approve_service_grant"],
+    ),
+    (
         "pre-integration service access is console/API-only; credentials and fresh grant consent are managed directly until runtime enforcement is available",
         &[
             "access_capability",

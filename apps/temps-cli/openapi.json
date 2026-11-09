@@ -5615,6 +5615,34 @@
         ],
         "type": "object"
       },
+      "ApproveServiceGrant": {
+        "additionalProperties": false,
+        "description": "Explicit operator approval, separate from a saved request. Reuse request_id\nonly when retrying this exact approval; it never extends an existing grant.",
+        "properties": {
+          "request_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "ttl_seconds": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_id",
+          "service_id",
+          "service_version",
+          "ttl_seconds"
+        ],
+        "type": "object"
+      },
       "ArchiveFlagResponse": {
         "properties": {
           "archived_at": {
@@ -63584,6 +63612,27 @@
         "required": [
           "alert_severity",
           "notification_setup_path"
+        ],
+        "type": "object"
+      },
+      "ServiceGrantApproval": {
+        "description": "Durable approval receipt. HTTP 202 does not mean the worker is connected.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "grant_id": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "sandbox_id",
+          "expires_at"
         ],
         "type": "object"
       },
@@ -154256,6 +154305,83 @@
         ]
       }
     },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve": {
+      "post": {
+        "operationId": "approve_service_grant",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sandbox ID",
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveServiceGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceGrantApproval"
+                }
+              }
+            },
+            "description": "Fresh approval persisted; worker enforcement is asynchronous"
+          },
+          "400": {
+            "description": "Invalid consent"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy or sandbox changed"
+          },
+          "500": {
+            "description": "Approval storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      }
+    },
     "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke": {
       "post": {
         "operationId": "revoke_service_grant",
@@ -170961,10 +171087,6 @@
       "name": "Feature Flags"
     },
     {
-      "description": "Saved service policies and time-limited access requests; runtime integration is not installed",
-      "name": "Sandbox service access"
-    },
-    {
       "description": "Ingress connectors: tunnels into the cluster (ADR 058)",
       "name": "Ingress"
     },
@@ -171083,6 +171205,10 @@
     {
       "description": "Sandbox snapshot API (ADR-037): create, list, get, and delete snapshots.",
       "name": "Snapshots"
+    },
+    {
+      "description": "Saved service policies and time-limited access requests; runtime integration is not installed",
+      "name": "Sandbox service access"
     },
     {
       "description": "Log search, context, live tail, and retention management",

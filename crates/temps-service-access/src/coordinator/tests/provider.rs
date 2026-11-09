@@ -12,7 +12,7 @@ use temps_sandbox_providers::{
 };
 use temps_service_access_runtime::{HostAudit, SandboxBinding, SessionDelivery, WorkerControl};
 
-pub(super) struct Provider {
+pub(crate) struct Provider {
     pub worker: WorkerControl,
     pub incarnation: Uuid,
     pub binding: Mutex<Option<(Arc<SandboxBinding>, u64)>>,

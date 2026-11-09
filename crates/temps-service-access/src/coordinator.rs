@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Control-plane orchestration. This is not yet exposed as a public approval API.
+//! Control-plane orchestration for explicit operator approvals.
 //! No queued intention is reported as connected; only exact worker ACKs write
 //! an applied version and the original signed policy lease deadline.
 use crate::{
@@ -108,6 +108,15 @@ impl ServiceAccessCoordinator {
         &self,
         consent: FreshConsent,
     ) -> Result<AuthorizedGrant, CoordinatorError> {
+        if consent.request_id.is_nil()
+            || consent.user_id <= 0
+            || !(60..=86400).contains(&consent.request.ttl_seconds)
+        {
+            return Err(AccessError::Validation {
+                field: "consent",
+                reason: "a non-nil request ID, user and lifetime between 60 and 86400 seconds are required",
+            }.into());
+        }
         let _permit = self.admit(&consent.sandbox_id)?;
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(&consent.sandbox_id))
@@ -338,4 +347,4 @@ impl AuditOperation for RetirementAudit {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

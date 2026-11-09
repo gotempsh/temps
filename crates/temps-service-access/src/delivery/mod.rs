@@ -28,7 +28,7 @@ pub enum DeliveryError {
         "Cannot complete sandbox access command {command_id}: delivery claim expired or changed"
     )]
     StaleClaim { command_id: i64 },
-    #[error("Cannot {operation} sandbox access delivery for {subject}: {source}")]
+    #[error("Cannot {operation} sandbox access delivery for {subject}: database failed")]
     Database {
         operation: &'static str,
         subject: String,
