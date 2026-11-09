@@ -15665,6 +15665,7 @@ dependencies = [
  "temps-docker-capture",
  "temps-docker-util",
  "temps-entities",
+ "temps-service-access-runtime",
  "temps-test-utils",
  "temps-vm-agent",
  "temps-workload",
@@ -15674,6 +15675,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "utoipa",
+ "uuid",
  "walkdir",
 ]
 

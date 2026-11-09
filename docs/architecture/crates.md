@@ -99,7 +99,7 @@ Containers, networking, DNS and the processes that run on worker nodes and insid
 | [`temps-preview-gateway`](../../crates/temps-preview-gateway) | Preview gateway binary: in-network TCP reverse proxy that routes workspace preview hostnames to sandbox container ports | none | `temps-preview-gateway` |
 | [`temps-pty-agent`](../../crates/temps-pty-agent) | In-sandbox PTY multiplexer binary and its framed protocol, serving workspace terminals over a Unix socket | **1**: sandbox | `temps-pty-agent` |
 | [`temps-runtime-health`](../../crates/temps-runtime-health) | Node-local runtime health probes (process, HTTP, TCP) with bounded scheduling and lease-fenced assignments | **3**: deployer, deployments, node-agent |  |
-| [`temps-service-access-runtime`](../../crates/temps-service-access-runtime) | Worker-local credential proxy with strict sandbox bindings and signed policy delivery | none |  |
+| [`temps-service-access-runtime`](../../crates/temps-service-access-runtime) | Worker-local credential proxy with strict sandbox bindings and signed policy delivery | **1**: sandbox-providers |  |
 | [`temps-vm-agent`](../../crates/temps-vm-agent) | In-guest PID 1 agent for Firecracker sandboxes and its vsock exec and filesystem RPC protocol | **1**: sandbox-providers | `temps-vm-agent` |
 | [`temps-wireguard`](../../crates/temps-wireguard) | WireGuard mesh for multi-node clusters: kernel mesh via netlink, userspace boringtun helpers and node pairing | **4**: cli, network, node-agent, nodes |  |
 | [`temps-workload-activator`](../../crates/temps-workload-activator) | One activator for scale-to-zero: wakes a workload on its first request and puts it back to sleep when idle (ADR-055 §11, §14) | **2**: cli, proxy |  |

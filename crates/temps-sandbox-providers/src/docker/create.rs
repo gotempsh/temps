@@ -64,6 +64,11 @@ impl DockerSandboxProvider {
     ) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        let _access_operation = self
+            .service_access
+            .as_ref()
+            .map(|mounts| mounts.operation(&container_name))
+            .transpose()?;
         let egress_policy =
             config
                 .egress_policy
@@ -90,17 +95,81 @@ impl DockerSandboxProvider {
             &container_name,
         );
 
-        // Remove existing container with the same name if any (leftover from crash)
-        let _ = self
-            .docker
-            .remove_container(
-                &container_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        if let Some(mounts) = &self.service_access {
+            match self
+                .docker
+                .inspect_container(
+                    &container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Ok(info) => {
+                    if !info
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.labels.as_ref())
+                        .and_then(|l| l.get(SANDBOX_CONTAINER_LABEL))
+                        .is_some_and(|v| v == "true")
+                    {
+                        return Err(AgentError::SandboxCreationFailed {
+                            run_id: config.run_id,
+                            provider: "docker".into(),
+                            reason: format!(
+                                "refuse to replace unmanaged container {container_name}"
+                            ),
+                        });
+                    }
+                    let id =
+                        info.id
+                            .as_deref()
+                            .ok_or_else(|| AgentError::SandboxCreationFailed {
+                                run_id: config.run_id,
+                                provider: "docker".into(),
+                                reason: "inspect previous sandbox omitted container ID".into(),
+                            })?;
+                    let _previous_operation = mounts.operation(id)?;
+                    mounts.close(id).await?;
+                    self.docker
+                        .remove_container(
+                            id,
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .map_err(|error| AgentError::SandboxCreationFailed {
+                            run_id: config.run_id,
+                            provider: "docker".into(),
+                            reason: format!("remove previous sandbox {id}: {error}"),
+                        })?;
+                    if let Some(mount_id) = super::service_access::mount_id(&info) {
+                        mounts.remove_detached(mount_id)?;
+                    }
+                }
+                Err(e) if docker_error_is_not_found(&e) => {}
+                Err(error) => {
+                    return Err(AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".into(),
+                        reason: format!("inspect previous sandbox {container_name}: {error}"),
+                    })
+                }
+            }
+        } else {
+            // Remove existing container with the same name if any (leftover from crash)
+            let _ = self
+                .docker
+                .remove_container(
+                    &container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
 
         // Resolve image: per-run override > provider config
         let default_image = self.config.resolved_image();
@@ -113,8 +182,36 @@ impl DockerSandboxProvider {
         // Nothing has been created yet, so a failure up to here needs no
         // rollback. From the network on, every failure rolls back.
         self.ensure_sandbox_image(image, config.run_id).await?;
-        let uses_daemon = self.image_uses_runtime_daemon(image, config.run_id).await?;
+        let (uses_daemon, supports_service_access) =
+            self.image_protocols(image, config.run_id).await?;
 
+        let mut access_mount = if supports_service_access {
+            match &self.service_access {
+                Some(mounts) => {
+                    mounts
+                        .reserve_for_image(Arc::clone(&self.docker), image)
+                        .await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let mut container_config = self.sandbox_container_body(
+            &config,
+            image,
+            docker_network.clone(),
+            &home_volume_name,
+            uses_daemon,
+        );
+        if let Some(pending) = &mut access_mount {
+            pending.configure(
+                &mut container_config,
+                Arc::clone(&self.docker),
+                &container_name,
+            )?;
+        }
         if let Err(error) = self
             .ensure_network(
                 &container_name,
@@ -127,13 +224,6 @@ impl DockerSandboxProvider {
             return Err(self.rollback_failed_create(&container_name, error).await);
         }
 
-        let container_config = self.sandbox_container_body(
-            &config,
-            image,
-            docker_network,
-            &home_volume_name,
-            uses_daemon,
-        );
         self.ensure_labelled_home_volume(&home_volume_name).await;
 
         let container_id = match self
@@ -150,6 +240,29 @@ impl DockerSandboxProvider {
                 return Err(self.rollback_failed_create(&container_name, error).await);
             }
         };
+        if let (Some(mounts), Some(pending)) = (&self.service_access, access_mount) {
+            let adoption = async {
+                let info = self
+                    .docker
+                    .inspect_container(
+                        &container_id,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                    .map_err(|error| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".into(),
+                        reason: format!(
+                            "inspect new service access container {container_id}: {error}"
+                        ),
+                    })?;
+                mounts.adopt(&info, pending)
+            }
+            .await;
+            if let Err(error) = adoption {
+                return Err(self.rollback_failed_create(&container_name, error).await);
+            }
+        }
         tracing::info!(
             "Sandbox container {} ({}) created for run {}",
             container_name,
@@ -196,11 +309,7 @@ impl DockerSandboxProvider {
 
     /// Whether `image` runs the in-sandbox runtime daemon, from its
     /// `sh.temps.runtime.protocol` label. Refuses a protocol other than 1.
-    async fn image_uses_runtime_daemon(
-        &self,
-        image: &str,
-        run_id: i32,
-    ) -> Result<bool, AgentError> {
+    async fn image_protocols(&self, image: &str, run_id: i32) -> Result<(bool, bool), AgentError> {
         let image_info = self.docker.inspect_image(image).await.map_err(|error| {
             AgentError::SandboxCreationFailed {
                 run_id,
@@ -221,7 +330,13 @@ impl DockerSandboxProvider {
             return Err(AgentError::SandboxCreationFailed { run_id, provider: "docker".into(),
                 reason: format!("image {image} requires unsupported runtime protocol {runtime_protocol:?}; expected 1") });
         }
-        Ok(runtime_protocol.is_some())
+        let service_access = image_info
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|labels| labels.get("sh.temps.service-access.protocol"))
+            .is_some_and(|version| version == "1");
+        Ok((runtime_protocol.is_some(), service_access))
     }
 
     /// The create request for a sandbox container: image, command,

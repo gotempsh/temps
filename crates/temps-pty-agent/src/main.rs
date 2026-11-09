@@ -100,12 +100,62 @@ fn main() -> std::io::Result<()> {
         std::process::exit(code);
     }
 
-    rt.block_on(async move { temps_pty_agent::server::run(&args.socket).await })
+    rt.block_on(run_server(
+        &args.socket,
+        std::path::Path::new("/run/temps-service-access"),
+    ))
+}
+
+async fn run_server(socket: &str, access_mount: &std::path::Path) -> std::io::Result<()> {
+    let server = temps_pty_agent::server::run(socket);
+    if !access_mount.is_dir() {
+        return server.await;
+    }
+    // The mount survives worker restarts even while its socket is recovered.
+    // Dropping either server lifetime also drops the relay and its connections.
+    let relay = async {
+        loop {
+            if let Err(error) = temps_pty_agent::service_proxy::run().await {
+                tracing::warn!(%error, "Sandbox service relay stopped; retrying");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    };
+    tokio::select! { result = server => result, () = relay => Ok(()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn server_starts_mount_relay_and_cancellation_releases_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("pty.sock");
+        let socket_string = socket.to_str().unwrap().to_string();
+        let mount = directory.path().to_path_buf();
+        let task = tokio::spawn(async move { run_server(&socket_string, &mount).await });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(temps_pty_agent::service_proxy::LISTEN_ADDRESS)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let listener =
+            tokio::net::TcpListener::bind(temps_pty_agent::service_proxy::LISTEN_ADDRESS)
+                .await
+                .unwrap();
+        drop(listener);
+    }
 
     #[test]
     fn service_proxy_is_an_exclusive_mode_with_a_host_assigned_socket() {

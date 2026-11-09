@@ -19,6 +19,8 @@ test-support = []
 temps-agent-core = { path = "../temps-agent-core" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-service-access-runtime = { path = "../temps-service-access-runtime" }
+uuid.workspace = true
 temps-docker-util = { path = "../temps-docker-util" }
 temps-entities = { path = "../temps-entities" }
 temps-vm-agent = { path = "../temps-vm-agent" }

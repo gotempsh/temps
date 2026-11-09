@@ -947,7 +947,15 @@ impl TempsPlugin for AgentsPlugin {
                         preview_gateway_container_name: preview_gateway_name.clone(),
                         exec_output_limit: None,
                     };
-                    let provider = Arc::new(DockerSandboxProvider::new(docker.clone(), config));
+                    let provider = DockerSandboxProvider::new(docker.clone(), config);
+                    // Unix sockets must live on the daemon host, not a Docker
+                    // Desktop client filesystem. Other hosts remain unavailable.
+                    #[cfg(target_os = "linux")]
+                    let provider = provider.with_service_access_root(
+                        temps_sandbox_providers::microsandbox::host_data_dir()
+                            .join("service-access-mounts"),
+                    );
+                    let provider = Arc::new(provider);
                     provider
                         .quarantine_stale_sandboxes()
                         .await

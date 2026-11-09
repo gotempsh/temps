@@ -512,12 +512,18 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 
     async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError> {
+        let _access_operation = self
+            .service_access
+            .as_ref()
+            .map(|mounts| mounts.operation(&handle.sandbox_id))
+            .transpose()?;
         tracing::info!(
             "Destroying sandbox container {} ({})",
             handle.sandbox_name,
             &handle.sandbox_id[..std::cmp::min(12, handle.sandbox_id.len())]
         );
 
+        let access_mount = self.close_service_access_for_destroy(handle).await?;
         // Stop gracefully (5s timeout), then force remove
         let _ = self
             .docker
@@ -561,6 +567,9 @@ impl SandboxProvider for DockerSandboxProvider {
             }
         }
 
+        if let (Some(mounts), Some(id)) = (&self.service_access, access_mount) {
+            mounts.remove_detached(&id)?;
+        }
         let _ = self
             .remove_isolated_sandbox_network(&handle.sandbox_name)
             .await;
@@ -596,7 +605,15 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 
     async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+        let _access_operation = self
+            .service_access
+            .as_ref()
+            .map(|mounts| mounts.operation(&handle.sandbox_id))
+            .transpose()?;
         tracing::info!("Stopping sandbox container {}", handle.sandbox_name);
+        if let Some(mounts) = &self.service_access {
+            mounts.close(&handle.sandbox_id).await?;
+        }
         let result = self
             .docker
             .stop_container(
@@ -624,6 +641,11 @@ impl SandboxProvider for DockerSandboxProvider {
     }
 
     async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+        let _access_operation = self
+            .service_access
+            .as_ref()
+            .map(|mounts| mounts.operation(&handle.sandbox_id))
+            .transpose()?;
         tracing::info!("Starting sandbox container {}", handle.sandbox_name);
         let info = self.inspect_handle_policy(handle).await?;
         let _network = self.prepare_network_for_start(handle, &info).await?;
@@ -645,11 +667,20 @@ impl SandboxProvider for DockerSandboxProvider {
             sandbox_id: handle.sandbox_id.clone(),
             reason: format!("Failed to start container: {}", e),
         })?;
+        self.recover_service_access_after_start(handle).await?;
         Ok(())
     }
 
     async fn restart(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
+        let _access_operation = self
+            .service_access
+            .as_ref()
+            .map(|mounts| mounts.operation(&handle.sandbox_id))
+            .transpose()?;
         tracing::info!("Restarting sandbox container {}", handle.sandbox_name);
+        if let Some(mounts) = &self.service_access {
+            mounts.close(&handle.sandbox_id).await?;
+        }
         let info = self.inspect_handle_policy(handle).await?;
         let _network = self.prepare_network_for_start(handle, &info).await?;
         self.docker
@@ -663,6 +694,7 @@ impl SandboxProvider for DockerSandboxProvider {
                 sandbox_id: handle.sandbox_id.clone(),
                 reason: format!("Failed to restart container: {}", e),
             })?;
+        self.recover_service_access_after_start(handle).await?;
         Ok(())
     }
 

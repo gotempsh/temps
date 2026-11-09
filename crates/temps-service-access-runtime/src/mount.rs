@@ -105,7 +105,10 @@ impl MountDirectory {
         {
             return Err(invalid("unassigned", "invalid mount ID"));
         }
-        let owner = private_directory(root, id, None)?;
+        // TempDir creation makes relative roots absolute. Recovery must use
+        // the same lexical resolution so Docker's absolute source still matches.
+        let root = std::path::absolute(root).map_err(|e| failure(id, "resolve mount root", e))?;
+        let owner = private_directory(&root, id, None)?;
         let outer = root.join(id);
         private_directory(&outer, id, Some(owner))?;
         let guest = outer.join("guest");

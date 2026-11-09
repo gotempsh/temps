@@ -135,3 +135,22 @@ async fn recovery_removes_a_stale_socket_only_after_claiming_the_mount() {
     assert!(!socket.exists());
     recovered.remove().unwrap();
 }
+
+#[test]
+fn relative_roots_recover_the_same_absolute_mount_path() {
+    let root = tempfile::Builder::new()
+        .prefix(".access-relative-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(".")
+        .unwrap();
+    let relative = Path::new(".").join(root.path().file_name().unwrap());
+    let mut mount = MountDirectory::create(&relative).unwrap();
+    let id = mount.id().to_string();
+    let path = mount.guest_path().to_owned();
+    assert!(path.is_absolute());
+    mount.retain();
+    drop(mount);
+    let recovered = MountDirectory::recover(&relative, &id).unwrap();
+    assert_eq!(path, recovered.guest_path());
+    recovered.remove().unwrap();
+}

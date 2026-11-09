@@ -70,7 +70,7 @@ pub fn build_router(
     // control plane uses for local ones.
     let sandbox_host = docker.clone().map(|docker| {
         let docker = Arc::new(docker);
-        let provider = Arc::new(temps_sandbox_providers::docker::DockerSandboxProvider::new(
+        let provider = temps_sandbox_providers::docker::DockerSandboxProvider::new(
             docker.clone(),
             temps_sandbox_providers::docker::DockerSandboxConfig {
                 control_plane_url: config.control_plane_url.clone(),
@@ -79,7 +79,11 @@ pub fn build_router(
                 exec_output_limit: Some(temps_sandbox_providers::remote::WORKER_EXEC_OUTPUT_LIMIT),
                 ..Default::default()
             },
-        ));
+        );
+        #[cfg(target_os = "linux")]
+        let provider = provider
+            .with_service_access_root(config.compose_data_dir().join("service-access-mounts"));
+        let provider = Arc::new(provider);
         spawn_sandbox_quarantine(provider.clone(), config.node_name.clone());
         SandboxHost {
             provider,

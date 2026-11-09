@@ -130,3 +130,104 @@ async fn golden_sandbox_with_full_network_and_egress_proxy() {
     assert_eq!(names.len(), 2, "proxy, then sandbox: {:?}", fake.calls());
     assert_golden(&fixture("sandbox-network-full"), &Value::Array(creates));
 }
+
+#[tokio::test]
+async fn service_proxy_mount_requires_a_compatible_image_and_is_read_only() {
+    for compatible in [false, true] {
+        let root = tempfile::Builder::new()
+            .prefix("access-create-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let fake = FakeDocker::start().await.unwrap();
+        fake.respond(
+            Method::GET,
+            "/images/",
+            200,
+            if compatible {
+                json!({"Config": {"Labels": {"sh.temps.service-access.protocol": "1"}}})
+            } else {
+                json!({})
+            },
+        );
+        if compatible {
+            fake.respond_when(
+                Method::POST,
+                "/containers/create",
+                "name=temps-service-access-probe-",
+                201,
+                json!({"Id":"probe-container", "Warnings":[]}),
+            );
+            fake.respond(
+                Method::DELETE,
+                "/containers/probe-container",
+                204,
+                json!(null),
+            );
+        }
+        let provider =
+            DockerSandboxProvider::new(Arc::new(fake.docker()), DockerSandboxConfig::default())
+                .with_service_access_root(root.path().join("mounts"));
+        let creates = creates_for(&fake, &provider, config(990, Some("none"))).await;
+        assert_eq!(creates.len(), if compatible { 2 } else { 1 });
+        let all_creates = fake.creates();
+        let body = &all_creates
+            .iter()
+            .find(|create| create.name.as_deref() == Some("temps-sandbox-990"))
+            .unwrap()
+            .body;
+        let mount = body["HostConfig"]["Mounts"]
+            .as_array()
+            .and_then(|mounts| mounts.first());
+        if compatible {
+            let mount = mount.unwrap();
+            assert_eq!(mount["Type"], "bind");
+            assert_eq!(mount["ReadOnly"], true);
+            assert_eq!(mount["Target"], "/run/temps-service-access");
+            assert_eq!(body["HostConfig"]["RestartPolicy"]["Name"], "no");
+            let source = PathBuf::from(mount["Source"].as_str().unwrap());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while source.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            assert!(mount.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_without_the_client_mount_still_creates_an_ordinary_sandbox() {
+    let root = tempfile::Builder::new()
+        .prefix("access-unshared-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let fake = FakeDocker::start().await.unwrap();
+    fake.respond(
+        Method::GET,
+        "/images/",
+        200,
+        json!({"Config":{"Labels":{"sh.temps.service-access.protocol":"1"}}}),
+    );
+    fake.respond_when(
+        Method::POST,
+        "/containers/create",
+        "name=temps-service-access-probe-",
+        400,
+        json!({"message":"invalid mount config: bind source path does not exist"}),
+    );
+    let provider =
+        DockerSandboxProvider::new(Arc::new(fake.docker()), DockerSandboxConfig::default())
+            .with_service_access_root(root.path().join("mounts"));
+    let creates = creates_for(&fake, &provider, config(991, Some("none"))).await;
+    assert_eq!(creates.len(), 2);
+    let captured = fake.creates();
+    let ordinary = captured
+        .iter()
+        .find(|create| create.name.as_deref() == Some("temps-sandbox-991"))
+        .unwrap();
+    assert!(ordinary.body["HostConfig"]["Mounts"].is_null());
+    assert!(ordinary.body["Labels"]["sh.temps.sandbox.service-access.mount"].is_null());
+}
