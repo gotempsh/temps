@@ -402,18 +402,26 @@ async fn timeouts_and_saturation_release_admission_without_unbounded_waiting() {
     let transport = WorkerTransport::new(provider.clone());
     provider.hang.store(true, Ordering::Relaxed);
     let sandbox = sandbox();
-    let (a, b, c) = tokio::join!(
+    let (a, b, c, d, e) = tokio::join!(
+        transport.inspect(&sandbox),
+        transport.inspect(&sandbox),
         transport.inspect(&sandbox),
         transport.inspect(&sandbox),
         transport.inspect(&sandbox)
     );
-    let errors = [a.unwrap_err(), b.unwrap_err(), c.unwrap_err()];
+    let errors = [
+        a.unwrap_err(),
+        b.unwrap_err(),
+        c.unwrap_err(),
+        d.unwrap_err(),
+        e.unwrap_err(),
+    ];
     assert_eq!(
         errors
             .iter()
             .filter(|e| matches!(e, TransportError::Timeout { .. }))
             .count(),
-        2
+        4
     );
     assert_eq!(
         errors
@@ -444,4 +452,16 @@ fn stored_targets_reject_legacy_or_malformed_identity() {
         )
         .is_err());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn inspection_saturation_does_not_block_retirement_delivery() {
+    let observed = target();
+    let provider = provider(&observed);
+    let transport = WorkerTransport::new(provider.clone());
+    let _inspections = transport.slots.acquire_many(4).await.unwrap();
+    *provider.reply.lock().unwrap() = ServiceAccessReply::Retired {
+        target: observed.target.clone(),
+    };
+    transport.retire(&observed).await.unwrap();
 }

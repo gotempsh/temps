@@ -48,7 +48,10 @@ fn consent(id: &str) -> FreshConsent {
 async fn coordinator_bounds_work_and_preserves_database_error_context() {
     let provider = Provider::new();
     let db = MockDatabase::new(DatabaseBackend::Postgres)
-        .append_query_errors([sea_orm::DbErr::Custom("private database detail".into())])
+        .append_query_errors([
+            sea_orm::DbErr::Custom("private database detail".into()),
+            sea_orm::DbErr::Custom("private database detail".into()),
+        ])
         .into_connection();
     let coordinator = coordinator(Arc::new(db), provider.clone());
     let a = coordinator.admit("a").unwrap();
@@ -58,7 +61,15 @@ async fn coordinator_bounds_work_and_preserves_database_error_context() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("two operations"));
+        .contains("claim commands"));
+    let slots = coordinator.dispatch_slots.acquire_many(4).await.unwrap();
+    assert!(coordinator
+        .dispatch_one()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("four deliveries"));
+    drop(slots);
     drop(a);
     drop(b);
     let error = coordinator.connect(consent("svc_test")).await.unwrap_err();
@@ -115,7 +126,10 @@ async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_
         binding.0.get().unwrap().as_ref().unwrap(),
         &late
     ));
-    assert_eq!(Arc::strong_count(&coordinator), before + 4);
+    assert_eq!(
+        Arc::strong_count(&coordinator),
+        before + 2 + crate::transport::DISPATCH_CONCURRENCY
+    );
     tokio::task::yield_now().await;
     assert!(weak.upgrade().is_some());
     drop(read_context);
@@ -196,7 +210,10 @@ async fn postgres_coordinator_delivers_approved_scope_and_recovers_unconfirmed_d
     .await
     .unwrap();
     let calls = provider.calls.load(Ordering::SeqCst);
-    assert_eq!(coordinator.dispatch_one().await.unwrap(), None);
+    assert_eq!(
+        coordinator.dispatch_one().await.unwrap(),
+        Some(DispatchOutcome::Contended)
+    );
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
     assert!(runtimes::Entity::find_by_id(first.runtime_id)
         .one(db.as_ref())
@@ -311,8 +328,8 @@ async fn postgres_coordinator_delivers_approved_scope_and_recovers_unconfirmed_d
         .unwrap();
     tx.commit().await.unwrap();
     assert!(matches!(
-        coordinator.dispatch_one().await,
-        Err(CoordinatorError::Transport(_))
+        coordinator.dispatch_next().await,
+        Ok(Some(Err(CoordinatorError::Transport(_))))
     ));
     let row = runtimes::Entity::find_by_id(first.runtime_id)
         .one(db.as_ref())

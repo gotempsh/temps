@@ -3,6 +3,9 @@
 
 //! Control-plane transport over the existing authenticated provider. Identity
 //! comes from a scoped database row and host inspection, never a guest request.
+mod delivery_budget;
+pub(crate) use delivery_budget::DISPATCH_CONCURRENCY;
+
 use std::{future::Future, sync::Arc, time::Duration};
 use temps_agent_core::error::AgentError;
 use temps_entities::{sandbox_access_delivery, sandbox_access_runtimes, sandboxes};
@@ -30,7 +33,7 @@ pub enum TransportError {
         operation: &'static str,
         seconds: u64,
     },
-    #[error("Cannot {operation} service access for sandbox {sandbox_id}: two worker operations are already in progress; retry later")]
+    #[error("Cannot {operation} service access for sandbox {sandbox_id}: worker operation capacity is occupied; retry later")]
     Busy {
         sandbox_id: String,
         operation: &'static str,
@@ -160,12 +163,14 @@ fn parse_backend(value: Option<&str>) -> Option<SandboxBackend> {
 pub struct WorkerTransport {
     provider: Arc<dyn SandboxProvider>,
     slots: Semaphore,
+    delivery: delivery_budget::DeliveryBudget,
 }
 impl WorkerTransport {
     pub fn new(provider: Arc<dyn SandboxProvider>) -> Self {
         Self {
             provider,
-            slots: Semaphore::new(2),
+            slots: Semaphore::new(4),
+            delivery: delivery_budget::DeliveryBudget::default(),
         }
     }
     async fn bounded<T>(
@@ -300,66 +305,68 @@ impl WorkerTransport {
             ));
         }
         let binding_version = delivery.version;
-        self.bounded(id, "apply", 10, async {
-            let reply = self
-                .provider
-                .service_access(
-                    &target.handle,
-                    ServiceAccessCommand::Apply {
-                        expected: target.target.clone(),
-                        delivery: Box::new(delivery),
-                    },
-                )
-                .await
-                .map_err(|source| Self::provider_error(id, "apply", source))?;
-            match reply {
-                ServiceAccessReply::Applied {
-                    target: applied,
-                    snapshot_version: snapshot,
-                    binding_version: binding,
-                } if applied == target.target
-                    && snapshot == snapshot_version
-                    && binding == binding_version =>
-                {
-                    Ok(())
+        self.delivery
+            .run(id, "apply", 10, async {
+                let reply = self
+                    .provider
+                    .service_access(
+                        &target.handle,
+                        ServiceAccessCommand::Apply {
+                            expected: target.target.clone(),
+                            delivery: Box::new(delivery),
+                        },
+                    )
+                    .await
+                    .map_err(|source| Self::provider_error(id, "apply", source))?;
+                match reply {
+                    ServiceAccessReply::Applied {
+                        target: applied,
+                        snapshot_version: snapshot,
+                        binding_version: binding,
+                    } if applied == target.target
+                        && snapshot == snapshot_version
+                        && binding == binding_version =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(invalid(
+                        id,
+                        "apply",
+                        "worker did not acknowledge the exact target and policy versions",
+                    )),
                 }
-                _ => Err(invalid(
-                    id,
-                    "apply",
-                    "worker did not acknowledge the exact target and policy versions",
-                )),
-            }
-        })
-        .await
+            })
+            .await
     }
     /// Retirement uses the saved immutable target even after deletion. It must
     /// never recover by name, which could now identify a replacement sandbox.
     pub async fn retire(&self, target: &StoredTarget) -> Result<(), TransportError> {
         let id = target.target.incarnation.as_str();
-        self.bounded(id, "retire", 5, async {
-            let reply = self
-                .provider
-                .service_access(
-                    &target.handle,
-                    ServiceAccessCommand::Retire {
-                        expected: target.target.clone(),
-                        boot_id: target.boot_id,
-                    },
-                )
-                .await
-                .map_err(|source| Self::provider_error(id, "retire", source))?;
-            match reply {
-                ServiceAccessReply::Retired { target: retired } if retired == target.target => {
-                    Ok(())
+        self.delivery
+            .run(id, "retire", 5, async {
+                let reply = self
+                    .provider
+                    .service_access(
+                        &target.handle,
+                        ServiceAccessCommand::Retire {
+                            expected: target.target.clone(),
+                            boot_id: target.boot_id,
+                        },
+                    )
+                    .await
+                    .map_err(|source| Self::provider_error(id, "retire", source))?;
+                match reply {
+                    ServiceAccessReply::Retired { target: retired } if retired == target.target => {
+                        Ok(())
+                    }
+                    _ => Err(invalid(
+                        id,
+                        "retire",
+                        "worker did not acknowledge retirement of the exact target",
+                    )),
                 }
-                _ => Err(invalid(
-                    id,
-                    "retire",
-                    "worker did not acknowledge retirement of the exact target",
-                )),
-            }
-        })
-        .await
+            })
+            .await
     }
 }
 

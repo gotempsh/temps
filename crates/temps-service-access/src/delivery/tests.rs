@@ -367,3 +367,20 @@ async fn worker_batches_report_progress_even_without_new_commands() {
     assert_eq!(batches, 7);
     test.cleanup().await;
 }
+
+#[tokio::test]
+async fn losing_a_claim_race_is_not_an_idle_queue() {
+    let queue = DeliveryQueue::new(Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![claimed_row()], vec![], vec![]])
+            .into_connection(),
+    ));
+    // The row existed at selection, but another dispatcher claimed it before
+    // the fenced UPDATE. Keep draining other workers without the idle delay.
+    let (claims, progress) = queue.claim_with_progress(1).await.unwrap();
+    assert!(claims.is_empty());
+    assert!(progress);
+    let (claims, progress) = queue.claim_with_progress(1).await.unwrap();
+    assert!(claims.is_empty());
+    assert!(!progress);
+}

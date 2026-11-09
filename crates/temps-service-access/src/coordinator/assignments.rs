@@ -3,30 +3,34 @@
 
 use std::{future::Future, time::Duration};
 
-// At most eight claimed sandbox groups, two in flight, three seconds each:
-// network failures consume at most twelve seconds of a renewal sweep. Each
-// group shares one inspection; cancelled database transactions roll back.
-pub(super) async fn run_pairs<T, F, Fut>(groups: Vec<T>, renew: F)
+// At most eight claimed sandbox groups, four in flight. A group gets the
+// transport's ten-second inspection allowance plus five seconds for database
+// renewal. Two waves bound a sweep to thirty seconds; a reachable slow worker
+// can complete instead of being cancelled at the same point on every retry.
+pub(super) async fn run_groups<T, F, Fut>(groups: Vec<T>, renew: F)
 where
     F: Fn(T) -> Fut,
     Fut: Future<Output = ()>,
 {
     let renew = &renew;
     let bounded = |group| async move {
-        if tokio::time::timeout(Duration::from_secs(3), renew(group))
-            .await
-            .is_err()
-        {
-            tracing::warn!("Sandbox service approval renewal exceeded its three-second budget; retrying on the next due claim");
+        if let Some(group) = group {
+            if tokio::time::timeout(Duration::from_secs(15), renew(group))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Sandbox service approval renewal exceeded its fifteen-second budget; retrying on the next due claim");
+            }
         }
     };
     let mut groups = groups.into_iter();
     while let Some(first) = groups.next() {
-        if let Some(second) = groups.next() {
-            tokio::join!(bounded(first), bounded(second));
-        } else {
-            bounded(first).await;
-        }
+        tokio::join!(
+            bounded(Some(first)),
+            bounded(groups.next()),
+            bounded(groups.next()),
+            bounded(groups.next()),
+        );
     }
 }
 
@@ -48,7 +52,7 @@ mod tests {
             }
         }
         let (completed, active, peak) = (&completed, &active, &peak);
-        run_pairs((0..8).collect(), |id| async move {
+        run_groups((0..8).collect(), |id| async move {
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(current, Ordering::SeqCst);
             let _active = Active(active);
@@ -61,7 +65,19 @@ mod tests {
         .await;
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         assert_eq!(active.load(Ordering::SeqCst), 0);
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert!(start.elapsed() <= Duration::from_secs(12));
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+        assert!(start.elapsed() <= Duration::from_secs(30));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn reachable_slow_workers_can_finish_inspection_and_renewal() {
+        let completed = AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        run_groups((0..8).collect(), |_| async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            completed.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(completed.load(Ordering::SeqCst), 8);
+        assert_eq!(start.elapsed(), Duration::from_secs(8));
     }
 }

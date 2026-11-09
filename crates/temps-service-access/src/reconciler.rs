@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Four owned tasks, no per-sandbox sidecars or unbounded task spawning. The
+//! Six owned tasks, no per-sandbox sidecars or unbounded task spawning. The
 //! durable queue survives shutdown; worker leases expire without renewal.
-use crate::coordinator::ServiceAccessCoordinator;
+use crate::{coordinator::ServiceAccessCoordinator, transport::DISPATCH_CONCURRENCY};
 use std::{
     sync::{Arc, OnceLock},
     time::Duration,
@@ -18,7 +18,7 @@ impl ServiceAccessReconciler {
     /// Idempotent startup after all provider services have initialized.
     pub fn start(&self, coordinator: Arc<ServiceAccessCoordinator>) {
         self.tasks.get_or_init(|| {
-            let mut tasks = Vec::with_capacity(4);
+            let mut tasks = Vec::with_capacity(2 + DISPATCH_CONCURRENCY);
             let scheduler = Arc::clone(&coordinator);
             tasks.push(tokio::spawn(async move {
                 loop {
@@ -44,12 +44,18 @@ impl ServiceAccessReconciler {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }));
-            for dispatcher in 0..2 {
+            for dispatcher in 0..DISPATCH_CONCURRENCY {
                 let coordinator = Arc::clone(&coordinator);
                 tasks.push(tokio::spawn(async move {
                     loop {
-                        match tokio::time::timeout(Duration::from_secs(25), coordinator.dispatch_one()).await {
-                            Ok(Ok(Some(_))) => continue,
+                        match tokio::time::timeout(Duration::from_secs(25), coordinator.dispatch_next()).await {
+                            Ok(Ok(Some(result))) => {
+                                if let Err(error) = result {
+                                    tracing::warn!(dispatcher, %error, "Sandbox service-access delivery failed; retry scheduled");
+                                }
+                                wait_after_batch(1, coordinator.wait_for_work()).await;
+                                continue;
+                            },
                             Ok(Ok(None)) => {},
                             Ok(Err(error)) => tracing::warn!(dispatcher, %error, "Sandbox service-access delivery failed"),
                             Err(_) => tracing::warn!(dispatcher, "Sandbox service-access dispatch deadline exceeded; claim remains recoverable"),

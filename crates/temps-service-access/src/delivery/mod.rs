@@ -105,6 +105,15 @@ impl DeliveryQueue {
     /// serialized per worker by short claim transactions. The DB clock is
     /// authoritative; a worker cannot extend a claim or grant deadline.
     pub async fn claim(&self, limit: u32) -> Result<Vec<DeliveryClaim>, DeliveryError> {
+        Ok(self.claim_with_progress(limit).await?.0)
+    }
+
+    /// A lost claim race is progress, not evidence that the queue is empty.
+    /// Let the dispatcher immediately try the next independent worker.
+    pub(crate) async fn claim_with_progress(
+        &self,
+        limit: u32,
+    ) -> Result<(Vec<DeliveryClaim>, bool), DeliveryError> {
         if !(1..=32).contains(&limit) {
             return Err(DeliveryError::Invalid {
                 operation: "claim commands",
@@ -116,6 +125,7 @@ impl DeliveryQueue {
             "SELECT d.* FROM sandbox_access_delivery d WHERE d.completed_at IS NULL AND d.available_at<=now() AND (d.claimed_until IS NULL OR d.claimed_until<=now()) AND NOT EXISTS (SELECT 1 FROM sandbox_access_delivery busy WHERE busy.worker_boot_id=d.worker_boot_id AND busy.completed_at IS NULL AND busy.claimed_until>now()) ORDER BY (d.operation='retire') DESC,d.available_at,d.id LIMIT $1",
             [i64::from(limit).into()])).all(self.db.as_ref()).await
             .map_err(|e| database("claim commands", "pending queue", e))?;
+        let had_candidates = !candidates.is_empty();
         let mut claims = Vec::new();
         for candidate in candidates {
             let tx = self
@@ -152,7 +162,7 @@ impl DeliveryQueue {
                 claims.push(DeliveryClaim { command, claim_id });
             }
         }
-        Ok(claims)
+        Ok((claims, had_candidates))
     }
 
     /// Persist an authenticated enforcement receipt. A delayed receipt can

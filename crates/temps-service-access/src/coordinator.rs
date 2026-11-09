@@ -69,6 +69,7 @@ pub enum DispatchOutcome {
     Applied,
     Retired,
     Superseded,
+    Contended,
 }
 
 pub struct ServiceAccessCoordinator {
@@ -80,6 +81,8 @@ pub struct ServiceAccessCoordinator {
     queue: DeliveryQueue,
     audit: Arc<dyn AuditLogger>,
     admission: Semaphore,
+    dispatch_slots: Semaphore,
+    planning: Semaphore,
     wake: Notify,
     batches: batches::RenewalBatches,
 }
@@ -102,6 +105,8 @@ impl ServiceAccessCoordinator {
             transport,
             audit,
             admission: Semaphore::new(2),
+            dispatch_slots: Semaphore::new(crate::transport::DISPATCH_CONCURRENCY),
+            planning: Semaphore::new(2),
             wake: Notify::new(),
             batches: batches::RenewalBatches::default(),
         }
@@ -188,23 +193,34 @@ impl ServiceAccessCoordinator {
         Ok(session)
     }
 
-    /// One bounded command. The caller schedules subsequent ticks; there is no
-    /// unbounded background task. The durable claim excludes other commands for the worker; no database
-    /// transaction is held during transport I/O.
+    /// One bounded command. A failed attempt preserves its authorization and
+    /// releases its durable claim with backoff.
     pub async fn dispatch_one(&self) -> Result<Option<DispatchOutcome>, CoordinatorError> {
-        let _permit = self.admit("delivery queue")?;
-        let Some(claim) = self.queue.claim(1).await?.pop() else {
-            return Ok(None);
+        self.dispatch_next().await?.transpose()
+    }
+
+    /// Distinguish a processed failure from an empty queue or a claim failure:
+    /// dispatchers must drain other workers immediately after a failed attempt.
+    pub(crate) async fn dispatch_next(
+        &self,
+    ) -> Result<Option<Result<DispatchOutcome, CoordinatorError>>, CoordinatorError> {
+        let _slot = self
+            .dispatch_slots
+            .try_acquire()
+            .map_err(|_| CoordinatorError::Invalid {
+                sandbox_id: "delivery queue".into(),
+                operation: "dispatch",
+                reason: "four deliveries are already in progress; retry later",
+            })?;
+        let (mut claims, had_candidates) = self.queue.claim_with_progress(1).await?;
+        let Some(claim) = claims.pop() else {
+            return Ok(had_candidates.then_some(Ok(DispatchOutcome::Contended)));
         };
-        match self.deliver(&claim).await {
-            Ok(result) => Ok(Some(result)),
-            Err(error) => {
-                if let Err(retry_error) = self.queue.retry(&claim).await {
-                    tracing::warn!(command_id=claim.command().id, %retry_error, "Cannot reschedule service-access delivery");
-                }
-                Err(error)
-            }
+        let result = self.deliver(&claim).await;
+        if result.is_err() {
+            self.queue.retry(&claim).await?;
         }
+        Ok(Some(result))
     }
 
     /// Bounded maintenance tick. Authorization changes wake their worker in the
@@ -228,7 +244,7 @@ impl ServiceAccessCoordinator {
                 .or_insert_with(Vec::new)
                 .push(assignment);
         }
-        assignments::run_pairs(groups.into_values().collect(), |group| async move {
+        assignments::run_groups(groups.into_values().collect(), |group| async move {
             let Some(first) = group.first() else { return; };
             let result = async {
                 let Some(sandbox) = self.service.assignment_sandbox(first).await? else {
@@ -316,11 +332,24 @@ impl ServiceAccessCoordinator {
             self.queue.supersede(claim).await?;
             return Ok(DispatchOutcome::Superseded);
         }
+        // Planning/signing stays limited to two operations. No planning or
+        // consent permit survives the worker RPC; four issued policies can be
+        // in flight (bounded protocol payloads), with only two slow RPCs.
+        let planning = self
+            .planning
+            .acquire()
+            .await
+            .map_err(|_| CoordinatorError::Invalid {
+                sandbox_id: command.runtime_id.to_string(),
+                operation: "plan delivery",
+                reason: "policy planning admission is closed",
+            })?;
         if let Some(batch) = self
             .batches
             .take(boot_id, command.runtime_id, command.desired_version)
         {
             if self.batch_is_current(&batch).await? {
+                drop(planning);
                 return self.apply_batch_binding(claim, batch, true).await;
             }
         }
@@ -358,6 +387,7 @@ impl ServiceAccessCoordinator {
             .authority
             .issue(plan.node_id, &plan.worker, revision, plan.bindings)
             .await?;
+        drop(planning);
         self.apply_batch_binding(
             claim,
             batches::RenewalBatch::new(boot_id, revision, issued),
