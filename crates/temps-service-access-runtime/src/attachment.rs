@@ -4,7 +4,7 @@
 //! Per-sandbox host attachment. Mount only `directory()` read-only into the
 //! owning sandbox; never mount the parent or use a shared TCP listener as an
 //! identity boundary. The caller must resolve the actual runtime incarnation.
-use crate::{RuntimeError, SandboxBinding, MAX_SANDBOX_CONNECTIONS};
+use crate::{MountDirectory, RuntimeError, SandboxBinding, MAX_SANDBOX_CONNECTIONS};
 use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
@@ -26,7 +26,20 @@ use tokio::{
 pub struct UnixAttachment {
     slot: Arc<AttachmentSlot>,
     task: JoinHandle<()>,
-    directory: TempDir,
+    directory: AttachmentDirectory,
+}
+
+enum AttachmentDirectory {
+    Temporary(TempDir),
+    Mounted(MountDirectory),
+}
+impl AttachmentDirectory {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(directory) => directory.path(),
+            Self::Mounted(directory) => directory.guest_path(),
+        }
+    }
 }
 
 struct AttachmentSlot {
@@ -58,6 +71,42 @@ impl UnixAttachment {
     /// closes connections immediately. `id` must come from the host's fresh
     /// sandbox incarnation, never a guest request or a reusable display name.
     pub fn reserve(parent: &Path, id: String) -> Result<Self, RuntimeError> {
+        let io_error = |source| RuntimeError::Attachment {
+            binding: id.clone(),
+            operation: "create Unix attachment directory",
+            source,
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("access-")
+            .tempdir_in(parent)
+            .map_err(io_error)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+            .map_err(io_error)?;
+        Self::listen(AttachmentDirectory::Temporary(directory), id)
+    }
+
+    /// The mount's inode survives a provider/worker restart once retained.
+    /// Reopening always starts denied; it never reloads a previous binding.
+    pub fn reserve_mounted(directory: MountDirectory, id: String) -> Result<Self, RuntimeError> {
+        Self::listen(AttachmentDirectory::Mounted(directory), id)
+    }
+
+    pub fn mount_id(&self) -> Option<&str> {
+        match &self.directory {
+            AttachmentDirectory::Temporary(_) => None,
+            AttachmentDirectory::Mounted(directory) => Some(directory.id()),
+        }
+    }
+
+    /// The provider calls this after creating the container, so dropping this
+    /// listener does not strand the container on an unlinked mount inode.
+    pub fn retain_mount(&mut self) {
+        if let AttachmentDirectory::Mounted(directory) = &mut self.directory {
+            directory.retain();
+        }
+    }
+
+    fn listen(directory: AttachmentDirectory, id: String) -> Result<Self, RuntimeError> {
         if id.is_empty() || id.len() > 256 {
             return Err(RuntimeError::Invalid {
                 operation: "reserve attachment",
@@ -75,16 +124,11 @@ impl UnixAttachment {
             operation: "create Unix attachment",
             source,
         };
-        let directory = tempfile::Builder::new()
-            .prefix("access-")
-            .tempdir_in(parent)
-            .map_err(io_error)?;
-        // The parent remains private to the worker. Only this child is exposed
-        // through a read-only mount; nobody can replace the socket or add files.
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
-            .map_err(io_error)?;
+        if let AttachmentDirectory::Mounted(directory) = &directory {
+            directory.clear_socket()?;
+        }
         let path = directory.path().join("proxy.sock");
-        let listener = UnixListener::bind(&path).map_err(io_error)?;
+        let listener = bind_listener(directory.path()).map_err(io_error)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
             .map_err(io_error)?;
         let task_slot = Arc::clone(&slot);
@@ -191,10 +235,38 @@ impl UnixAttachment {
     }
 }
 
+// Linux workers may keep their private state under a long data-directory
+// prefix. Unix socket addresses are limited to roughly 100 bytes even when
+// the filesystem accepts that path. Bind through an owned directory fd;
+// Docker guests connect through their short, fixed mount path instead.
+#[cfg(target_os = "linux")]
+fn bind_listener(directory: &Path) -> std::io::Result<UnixListener> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory)?;
+    UnixListener::bind(format!(
+        "/proc/self/fd/{}/proxy.sock",
+        directory.as_raw_fd()
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_listener(directory: &Path) -> std::io::Result<UnixListener> {
+    UnixListener::bind(directory.join("proxy.sock"))
+}
+
 impl Drop for UnixAttachment {
     fn drop(&mut self) {
         self.slot.close();
         self.task.abort();
-        // TempDir removes only the uniquely owned endpoint directory.
+        if let AttachmentDirectory::Mounted(directory) = &self.directory {
+            if directory.clear_socket().is_err() {
+                tracing::warn!(binding=%self.slot.id,"Could not remove stopped sandbox proxy socket");
+            }
+        }
+        // Temporary directories are removed. Retained mount directories keep
+        // their inode until explicit container destruction removes them.
     }
 }

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
+#[cfg(unix)]
+#[path = "traffic_tests.rs"]
+mod traffic;
 use tokenless_control::service::{
     policy::{CreateCredential, CreateRule},
     sessions::{MintSession, SessionBinding},
@@ -38,6 +41,21 @@ impl Fixture {
         Self::with_lease(30).await
     }
     async fn with_lease(lease_secs: u32) -> Self {
+        Self::with_transport(
+            lease_secs,
+            "api.example.com",
+            DataPlaneConfig::default(),
+            false,
+        )
+        .await
+    }
+
+    async fn with_transport(
+        lease_secs: u32,
+        host: &str,
+        transport: DataPlaneConfig,
+        fixture_loopback: bool,
+    ) -> Self {
         let store = Arc::new(MemoryStore::new());
         let cipher = Arc::new(
             Envelope::open(&AesGcmCipher::generate_key(), store.clone())
@@ -64,6 +82,9 @@ impl Fixture {
         let caller = Caller::service(Principal::service("test-host", Role::Admin, None));
         let mut settings = control.policy.get_settings(&caller).await.unwrap();
         settings.unmatched_host_policy = UnmatchedHostPolicy::Deny;
+        if fixture_loopback {
+            settings.egress.allow = vec!["127.0.0.1/32".parse().unwrap()];
+        }
         control
             .policy
             .put_settings(&caller, settings)
@@ -83,7 +104,7 @@ impl Fixture {
                     name: "test-service".into(),
                     template_id: "generic-bearer".into(),
                     template_version: None,
-                    host_override: vec!["api.example.com".into()],
+                    host_override: vec![host.into()],
                     fields: [("token".into(), "test-credential".into())].into(),
                     custom_headers: vec![],
                     substitutions: vec![],
@@ -119,13 +140,14 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let proxy = WorkerProxy::start(
+        let proxy = WorkerProxy::start_config(
             NodeKeys {
                 node_id: registration.node.id,
                 seal_secret,
                 snapshot_key: registration.snapshot_verify_key,
             },
             Arc::new(Audit),
+            transport,
         )
         .await
         .unwrap();
@@ -546,4 +568,99 @@ async fn reserved_attachment_rejects_another_sandbox_and_closed_pending_activati
     assert!(pending.activate(binding).is_err());
     assert!(UnixAttachment::reserve(root.path(), String::new()).is_err());
     assert!(UnixAttachment::reserve(root.path(), "x".repeat(257)).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mounted_restart_preserves_the_directory_but_requires_a_new_incarnation_grant() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let old = f.proxy.bind(f.spec(token), version).await.unwrap();
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = MountDirectory::create(root.path()).unwrap();
+    let id = directory.id().to_string();
+    let path = directory.guest_path().to_path_buf();
+    let inode = std::fs::metadata(&path).unwrap().ino();
+    let mut attachment = UnixAttachment::reserve_mounted(directory, old.id().into()).unwrap();
+    assert_eq!(attachment.mount_id(), Some(id.as_str()));
+    attachment.retain_mount();
+    attachment.activate(Arc::clone(&old)).unwrap();
+    let guest = idle_guest_tunnel(&attachment).await;
+    drop(attachment);
+    assert_guest_closed(guest).await;
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    let directory = MountDirectory::recover(root.path(), &id).unwrap();
+    let new_id = "sandbox:new-incarnation";
+    let attachment = UnixAttachment::reserve_mounted(directory, new_id.into()).unwrap();
+    assert!(attachment.activate(old).is_err());
+    assert_guest_closed(
+        tokio::net::UnixStream::connect(path.join("proxy.sock"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let token = f
+        .control
+        .sessions
+        .mint(
+            &f.caller,
+            &f.vault,
+            MintSession {
+                rule_ids: vec![f.rule],
+                node_id: Some(f.node.id),
+                binding: Some(SessionBinding {
+                    id: new_id.into(),
+                    generation: 1,
+                }),
+                strict: true,
+                ttl_secs: Some(60),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .token;
+    let version = f.install().await;
+    let mut spec = f.spec(token);
+    spec.binding_id = new_id.into();
+    let fresh = f.proxy.bind(spec, version).await.unwrap();
+    attachment.activate(fresh).unwrap();
+    let guest = idle_guest_tunnel(&attachment).await;
+    attachment
+        .revoke_and_wait(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_guest_closed(guest).await;
+    drop(attachment);
+    MountDirectory::recover(root.path(), &id)
+        .unwrap()
+        .remove()
+        .unwrap();
+    assert!(!path.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_long_host_data_directory_binds_through_the_short_guest_mount_path() {
+    use std::os::unix::fs::{symlink, DirBuilderExt};
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let long = root.path().join("host-data-".repeat(16));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&long)
+        .unwrap();
+    let mount = MountDirectory::create(&long).unwrap();
+    let attachment = UnixAttachment::reserve_mounted(mount, "sandbox:long-path".into()).unwrap();
+    assert!(attachment.directory().as_os_str().len() > 108);
+    // A symlink provides the same short pathname resolution that a Docker
+    // bind mount does. The listener lives at the long host path's inode.
+    let guest_path = root.path().join("guest");
+    symlink(attachment.directory(), &guest_path).unwrap();
+    let guest = tokio::net::UnixStream::connect(guest_path.join("proxy.sock"))
+        .await
+        .unwrap();
+    assert_guest_closed(guest).await;
 }

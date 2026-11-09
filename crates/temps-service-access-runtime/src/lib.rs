@@ -8,6 +8,10 @@
 mod attachment;
 #[cfg(unix)]
 pub use attachment::UnixAttachment;
+#[cfg(unix)]
+mod mount;
+#[cfg(unix)]
+pub use mount::MountDirectory;
 
 use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
@@ -117,6 +121,14 @@ pub struct WorkerProxy {
 
 impl WorkerProxy {
     pub async fn start(keys: NodeKeys, audit: Arc<dyn AuditShipper>) -> Result<Self, RuntimeError> {
+        Self::start_config(keys, audit, DataPlaneConfig::default()).await
+    }
+
+    async fn start_config(
+        keys: NodeKeys,
+        audit: Arc<dyn AuditShipper>,
+        transport: DataPlaneConfig,
+    ) -> Result<Self, RuntimeError> {
         let snapshot_key = keys.snapshot_key;
         let (plane, installer) = DataPlane::start_embedded(
             DataPlaneConfig {
@@ -125,7 +137,7 @@ impl WorkerProxy {
                 audit_capacity: 4096,
                 audit_batch_max: 128,
                 connect_timeout: Duration::from_secs(10),
-                ..DataPlaneConfig::default()
+                ..transport
             },
             keys,
             audit,
