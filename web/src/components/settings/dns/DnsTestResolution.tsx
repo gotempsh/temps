@@ -15,6 +15,7 @@ import {
 import { Search } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
+import { Link } from 'react-router'
 import {
   Form,
   FormControl,
@@ -32,6 +33,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
+import { internalAccessDiagnostic } from '@/components/project/settings/internal-access'
 import { problemDetail } from '@/lib/api-problem'
 import {
   DNS_PARAMS,
@@ -107,7 +109,33 @@ function ResolveResult({ result }: { result: DnsResolveResponse }) {
         </p>
       )}
       {result.note ? <Callout tone="info">{result.note}</Callout> : null}
+      <InternalAccessResult result={result} />
     </section>
+  )
+}
+
+/**
+ * A name that resolves is half a working call: another project's internal
+ * address answers 403 unless that project allows the caller (ADR 100).
+ */
+function InternalAccessResult({ result }: { result: DnsResolveResponse }) {
+  const diagnostic = result.internal_access
+    ? internalAccessDiagnostic(result.internal_access, 'the selected project')
+    : null
+  if (!diagnostic) return null
+  return (
+    <Callout tone={diagnostic.tone} title={diagnostic.title}>
+      <p>{diagnostic.detail}</p>
+      {diagnostic.setupPath ? (
+        <Link
+          to={diagnostic.setupPath}
+          className="font-medium text-foreground underline underline-offset-4"
+        >
+          Open {result.internal_access?.target_project_name}&apos;s internal
+          access
+        </Link>
+      ) : null}
+    </Callout>
   )
 }
 

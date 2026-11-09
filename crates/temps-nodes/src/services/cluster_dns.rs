@@ -530,6 +530,9 @@ pub struct TestResolution {
     pub answer: ResolveAnswer,
     /// A caveat about how the answer was obtained.
     pub note: Option<String>,
+    /// For an internal route asked as a project: who owns it, and whether
+    /// that project lets the asking one call it (ADR 100 D7).
+    pub internal_access: Option<super::internal_access_check::InternalAccessVerdict>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -739,8 +742,34 @@ impl ClusterDnsService {
     }
 
     /// Resolve `name` from `node_id`'s resolver, as `project_id`'s container
-    /// there would be answered when one is given.
+    /// there would be answered when one is given. Asked as a project, an
+    /// internal route also says whether its project lets that one call it.
     pub async fn resolve(
+        &self,
+        node_id: i32,
+        name: &str,
+        record_type: &str,
+        project_id: Option<i32>,
+    ) -> Result<TestResolution, ClusterDnsError> {
+        let mut resolution = self
+            .resolve_answer(node_id, name, record_type, project_id)
+            .await?;
+        if let Some(project_id) = project_id {
+            resolution.internal_access = super::internal_access_check::internal_access_verdict(
+                self.db.as_ref(),
+                &resolution.name,
+                project_id,
+            )
+            .await
+            .map_err(|source| ClusterDnsError::Database {
+                operation: "checking internal access for a test resolution",
+                source,
+            })?;
+        }
+        Ok(resolution)
+    }
+
+    async fn resolve_answer(
         &self,
         node_id: i32,
         name: &str,
@@ -838,6 +867,7 @@ impl ClusterDnsService {
             asked_as: source,
             answer,
             note: None,
+            internal_access: None,
         })
     }
 
@@ -899,6 +929,7 @@ impl ClusterDnsService {
             asked_as: None,
             answer,
             note,
+            internal_access: None,
         })
     }
 }

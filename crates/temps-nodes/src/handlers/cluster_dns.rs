@@ -700,6 +700,43 @@ pub struct DnsResolveResponse {
     pub asked_as: Option<String>,
     /// A caveat about how the answer was obtained.
     pub note: Option<String>,
+    /// Asked as a project, for an internal route: who owns it and whether
+    /// that project lets the asking one call it. The internal proxy answers
+    /// `403` when `reach` is `not_granted`.
+    pub internal_access: Option<DnsInternalAccess>,
+}
+
+/// Whether the asking project may call an internal route (ADR 100 D7).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DnsInternalAccess {
+    pub target_project_id: i32,
+    pub target_project_name: String,
+    pub target_project_slug: String,
+    pub target_environment_id: i32,
+    pub target_environment_name: String,
+    /// `same_project`, `granted`, `some_environments` or `not_granted`.
+    #[schema(example = "not_granted")]
+    pub reach: String,
+    /// Where the owning project's grants are managed in the console.
+    #[schema(example = "/projects/orders-api/settings/security#internal-access")]
+    pub setup_path: String,
+}
+
+impl From<crate::services::internal_access_check::InternalAccessVerdict> for DnsInternalAccess {
+    fn from(verdict: crate::services::internal_access_check::InternalAccessVerdict) -> Self {
+        Self {
+            setup_path: format!(
+                "/projects/{}/settings/security#internal-access",
+                verdict.target_project_slug
+            ),
+            target_project_id: verdict.target_project_id,
+            target_project_name: verdict.target_project_name,
+            target_project_slug: verdict.target_project_slug,
+            target_environment_id: verdict.target_environment_id,
+            target_environment_name: verdict.target_environment_name,
+            reach: verdict.reach.as_str().to_string(),
+        }
+    }
 }
 
 impl From<TestResolution> for DnsResolveResponse {
@@ -715,6 +752,7 @@ impl From<TestResolution> for DnsResolveResponse {
             latency_ms: t.answer.latency_us as f64 / 1000.0,
             asked_as: t.asked_as.map(|ip| ip.to_string()),
             note: t.note,
+            internal_access: t.internal_access.map(Into::into),
         }
     }
 }
@@ -789,6 +827,7 @@ pub async fn resolve_dns_name(
         DnsResolveRequest,
         DnsResolveResponse,
         DnsResolvedRecord,
+        DnsInternalAccess,
     ))
 )]
 pub struct ClusterDnsApiDoc;
