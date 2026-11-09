@@ -42,8 +42,12 @@ mod cli;
 mod error;
 mod handle;
 mod index;
+mod query;
+pub use query::QuerySerialization;
 mod integration_tests;
+mod plugin_registry;
 mod secrets;
+pub use plugin_registry::{PluginDispatchGuard, PluginToolsRegistry};
 
 pub use caller::{
     ApiCallScope, ApiToolResponse, BuiltRequest, InternalApiCaller, PreparedWrite,
@@ -52,7 +56,8 @@ pub use caller::{
 pub use error::ApiToolError;
 pub use handle::{ApiToolsHandle, WriteApiToolsHandle};
 pub use index::{
-    ApiOperation, OperationSchema, OperationSummary, ParamLocation, ParamSpec, ReadOnlyApiIndex,
+    ApiOperation, OperationSchema, OperationSummary, ParamLocation, ParamSpec, PluginTool,
+    PluginToolAccess, PluginToolsError, PluginToolsIndex, ReadOnlyApiIndex,
 };
 pub use secrets::{
     is_secret_ref, pointer_is_credential, SecretPath, SecretPathSegment, SecretResolveError,

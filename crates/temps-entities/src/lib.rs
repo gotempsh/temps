@@ -316,3 +316,5 @@ pub mod workload_volumes;
 pub mod functions;
 // ADR-055 Phase 10: Firecracker for deployments
 pub mod environment_workload_isolation;
+
+pub mod external_plugin_actors;

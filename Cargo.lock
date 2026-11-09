@@ -12365,10 +12365,13 @@ dependencies = [
 name = "temps-ai-api-tools"
 version = "0.1.0-beta.61"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "chrono",
  "http 1.5.0",
+ "http-body-util",
+ "matchit",
  "serde",
  "serde_json",
  "temps-authz",
@@ -12380,6 +12383,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -13851,6 +13855,7 @@ dependencies = [
  "tar",
  "tempfile",
  "temps-ai",
+ "temps-ai-api-tools",
  "temps-auth",
  "temps-config",
  "temps-core",

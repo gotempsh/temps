@@ -122,6 +122,9 @@
     "packages/plugin-sdk": {
       "name": "@temps-sdk/plugin",
       "version": "0.1.0-beta.2",
+      "dependencies": {
+        "zod": "^4.0.0",
+      },
       "devDependencies": {
         "@types/bun": "latest",
         "@types/node": "^22.0.0",

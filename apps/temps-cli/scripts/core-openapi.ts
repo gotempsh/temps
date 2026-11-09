@@ -1,9 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/** External plugin APIs live under /x and must not enter the canonical CLI SDK. */
+/** Preserve the console-owned AI consent contract alongside the core API. */
+const CORE_PLUGIN_PATHS = new Set(['/x/plugins/{name}/ai-tools'])
+
+/** Plugin APIs and legacy management bindings are excluded from the CLI SDK. */
 export function isPluginPath(path: string): boolean {
-  return path === '/x' || path.startsWith('/x/')
+  return (
+    !CORE_PLUGIN_PATHS.has(path) && (path === '/x' || path.startsWith('/x/'))
+  )
 }
 
 type Document = Record<string, unknown> & {
@@ -59,10 +64,10 @@ export function coreOpenApi(spec: unknown): unknown {
     return spec
   const source = spec as Document
   const paths = Object.fromEntries(
-    Object.entries(source.paths).filter(([path]) => !isPluginPath(path)),
+    Object.entries(source.paths).filter(([path]) => !isPluginPath(path))
   )
   const pluginPaths = Object.fromEntries(
-    Object.entries(source.paths).filter(([path]) => isPluginPath(path)),
+    Object.entries(source.paths).filter(([path]) => isPluginPath(path))
   )
   const candidates = referencedComponents(pluginPaths, source)
   const { components, ...root } = source
@@ -90,9 +95,9 @@ export function coreOpenApi(spec: unknown): unknown {
                 Object.entries(entries).filter(([name]) => {
                   const ref = `#/components/${kind}/${name.replaceAll('~', '~0').replaceAll('/', '~1')}`
                   return !candidates.has(ref) || retained.has(ref)
-                }),
+                })
               ),
-            ]),
+            ])
           ),
         }
       : {}),

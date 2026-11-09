@@ -348,15 +348,14 @@ fn render_operation_help(op: &ApiOperation) -> String {
     } else {
         out.push_str("Flags:\n");
         for p in flags {
-            // Path params are structurally required, and so are body fields the
-            // schema marks required — a write call fails without them, so the
-            // help has to say which ones they are. (Query params stay unmarked:
-            // they're optional filters, and OpenAPI required-ness is frequently
-            // wrong for them, so claiming "required" would send the model
-            // inventing values for filters it should simply omit.)
+            // Plugin query contracts are authoritative. Curated core queries
+            // retain their compatibility exception for inaccurate required flags.
             let req = match p.location {
                 ParamLocation::Path => " (required)",
                 ParamLocation::Body if p.required => " (required)",
+                ParamLocation::Query if p.required && op.operation_id.starts_with("plugin.") => {
+                    " (required)"
+                }
                 _ => "",
             };
             out.push_str(&format!("  --{} {}{}", p.name, flag_value_label(p), req));
@@ -750,6 +749,11 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
     // turned `--version 18` into JSON number 18 and made a human-approved
     // create-service proposal fail only after confirmation.
     match expected_type {
+        Some("json") => {
+            return serde_json::from_str(s.trim()).map_err(|error| {
+                format!("Invalid JSON value for `--{flag}`: {error}. Use a JSON number, boolean, null, object, array or double-quoted string.")
+            });
+        }
         Some("string") => {
             let trimmed = s.trim();
             if trimmed.starts_with('"') && trimmed.ends_with('"') {
@@ -888,8 +892,35 @@ mod tests {
     use crate::index::ParamSpec;
 
     #[test]
+    fn operation_help_marks_required_plugin_queries_but_preserves_core_compatibility() {
+        for method in ["get", "post"] {
+            let spec = serde_json::from_value(serde_json::json!({
+                "openapi":"3.1.0", "info":{"title":"Reports","version":"1"},
+                "paths":{"/reports":{method:{
+                    "operationId":"list", "x-temps-ai-tool":{},
+                    "parameters":[
+                        {"name":"report_name","in":"query","required":true,"schema":{"type":"string"}},
+                        {"name":"filter","in":"query","required":false,"schema":{"type":"string"}}
+                    ],
+                    "responses":{"200":{"description":"OK"}}
+                }}}
+            })).unwrap();
+            let plugin = crate::PluginToolsIndex::from_openapi("reports", &spec, true).unwrap();
+            let mut operation = plugin.tools()[0].operation.clone();
+            let help = render_operation_help(&operation);
+            assert!(help.contains("--report_name <string> (required)"), "{help}");
+            assert!(help.contains("--filter <string>\n"), "{help}");
+            operation.operation_id = "list_reports".into();
+            let core_help = render_operation_help(&operation);
+            assert!(!core_help.contains("(required)"), "{core_help}");
+        }
+    }
+
+    #[test]
     fn operation_help_explains_optional_project_linkage() {
         let operation = ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: "create_service".to_string(),
             path: "/external-services".to_string(),
             method: "POST".to_string(),
@@ -897,6 +928,7 @@ mod tests {
             description: None,
             tags: vec!["External Services".to_string()],
             params: vec![ParamSpec {
+                query_serialization: None,
                 name: "project_id".to_string(),
                 location: ParamLocation::Body,
                 required: false,
@@ -1043,6 +1075,8 @@ mod tests {
     #[test]
     fn operation_schema_preserves_number_looking_string_flags() {
         let operation = ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: "create_service".to_string(),
             path: "/external-services".to_string(),
             method: "POST".to_string(),
@@ -1050,6 +1084,7 @@ mod tests {
             description: None,
             tags: vec!["External Services".to_string()],
             params: vec![crate::index::ParamSpec {
+                query_serialization: None,
                 name: "version".to_string(),
                 location: ParamLocation::Body,
                 required: true,
@@ -1196,6 +1231,7 @@ mod tests {
 
     fn array_param(name: &str, item_ty: Option<&str>) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required: true,
@@ -1209,6 +1245,7 @@ mod tests {
 
     fn env_var_operation() -> ApiOperation {
         let scalar = |name: &str, ty: &str| ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required: true,
@@ -1219,6 +1256,8 @@ mod tests {
             object_shape: None,
         };
         ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: "create_environment_variable".to_string(),
             path: "/projects/{project_id}/env-vars".to_string(),
             method: "POST".to_string(),
@@ -1405,7 +1444,10 @@ mod tests {
     #[test]
     fn help_without_list_flags_has_no_list_hint() {
         let help = render_operation_help(&ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             params: vec![ParamSpec {
+                query_serialization: None,
                 name: "name".to_string(),
                 location: ParamLocation::Body,
                 required: true,

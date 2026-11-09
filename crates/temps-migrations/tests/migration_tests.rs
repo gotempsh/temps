@@ -7654,3 +7654,85 @@ async fn test_github_manifest_states_migration_is_single_use_and_reversible() ->
     assert_eq!(table_exists().await?.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping plugin AI tools migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            // Only a missing Docker skips the test; any other startup failure
+            // is a broken setup and must stay visible.
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping plugin AI tools migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20261108_000001_external_plugin_ai_tools";
+    Migrator::up(
+        &db,
+        Some(Migrator::migrations().len() as u32 - steps_back_to(target)),
+    )
+    .await?;
+    db.execute_unprepared("INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES ('00000000-0000-4000-8000-000000000001','reports','fixture','fixture',true)").await?;
+    Migrator::up(&db, None).await?;
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == target)
+        .unwrap();
+    migration.up(&SchemaManager::new(&db)).await?;
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT ai_tools_enabled FROM external_plugin_actors WHERE plugin_name='reports'",
+        ))
+        .await?
+        .unwrap();
+    assert!(!row.try_get::<bool>("", "ai_tools_enabled")?);
+    db.execute_unprepared(
+        "UPDATE external_plugin_actors SET ai_tools_enabled=true WHERE plugin_name='reports'",
+    )
+    .await?;
+    let approval_columns = db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Postgres, "SELECT column_name FROM information_schema.columns WHERE table_name='ai_pending_actions' AND column_name='plugin_revision' AND is_nullable='YES'")).await?;
+    assert_eq!(approval_columns.len(), 1);
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    migration.down(&SchemaManager::new(&db)).await?;
+    let approval_columns = db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Postgres, "SELECT column_name FROM information_schema.columns WHERE table_name='ai_pending_actions' AND column_name='plugin_revision'")).await?;
+    assert!(approval_columns.is_empty());
+    let rows = db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Postgres,"SELECT column_name FROM information_schema.columns WHERE table_name='external_plugin_actors' AND column_name='ai_tools_enabled'")).await?;
+    assert!(rows.is_empty());
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM external_plugin_actors WHERE plugin_name='reports'",
+        ))
+        .await?;
+    assert_eq!(rows.len(), 1);
+    Ok(())
+}

@@ -247,6 +247,7 @@ impl PendingActionService {
             message_id: Set(None),
             project_id: Set(project_id),
             operation_id: Set(prepared.operation_id.clone()),
+            plugin_revision: Set(prepared.plugin_revision.clone()),
             method: Set(prepared.method.clone()),
             summary: Set(prepared.summary.clone()),
             params: Set(
@@ -347,6 +348,7 @@ impl PendingActionService {
                 plan_public_id: Set(Some(plan_public_id.clone())),
                 step_index: Set(idx as i32),
                 operation_id: Set(prepared.operation_id.clone()),
+                plugin_revision: Set(prepared.plugin_revision.clone()),
                 method: Set(prepared.method.clone()),
                 summary: Set(prepared.summary.clone()),
                 params: Set(encrypted_params),
@@ -614,7 +616,12 @@ impl PendingActionService {
             }),
         };
         let exec_result = caller
-            .execute_write(&action.operation_id, executable_params, &scope)
+            .execute_approved_write(
+                &action.operation_id,
+                executable_params,
+                &scope,
+                action.plugin_revision.as_deref(),
+            )
             .await;
 
         // 8. Persist outcome regardless of success/failure.
@@ -883,6 +890,7 @@ mod tests {
 
     fn make_prepared() -> PreparedWrite {
         PreparedWrite {
+            plugin_revision: None,
             operation_id: "redeploy_deployment".to_string(),
             method: "POST".to_string(),
             path: "/projects/{project_id}/deployments/redeploy".to_string(),
@@ -896,6 +904,7 @@ mod tests {
     fn make_proposed(id: i64, public_id: &str, project_id: i32) -> ai_pending_actions::Model {
         let now = Utc::now();
         ai_pending_actions::Model {
+            plugin_revision: None,
             id,
             public_id: public_id.to_string(),
             conversation_id: 1,
@@ -1173,6 +1182,41 @@ mod tests {
         assert!(!log.contains("must-not-reach-the-database-in-plaintext"));
         assert!(log.contains("__temps_encrypted_v1"));
         assert!(log.contains("***"));
+    }
+
+    #[tokio::test]
+    async fn standalone_and_plan_inserts_bind_plugin_revision() {
+        for plan in [false, true] {
+            let row = make_proposed(1, "approval", 7);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![row]])
+                    .into_connection(),
+            );
+            let svc = PendingActionService::new(db.clone(), noop_write_handle(), test_encryption());
+            let mut prepared = make_prepared();
+            let revision = "00000000-0000-4000-8000-000000000123";
+            prepared.plugin_revision = Some(revision.into());
+            if plan {
+                svc.create_plan(1, Some(7), &[(prepared, None)], 1)
+                    .await
+                    .unwrap();
+            } else {
+                svc.create(1, Some(7), &prepared, None, 1).await.unwrap();
+            }
+            drop(svc);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let insert = transactions
+                .iter()
+                .flat_map(|t| t.statements())
+                .find(|s| s.sql.starts_with("INSERT"))
+                .unwrap();
+            assert!(insert.sql.contains("plugin_revision"));
+            assert!(
+                format!("{:?}", insert.values).contains(revision),
+                "{insert:?}"
+            );
+        }
     }
 
     // get: not-found returns NotFound.

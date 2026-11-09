@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   getProjectsInfiniteOptions,
   listGlobalMcpsOptions,
@@ -28,6 +29,7 @@ import { projectHasPage } from '@/lib/project-navigation'
 import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
   PROJECT_SETTINGS_INDEX,
+  pluginAiToolSetting,
   projectHasSetting,
   projectSettingUrl,
   type SettingPreset,
@@ -1325,13 +1327,14 @@ export function projectNavItemsFor(project: {
 }
 
 export function CommandPalette() {
+  const isAdmin = useIsInstanceAdmin()
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   // The highlighted row, controlled so it always matches the ranked list.
   const [activeValue, setActiveValue] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
-  const { platformNavEntries, settingsNavEntries, projectNavEntries } =
+  const { platformNavEntries, settingsNavEntries, projectNavEntries, plugins } =
     usePluginsContext()
   const showFullBrowseCatalog =
     localStorage.getItem('temps:show-full-command-catalog') === 'true'
@@ -1517,14 +1520,24 @@ export function CommandPalette() {
   // route, so mapping the manifests here sent every plugin command to a 404
   // while the sidebar, which uses the resolved entries, worked.
   const pluginNavItems: NavigationItem[] = useMemo(
-    () =>
-      [...platformNavEntries, ...settingsNavEntries].map((entry) => ({
+    () => [
+      ...[...platformNavEntries, ...settingsNavEntries].map((entry) => ({
         title: entry.label,
         url: entry.path,
         icon: resolvePluginIcon(entry.icon),
         keywords: ['plugin', entry.pluginName, entry.label.toLowerCase()],
       })),
-    [platformNavEntries, settingsNavEntries]
+      ...(isAdmin ? plugins : []).map((plugin) => {
+        const setting = pluginAiToolSetting(plugin.name)
+        return {
+          title: setting.title,
+          url: projectSettingUrl(setting),
+          icon: resolvePluginIcon('bot'),
+          keywords: setting.keywords,
+        }
+      }),
+    ],
+    [platformNavEntries, settingsNavEntries, plugins, isAdmin]
   )
 
   // Project-scoped plugin nav entries (relative URLs, prefixed at render time)

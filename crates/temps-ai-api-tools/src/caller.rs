@@ -123,6 +123,8 @@ pub struct ApiToolResponse {
 /// [`InternalApiCaller::execute_write`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PreparedWrite {
+    /// Immutable plugin publication approved by the user; absent for core operations.
+    pub plugin_revision: Option<String>,
     /// The `operation_id` of the operation to execute.
     pub operation_id: String,
     /// Uppercase HTTP method, e.g. `"POST"`.
@@ -171,9 +173,18 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
     if param.name == "project_id" {
         return true;
     }
+    let local_path = if op.operation_id.starts_with("plugin.") {
+        op.path
+            .strip_prefix("/x/")
+            .and_then(|path| path.split_once('/'))
+            .map(|(_, path)| path)
+    } else {
+        op.path.strip_prefix('/')
+    };
     matches!(param.location, ParamLocation::Path)
         && param.name == "id"
-        && op.path.starts_with("/projects/{id}")
+        && local_path
+            .is_some_and(|path| path == "projects/{id}" || path.starts_with("projects/{id}/"))
 }
 
 /// Route a flat `params` JSON object into a substituted path, query string, and
@@ -200,9 +211,11 @@ pub(crate) fn is_project_scope_param(op: &ApiOperation, param: &ParamSpec) -> bo
 ///   is allowed. Operations without a project selector remain available: their
 ///   authorization is evaluated by the real router using the authenticated
 ///   user's current role and permissions.
-/// - **Limit injection**: if a param named `limit` exists in the operation:
+/// - **Core pagination**: if a query param named `limit` exists in a core operation:
 ///   - absent → `default_limit` is injected.
 ///   - present → clamped to `[1, max_limit]`.
+///
+///   Plugin parameters retain their declared endpoint's semantics.
 ///
 /// ## Parameters
 ///
@@ -225,6 +238,46 @@ pub fn build_request_parts(
         ProjectSelectorScope::Allowed(allowed_project_ids.to_vec())
     };
     build_request_parts_scoped(op, params, &project_scope, default_limit, max_limit)
+}
+
+fn validate_plugin_path_value(
+    op: &ApiOperation,
+    param: &ParamSpec,
+    str_val: &str,
+) -> Result<(), ApiToolError> {
+    if op.operation_id.starts_with("plugin.")
+        && (str_val.is_empty()
+            || matches!(str_val, "." | "..")
+            || str_val.contains(['/', '\\', '%']))
+    {
+        return Err(ApiToolError::BadParamType {
+            name: param.name.clone(),
+            problem: "path value could change the declared plugin endpoint".into(),
+            expected:
+                "a nonempty path segment without dot traversal, separators or percent escapes"
+                    .into(),
+            operation_id: op.operation_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn is_core_pagination_limit(op: &ApiOperation, param: &ParamSpec) -> bool {
+    !op.operation_id.starts_with("plugin.")
+        && param.name == "limit"
+        && matches!(param.location, ParamLocation::Query)
+}
+
+fn parameter_is_supplied(
+    param: &ParamSpec,
+    params: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    params
+        .and_then(|object| object.get(&param.name))
+        .is_some_and(|value| {
+            !value.is_null()
+                || (param.ty == "json" && !matches!(param.location, ParamLocation::Path))
+        })
 }
 
 /// Policy-aware request builder used by chat tool calls. Unlike the public
@@ -281,16 +334,13 @@ fn build_request_parts_scoped(
     // time, and never reaches a valid call. Collecting them means one round.
     //
     // The rules mirror the loop exactly — auto-filled project selectors and the
-    // injected `limit` are not "missing", and absent query params are left to the
-    // router (OpenAPI required-ness is frequently wrong for those).
+    // injected core `limit` are not "missing". Core query metadata retains its
+    // compatibility exception; required plugin query inputs are enforced.
     let missing: Vec<&str> = op
         .params
         .iter()
         .filter(|param| {
-            if params_obj
-                .and_then(|o| o.get(&param.name))
-                .is_some_and(|v| !v.is_null())
-            {
+            if parameter_is_supplied(param, params_obj) {
                 return false;
             }
             if is_project_scope_param(op, param)
@@ -298,13 +348,13 @@ fn build_request_parts_scoped(
             {
                 return false; // auto-filled
             }
-            if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
+            if is_core_pagination_limit(op, param) {
                 return false; // injected with a default
             }
             match param.location {
                 ParamLocation::Path => true,
                 ParamLocation::Body => param.required,
-                ParamLocation::Query => false,
+                ParamLocation::Query => op.operation_id.starts_with("plugin.") && param.required,
             }
         })
         .map(|param| param.name.as_str())
@@ -394,8 +444,8 @@ fn build_request_parts_scoped(
                     }
                 }
             }
-        } else if param.name == "limit" && matches!(param.location, ParamLocation::Query) {
-            // Limit injection: default + clamp (only for query params named "limit").
+        } else if is_core_pagination_limit(op, param) {
+            // Only core endpoints share these pagination semantics.
             let raw = params_obj.and_then(|o| o.get(&param.name));
             let limit_val = match raw {
                 Some(v) => {
@@ -483,16 +533,12 @@ fn build_request_parts_scoped(
         match param.location {
             ParamLocation::Path => {
                 let str_val = value_to_string(&value);
+                validate_plugin_path_value(op, param, &str_val)?;
                 let placeholder = format!("{{{}}}", param.name);
                 path = path.replace(&placeholder, &urlencoding::encode(&str_val));
             }
             ParamLocation::Query => {
-                let str_val = value_to_string(&value);
-                query_parts.push(format!(
-                    "{}={}",
-                    urlencoding::encode(&param.name),
-                    urlencoding::encode(&str_val),
-                ));
+                query_parts.extend(crate::query::serialize(op, param, &value)?);
             }
             ParamLocation::Body => {
                 body_map.insert(param.name.clone(), value);
@@ -506,10 +552,11 @@ fn build_request_parts_scoped(
     // optional (e.g. DeployFromImageRequest) accept `{}`, and axum's `Json`
     // extractor 415s on a missing content type — so an empty body must still be
     // sent as `{}`, not omitted. GET/DELETE ops without a body stay body-less.
-    let op_expects_body = op
-        .params
-        .iter()
-        .any(|p| matches!(p.location, ParamLocation::Body));
+    let op_expects_body = op.has_json_body
+        || op
+            .params
+            .iter()
+            .any(|p| matches!(p.location, ParamLocation::Body));
     let body = if body_map.is_empty() {
         if op_expects_body {
             Some(Value::Object(serde_json::Map::new()))
@@ -541,6 +588,7 @@ fn build_request_parts_scoped(
 #[derive(Clone)]
 pub struct InternalApiCaller {
     router: axum::Router,
+    plugins: Option<crate::plugin_registry::PluginBinding>,
     index: ReadOnlyApiIndex,
     default_limit: i64,
     max_limit: i64,
@@ -548,6 +596,22 @@ pub struct InternalApiCaller {
 }
 
 impl InternalApiCaller {
+    /// Publication identity for invalidating turn-local discovery/refusal caches.
+    pub fn plugin_tools_revision(&self) -> Option<String> {
+        self.plugins
+            .as_ref()
+            .map(|binding| binding.snapshot.revision.to_string())
+    }
+
+    pub(crate) fn with_plugin_snapshot(
+        mut self,
+        binding: crate::plugin_registry::PluginBinding,
+    ) -> Self {
+        binding.snapshot.append_to(&mut self.index, binding.access);
+        self.plugins = Some(binding);
+        self
+    }
+
     /// Construct a new caller.
     ///
     /// - `router`: the full (or filtered) Axum router to replay calls through.
@@ -562,6 +626,7 @@ impl InternalApiCaller {
         let index = ReadOnlyApiIndex::from_openapi(openapi, &denylist_refs);
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -584,6 +649,7 @@ impl InternalApiCaller {
         let index = ReadOnlyApiIndex::from_openapi_allowlist(openapi, &allowlist_refs);
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -613,6 +679,7 @@ impl InternalApiCaller {
         );
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -635,6 +702,7 @@ impl InternalApiCaller {
         let index = ReadOnlyApiIndex::from_openapi_write_allowlist(openapi, &allowlist_refs);
         Self {
             router,
+            plugins: None,
             index,
             default_limit: 20,
             max_limit: 100,
@@ -864,6 +932,18 @@ impl InternalApiCaller {
         match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
             crate::cli::CliAction::Execute(op, params) => {
+                if op.operation_id.starts_with("plugin.")
+                    && self.plugins.as_ref().is_none_or(|binding| {
+                        binding
+                            .snapshot
+                            .callable(&op.operation_id, crate::PluginToolAccess::Write)
+                            .is_none()
+                    })
+                {
+                    return WritePrepareOutcome::Invalid(
+                        "Plugin AI access is disabled; enable it in plugin settings.".into(),
+                    );
+                }
                 // Validate by running build_request_parts but discarding the
                 // built request — we only care whether it succeeds or errors.
                 match build_request_parts_scoped(
@@ -872,7 +952,9 @@ impl InternalApiCaller {
                     &scope.project_scope,
                     self.default_limit,
                     self.max_limit,
-                ) {
+                )
+                .and_then(|built| self.validate_plugin_route(op, &built))
+                {
                     Err(e) => WritePrepareOutcome::Invalid(format!(
                         "{e}\nRun `{} --help` to check its flags.",
                         op.operation_id
@@ -905,6 +987,11 @@ impl InternalApiCaller {
                         let required_permission =
                             required_write_permission(op).map(|p| p.to_string());
                         WritePrepareOutcome::Prepared(PreparedWrite {
+                            plugin_revision: self
+                                .plugins
+                                .as_ref()
+                                .filter(|_| op.operation_id.starts_with("plugin."))
+                                .map(|binding| binding.snapshot.revision.to_string()),
                             operation_id: op.operation_id.clone(),
                             method: op.method.clone(),
                             path: op.path.clone(),
@@ -916,6 +1003,30 @@ impl InternalApiCaller {
                 }
             }
         }
+    }
+
+    /// Execute only the plugin declaration that was recorded with the approval.
+    /// Any lifecycle/consent publication (including restart) requires a fresh proposal.
+    pub async fn execute_approved_write(
+        &self,
+        operation_id: &str,
+        params: Value,
+        scope: &ApiCallScope,
+        plugin_revision: Option<&str>,
+    ) -> Result<ApiToolResponse, ApiToolError> {
+        if let Some(plugin) = operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|pair| pair.0))
+        {
+            let current = self
+                .plugins
+                .as_ref()
+                .map(|binding| binding.snapshot.revision.to_string());
+            if plugin_revision.is_none() || plugin_revision != current.as_deref() {
+                return Err(ApiToolError::PluginOperation {plugin:plugin.into(),operation_id:operation_id.into(),reason:"Plugin declaration changed since approval was requested; propose the operation again".into()});
+            }
+        }
+        self.execute_write(operation_id, params, scope).await
     }
 
     /// Execute a previously-prepared write operation.
@@ -951,6 +1062,104 @@ impl InternalApiCaller {
         params: Value,
         scope: &ApiCallScope,
     ) -> Result<ApiToolResponse, ApiToolError> {
+        if let Some(plugin) = operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|p| p.0))
+        {
+            let failure = |reason: &str| ApiToolError::PluginOperation {
+                plugin: plugin.into(),
+                operation_id: operation_id.into(),
+                reason: reason.into(),
+            };
+            let binding = self
+                .plugins
+                .as_ref()
+                .ok_or_else(|| failure("tools are unavailable"))?;
+            let registry = binding
+                .registry
+                .upgrade()
+                .ok_or_else(|| failure("plugin registry is unavailable"))?;
+            let current = registry.snapshot();
+            if !std::sync::Arc::ptr_eq(&current, &binding.snapshot) {
+                return Err(failure(
+                    "plugin tools changed; discover the operation again",
+                ));
+            }
+            if current.callable(operation_id, binding.access).is_none() {
+                return Err(failure(
+                    "AI access is disabled; enable it in plugin settings",
+                ));
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let call_id = uuid::Uuid::new_v4();
+            if binding.access == crate::PluginToolAccess::Write {
+                let event = crate::plugin_registry::PluginWriteAudit {
+                    call_id,
+                    plugin,
+                    operation_id,
+                    user_id: scope.auth.user_id_opt(),
+                    succeeded: None,
+                };
+                binding.audit_write(&event, deadline).await;
+            }
+            let result = match tokio::time::timeout_at(
+                deadline,
+                self.call_inner(operation_id, params, scope),
+            )
+            .await
+            {
+                Ok(Err(ApiToolError::Upstream { status, .. })) if status >= 500 => {
+                    Err(failure(&format!("plugin unavailable (HTTP {status})")))
+                }
+                Ok(result) => result,
+                Err(_) => Err(failure("request timed out after 30 seconds")),
+            };
+            if binding.access == crate::PluginToolAccess::Write {
+                let event = crate::plugin_registry::PluginWriteAudit {
+                    call_id,
+                    plugin,
+                    operation_id,
+                    user_id: scope.auth.user_id_opt(),
+                    succeeded: Some(result.is_ok()),
+                };
+                binding.audit_write(&event, deadline).await;
+            }
+            return result;
+        }
+        self.call_inner(operation_id, params, scope).await
+    }
+
+    fn validate_plugin_route(
+        &self,
+        operation: &ApiOperation,
+        built: &BuiltRequest,
+    ) -> Result<(), ApiToolError> {
+        let Some(plugin) = operation
+            .operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.').map(|pair| pair.0))
+        else {
+            return Ok(());
+        };
+        if self
+            .plugins
+            .as_ref()
+            .is_some_and(|binding| binding.snapshot.resolves_to(operation, &built.path))
+        {
+            return Ok(());
+        }
+        Err(ApiToolError::PluginOperation {
+            plugin: plugin.into(), operation_id: operation.operation_id.clone(),
+            reason: "Rendered path selects a different plugin endpoint; use that endpoint's declared tool and approval flow".into(),
+        })
+    }
+
+    async fn call_inner(
+        &self,
+        operation_id: &str,
+        params: Value,
+        scope: &ApiCallScope,
+    ) -> Result<ApiToolResponse, ApiToolError> {
         // Step 1: look up the operation.
         let op = self
             .index
@@ -974,6 +1183,7 @@ impl InternalApiCaller {
             self.default_limit,
             self.max_limit,
         )?;
+        self.validate_plugin_route(op, &built)?;
 
         // Handles belong in credential body fields only, never in a URL.
         crate::secrets::reject_references_in_url(operation_id, &built.path, &built.query)?;
@@ -1038,6 +1248,17 @@ impl InternalApiCaller {
             req.extensions_mut().insert(origin.clone());
         }
 
+        let plugin_guard = self
+            .plugins
+            .as_ref()
+            .filter(|_| operation_id.starts_with("plugin."))
+            .map(|binding| {
+                crate::PluginDispatchGuard::new(binding.clone(), operation_id.to_owned())
+            });
+        if let Some(guard) = &plugin_guard {
+            req.extensions_mut().insert(guard.clone());
+        }
+
         // Step 4: replay through the router.
         let response =
             self.router
@@ -1054,7 +1275,21 @@ impl InternalApiCaller {
         // Step 5: collect body with size cap.
         let (mut body_value, truncated) =
             collect_body(response.into_body(), self.max_response_bytes, operation_id).await?;
+        // A byte cap can cut through a credential (including its JSON-escaped
+        // representation). Full-value replacement cannot safely mask that prefix.
+        // Keep bounded output, but withhold truncated credential-bearing responses.
+        if truncated
+            && (!substituted.is_empty()
+                || plugin_guard
+                    .as_ref()
+                    .is_some_and(|guard| guard.has_response_credentials()))
+        {
+            body_value = Value::String("Truncated response omitted to protect credentials".into());
+        }
         crate::secrets::scrub(&mut body_value, &substituted);
+        if let Some(guard) = &plugin_guard {
+            guard.scrub_response(&mut body_value);
+        }
 
         if truncated {
             warn!(
@@ -1338,6 +1573,7 @@ fn parse_http_method(method: &str) -> http::Method {
         "PUT" => http::Method::PUT,
         "PATCH" => http::Method::PATCH,
         "DELETE" => http::Method::DELETE,
+        "TRACE" => http::Method::TRACE,
         "HEAD" => http::Method::HEAD,
         "OPTIONS" => http::Method::OPTIONS,
         // Unknown method — fall back to GET (safe: the router will 404/405).
@@ -1351,6 +1587,9 @@ fn parse_http_method(method: &str) -> http::Method {
 /// tag so related tags (e.g. the several OTel telemetry tags) collapse onto one
 /// permission; `None` means "no known mapping → show it".
 fn required_read_permission(op: &ApiOperation) -> Option<Permission> {
+    if op.operation_id.starts_with("plugin.") {
+        return None;
+    }
     let tag = op.tags.first()?.to_ascii_lowercase();
     // Order matters: more specific keywords first (e.g. telemetry before metrics).
     let perm = if tag.contains("telemetry")
@@ -1410,6 +1649,9 @@ fn required_read_permission(op: &ApiOperation) -> Option<Permission> {
 /// Only the domains that have an explicit write variant are mapped; everything
 /// else returns `None` (shown by default, router still guards).
 pub(crate) fn required_write_permission(op: &ApiOperation) -> Option<Permission> {
+    if op.operation_id.starts_with("plugin.") {
+        return None;
+    }
     let tag = op.tags.first()?.to_ascii_lowercase();
     let method = op.method.as_str();
 
@@ -1455,21 +1697,25 @@ async fn collect_body(
     max_bytes: usize,
     operation_id: &str,
 ) -> Result<(Value, bool), ApiToolError> {
-    // We collect up to max_bytes + 1 so we can detect truncation.
-    let cap = max_bytes + 1;
-    let bytes = axum::body::to_bytes(body, cap)
-        .await
-        .map_err(|e| ApiToolError::BodyReadError {
+    use http_body_util::BodyExt;
+    let mut body = body;
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| ApiToolError::BodyReadError {
             operation_id: operation_id.to_string(),
-            reason: format!("Failed to read response body bytes: {}", e),
+            reason: format!("Failed to read response body bytes: {e}"),
         })?;
-
-    let truncated = bytes.len() > max_bytes;
-    let slice = if truncated {
-        &bytes[..max_bytes]
-    } else {
-        &bytes[..]
-    };
+        if let Ok(data) = frame.into_data() {
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&data[..data.len().min(remaining)]);
+            if data.len() > remaining {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    let slice = &bytes;
 
     let text = String::from_utf8_lossy(slice);
 
@@ -1550,6 +1796,8 @@ mod tests {
 
     fn make_op(operation_id: &str, path: &str, params: Vec<ParamSpec>) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: operation_id.to_string(),
             path: path.to_string(),
             method: "GET".to_string(),
@@ -1568,6 +1816,8 @@ mod tests {
         params: Vec<ParamSpec>,
     ) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             operation_id: operation_id.to_string(),
             path: path.to_string(),
             method: method.to_string(),
@@ -1584,6 +1834,7 @@ mod tests {
 
     fn path_param(name: &str) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Path,
             required: true,
@@ -1597,6 +1848,7 @@ mod tests {
 
     fn query_param(name: &str, required: bool) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Query,
             required,
@@ -1610,6 +1862,7 @@ mod tests {
 
     fn body_param(name: &str, required: bool) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required,
@@ -1623,6 +1876,7 @@ mod tests {
 
     fn body_enum_param(name: &str, values: &[&str], required: bool) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Body,
             required,
@@ -1636,6 +1890,8 @@ mod tests {
 
     fn op_tagged(tag: &str) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             tags: if tag.is_empty() {
                 vec![]
             } else {
@@ -1647,6 +1903,8 @@ mod tests {
 
     fn op_tagged_with_method(tag: &str, method: &str) -> ApiOperation {
         ApiOperation {
+            has_json_body: false,
+            plugin_enabled: None,
             method: method.to_string(),
             tags: if tag.is_empty() {
                 vec![]
@@ -1655,6 +1913,14 @@ mod tests {
             },
             ..make_op("x", "/x", vec![])
         }
+    }
+
+    #[test]
+    fn plugin_names_do_not_inherit_core_permission_hints() {
+        let mut op = op_tagged("plugin.deployments");
+        op.operation_id = "plugin.deployments.list".into();
+        assert_eq!(required_read_permission(&op), None);
+        assert_eq!(required_write_permission(&op), None);
     }
 
     #[test]
@@ -1693,6 +1959,7 @@ mod tests {
 
     fn enum_query_param(name: &str, values: &[&str]) -> ParamSpec {
         ParamSpec {
+            query_serialization: None,
             name: name.to_string(),
             location: ParamLocation::Query,
             required: false,
@@ -2596,6 +2863,39 @@ mod tests {
     // -----------------------------------------------------------------------
     // Limit injection + clamping
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugin_limit_preserves_values_and_omission_for_reads_and_writes() {
+        for method in ["GET", "POST"] {
+            for (ty, values) in [
+                ("string", vec![serde_json::json!("unlimited")]),
+                ("number", vec![serde_json::json!(0.5)]),
+                (
+                    "integer",
+                    vec![serde_json::json!(0), serde_json::json!(9999)],
+                ),
+            ] {
+                let mut limit = query_param("limit", false);
+                limit.ty = ty.into();
+                let mut op = make_op(
+                    "plugin.reports.evaluate",
+                    "/x/reports/evaluate",
+                    vec![limit],
+                );
+                op.method = method.into();
+                let absent =
+                    build_request_parts(&op, &serde_json::json!({}), &[], 20, 100).unwrap();
+                assert!(absent.query.is_empty());
+                for value in values {
+                    let expected = format!("limit={}", value_to_string(&value));
+                    let request =
+                        build_request_parts(&op, &serde_json::json!({"limit":value}), &[], 20, 100)
+                            .unwrap();
+                    assert_eq!(urlencoding::decode(&request.query).unwrap(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn limit_defaults_when_absent() {

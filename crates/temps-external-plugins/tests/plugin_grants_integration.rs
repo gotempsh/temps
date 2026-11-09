@@ -309,6 +309,8 @@ async fn test_consume_ai_call_concurrent_requests_allow_exact_daily_limit() {
 
 #[tokio::test]
 async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
+    use sea_orm::EntityTrait;
+    use temps_entities::external_plugin_actors;
     use temps_migrations::{Migrator, MigratorTrait, SchemaManager};
 
     let Some(database) = boot_database().await else {
@@ -336,7 +338,16 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .into_iter()
         .find(|migration| migration.name() == "m20260916_000001_external_plugin_actors")
         .expect("actor migration must be registered");
+    let consent_migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261108_000001_external_plugin_ai_tools")
+        .expect("AI consent migration must be registered");
     let manager = SchemaManager::new(db.as_ref());
+    // Roll back dependent columns before dropping their owning table.
+    consent_migration
+        .down(&manager)
+        .await
+        .expect("rollback AI consent before actor tables");
     migration
         .down(&manager)
         .await
@@ -362,6 +373,10 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .up(&manager)
         .await
         .expect("reapply actor migration");
+    consent_migration
+        .up(&manager)
+        .await
+        .expect("reapply AI consent before using the current actor service");
     let recreated = service
         .ensure_actor(
             "rollback-plugin",
@@ -371,6 +386,14 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .await
         .expect("create actor after migration reapplication");
     assert_ne!(recreated.actor.id, grants.actor.id);
+    let recreated_id =
+        uuid::Uuid::parse_str(&recreated.actor.id).expect("recreated actor has a valid UUID");
+    let persisted = external_plugin_actors::Entity::find_by_id(recreated_id)
+        .one(db.as_ref())
+        .await
+        .expect("read recreated actor consent")
+        .expect("recreated actor is persisted");
+    assert!(!persisted.ai_tools_enabled);
     assert!(recreated.config.permissions.is_empty());
     eprintln!("Actor migration: populated up -> down (all three tables absent, users preserved) -> up passed");
 }

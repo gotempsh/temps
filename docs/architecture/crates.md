@@ -201,7 +201,7 @@ AI foundation, agents, chat, gateway and the MCP surfaces.
 | [`temps-ai`](../../crates/temps-ai) | Temps AI foundation: a governed, provider-agnostic seam for text and typed/structured output, plus reusable schemas (ADR-022) | **8**: ai-agent-cli, ai-agents, ai-chat, ai-cli, ai-gateway, analytics, external-plugins, otel |  |
 | [`temps-ai-agent-cli`](../../crates/temps-ai-agent-cli) | Bridge between AiService and AiCliProvider for subscription-backed AI workloads (ADR-037) | **2**: ai-chat, ai-gateway |  |
 | [`temps-ai-agents`](../../crates/temps-ai-agents) | AI agent runs: agent definitions, workflows and triggers, AI CLI provider logins, the autofixer, and the sandbox providers they run in | **1**: cli |  |
-| [`temps-ai-api-tools`](../../crates/temps-ai-api-tools) | Turns the REST API into a searchable, callable tool index for AI, replaying calls through the router with propose-then-confirm writes | **2**: ai-chat, cli |  |
+| [`temps-ai-api-tools`](../../crates/temps-ai-api-tools) | Turns the REST API into a searchable, callable tool index for AI, replaying calls through the router with propose-then-confirm writes | **3**: ai-chat, cli, external-plugins |  |
 | [`temps-ai-chat`](../../crates/temps-ai-chat) | Persistent, resumable AI debugging conversations attached to any entity (ADR-023) | **1**: cli |  |
 | [`temps-ai-cli`](../../crates/temps-ai-cli) | AI coding CLI providers: Claude, Codex, OpenCode and OpenAI-compatible runs, their catalog, logins and credential snapshots | **4**: ai-agent-cli, ai-agents, ai-chat, ai-gateway |  |
 | [`temps-ai-gateway`](../../crates/temps-ai-gateway) | AI gateway: OpenAI-compatible and native endpoints proxied to configured providers, with provider keys, models, pricing, usage and limits | **1**: cli |  |

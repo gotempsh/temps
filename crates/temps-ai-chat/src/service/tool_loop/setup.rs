@@ -32,7 +32,7 @@ pub(super) struct TurnInputs {
     pub(super) provider: Option<Arc<dyn ConversationContextProvider>>,
     pub(super) api_tools: Option<Arc<dyn ConversationContextProvider>>,
     pub(super) repo_tools: Option<Arc<dyn ConversationContextProvider>>,
-    pub(super) write_handle: Option<Arc<temps_ai_api_tools::InternalApiCaller>>,
+    pub(super) write_handle: Option<Arc<temps_ai_api_tools::WriteApiToolsHandle>>,
     pub(super) pending: Option<Arc<PendingActionService>>,
     pub(super) audit: Option<Arc<dyn AuditLogger>>,
     pub(super) goals: Option<crate::goals::GoalToolSupport>,

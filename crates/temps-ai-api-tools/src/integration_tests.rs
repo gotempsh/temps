@@ -786,4 +786,446 @@ mod tests {
         assert!(root.contains("Temps write API"), "{root}");
         assert!(!root.contains("read-only"), "{root}");
     }
+    fn plugin_spec() -> utoipa::openapi::OpenApi {
+        serde_json::from_value(json!({
+            "openapi":"3.1.0","info":{"title":"Reports","version":"1"},
+            "paths":{
+                "/reports":{"get":{"operationId":"list","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}},
+                    "parameters":[{"name":"project_id","in":"query","required":true,"schema":{"type":"integer"}}]},
+                    "post":{"operationId":"create","x-temps-ai-tool":{"access":"read"},"responses":{"200":{"description":"OK"}}}},
+                "/down":{"get":{"operationId":"down","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}},
+                "/slow":{"get":{"operationId":"slow","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}}
+            }
+        })).unwrap()
+    }
+
+    #[derive(Default)]
+    struct PluginAudit(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for PluginAudit {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            self.0.lock().unwrap().push(operation.serialize()?);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plugin_registry_rebuild_routes_scopes_times_out_and_audits_confirmed_writes() {
+        use crate::{
+            ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry,
+            WritePrepareOutcome,
+        };
+        use std::sync::Arc;
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let read = ApiToolsHandle::new();
+        let write = ApiToolsHandle::new();
+        let audit = Arc::new(PluginAudit::default());
+        let router = Router::new()
+            .route("/x/reports/reports", get(whoami).post(whoami))
+            .route(
+                "/x/reports/down",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route(
+                "/x/reports/slow",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    "late"
+                }),
+            );
+        for (handle, access) in [
+            (read.clone(), PluginToolAccess::Read),
+            (write.clone(), PluginToolAccess::Write),
+        ] {
+            registry.bind(
+                InternalApiCaller::new_allowlisted(router.clone(), &plugin_spec(), vec![]),
+                access,
+                audit.clone(),
+                move |caller| handle.set(caller),
+            );
+        }
+        let scope = ApiCallScope {
+            auth: auth_with_role(7, Role::PlatformAdmin),
+            project_scope: ProjectSelectorScope::Allowed(vec![42]),
+            origin: None,
+            secrets: None,
+        };
+        registry.publish(PluginToolsIndex::from_openapi("reports", &plugin_spec(), false).unwrap());
+        let disabled = read.get().unwrap();
+        assert!(disabled
+            .search("plugin.reports", &scope)
+            .iter()
+            .all(|op| !op.enabled && op.source_plugin.as_deref() == Some("reports")));
+        assert!(disabled
+            .call("plugin.reports.list", json!({}), &scope)
+            .await
+            .is_err());
+        assert!(matches!(
+            write
+                .get()
+                .unwrap()
+                .prepare_write_cli("plugin.reports.create", &scope),
+            WritePrepareOutcome::Invalid(_)
+        ));
+        registry.publish(PluginToolsIndex::from_openapi("reports", &plugin_spec(), true).unwrap());
+        let ready = read.get().unwrap();
+        assert!(ready.describe("plugin.reports.create").is_none());
+        assert_eq!(
+            ready
+                .call("plugin.reports.list", json!({}), &scope)
+                .await
+                .unwrap()
+                .body["user_id"],
+            7
+        );
+        assert!(ready
+            .call("plugin.reports.list", json!({"project_id":43}), &scope)
+            .await
+            .is_err());
+        for id in ["plugin.reports.down", "plugin.reports.slow"] {
+            let error = ready.call(id, json!({}), &scope).await.unwrap_err();
+            assert!(
+                matches!(error,crate::ApiToolError::PluginOperation { ref plugin, ref operation_id, .. } if plugin=="reports" && operation_id==id)
+            );
+        }
+        let writer = write.get().unwrap();
+        let prepared = writer.prepare_write_cli("plugin.reports.create", &scope);
+        let WritePrepareOutcome::Prepared(prepared) = prepared else {
+            panic!("expected proposal")
+        };
+        assert!(
+            audit.0.lock().unwrap().is_empty(),
+            "proposal must not execute or audit a write"
+        );
+        writer
+            .execute_write("plugin.reports.create", json!({}), &scope)
+            .await
+            .unwrap();
+        let entries = audit.0.lock().unwrap().clone();
+        assert_eq!(entries.len(), 2);
+        assert!(serde_json::from_str::<Value>(&entries[0]).unwrap()["succeeded"].is_null());
+        let entry: Value = serde_json::from_str(&entries[1]).unwrap();
+        assert_eq!(entry["plugin"], "reports");
+        assert_eq!(entry["user_id"], 7);
+        assert_eq!(entry["succeeded"], true);
+        assert!(entry["call_id"].as_str().is_some());
+        assert_eq!(
+            entry["call_id"],
+            serde_json::from_str::<Value>(&entries[0]).unwrap()["call_id"]
+        );
+        // Reload invalidates old snapshots, even if the declarations are identical.
+        registry.publish(PluginToolsIndex::from_openapi("reports", &plugin_spec(), true).unwrap());
+        assert!(ready
+            .call("plugin.reports.list", json!({}), &scope)
+            .await
+            .is_err());
+        assert!(read
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", json!({}), &scope)
+            .await
+            .is_ok());
+        // Actual confirmation fetches the NEW handle, not the retained writer.
+        let latest = write.get().unwrap();
+        assert!(latest
+            .execute_approved_write(
+                "plugin.reports.create",
+                json!({}),
+                &scope,
+                prepared.plugin_revision.as_deref()
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            audit.0.lock().unwrap().len(),
+            2,
+            "a stale approval never executes"
+        );
+        // Uninstall removes discovery and revokes an already prepared writer.
+        registry.publish(PluginToolsIndex::default());
+        assert!(read
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        assert!(writer
+            .execute_write("plugin.reports.create", json!({}), &scope)
+            .await
+            .is_err());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_audits_do_not_block_plugin_write_completion() {
+        use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct StalledAudit {
+            calls: AtomicUsize,
+            stall_call: usize,
+        }
+        #[async_trait::async_trait]
+        impl temps_core::AuditLogger for StalledAudit {
+            async fn create_audit_log(
+                &self,
+                _: &dyn temps_core::audit::AuditOperation,
+            ) -> temps_core::AuditResult<()> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.stall_call {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        }
+        for stall_call in [0, 1] {
+            let executed = Arc::new(AtomicUsize::new(0));
+            let count = executed.clone();
+            let router = Router::new().route(
+                "/x/reports/reports",
+                axum::routing::post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { Json(json!({"created":true})) }
+                }),
+            );
+            let spec = plugin_spec();
+            let registry = Arc::new(PluginToolsRegistry::default());
+            let handle = ApiToolsHandle::new();
+            let target = handle.clone();
+            let audit = Arc::new(StalledAudit {
+                calls: AtomicUsize::new(0),
+                stall_call,
+            });
+            registry.bind(
+                InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+                PluginToolAccess::Write,
+                audit.clone(),
+                move |caller| target.set(caller),
+            );
+            registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                handle.get().unwrap().execute_write(
+                    "plugin.reports.create",
+                    json!({}),
+                    &secrets_scope(None),
+                ),
+            )
+            .await
+            .expect("audit must not exceed its budget")
+            .unwrap();
+            assert_eq!(result.body["created"], true);
+            assert_eq!(executed.load(Ordering::SeqCst), 1);
+            assert_eq!(audit.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_plugin_writes_leave_an_audit_attempt() {
+        use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};
+        use std::sync::Arc;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let router = Router::new().route(
+            "/x/reports/create",
+            axum::routing::post(move || {
+                let notify = notify.clone();
+                async move {
+                    notify.notify_one();
+                    std::future::pending::<String>().await
+                }
+            }),
+        );
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"OK"}}}}}})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        let audit = Arc::new(PluginAudit::default());
+        registry.bind(
+            InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Write,
+            audit.clone(),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let caller = handle.get().unwrap();
+        let task = tokio::spawn(async move {
+            caller
+                .execute_write("plugin.reports.create", json!({}), &secrets_scope(None))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event: Value = serde_json::from_str(&events[0]).unwrap();
+        assert!(
+            event["succeeded"].is_null(),
+            "unknown outcome must not be reported as failure or success"
+        );
+        assert_eq!(event["operation_id"], "plugin.reports.create");
+    }
+
+    #[tokio::test]
+    async fn plugin_responses_keep_size_caps_secret_scrubbing_and_failure_audits() {
+        use crate::{ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry};
+        use std::sync::Arc;
+        let mut spec = serde_json::to_value(sources_openapi()).unwrap();
+        spec["paths"]["/sources"]["post"]["x-temps-ai-tool"] = json!({});
+        let spec = serde_json::from_value(spec).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        let audit = Arc::new(PluginAudit::default());
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        registry.bind(
+            InternalApiCaller::new_write_allowlisted(
+                Router::new().nest("/x/reports", sources_router(seen.clone())),
+                &spec,
+                vec![],
+            )
+            .with_max_response_bytes(256),
+            PluginToolAccess::Write,
+            audit.clone(),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = secrets_scope(Some(Arc::new(OneSecret)));
+        let caller = handle.get().unwrap();
+        let response = caller
+            .execute_write(
+                "plugin.reports.create_source",
+                json!({"name":"report", "secret_key":SECRET_HANDLE}),
+                &scope,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["secret_key"],
+            SECRET_VALUE
+        );
+        assert!(!response.body.to_string().contains(SECRET_VALUE));
+        let error = caller
+            .execute_write(
+                "plugin.reports.create_source",
+                json!({"name":"reject", "secret_key":SECRET_HANDLE}),
+                &scope,
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains(SECRET_VALUE));
+        let response = caller
+            .execute_write(
+                "plugin.reports.create_source",
+                json!({"name":"x".repeat(2048), "secret_key":SECRET_HANDLE}),
+                &scope,
+            )
+            .await
+            .unwrap();
+        assert!(response.truncated);
+        assert!(response.body.as_str().unwrap().len() <= 256);
+        assert!(!response.body.to_string().contains(SECRET_VALUE));
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            serde_json::from_str::<Value>(&events[3]).unwrap()["succeeded"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn read_templates_cannot_dispatch_static_or_nested_write_and_unmarked_routes() {
+        use crate::{
+            ApiToolsHandle, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry,
+            WritePrepareOutcome,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mutation = move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Json(json!({"changed":true})) }
+        };
+        let router = Router::new()
+            .route(
+                "/x/reports/reports/{id}",
+                get(|| async { Json(json!({"read":true})) }),
+            )
+            .route(
+                "/x/reports/reports/{id}/{part}",
+                get(|| async { Json(json!({"read":true})) }),
+            )
+            .route("/x/reports/reports/reset", get(mutation.clone()))
+            .route("/x/reports/reports/private", get(mutation.clone()))
+            .route("/x/reports/reports/reset/{part}", get(mutation));
+        let spec = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{
+            "/reports/{id}":{"get":{"operationId":"read","x-temps-ai-tool":{},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}},
+            "/reports/{id}/{part}":{"get":{"operationId":"part","x-temps-ai-tool":{},"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"part","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}},
+            "/reports/reset":{"get":{"operationId":"reset","x-temps-ai-tool":{"access":"write"},"responses":{"200":{"description":"ok"}}}},
+            "/reports/private":{"get":{"operationId":"private","responses":{"200":{"description":"ok"}}}},
+            "/reports/reset/{part}":{"get":{"operationId":"reset_part","x-temps-ai-tool":{"access":"write"},"parameters":[{"name":"part","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}
+        }})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let read = ApiToolsHandle::new();
+        let write = ApiToolsHandle::new();
+        for (handle, access) in [
+            (read.clone(), PluginToolAccess::Read),
+            (write.clone(), PluginToolAccess::Write),
+        ] {
+            registry.bind(
+                InternalApiCaller::new_allowlisted(router.clone(), &spec, vec![]),
+                access,
+                Arc::new(temps_core::audit::NoopAuditLogger),
+                move |caller| handle.set(caller),
+            );
+        }
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: auth_with_role(7, Role::PlatformAdmin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let reader = read.get().unwrap();
+        assert!(reader
+            .call("plugin.reports.read", json!({"id":"123"}), &scope)
+            .await
+            .is_ok());
+        for (operation, params) in [
+            ("plugin.reports.read", json!({"id":"reset"})),
+            ("plugin.reports.read", json!({"id":"private"})),
+            (
+                "plugin.reports.part",
+                json!({"id":"reset","part":"summary"}),
+            ),
+        ] {
+            let error = reader.call(operation, params, &scope).await.unwrap_err();
+            assert!(
+                matches!(error, crate::ApiToolError::PluginOperation { ref plugin, ref operation_id, .. } if plugin=="reports" && operation_id==operation)
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let writer = write.get().unwrap();
+        let prepared = match writer.prepare_write_cli("plugin.reports.reset", &scope) {
+            WritePrepareOutcome::Prepared(prepared) => prepared,
+            _ => panic!("the explicit write operation must still be preparable"),
+        };
+        writer
+            .execute_approved_write(
+                &prepared.operation_id,
+                prepared.params,
+                &scope,
+                prepared.plugin_revision.as_deref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

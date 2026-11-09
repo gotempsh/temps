@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PluginAiTools } from '@/components/plugins/PluginAiTools'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Button } from '@/components/ui/button'
@@ -281,6 +282,10 @@ export function PluginPage() {
           )}
         </div>
       )}
+
+      <div className="px-4 py-3 border-b shrink-0">
+        <PluginAiTools key={plugin.name} name={plugin.name} />
+      </div>
 
       {/* iframe container */}
       {hasError ? (

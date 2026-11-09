@@ -39,6 +39,7 @@ import {
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { DeliveryDetailDialog } from './DeliveryDetailDialog'
+import { openExternal } from '@/lib/open-external'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 interface WebhookDetailProps {
@@ -258,7 +259,7 @@ export function WebhookDetail({ project }: WebhookDetailProps) {
                 aria-label="Open webhook URL in a new tab"
                 variant="ghost"
                 size="sm"
-                onClick={() => window.open(webhook.url, '_blank')}
+                onClick={() => openExternal(webhook.url)}
               >
                 <ExternalLink className="h-4 w-4" />
               </Button>

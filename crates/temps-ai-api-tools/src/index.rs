@@ -38,6 +38,9 @@
 //! | Object required      | `obj.required: Vec<String>`                               |
 //! | $ref location        | `Ref::ref_location: String`                               |
 
+mod plugin;
+pub use plugin::{PluginTool, PluginToolAccess, PluginToolsError, PluginToolsIndex};
+
 use std::collections::{BTreeMap, HashMap};
 
 use crate::secrets::{secret_paths_for_request_body, SecretPath};
@@ -182,6 +185,9 @@ impl ObjectShape {
 /// Compact description of a single parameter, extracted from the utoipa schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamSpec {
+    /// Plugin query wire format. None preserves the curated core API behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_serialization: Option<crate::QuerySerialization>,
     /// Parameter name as it appears in the path template, query string, or
     /// request body JSON object.
     pub name: String,
@@ -190,7 +196,8 @@ pub struct ParamSpec {
     /// Whether the parameter must be supplied (path params are always required).
     pub required: bool,
     /// JSON Schema type as a short string ("string", "integer", "number",
-    /// "boolean", "array", "object", or "any").  Derived from the utoipa
+    /// "boolean", "array", "object", "any", or "json" for composite plugin
+    /// inputs requiring explicit JSON encoding). Derived from the utoipa
     /// `SchemaType`; defaults to "string" when the schema is absent or
     /// is a `$ref` (the full schema is not resolved here — Phase 2).
     pub ty: String,
@@ -217,6 +224,12 @@ pub struct ParamSpec {
 /// A single operation kept in the index (GET *or* an allowlisted write method).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiOperation {
+    /// Plugin JSON body metadata, including schemas with no flattened fields.
+    #[serde(default)]
+    pub has_json_body: bool,
+    /// Host-owned plugin consent; never inferred from untrusted descriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_enabled: Option<bool>,
     /// Stable identifier for this operation, used as the tool call name.
     pub operation_id: String,
     /// URL path template, e.g. `/projects/{project_id}/deployments/{id}`.
@@ -242,6 +255,9 @@ pub struct ApiOperation {
 /// Compact view returned by [`ReadOnlyApiIndex::search`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationSummary {
+    pub source_plugin: Option<String>,
+    pub enabled: bool,
+    pub setup_path: Option<String>,
     pub operation_id: String,
     pub method: String,
     pub path: String,
@@ -252,7 +268,17 @@ pub struct OperationSummary {
 
 impl From<&ApiOperation> for OperationSummary {
     fn from(op: &ApiOperation) -> Self {
+        let source_plugin = op
+            .operation_id
+            .strip_prefix("plugin.")
+            .and_then(|id| id.split_once('.'))
+            .map(|(name, _)| name.to_owned());
         Self {
+            setup_path: source_plugin
+                .as_ref()
+                .map(|name| format!("/plugins/{name}")),
+            source_plugin,
+            enabled: op.plugin_enabled.unwrap_or(true),
             operation_id: op.operation_id.clone(),
             method: op.method.clone(),
             path: op.path.clone(),
@@ -725,6 +751,8 @@ fn build_api_operation(
     params.extend_from_slice(extra_params);
 
     ApiOperation {
+        has_json_body: false,
+        plugin_enabled: None,
         operation_id,
         path,
         method: method.to_string(),
@@ -847,6 +875,7 @@ fn resolve_body_params(op: &Operation, openapi: &utoipa::openapi::OpenApi) -> Ve
         };
 
         params.push(ParamSpec {
+            query_serialization: None,
             name: prop_name.clone(),
             location: ParamLocation::Body,
             required,
@@ -1053,6 +1082,7 @@ fn build_param_spec(param: &utoipa::openapi::path::Parameter) -> Option<ParamSpe
     let (ty, enum_values) = extract_type_and_enum(param.schema.as_ref());
 
     Some(ParamSpec {
+        query_serialization: None,
         name: param.name.clone(),
         location,
         required,
