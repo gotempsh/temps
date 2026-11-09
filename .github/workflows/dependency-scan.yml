@@ -209,27 +209,31 @@ jobs:
       #   return uninitialized page-cache memory when it opens a database
       #   together with a crafted sibling `-wal` file of a different page
       #   size; fixed in >= 0.39.0). Cargo.lock has one copy, 0.30.1, shared
-      #   by two consumers, and the crate is `links = "sqlite3"`, so no
-      #   second, patched copy can coexist:
-      #   * sqlx-sqlite 0.8, enabled by sea-orm 1.1's `sqlx-sqlite` feature;
-      #     sqlx 0.8 requires libsqlite3-sys 0.30, which has no patched
-      #     release. Not reachable on disk: temps-database only accepts
-      #     postgres:// URLs (connection.rs parse_database_url), SQLite is
-      #     used through `sqlite::memory:` connections in tests, and the
-      #     legacy SQLite branch of the backup restore (temps-backup
-      #     restore.rs) only runs for a sqlite: database URL, which the
-      #     server cannot start with.
-      #   * sqlx-sqlite 0.9 (capped at libsqlite3-sys < 0.38), used by
-      #     microsandbox-db, part of the exactly pinned microsandbox SDK
-      #     (temps-sandbox-providers; not linked on musl or Intel macOS).
-      #     Reachable: when the experimental microsandbox backend is used,
-      #     the server opens the SDK's on-disk catalog under
-      #     `<data_dir>/microsandbox/db/` in WAL mode, and the `msb` VMM
-      #     process writes the same catalog. Planting a crafted `-wal` there
-      #     takes write access to that 0700, Temps-owned directory: the
-      #     Temps user itself, or a guest that has already escaped into the
-      #     VMM, which ADR-050 treats as holding whatever the VMM can reach.
-      #     That residual risk is accepted until a patched copy is reachable.
+      #   by sqlx-sqlite 0.8 (sea-orm 1.1's `sqlx-sqlite` feature; sqlx 0.8
+      #   requires libsqlite3-sys 0.30, which has no patched release) and
+      #   sqlx-sqlite 0.9 (microsandbox-db in the exactly pinned microsandbox
+      #   SDK; capped at libsqlite3-sys < 0.38). The crate is
+      #   `links = "sqlite3"`, so no second, patched copy can coexist.
+      #   It is reachable. Two code paths open an on-disk database in WAL
+      #   mode:
+      #   * `temps edge` opens `<cache_dir>/analytics.db` through sea-orm and
+      #     sets `journal_mode = WAL` (temps-edge analytics.rs
+      #     AnalyticsStore::open). The cache dir defaults to
+      #     `~/.temps/edge-cache` and is created with the default umask.
+      #   * the experimental microsandbox backend (not linked on musl or
+      #     Intel macOS) opens the SDK's catalog under
+      #     `<data_dir>/microsandbox/db/` in WAL mode in the server process;
+      #     the `msb` VMM process writes the same catalog. The SDK home is
+      #     0700 and Temps-owned.
+      #   The main server database is never SQLite: temps-database only
+      #   accepts postgres:// URLs, and the other SQLite uses are
+      #   `sqlite::memory:` connections and mocks in tests.
+      #   Planting a crafted `-wal` next to either file takes write access to
+      #   a directory the Temps user owns: the Temps user itself (or root), an
+      #   operator who pointed `--cache-dir` at a shared writable path, or,
+      #   for the catalog, a guest that has already escaped into the VMM,
+      #   which ADR-050 treats as holding whatever the VMM can reach. That
+      #   residual risk is accepted until a patched copy is reachable.
       #   Drop this entry once both sea-orm's sqlx and microsandbox-db allow
       #   libsqlite3-sys >= 0.39.
       # Remove an entry once its upstream is fixed/replaced.
