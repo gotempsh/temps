@@ -25,6 +25,7 @@ import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
 import { EnvironmentIngressCard } from './EnvironmentIngressCard'
 import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
 import { PurgeAssetCacheCard } from './PurgeAssetCacheCard'
+import { InternalAccessCard } from '../InternalAccessCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
@@ -281,6 +282,16 @@ export function EnvironmentDetail({
         projectId={project.id}
         environmentId={environment.id}
         scopeName={environment.name}
+      />
+
+      <InternalAccessCard
+        key={`internal-access:${environment.id}`}
+        projectId={project.id}
+        projectName={project.name}
+        projectSlug={project.slug}
+        environmentId={environment.id}
+        environmentName={environment.name}
+        environmentSlug={environment.slug}
       />
 
       <EnvironmentIngressCard
