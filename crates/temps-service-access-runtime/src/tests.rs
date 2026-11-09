@@ -532,6 +532,45 @@ async fn worker_releases_admission_after_binding_drop() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn closed_proxy_response_releases_capacity_with_guest_write_half_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new().await;
+    let token = f.mint(true).await;
+    let version = f.install().await;
+    let mut spec = f.spec(token);
+    spec.max_connections = MAX_SANDBOX_CONNECTIONS;
+    let binding = f.proxy.bind(spec, version).await.unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let attachment = UnixAttachment::bind(root.path(), Arc::clone(&binding)).unwrap();
+    let mut retained = Vec::new();
+    for _ in 0..=MAX_SANDBOX_CONNECTIONS {
+        let mut guest = tokio::net::UnixStream::connect(attachment.directory().join("proxy.sock"))
+            .await
+            .unwrap();
+        guest.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), guest.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        // Intentionally retain the guest writer even after the proxy sends EOF.
+        retained.push(guest);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while binding.own_connections.available_permits() != MAX_SANDBOX_CONNECTIONS
+                || binding.tls_connections.available_permits() != MAX_WORKER_CONNECTIONS
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed response retained host connection permits");
+    }
+    assert_eq!(retained.len(), MAX_SANDBOX_CONNECTIONS + 1);
+}
+
+#[cfg(unix)]
 async fn idle_guest_tunnel(attachment: &UnixAttachment) -> tokio::net::UnixStream {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut guest = tokio::net::UnixStream::connect(attachment.directory().join("proxy.sock"))

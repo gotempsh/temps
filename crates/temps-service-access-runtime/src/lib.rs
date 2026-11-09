@@ -4,6 +4,7 @@
 //! Trusted worker proxy. Only authenticated host code installs snapshots and
 //! creates attachments. Guest byte streams receive a specific binding and may
 //! never select their own identity, session or node.
+mod bridge;
 mod control;
 pub use control::{PublicCertificate, WorkerAuthority, WorkerControl, WorkerIdentity};
 mod protocol;
@@ -105,7 +106,7 @@ impl SandboxBinding {
     pub fn status(&self) -> BindingStatus {
         self.inner.status()
     }
-    pub async fn serve<S>(&self, mut stream: S) -> Result<(), RuntimeError>
+    pub async fn serve<S>(&self, stream: S) -> Result<(), RuntimeError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
@@ -136,22 +137,35 @@ impl SandboxBinding {
                 workload_tls.accept(server)
             )
         };
-        let (mut client, server) = tokio::time::timeout(Duration::from_secs(5), handshake)
+        let (client, server) = tokio::time::timeout(Duration::from_secs(5), handshake)
             .await
             .map_err(|_| RuntimeError::Invalid {
                 operation: "connect workload TLS",
                 binding: self.id().into(),
                 reason: "handshake deadline exceeded",
             })??;
-        let (_, result) = tokio::join!(
-            tokio::io::copy_bidirectional(&mut stream, &mut client),
-            self.inner.serve(server)
-        );
-        result.map_err(|source| RuntimeError::DataPlane {
-            operation: "forward traffic",
-            binding: self.id().into(),
-            source,
-        })
+        tokio::try_join!(
+            async {
+                bridge::forward(stream, client)
+                    .await
+                    .map_err(|source| RuntimeError::Attachment {
+                        operation: "bridge workload response",
+                        binding: self.id().into(),
+                        source,
+                    })
+            },
+            async {
+                self.inner
+                    .serve(server)
+                    .await
+                    .map_err(|source| RuntimeError::DataPlane {
+                        operation: "forward traffic",
+                        binding: self.id().into(),
+                        source,
+                    })
+            }
+        )?;
+        Ok(())
     }
 
     pub async fn revoke_and_wait(&self, timeout: Duration) -> Result<CutReport, RuntimeError> {
