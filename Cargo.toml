@@ -4,6 +4,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/patches/libsqlite3-sys-compat",
     # Application crates
     "crates/temps-cli",
     "crates/temps-vm-agent",
@@ -751,3 +752,6 @@ debug = false
 # crate drags in opentelemetry_sdk 0.30 (GHSA-w9wp-h8wv-79jx). See item 2b above
 # and crates/patches/opentelemetry-proto-unused/Cargo.toml.
 opentelemetry-proto = { path = "crates/patches/opentelemetry-proto-unused" }
+
+# SQLx compatibility layer; the native library is libsqlite3-sys 0.39.1.
+libsqlite3-sys = { path = "crates/patches/libsqlite3-sys-compat" }

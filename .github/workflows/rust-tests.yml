@@ -1121,7 +1121,7 @@ jobs:
             # that crate.
             filter: >-
               ((package(temps-providers*) and not test(/^query::/)) or package(temps-presets) or
-              package(temps-auth) or package(temps-core) or
+              package(temps-auth) or package(temps-core) or package(libsqlite3-sys) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
