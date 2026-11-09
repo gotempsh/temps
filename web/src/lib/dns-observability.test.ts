@@ -19,6 +19,8 @@ import {
   parseIntParam,
   parsePageSize,
   recordTestParams,
+  redirectMissing,
+  routingAddress,
   testValuesFromUrl,
   withParams,
   trafficPoints,
@@ -184,6 +186,104 @@ describe('nodeDnsHealth', () => {
       note: 'The node is offline',
       problem: null,
     })
+  })
+})
+
+describe('internal routing with its own port (ADR-098)', () => {
+  /** A worker whose agent could not install the port-80 redirect. */
+  const fallback = {
+    listening: true,
+    address: '10.205.0.1:80',
+    mode: 'direct' as const,
+    redirect: 'missing' as const,
+    redirect_error: 'nft (nftables) is not installed on this worker',
+  }
+  const worker = (internal_proxy: DnsResolverEntry['internal_proxy']) =>
+    resolver({
+      node_id: 4,
+      node_name: 'master',
+      is_control_plane: false,
+      internal_proxy,
+    })
+
+  test('labels: redirected, direct on port 80, working, down, not reported', () => {
+    expect(
+      nodeDnsHealth(
+        worker({
+          listening: true,
+          address: '10.205.0.1:80',
+          mode: 'redirect',
+          redirect: 'installed',
+          proxy_address: '10.205.0.1:591',
+        }),
+        true
+      ).routing
+    ).toMatchObject({ tone: 'ok', label: 'Redirected', reason: null })
+    expect(nodeDnsHealth(worker(fallback), true).routing).toMatchObject({
+      tone: 'warn',
+      label: 'Direct on port 80',
+      // The agent's own reason, never advice the page made up.
+      reason: 'nft (nftables) is not installed on this worker',
+    })
+    // Not Linux: direct is all there is, nothing to fix.
+    expect(
+      nodeDnsHealth(worker({ ...fallback, redirect: 'unsupported' }), true)
+        .routing
+    ).toMatchObject({ tone: 'ok', label: 'Working' })
+    // An agent from before ADR-098.
+    expect(
+      nodeDnsHealth(worker({ listening: true }), true).routing
+    ).toMatchObject({ tone: 'ok', label: 'Working' })
+    expect(
+      nodeDnsHealth(worker({ listening: false, mode: 'down' }), true).routing
+    ).toMatchObject({ tone: 'error', label: 'Down' })
+    expect(nodeDnsHealth(worker({}), true).routing?.label).toBe('Not reported')
+  })
+
+  test('redirectMissing is only the served fallback, not down or unsupported', () => {
+    expect(redirectMissing(fallback)).toBe(true)
+    expect(redirectMissing({ ...fallback, redirect: 'unsupported' })).toBe(
+      false
+    )
+    expect(redirectMissing({ ...fallback, listening: false })).toBe(false)
+    expect(redirectMissing(null)).toBe(false)
+  })
+
+  test('a missing redirect warns but does not fail the summary', () => {
+    const health = nodeDnsHealth(worker(fallback), true)
+    expect(health.tone).toBe('warn')
+    expect(health.problem).toMatchObject({ area: 'routing' })
+    expect(health.problem?.why).toContain('10.205.0.1:80')
+    expect(dnsSummary([resolver({}), worker(fallback)], true)).toMatchObject({
+      tone: 'warn',
+      label: 'Port-80 redirect missing on 1 node',
+    })
+    // A node that is down wins over the warning.
+    expect(
+      dnsSummary(
+        [
+          worker(fallback),
+          resolver({
+            node_id: 5,
+            is_control_plane: false,
+            internal_proxy: { listening: false },
+          }),
+        ],
+        true
+      ).tone
+    ).toBe('error')
+  })
+
+  test('the address shows where a redirect sends port 80', () => {
+    expect(
+      routingAddress({
+        address: '10.205.0.1:80',
+        mode: 'redirect',
+        proxy_address: '10.205.0.1:591',
+      })
+    ).toBe('10.205.0.1:80 → 10.205.0.1:591')
+    expect(routingAddress(fallback)).toBe('10.205.0.1:80')
+    expect(routingAddress(null)).toBeNull()
   })
 })
 

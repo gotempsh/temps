@@ -12,6 +12,7 @@ import {
   DNS_PARAMS,
   formatAge,
   nodeRowId,
+  routingAddress,
   withParams,
   type ClusterDnsResolversResponse,
   type DnsFacet,
@@ -84,7 +85,7 @@ function NodeDetails({
         <Fact label="Listens on">{resolver.listen_address ?? '—'}</Fact>
         <Fact label="Internal routing on">
           {resolver.internal_proxy
-            ? (resolver.internal_proxy.address ?? '—')
+            ? (routingAddress(resolver.internal_proxy) ?? '—')
             : 'Main proxy'}
         </Fact>
         <Fact label="Version">{resolver.build_version ?? '—'}</Fact>

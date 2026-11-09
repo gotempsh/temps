@@ -57,7 +57,10 @@ const resolvers: ClusterDnsResolversResponse = {
       internal_proxy: {
         listening: false,
         address: '10.205.0.1:80',
-        error: 'another program already listens on 10.205.0.1:80',
+        error:
+          "containers' calls to port 80 of 10.205.0.1 are not redirected to the internal proxy on 10.205.0.1:591: nft (nftables) is not installed on this worker",
+        mode: 'down',
+        redirect: 'missing',
       },
       running: false,
       tasks_alive: false,
@@ -289,6 +292,9 @@ describe('DnsPage', () => {
     expect(html).toContain('DNS resolver down on worker-a')
     expect(html).toContain('href="/settings/notifications"')
     expect(html).toContain('href="/settings/nodes/7"')
+    // Port 80 held by another program is no longer the operator's to free
+    // (ADR-098): the agent redirects around it.
+    expect(html).not.toContain('Free port 80')
     expect(html).toContain('Main proxy')
     // The cluster-DNS switch is on this tab too.
     expect(html).toContain('Cluster DNS')

@@ -24161,7 +24161,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/InternalProxyState",
-                "description": "The worker's internal edge proxy, which serves the HTTP behind every\n`<env>.<project>.temps.local` name on that node. `None` for the\ncontrol plane, whose main proxy does this."
+                "description": "The worker's internal routing, which serves the HTTP behind every\n`<env>.<project>.temps.local` name on that node (ADR-098). `None`\nfor the control plane, whose main proxy does this."
               },
               {
                 "type": "null"
@@ -39439,31 +39439,85 @@
         ]
       },
       "InternalProxyState": {
-        "description": "A worker's internal edge proxy, from its heartbeat's\n`capacity.internal_proxy`. Every `<env>.<project>.temps.local` name\npoints at the node's bridge, port 80, where this proxy listens: the\nresolver can be healthy while the proxy is not, and then the names\nresolve and every call to them fails.",
+        "description": "A worker's internal routing, from its heartbeat's\n`capacity.internal_proxy`. Every `<env>.<project>.temps.local` name\npoints at the node's bridge, port 80: the resolver can be healthy while\nnothing serves those calls, and then the names resolve and every call to\nthem fails.",
         "properties": {
           "address": {
-            "description": "The address it binds, e.g. `10.205.0.1:80`.",
+            "description": "What containers call, e.g. `10.205.0.1:80`.",
             "type": [
               "string",
               "null"
             ]
           },
           "error": {
-            "description": "Why the last bind failed; `None` while it listens.",
+            "description": "Why the calls are not served; `None` while they are.",
             "type": [
               "string",
               "null"
             ]
           },
           "listening": {
-            "description": "`None` when the agent does not report it (an older agent, or no\noverlay bridge yet): unknown, never \"not listening\".",
+            "description": "Whether containers' calls to port 80 of the bridge address are\nserved. `None` when the agent does not report it (an older agent, or\nno overlay bridge yet): unknown, never \"not listening\".",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRoutingMode",
+                "description": "How they are served. `None` from an agent older than ADR-098, which\nonly ever binds port 80 directly."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "proxy_address": {
+            "description": "The proxy's own listener, e.g. `10.205.0.1:591`, while the agent\nholds it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "redirect": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRedirectState",
+                "description": "Whether the redirect is in place; `None` from an older agent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "redirect_error": {
+            "description": "Why the redirect is missing, also while the fallback serves.",
+            "type": [
+              "string",
               "null"
             ]
           }
         },
         "type": "object"
+      },
+      "InternalRedirectState": {
+        "description": "Whether a worker's port-80 redirect is in place.",
+        "enum": [
+          "installed",
+          "missing",
+          "unsupported"
+        ],
+        "type": "string"
+      },
+      "InternalRoutingMode": {
+        "description": "How a worker serves port 80 of its bridge address (ADR-098 D5).",
+        "enum": [
+          "redirect",
+          "direct",
+          "down"
+        ],
+        "type": "string"
       },
       "IpAccessCidrEntry": {
         "description": "One CIDR in a policy, in canonical form (network address, explicit prefix).",
@@ -45248,23 +45302,59 @@
             ]
           },
           "internal_proxy_address": {
-            "description": "The address the proxy binds, e.g. `10.205.0.1:80`.",
+            "description": "What containers call, e.g. `10.205.0.1:80`.",
             "type": [
               "string",
               "null"
             ]
           },
           "internal_proxy_error": {
-            "description": "Why the last bind failed, written for the operator; `None` while it\nlistens.",
+            "description": "Why the calls are not served, written for the operator; `None` while\nthey are.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "internal_proxy_listen_address": {
+            "description": "The proxy's own listener, e.g. `10.205.0.1:591`, while the agent\nholds it.",
             "type": [
               "string",
               "null"
             ]
           },
           "internal_proxy_listening": {
-            "description": "Whether the node's internal edge proxy listens on its bridge address\n(port 80), which is where every `<env>.<project>.temps.local` name\npoints. The resolver can be healthy while this is `false`: the names\nresolve and every call fails. `None` = not reported (older agent, or\nno overlay bridge yet).",
+            "description": "Whether containers' calls to port 80 of the node's bridge address,\nwhere every `<env>.<project>.temps.local` name points, are served.\nThe resolver can be healthy while this is `false`: the names resolve\nand every call fails. `None` = not reported (older agent, or no\noverlay bridge yet).",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "internal_proxy_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRoutingMode",
+                "description": "How the calls are served (ADR-098): `redirect` to the proxy's own\nport, the `direct` fallback on port 80, or `down`. `None` from an\nolder agent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "internal_proxy_redirect": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/InternalRedirectState",
+                "description": "Whether the port-80 redirect is in place; `None` from an older agent."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "internal_proxy_redirect_error": {
+            "description": "Why the redirect is missing, also while the fallback serves.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -171337,14 +171427,6 @@
       "name": "Metrics"
     },
     {
-      "description": "Key-Value storage operations",
-      "name": "KV Store"
-    },
-    {
-      "description": "KV service management operations",
-      "name": "KV Management"
-    },
-    {
       "description": "Blob storage operations",
       "name": "Blob"
     },
@@ -171481,10 +171563,6 @@
       "name": "Logs"
     },
     {
-      "description": "Import workloads from external sources",
-      "name": "Imports"
-    },
-    {
       "description": "Status page and monitoring endpoints",
       "name": "Status Page"
     },
@@ -171575,6 +171653,18 @@
     {
       "description": "What each workload may reach, and whether a node enforces it",
       "name": "Network Policy"
+    },
+    {
+      "description": "Key-Value storage operations",
+      "name": "KV Store"
+    },
+    {
+      "description": "KV service management operations",
+      "name": "KV Management"
+    },
+    {
+      "description": "Import workloads from external sources",
+      "name": "Imports"
     }
   ]
 }

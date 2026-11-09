@@ -30,7 +30,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::handlers::types::NodeAdminState;
 use crate::services::cluster_dns::{
     dns_nodes, resolver_health, ClusterDnsError, DnsNode, HealthInput, InternalProxyState,
-    ResolverHealth, TestResolution,
+    InternalRedirectState, InternalRoutingMode, ResolverHealth, TestResolution,
 };
 
 const CONTROL_PLANE_NAME: &str = "control plane";
@@ -107,9 +107,9 @@ pub struct DnsResolverEntry {
     pub last_error: Option<String>,
     /// Query-log entries the resolver dropped under load.
     pub dropped_log_entries: i64,
-    /// The worker's internal edge proxy, which serves the HTTP behind every
-    /// `<env>.<project>.temps.local` name on that node. `None` for the
-    /// control plane, whose main proxy does this.
+    /// The worker's internal routing, which serves the HTTP behind every
+    /// `<env>.<project>.temps.local` name on that node (ADR-098). `None`
+    /// for the control plane, whose main proxy does this.
     pub internal_proxy: Option<InternalProxyState>,
 }
 
@@ -777,6 +777,8 @@ pub async fn resolve_dns_name(
         DnsAlertEntry,
         ResolverHealth,
         InternalProxyState,
+        InternalRoutingMode,
+        InternalRedirectState,
         DnsRecordListResponse,
         DnsRecordEntry,
         DnsQueryLogResponse,

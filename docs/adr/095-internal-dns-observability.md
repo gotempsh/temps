@@ -4,6 +4,8 @@
 
 Proposed — 2026-11-08
 
+**Amended by:** [ADR-098](./098-internal-proxy-own-port.md)
+
 Related: ADR-011 (internal DNS and the per-node resolver), ADR-024 (the
 control-plane resolver), ADR-025 (unified alarm log), ADR-055 §9–§10 (DNS
 policy for restricted workloads, environment names), ADR-061 (worker metrics,
@@ -150,12 +152,16 @@ point):
   the control plane no local resolver) and
   why, version, records served against the zone's, last sync and failed
   syncs in a row, listen address, last report, and **internal routing**:
-  whether the worker's internal edge proxy listens on its bridge address
-  (port 80), from the heartbeat's `capacity.internal_proxy`, with the bind
-  error when it does not. Every `<env>.<project>.temps.local` name points
-  there, so a healthy resolver in front of a proxy that cannot bind (another
-  program holds the port) resolves names whose every call fails; the page
-  says so instead of showing the node healthy. The agent retries the bind
+  whether containers' calls to port 80 of the worker's bridge address are
+  served, from the heartbeat's `capacity.internal_proxy`, with the reason
+  when they are not. Every `<env>.<project>.temps.local` name points there,
+  so a healthy resolver in front of routing that is down resolves names
+  whose every call fails; the page says so instead of showing the node
+  healthy. Since [ADR-098](./098-internal-proxy-own-port.md) the proxy
+  listens on its own port (591) and an nftables rule redirects those calls
+  to it, so another program on port 80 of the host no longer takes them;
+  the column shows *Redirected*, *Direct on port 80* (the fallback, with
+  why the redirect is missing), *Down* or *Not reported*. The agent retries
   with backoff rather than giving up after one attempt.
 - **Traffic:** one node at a time, over 1 h, 6 h, 24 h or 7 d: internal
   queries by outcome, the NXDOMAIN rate on its own chart, and totals
@@ -204,8 +210,11 @@ own when the condition clears. Only while cluster DNS is on:
   and alerts nobody. The message names the top failing names.
 
 - **`dns_internal_proxy_down`** (critical): an active worker whose
-  internal edge proxy reports not listening on two evaluations in a row.
-  Not raised for an agent that does not report it (unknown is not down).
+  internal routing reports its port-80 calls not served (`listening:
+  false`) on two evaluations in a row. Not raised for an agent that does not
+  report it (unknown is not down), nor for one serving through the port-80
+  fallback ([ADR-098](./098-internal-proxy-own-port.md) D4), which the page
+  shows as a warning.
 
 The thresholds are constants in this version.
 

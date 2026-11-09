@@ -425,12 +425,52 @@ function lookupsFacet(resolver: DnsResolverEntry): DnsFacet {
 }
 
 /** Internal routing: the worker's proxy behind its `*.temps.local` names. */
+/**
+ * Served, but through the agent's fallback on port 80 because the port-80
+ * redirect to the internal proxy is missing (ADR-098): the agent holds port
+ * 80 of the bridge address, and `redirect_error` says why.
+ */
+export function redirectMissing(
+  proxy: InternalProxyState | null | undefined
+): boolean {
+  return (
+    proxy?.listening === true &&
+    proxy.mode === 'direct' &&
+    proxy.redirect === 'missing'
+  )
+}
+
+/**
+ * Where a worker's internal routing listens: its bridge address, and where a
+ * port-80 redirect sends it (ADR-098).
+ */
+export function routingAddress(
+  proxy: InternalProxyState | null | undefined
+): string | null {
+  if (!proxy?.address) return null
+  return proxy.mode === 'redirect' && proxy.proxy_address
+    ? `${proxy.address} → ${proxy.proxy_address}`
+    : proxy.address
+}
+
 function routingFacet(resolver: DnsResolverEntry): DnsFacet | null {
   const proxy = resolver.internal_proxy
   if (!proxy) return null
   // Nothing routes through an offline node, so its proxy is no outage.
   if (resolver.node_status !== 'active' && resolver.node_status !== 'draining')
     return { tone: 'idle', label: 'Not checked', reason: null, why: null }
+  if (redirectMissing(proxy)) {
+    const address = proxy.address ?? 'its bridge address'
+    return {
+      tone: 'warn',
+      label: 'Direct on port 80',
+      reason: proxy.redirect_error ?? 'No reason reported',
+      why: `Calls to *.temps.local names work, but ${resolver.node_name} redirects nothing: its agent serves them on ${address} itself, so it holds port 80 of its bridge address. Once the redirect can be installed, the agent moves to its own port and releases port 80.`,
+    }
+  }
+  if (proxy.listening === true && proxy.mode === 'redirect')
+    return { tone: 'ok', label: 'Redirected', reason: null, why: null }
+  // An agent older than ADR-098, or one that cannot redirect (not Linux).
   if (proxy.listening === true)
     return { tone: 'ok', label: 'Working', reason: null, why: null }
   if (proxy.listening === false) {
@@ -575,6 +615,18 @@ export function dnsSummary(
     return { tone: 'error', label, detail, affected: failing, nodes: all }
   }
   const attention = all.filter((n) => n.tone === 'warn')
+  // Served, but the agent holds port 80 of the bridge address (ADR-098).
+  const directOnly = attention.every(
+    (n) => n.lookups.tone !== 'warn' && n.routing?.label === 'Direct on port 80'
+  )
+  if (attention.length > 0 && directOnly)
+    return {
+      tone: 'warn',
+      label: `Port-80 redirect missing on ${nodes(attention.length)}`,
+      detail: `Lookups and calls work, but the agent on ${names(attention)} holds port 80 of its bridge address.`,
+      affected: attention,
+      nodes: all,
+    }
   if (attention.length > 0)
     return {
       tone: 'warn',
