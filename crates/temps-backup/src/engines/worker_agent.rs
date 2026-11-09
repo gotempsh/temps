@@ -1,26 +1,28 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `worker_agent`: backups of the MongoDB, Redis, MariaDB and managed S3
-//! services that run on worker nodes, taken by the worker's agent.
+//! `worker_agent`: backups of the managed S3 services that run on worker
+//! nodes, taken by the worker's agent.
 //!
-//! The local engines (`redis`, `mongodb`, `mariadb_*`, `s3_mirror`) drive
-//! this host's Docker, where a worker's container is not, and a
-//! `--profile control-plane` server has no Docker at all. So for a service on
-//! a worker this engine asks the node's agent to run the engine's own dump
-//! (or the storage service's bucket mirror) on that node, straight into the
-//! S3 source (`temps_providers::externalsvc::worker_data`). The request is
-//! sealed to the node: it carries the source's decrypted credentials,
-//! session token included. Nothing about the service changes; it is not
-//! stopped or restarted.
+//! The local engine (`s3_mirror`) drives this host's Docker, where a
+//! worker's container is not, and a `--profile control-plane` server has no
+//! Docker at all. So for a storage service on a worker this engine asks the
+//! node's agent to run the bucket mirror on that node, straight into the S3
+//! source (`temps_providers::externalsvc::worker_data`). The request is
+//! sealed to the node and carries a credential scoped to this backup's own
+//! prefix (ADR-093), never the source's. Nothing about the service changes;
+//! it is not stopped or restarted.
 //!
-//! The objects are the local engines' (`.../dump.archive`,
-//! `.../dump.rdb.gz`, `.../dump.sql.gz`, or a bucket mirror under
-//! `.../external_services/s3/<service>/<uuid>/<bucket>/`), so the providers'
-//! restores read them. A restore of one runs on the node too (see
+//! The objects are the local engine's (a bucket mirror under
+//! `.../external_services/s3/<service>/<uuid>/<bucket>/`), so the provider's
+//! restore reads them. A restore of one runs on the node too (see
 //! `services::restore::run_agent_restore`), in place.
 //!
-//! PostgreSQL on a worker takes the job path instead (`workload_job`).
+//! PostgreSQL, MongoDB, Redis and MariaDB on a worker take the control
+//! plane's own engines instead, whose container steps the node's agent runs
+//! (`postgres_walg`, `workload_job` without WAL-G, `mongodb`, `redis`,
+//! `mariadb_physical` and `mariadb_dump`; ADR-099). [`scoped_destination`]
+//! and [`restore_read_prefix`] are their shared credential scoping.
 
 use std::sync::Arc;
 
@@ -45,8 +47,8 @@ use temps_providers::worker_s3_scope::{
 pub const ENGINE_KEY: &str = "worker_agent";
 
 /// Whether a backup (and an in-place restore) of `service` runs on its
-/// worker node through the agent: a standalone MongoDB, Redis, MariaDB or
-/// storage service whose node is a worker.
+/// worker node through the agent: a standalone storage service whose node
+/// is a worker.
 pub fn takes_agent_path(service: &temps_entities::external_services::Model) -> bool {
     worker_node(service).is_some()
         && service.topology.as_str() != "cluster"
@@ -62,8 +64,9 @@ pub enum WorkerServiceKind {
     Storage,
 }
 
-/// The kind of worker backup `service_type` takes, `None` for PostgreSQL
-/// (the job path) and unknown types.
+/// The kind of worker backup `service_type` takes, `None` for PostgreSQL,
+/// MongoDB and Redis (the control plane's own engines, run by the node's
+/// agent) and unknown types.
 pub fn worker_service_kind(service_type: &str) -> Option<WorkerServiceKind> {
     let service_type = match service_type {
         "mongo" => ServiceType::Mongodb,
@@ -71,7 +74,7 @@ pub fn worker_service_kind(service_type: &str) -> Option<WorkerServiceKind> {
     };
     #[allow(deprecated, reason = "MinIO is matched so its refusal names it")]
     match service_type {
-        ServiceType::Postgres => None,
+        ServiceType::Postgres | ServiceType::Mongodb => None,
         ServiceType::S3 | ServiceType::Blob | ServiceType::Rustfs | ServiceType::Minio => {
             Some(WorkerServiceKind::Storage)
         }
@@ -106,8 +109,6 @@ pub fn backup_key(
 fn dump_engine_label(engine: DumpEngine) -> &'static str {
     match engine {
         DumpEngine::Mongodb => "mongodb",
-        DumpEngine::Redis => "redis",
-        DumpEngine::Mariadb => "mariadb",
     }
 }
 
@@ -118,6 +119,43 @@ pub fn backup_scope_prefix(key: &str, kind: WorkerServiceKind) -> String {
         WorkerServiceKind::Dump(_) => key_directory(key),
         WorkerServiceKind::Storage => temps_providers::worker_s3_scope::as_prefix(key),
     }
+}
+
+/// The prefix a worker restore reading `location` is granted (ADR-093): a
+/// WAL-G repository `s3://<bucket>/<prefix>` as that prefix, an object key as
+/// its own directory. `None` for a repository outside `bucket`, or a location
+/// with no directory, which would be the whole bucket. The scoper refuses
+/// anything outside the source's own path on top of this.
+pub fn restore_read_prefix(location: &str, bucket: &str) -> Option<String> {
+    let location = location.trim();
+    let prefix = if location.starts_with("s3://") {
+        temps_providers::worker_s3_scope::s3_url_prefix(location, bucket)?
+    } else {
+        key_directory(location)
+    };
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+/// How deep below the source's base path a restore's read grant must sit:
+/// `external_services/<engine>/<service>/` at least, so a grant never spans
+/// more than one service's backups, whatever a backup row's location says.
+pub const MIN_RESTORE_PREFIX_DEPTH: usize = 3;
+
+/// Whether `prefix` sits at least [`MIN_RESTORE_PREFIX_DEPTH`] path
+/// segments below `bucket_path` (the S3 source's base path).
+pub fn within_one_service(prefix: &str, bucket_path: &str) -> bool {
+    let root = bucket_path.trim_matches('/');
+    let prefix = prefix.trim_matches('/');
+    let below = if root.is_empty() {
+        Some(prefix)
+    } else {
+        prefix
+            .strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+    };
+    below.is_some_and(|below| {
+        below.split('/').filter(|part| !part.is_empty()).count() >= MIN_RESTORE_PREFIX_DEPTH
+    })
 }
 
 /// The S3 destination a worker job receives (ADR-093): a credential the
@@ -406,6 +444,71 @@ pub fn restore_location_matches(
 mod tests {
     use super::*;
 
+    /// A restore reads one backup: a WAL-G repository as its prefix, an
+    /// object as its own directory. Another bucket's repository, a key at the
+    /// bucket's root (whose directory is the whole bucket) and an empty
+    /// location are refused before any credential is asked for.
+    #[test]
+    fn a_restore_reads_only_its_own_backup() {
+        assert_eq!(
+            restore_read_prefix(
+                "s3://backups/base/external_services/mongodb/orders/walg",
+                "backups"
+            )
+            .as_deref(),
+            Some("base/external_services/mongodb/orders/walg/")
+        );
+        assert_eq!(
+            restore_read_prefix(
+                " base/external_services/redis/cache/2026/11/09/u-1/dump.rdb.gz ",
+                "backups"
+            )
+            .as_deref(),
+            Some("base/external_services/redis/cache/2026/11/09/u-1/")
+        );
+        assert_eq!(
+            restore_read_prefix("/base/x/dump.sql.gz", "backups").as_deref(),
+            Some("base/x/")
+        );
+        for refused in [
+            "s3://elsewhere/base/external_services/mongodb/orders/walg",
+            "s3://backups",
+            "s3://backups/",
+            "dump.archive",
+            "",
+            "   ",
+        ] {
+            assert_eq!(restore_read_prefix(refused, "backups"), None, "{refused:?}");
+        }
+    }
+
+    /// A read grant spans one service's backups at most, under an empty
+    /// base path too.
+    #[test]
+    fn a_restore_grant_stays_within_one_service() {
+        assert!(within_one_service(
+            "base/external_services/mongodb/orders/walg/",
+            "/base/"
+        ));
+        assert!(within_one_service(
+            "external_services/mariadb/shop/binlog/",
+            ""
+        ));
+        assert!(within_one_service("external_services/mongodb/orders/", ""));
+        for (prefix, bucket_path) in [
+            ("external_services/mongodb/", ""),
+            ("base/external_services/mongodb/", "base"),
+            ("base/", "base"),
+            ("other/external_services/mongodb/orders/", "base"),
+            ("basement/external_services/mongodb/orders/", "base"),
+        ] {
+            assert!(
+                !within_one_service(prefix, bucket_path),
+                "{prefix:?} under {bucket_path:?}"
+            );
+        }
+    }
+
     fn service(
         service_type: &str,
         node_id: Option<i32>,
@@ -442,10 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn every_non_postgres_engine_on_a_worker_takes_the_agent_path() {
-        for service_type in [
-            "mongodb", "mongo", "redis", "kv", "mariadb", "s3", "rustfs", "blob", "minio",
-        ] {
+    fn every_engine_without_its_own_on_a_worker_takes_the_agent_path() {
+        for service_type in ["s3", "rustfs", "blob", "minio"] {
             assert!(
                 takes_agent_path(&service(service_type, Some(3))),
                 "{service_type} on a worker"
@@ -459,46 +560,22 @@ mod tests {
                 "node 0 is the control plane"
             );
         }
-        assert!(
-            !takes_agent_path(&service("postgres", Some(3))),
-            "the job path"
-        );
-        let mut cluster = service("redis", Some(3));
+        for engine_on_the_node in ["postgres", "redis", "kv", "mongodb", "mongo", "mariadb"] {
+            assert!(
+                !takes_agent_path(&service(engine_on_the_node, Some(3))),
+                "{engine_on_the_node} takes the control plane's engine on its node"
+            );
+        }
+        for engine_on_the_node in ["redis", "kv", "mongodb", "mongo", "mariadb"] {
+            assert_eq!(worker_service_kind(engine_on_the_node), None);
+        }
+        let mut cluster = service("rustfs", Some(3));
         cluster.topology = "cluster".to_string();
         assert!(!takes_agent_path(&cluster));
     }
 
     #[test]
     fn backups_use_the_local_engines_keys() {
-        let mongo = backup_key(
-            "tenant",
-            &service("mongodb", Some(3)),
-            "u1",
-            WorkerServiceKind::Dump(DumpEngine::Mongodb),
-        );
-        assert!(
-            mongo.starts_with("tenant/external_services/mongodb/orders/"),
-            "{mongo}"
-        );
-        assert!(mongo.ends_with("/u1/dump.archive"), "{mongo}");
-        let redis = backup_key(
-            "",
-            &service("redis", Some(3)),
-            "u1",
-            WorkerServiceKind::Dump(DumpEngine::Redis),
-        );
-        assert!(
-            redis.starts_with("external_services/redis/orders/"),
-            "{redis}"
-        );
-        assert!(redis.ends_with("/u1/dump.rdb.gz"));
-        let maria = backup_key(
-            "",
-            &service("mariadb", Some(3)),
-            "u1",
-            WorkerServiceKind::Dump(DumpEngine::Mariadb),
-        );
-        assert!(maria.ends_with("/u1/dump.sql.gz"));
         assert_eq!(
             backup_key(
                 "tenant/",
@@ -512,24 +589,19 @@ mod tests {
 
     #[test]
     fn restores_apply_only_their_own_backup_format() {
-        let redis = service("redis", Some(3));
-        assert!(restore_location_matches(
-            &redis,
+        let mongo = service("mongodb", Some(3));
+        assert!(
+            !restore_location_matches(&mongo, "x/dump.archive"),
+            "MongoDB restores take the control plane's restore, not this path"
+        );
+        assert!(!restore_location_matches(
+            &service("redis", Some(3)),
             "external_services/redis/orders/2026/01/01/u/dump.rdb.gz"
         ));
         assert!(!restore_location_matches(
-            &redis,
-            "external_services/mongodb/orders/2026/01/01/u/dump.archive"
+            &service("mariadb", Some(3)),
+            "external_services/mariadb/orders/2026/01/01/u/dump.sql.gz"
         ));
-        assert!(!restore_location_matches(
-            &redis,
-            "s3://backups/redis/base_000000010000000000000002"
-        ));
-        let mongo = service("mongodb", Some(3));
-        assert!(restore_location_matches(&mongo, "x/dump.archive"));
-        let maria = service("mariadb", Some(3));
-        assert!(restore_location_matches(&maria, "x/dump.sql.gz"));
-        assert!(!restore_location_matches(&maria, "x/base.xbstream"));
         let storage = service("rustfs", Some(3));
         assert!(restore_location_matches(
             &storage,
@@ -550,10 +622,10 @@ mod tests {
         use temps_providers::externalsvc::worker_data::DumpEngine;
         assert_eq!(
             backup_scope_prefix(
-                "base/external_services/redis/cache/2026/11/08/u-1/dump.rdb.gz",
-                WorkerServiceKind::Dump(DumpEngine::Redis)
+                "base/external_services/mongodb/shop/2026/11/08/u-1/dump.archive",
+                WorkerServiceKind::Dump(DumpEngine::Mongodb)
             ),
-            "base/external_services/redis/cache/2026/11/08/u-1/"
+            "base/external_services/mongodb/shop/2026/11/08/u-1/"
         );
         assert_eq!(
             backup_scope_prefix(

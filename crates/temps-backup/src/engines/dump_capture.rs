@@ -174,7 +174,7 @@ impl DumpCaptureError {
         }
     }
 
-    /// Classify a failure from [`super::mariadb_exec::exec_stream_stdout_to_file`]
+    /// Classify a failure of a `docker exec` that streams a dump
     /// as an exec-stream failure, preserving cancellation and permanence.
     pub fn exec(tool: &'static str, container: &str, error: BackupError) -> Self {
         let permanent = error.is_permanent();

@@ -5,7 +5,10 @@
 //! parameters.
 
 use crate::externalsvc::{
-    mariadb::{validate_mariadb_image, MariaDbSizeProfile, MARIADB_DEFAULT_IMAGE},
+    mariadb::{
+        mariadb_server_command, validate_mariadb_image, BinlogArchiveInterval, MariaDbSizeProfile,
+        MARIADB_DEFAULT_IMAGE,
+    },
     rustfs::DEFAULT_RUSTFS_IMAGE,
     ServiceType,
 };
@@ -346,13 +349,29 @@ impl ExternalServiceManager {
                     ("MARIADB_USER".to_string(), username),
                     ("MARIADB_PASSWORD".to_string(), password),
                     ("MARIADB_AUTO_UPGRADE".to_string(), "1".to_string()),
+                    // The binlog timestamps a point-in-time recovery stops
+                    // at are UTC, as on this host.
+                    ("TZ".to_string(), "UTC".to_string()),
                 ]);
+                let binlog_interval = parameters
+                    .get("binlog_archive_interval")
+                    .and_then(|value| {
+                        serde_json::from_value::<BinlogArchiveInterval>(serde_json::Value::String(
+                            value.clone(),
+                        ))
+                        .ok()
+                    })
+                    .unwrap_or_default();
                 (
                     image,
                     3306u16,
                     env,
                     "/var/lib/mysql".to_string(),
-                    Some(size_profile.server_args()),
+                    Some(mariadb_server_command(
+                        service_name,
+                        size_profile,
+                        binlog_interval,
+                    )),
                 )
             }
             ServiceType::Postgres => {
@@ -993,6 +1012,372 @@ impl ExternalServiceManager {
         Ok(result)
     }
 
+    /// Back up MongoDB service `service_id`, which runs on a worker node, with
+    /// the control plane's own engine on that node (ADR-099): the backup
+    /// `mode` names, with `destination` scoped to it (ADR-093). Credentials
+    /// travel sealed.
+    pub async fn mongodb_backup_worker(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+        mode: crate::remote_service_client::MongodbBackupMode,
+    ) -> Result<crate::remote_service_client::MongodbBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "MongoDB backup")
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mongodb_backup(&crate::remote_service_client::MongodbBackupRequest {
+                service_id,
+                node_id,
+                service_config,
+                destination,
+                bucket_path,
+                backup_uuid,
+                mode,
+            })
+            .await
+    }
+
+    /// Restore MongoDB service `service_id`, which runs on a worker node, in
+    /// place from `location` in `source`, with the control plane's own
+    /// restore run by the node's agent. `origin_password` is the backup
+    /// origin's password for another service's backup, the provider's
+    /// fallback login as on the control plane.
+    pub async fn mongodb_restore_worker(
+        &self,
+        service_id: i32,
+        origin_password: Option<String>,
+        source: crate::remote_service_client::WorkerS3Destination,
+        location: String,
+    ) -> Result<crate::remote_service_client::MongodbRestoreResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "MongoDB restore")
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mongodb_restore(&crate::remote_service_client::MongodbRestoreRequest {
+                service_id,
+                node_id,
+                service_config,
+                origin_password,
+                source,
+                location,
+            })
+            .await
+    }
+
+    /// Push a WAL-G stream backup of Redis service `service_id`, which runs on
+    /// a worker node, with the control plane's own Redis engine on that node
+    /// (ADR-099). Credentials travel sealed.
+    pub async fn walg_backup_worker_redis(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::RedisWalgBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "Redis WAL-G backup")
+            .await?;
+        refuse_loopback_source(service_id, node_id, &destination)?;
+        self.get_remote_client(node_id)
+            .await?
+            .redis_walg_backup(&crate::remote_service_client::RedisWalgBackupRequest {
+                service_id,
+                service_config,
+                destination,
+                bucket_path,
+                backup_uuid,
+            })
+            .await
+    }
+
+    /// Take an RDB backup of Redis service `service_id`, which runs on a
+    /// worker node, into `key` of `destination`, with the control plane's own
+    /// pinned helper on that node.
+    pub async fn rdb_backup_worker_redis(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        key: String,
+    ) -> Result<crate::remote_service_client::RedisRdbBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "Redis RDB backup")
+            .await?;
+        refuse_loopback_source(service_id, node_id, &destination)?;
+        self.get_remote_client(node_id)
+            .await?
+            .redis_rdb_backup(&crate::remote_service_client::RedisRdbBackupRequest {
+                service_id,
+                service_config,
+                destination,
+                key,
+            })
+            .await
+    }
+
+    /// Restore Redis service `service_id`, which runs on a worker node, in
+    /// place from `location` in `source`, with the provider's own restore run
+    /// by the node's agent. `keep_target_bookkeeping` keeps the service's own
+    /// `_temps:*` keys over the backup's (a backup of another service).
+    pub async fn restore_worker_redis(
+        &self,
+        service_id: i32,
+        source: crate::remote_service_client::WorkerS3Destination,
+        location: String,
+        keep_target_bookkeeping: bool,
+    ) -> Result<crate::remote_service_client::RedisRestoreResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "Redis restore")
+            .await?;
+        refuse_loopback_source(service_id, node_id, &source)?;
+        self.get_remote_client(node_id)
+            .await?
+            .redis_restore(&crate::remote_service_client::RedisRestoreRequest {
+                service_id,
+                service_config,
+                source,
+                location,
+                keep_target_bookkeeping,
+            })
+            .await
+    }
+
+    /// The worker node and stored configuration of MariaDB service
+    /// `service_id`, refusing an S3 endpoint on this server's loopback,
+    /// which the node cannot reach.
+    async fn worker_mariadb_target(
+        &self,
+        service_id: i32,
+        operation: &str,
+        endpoint: Option<&str>,
+    ) -> Result<(i32, crate::externalsvc::ServiceConfig), ExternalServiceError> {
+        let (node_id, service_config) = self.worker_service_target(service_id, operation).await?;
+        if let Some(endpoint) = endpoint.filter(|endpoint| is_loopback_endpoint(endpoint)) {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "the S3 source's endpoint {endpoint} is this server's loopback address, \
+                     which worker node {node_id} cannot reach for the MariaDB {operation}; use \
+                     an address the node can reach"
+                ),
+            });
+        }
+        Ok((node_id, service_config))
+    }
+
+    /// Take a WAL-G physical base backup of MariaDB service `service_id`,
+    /// which runs on a worker node, with the control plane's own engine on
+    /// that node (ADR-099). Credentials travel sealed.
+    pub async fn mariadb_physical_backup_worker(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::MariadbPhysicalBackupResult, ExternalServiceError>
+    {
+        let (node_id, service_config) = self
+            .worker_mariadb_target(
+                service_id,
+                "physical backup",
+                destination.endpoint.as_deref(),
+            )
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mariadb_physical_backup(
+                &crate::remote_service_client::MariadbPhysicalBackupRequest {
+                    service_id,
+                    node_id,
+                    service_config,
+                    destination,
+                    bucket_path,
+                    backup_uuid,
+                },
+            )
+            .await
+    }
+
+    /// Dump MariaDB service `service_id`, which runs on a worker node, to
+    /// `key` with the control plane's own dump on that node.
+    pub async fn mariadb_dump_backup_worker(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        key: String,
+    ) -> Result<crate::remote_service_client::MariadbDumpBackupResult, ExternalServiceError> {
+        let (node_id, service_config) = self
+            .worker_mariadb_target(service_id, "dump", destination.endpoint.as_deref())
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mariadb_dump_backup(&crate::remote_service_client::MariadbDumpBackupRequest {
+                service_id,
+                node_id,
+                service_config,
+                destination,
+                bucket_path,
+                key,
+            })
+            .await
+    }
+
+    /// Restore MariaDB service `service_id`, which runs on a worker node, in
+    /// place or to `recovery_target`, from `location` in `source`, with the
+    /// control plane's own restore run by the node's agent. `restored_login`
+    /// is the login the restored data answers to (the backup origin's, for a
+    /// physical backup of another service).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the restore's inputs, as the agent request"
+    )]
+    pub async fn mariadb_restore_worker(
+        &self,
+        service_id: i32,
+        restored_login: Option<&serde_json::Map<String, serde_json::Value>>,
+        source: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        location: String,
+        recovery_target: Option<crate::remote_service_client::RecoveryTarget>,
+        target_user_data: Option<String>,
+    ) -> Result<crate::remote_service_client::MariadbRestoreResult, ExternalServiceError> {
+        let (node_id, mut service_config) = self
+            .worker_mariadb_target(service_id, "restore", source.endpoint.as_deref())
+            .await?;
+        if let (Some(login), Some(parameters)) =
+            (restored_login, service_config.parameters.as_object_mut())
+        {
+            for (key, value) in login {
+                parameters.insert(key.clone(), value.clone());
+            }
+        }
+        let result = self
+            .get_remote_client(node_id)
+            .await?
+            .mariadb_restore(&crate::remote_service_client::MariadbRestoreRequest {
+                service_id,
+                node_id,
+                service_config,
+                source,
+                bucket_path,
+                location,
+                recovery_target,
+                target_user_data,
+            })
+            .await?;
+        // The restore stops and starts the container, which may come back
+        // with another address on the node's networks.
+        if !matches!(
+            result,
+            crate::remote_service_client::MariadbRestoreResult::Refused { .. }
+        ) {
+            if let Err(error) = self.register_standalone_service_dns(service_id).await {
+                warn!(
+                    service_id,
+                    node_id,
+                    error = %error,
+                    "MariaDB was restarted on its node by a restore, but its internal DNS \
+                     record could not be republished"
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// The credential worker `node_id` ships the binary logs of MariaDB
+    /// `service` with (ADR-093): an archive-class grant on the service's
+    /// `binlog/` prefix in `s3_source` and nothing else, the only prefix the
+    /// archiver reads and writes. It lives
+    /// [`ARCHIVE_CREDENTIAL_LIFETIME`](crate::worker_s3_scope::ARCHIVE_CREDENTIAL_LIFETIME)
+    /// (less on a managed source), so the caller reuses it across ticks and
+    /// mints another every
+    /// [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`](crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL).
+    /// A source that cannot scope one is refused unless its worker
+    /// credentials setting allows the full credential, which is then logged;
+    /// the returned scope says which it is, and when a scoped one expires.
+    /// An endpoint on this server's loopback is refused before anything is
+    /// minted.
+    pub async fn mariadb_binlog_archive_destination(
+        &self,
+        service: &temps_entities::external_services::Model,
+        node_id: i32,
+        s3_source: &temps_entities::s3_sources::Model,
+    ) -> Result<crate::worker_s3_scope::ScopedWorkerDestination, ExternalServiceError> {
+        if let Some(endpoint) = s3_source
+            .endpoint
+            .as_deref()
+            .filter(|endpoint| is_loopback_endpoint(endpoint))
+        {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: service.id,
+                reason: format!(
+                    "the S3 source's endpoint {endpoint} is this server's loopback address, \
+                     which worker node {node_id} cannot reach for MariaDB binary-log \
+                     archiving; use an address the node can reach"
+                ),
+            });
+        }
+        let scoped = self
+            .worker_credentials
+            .destination(
+                s3_source,
+                crate::worker_s3_scope::WorkerS3Grant::archive(
+                    service.id,
+                    node_id,
+                    crate::externalsvc::mariadb_node::binlog_key_prefix(
+                        &s3_source.bucket_path,
+                        &service.name,
+                    ),
+                ),
+            )
+            .await
+            .map_err(|error| ExternalServiceError::InternalError {
+                reason: format!(
+                    "could not derive the binary-log archiving credential of MariaDB service {} \
+                     ('{}') on node {node_id} from S3 source {}: {error}",
+                    service.id, service.name, s3_source.id
+                ),
+            })?;
+        if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
+            warn!(service_id = service.id, node_id, "{warning}");
+        }
+        Ok(scoped)
+    }
+
+    /// Ship the binary logs of MariaDB service `service_id`, which runs on a
+    /// worker node, to `destination` with the control plane's own archiver
+    /// on that node.
+    pub async fn mariadb_binlog_archive_worker(
+        &self,
+        service_id: i32,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+    ) -> Result<crate::remote_service_client::MariadbBinlogArchiveResult, ExternalServiceError>
+    {
+        let (node_id, service_config) = self
+            .worker_mariadb_target(
+                service_id,
+                "binary-log archiving",
+                destination.endpoint.as_deref(),
+            )
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .mariadb_binlog_archive(&crate::remote_service_client::MariadbBinlogArchiveRequest {
+                service_id,
+                node_id,
+                service_config,
+                destination,
+                bucket_path,
+            })
+            .await
+    }
+
     /// Restore service `service_id`, which runs on a worker node, in place on
     /// that node from the backup at `location` in `source`.
     pub async fn restore_worker_service(
@@ -1011,6 +1396,29 @@ impl ExternalServiceManager {
                 location,
             })
             .await
+    }
+}
+
+/// Refuse an S3 source at this server's loopback for an operation a worker
+/// node runs: the node would reach itself, not the source.
+fn refuse_loopback_source(
+    service_id: i32,
+    node_id: i32,
+    source: &crate::remote_service_client::WorkerS3Destination,
+) -> Result<(), ExternalServiceError> {
+    match source
+        .endpoint
+        .as_deref()
+        .filter(|endpoint| is_loopback_endpoint(endpoint))
+    {
+        Some(endpoint) => Err(ExternalServiceError::ParameterValidationFailed {
+            service_id,
+            reason: format!(
+                "the S3 source's endpoint {endpoint} is this server's loopback address, which \
+                 worker node {node_id} cannot reach; use an address the node can reach"
+            ),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1516,6 +1924,54 @@ mod tests {
                 "wrong name for {service_type} with {parameters:?}"
             );
         }
+    }
+
+    /// Parity (ADR-099): a MariaDB on a worker runs the control plane's
+    /// server command, binary logging at its archive interval included, and
+    /// in UTC, so its binary logs can be shipped and replayed to a time.
+    #[test]
+    fn a_worker_mariadb_runs_the_control_plane_server_command() {
+        let manager = control_plane_manager();
+        let parameters = HashMap::from([
+            ("binlog_archive_interval".to_string(), "15m".to_string()),
+            ("size_profile".to_string(), "dedicated".to_string()),
+        ]);
+        let params = manager
+            .build_remote_create_params(7, "orders", &ServiceType::Mariadb, &parameters)
+            .expect("a worker MariaDB");
+        let profile = MariaDbSizeProfile::parse("dedicated").expect("a size profile");
+        assert_eq!(
+            params.command,
+            Some(mariadb_server_command(
+                "orders",
+                profile,
+                BinlogArchiveInterval::Min15
+            ))
+        );
+        let command = params.command.unwrap_or_default();
+        assert!(command.iter().any(|arg| arg == "--log-bin=mysql-bin"));
+        assert!(command.iter().any(|arg| arg
+            == &format!(
+                "--binlog-expire-logs-seconds={}",
+                BinlogArchiveInterval::Min15.binlog_expire_seconds()
+            )));
+        assert_eq!(
+            params.environment.get("TZ").map(String::as_str),
+            Some("UTC")
+        );
+
+        // Without parameters it takes the control plane's defaults.
+        let defaults = manager
+            .build_remote_create_params(7, "orders", &ServiceType::Mariadb, &HashMap::new())
+            .expect("a worker MariaDB");
+        assert_eq!(
+            defaults.command,
+            Some(mariadb_server_command(
+                "orders",
+                MariaDbSizeProfile::default(),
+                BinlogArchiveInterval::default()
+            ))
+        );
     }
 
     /// Starting a service on a worker ends by asking for its readiness gate.

@@ -11,13 +11,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bollard::Docker;
 use temps_service_protocol::{
-    AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult, NodeAttachment,
-    NodeServiceError, NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
+    AdmittedWorkload, AfterCreate, ContainerSnapshot, HealthProbeResult,
+    MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbDumpBackupRequest,
+    MariadbDumpBackupResult, MariadbPhysicalBackupRequest, MariadbPhysicalBackupResult,
+    MariadbRestoreRequest, MariadbRestoreResult, MongodbBackupRequest, MongodbBackupResult,
+    MongodbRestoreRequest, MongodbRestoreResult, NodeAttachment, NodeServiceError,
+    NodeServiceRuntime, PostgresWalgArchiveRequest, PostgresWalgArchiveResult,
     PostgresWalgBackupRequest, PostgresWalgBackupResult, PostgresWalgCredentialsRequest,
     PostgresWalgCredentialsResult, PostgresWalgRestoreRequest, PostgresWalgRestoreResult,
-    RecreateHook, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthResponse,
-    ServiceConfig, ServiceType,
+    RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest,
+    RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthResponse, ServiceConfig, ServiceType,
 };
 
 use crate::externalsvc;
@@ -254,6 +259,103 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             published_address,
         )
         .await)
+    }
+
+    async fn mongodb_backup(
+        &self,
+        request: MongodbBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mongodb_backup::mongodb_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mongodb_restore(
+        &self,
+        request: MongodbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbRestoreResult, NodeServiceError> {
+        Ok(
+            externalsvc::mongodb_backup::mongodb_restore_on_node(
+                request,
+                docker,
+                published_address,
+            )
+            .await,
+        )
+    }
+
+    async fn redis_walg_backup(
+        &self,
+        request: RedisWalgBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisWalgBackupResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::walg_backup_on_node(request, docker).await)
+    }
+
+    async fn redis_rdb_backup(
+        &self,
+        request: RedisRdbBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRdbBackupResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::rdb_backup_on_node(request, docker).await)
+    }
+
+    async fn redis_restore(
+        &self,
+        request: RedisRestoreRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRestoreResult, NodeServiceError> {
+        Ok(externalsvc::redis_node::restore_on_node(request, docker).await)
+    }
+
+    async fn mariadb_physical_backup(
+        &self,
+        request: MariadbPhysicalBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbPhysicalBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::physical_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mariadb_dump_backup(
+        &self,
+        request: MariadbDumpBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbDumpBackupResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::dump_backup_on_node(request, docker, published_address)
+                .await,
+        )
+    }
+
+    async fn mariadb_restore(
+        &self,
+        request: MariadbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbRestoreResult, NodeServiceError> {
+        Ok(externalsvc::mariadb_node::restore_on_node(request, docker, published_address).await)
+    }
+
+    async fn mariadb_binlog_archive(
+        &self,
+        request: MariadbBinlogArchiveRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbBinlogArchiveResult, NodeServiceError> {
+        Ok(
+            externalsvc::mariadb_node::binlog_archive_on_node(request, docker, published_address)
+                .await,
+        )
     }
 }
 

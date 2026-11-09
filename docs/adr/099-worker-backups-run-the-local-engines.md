@@ -136,6 +136,80 @@ Until an engine has moved, its worker backups keep the current path and the
 capability endpoint says so plainly. Existing worker dumps stay restorable
 in place for as long as they are retained.
 
+### Scoped credentials per engine
+
+No worker job receives the S3 source's own credential (ADR-093). The
+control plane already decides everything that fixes which objects a job
+touches (the engine, through the same tool check as a local service, and
+the key or repository), so each request carries a credential the source's
+STS (or Temps Cloud, for a managed source) derives for exactly those
+prefixes. A source that cannot scope is refused, unless its
+`worker_credentials` setting allows the full credential, which the job's
+log then names. Prefixes outside the source's `bucket_path` are refused
+before anything is minted.
+
+| Engine | Operation | Access | Prefixes |
+|---|---|---|---|
+| PostgreSQL | WAL-G base backup and continuous archiving | write (archive class, refreshed every two hours) | the service's WAL-G repository |
+| MongoDB | WAL-G stream | write | the service's WAL-G repository |
+| MongoDB | archive (`mongodump`) | write | the archive key's own directory |
+| Redis | WAL-G stream | write | the service's WAL-G repository |
+| Redis | RDB snapshot | write | the snapshot key's own directory |
+| MariaDB | physical base (`wal-g backup-push`) | write | the service's WAL-G repository |
+| MariaDB | logical dump | write | the dump key's own directory |
+| MariaDB | binary-log shipping | write (archive class) | `<service root>/binlog/` |
+| any | restore | read | the backup's repository or directory |
+| MariaDB | point-in-time recovery | read | the above, plus the `binlog/` prefix of the service the base was taken of |
+
+The hard cases, and how they are resolved:
+
+- **A MongoDB archive's key.** The node used to pick it, with a date in it,
+  so no prefix could be granted in advance. The control plane now probes
+  WAL-G through the agent, picks the mode, and for an archive chooses the
+  key itself. The request carries the mode (`walg_stream`, or `archive`
+  with the key), and the node refuses a key that is not an archive of that
+  service. The engine accepts only an outcome in the granted mode and key,
+  so a node cannot report a backup it was not allowed to write.
+- **WAL-G stream modes** (MongoDB, Redis) are granted the service's
+  repository, the one prefix `wal-g` writes. A MongoDB container that lost
+  WAL-G after the plane chose it fails the job, which is retried. It never
+  falls back to an archive under the stream's grant.
+- **MariaDB binary logs** are shipped on every archive interval, not once
+  per job. The health monitor reuses one archive-class credential per
+  service, and only while everything it was minted for is unchanged: the
+  same node, the same source (any edit bumps its `updated_at`), the same
+  bucket and `binlog/` prefix. It mints another every two hours, ten
+  minutes before the credential's own expiry if that comes sooner, and
+  after a run that failed. A source's full credential (`allow_full`) is
+  never cached, so switching the source to scoped takes effect on the next
+  run. Pruning stays on the control plane with its own credential, because
+  the grant carries no delete.
+- **Cross-service PITR** reads the binary logs of the service the base was
+  taken of. The read grant is derived from the backup's layout the same way
+  the node derives which logs to replay (`binlog_read_prefix`), so the
+  credential reaches exactly those logs.
+
+A restore's read grant must sit at least three segments below the
+source's base path (`external_services/<engine>/<service>/`), whatever a
+backup row's location says. A location whose grant would span more than
+one service's backups is refused, never granted.
+
+No grant includes `s3:DeleteObject`. Retention and pruning run on the
+control plane. What remains, by design:
+
+- A restore of another service's backup gives the target's node read
+  access to the origin's whole WAL-G repository, plus its whole `binlog/`
+  prefix for a point-in-time recovery, for the job's 12-hour lifetime, not
+  only the chosen base.
+- A write grant on a repository can overwrite, though not delete, earlier
+  objects of the same service. Only bucket versioning or object lock
+  protects against a compromised node doing that.
+
+This refines ADR-093's table for these engines. A WAL-G stream writes the
+service's repository, as PostgreSQL's does, not a per-backup directory,
+because WAL-G lays out its own keys. Binary-log shipping is an
+archive-class grant of its own.
+
 ### Version skew
 
 A plane that sends a new operation to an agent that does not have it gets a
@@ -150,8 +224,10 @@ back to the old dump silently.
 - PITR becomes available on workers once the restore step lands.
 - The agent gains a few sealed, fixed operations and keeps no caller-chosen
   command execution.
-- The worker receives the S3 source's decrypted credentials, as it does for
-  the dump paths today. Scoping them per service is a follow-up.
+- The worker never receives the S3 source's own credential: every request
+  carries one scoped to that job's prefixes ([ADR-093](./093-scoped-s3-credentials-for-worker-jobs.md);
+  per engine under "Scoped credentials per engine" above), and nothing on a
+  worker can delete a backup.
 - Each step ships with a Docker proof that runs the node half through the
   agent's handler against a real container, and a parity test: a local and a
   worker service of the same type choose the same engine and produce the

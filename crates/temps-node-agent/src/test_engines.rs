@@ -50,6 +50,20 @@ pub(crate) struct StubRuntime {
             temps_service_protocol::NodeAttachment,
         )>,
     >,
+    /// The MongoDB backups asked for, with the published address.
+    pub(crate) mongodb_backups: Mutex<
+        Vec<(
+            temps_service_protocol::MongodbBackupRequest,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
+    /// The MongoDB restores asked for, with the published address.
+    pub(crate) mongodb_restores: Mutex<
+        Vec<(
+            temps_service_protocol::MongodbRestoreRequest,
+            Option<std::net::IpAddr>,
+        )>,
+    >,
     /// The WAL-G restores asked for, with the attachment and published
     /// address.
     pub(crate) walg_restores: Mutex<
@@ -61,6 +75,12 @@ pub(crate) struct StubRuntime {
     >,
     /// The WAL-G archiving credential refreshes asked for.
     pub(crate) walg_credentials: Mutex<Vec<temps_service_protocol::PostgresWalgCredentialsRequest>>,
+    /// The Redis operations asked for, by route.
+    pub(crate) redis_walg_backups: Mutex<Vec<temps_service_protocol::RedisWalgBackupRequest>>,
+    pub(crate) redis_rdb_backups: Mutex<Vec<temps_service_protocol::RedisRdbBackupRequest>>,
+    pub(crate) redis_restores: Mutex<Vec<temps_service_protocol::RedisRestoreRequest>>,
+    /// The MariaDB node operations asked for, by route.
+    pub(crate) mariadb_operations: Mutex<Vec<(&'static str, i32)>>,
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -233,6 +253,120 @@ impl NodeServiceRuntime for StubRuntime {
             .expect("walg_restores")
             .push((request, node, published_address));
         Err(not_available("postgres_walg_restore"))
+    }
+
+    async fn mongodb_backup(
+        &self,
+        request: temps_service_protocol::MongodbBackupRequest,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MongodbBackupResult, NodeServiceError> {
+        self.mongodb_backups
+            .lock()
+            .expect("mongodb_backups")
+            .push((request, published_address));
+        Err(not_available("mongodb_backup"))
+    }
+
+    async fn mongodb_restore(
+        &self,
+        request: temps_service_protocol::MongodbRestoreRequest,
+        _docker: Arc<Docker>,
+        published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MongodbRestoreResult, NodeServiceError> {
+        self.mongodb_restores
+            .lock()
+            .expect("mongodb_restores")
+            .push((request, published_address));
+        Err(not_available("mongodb_restore"))
+    }
+
+    async fn redis_walg_backup(
+        &self,
+        request: temps_service_protocol::RedisWalgBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisWalgBackupResult, NodeServiceError> {
+        self.redis_walg_backups
+            .lock()
+            .expect("redis_walg_backups")
+            .push(request);
+        Err(not_available("redis_walg_backup"))
+    }
+
+    async fn redis_rdb_backup(
+        &self,
+        request: temps_service_protocol::RedisRdbBackupRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisRdbBackupResult, NodeServiceError> {
+        self.redis_rdb_backups
+            .lock()
+            .expect("redis_rdb_backups")
+            .push(request);
+        Err(not_available("redis_rdb_backup"))
+    }
+
+    async fn redis_restore(
+        &self,
+        request: temps_service_protocol::RedisRestoreRequest,
+        _docker: Arc<Docker>,
+    ) -> Result<temps_service_protocol::RedisRestoreResult, NodeServiceError> {
+        self.redis_restores
+            .lock()
+            .expect("redis_restores")
+            .push(request);
+        Err(not_available("redis_restore"))
+    }
+
+    async fn mariadb_physical_backup(
+        &self,
+        request: temps_service_protocol::MariadbPhysicalBackupRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbPhysicalBackupResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("physical-backup", request.service_id));
+        Err(not_available("mariadb_physical_backup"))
+    }
+
+    async fn mariadb_dump_backup(
+        &self,
+        request: temps_service_protocol::MariadbDumpBackupRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbDumpBackupResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("dump-backup", request.service_id));
+        Err(not_available("mariadb_dump_backup"))
+    }
+
+    async fn mariadb_restore(
+        &self,
+        request: temps_service_protocol::MariadbRestoreRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbRestoreResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("restore", request.service_id));
+        Err(not_available("mariadb_restore"))
+    }
+
+    async fn mariadb_binlog_archive(
+        &self,
+        request: temps_service_protocol::MariadbBinlogArchiveRequest,
+        _docker: Arc<Docker>,
+        _published_address: Option<std::net::IpAddr>,
+    ) -> Result<temps_service_protocol::MariadbBinlogArchiveResult, NodeServiceError> {
+        self.mariadb_operations
+            .lock()
+            .expect("mariadb_operations")
+            .push(("binlog-archive", request.service_id));
+        Err(not_available("mariadb_binlog_archive"))
     }
 }
 

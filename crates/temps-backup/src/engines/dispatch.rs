@@ -16,9 +16,9 @@
 //! | `"postgres"`   | standalone, on a worker | no      | `"postgres_workload_job"` |
 //! | `"postgres"`   | other        | yes              | `"postgres_walg"`   |
 //! | `"postgres"`   | other        | no               | `"postgres_pgdump"` |
-//! | `"redis"` / `"mongodb"` / `"mariadb"` / storage | standalone, on a worker | – | `"worker_agent"` |
-//! | `"redis"`      | any          | –                | `"redis"`           |
-//! | `"mongodb"`    | any          | –                | `"mongodb"`         |
+//! | `"mariadb"` / storage | standalone, on a worker | – | `"worker_agent"` |
+//! | `"redis"`      | any, here or on a worker | checked by the engine in the container | `"redis"` |
+//! | `"mongodb"`    | any, here or on a worker | checked by the engine in the container | `"mongodb"` |
 //! | `"mariadb"`    | any          | yes (PITR tools) | `"mariadb_physical"` |
 //! | `"mariadb"`    | any          | no               | `"mariadb_dump"`    |
 //! | `"s3"` / `"minio"` / `"blob"` | any | –       | `"s3_mirror"`       |
@@ -27,8 +27,11 @@
 //! Every service on a worker node is backed up on that node. A PostgreSQL
 //! service on a WAL-G image takes the same engine as on the control plane,
 //! whose container steps its node's agent runs (ADR-099); without WAL-G it
-//! takes a dump job (`workload_job`). The others are backed up by the node's
-//! agent (`worker_agent`).
+//! takes a dump job (`workload_job`). A MongoDB and a Redis take the same
+//! `mongodb` and `redis` engines everywhere: the engine checks for WAL-G in
+//! the container (through the node's agent for a worker) and runs its
+//! container steps on the node that has it. The others are backed up by the
+//! node's agent (`worker_agent`).
 //!
 //! The WAL-G and PITR-tool probes inspect a container on this host's Docker,
 //! or, for a worker's PostgreSQL, ask its node's agent.
@@ -46,6 +49,12 @@ pub trait WorkerToolProbe: Send + Sync {
     /// check [`container_has_walg`] runs on this host. `false` on any error,
     /// like that one.
     async fn worker_has_walg(&self, node_id: i32, container_name: &str) -> bool;
+
+    /// Whether every MariaDB physical-backup and PITR tool resolves in
+    /// `container_name` on worker `node_id`: the check
+    /// [`container_has_mariadb_pitr_tools`] runs on this host, the same
+    /// [`MARIADB_PITR_TOOLS_PROBE`]. `false` on any error, like that one.
+    async fn worker_has_mariadb_pitr_tools(&self, node_id: i32, container_name: &str) -> bool;
 }
 
 /// How long the agent's WAL-G check may take, as the local one.
@@ -53,6 +62,39 @@ const WORKER_WALG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 
 #[async_trait]
 impl WorkerToolProbe for temps_providers::ExternalServiceManager {
+    async fn worker_has_mariadb_pitr_tools(&self, node_id: i32, container_name: &str) -> bool {
+        let probe = self.exec_in_worker_service(
+            node_id,
+            container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                MARIADB_PITR_TOOLS_PROBE.to_string(),
+            ],
+        );
+        match tokio::time::timeout(WORKER_WALG_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(exit_code)) => exit_code == 0,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    node_id,
+                    container = container_name,
+                    %error,
+                    "Could not ask the node's agent whether the MariaDB backup tools are installed"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    node_id,
+                    container = container_name,
+                    "The node's agent did not answer whether the MariaDB backup tools are \
+                     installed in time"
+                );
+                false
+            }
+        }
+    }
+
     async fn worker_has_walg(&self, node_id: i32, container_name: &str) -> bool {
         let probe = self.exec_in_worker_service(
             node_id,
@@ -124,6 +166,10 @@ enum EngineChoice {
         node_id: i32,
     },
     ProbeMariadb,
+    /// A standalone MariaDB on worker `node_id`: its agent is asked.
+    ProbeWorkerMariadb {
+        node_id: i32,
+    },
 }
 
 fn engine_choice(
@@ -143,6 +189,15 @@ fn engine_choice(
                 }
             }
             Ok(EngineChoice::ProbePostgres)
+        }
+        // A standalone MariaDB on a worker takes the control plane's own
+        // engines, run by its node's agent (ADR-099): the PITR-tools check
+        // asks the agent.
+        "mariadb" if service.topology.as_str() != "cluster" => {
+            match super::workload_job::worker_node(service) {
+                Some(node_id) => Ok(EngineChoice::ProbeWorkerMariadb { node_id }),
+                None => Ok(EngineChoice::ProbeMariadb),
+            }
         }
         // Every other service on a worker node is backed up by its node's
         // agent, with the engine's own tool on that node.
@@ -173,6 +228,9 @@ pub async fn resolve_engine_key_on_this_host(
         EngineChoice::ProbeWorkerPostgres { node_id } => {
             return Ok(worker_postgres_engine(service, node_id, workers).await)
         }
+        EngineChoice::ProbeWorkerMariadb { node_id } => {
+            return Ok(worker_mariadb_engine(service, node_id, workers).await)
+        }
         EngineChoice::ProbePostgres | EngineChoice::ProbeMariadb => {}
     }
     let docker = bollard::Docker::connect_with_local_defaults().map_err(|error| {
@@ -202,6 +260,23 @@ async fn worker_postgres_engine(
     }
 }
 
+/// The engine of a standalone MariaDB on a worker: the one the control
+/// plane picks for the same image, from the same check run by the agent.
+async fn worker_mariadb_engine(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    workers: &dyn WorkerToolProbe,
+) -> &'static str {
+    if workers
+        .worker_has_mariadb_pitr_tools(node_id, &service_container_name(service))
+        .await
+    {
+        super::mariadb_physical::ENGINE_KEY
+    } else {
+        super::mariadb_dump::ENGINE_KEY
+    }
+}
+
 /// Resolve the engine key for a given external service.
 ///
 /// The function is `async` because the Postgres routing requires a Docker probe
@@ -219,6 +294,9 @@ pub async fn resolve_engine_key(
         EngineChoice::Known(key) => Ok(key),
         EngineChoice::ProbeWorkerPostgres { node_id } => {
             Ok(worker_postgres_engine(service, node_id, workers).await)
+        }
+        EngineChoice::ProbeWorkerMariadb { node_id } => {
+            Ok(worker_mariadb_engine(service, node_id, workers).await)
         }
         // Probe for WAL-G in the running container. Container naming must
         // match the legacy provider's `get_container_name()` —
@@ -406,6 +484,9 @@ mod tests {
         async fn worker_has_walg(&self, _node_id: i32, _container_name: &str) -> bool {
             false
         }
+        async fn worker_has_mariadb_pitr_tools(&self, _node_id: i32, _container: &str) -> bool {
+            false
+        }
     }
 
     /// A fleet whose agents find WAL-G, recording what they were asked.
@@ -421,6 +502,35 @@ mod tests {
                 .push((node_id, container_name.to_string()));
             true
         }
+        async fn worker_has_mariadb_pitr_tools(&self, node_id: i32, container_name: &str) -> bool {
+            self.worker_has_walg(node_id, container_name).await
+        }
+    }
+
+    /// Parity (ADR-099): a MariaDB on a worker takes the engine the control
+    /// plane takes for the same image, decided by the same PITR-tools check
+    /// run by its node's agent; no local Docker is opened.
+    #[tokio::test]
+    async fn a_worker_mariadb_takes_the_control_plane_engines() {
+        let mut service = make_service("mariadb", "standalone");
+        service.node_id = Some(3);
+        let workers = WalgWorkers::default();
+        assert_eq!(
+            resolve_engine_key_on_this_host(&service, &workers)
+                .await
+                .ok(),
+            Some(super::super::mariadb_physical::ENGINE_KEY)
+        );
+        assert_eq!(
+            *workers.0.lock().expect("asked"),
+            vec![(3, "mariadb-test-svc".to_string())]
+        );
+        assert_eq!(
+            resolve_engine_key_on_this_host(&service, &NoWorkers)
+                .await
+                .ok(),
+            Some(super::super::mariadb_dump::ENGINE_KEY)
+        );
     }
 
     /// Parity (ADR-099): a PostgreSQL on a WAL-G image takes the same engine
@@ -585,7 +695,7 @@ mod tests {
     /// refused. The same types on the control plane keep their engines.
     #[tokio::test]
     async fn worker_services_resolve_to_the_agent_engine_without_docker() {
-        for service_type in ["mariadb", "redis", "mongodb", "s3", "rustfs", "blob"] {
+        for service_type in ["s3", "rustfs", "blob"] {
             let mut service = make_service(service_type, "standalone");
             service.node_id = Some(3);
             assert_eq!(
@@ -604,6 +714,42 @@ mod tests {
             engine_choice(&make_service("redis", "standalone")),
             Ok(EngineChoice::Known("redis"))
         ));
+        // Redis on a worker takes the control plane's own engine, resolved
+        // without this host's Docker.
+        let mut worker_redis = make_service("redis", "standalone");
+        worker_redis.node_id = Some(3);
+        assert_eq!(
+            resolve_engine_key_on_this_host(&worker_redis, &NoWorkers)
+                .await
+                .ok(),
+            Some("redis")
+        );
+    }
+
+    /// Parity (ADR-099): a MongoDB takes the same engine on a worker as on
+    /// the control plane, without this host's Docker; the engine checks for
+    /// WAL-G in the container, on the node that runs it.
+    #[tokio::test]
+    async fn a_worker_mongodb_takes_the_control_plane_engine() {
+        for service_type in ["mongodb", "mongo"] {
+            let local = make_service(service_type, "standalone");
+            let mut worker = local.clone();
+            worker.node_id = Some(3);
+            for service in [&local, &worker] {
+                assert!(matches!(
+                    engine_choice(service),
+                    Ok(EngineChoice::Known(key)) if key == super::super::mongodb::ENGINE_KEY
+                ));
+                assert_eq!(
+                    resolve_engine_key_on_this_host(service, &NoWorkers)
+                        .await
+                        .ok(),
+                    Some(super::super::mongodb::ENGINE_KEY),
+                    "{service_type} on node {:?}",
+                    service.node_id
+                );
+            }
+        }
     }
 
     #[test]

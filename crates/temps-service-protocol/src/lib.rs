@@ -21,6 +21,9 @@ use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+mod mariadb;
+pub use mariadb::*;
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServiceConfig {
     pub name: String,
@@ -663,6 +666,244 @@ pub enum PostgresWalgRestoreResult {
     Failed { reason: String },
 }
 
+/// `POST /agent/services/mongodb/backup`: a backup of a MongoDB service on
+/// the node that runs it, by the control plane's own engine (ADR-099). The
+/// control plane checks the service's image for WAL-G, as it does for a
+/// local one, and names the kind of backup in `mode`: `wal-g backup-push`
+/// streaming `mongodump --archive` into the service's WAL-G repository, or a
+/// pinned `mongodump --archive --gzip` helper writing one archive object at
+/// the key the control plane chose. `destination` is a credential scoped to
+/// exactly that repository or that archive's directory (ADR-093), so the node
+/// cannot pick another.
+///
+/// Names no command, image, host or path: the container follows from the
+/// service's name, the WAL-G prefix from the bucket, `bucket_path` and the
+/// service's name, and the commands are fixed in the engine. The archive key
+/// is checked against the same layout before anything is written.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MongodbBackupRequest {
+    pub service_id: i32,
+    /// The node the service runs on, for its messages.
+    pub node_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+    /// The backup's id, in WAL-G's sentinel and in the archive's key.
+    pub backup_uuid: String,
+    /// The backup the control plane granted `destination` for.
+    pub mode: MongodbBackupMode,
+}
+
+/// The kind of MongoDB backup a [`MongodbBackupRequest`] takes, chosen by
+/// the control plane so that its credential can be scoped to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MongodbBackupMode {
+    /// `wal-g backup-push` into the service's WAL-G repository. A container
+    /// without WAL-G fails the backup (retryable: the next attempt checks the
+    /// image again) instead of taking an archive it has no credential for.
+    WalgStream,
+    /// A mongodump archive uploaded to exactly `key`, which must be this
+    /// service's and backup's archive key.
+    Archive { key: String },
+}
+
+/// What a [`MongodbBackupRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MongodbBackupResult {
+    /// WAL-G streamed the dump into the service's WAL-G repository.
+    WalgStream {
+        /// The end of `wal-g backup-push`'s output.
+        stdout: String,
+        stderr: String,
+    },
+    /// The image has no WAL-G: a gzipped mongodump archive was uploaded to
+    /// `key`.
+    Archive { key: String, size_bytes: u64 },
+    /// Nothing was changed and retrying cannot change that.
+    Refused { reason: String },
+    /// The backup failed; a retry may succeed.
+    Failed { reason: String },
+}
+
+/// `POST /agent/services/mongodb/restore`: the control plane's in-place
+/// restore of a worker's MongoDB, run on its node against its container
+/// (ADR-099): a WAL-G repository (`s3://…`) is fetched by `wal-g
+/// backup-fetch` inside the container, a mongodump archive (an object key) is
+/// downloaded and replayed by a `mongorestore --drop` sidecar. No command
+/// comes from the caller.
+/// `Debug` prints neither password: only the service's name stands for its
+/// configuration, and the origin's password is redacted.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MongodbRestoreRequest {
+    pub service_id: i32,
+    /// The node the service runs on, for its messages.
+    pub node_id: i32,
+    /// The target's own configuration: the login of the server running now.
+    pub service_config: ServiceConfig,
+    /// The backup origin's password, for another service's backup: tried
+    /// when the target's own is refused (an earlier restore already replaced
+    /// `admin.system.users`), as on the control plane.
+    #[serde(default)]
+    pub origin_password: Option<String>,
+    /// The S3 source holding the backup.
+    pub source: WorkerS3Destination,
+    /// The backup: a WAL-G repository `s3://<source's bucket>/…`, or a
+    /// mongodump archive's key in the source's bucket.
+    pub location: String,
+}
+
+impl std::fmt::Debug for MongodbRestoreRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongodbRestoreRequest")
+            .field("service_id", &self.service_id)
+            .field("node_id", &self.node_id)
+            .field("service", &self.service_config.name)
+            .field(
+                "origin_password",
+                &self.origin_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("source", &self.source)
+            .field("location", &self.location)
+            .finish()
+    }
+}
+
+impl MongodbRestoreRequest {
+    /// The configuration the engine restores with: the target's, with the
+    /// origin's password as its `_alt_password` fallback, exactly as the
+    /// control plane hands it to the provider.
+    pub fn engine_config(&self) -> ServiceConfig {
+        let mut config = self.service_config.clone();
+        if let (Some(origin), Some(parameters)) = (
+            self.origin_password.as_ref(),
+            config.parameters.as_object_mut(),
+        ) {
+            parameters.insert(
+                "_alt_password".to_string(),
+                serde_json::Value::String(origin.clone()),
+            );
+        }
+        config
+    }
+}
+
+/// What a [`MongodbRestoreRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MongodbRestoreResult {
+    /// The backup was restored into the running service.
+    Completed,
+    /// Nothing was changed: the request cannot run on this service.
+    Refused { reason: String },
+    /// The restore failed.
+    Failed { reason: String },
+}
+
+/// `POST /agent/services/redis/walg-backup`: the control plane's WAL-G stream
+/// backup of a Redis service, run on the node that hosts it (ADR-099):
+/// `wal-g backup-push` in the container, streaming `redis-cli --rdb` straight
+/// to the S3 source. Never stops or restarts Redis.
+///
+/// Names no command, image, host or path: the container follows from the
+/// service's name, the WAL-G prefix from the bucket, `bucket_path` and the
+/// service's name, the stream commands are fixed in the engine.
+/// `destination` is a credential scoped to that one repository (ADR-093).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedisWalgBackupRequest {
+    pub service_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    /// The S3 source's base path inside its bucket; empty for none.
+    #[serde(default)]
+    pub bucket_path: String,
+    /// The backup's id, recorded in WAL-G's sentinel to find it again.
+    pub backup_uuid: String,
+}
+
+/// What a [`RedisWalgBackupRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RedisWalgBackupResult {
+    /// The stream was pushed; the control plane measures the repository.
+    Completed,
+    /// Nothing ran and retrying cannot change that.
+    Refused { reason: String },
+    /// The backup failed; a retry may succeed.
+    Failed { reason: String },
+}
+
+/// `POST /agent/services/redis/rdb-backup`: the control plane's logical
+/// backup of a Redis service whose image has no WAL-G, run on the node that
+/// hosts it: the pinned `redis-cli` helper takes an RDB snapshot over the
+/// service network and its gzipped output is streamed to `key`. Never stops
+/// or restarts Redis. `key` must be a `dump.rdb.gz` object under the
+/// service's own `external_services/redis/<service>/` prefix, and
+/// `destination` is a credential scoped to `key`'s directory alone
+/// (ADR-093): the control plane chose the key, date included.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedisRdbBackupRequest {
+    pub service_id: i32,
+    pub service_config: ServiceConfig,
+    pub destination: WorkerS3Destination,
+    pub key: String,
+}
+
+/// What a [`RedisRdbBackupRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RedisRdbBackupResult {
+    /// The gzipped snapshot was uploaded.
+    Completed { size_bytes: u64 },
+    /// Nothing ran and retrying cannot change that.
+    Refused { reason: String },
+    /// The backup failed; a retry may succeed.
+    Failed { reason: String },
+}
+
+/// `POST /agent/services/redis/restore`: the control plane's in-place
+/// restore of a Redis service, run on the node that hosts it (ADR-099):
+/// a WAL-G stream backup (`location` is its `s3://<source's bucket>/…/walg`
+/// repository) or a gzipped RDB snapshot (`location` is its
+/// `….rdb.gz` key). The snapshot is staged on the data volume while the
+/// container is stopped and replaces the data only once it was fetched
+/// whole; on any failure the original data is started again as it was.
+/// `source` is a read-only credential for that one repository or the
+/// snapshot's directory (ADR-093).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedisRestoreRequest {
+    pub service_id: i32,
+    pub service_config: ServiceConfig,
+    pub source: WorkerS3Destination,
+    pub location: String,
+    /// The backup is another service's (or its producer is unknown): Temps'
+    /// own bookkeeping keys in database 0 (`_temps:*`, which record which
+    /// project owns which logical database) are put back to the target's
+    /// after the restore instead of taking the backup's.
+    pub keep_target_bookkeeping: bool,
+}
+
+/// What a [`RedisRestoreRequest`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RedisRestoreResult {
+    /// The restored data is live.
+    Completed,
+    /// Nothing was changed: the request cannot run on this service.
+    Refused { reason: String },
+    /// The restore failed. The original data is running again unless the
+    /// reason says otherwise.
+    Failed { reason: String },
+}
+
 /// Runs once between creating a replacement container and starting it, with
 /// its id (the agent joins it to the overlay there). Shared, unlike
 /// [`AfterCreate`], because an engine may recreate more than once.
@@ -920,11 +1161,126 @@ pub trait NodeServiceRuntime: Send + Sync {
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
     ) -> Result<PostgresWalgRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's MongoDB backup on this node (see
+    /// [`MongodbBackupRequest`]).
+    async fn mongodb_backup(
+        &self,
+        request: MongodbBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbBackupResult, NodeServiceError>;
+
+    /// Run the control plane's in-place MongoDB restore on this node (see
+    /// [`MongodbRestoreRequest`]).
+    async fn mongodb_restore(
+        &self,
+        request: MongodbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MongodbRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's Redis WAL-G stream backup on this node (see
+    /// [`RedisWalgBackupRequest`]).
+    async fn redis_walg_backup(
+        &self,
+        request: RedisWalgBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisWalgBackupResult, NodeServiceError>;
+
+    /// Run the control plane's Redis RDB backup on this node (see
+    /// [`RedisRdbBackupRequest`]).
+    async fn redis_rdb_backup(
+        &self,
+        request: RedisRdbBackupRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRdbBackupResult, NodeServiceError>;
+
+    /// Run the control plane's Redis in-place restore on this node (see
+    /// [`RedisRestoreRequest`]).
+    async fn redis_restore(
+        &self,
+        request: RedisRestoreRequest,
+        docker: Arc<Docker>,
+    ) -> Result<RedisRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's MariaDB physical (WAL-G) base backup on this
+    /// node (see [`MariadbPhysicalBackupRequest`]).
+    async fn mariadb_physical_backup(
+        &self,
+        request: MariadbPhysicalBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbPhysicalBackupResult, NodeServiceError>;
+
+    /// Run the control plane's MariaDB logical dump on this node (see
+    /// [`MariadbDumpBackupRequest`]).
+    async fn mariadb_dump_backup(
+        &self,
+        request: MariadbDumpBackupRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbDumpBackupResult, NodeServiceError>;
+
+    /// Run the control plane's in-place MariaDB restore on this node (see
+    /// [`MariadbRestoreRequest`]).
+    async fn mariadb_restore(
+        &self,
+        request: MariadbRestoreRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbRestoreResult, NodeServiceError>;
+
+    /// Run the control plane's binary-log archiver on this node (see
+    /// [`MariadbBinlogArchiveRequest`]).
+    async fn mariadb_binlog_archive(
+        &self,
+        request: MariadbBinlogArchiveRequest,
+        docker: Arc<Docker>,
+        published_address: Option<IpAddr>,
+    ) -> Result<MariadbBinlogArchiveResult, NodeServiceError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A MongoDB restore request printed for a log or an error shows which
+    /// service and backup, never a password or the S3 secret.
+    #[test]
+    fn a_mongodb_restore_request_debug_prints_no_secret() {
+        let request = MongodbRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: ServiceConfig {
+                name: "orders".to_string(),
+                service_type: ServiceType::Mongodb,
+                version: None,
+                parameters: serde_json::json!({ "password": "target-secret" }),
+            },
+            origin_password: Some("origin-secret".to_string()),
+            source: WorkerS3Destination {
+                bucket: "b".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                force_path_style: true,
+                access_key_id: "AKID".to_string(),
+                secret_access_key: "s3-secret".to_string(),
+                session_token: Some("token-secret".to_string()),
+            },
+            location: "fleet/external_services/mongodb/orders/walg".to_string(),
+        };
+        let printed = format!("{request:?}");
+        for secret in [
+            "target-secret",
+            "origin-secret",
+            "s3-secret",
+            "token-secret",
+        ] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert!(printed.contains("orders"), "{printed}");
+    }
 
     #[test]
     fn service_type_names_round_trip_and_an_unknown_one_is_not_repeated() {
@@ -1007,6 +1363,68 @@ mod tests {
             "command": ["sh", "-c", "id"]
         }));
         assert!(refused.is_err());
+    }
+
+    /// The Redis operations take no command, image, path or host of the
+    /// caller's, and never log a credential.
+    #[test]
+    fn redis_requests_take_no_command_and_hide_credentials() {
+        let config = serde_json::json!({
+            "name": "cache",
+            "service_type": "redis",
+            "version": null,
+            "parameters": {"password": "redis-secret"}
+        });
+        let destination = serde_json::json!({
+            "bucket": "backups",
+            "region": "us-east-1",
+            "force_path_style": true,
+            "access_key_id": "AKIAEXAMPLE",
+            "secret_access_key": "very-secret"
+        });
+        let walg = serde_json::json!({
+            "service_id": 4,
+            "service_config": config.clone(),
+            "destination": destination.clone(),
+            "backup_uuid": "u-1"
+        });
+        let rdb = serde_json::json!({
+            "service_id": 4,
+            "service_config": config.clone(),
+            "destination": destination.clone(),
+            "key": "external_services/redis/cache/2026/11/08/u-1/dump.rdb.gz"
+        });
+        let restore = serde_json::json!({
+            "service_id": 4,
+            "service_config": config,
+            "source": destination,
+            "location": "s3://backups/external_services/redis/cache/walg",
+            "keep_target_bookkeeping": true
+        });
+        let parsed: RedisWalgBackupRequest =
+            serde_json::from_value(walg.clone()).expect("a WAL-G backup request");
+        assert_eq!(parsed.bucket_path, "");
+        assert!(!format!("{parsed:?}").contains("very-secret"));
+        serde_json::from_value::<RedisRdbBackupRequest>(rdb.clone()).expect("an RDB request");
+        let parsed: RedisRestoreRequest =
+            serde_json::from_value(restore.clone()).expect("a restore request");
+        assert!(parsed.keep_target_bookkeeping);
+        assert!(!format!("{parsed:?}").contains("very-secret"));
+        for field in ["command", "image", "container", "host_path"] {
+            let mut walg = walg.clone();
+            walg[field] = serde_json::json!("x");
+            assert!(serde_json::from_value::<RedisWalgBackupRequest>(walg).is_err());
+            let mut rdb = rdb.clone();
+            rdb[field] = serde_json::json!("x");
+            assert!(serde_json::from_value::<RedisRdbBackupRequest>(rdb).is_err());
+            let mut restore = restore.clone();
+            restore[field] = serde_json::json!("x");
+            assert!(serde_json::from_value::<RedisRestoreRequest>(restore).is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(RedisRestoreResult::Completed).expect("serialize"),
+            serde_json::json!({"status": "completed"})
+        );
     }
 
     #[test]

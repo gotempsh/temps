@@ -21,11 +21,13 @@ use std::time::Duration;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
+    MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
     PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
-    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook,
-    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
-    RemoteServiceRestoreResponse,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest,
+    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
+    RedisWalgBackupResult, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
 };
 use tokio::sync::Semaphore;
 
@@ -37,15 +39,15 @@ pub const MAX_DATA_OPERATIONS: usize = 2;
 /// Upper bound of one backup or restore; the control plane waits as long.
 pub const DATA_OPERATION_DEADLINE: Duration = Duration::from_secs(6 * 3600);
 
-static DATA_OPERATIONS: Semaphore = Semaphore::const_new(MAX_DATA_OPERATIONS);
+pub(crate) static DATA_OPERATIONS: Semaphore = Semaphore::const_new(MAX_DATA_OPERATIONS);
 
 /// A slot among the node's [`MAX_DATA_OPERATIONS`], or `None` when every
 /// slot is taken and the request is refused as [`busy`].
-fn admit(slots: &Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
+pub(crate) fn admit(slots: &Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
     slots.try_acquire().ok()
 }
 
-fn busy(operation: &str, service: &str) -> axum::response::Response {
+pub(crate) fn busy(operation: &str, service: &str) -> axum::response::Response {
     error_response(
         StatusCode::TOO_MANY_REQUESTS,
         format!(
@@ -56,7 +58,7 @@ fn busy(operation: &str, service: &str) -> axum::response::Response {
     .into_response()
 }
 
-fn docker_missing(operation: &str, service: &str) -> axum::response::Response {
+pub(crate) fn docker_missing(operation: &str, service: &str) -> axum::response::Response {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         format!("Docker is not available on this agent to {operation} service '{service}'"),
@@ -64,7 +66,7 @@ fn docker_missing(operation: &str, service: &str) -> axum::response::Response {
     .into_response()
 }
 
-fn deadline_exceeded(operation: &str, service: &str) -> axum::response::Response {
+pub(crate) fn deadline_exceeded(operation: &str, service: &str) -> axum::response::Response {
     error_response(
         StatusCode::GATEWAY_TIMEOUT,
         format!(
@@ -294,7 +296,7 @@ pub async fn postgres_walg_backup(
 }
 
 /// What [`run_detached`] returns: the engine's outcome, or why it has none.
-enum Detached<T> {
+pub(crate) enum Detached<T> {
     Done(Result<T, temps_service_protocol::NodeServiceError>),
     DeadlineExceeded,
     Panicked(String),
@@ -306,7 +308,10 @@ enum Detached<T> {
 /// between moving the data directory aside and starting the server again
 /// would leave the service down. Detached, it finishes, putting the
 /// original back if it must.
-async fn run_detached<T, F>(permit: tokio::sync::SemaphorePermit<'static>, engine: F) -> Detached<T>
+pub(crate) async fn run_detached<T, F>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    engine: F,
+) -> Detached<T>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, temps_service_protocol::NodeServiceError>>
@@ -633,6 +638,409 @@ pub async fn postgres_walg_restore(
     AgentResponse::ok(outcome).into_response()
 }
 
+/// `POST /agent/services/mongodb/backup`: back up a MongoDB service this
+/// node runs with the control plane's own engine (ADR-099). The engine checks
+/// the image for WAL-G as on the control plane: with it, `wal-g backup-push`
+/// streams `mongodump --archive` into the service's WAL-G repository; without
+/// it, a pinned `mongodump --archive --gzip` helper uploads one archive. The
+/// service is never stopped. Engine outcomes come back as 200 with
+/// `walg_stream`, `archive`, `refused` (retrying cannot help) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/mongodb/backup",
+    request_body = MongodbBackupRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<MongodbBackupResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Backup deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn mongodb_backup(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<MongodbBackupRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("back up", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("back up", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.destination.bucket,
+        "Backing up a MongoDB service on this node with the control plane's engine"
+    );
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .mongodb_backup(request, engine_docker, published_address)
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "MongoDB backup could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB backup of service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "MongoDB backup panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB backup of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("MongoDB backup", &service),
+    };
+    match &outcome {
+        MongodbBackupResult::WalgStream { .. } => {
+            tracing::info!(service = %service, "MongoDB WAL-G stream backup completed");
+        }
+        MongodbBackupResult::Archive { key, size_bytes } => {
+            tracing::info!(service = %service, %key, size_bytes, "MongoDB archive backup completed");
+        }
+        MongodbBackupResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "MongoDB backup refused");
+        }
+        MongodbBackupResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "MongoDB backup failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// `POST /agent/services/mongodb/restore`: restore a MongoDB service this
+/// node runs, in place, with the control plane's own restore (the provider's
+/// `restore_in_place`): `wal-g backup-fetch` in the container for a WAL-G
+/// repository, a `mongorestore --drop` sidecar for an archive. Runs in a task
+/// of its own, so a control plane that stops waiting cannot interrupt it.
+/// Engine outcomes come back as 200 with `completed`, `refused` (nothing was
+/// changed) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/mongodb/restore",
+    request_body = MongodbRestoreRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<MongodbRestoreResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Restore deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn mongodb_restore(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<MongodbRestoreRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return busy("restore", &service);
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return docker_missing("restore", &service);
+    };
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.source.bucket,
+        location = %request.location,
+        "Restoring a MongoDB service on this node with the control plane's restore"
+    );
+    let published_address =
+        crate::service_handlers::published_probe_address(&state.host_bind_address());
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    let outcome = match run_detached(permit, async move {
+        runtime
+            .mongodb_restore(request, engine_docker, published_address)
+            .await
+    })
+    .await
+    {
+        Detached::Done(Ok(outcome)) => outcome,
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "MongoDB restore could not run");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB restore of service '{service}' could not run: {error}"),
+            )
+            .into_response();
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "MongoDB restore panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("MongoDB restore of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response();
+        }
+        Detached::DeadlineExceeded => return deadline_exceeded("MongoDB restore", &service),
+    };
+    match &outcome {
+        MongodbRestoreResult::Completed => {
+            tracing::info!(service = %service, "MongoDB restore completed");
+        }
+        MongodbRestoreResult::Refused { reason } => {
+            tracing::warn!(service = %service, %reason, "MongoDB restore refused");
+        }
+        MongodbRestoreResult::Failed { reason } => {
+            tracing::error!(service = %service, %reason, "MongoDB restore failed");
+        }
+    }
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// Admit one Redis data operation and run it detached on this node's
+/// Docker, with the same slot, deadline and error shapes as every data
+/// operation. `Err` is the response to return as it is.
+async fn run_redis_operation<T, F, Fut>(
+    state: &AgentState,
+    service: &str,
+    verb: &str,
+    label: &str,
+    engine: F,
+) -> Result<T, Box<axum::response::Response>>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<dyn temps_service_protocol::NodeServiceRuntime>, Arc<bollard::Docker>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, temps_service_protocol::NodeServiceError>>
+        + Send
+        + 'static,
+{
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
+        return Err(Box::new(busy(verb, service)));
+    };
+    let Some(docker) = state.docker.as_ref() else {
+        return Err(Box::new(docker_missing(verb, service)));
+    };
+    let future = engine(state.service_runtime.clone(), Arc::new(docker.clone()));
+    match run_detached(permit, future).await {
+        Detached::Done(Ok(outcome)) => Ok(outcome),
+        Detached::Done(Err(error)) => {
+            tracing::error!(service = %service, %error, "{label} could not run");
+            Err(Box::new(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{label} of service '{service}' could not run: {error}"),
+                )
+                .into_response(),
+            ))
+        }
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "{label} panicked");
+            Err(Box::new(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{label} of service '{service}' stopped unexpectedly: {error}"),
+                )
+                .into_response(),
+            ))
+        }
+        Detached::DeadlineExceeded => Err(Box::new(deadline_exceeded(label, service))),
+    }
+}
+
+/// Log a Redis engine outcome: `Some(reason)` with whether it was refused.
+fn log_redis_outcome(service: &str, label: &str, failure: Option<(bool, &str)>) {
+    match failure {
+        None => tracing::info!(service = %service, "{label} completed"),
+        Some((true, reason)) => tracing::warn!(service = %service, %reason, "{label} refused"),
+        Some((false, reason)) => tracing::error!(service = %service, %reason, "{label} failed"),
+    }
+}
+
+/// `POST /agent/services/redis/walg-backup`: the control plane's Redis
+/// WAL-G stream backup of a Redis service on this node (ADR-099):
+/// `wal-g backup-push` in the service's container, streaming
+/// `redis-cli --rdb -` to the S3 source. Redis keeps running. The caller
+/// names the service and the source; the container, repository and
+/// command follow from them. Engine outcomes come back as 200 with
+/// `completed`, `refused` (retrying cannot help) or `failed`.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/redis/walg-backup",
+    request_body = RedisWalgBackupRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<RedisWalgBackupResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Backup deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn redis_walg_backup(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RedisWalgBackupRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    const LABEL: &str = "Redis WAL-G backup";
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.destination.bucket,
+        "Backing up a Redis service on this node with WAL-G"
+    );
+    let outcome = match run_redis_operation(
+        &state,
+        &service,
+        "back up",
+        LABEL,
+        |runtime, docker| async move { runtime.redis_walg_backup(request, docker).await },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    log_redis_outcome(
+        &service,
+        LABEL,
+        match &outcome {
+            RedisWalgBackupResult::Completed => None,
+            RedisWalgBackupResult::Refused { reason } => Some((true, reason)),
+            RedisWalgBackupResult::Failed { reason } => Some((false, reason)),
+        },
+    );
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// `POST /agent/services/redis/rdb-backup`: the control plane's Redis RDB
+/// backup (an image without WAL-G) of a Redis service on this node: the
+/// pinned `redis-cli` helper takes a snapshot over the service network and
+/// its gzipped output is streamed to the one key the request names, which
+/// must be the service's own `dump.rdb.gz`. Redis keeps running.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/redis/rdb-backup",
+    request_body = RedisRdbBackupRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<RedisRdbBackupResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Backup deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn redis_rdb_backup(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RedisRdbBackupRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    const LABEL: &str = "Redis RDB backup";
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.destination.bucket,
+        key = %request.key,
+        "Backing up a Redis service on this node with an RDB snapshot"
+    );
+    let outcome = match run_redis_operation(
+        &state,
+        &service,
+        "back up",
+        LABEL,
+        |runtime, docker| async move { runtime.redis_rdb_backup(request, docker).await },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    log_redis_outcome(
+        &service,
+        LABEL,
+        match &outcome {
+            RedisRdbBackupResult::Completed { .. } => None,
+            RedisRdbBackupResult::Refused { reason } => Some((true, reason)),
+            RedisRdbBackupResult::Failed { reason } => Some((false, reason)),
+        },
+    );
+    AgentResponse::ok(outcome).into_response()
+}
+
+/// `POST /agent/services/redis/restore`: the control plane's in-place
+/// restore of a Redis service on this node, from a WAL-G repository or an
+/// RDB snapshot. The snapshot is staged on the data volume first; Redis is
+/// stopped only to swap it in, the original data kept aside until the
+/// restored server answers, and put back, the container started as it was,
+/// when it does not. Detached from the request, so a control plane that
+/// stops waiting cannot stop it between the swap and the start.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/redis/restore",
+    request_body = RedisRestoreRequest,
+    responses(
+        (status = 200, description = "The engine ran; its outcome", body = AgentResponse<RedisRestoreResult>),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "This node already runs its maximum of backups and restores"),
+        (status = 500, description = "The engine could not run"),
+        (status = 503, description = "Docker is not available on this agent"),
+        (status = 504, description = "Restore deadline exceeded")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn redis_restore(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<RedisRestoreRequest>,
+) -> axum::response::Response {
+    let service = request.service_config.name.clone();
+    const LABEL: &str = "Redis restore";
+    tracing::info!(
+        service = %service,
+        service_id = request.service_id,
+        bucket = %request.source.bucket,
+        keep_target_bookkeeping = request.keep_target_bookkeeping,
+        "Restoring a Redis service on this node in place"
+    );
+    let outcome = match run_redis_operation(
+        &state,
+        &service,
+        "restore",
+        LABEL,
+        |runtime, docker| async move { runtime.redis_restore(request, docker).await },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    log_redis_outcome(
+        &service,
+        LABEL,
+        match &outcome {
+            RedisRestoreResult::Completed => None,
+            RedisRestoreResult::Refused { reason } => Some((true, reason)),
+            RedisRestoreResult::Failed { reason } => Some((false, reason)),
+        },
+    );
+    AgentResponse::ok(outcome).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +1071,11 @@ mod tests {
                 "/agent/services/postgres/walg-credentials",
                 post(postgres_walg_credentials),
             )
+            .route("/agent/services/mongodb/backup", post(mongodb_backup))
+            .route("/agent/services/mongodb/restore", post(mongodb_restore))
+            .route("/agent/services/redis/walg-backup", post(redis_walg_backup))
+            .route("/agent/services/redis/rdb-backup", post(redis_rdb_backup))
+            .route("/agent/services/redis/restore", post(redis_restore))
             .with_state(state)
     }
 
@@ -981,6 +1394,154 @@ mod tests {
         );
     }
 
+    fn mongodb_backup_body() -> serde_json::Value {
+        serde_json::json!({
+            "service_id": 8,
+            "node_id": 2,
+            "service_config": {
+                "name": "orders",
+                "service_type": "mongodb",
+                "version": null,
+                "parameters": {"host": "localhost", "port": "27017"}
+            },
+            "destination": backup_body(None)["destination"].clone(),
+            "bucket_path": "base",
+            "backup_uuid": "u-1",
+            "mode": {
+                "kind": "archive",
+                "key": "base/external_services/mongodb/orders/2026/11/09/u-1/dump.archive"
+            }
+        })
+    }
+
+    fn mongodb_restore_body() -> serde_json::Value {
+        serde_json::json!({
+            "service_id": 8,
+            "node_id": 2,
+            "service_config": mongodb_backup_body()["service_config"].clone(),
+            "origin_password": "origin",
+            "source": backup_body(None)["destination"].clone(),
+            "location": "s3://backups/external_services/mongodb/orders/walg"
+        })
+    }
+
+    /// A MongoDB backup names no command, image, path, key or attachment:
+    /// the engine runs on this node with the published address the node's
+    /// own probes use, and a failure to run names the service.
+    #[tokio::test]
+    async fn a_mongodb_backup_runs_the_engine_and_takes_nothing_to_run() {
+        for field in [
+            "command",
+            "image",
+            "key",
+            "walg_prefix",
+            "host_ip",
+            "container",
+        ] {
+            let mut body = mongodb_backup_body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/mongodb/backup",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+        // The control plane names the backup its credential was scoped to
+        // (ADR-099, ADR-093): a request without one, or with a kind the node
+        // does not know, is refused before anything runs.
+        for mode in [
+            serde_json::Value::Null,
+            serde_json::json!({"kind": "anything"}),
+            serde_json::json!({"kind": "archive"}),
+        ] {
+            let mut body = mongodb_backup_body();
+            if mode.is_null() {
+                body.as_object_mut().expect("an object").remove("mode");
+            } else {
+                body["mode"] = mode.clone();
+            }
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/mongodb/backup",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{mode}");
+        }
+
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state),
+            "/agent/services/mongodb/backup",
+            mongodb_backup_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("MongoDB backup of service 'orders' could not run"),
+            "{error}"
+        );
+        let asked = runtime.mongodb_backups.lock().expect("mongodb_backups");
+        let [(request, _)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.service_id, 8);
+        assert_eq!(request.bucket_path, "base");
+        assert_eq!(request.backup_uuid, "u-1");
+        assert_eq!(
+            request.mode,
+            temps_service_protocol::MongodbBackupMode::Archive {
+                key: "base/external_services/mongodb/orders/2026/11/09/u-1/dump.archive".into()
+            }
+        );
+    }
+
+    /// A MongoDB restore takes a service, a source and a location only; the
+    /// origin's password arrives as sent, and a failure to run names the
+    /// service.
+    #[tokio::test]
+    async fn a_mongodb_restore_runs_the_engine_and_takes_nothing_to_run() {
+        for field in ["command", "image", "container", "host_ip", "sidecar_image"] {
+            let mut body = mongodb_restore_body();
+            body[field] = serde_json::json!("x");
+            let (status, _) = post_json(
+                app(agent_state(service_runtime(), plugin_builder())),
+                "/agent/services/mongodb/restore",
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
+        }
+
+        let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+        let state = agent_state(runtime.clone(), plugin_builder());
+        let (status, json) = post_json(
+            app(state),
+            "/agent/services/mongodb/restore",
+            mongodb_restore_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("MongoDB restore of service 'orders' could not run"),
+            "{error}"
+        );
+        let asked = runtime.mongodb_restores.lock().expect("mongodb_restores");
+        let [(request, _)] = asked.as_slice() else {
+            panic!("the engine runs once: {}", asked.len());
+        };
+        assert_eq!(request.origin_password.as_deref(), Some("origin"));
+        assert_eq!(
+            request.location,
+            "s3://backups/external_services/mongodb/orders/walg"
+        );
+    }
+
     /// An engine keeps running, and keeps its slot, when the request that
     /// started it is dropped: a WAL-G restore stopped mid-swap would leave
     /// the service down.
@@ -1031,5 +1592,125 @@ mod tests {
         assert_eq!(refusal.status(), StatusCode::TOO_MANY_REQUESTS);
         drop(held);
         assert!(admit(&slots).is_some());
+    }
+
+    fn redis_config() -> serde_json::Value {
+        serde_json::json!({
+            "name": "cache",
+            "service_type": "redis",
+            "version": null,
+            "parameters": {"host": "localhost", "port": "6379", "password": "pw"}
+        })
+    }
+
+    /// Each Redis route's body, by path.
+    fn redis_bodies() -> [(&'static str, serde_json::Value); 3] {
+        let destination = backup_body(None)["destination"].clone();
+        [
+            (
+                "/agent/services/redis/walg-backup",
+                serde_json::json!({
+                    "service_id": 9,
+                    "service_config": redis_config(),
+                    "destination": destination.clone(),
+                    "bucket_path": "fleet",
+                    "backup_uuid": "u-9"
+                }),
+            ),
+            (
+                "/agent/services/redis/rdb-backup",
+                serde_json::json!({
+                    "service_id": 9,
+                    "service_config": redis_config(),
+                    "destination": destination.clone(),
+                    "key": "external_services/redis/cache/2026/11/08/u-9/dump.rdb.gz"
+                }),
+            ),
+            (
+                "/agent/services/redis/restore",
+                serde_json::json!({
+                    "service_id": 9,
+                    "service_config": redis_config(),
+                    "source": destination,
+                    "location": "s3://backups/external_services/redis/cache/walg",
+                    "keep_target_bookkeeping": true
+                }),
+            ),
+        ]
+    }
+
+    /// The Redis routes take a service and a source only: a command, image,
+    /// container, prefix or host of the caller's own is rejected before
+    /// anything runs.
+    #[tokio::test]
+    async fn the_redis_routes_take_no_command_image_or_container() {
+        for (path, body) in redis_bodies() {
+            for field in [
+                "command",
+                "image",
+                "container_name",
+                "walg_prefix",
+                "host_ip",
+            ] {
+                let mut body = body.clone();
+                body[field] = serde_json::json!("x");
+                let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+                let (status, _) = post_json(
+                    app(agent_state(runtime.clone(), plugin_builder())),
+                    path,
+                    body,
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path} {field}");
+                assert!(runtime.redis_walg_backups.lock().expect("walg").is_empty());
+                assert!(runtime.redis_rdb_backups.lock().expect("rdb").is_empty());
+                assert!(runtime.redis_restores.lock().expect("restore").is_empty());
+            }
+        }
+    }
+
+    /// Each Redis route runs the control plane's engine once on this node,
+    /// with the request as sent, and a failure to run names the service.
+    #[tokio::test]
+    async fn each_redis_route_runs_the_engine_once_and_names_the_service() {
+        for (path, body) in redis_bodies() {
+            let runtime = Arc::new(crate::test_engines::StubRuntime::default());
+            let (status, json) = post_json(
+                app(agent_state(runtime.clone(), plugin_builder())),
+                path,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+            let error = json["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("of service 'cache' could not run"),
+                "{error}"
+            );
+            assert!(
+                error.contains("in the test engine"),
+                "the stub ran: {error}"
+            );
+            let ran = (
+                runtime.redis_walg_backups.lock().expect("walg").len(),
+                runtime.redis_rdb_backups.lock().expect("rdb").len(),
+                runtime.redis_restores.lock().expect("restore").len(),
+            );
+            match path {
+                "/agent/services/redis/walg-backup" => {
+                    assert_eq!(ran, (1, 0, 0));
+                    let asked = runtime.redis_walg_backups.lock().expect("walg");
+                    assert_eq!(asked[0].bucket_path, "fleet");
+                    assert_eq!(asked[0].backup_uuid, "u-9");
+                }
+                "/agent/services/redis/rdb-backup" => assert_eq!(ran, (0, 1, 0)),
+                _ => {
+                    assert_eq!(ran, (0, 0, 1));
+                    assert!(
+                        runtime.redis_restores.lock().expect("restore")[0].keep_target_bookkeeping
+                    );
+                }
+            }
+        }
     }
 }

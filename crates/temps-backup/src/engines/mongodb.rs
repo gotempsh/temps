@@ -1,66 +1,61 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `MongodbEngine`: direct-to-S3 WAL-G stream backups for managed MongoDB
-//! images, with a logical `mongodump` fallback for arbitrary OSS images.
+//! `MongodbEngine`: backups of a managed MongoDB, a direct-to-S3 WAL-G stream
+//! when its image has WAL-G, else one `mongodump` archive.
 //!
 //! ## Flow
 //!
-//! 1. Load the external-service row, decrypt its config, locate the target
-//!    mongo container (`temps-mongodb-<name>`).
-//! 2. Prefer the container's `MONGO_INITDB_ROOT_USERNAME` /
-//!    `MONGO_INITDB_ROOT_PASSWORD` env vars (root creds — full access) over
-//!    the per-service config creds (which may have been provisioned with a
-//!    narrower role). Verified necessary on 2026-05-14 when configured user
-//!    silently emitted a 927-byte admin-only archive instead of the real
-//!    100k+ docs.
-//! 3. When the service image contains WAL-G, execute `wal-g backup-push`
-//!    inside the service container. WAL-G streams `mongodump --archive`
-//!    directly to S3 without a database-sized host file.
-//! 4. Otherwise run a one-shot `mongo` sidecar that executes
-//!    `mongodump --archive --gzip` against the target container over the
-//!    user-defined bridge network, writing the archive into the sidecar's own
-//!    filesystem. Temps streams it out through the Docker archive API into an
-//!    attempt-scoped host dir (see `dump_capture`).
-//! 5. Upload the fallback `.archive` to S3 and write its metadata companion.
+//! 1. Load the external-service row and the S3 source; check the bucket.
+//! 2. The node half (`temps_providers::externalsvc::mongodb_backup`): read
+//!    the root credentials from the container, check its image for WAL-G,
+//!    then either `wal-g backup-push` in the container (WAL-G streams
+//!    `mongodump --archive` into the service's repository) or a pinned
+//!    `mongodump --archive --gzip` helper streamed into one S3 object.
+//! 3. Size the result and write its `metadata.json` companion; record the
+//!    WAL-G identity of a stream backup.
 //!
-//! ## Why a sidecar, not exec
+//! The node half is one function. For a service on this host it runs here
+//! with this host's Docker; for a service on a worker node, that node's
+//! agent runs it with the node's Docker (ADR-099). So the engine choice, the
+//! commands, the layout and every artifact are the same for both.
 //!
-//! Earlier versions called `docker exec` against the mongo container itself
-//! and piped the archive back to the host process — that requires keeping
-//! the exec attached for the entire dump and made cancellation racy. The
-//! one-shot helper isolates the dump in its own container so cancellation
-//! is just `docker stop`.
+//! A worker never receives the S3 source's own credential (ADR-093). The
+//! control plane asks the node whether the image has WAL-G (the check the
+//! node half makes locally), then picks the backup itself: a WAL-G stream
+//! into the service's repository, or an archive at a key it chooses, date
+//! included. The credential it sends is scoped to that one repository or
+//! that one archive's directory, and the node takes exactly that backup.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
+use temps_providers::externalsvc::mongodb_backup::{
+    self as node_half, MongodbBackup, MongodbBackupError, MongodbBackupOutcome,
+};
+use temps_providers::remote_service_client::{MongodbBackupMode, MongodbBackupResult};
+use temps_providers::worker_s3_scope::{key_directory, WorkerCredentialScoper, WorkerS3Grant};
 use tracing::{info, warn};
 
-use super::dispatch::{container_has_walg, service_container_name};
-use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
-use super::oneshot::OneShotSpec;
-use super::postgres_walg::run_walg_exec;
+use super::dispatch::service_container_name;
 use super::v2_common;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 pub(crate) const ENGINE_KEY: &str = "mongodb";
-const DUMP_FILE_SUFFIX: &str = "dump.archive";
-/// Database name used in user-facing dump errors.
-const MONGO_TOOL: &str = "MongoDB";
-/// Archive name inside the sidecar's attempt directory.
-const SIDECAR_ARCHIVE: &str = "dump.archive";
-const MONGO_SIDECAR_IMAGE: &str =
-    "mongo:7.0.39-jammy@sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6";
-const WALG_STREAM_CREATE_COMMAND: &str = "mongodump --archive --uri=\"$MONGODB_URI\"";
-const WALG_STREAM_RESTORE_COMMAND: &str = "mongorestore --archive --drop --uri=\"$MONGODB_URI\"";
 
 pub struct MongodbDeps {
     pub db: Arc<DatabaseConnection>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
-    pub docker: bollard::Docker,
+    /// This host's Docker, for services on this host. `None` on a server
+    /// without one (`--profile control-plane`), which backs up only
+    /// services on worker nodes.
+    pub docker: Option<bollard::Docker>,
+    /// Reaches a worker service's node through its agent.
+    pub manager: Arc<temps_providers::ExternalServiceManager>,
+    /// Derives a worker backup's S3 credential (ADR-093).
+    pub worker_credentials: Arc<WorkerCredentialScoper>,
 }
 
 pub struct MongodbEngine {
@@ -106,328 +101,287 @@ impl BackupEngine for MongodbEngine {
         )
         .await?;
         v2_common::assert_bucket_reachable(&s3_client, &s3_source.bucket_name).await?;
-
-        // ── Resolve credentials, preferring container env vars ───────────────
-        let config_json = deps
-            .encryption_service
-            .decrypt_string(service.config.as_deref().unwrap_or("{}"))
-            .unwrap_or_else(|_| "{}".to_string());
-        let cfg: Value = serde_json::from_str(&config_json).unwrap_or_else(|_| json!({}));
-        let mut username = cfg
-            .get("username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let mut password = cfg
-            .get("password")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let target_container = service_container_name(&service);
-        match deps
-            .docker
-            .inspect_container(
-                &target_container,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-        {
-            Ok(inspect) => {
-                if let Some(env_vec) = inspect.config.as_ref().and_then(|c| c.env.as_ref()) {
-                    for env in env_vec {
-                        if let Some(v) = env.strip_prefix("MONGO_INITDB_ROOT_USERNAME=") {
-                            username = v.to_string();
-                        } else if let Some(v) = env.strip_prefix("MONGO_INITDB_ROOT_PASSWORD=") {
-                            password = v.to_string();
-                        }
-                    }
-                }
-            }
-            Err(e) => warn!(
-                backup_id,
-                container = %target_container,
-                error = %e,
-                "MongodbEngine: could not inspect target for root creds; falling back to service config",
-            ),
-        }
-        if username.is_empty() {
-            username = "admin".to_string();
-        }
-        info!(
-            backup_id,
-            container = %target_container,
-            username = %username,
-            password_set = !password.is_empty(),
-            "MongodbEngine: mongodump credentials resolved",
-        );
-
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
-        if container_has_walg(&deps.docker, &target_container).await {
-            return run_walg_backup(
-                &deps,
-                ctx,
-                &service,
-                &s3_source,
-                &s3_client,
-                &target_container,
-                &username,
-                &password,
-                &backup_uuid,
-            )
-            .await;
-        }
-        warn!(
-            backup_id,
-            container = %target_container,
-            "MongodbEngine: WAL-G is unavailable; using logical mongodump fallback. This backup remains usable in OSS but is not eligible for managed Cloud restore verification",
-        );
 
-        let s3_key = v2_common::build_external_service_s3_key(
-            &s3_source.bucket_path,
-            "mongodb",
-            &service.name,
-            &backup_uuid,
-            DUMP_FILE_SUFFIX,
-        );
-
-        // ── One-shot mongodump container ─────────────────────────────────────
-        //
-        // The sidecar writes the archive into its own filesystem and Temps
-        // streams it out through the Docker archive API (see `dump_capture`):
-        // no host bind mount, so Docker in a VM or on another host works, and
-        // every name is scoped to this attempt so retries never collide.
-        let attempt = DumpAttempt::new(MONGO_TOOL, ENGINE_KEY, &backup_uuid)?;
-        let spec = mongodump_spec(&attempt, backup_id, &target_container, &username, &password);
-        let host_dump_path = attempt.host_path(SIDECAR_ARCHIVE);
-
-        super::image_pull::ensure_image_pulled_v2(MONGO_SIDECAR_IMAGE, ENGINE_KEY).await?;
-
-        let file_size = capture_dump(
-            &deps.docker,
-            CaptureRequest {
-                tool: MONGO_TOOL,
-                spec,
-                container_path: attempt.container_path(SIDECAR_ARCHIVE),
-                host_path: host_dump_path.clone(),
-                failure_log: None,
-            },
-            &ctx.cancel,
-        )
-        .await?;
-        let file_size = i64::try_from(file_size).map_err(|_| BackupError::Failed {
-            reason: format!(
-                "mongodump archive for backup {backup_id} is larger than i64::MAX bytes"
-            ),
-        })?;
-        let host_dump_path_str = host_dump_path.to_string_lossy().into_owned();
-
+        let outcome = match super::workload_job::worker_node(&service) {
+            Some(node_id) => {
+                backup_on_worker(
+                    &deps,
+                    ctx,
+                    &service,
+                    node_id,
+                    s3_source_id,
+                    &s3_source.bucket_path,
+                    &backup_uuid,
+                )
+                .await?
+            }
+            None => backup_on_this_host(&deps, ctx, &service, &s3_source, &backup_uuid).await?,
+        };
         if ctx.cancel.is_cancelled() {
             return Err(BackupError::Cancelled);
         }
-        let tags = v2_common::BackupTags::load_for_backup(&ctx.db, ctx.backup_id).await;
-        v2_common::upload_file(
-            &s3_client,
-            &s3_source.bucket_name,
-            &s3_key,
-            &host_dump_path_str,
-            "application/octet-stream",
-            file_size,
-            Some(&tags),
-            &ctx.cancel,
-        )
-        .await
-        .map_err(|error| {
-            DumpCaptureError::upload(MONGO_TOOL, &s3_source.bucket_name, &s3_key, error)
-        })?;
-        // Deletes this attempt's host dir (and the archive in it); every early
-        // return above does the same when `attempt` drops.
-        drop(attempt);
-
-        let metadata_key = v2_common::derive_metadata_key(&s3_key);
-        v2_common::write_metadata_companion(
-            &s3_client,
-            &s3_source.bucket_name,
-            &metadata_key,
-            ENGINE_KEY,
-            &backup_uuid,
-            &s3_key,
-            file_size,
-            s3_source_id,
-            "gzip",
-            Some(json!({
-                "service": { "id": service_id, "name": service.name },
-            })),
-        )
-        .await?;
-
-        info!(
-            backup_id,
-            bucket = %s3_source.bucket_name,
-            key = %s3_key,
-            size_bytes = file_size,
-            "MongodbEngine: backup complete",
-        );
-
-        Ok(BackupOutcome {
-            location: s3_key,
-            size_bytes: Some(file_size),
-            compression: "gzip".to_string(),
-        })
+        match outcome {
+            MongodbBackupOutcome::WalgStream { .. } => {
+                record_walg_stream(&deps, ctx, &service, &s3_source, &s3_client, &backup_uuid).await
+            }
+            MongodbBackupOutcome::Archive { key, size_bytes } => {
+                record_archive(
+                    &service,
+                    &s3_source,
+                    &s3_client,
+                    &backup_uuid,
+                    backup_id,
+                    key,
+                    size_bytes,
+                )
+                .await
+            }
+        }
     }
 }
 
-/// `mongodump --archive --gzip` into the attempt's directory inside the
-/// sidecar's own filesystem. No bind mount: the archive is read back with
-/// the Docker archive API.
-///
-/// The credentials travel as a percent-encoded connection URI in the
-/// container's environment (`MONGODB_URI`), never as `-u`/`-p` arguments.
-/// `mongodump` reads any argv token starting with `-` as a flag, including in
-/// the value position of a space-separated `-p`, and the generated service
-/// passwords are drawn from a charset containing `-`. A password that began
-/// with one was quoted correctly by the shell and still failed every attempt
-/// with `expected argument for flag '-p, --password'`, leaving the backup
-/// `running` until its retries ran out. A URI is a single token that starts
-/// with `mongodb://`, so it cannot be mistaken for a flag, and keeping it out
-/// of argv also keeps the password out of the process list.
-fn mongodump_spec(
-    attempt: &DumpAttempt,
-    backup_id: i32,
-    target_container: &str,
-    username: &str,
-    password: &str,
-) -> OneShotSpec {
-    let dump_cmd = format!(
-        "mkdir -p {} && mongodump --uri=\"$MONGODB_URI\" --archive={} --gzip",
-        v2_common::shell_escape(&attempt.container_dir()),
-        v2_common::shell_escape(&attempt.container_path(SIDECAR_ARCHIVE)),
-    );
-    let mongodb_uri = format!(
-        "mongodb://{}:{}@{}:27017/?authSource=admin",
-        urlencoding::encode(username),
-        urlencoding::encode(password),
-        target_container,
-    );
-    OneShotSpec {
-        image: MONGO_SIDECAR_IMAGE.to_string(),
-        name: attempt.container_name("temps-mongodump"),
-        engine: ENGINE_KEY,
-        backup_id,
-        entrypoint: vec!["sh".to_string(), "-c".to_string()],
-        cmd: vec![dump_cmd],
-        env: vec![format!("MONGODB_URI={mongodb_uri}")],
-        binds: vec![],
-        network_mode: Some(temps_core::NETWORK_NAME.to_string()),
-        user: Some("root".to_string()),
-        stderr_watch: None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_walg_backup(
+/// The node half, here, against this host's Docker.
+async fn backup_on_this_host(
     deps: &MongodbDeps,
     ctx: &BackupContext,
     service: &temps_entities::external_services::Model,
     s3_source: &temps_entities::s3_sources::Model,
-    s3_client: &aws_sdk_s3::Client,
-    container_name: &str,
-    username: &str,
-    password: &str,
     backup_uuid: &str,
-) -> Result<BackupOutcome, BackupError> {
-    let bucket_path = s3_source.bucket_path.trim_matches('/');
-    let service_root = format!("external_services/mongodb/{}/walg", service.name);
-    let repository_key = if bucket_path.is_empty() {
-        service_root
-    } else {
-        format!("{bucket_path}/{service_root}")
+) -> Result<MongodbBackupOutcome, BackupError> {
+    let Some(docker) = deps.docker.clone() else {
+        return Err(BackupError::PermanentFailure {
+            reason: format!(
+                "Service {} ('{}') runs on this server, which has no Docker daemon to run its \
+                 MongoDB backup in",
+                service.id, service.name
+            ),
+        });
     };
-    let walg_prefix = format!("s3://{}/{}", s3_source.bucket_name, repository_key);
-    let list_prefix = format!("{repository_key}/");
-
-    let access_key = deps
-        .encryption_service
-        .decrypt_string(&s3_source.access_key_id)
-        .map_err(|error| BackupError::PermanentFailure {
-            reason: format!("decrypt MongoDB WAL-G access key: {error}"),
-        })?;
-    let secret_key = deps
-        .encryption_service
-        .decrypt_string(&s3_source.secret_key)
-        .map_err(|error| BackupError::PermanentFailure {
-            reason: format!("decrypt MongoDB WAL-G secret key: {error}"),
-        })?;
-    let session_token = v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?;
-    let container_endpoint = temps_providers::externalsvc::S3Credentials {
-        access_key_id: access_key.clone(),
-        secret_key: secret_key.clone(),
-        session_token: session_token.clone(),
+    let decrypt = |field: &str, value: &str| {
+        deps.encryption_service
+            .decrypt_string(value)
+            .map_err(|e| BackupError::PermanentFailure {
+                reason: format!("decrypt {field} of S3 source {}: {e}", s3_source.id),
+            })
+    };
+    let s3 = temps_providers::externalsvc::S3Credentials {
+        access_key_id: decrypt("access key", &s3_source.access_key_id)?,
+        secret_key: decrypt("secret key", &s3_source.secret_key)?,
+        session_token: v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?,
         region: s3_source.region.clone(),
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
         bucket_path: s3_source.bucket_path.clone(),
         force_path_style: s3_source.force_path_style.unwrap_or(true),
-    }
-    .resolve_endpoint_for_container(&deps.docker, container_name)
-    .await;
-    let mongodb_uri = format!(
-        "mongodb://{}:{}@127.0.0.1:27017/?authSource=admin",
-        urlencoding::encode(username),
-        urlencoding::encode(password),
-    );
-    let mut env = vec![
-        format!("WALG_S3_PREFIX={walg_prefix}"),
-        format!("AWS_ACCESS_KEY_ID={access_key}"),
-        format!("AWS_SECRET_ACCESS_KEY={secret_key}"),
-        format!("AWS_REGION={}", s3_source.region),
-        format!("MONGODB_URI={mongodb_uri}"),
-        format!("WALG_STREAM_CREATE_COMMAND={WALG_STREAM_CREATE_COMMAND}"),
-        format!("WALG_STREAM_RESTORE_COMMAND={WALG_STREAM_RESTORE_COMMAND}"),
-    ];
-    // Present only for a temporary credential; a long-lived one contributes
-    // nothing here and the container's environment is byte-for-byte unchanged.
-    env.extend(temps_providers::externalsvc::aws_session_token_env(
-        session_token.as_deref(),
-    ));
-    env.extend(v2_common::walg_identity_env(backup_uuid));
-    if let Some(endpoint) = container_endpoint {
-        env.push(format!(
-            "AWS_ENDPOINT={}",
-            if endpoint.starts_with("http") {
-                endpoint
-            } else {
-                format!("http://{endpoint}")
-            }
-        ));
-    }
-    if s3_source.force_path_style.unwrap_or(true) {
-        env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
-    }
-
-    info!(
-        backup_id = ctx.backup_id,
-        repository = %walg_prefix,
-        "MongodbEngine: starting direct WAL-G stream backup",
-    );
-    let exec = run_walg_exec(
-        &deps.docker,
-        container_name,
-        "wal-g backup-push",
-        &env,
+    };
+    let config_json = deps
+        .encryption_service
+        .decrypt_string(service.config.as_deref().unwrap_or("{}"))
+        .unwrap_or_else(|_| "{}".to_string());
+    let service_config = temps_providers::externalsvc::ServiceConfig {
+        name: service.name.clone(),
+        service_type: temps_providers::externalsvc::ServiceType::Mongodb,
+        version: None,
+        parameters: serde_json::from_str(&config_json).unwrap_or(Value::Null),
+    };
+    node_half::mongodb_backup(
+        Arc::new(docker),
+        MongodbBackup {
+            service_id: service.id,
+            container_name: service_container_name(service),
+            service_config,
+            s3,
+            backup_uuid: backup_uuid.to_string(),
+            mode: None,
+        },
         &ctx.cancel,
     )
-    .await?;
-    if exec.exit_code != 0 {
-        return Err(BackupError::Failed {
-            reason: format!(
-                "MongoDB wal-g backup-push exited with code {}. stderr: {}",
-                exec.exit_code,
-                bounded_tail(&exec.stderr),
-            ),
-        });
-    }
+    .await
+    .map_err(backup_error)
+}
 
+/// The node half, on the worker that runs the service, by its agent.
+async fn backup_on_worker(
+    deps: &MongodbDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    s3_source_id: i32,
+    bucket_path: &str,
+    backup_uuid: &str,
+) -> Result<MongodbBackupOutcome, BackupError> {
+    // The plane picks the backup (ADR-099), so the credential covers it and
+    // nothing else: the check is the node half's own `which wal-g`.
+    let has_walg = super::dispatch::WorkerToolProbe::worker_has_walg(
+        deps.manager.as_ref(),
+        node_id,
+        &service_container_name(service),
+    )
+    .await;
+    let (mode, prefix) = worker_backup_plan(
+        has_walg,
+        bucket_path,
+        &service.name,
+        backup_uuid,
+        chrono::Utc::now(),
+    );
+    info!(
+        backup_id = ctx.backup_id,
+        service_id = service.id,
+        node_id,
+        mode = ?mode,
+        prefix = %prefix,
+        "MongoDB backup on a worker node: credential scoped to one backup location"
+    );
+    // Refuses an endpoint on this host's loopback, which the node cannot
+    // reach.
+    let destination = super::worker_agent::scoped_destination(
+        &deps.worker_credentials,
+        deps.db.as_ref(),
+        s3_source_id,
+        WorkerS3Grant::job(
+            service.id,
+            node_id,
+            prefix,
+            temps_core::ScopedS3Access::Write,
+            "backup",
+        ),
+        "backup",
+    )
+    .await?;
+    // A node already running its maximum of backups and restores is waited
+    // for (bounded, within this backup's own runtime limit) instead of
+    // failing the backup.
+    let request = crate::node_busy::retry_while_node_busy(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        || {
+            deps.manager.mongodb_backup_worker(
+                service.id,
+                destination.clone(),
+                bucket_path.to_string(),
+                backup_uuid.to_string(),
+                mode.clone(),
+            )
+        },
+        |wait| super::worker_agent::wait_for_node_slot(ctx.backup_id, service.id, wait),
+    );
+    let result = tokio::select! {
+        // Dropping the request ends it on the node too.
+        _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
+        result = request => match result {
+            Ok(result) => result,
+            Err(never) => match never {},
+        },
+    }
+    .map_err(|e| BackupError::Failed {
+        reason: format!(
+            "MongoDB backup of service {} ('{}') on node {node_id}: {e}",
+            service.id, service.name
+        ),
+    })?;
+    worker_outcome(service, node_id, &mode, result)
+}
+
+/// The backup a worker takes and the key prefix its credential is scoped
+/// to: the service's WAL-G repository when the image has WAL-G, else one
+/// archive at the key of `now`, whose directory is that backup's alone.
+pub(crate) fn worker_backup_plan(
+    has_walg: bool,
+    bucket_path: &str,
+    service_name: &str,
+    backup_uuid: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (MongodbBackupMode, String) {
+    if has_walg {
+        (
+            MongodbBackupMode::WalgStream,
+            node_half::walg_key_prefix(bucket_path, service_name),
+        )
+    } else {
+        let key = node_half::archive_key(bucket_path, service_name, backup_uuid, now);
+        let prefix = key_directory(&key);
+        (MongodbBackupMode::Archive { key }, prefix)
+    }
+}
+
+/// A worker's answer, as the outcome or error of the same run here. Only
+/// the backup the plane granted is accepted: a stream for a stream, the
+/// chosen key for an archive.
+fn worker_outcome(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    granted: &MongodbBackupMode,
+    result: MongodbBackupResult,
+) -> Result<MongodbBackupOutcome, BackupError> {
+    let on_node = |reason: String| {
+        format!(
+            "MongoDB backup of service {} ('{}') on node {node_id}: {reason}",
+            service.id, service.name
+        )
+    };
+    match result {
+        MongodbBackupResult::WalgStream { stdout, stderr } => match granted {
+            MongodbBackupMode::WalgStream => Ok(MongodbBackupOutcome::WalgStream { stdout, stderr }),
+            MongodbBackupMode::Archive { key } => Err(BackupError::PermanentFailure {
+                reason: on_node(format!(
+                    "the node reported a WAL-G stream backup, but it was granted an archive at                      '{key}'"
+                )),
+            }),
+        },
+        MongodbBackupResult::Archive { key, size_bytes } => match granted {
+            MongodbBackupMode::Archive { key: granted_key } if *granted_key == key => {
+                Ok(MongodbBackupOutcome::Archive { key, size_bytes })
+            }
+            MongodbBackupMode::Archive { key: granted_key } => Err(BackupError::PermanentFailure {
+                reason: on_node(format!(
+                    "the node reported archive '{key}', which is not the key it was granted                      ('{granted_key}')"
+                )),
+            }),
+            MongodbBackupMode::WalgStream => Err(BackupError::PermanentFailure {
+                reason: on_node(format!(
+                    "the node reported archive '{key}', but it was granted a WAL-G stream backup"
+                )),
+            }),
+        },
+        MongodbBackupResult::Refused { reason } => Err(BackupError::PermanentFailure {
+            reason: on_node(reason),
+        }),
+        MongodbBackupResult::Failed { reason } => Err(BackupError::Failed {
+            reason: on_node(reason),
+        }),
+    }
+}
+
+/// The node half's error as the executor's: a refusal is final, a
+/// cancellation is a cancellation, the rest may succeed on a retry.
+fn backup_error(error: MongodbBackupError) -> BackupError {
+    match error {
+        MongodbBackupError::Cancelled { .. } => BackupError::Cancelled,
+        error if error.is_refusal() => BackupError::PermanentFailure {
+            reason: error.to_string(),
+        },
+        error => BackupError::Failed {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Size, metadata and identity of a WAL-G stream backup.
+async fn record_walg_stream(
+    deps: &MongodbDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    s3_source: &temps_entities::s3_sources::Model,
+    s3_client: &aws_sdk_s3::Client,
+    backup_uuid: &str,
+) -> Result<BackupOutcome, BackupError> {
+    let walg_prefix = node_half::walg_prefix(
+        &s3_source.bucket_name,
+        &s3_source.bucket_path,
+        &service.name,
+    );
+    let list_prefix = node_half::walg_key_prefix(&s3_source.bucket_path, &service.name);
     let file_size = list_total_s3_size(s3_client, &s3_source.bucket_name, &list_prefix).await?;
     if file_size <= 0 {
         return Err(BackupError::Failed {
@@ -452,7 +406,6 @@ async fn run_walg_backup(
     )
     .await?;
     v2_common::record_walg_identity(deps.db.as_ref(), ctx.backup_id, backup_uuid).await?;
-
     info!(
         backup_id = ctx.backup_id,
         repository = %walg_prefix,
@@ -466,17 +419,52 @@ async fn run_walg_backup(
     })
 }
 
-fn bounded_tail(value: &str) -> String {
-    const MAX_BYTES: usize = 2_000;
-    let trimmed = value.trim();
-    if trimmed.len() <= MAX_BYTES {
-        return trimmed.to_string();
-    }
-    let mut start = trimmed.len() - MAX_BYTES;
-    while !trimmed.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &trimmed[start..])
+/// Metadata of an archive backup.
+async fn record_archive(
+    service: &temps_entities::external_services::Model,
+    s3_source: &temps_entities::s3_sources::Model,
+    s3_client: &aws_sdk_s3::Client,
+    backup_uuid: &str,
+    backup_id: i32,
+    key: String,
+    size_bytes: u64,
+) -> Result<BackupOutcome, BackupError> {
+    let file_size = i64::try_from(size_bytes).map_err(|_| BackupError::Failed {
+        reason: format!("mongodump archive for backup {backup_id} is larger than i64::MAX bytes"),
+    })?;
+    v2_common::write_metadata_companion(
+        s3_client,
+        &s3_source.bucket_name,
+        &v2_common::derive_metadata_key(&key),
+        ENGINE_KEY,
+        backup_uuid,
+        &key,
+        file_size,
+        s3_source.id,
+        "gzip",
+        Some(json!({
+            "service": { "id": service.id, "name": service.name },
+        })),
+    )
+    .await?;
+    warn!(
+        backup_id,
+        key = %key,
+        "MongodbEngine: the image has no WAL-G; took a mongodump archive. It is restorable but \
+         not eligible for managed Cloud restore verification",
+    );
+    info!(
+        backup_id,
+        bucket = %s3_source.bucket_name,
+        key = %key,
+        size_bytes = file_size,
+        "MongodbEngine: archive backup complete",
+    );
+    Ok(BackupOutcome {
+        location: key,
+        size_bytes: Some(file_size),
+        compression: "gzip".to_string(),
+    })
 }
 
 async fn list_total_s3_size(
@@ -514,79 +502,203 @@ async fn list_total_s3_size(
 mod tests {
     use super::*;
 
-    #[test]
-    fn mongodump_spec_has_no_bind_mount_and_is_attempt_scoped() {
-        let parent = tempfile::tempdir().expect("parent");
-        let first =
-            DumpAttempt::new_in(parent.path(), MONGO_TOOL, ENGINE_KEY, "b-uuid").expect("first");
-        let retry =
-            DumpAttempt::new_in(parent.path(), MONGO_TOOL, ENGINE_KEY, "b-uuid").expect("retry");
-
-        let spec = mongodump_spec(&first, 7, "temps-mongodb-x", "root", "pw");
-        let retry_spec = mongodump_spec(&retry, 7, "temps-mongodb-x", "root", "pw");
-
-        assert!(
-            spec.binds.is_empty(),
-            "output must not depend on a host bind"
-        );
-        assert_ne!(spec.name, retry_spec.name);
-        assert!(spec.name.starts_with("temps-mongodump-b-uuid-"));
-        assert!(spec.cmd[0].contains(&first.container_path(SIDECAR_ARCHIVE)));
-        assert!(!spec.cmd[0].contains(&retry.container_path(SIDECAR_ARCHIVE)));
+    fn service() -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: 7,
+            name: "orders".into(),
+            service_type: "mongodb".into(),
+            version: None,
+            status: "running".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: None,
+            config: None,
+            node_id: Some(3),
+            topology: "standalone".into(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        }
     }
 
+    /// The layout is the control plane's: a WAL-G repository under the
+    /// service, or the archive key the local engines always wrote.
     #[test]
-    fn mongodump_credentials_never_reach_argv_whatever_their_shape() {
-        let parent = tempfile::tempdir().expect("parent");
-        let attempt =
-            DumpAttempt::new_in(parent.path(), MONGO_TOOL, ENGINE_KEY, "b-uuid").expect("attempt");
-
-        // A leading `-` is what mongodump's parser mistook for a flag; the
-        // other characters would reshape an unescaped URI.
-        let password = "-NPtX2D2@9q:/?#Td_&Mt!7 g";
-        let spec = mongodump_spec(&attempt, 7, "temps-mongodb-x", "svc-admin", password);
-
-        let command = &spec.cmd[0];
-        assert!(
-            !command.contains(password)
-                && !command.contains(" -u ")
-                && !command.contains("--password"),
-            "credentials must not be arguments of mongodump: {command}"
+    fn the_archive_layout_is_the_local_engines() {
+        let key = node_half::archive_key("tenant", "orders", "u-1", chrono::Utc::now());
+        let expected = v2_common::build_external_service_s3_key(
+            "tenant",
+            ENGINE_KEY,
+            "orders",
+            "u-1",
+            node_half::ARCHIVE_FILE_NAME,
         );
-        assert!(command.contains("--uri=\"$MONGODB_URI\""));
+        assert_eq!(key, expected);
         assert_eq!(
-            spec.env,
-            vec![format!(
-                "MONGODB_URI=mongodb://svc-admin:{}@temps-mongodb-x:27017/?authSource=admin",
-                urlencoding::encode(password)
-            )]
-        );
-        assert!(
-            !spec.env[0].contains(password),
-            "the password must be percent-encoded inside the URI"
+            v2_common::derive_metadata_key(&key),
+            key.replace("dump.archive", "metadata.json")
         );
     }
 
+    /// The plane scopes a worker's credential to one backup location: the
+    /// service's WAL-G repository for a stream, one archive's own directory
+    /// (date and backup included) for an archive. Never the service's whole
+    /// tree, never the source's path.
     #[test]
-    fn mongo_sidecar_image_is_release_and_digest_pinned() {
-        assert!(MONGO_SIDECAR_IMAGE.contains("mongo:7.0.39-jammy@"));
-        assert!(MONGO_SIDECAR_IMAGE
-            .contains("sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6"));
+    fn a_worker_backup_is_granted_one_location() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-09T10:00:00Z")
+            .expect("a timestamp")
+            .with_timezone(&chrono::Utc);
+        let (mode, prefix) = worker_backup_plan(true, "tenant", "orders", "u-1", now);
+        assert_eq!(mode, MongodbBackupMode::WalgStream);
+        assert_eq!(prefix, "tenant/external_services/mongodb/orders/walg/");
+
+        let (mode, prefix) = worker_backup_plan(false, "tenant", "orders", "u-1", now);
+        assert_eq!(
+            mode,
+            MongodbBackupMode::Archive {
+                key: "tenant/external_services/mongodb/orders/2026/11/09/u-1/dump.archive".into()
+            }
+        );
+        assert_eq!(
+            prefix,
+            "tenant/external_services/mongodb/orders/2026/11/09/u-1/"
+        );
+        // No source path: still inside the service's own tree.
+        let (_, prefix) = worker_backup_plan(false, "", "orders", "u-1", now);
+        assert_eq!(prefix, "external_services/mongodb/orders/2026/11/09/u-1/");
+    }
+
+    /// A worker's outcomes are this engine's, and only the backup the node was
+    /// granted is accepted: a stream for a stream, the very key for an
+    /// archive. A refusal is final, a failure retryable.
+    #[test]
+    fn worker_outcomes_map_to_the_engines() {
+        let service = service();
+        let key = node_half::archive_key("base", "orders", "u-1", chrono::Utc::now());
+        let archive = MongodbBackupMode::Archive { key: key.clone() };
+        let stream = MongodbBackupMode::WalgStream;
+        assert_eq!(
+            worker_outcome(
+                &service,
+                3,
+                &archive,
+                MongodbBackupResult::Archive {
+                    key: key.clone(),
+                    size_bytes: 9
+                }
+            )
+            .ok(),
+            Some(MongodbBackupOutcome::Archive {
+                key: key.clone(),
+                size_bytes: 9
+            })
+        );
+        assert!(matches!(
+            worker_outcome(
+                &service,
+                3,
+                &archive,
+                MongodbBackupResult::Archive {
+                    key: "elsewhere/dump.archive".into(),
+                    size_bytes: 9
+                }
+            ),
+            Err(BackupError::PermanentFailure { reason }) if reason.contains("elsewhere")
+        ));
+        assert!(matches!(
+            worker_outcome(
+                &service,
+                3,
+                &stream,
+                MongodbBackupResult::Archive { key, size_bytes: 9 }
+            ),
+            Err(BackupError::PermanentFailure { reason }) if reason.contains("WAL-G stream")
+        ));
+        assert!(matches!(
+            worker_outcome(
+                &service,
+                3,
+                &archive,
+                MongodbBackupResult::WalgStream {
+                    stdout: String::new(),
+                    stderr: String::new()
+                }
+            ),
+            Err(BackupError::PermanentFailure { reason }) if reason.contains("granted an archive")
+        ));
+        assert!(matches!(
+            worker_outcome(
+                &service,
+                3,
+                &stream,
+                MongodbBackupResult::Refused {
+                    reason: "no".into()
+                }
+            ),
+            Err(BackupError::PermanentFailure { reason }) if reason.contains("node 3")
+        ));
+        assert!(matches!(
+            worker_outcome(
+                &service,
+                3,
+                &stream,
+                MongodbBackupResult::Failed {
+                    reason: "exit 1".into()
+                }
+            ),
+            Err(BackupError::Failed { .. })
+        ));
+        assert!(matches!(
+            worker_outcome(
+                &service,
+                3,
+                &stream,
+                MongodbBackupResult::WalgStream {
+                    stdout: String::new(),
+                    stderr: String::new()
+                }
+            ),
+            Ok(MongodbBackupOutcome::WalgStream { .. })
+        ));
     }
 
     #[test]
-    fn walg_stream_commands_use_ephemeral_uri_environment() {
-        assert!(WALG_STREAM_CREATE_COMMAND.contains("$MONGODB_URI"));
-        assert!(WALG_STREAM_RESTORE_COMMAND.contains("$MONGODB_URI"));
-        assert!(!WALG_STREAM_CREATE_COMMAND.contains("mongodb://"));
-        assert!(!WALG_STREAM_RESTORE_COMMAND.contains("mongodb://"));
-    }
-
-    #[test]
-    fn bounded_tail_preserves_utf8_boundaries() {
-        let value = format!("{}END", "é".repeat(1_100));
-        let tail = bounded_tail(&value);
-        assert!(tail.ends_with("END"));
-        assert!(tail.starts_with('…'));
+    fn node_half_errors_keep_their_retry_class() {
+        assert!(matches!(
+            backup_error(MongodbBackupError::Cancelled {
+                container: "c".into()
+            }),
+            BackupError::Cancelled
+        ));
+        assert!(matches!(
+            backup_error(MongodbBackupError::Target {
+                service_id: 1,
+                service: "s".into(),
+                reason: "r".into()
+            }),
+            BackupError::PermanentFailure { .. }
+        ));
+        assert!(matches!(
+            backup_error(MongodbBackupError::BackupPush {
+                service_id: 1,
+                container: "c".into(),
+                exit_code: 1,
+                stderr: "e".into()
+            }),
+            BackupError::Failed { .. }
+        ));
     }
 }

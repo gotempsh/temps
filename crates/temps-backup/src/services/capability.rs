@@ -333,48 +333,25 @@ fn classify_capability(
     }
 }
 
-/// What a backup of a standalone service on a worker node writes: a logical
-/// dump taken on the node (or a bucket mirror for storage), whatever its
-/// image holds. `None` for a service the local engines back up.
+/// What a backup of a storage service on a worker node writes: a bucket
+/// mirror taken by its agent. `None` for a service the local engines back
+/// up: MongoDB, Redis and MariaDB take the control plane's engines on a
+/// worker, checked in their container like local ones (`worker_service_kind`
+/// never returns them).
 fn worker_capability(
     service: &external_services::Model,
 ) -> Option<ExternalServiceBackupCapability> {
     use crate::engines::worker_agent::{self, WorkerServiceKind};
-    use temps_providers::externalsvc::worker_data::DumpEngine;
-    let node = worker_node(service)?;
-    let (engine, artifact) = if worker_agent::takes_agent_path(service) {
-        match worker_agent::worker_service_kind(&service.service_type)? {
-            WorkerServiceKind::Storage => {
-                return Some(compatible(worker_agent::ENGINE_KEY, "object_set", false))
-            }
-            WorkerServiceKind::Dump(DumpEngine::Mongodb) => {
-                (worker_agent::ENGINE_KEY, "mongodump_archive")
-            }
-            WorkerServiceKind::Dump(DumpEngine::Redis) => (worker_agent::ENGINE_KEY, "redis_rdb"),
-            WorkerServiceKind::Dump(DumpEngine::Mariadb) => {
-                (worker_agent::ENGINE_KEY, "logical_mariadb_dump")
-            }
-        }
-    } else {
+    worker_node(service)?;
+    if !worker_agent::takes_agent_path(service) {
         return None;
-    };
-    Some(ExternalServiceBackupCapability {
-        cloud_backup_compatible: false,
-        verified: true,
-        wal_g_installed: false,
-        engine: engine.to_string(),
-        artifact: artifact.to_string(),
-        reason: Some(format!(
-            "Service {} runs on worker node {node}, where backups are logical dumps taken on the \
-             node and uploaded to the chosen S3 source; WAL-G repositories and point-in-time \
-             recovery are not available there yet.",
-            service.id
-        )),
-        remediation: Some(
-            "Backups and in-place restores work as they are; nothing needs to change.".to_string(),
-        ),
-        recommended_image: None,
-    })
+    }
+    match worker_agent::worker_service_kind(&service.service_type)? {
+        WorkerServiceKind::Storage => {
+            Some(compatible(worker_agent::ENGINE_KEY, "object_set", false))
+        }
+        WorkerServiceKind::Dump(_) => None,
+    }
 }
 
 /// What a backup of a standalone PostgreSQL on worker `node` writes, given
@@ -518,35 +495,17 @@ fn recommended_image(service_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    /// A worker's services report the dump their node writes, without a
-    /// probe; a storage service's mirror stays an object set.
+    /// Only a worker's storage service is described without a probe, its
+    /// mirror an object set. Every database on a worker takes the control
+    /// plane's engines (ADR-099) and is probed through its agent like a
+    /// local one, so none is described here.
     #[test]
-    fn worker_services_report_the_dump_taken_on_their_node() {
-        let mut redis = service("redis", "standalone");
-        redis.node_id = Some(3);
-        let capability = worker_capability(&redis).expect("a worker service");
-        assert_eq!(capability.engine, "worker_agent");
-        assert_eq!(capability.artifact, "redis_rdb");
-        assert!(!capability.cloud_backup_compatible);
-        assert!(capability.verified);
-        assert!(capability
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("worker node 3"));
-
-        // Never advice this server cannot follow: a control-plane profile
-        // runs no databases at all.
-        assert!(!capability
-            .remediation
-            .as_deref()
-            .unwrap_or_default()
-            .contains("control plane"));
-
-        // A worker PostgreSQL is probed, not described here.
-        let mut postgres = service("postgres", "standalone");
-        postgres.node_id = Some(3);
-        assert!(worker_capability(&postgres).is_none());
+    fn only_worker_storage_is_described_without_a_probe() {
+        for service_type in ["postgres", "mongodb", "redis", "mariadb"] {
+            let mut worker = service(service_type, "standalone");
+            worker.node_id = Some(3);
+            assert!(worker_capability(&worker).is_none(), "{service_type}");
+        }
 
         let mut storage = service("rustfs", "standalone");
         storage.node_id = Some(3);
@@ -554,7 +513,38 @@ mod tests {
         assert!(capability.cloud_backup_compatible);
         assert_eq!(capability.artifact, "object_set");
 
-        assert!(worker_capability(&service("redis", "standalone")).is_none());
+        // A service on this host is the local engines' to describe.
+        assert!(worker_capability(&service("rustfs", "standalone")).is_none());
+    }
+
+    /// Parity (ADR-099): a worker Redis is probed through its agent and
+    /// reports exactly what a local Redis on the same image reports, for
+    /// every outcome of the probe.
+    #[test]
+    fn a_worker_redis_reports_what_a_local_redis_reports() {
+        let local = service("redis", "standalone");
+        let mut worker = local.clone();
+        worker.node_id = Some(3);
+        assert!(
+            worker_capability(&worker).is_none(),
+            "probed, not described"
+        );
+        for probe in [
+            ToolProbe::Available,
+            ToolProbe::Missing,
+            ToolProbe::Unverified(UnverifiedCause::Unavailable),
+            ToolProbe::Unverified(UnverifiedCause::TimedOut {
+                stage: "backup tool check",
+            }),
+        ] {
+            let on_worker = classify_capability(&worker, probe);
+            let here = classify_capability(&local, probe);
+            assert_eq!(on_worker, here);
+        }
+        assert_eq!(
+            classify_capability(&worker, ToolProbe::Available).engine,
+            "redis"
+        );
     }
 
     /// Parity (ADR-099): a worker PostgreSQL whose agent finds WAL-G reports
@@ -597,6 +587,37 @@ mod tests {
             .remediation
             .unwrap_or_default()
             .contains("control plane"));
+    }
+
+    /// Parity (ADR-099): a worker MongoDB is not described as a node dump;
+    /// it is probed in its container like a local one (the same `which
+    /// wal-g`, asked of its agent) and classified by the same function, so
+    /// it reports exactly what a local MongoDB on the same image reports.
+    #[test]
+    fn a_worker_mongodb_reports_exactly_what_a_local_one_does() {
+        for service_type in ["mongodb", "mongo"] {
+            let local = service(service_type, "standalone");
+            let mut worker = local.clone();
+            worker.node_id = Some(3);
+            assert!(worker_capability(&worker).is_none(), "{service_type}");
+            assert!(requires_live_tool_probe(service_type, "standalone"));
+            assert_eq!(tool_probe_command(service_type), vec!["which", "wal-g"]);
+            for probe in [
+                ToolProbe::Available,
+                ToolProbe::Missing,
+                ToolProbe::Unverified(UnverifiedCause::Unavailable),
+            ] {
+                assert_eq!(
+                    classify_capability(&worker, probe),
+                    classify_capability(&local, probe),
+                    "{service_type} {probe:?}"
+                );
+            }
+            let walg = classify_capability(&worker, ToolProbe::Available);
+            assert_eq!(walg.engine, "mongodb");
+            assert_eq!(walg.artifact, "mongodb_walg_stream");
+            assert!(walg.cloud_backup_compatible && walg.wal_g_installed);
+        }
     }
 
     #[test]
