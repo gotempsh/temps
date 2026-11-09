@@ -9,5 +9,6 @@ pub mod handlers;
 mod plugin;
 pub mod service;
 pub mod tokenless;
+pub mod transport;
 pub mod types;
 pub use plugin::ServiceAccessPlugin;

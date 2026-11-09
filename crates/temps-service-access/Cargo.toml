@@ -13,6 +13,9 @@ authors.workspace = true
 temps-core = { path = "../temps-core" }
 temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
+temps-agent-core = { path = "../temps-agent-core" }
+tokio.workspace = true
 temps-service-access-runtime = { path = "../temps-service-access-runtime" }
 base64.workspace = true
 rcgen.workspace = true

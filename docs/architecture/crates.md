@@ -165,7 +165,7 @@ Control-plane features: a service layer plus HTTP handlers for one product area.
 | [`temps-providers-s3`](../../crates/temps-providers-s3) | The S3-compatible object storage engines: RustFS, Garage and legacy MinIO, with their backup, restore and bucket mirroring | **1**: providers |  |
 | [`temps-revenue`](../../crates/temps-revenue) | Per-project revenue tracking from verified payment-provider webhooks (Stripe), normalized into a provider-agnostic model | **1**: cli |  |
 | [`temps-sandbox`](../../crates/temps-sandbox) | Standalone sandbox HTTP API (/v1/sandbox), compatible with the Vercel Sandbox SDK, backed by the shared SandboxProvider | **3**: ai-agent-cli, ai-chat, cli |  |
-| [`temps-sandbox-providers`](../../crates/temps-sandbox-providers) | Sandbox backends behind one provider trait: Docker, Firecracker, microsandbox, local, and worker nodes over their remote protocol | **7**: ai-agent-cli, ai-agents, ai-chat, ai-gateway, cli, node-agent, sandbox |  |
+| [`temps-sandbox-providers`](../../crates/temps-sandbox-providers) | Sandbox backends behind one provider trait: Docker, Firecracker, microsandbox, local, and worker nodes over their remote protocol | **8**: ai-agent-cli, ai-agents, ai-chat, ai-gateway, cli, node-agent, sandbox, service-access |  |
 | [`temps-service-access`](../../crates/temps-service-access) | Project service policies and time-limited sandbox access requests with a fail-closed broker boundary | **1**: cli |  |
 | [`temps-status-page`](../../crates/temps-status-page) | Status pages: uptime monitors, health checks, incidents and the public status page routes | **1**: cli |  |
 | [`temps-teams`](../../crates/temps-teams) | Teams and project-scoped role-based access control | **1**: cli |  |
@@ -198,7 +198,7 @@ AI foundation, agents, chat, gateway and the MCP surfaces.
 
 | Crate | Description | Consumers | Binaries |
 |---|---|---|---|
-| [`temps-agent-core`](../../crates/temps-agent-core) | What the AI CLI and sandbox crates share: AgentError, the sandbox user and paths, the output callback and agent run statuses | **6**: ai-agent-cli, ai-agents, ai-cli, node-agent, sandbox, sandbox-providers |  |
+| [`temps-agent-core`](../../crates/temps-agent-core) | What the AI CLI and sandbox crates share: AgentError, the sandbox user and paths, the output callback and agent run statuses | **7**: ai-agent-cli, ai-agents, ai-cli, node-agent, sandbox, sandbox-providers, service-access |  |
 | [`temps-agents-mcp-proxy`](../../crates/temps-agents-mcp-proxy) | MCP proxy server that bridges custom tool definitions to webhook endpoints | **1**: ai-agents |  |
 | [`temps-ai`](../../crates/temps-ai) | Temps AI foundation: a governed, provider-agnostic seam for text and typed/structured output, plus reusable schemas (ADR-022) | **8**: ai-agent-cli, ai-agents, ai-chat, ai-cli, ai-gateway, analytics, external-plugins, otel |  |
 | [`temps-ai-agent-cli`](../../crates/temps-ai-agent-cli) | Bridge between AiService and AiCliProvider for subscription-backed AI workloads (ADR-037) | **2**: ai-chat, ai-gateway |  |
