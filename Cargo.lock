@@ -484,15 +484,15 @@ checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 
 [[package]]
 name = "astral-tokio-tar"
-version = "0.6.2"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb50a7aae84a03bf55b067832bc376f4961b790c97e64d3eacee97d389b90277"
+checksum = "b18457efd137254e016bbde5e1d88df61c4e1a5ae2223746e56123bac6af2463"
 dependencies = [
- "filetime",
  "futures-core",
  "libc",
  "portable-atomic",
  "rustc-hash",
+ "rustix",
  "tokio",
  "tokio-stream",
  "xattr",

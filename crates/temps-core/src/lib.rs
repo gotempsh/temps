@@ -247,6 +247,11 @@ mod unmaintained_dependency_guard_tests {
         "msb_krun_vmm",
     ];
 
+    /// The only packages allowed to depend on `astral-tokio-tar`; see the
+    /// RUSTSEC-2026-0440 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_ASTRAL_TOKIO_TAR_DEPENDENTS: &[&str] =
+        &["microsandbox", "microsandbox-image", "testcontainers"];
+
     /// The only package allowed to depend on `serde_yaml`; see the
     /// RUSTSEC-2024-0449 note in `.github/workflows/dependency-scan.yml`.
     const ALLOWED_SERDE_YAML_DEPENDENTS: &[&str] = &["pingora-core"];
@@ -393,6 +398,35 @@ mod unmaintained_dependency_guard_tests {
         );
     }
 
+    /// RUSTSEC-2026-0440: `astral-tokio-tar` is unmaintained, but the
+    /// microsandbox SDK and testcontainers still require it. It must not gain
+    /// new dependents, and the lock must stay on 0.6.4 or later: 0.6.3 added
+    /// the parser hardening that matters for the OCI layers microsandbox-image
+    /// unpacks.
+    #[test]
+    fn astral_tokio_tar_is_only_reached_through_microsandbox_and_testcontainers() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "astral-tokio-tar")
+            .into_iter()
+            .filter(|name| !ALLOWED_ASTRAL_TOKIO_TAR_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on astral-tokio-tar, which is unmaintained \
+             (RUSTSEC-2026-0440). The dependency-scan.yml exception only covers the \
+             microsandbox SDK and testcontainers; use the `tar` crate (or `tar-codec`) instead."
+        );
+
+        let outdated: Vec<_> = locked_versions(CARGO_LOCK, "astral-tokio-tar")
+            .into_iter()
+            .filter(|version| *version < (0, 6, 4))
+            .collect();
+        assert!(
+            outdated.is_empty(),
+            "Cargo.lock pins astral-tokio-tar {outdated:?}; keep it at 0.6.4 or later \
+             (`cargo update -p astral-tokio-tar`) so the parser keeps 0.6.3's hardening."
+        );
+    }
+
     #[test]
     fn bincode_is_only_reached_through_microsandbox() {
         let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "bincode")
@@ -431,6 +465,88 @@ mod unmaintained_dependency_guard_tests {
              lopdf 0.42 required it; lopdf 0.46+ only uses the maintained skrifa behind its \
              `font_embedding` feature. PDF text is read with lopdf directly in \
              temps-ai-chat's attachments.rs, not through pdf-extract, which pins lopdf 0.42."
+        );
+    }
+
+    const DENY_TOML: &str = include_str!("../../../deny.toml");
+    const DEPENDENCY_SCAN_WORKFLOW: &str =
+        include_str!("../../../.github/workflows/dependency-scan.yml");
+
+    /// Advisory IDs in `deny.toml`'s `[advisories] ignore` list
+    /// (`{ id = "RUSTSEC-...", reason = "..." }` entries).
+    fn deny_ignored_advisories(deny: &str) -> std::collections::BTreeSet<&str> {
+        deny.lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[advisories]")
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .filter_map(|line| line.strip_prefix("{ id = \""))
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    /// Advisory IDs in the cargo-audit step's `ignore:` input. Panics unless
+    /// the workflow has exactly one such line, so a second audit step or a
+    /// renamed input cannot make this guard compare the wrong list.
+    fn cargo_audit_ignored_advisories(workflow: &str) -> std::collections::BTreeSet<&str> {
+        let lines: Vec<_> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("ignore:"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one `ignore:` input in dependency-scan.yml, found {}",
+            lines.len()
+        );
+        lines[0]
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn advisory_ignore_parsers_read_both_formats() {
+        let deny = "[graph]\nall-features = true\n\n[advisories]\nignore = [\n    \
+                    { id = \"RUSTSEC-1\", reason = \"a\" },\n    { id = \"RUSTSEC-2\", reason = \"b\" },\n]\n\n\
+                    [bans]\nskip = [\n    { id = \"NOT-AN-ADVISORY\" },\n]\n";
+        assert_eq!(
+            deny_ignored_advisories(deny)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["RUSTSEC-1", "RUSTSEC-2"]
+        );
+        let workflow = "      # ignore: commented out\n        with:\n          \
+                        ignore: RUSTSEC-2,RUSTSEC-1\n";
+        assert_eq!(
+            cargo_audit_ignored_advisories(workflow)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["RUSTSEC-1", "RUSTSEC-2"]
+        );
+    }
+
+    /// `deny.toml` says its advisory ignore list mirrors the cargo-audit step's
+    /// in `dependency-scan.yml` so the two gates cannot disagree. Nothing else
+    /// checks that, and an exception added to one list only (RUSTSEC-2026-0440
+    /// was, at first) leaves cargo-deny and cargo-audit judging the same
+    /// lockfile differently.
+    #[test]
+    fn deny_toml_and_cargo_audit_ignore_the_same_advisories() {
+        let deny = deny_ignored_advisories(DENY_TOML);
+        let audit = cargo_audit_ignored_advisories(DEPENDENCY_SCAN_WORKFLOW);
+        assert!(
+            !deny.is_empty(),
+            "no `{{ id = ... }}` entries found in deny.toml"
+        );
+        let only_in_deny: Vec<_> = deny.difference(&audit).collect();
+        let only_in_audit: Vec<_> = audit.difference(&deny).collect();
+        assert!(
+            only_in_deny.is_empty() && only_in_audit.is_empty(),
+            "advisory ignore lists disagree: only in deny.toml {only_in_deny:?}, only in \
+             dependency-scan.yml's cargo-audit step {only_in_audit:?}. Add each exception, \
+             with its reason, to both."
         );
     }
 }

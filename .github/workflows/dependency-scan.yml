@@ -121,6 +121,27 @@ jobs:
       #   `bincode ^2.0.1` non-optionally, so no upgrade drops it. No
       #   vulnerability is reported against bincode 2.0.1. A temps-core
       #   Cargo.lock guard test fails if anything else starts depending on it.
+      # - RUSTSEC-2026-0440 (astral-tokio-tar): Astral ended maintenance on
+      #   2026-11-03; no patched version exists. No workspace crate uses it.
+      #   Dependents:
+      #   * microsandbox-image (and microsandbox's `local` feature, enabled by
+      #     temps-sandbox-providers): parses OCI image layer tarballs pulled
+      #     from registries when a microsandbox sandbox boots, so
+      #     registry-supplied archives do reach this parser. Not linked on musl
+      #     (the container image) or Intel macOS, same as bincode above.
+      #   * testcontainers: writes tar archives for copy-to-container and
+      #     reads copy-from-container output, against containers the tests
+      #     start themselves. Test-only: it is a dependency of the dev-only
+      #     temps-test-utils crate and of dev-dependencies, and no crate
+      #     depends on temps-test-utils outside dev-dependencies.
+      #   Checked 2026-11-09: the latest releases (microsandbox and
+      #   microsandbox-image 0.7.14, testcontainers 0.28.0) still require
+      #   `astral-tokio-tar ^0.6`, so no upgrade drops it. Cargo.lock is held
+      #   at 0.6.4, the last 0.6 release, which carries 0.6.3's parser
+      #   hardening (rejects ambiguous PAX/GNU metadata, truncated payloads and
+      #   partial sparse maps). A temps-core guard test fails if anything else
+      #   starts depending on it or if the lock drops below 0.6.4. Replace once
+      #   microsandbox and testcontainers move to a maintained tar crate.
       #
       # The six below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices). A version bump here cannot clear any of them: either no fix is
@@ -251,7 +272,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440
 
   cargo-deny:
     name: Rust Licences, Sources & Bans (cargo-deny)
