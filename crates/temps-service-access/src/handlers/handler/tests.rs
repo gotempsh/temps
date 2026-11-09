@@ -1165,7 +1165,7 @@ async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
                             revoked_at: None,
                             version: 1,
                             grant_id: None,
-                            next_reconcile_at: now,
+                            next_reconcile_at: Some(now),
                             created_at: now,
                             updated_at: now,
                         }]])

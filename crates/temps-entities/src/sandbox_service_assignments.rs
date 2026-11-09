@@ -18,7 +18,8 @@ pub struct Model {
     pub revoked_at: Option<temps_core::DBDateTime>,
     pub version: i32,
     pub grant_id: Option<String>,
-    pub next_reconcile_at: temps_core::DBDateTime,
+    /// None removes terminal approvals from the due-work range without deleting history.
+    pub next_reconcile_at: Option<temps_core::DBDateTime>,
     pub created_at: temps_core::DBDateTime,
     pub updated_at: temps_core::DBDateTime,
 }

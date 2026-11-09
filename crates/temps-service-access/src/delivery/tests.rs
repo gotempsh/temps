@@ -335,3 +335,35 @@ async fn worker_claim_excludes_other_sandboxes_until_release() {
     assert_eq!(queue.claim(2).await.unwrap().len(), 1);
     test.cleanup().await;
 }
+
+#[tokio::test]
+async fn worker_batches_report_progress_even_without_new_commands() {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping worker backlog: database unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO sandbox_access_authorities (id,sdk_node_id,seal_public_key,snapshot_key_encrypted,session_key_encrypted,ca_certificate,ca_key_encrypted,next_reconcile_at) SELECT gen_random_uuid(),gen_random_uuid(),repeat('a',44),'test-snapshot','test-session','test-ca','test-key',now() FROM generate_series(1,97)").await.unwrap();
+    let queue = DeliveryQueue::new(db.clone());
+    let mut total = 0;
+    let mut batches = 0;
+    loop {
+        let batch = queue.schedule_due(16).await.unwrap();
+        assert_eq!(batch.queued, 0);
+        if batch.processed == 0 {
+            break;
+        }
+        assert!(batch.processed <= 16);
+        total += batch.processed;
+        batches += 1;
+        assert!(batches <= 7);
+    }
+    assert_eq!(total, 97);
+    assert_eq!(batches, 7);
+    test.cleanup().await;
+}

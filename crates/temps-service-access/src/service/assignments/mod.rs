@@ -111,7 +111,7 @@ impl ServiceAccessService {
                 revoked_at: Set(None),
                 version: Set(1),
                 grant_id: Set(None),
-                next_reconcile_at: Set(Utc::now()),
+                next_reconcile_at: Set(Some(Utc::now())),
                 created_at: Set(Utc::now()),
                 updated_at: Set(Utc::now()),
             }
@@ -294,7 +294,7 @@ impl ServiceAccessService {
         model.service_version = Set(service.version);
         model.version = Set(request.expected_version + 1);
         model.grant_id = Set(None);
-        model.next_reconcile_at = Set(Utc::now());
+        model.next_reconcile_at = Set(Some(Utc::now()));
         model.updated_at = Set(Utc::now());
         let row = model
             .update(&tx)

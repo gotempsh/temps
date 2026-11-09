@@ -580,3 +580,76 @@ async fn single_service_read_scopes_query_and_handles_storage_errors() {
         })
     ));
 }
+
+#[tokio::test]
+async fn stored_bearer_cannot_follow_an_origin_change() {
+    let mut old = row();
+    old.credential_encrypted = Some(encryption().encrypt_string("original-test-secret").unwrap());
+    let s = service(
+        db().append_query_results([vec![project_row()]])
+            .append_query_results([vec![old]]),
+    );
+    let mut req = request();
+    req.expected_version = Some(1);
+    req.policy.origin = "https://other.example.com".into();
+    assert!(matches!(
+        s.save_service(7, Some("svc_test".into()), req).await,
+        Err(AccessError::Validation {
+            field: "credential",
+            ..
+        })
+    ));
+    let log = format!(
+        "{:?}",
+        Arc::try_unwrap(s.db).unwrap().into_transaction_log()
+    );
+    assert!(
+        !log.contains(" SET "),
+        "an unsafe edit must roll back before writing"
+    );
+}
+
+#[tokio::test]
+async fn origin_edits_allow_explicit_replacement_or_clearing_and_same_origin_retains_secret() {
+    for (origin, replacement, clear) in [
+        (
+            "https://other.example.com",
+            Some("replacement-test-secret"),
+            false,
+        ),
+        ("https://other.example.com", None, true),
+        ("https://API.EXAMPLE.COM:443/", None, false),
+    ] {
+        let mut old = row();
+        old.credential_encrypted =
+            Some(encryption().encrypt_string("original-test-secret").unwrap());
+        let mut updated = old.clone();
+        updated.version = 2;
+        let mut req = request();
+        req.expected_version = Some(1);
+        req.policy.origin = origin.into();
+        req.credential = replacement.map(Into::into);
+        req.clear_credential = clear;
+        let s = service(db_with_update(old, updated));
+        s.save_service(7, Some("svc_test".into()), req)
+            .await
+            .unwrap();
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(s.db).unwrap().into_transaction_log()
+        );
+        assert!(log.contains("UPDATE"));
+        assert_eq!(
+            log.split(" SET ")
+                .nth(1)
+                .unwrap()
+                .split(" WHERE ")
+                .next()
+                .unwrap()
+                .contains("credential_encrypted"),
+            replacement.is_some() || clear
+        );
+        assert!(!log.contains("original-test-secret"));
+        assert!(!log.contains("replacement-test-secret"));
+    }
+}

@@ -66,7 +66,12 @@ async fn durable_approvals_renew_only_after_explicit_consent_and_revocation_wins
         .await
         .unwrap();
     assert_eq!(pending.status, SandboxServiceStatus::PendingApproval);
-    assert!(service.due_assignments().await.unwrap().is_empty());
+    assert!(service
+        .due_assignments()
+        .await
+        .unwrap()
+        .assignments
+        .is_empty());
     assert_eq!(
         service
             .request_sandbox_service(9751, "sbx_durable", 9751, false, request())
@@ -304,9 +309,75 @@ async fn durable_approvals_renew_only_after_explicit_consent_and_revocation_wins
         .is_none());
     db.execute_unprepared(&format!("UPDATE sandbox_service_assignments SET expires_at=now()-interval '1 second',next_reconcile_at=now()-interval '1 minute' WHERE id='{}'",fixed.id)).await.unwrap();
     assert!(
-        service.due_assignments().await.unwrap().is_empty(),
+        service
+            .due_assignments()
+            .await
+            .unwrap()
+            .assignments
+            .is_empty(),
         "expired approvals must never enter provider renewal work"
     );
+    let terminal = assignments::Entity::find_by_id(&fixed.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(terminal.next_reconcile_at.is_none());
+    assert!(terminal.approved_at.is_some(), "retain approval history");
+    assert!(
+        terminal.revoked_at.is_none(),
+        "expiry is not operator revocation"
+    );
+    assert_eq!(service.due_assignments().await.unwrap().processed, 0);
+    // Reapproval explicitly wakes a terminal declaration again.
+    let policy_version = service.get_service(9751, &svc.id).await.unwrap().version;
+    service
+        .approve_sandbox_service(
+            9751,
+            "sbx_durable",
+            &fixed.id,
+            9751,
+            false,
+            ApproveSandboxService {
+                expected_version: terminal.version,
+                service_version: policy_version,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service.due_assignments().await.unwrap().assignments.len(),
+        1
+    );
+    // Both hard-deleted (NULL) and soft-deleted approvers must leave due work.
+    db.execute_unprepared(&format!("UPDATE sandbox_service_assignments SET approved_by=NULL,next_reconcile_at=now() WHERE id='{}'", fixed.id)).await.unwrap();
+    let batch = service.due_assignments().await.unwrap();
+    assert_eq!(batch.processed, 1);
+    assert!(batch.assignments.is_empty());
+    assert_eq!(service.due_assignments().await.unwrap().processed, 0);
+    db.execute_unprepared(&format!("UPDATE sandbox_service_assignments SET approved_by=9751,next_reconcile_at=now() WHERE id='{}'; UPDATE users SET deleted_at=now() WHERE id=9751", fixed.id)).await.unwrap();
+    assert!(service
+        .due_assignments()
+        .await
+        .unwrap()
+        .assignments
+        .is_empty());
+    assert_eq!(service.due_assignments().await.unwrap().processed, 0);
+    // A backlog of terminal rows is consumed once in bounded batches, without
+    // sleeping after batches that contain cleanup work but no live renewals.
+    db.execute_unprepared("UPDATE users SET deleted_at=NULL WHERE id=9751; INSERT INTO sandbox_access_services(id,project_id,name,policy,max_ttl_seconds) SELECT 'svc_history_'||i,9751,'History','{}',60 FROM generate_series(1,25) i; INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,service_version,approved_by,approved_at,expires_at,next_reconcile_at) SELECT 'access_history_'||i,9751,9751,'svc_history_'||i,1,9751,now()-interval '1 day',CASE WHEN i=25 THEN NULL ELSE now()-interval '1 hour' END,now()-interval '1 minute' FROM generate_series(1,25) i").await.unwrap();
+    let mut processed = 0;
+    let mut live = 0;
+    for _ in 0..4 {
+        let batch = service.due_assignments().await.unwrap();
+        assert!((1..=8).contains(&batch.processed));
+        processed += batch.processed;
+        live += batch.assignments.len();
+    }
+    assert_eq!(processed, 25);
+    assert_eq!(live, 1);
+    assert_eq!(service.due_assignments().await.unwrap().processed, 0);
     test.cleanup().await;
 }
 
@@ -363,7 +434,12 @@ async fn replacement_waits_for_runtime_before_touching_authority() {
         .await
         .unwrap();
     assert_eq!(pending.status, SandboxServiceStatus::PendingApproval);
-    assert!(service.due_assignments().await.unwrap().is_empty());
+    assert!(service
+        .due_assignments()
+        .await
+        .unwrap()
+        .assignments
+        .is_empty());
     assert_eq!(
         service
             .request_sandbox_service(9751, "sbx_durable", 9751, false, request())

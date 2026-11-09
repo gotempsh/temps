@@ -23,7 +23,10 @@ impl ServiceAccessReconciler {
             tasks.push(tokio::spawn(async move {
                 loop {
                     match tokio::time::timeout(Duration::from_secs(12), scheduler.maintain()).await {
-                        Ok(Ok(_)) => {},
+                        Ok(Ok(batch)) => {
+                            wait_after_batch(batch.processed, scheduler.wait_for_work()).await;
+                            continue;
+                        },
                         Ok(Err(error)) => tracing::warn!(%error, "Cannot schedule sandbox service-access reconciliation"),
                         Err(_) => tracing::warn!("Sandbox service-access maintenance deadline exceeded"),
                     }
@@ -34,7 +37,7 @@ impl ServiceAccessReconciler {
             tasks.push(tokio::spawn(async move {
                 loop {
                     match tokio::time::timeout(Duration::from_secs(90), approvals.maintain_assignments()).await {
-                        Ok(Ok(count)) => { wait_after_approval_batch(count).await; continue; },
+                        Ok(Ok(count)) => { wait_after_batch(count, tokio::time::sleep(Duration::from_secs(5))).await; continue; },
                         Ok(Err(error)) => tracing::warn!(%error, "Cannot maintain sandbox service approvals"),
                         Err(_) => tracing::warn!("Sandbox service approval maintenance timed out"),
                     }
@@ -70,9 +73,9 @@ impl Drop for ServiceAccessReconciler {
 }
 
 // Yield between bounded batches; only an empty queue needs the polling delay.
-async fn wait_after_approval_batch(count: usize) {
+async fn wait_after_batch(count: usize, idle: impl std::future::Future<Output = ()>) {
     if count == 0 {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        idle.await;
     } else {
         tokio::task::yield_now().await;
     }
@@ -85,10 +88,23 @@ mod tests {
     async fn backlog_does_not_spend_short_grant_lifetimes_sleeping() {
         let start = tokio::time::Instant::now();
         for _ in 0..16 {
-            wait_after_approval_batch(8).await;
+            wait_after_batch(8, tokio::time::sleep(Duration::from_secs(5))).await;
         }
         assert_eq!(start.elapsed(), Duration::ZERO);
-        wait_after_approval_batch(0).await;
+        wait_after_batch(0, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_backlog_drains_before_policy_leases_expire() {
+        let start = tokio::time::Instant::now();
+        let mut workers = 97;
+        while workers > 0 {
+            let processed = workers.min(16);
+            workers -= processed;
+            wait_after_batch(processed, tokio::time::sleep(Duration::from_secs(5))).await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        wait_after_batch(0, tokio::time::sleep(Duration::from_secs(5))).await;
         assert_eq!(start.elapsed(), Duration::from_secs(5));
     }
 }

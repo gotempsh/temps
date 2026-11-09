@@ -173,6 +173,22 @@ impl ServiceAccessService {
             if current.version != version || current.version == i32::MAX {
                 return Err(AccessError::Conflict { id, version });
             }
+            if current.credential_encrypted.is_some()
+                && encrypted.is_none()
+                && !request.clear_credential
+                && request.policy.github_repository.is_none()
+            {
+                let previous: SandboxAccessPolicy = serde_json::from_value(current.policy.clone())
+                    .map_err(|source| AccessError::StoredPolicy {
+                        id: current.id.clone(),
+                        project_id,
+                        source,
+                    })?;
+                let (previous, _) = crate::tokenless::compile_policy(&previous)?;
+                if previous.origin != request.policy.origin {
+                    return Err(invalid("credential", "changing the HTTPS origin requires a replacement credential or explicit credential clearing"));
+                }
+            }
             let mut model = current.into_active_model();
             model.version = Set(version + 1);
             model

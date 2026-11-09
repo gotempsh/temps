@@ -10,16 +10,43 @@ use temps_entities::{
 struct Approver {
     admin: bool,
 }
+pub(crate) struct ApprovalBatch {
+    pub assignments: Vec<assignments::Model>,
+    pub processed: usize,
+}
 impl ServiceAccessService {
     /// Indexed, bounded claims. Claiming never authorizes traffic. A crashed
     /// reconciler retries after 30s; stale work must pass the transaction again.
-    pub(crate) async fn due_assignments(&self) -> Result<Vec<assignments::Model>, AccessError> {
-        assignments::Model::find_by_statement(Statement::from_string(DatabaseBackend::Postgres,r#"
-WITH due AS (SELECT id FROM sandbox_service_assignments WHERE approved_at IS NOT NULL AND revoked_at IS NULL
- AND approved_by IS NOT NULL AND (expires_at IS NULL OR expires_at>now()+interval '1 second')
- AND next_reconcile_at<=now() ORDER BY next_reconcile_at,id LIMIT 8 FOR UPDATE SKIP LOCKED)
-UPDATE sandbox_service_assignments a SET next_reconcile_at=now()+interval '30 seconds' FROM due WHERE a.id=due.id RETURNING a.*
-"#)).all(self.db.as_ref()).await.map_err(|e|AccessError::database("claim due service approvals",0,e))
+    pub(crate) async fn due_assignments(&self) -> Result<ApprovalBatch, AccessError> {
+        // Limit candidates before testing terminal conditions, so expired history
+        // cannot consume an unbounded scan on every poll. NULL leaves the indexed
+        // next_reconcile_at <= now() range; explicit reapproval schedules it again.
+        let rows = assignments::Model::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"
+WITH due AS (
+ SELECT id FROM sandbox_service_assignments
+ WHERE approved_at IS NOT NULL AND revoked_at IS NULL AND next_reconcile_at<=now()
+ ORDER BY next_reconcile_at,id LIMIT 8 FOR UPDATE SKIP LOCKED
+)
+UPDATE sandbox_service_assignments a SET next_reconcile_at=CASE
+ WHEN (a.expires_at IS NOT NULL AND a.expires_at<=now()+interval '1 second')
+   OR NOT EXISTS (SELECT 1 FROM users u WHERE u.id=a.approved_by AND u.deleted_at IS NULL)
+ THEN NULL ELSE LEAST(now()+interval '30 seconds',a.expires_at-interval '1 second') END
+FROM due WHERE a.id=due.id RETURNING a.*
+"#,
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|e| AccessError::database("claim due service approvals", 0, e))?;
+        let processed = rows.len();
+        Ok(ApprovalBatch {
+            assignments: rows
+                .into_iter()
+                .filter(|row| row.next_reconcile_at.is_some())
+                .collect(),
+            processed,
+        })
     }
     pub(crate) async fn assignment_sandbox(
         &self,

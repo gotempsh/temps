@@ -196,19 +196,19 @@ impl ServiceAccessCoordinator {
 
     /// Bounded maintenance tick. Authorization changes wake their worker in the
     /// database; periodic rechecks renew only still-authorized short leases.
-    pub async fn maintain(&self) -> Result<u64, CoordinatorError> {
-        let queued = self.queue.schedule_due(16).await?;
+    pub async fn maintain(&self) -> Result<crate::delivery::ScheduledBatch, CoordinatorError> {
+        let batch = self.queue.schedule_due(16).await?;
         self.queue.prune_completed().await?;
-        if queued > 0 {
+        if batch.queued > 0 {
             self.wake.notify_waiters();
         }
-        Ok(queued)
+        Ok(batch)
     }
 
     pub(crate) async fn maintain_assignments(&self) -> Result<usize, CoordinatorError> {
         let assignments = self.service.due_assignments().await?;
-        let count = assignments.len();
-        for assignment in assignments {
+        let count = assignments.processed;
+        for assignment in assignments.assignments {
             let result = async {
                 let Some(sandbox) = self.service.assignment_sandbox(&assignment).await? else {
                     return Ok::<_, CoordinatorError>(());

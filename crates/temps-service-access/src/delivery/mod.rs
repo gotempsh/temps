@@ -6,6 +6,13 @@
 //! its enforcement receipt before completing a command. No credentials are
 //! persisted in this queue, and no database operation runs on the proxy path.
 mod schedule;
+
+/// Scheduling progress is independent of the number of new outbox commands.
+#[derive(Debug, Default)]
+pub struct ScheduledBatch {
+    pub processed: usize,
+    pub queued: u64,
+}
 use std::sync::Arc;
 
 use sea_orm::{

@@ -392,7 +392,7 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
     // planning may reject the entire worker before retiring these stale rows.
     db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) VALUES(gen_random_uuid(),9601,10128,'{boot}','container-extra','temps-sandbox-capacity_10128','docker')")).await.unwrap();
     let queue = DeliveryQueue::new(db.clone());
-    assert!(queue.schedule_due(16).await.unwrap() > 0);
+    assert!(queue.schedule_due(16).await.unwrap().queued > 0);
     let planner = PolicyPlanner::new(
         db.clone(),
         encryption(),

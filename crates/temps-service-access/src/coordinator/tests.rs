@@ -247,7 +247,7 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
     );
     assert!(!revoked.connected);
     let (a, b) = tokio::join!(coordinator.maintain(), coordinator.maintain());
-    assert_eq!(a.unwrap() + b.unwrap(), 1);
+    assert_eq!(a.unwrap().queued + b.unwrap().queued, 1);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Applied)
@@ -375,20 +375,20 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
         .await
         .unwrap();
     let grant = coordinator.connect(consent(&service.id)).await.unwrap();
-    assert_eq!(coordinator.maintain().await.unwrap(), 0);
+    assert_eq!(coordinator.maintain().await.unwrap().queued, 0);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Applied)
     );
     let binding = provider.binding.lock().unwrap().as_ref().unwrap().0.clone();
-    assert_eq!(coordinator.maintain().await.unwrap(), 0);
+    assert_eq!(coordinator.maintain().await.unwrap().queued, 0);
     db.execute_unprepared(
         "UPDATE sandbox_access_authorities SET next_reconcile_at=now()-interval '1 second'",
     )
     .await
     .unwrap();
-    assert_eq!(coordinator.maintain().await.unwrap(), 1);
-    assert_eq!(coordinator.maintain().await.unwrap(), 0);
+    assert_eq!(coordinator.maintain().await.unwrap().queued, 1);
+    assert_eq!(coordinator.maintain().await.unwrap().queued, 0);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Applied)
@@ -404,7 +404,7 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
         .revoke_grant(9801, "sbx_dispatch", &grant.grant_id, 9801, false, 1)
         .await
         .unwrap();
-    assert_eq!(coordinator.maintain().await.unwrap(), 1);
+    assert_eq!(coordinator.maintain().await.unwrap().queued, 1);
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Superseded)

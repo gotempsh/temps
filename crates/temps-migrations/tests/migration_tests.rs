@@ -8137,3 +8137,46 @@ async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
     assert_eq!(rows.len(), 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn terminal_approval_scheduling_preserves_history_and_guards_downgrade() -> anyhow::Result<()>
+{
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("terminal approval scheduling");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261109_000009_terminal_service_approval_scheduling";
+    let migrations = Migrator::migrations();
+    let migration = migrations.iter().find(|m| m.name() == target).unwrap();
+    let manager = SchemaManager::new(&db);
+    Migrator::up(&db, Some(migrations.len() as u32 - steps_back_to(target))).await?;
+    db.execute_unprepared(r#"
+INSERT INTO users(id,name,email) VALUES(9901,'Test user','user@example.com');
+INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9901,'Schedule','repo','owner','/','main','nodejs','schedule',now(),now());
+INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9901,'sbx_schedule','schedule',9901,9901,'running','docker');
+INSERT INTO sandbox_access_services(id,project_id,name,policy,max_ttl_seconds) VALUES('svc_schedule',9901,'Schedule','{}',60);
+INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,service_version,approved_by,approved_at,expires_at) VALUES('access_schedule',9901,9901,'svc_schedule',1,9901,now()-interval '2 minutes',now()-interval '1 minute');
+"#).await?;
+    migration.up(&manager).await?;
+    migration.up(&manager).await?;
+    let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,"SELECT next_reconcile_at IS NOT NULL AS scheduled FROM sandbox_service_assignments WHERE id='access_schedule'")).await?.unwrap();
+    assert!(row.try_get::<bool>("", "scheduled")?);
+    db.execute_unprepared(
+        "UPDATE sandbox_service_assignments SET next_reconcile_at=NULL WHERE id='access_schedule'",
+    )
+    .await?;
+    let error = migration.down(&manager).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("terminal approvals have no next check"));
+    let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,"SELECT approved_at IS NOT NULL AND revoked_at IS NULL AND expires_at<now() AND next_reconcile_at IS NULL AS retained FROM sandbox_service_assignments WHERE id='access_schedule'")).await?.unwrap();
+    assert!(row.try_get::<bool>("", "retained")?);
+    db.execute_unprepared("DELETE FROM sandbox_service_assignments WHERE id='access_schedule'")
+        .await?;
+    migration.down(&manager).await?;
+    migration.up(&manager).await?;
+    Ok(())
+}

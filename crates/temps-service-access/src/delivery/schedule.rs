@@ -14,7 +14,7 @@ impl DeliveryQueue {
     /// Indexed due-worker scan, not a scan of every sandbox. Changes wake the
     /// authority in the same transaction; active workers recheck every 10s for
     /// their 30s leases. Pending versions are retained rather than multiplied.
-    pub async fn schedule_due(&self, limit: u32) -> Result<u64, DeliveryError> {
+    pub async fn schedule_due(&self, limit: u32) -> Result<ScheduledBatch, DeliveryError> {
         if !(1..=16).contains(&limit) {
             return Err(DeliveryError::Invalid {
                 operation: "schedule due workers",
@@ -32,15 +32,19 @@ impl DeliveryQueue {
         })?
     }
 
-    async fn schedule_due_inner(&self, limit: u32) -> Result<u64, DeliveryError> {
+    async fn schedule_due_inner(&self, limit: u32) -> Result<ScheduledBatch, DeliveryError> {
         let due = DueWorker::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "SELECT id FROM sandbox_access_authorities WHERE closed_at IS NULL AND next_reconcile_at<=now() ORDER BY next_reconcile_at,id LIMIT $1", [i64::from(limit).into()]))
             .all(self.db.as_ref()).await.map_err(|e| database("find due workers", "reconciliation queue", e))?;
+        let processed = due.len();
         let mut scheduled = 0;
         for worker in due {
             scheduled += self.schedule_worker(worker.id).await?;
         }
-        Ok(scheduled)
+        Ok(ScheduledBatch {
+            processed,
+            queued: scheduled,
+        })
     }
 
     async fn schedule_worker(&self, id: Uuid) -> Result<u64, DeliveryError> {
