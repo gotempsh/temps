@@ -16821,6 +16821,43 @@
         ],
         "type": "object"
       },
+      "CreateInternalAccessGrantRequest": {
+        "properties": {
+          "caller_environment_id": {
+            "description": "Only this environment of the calling project; omit for every\nenvironment, present and future.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "caller_project_id": {
+            "description": "The project whose workloads may call.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "description": {
+            "description": "Why the grant exists, up to 200 characters.",
+            "example": "The checkout worker calls the orders API",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_environment_id": {
+            "description": "The environment of this project that may be called; omit for every\nenvironment, present and future.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "caller_project_id"
+        ],
+        "type": "object"
+      },
       "CreateIpAccessControlRequest": {
         "description": "Request to create an IP access control rule",
         "properties": {
@@ -22614,6 +22651,48 @@
         ],
         "type": "string"
       },
+      "DnsInternalAccess": {
+        "description": "Whether the asking project may call an internal route (ADR 100 D7).",
+        "properties": {
+          "reach": {
+            "description": "`same_project`, `granted`, `some_environments` or `not_granted`.",
+            "example": "not_granted",
+            "type": "string"
+          },
+          "setup_path": {
+            "description": "Where the owning project's grants are managed in the console.",
+            "example": "/projects/orders-api/settings/security#internal-access",
+            "type": "string"
+          },
+          "target_environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_environment_name": {
+            "type": "string"
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_name": {
+            "type": "string"
+          },
+          "target_project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_project_id",
+          "target_project_name",
+          "target_project_slug",
+          "target_environment_id",
+          "target_environment_name",
+          "reach",
+          "setup_path"
+        ],
+        "type": "object"
+      },
       "DnsLookupError": {
         "description": "Error response for DNS lookup failures",
         "properties": {
@@ -24060,6 +24139,17 @@
           "authoritative": {
             "description": "Answered from the internal zone.",
             "type": "boolean"
+          },
+          "internal_access": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DnsInternalAccess",
+                "description": "Asked as a project, for an internal route: who owns it and whether\nthat project lets the asking one call it. The internal proxy answers\n`403` when `reach` is `not_granted`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "latency_ms": {
             "format": "double",
@@ -39437,6 +39527,123 @@
             "type": "object"
           }
         ]
+      },
+      "InternalAccessGrantListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/InternalAccessGrantResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "InternalAccessGrantResponse": {
+        "description": "One grant: who (a project, or one environment of it) may call what (this\nproject, or one environment of it).",
+        "properties": {
+          "caller_environment_id": {
+            "description": "`null`: every environment of the caller project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "caller_environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "caller_project_name": {
+            "type": "string"
+          },
+          "caller_project_slug": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_environment_id": {
+            "description": "`null`: every environment of the target project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_environment_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_project_name": {
+            "type": "string"
+          },
+          "target_project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "target_project_id",
+          "target_project_name",
+          "target_project_slug",
+          "caller_project_id",
+          "caller_project_name",
+          "caller_project_slug",
+          "created_at"
+        ],
+        "type": "object"
       },
       "InternalProxyState": {
         "description": "A worker's internal routing, from its heartbeat's\n`capacity.internal_proxy`. Every `<env>.<project>.temps.local` name\npoints at the node's bridge, port 80: the resolver can be healthy while\nnothing serves those calls, and then the names resolve and every call to\nthem fails.",
@@ -152656,6 +152863,315 @@
         "x-maturity": "experimental"
       }
     },
+    "/projects/{project_id}/internal-access": {
+      "get": {
+        "description": "Newest first. With `environment_id`, only the grants that cover that\nenvironment (its own and the project-wide ones).",
+        "operationId": "list_internal_access_grants",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only grants that cover this environment of the project: its own and\nthe project-wide ones.",
+            "in": "query",
+            "name": "environment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "1-based page, default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalAccessGrantListResponse"
+                }
+              }
+            },
+            "description": "Grants on the project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the projects allowed to call this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      },
+      "post": {
+        "description": "Workloads of the calling project (or of one environment of it) may then\ncall this project's `*.temps.local` addresses (or one environment's)\nthrough the internal proxy. Workers apply it with their next route sync,\nwithin seconds.",
+        "operationId": "create_internal_access_grant",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInternalAccessGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalAccessGrantResponse"
+                }
+              }
+            },
+            "description": "Grant created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid grant"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions on either project"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Already granted, or too many grants"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Allow another project to call this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
+    "/projects/{project_id}/internal-access/{grant_id}": {
+      "delete": {
+        "description": "Workers refuse the caller again with their next route sync, within\nseconds (ADR 100 D5).",
+        "operationId": "delete_internal_access_grant",
+        "parameters": [
+          {
+            "description": "The project being called",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Grant ID",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Grant removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Grant not found on this project"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop another project from calling this project's internal addresses",
+        "tags": [
+          "Internal Access"
+        ]
+      }
+    },
     "/projects/{project_id}/ip-access": {
       "delete": {
         "description": "The project becomes reachable from any address again (environments with\ntheir own policy keep it).",
@@ -171653,6 +172169,10 @@
     {
       "description": "What each workload may reach, and whether a node enforces it",
       "name": "Network Policy"
+    },
+    {
+      "description": "Which other projects may call a project's *.temps.local addresses",
+      "name": "Internal Access"
     },
     {
       "description": "Key-Value storage operations",

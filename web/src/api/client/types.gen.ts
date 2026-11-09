@@ -8160,6 +8160,27 @@ export type CreateIntegrationBody = {
     signing_secret: SecretString;
 };
 
+export type CreateInternalAccessGrantRequest = {
+    /**
+     * Only this environment of the calling project; omit for every
+     * environment, present and future.
+     */
+    caller_environment_id?: number | null;
+    /**
+     * The project whose workloads may call.
+     */
+    caller_project_id: number;
+    /**
+     * Why the grant exists, up to 200 characters.
+     */
+    description?: string | null;
+    /**
+     * The environment of this project that may be called; omit for every
+     * environment, present and future.
+     */
+    target_environment_id?: number | null;
+};
+
 /**
  * Request to create an IP access control rule
  */
@@ -11015,6 +11036,25 @@ export type DnsCompletionResponse = {
 export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
 
 /**
+ * Whether the asking project may call an internal route (ADR 100 D7).
+ */
+export type DnsInternalAccess = {
+    /**
+     * `same_project`, `granted`, `some_environments` or `not_granted`.
+     */
+    reach: string;
+    /**
+     * Where the owning project's grants are managed in the console.
+     */
+    setup_path: string;
+    target_environment_id: number;
+    target_environment_name: string;
+    target_project_id: number;
+    target_project_name: string;
+    target_project_slug: string;
+};
+
+/**
  * Error response for DNS lookup failures
  */
 export type DnsLookupError = {
@@ -11597,6 +11637,7 @@ export type DnsResolveResponse = {
      * Answered from the internal zone.
      */
     authoritative: boolean;
+    internal_access?: DnsInternalAccess | null;
     latency_ms: number;
     name: string;
     node_id: number;
@@ -18406,6 +18447,40 @@ export type Intent = {
     before?: HttpPolicy | null;
     hostname: string;
     type: 'http_policy';
+};
+
+export type InternalAccessGrantListResponse = {
+    items: Array<InternalAccessGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * One grant: who (a project, or one environment of it) may call what (this
+ * project, or one environment of it).
+ */
+export type InternalAccessGrantResponse = {
+    /**
+     * `null`: every environment of the caller project.
+     */
+    caller_environment_id?: number | null;
+    caller_environment_name?: string | null;
+    caller_project_id: number;
+    caller_project_name: string;
+    caller_project_slug: string;
+    created_at: string;
+    created_by?: number | null;
+    description?: string | null;
+    id: number;
+    /**
+     * `null`: every environment of the target project.
+     */
+    target_environment_id?: number | null;
+    target_environment_name?: string | null;
+    target_project_id: number;
+    target_project_name: string;
+    target_project_slug: string;
 };
 
 /**
@@ -81224,6 +81299,158 @@ export type GetInheritedEnvVarsResponses = {
 };
 
 export type GetInheritedEnvVarsResponse = GetInheritedEnvVarsResponses[keyof GetInheritedEnvVarsResponses];
+
+export type ListInternalAccessGrantsData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Only grants that cover this environment of the project: its own and
+         * the project-wide ones.
+         */
+        environment_id?: number | null;
+        /**
+         * 1-based page, default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/internal-access';
+};
+
+export type ListInternalAccessGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListInternalAccessGrantsError = ListInternalAccessGrantsErrors[keyof ListInternalAccessGrantsErrors];
+
+export type ListInternalAccessGrantsResponses = {
+    /**
+     * Grants on the project
+     */
+    200: InternalAccessGrantListResponse;
+};
+
+export type ListInternalAccessGrantsResponse = ListInternalAccessGrantsResponses[keyof ListInternalAccessGrantsResponses];
+
+export type CreateInternalAccessGrantData = {
+    body: CreateInternalAccessGrantRequest;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access';
+};
+
+export type CreateInternalAccessGrantErrors = {
+    /**
+     * Invalid grant
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions on either project
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Already granted, or too many grants
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateInternalAccessGrantError = CreateInternalAccessGrantErrors[keyof CreateInternalAccessGrantErrors];
+
+export type CreateInternalAccessGrantResponses = {
+    /**
+     * Grant created
+     */
+    201: InternalAccessGrantResponse;
+};
+
+export type CreateInternalAccessGrantResponse = CreateInternalAccessGrantResponses[keyof CreateInternalAccessGrantResponses];
+
+export type DeleteInternalAccessGrantData = {
+    body?: never;
+    path: {
+        /**
+         * The project being called
+         */
+        project_id: number;
+        /**
+         * Grant ID
+         */
+        grant_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/internal-access/{grant_id}';
+};
+
+export type DeleteInternalAccessGrantErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Grant not found on this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteInternalAccessGrantError = DeleteInternalAccessGrantErrors[keyof DeleteInternalAccessGrantErrors];
+
+export type DeleteInternalAccessGrantResponses = {
+    /**
+     * Grant removed
+     */
+    204: void;
+};
+
+export type DeleteInternalAccessGrantResponse = DeleteInternalAccessGrantResponses[keyof DeleteInternalAccessGrantResponses];
 
 export type DeleteProjectIpAccessData = {
     body?: never;
