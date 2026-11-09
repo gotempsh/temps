@@ -1285,7 +1285,7 @@ fn cache_acme_result(state: &ProxyState, key: String, value: Option<String>, ttl
     });
 }
 
-/// Who the caller is and whether it may call `entry` (ADR 100 D6). The
+/// Who the caller is and whether it may call `entry` (ADR 101 D6). The
 /// Docker re-check runs only for an allowed caller, charged to the caller's
 /// own project.
 async fn caller_access(

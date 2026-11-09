@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Who may list, create and delete internal access grants (ADR 100 D3).
+//! Who may list, create and delete internal access grants (ADR 101 D3).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;

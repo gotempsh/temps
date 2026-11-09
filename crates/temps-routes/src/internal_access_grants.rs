@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Internal access grants in the route snapshot (ADR 100 D5).
+//! Internal access grants in the route snapshot (ADR 101 D5).
 //!
 //! Every snapshot reads the live grants once and attaches to each internal
 //! route the callers from other projects it admits. Grants are bounded per
@@ -24,7 +24,7 @@ struct GrantRow {
 }
 
 /// Every grant whose projects and environments are all live. The database
-/// already removes a grant when either side is deleted (ADR 100 D4); the
+/// already removes a grant when either side is deleted (ADR 101 D4); the
 /// joins keep a row a trigger has not reached yet out of every snapshot.
 const LIVE_GRANTS_SQL: &str = "\
 SELECT g.target_project_id, g.target_environment_id, \
@@ -138,7 +138,7 @@ mod tests {
         assert!(routes[3].allowed_callers.is_empty());
     }
 
-    /// The pre-ADR-100 agent's route shape (`temps-node-agent`'s
+    /// The pre-ADR-101 agent's route shape (`temps-node-agent`'s
     /// `SnapshotRoute` before the field existed): no `allowed_callers`, and
     /// unknown fields ignored, as serde does by default.
     #[derive(Debug, Deserialize)]

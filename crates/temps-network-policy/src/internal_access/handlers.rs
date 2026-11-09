@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! HTTP surface for internal access grants (ADR 100 D3, D7).
+//! HTTP surface for internal access grants (ADR 101 D3, D7).
 //!
 //! A grant belongs to the project being called. Listing needs
 //! `projects:read` on it; creating and deleting need `projects:write` on it,
@@ -407,7 +407,7 @@ pub async fn create_internal_access_grant(
 /// Stop another project from calling this project's internal addresses
 ///
 /// Workers refuse the caller again with their next route sync, within
-/// seconds (ADR 100 D5).
+/// seconds (ADR 101 D5).
 #[utoipa::path(
     tag = "Internal Access",
     delete,

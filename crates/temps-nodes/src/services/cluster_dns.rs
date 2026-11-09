@@ -531,7 +531,7 @@ pub struct TestResolution {
     /// A caveat about how the answer was obtained.
     pub note: Option<String>,
     /// For an internal route asked as a project: who owns it, and whether
-    /// that project lets the asking one call it (ADR 100 D7).
+    /// that project lets the asking one call it (ADR 101 D7).
     pub internal_access: Option<super::internal_access_check::InternalAccessVerdict>,
 }
 

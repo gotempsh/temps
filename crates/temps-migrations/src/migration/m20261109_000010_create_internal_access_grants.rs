@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Internal access grants (ADR 100): which other projects, or environments of
+//! Internal access grants (ADR 101): which other projects, or environments of
 //! them, may call a project's `*.temps.local` routes through the internal
 //! proxy.
 //!
@@ -14,7 +14,7 @@
 //!   invisible to foreign keys, so row triggers remove their grants, on both
 //!   sides, in the transaction that hides them.
 //! - Every write announces a route reload on `route_table_changes`, so agents'
-//!   long polls return with the new caller lists at once (ADR 100 D5). The
+//!   long polls return with the new caller lists at once (ADR 101 D5). The
 //!   trigger is row-level: a statement that matches nothing announces nothing.
 
 use sea_orm_migration::prelude::*;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! An internal access grant (ADR 100): the target project lets a caller
+//! An internal access grant (ADR 101): the target project lets a caller
 //! project, or one environment of it, call its `*.temps.local` routes through
 //! the internal proxy.
 //!

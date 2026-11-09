@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-100: Internal access grants let another project call a project's `*.temps.local` routes
+# ADR-101: Internal access grants let another project call a project's `*.temps.local` routes
 
 **Status:** Proposed — 2026-11-09
 

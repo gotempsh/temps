@@ -157,7 +157,7 @@ struct SnapshotRoute {
     gate: Option<temps_core::gate::GatePolicy>,
     #[serde(default)]
     shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
-    /// ADR 100 D5: absent from a control plane that predates grants, which
+    /// ADR 101 D5: absent from a control plane that predates grants, which
     /// leaves the route admitting its own project only.
     #[serde(default)]
     allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,

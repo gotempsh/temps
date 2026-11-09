@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Whether a project may call an internal name (ADR 100 D7), for the DNS
+//! Whether a project may call an internal name (ADR 101 D7), for the DNS
 //! *Test resolution* tool.
 //!
 //! A name resolving is half of a working call: the internal proxy then

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Internal access grants (ADR 100): which other projects may call this
+ * Internal access grants (ADR 101): which other projects may call this
  * project's `*.temps.local` addresses. Pure helpers for the card and the DNS
  * test tool, kept apart so they are tested without rendering.
  */

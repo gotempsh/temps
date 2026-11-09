@@ -11,7 +11,7 @@
 //! * `nodes.network_policy_mode` (`control_plane_node_settings` for node 0):
 //!   `legacy` (default, today's behaviour), `shadow`, `enforce`.
 //! * `internal_access_grants`: which other projects may call a project's
-//!   `*.temps.local` addresses through the internal proxy (ADR 100).
+//!   `*.temps.local` addresses through the internal proxy (ADR 101).
 //! * The node-0 enforcer: `temps-workload-netpol`'s [`NodeEnforcer`] with the
 //!   database as its policy source.
 //!

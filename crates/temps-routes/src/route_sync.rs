@@ -111,7 +111,7 @@ pub struct RouteEntryDto {
     /// an agent that declared `shield-v1`; an older one never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
-    /// Callers from other projects this internal route admits (ADR 100 D5).
+    /// Callers from other projects this internal route admits (ADR 101 D5).
     /// Set only on routes in `RouteSnapshot::routes`. An agent that predates
     /// grants ignores it and admits its route's own project only, which is
     /// the default; an empty list means the same, so it is not sent.
@@ -1085,7 +1085,7 @@ pub(crate) async fn build_snapshot(
             routes.push(entry);
         }
     }
-    // ADR 100 D5: who from other projects each internal route admits.
+    // ADR 101 D5: who from other projects each internal route admits.
     let grants = crate::internal_access_grants::load_live_grants(state.db.as_ref())
         .await
         .map_err(|source| SnapshotBuildError::Database {

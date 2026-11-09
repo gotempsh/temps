@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Who may call an internal route (ADR 100 D6).
+//! Who may call an internal route (ADR 101 D6).
 //!
 //! The caller is the container that owns the request's source address
 //! (resolved by the internal proxy through the local Docker daemon). What it

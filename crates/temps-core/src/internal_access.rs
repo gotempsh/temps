@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Internal access grants on the wire (ADR 100).
+//! Internal access grants on the wire (ADR 101).
 //!
 //! The control plane attaches to every internal route the callers from other
 //! projects that the route's project granted access to; the worker's internal

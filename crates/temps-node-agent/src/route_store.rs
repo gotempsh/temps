@@ -68,7 +68,7 @@ pub struct RouteEntry {
     /// does not clone them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
-    /// Callers from other projects this internal route admits (ADR 100 D6).
+    /// Callers from other projects this internal route admits (ADR 101 D6).
     /// Empty, the default from a control plane or a `routes.json` that
     /// predates grants, admits the route's own project only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -76,7 +76,7 @@ pub struct RouteEntry {
 }
 
 /// What a container serves, by the control plane's route snapshot: the
-/// caller identity the internal proxy checks (ADR 100 D6).
+/// caller identity the internal proxy checks (ADR 101 D6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkloadIdentity {
     pub project_id: i32,

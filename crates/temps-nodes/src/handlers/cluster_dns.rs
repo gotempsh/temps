@@ -706,7 +706,7 @@ pub struct DnsResolveResponse {
     pub internal_access: Option<DnsInternalAccess>,
 }
 
-/// Whether the asking project may call an internal route (ADR 100 D7).
+/// Whether the asking project may call an internal route (ADR 101 D7).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DnsInternalAccess {
     pub target_project_id: i32,

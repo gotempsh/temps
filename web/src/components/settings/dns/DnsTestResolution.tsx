@@ -116,7 +116,7 @@ function ResolveResult({ result }: { result: DnsResolveResponse }) {
 
 /**
  * A name that resolves is half a working call: another project's internal
- * address answers 403 unless that project allows the caller (ADR 100).
+ * address answers 403 unless that project allows the caller (ADR 101).
  */
 function InternalAccessResult({ result }: { result: DnsResolveResponse }) {
   const diagnostic = result.internal_access

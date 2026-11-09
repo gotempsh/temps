@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Internal access (ADR 100): which other projects may call this project's
+ * Internal access (ADR 101): which other projects may call this project's
  * `*.temps.local` addresses through the internal proxy.
  *
  * By default only the project's own environments can call each other; every

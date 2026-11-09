@@ -3,7 +3,7 @@
 
 use thiserror::Error;
 
-/// What can go wrong reading or changing internal access grants (ADR 100).
+/// What can go wrong reading or changing internal access grants (ADR 101).
 #[derive(Debug, Error)]
 pub enum InternalAccessError {
     #[error("Project {project_id} not found, or it is being deleted")]

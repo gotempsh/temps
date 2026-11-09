@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Internal access grants: list, create, delete (ADR 100 D1-D4).
+//! Internal access grants: list, create, delete (ADR 101 D1-D4).
 //!
 //! Authorization is the handlers' job; this layer validates scopes, bounds
 //! the number of grants and writes in one transaction. The database refuses
@@ -20,7 +20,7 @@ use temps_entities::internal_access_grants;
 use super::error::InternalAccessError;
 
 /// The most grants one target project may hold. Every grant ends up in the
-/// caller list of the target's routes in every route snapshot (ADR 100 D5).
+/// caller list of the target's routes in every route snapshot (ADR 101 D5).
 pub const MAX_GRANTS_PER_PROJECT: u64 = 100;
 pub const MAX_DESCRIPTION_LENGTH: usize = 200;
 pub const DEFAULT_PAGE_SIZE: u64 = 20;
