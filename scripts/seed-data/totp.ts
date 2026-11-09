@@ -60,3 +60,12 @@ export async function waitForFreshWindow(seconds = 3): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, remaining * 1000 + 500));
   }
 }
+
+/**
+ * Wait for the next 30 s TOTP window. The server rejects a code it has already
+ * accepted (replay protection), so each step that consumes a code needs its own.
+ */
+export async function waitForNextWindow(): Promise<void> {
+  const remaining = 30 - (Math.floor(Date.now() / 1000) % 30);
+  await new Promise((resolve) => setTimeout(resolve, remaining * 1000 + 500));
+}

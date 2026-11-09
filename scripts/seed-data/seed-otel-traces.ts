@@ -466,7 +466,7 @@ async function ensureProject(def: ProjectDef): Promise<number> {
 
 /** Mint the OTLP ingest key. See `admin-key.ts` for why this is not a direct insert. */
 async function createIngestKey(): Promise<string> {
-  const key = await mintApiKey(api, `otel-trace-seed-${Date.now()}`);
+  const key = await mintApiKey(api, `otel-trace-seed-${Date.now()}`, PASSWORD);
   console.log("✓ created OTLP ingest API key (MFA enrolled, used, and removed)");
   return key;
 }

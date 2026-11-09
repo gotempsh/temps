@@ -37,7 +37,7 @@
 //! is bounded regardless of page depth.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,12 +52,12 @@ use crate::chunk::cache::{CacheTier, ChunkCache};
 use crate::chunk::format::{decode_block, decode_footer, decode_v1, BlockFilter, ChunkIdentity};
 use crate::chunk::{level_bit, level_mask_for, ChunkFooter, ChunkLabels, DecodedLine};
 use crate::error::LogAggregatorError;
-use crate::index::analytics::AttrPredicate;
+use crate::index::analytics::{level_name, AttrPredicate, HistogramBucket};
 use crate::storage::LogStorage;
 use crate::store::manifest::{Manifest, ManifestCursor, ManifestRepo};
 use crate::store::{
-    FacetField, FacetResult, LogAccessScope, LogLineKey, LogLineRecord, LogLineStore, LogPage,
-    LogQuery, LogSelection, LogSourceKind, HEAD_LINE_ID_BASE,
+    FacetField, FacetResult, FacetValue, LogAccessScope, LogLineKey, LogLineRecord, LogLineStore,
+    LogPage, LogQuery, LogSelection, LogSourceKind, HEAD_LINE_ID_BASE, MAX_FACET_VALUES,
 };
 use crate::types::{ContextLine, LineContext, LogLine, LogSource};
 
@@ -309,6 +309,132 @@ pub fn labels_match(labels: &ChunkLabels, query: &LogQuery) -> bool {
         }
     }
     true
+}
+
+/// A stream label's value as a facet or group value, or `None` when the
+/// stream has none (`level` and `stream` are per line, not per stream).
+fn label_value(labels: &ChunkLabels, field: FacetField) -> Option<String> {
+    match field {
+        FacetField::Env => Some(labels.env.clone()),
+        FacetField::Service => Some(labels.service.clone()),
+        FacetField::Project => Some(labels.project_id.to_string()),
+        FacetField::ExternalService => labels.external_service_id.map(|id| id.to_string()),
+        FacetField::Node => labels.node_id.map(|id| id.to_string()),
+        FacetField::Deploy => labels.deploy_id.map(|id| id.to_string()),
+        FacetField::Container => Some(labels.container_id.clone()),
+        FacetField::Level | FacetField::Stream => None,
+    }
+}
+
+/// Fold the head buffers into facets the manifest answered.
+///
+/// A container's lines reach `log_chunks` only when its buffer seals —
+/// every few minutes under load, up to half an hour when quiet — so facets
+/// over a live window would otherwise miss everything since the last seal.
+/// A head counts the way the manifest counts a chunk: whole, when it
+/// overlaps the window and passes the label filters, with exact per-level
+/// counts. `O(#containers)`: only summaries are read, never lines.
+fn add_head_facets(
+    result: &mut FacetResult,
+    heads: &[ChunkLabels],
+    query: &LogQuery,
+    fields: &[FacetField],
+) {
+    let live: Vec<&ChunkLabels> = heads
+        .iter()
+        .filter(|labels| {
+            labels_match(labels, query)
+                && labels.ended_at >= query.start_time
+                && labels.started_at <= query.end_time
+        })
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    for field in fields {
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for labels in &live {
+            let total = i64::from(labels.line_count);
+            match field {
+                FacetField::Level => {
+                    for (i, n) in labels.level_counts.iter().enumerate() {
+                        if *n > 0 {
+                            let level = crate::chunk::level_from_u8(i as u8);
+                            *counts.entry(level.to_string()).or_default() += i64::from(*n);
+                        }
+                    }
+                }
+                // Same estimate as the manifest: no per-stream counts.
+                FacetField::Stream => {
+                    for stream in ["stdout", "stderr"] {
+                        *counts.entry(stream.to_string()).or_default() += total;
+                    }
+                }
+                other => {
+                    if let Some(value) = label_value(labels, *other) {
+                        *counts.entry(value).or_default() += total;
+                    }
+                }
+            }
+        }
+        if counts.is_empty() {
+            continue;
+        }
+        let values = result.fields.entry(field.as_str().to_string()).or_default();
+        for value in values.iter_mut() {
+            if let Some(n) = counts.remove(&value.value) {
+                value.count += n;
+            }
+        }
+        values.extend(
+            counts
+                .into_iter()
+                .map(|(value, count)| FacetValue { value, count }),
+        );
+        values.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+        if values.len() > MAX_FACET_VALUES as usize {
+            values.truncate(MAX_FACET_VALUES as usize);
+            result.partial = true;
+        }
+    }
+}
+
+/// Count one head's matching lines into `counts`, bucketed on the epoch
+/// like the line index (`floor(epoch / bucket) * bucket`) and grouped by
+/// the value the index would report for `group_by`.
+fn count_head_lines(
+    snapshot: &HeadSnapshot,
+    labels: &ChunkLabels,
+    filter: &LineFilter,
+    bucket_secs: u32,
+    group_by: Option<FacetField>,
+    counts: &mut BTreeMap<(DateTime<Utc>, Option<String>), i64>,
+) {
+    let bucket = i64::from(bucket_secs.max(1));
+    let mut scratch = Vec::new();
+    for (_, line) in snapshot.iter() {
+        if line.ts < filter.start || line.ts > filter.end {
+            continue;
+        }
+        if filter.level_mask & level_bit(line.level) == 0 {
+            continue;
+        }
+        if !filter.text_matches(&line.msg, &mut scratch) || !filter.attrs_match(line.fields.as_ref())
+        {
+            continue;
+        }
+        let Some(ts) = DateTime::from_timestamp(line.ts.timestamp().div_euclid(bucket) * bucket, 0)
+        else {
+            continue;
+        };
+        let group = group_by.map(|field| match field {
+            FacetField::Level => level_name(line.level).to_string(),
+            FacetField::Stream => line.stream.to_string(),
+            // The index reads an absent label as `''`.
+            other => label_value(labels, other).unwrap_or_default(),
+        });
+        *counts.entry((ts, group)).or_default() += 1;
+    }
 }
 
 // ── Candidates ──────────────────────────────────────────────────────────
@@ -973,7 +1099,48 @@ impl LogLineStore for ChunkStore {
         fields: &[FacetField],
     ) -> Result<FacetResult, LogAggregatorError> {
         query.validate()?;
-        self.manifests.facets(query, fields).await
+        let mut result = self.manifests.facets(query, fields).await?;
+        // A chunk restriction names sealed chunks only; heads are never in it.
+        if query.chunk_seqs.is_none() {
+            let heads: Vec<ChunkLabels> = self
+                .heads
+                .summaries()
+                .await
+                .into_iter()
+                .map(|summary| summary.labels)
+                .collect();
+            add_head_facets(&mut result, &heads, query, fields);
+        }
+        Ok(result)
+    }
+
+    async fn unsealed_histogram(
+        &self,
+        query: &LogQuery,
+        bucket_secs: u32,
+        group_by: Option<FacetField>,
+    ) -> Result<Vec<HistogramBucket>, LogAggregatorError> {
+        query.validate()?;
+        if query.chunk_seqs.is_some() {
+            return Ok(Vec::new());
+        }
+        let filter = LineFilter::compile(query);
+        let mut counts = BTreeMap::new();
+        for candidate in self.head_candidates(query, &filter).await {
+            let Candidate::Head(labels) = candidate else {
+                continue;
+            };
+            // Sealed between the summary and now: its lines are in a chunk
+            // the index will pick up, not here.
+            let Some(snapshot) = self.heads.snapshot(&labels.container_id).await else {
+                continue;
+            };
+            count_head_lines(&snapshot, &labels, &filter, bucket_secs, group_by, &mut counts);
+        }
+        Ok(counts
+            .into_iter()
+            .map(|((ts, group), count)| HistogramBucket { ts, group, count })
+            .collect())
     }
 
     async fn context(
@@ -1598,6 +1765,152 @@ mod tests {
         assert_eq!(m.message, "Connection refused");
         assert!(m.line_id >= HEAD_LINE_ID_BASE);
         assert_eq!(m.key().chunk_position(), None);
+    }
+
+    fn window(q: &mut LogQuery) {
+        q.start_time = "2026-01-01T00:00:00Z".parse().unwrap();
+        q.end_time = "2026-01-01T02:00:00Z".parse().unwrap();
+    }
+
+    #[test]
+    fn head_facets_add_unsealed_lines_to_the_manifest_counts() {
+        let mut result = FacetResult::default();
+        result.fields.insert(
+            "service".into(),
+            vec![FacetValue {
+                value: "api".into(),
+                count: 10,
+            }],
+        );
+        result.fields.insert(
+            "level".into(),
+            vec![FacetValue {
+                value: "INFO".into(),
+                count: 10,
+            }],
+        );
+        let mut api = labels(1, None);
+        api.line_count = 5;
+        api.level_counts = [0, 0, 3, 0, 2];
+        let mut worker = labels(1, None);
+        worker.service = "worker".into();
+        worker.container_id = "c2".into();
+        worker.line_count = 20;
+        worker.level_counts = [0, 0, 20, 0, 0];
+        let mut q = query(LogAccessScope::All);
+        window(&mut q);
+
+        add_head_facets(
+            &mut result,
+            &[api, worker],
+            &q,
+            &[FacetField::Service, FacetField::Level],
+        );
+
+        let pairs = |key: &str| -> Vec<(String, i64)> {
+            result.fields[key]
+                .iter()
+                .map(|v| (v.value.clone(), v.count))
+                .collect()
+        };
+        // A service the manifest has never seen appears, sorted by count.
+        assert_eq!(
+            pairs("service"),
+            vec![("worker".into(), 20), ("api".into(), 15)]
+        );
+        assert_eq!(
+            pairs("level"),
+            vec![("INFO".into(), 33), ("ERROR".into(), 2)]
+        );
+        assert!(!result.partial);
+    }
+
+    #[test]
+    fn head_facets_skip_heads_outside_the_scope_or_window() {
+        let mut result = FacetResult::default();
+        let mut outside = labels(2, None);
+        outside.started_at = "2026-01-01T03:00:00Z".parse().unwrap();
+        outside.ended_at = "2026-01-01T04:00:00Z".parse().unwrap();
+        let mut q = query(LogAccessScope::Allowed {
+            project_ids: vec![2],
+            external_service_ids: vec![],
+        });
+        window(&mut q);
+        // Project 1 is out of scope; project 2's buffer is out of the window.
+        add_head_facets(
+            &mut result,
+            &[labels(1, None), outside],
+            &q,
+            &[FacetField::Service],
+        );
+        assert!(result.fields.is_empty());
+    }
+
+    #[test]
+    fn head_lines_bucket_and_group_like_the_line_index() {
+        let ts: DateTime<Utc> = "2026-01-01T00:30:10Z".parse().unwrap();
+        let mk = |msg: &str, level: LogLevel, offset: i64| LogLine {
+            ts: ts + chrono::Duration::seconds(offset),
+            stream: LogStream::Stdout,
+            level,
+            msg: msg.into(),
+            fields: None,
+            container_id: "c1".into(),
+            service: "api".into(),
+            env: "prod".into(),
+            project_id: 1,
+            external_service_id: None,
+            deploy_id: Some(9),
+            node_id: None,
+            node_name: None,
+        };
+        let snap = HeadSnapshot {
+            identity: ChunkIdentity {
+                project_id: 1,
+                external_service_id: None,
+                env: "prod".into(),
+                service: "api".into(),
+                container_id: "c1".into(),
+                deploy_id: Some(9),
+                node_id: None,
+                node_name: None,
+            },
+            segments: vec![
+                Arc::new(vec![
+                    mk("GET /cart 200", LogLevel::Info, 0),
+                    mk("GET /cart 200", LogLevel::Info, 20),
+                ]),
+                Arc::new(vec![
+                    mk("payment timed out", LogLevel::Error, 55),
+                    mk("GET / 200", LogLevel::Info, 3600 * 5),
+                ]),
+            ],
+        };
+        let labels = head_snapshot_labels(&snap).unwrap();
+        let mut q = query(LogAccessScope::All);
+        window(&mut q);
+
+        let mut counts = BTreeMap::new();
+        let filter = LineFilter::compile(&q);
+        count_head_lines(&snap, &labels, &filter, 60, Some(FacetField::Level), &mut counts);
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        // Epoch-aligned minutes, lowercase level names, the out-of-window
+        // line dropped.
+        assert_eq!(
+            counts.into_iter().collect::<Vec<_>>(),
+            vec![
+                ((at("2026-01-01T00:30:00Z"), Some("info".into())), 2),
+                ((at("2026-01-01T00:31:00Z"), Some("error".into())), 1),
+            ]
+        );
+
+        q.text = Some("cart".into());
+        let mut counts = BTreeMap::new();
+        count_head_lines(&snap, &labels, &LineFilter::compile(&q), 3600, None, &mut counts);
+        assert_eq!(
+            counts.into_iter().collect::<Vec<_>>(),
+            vec![((at("2026-01-01T00:00:00Z"), None), 2)]
+        );
     }
 
     #[test]

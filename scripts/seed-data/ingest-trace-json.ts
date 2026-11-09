@@ -101,7 +101,7 @@ sessionCookie = session;
 
 // Same real MFA + step-up flow the seeder uses — `POST /api-keys` is a guarded
 // sensitive action, and a replay script is not a reason to route around it.
-const apiKey = await mintApiKey(api, `trace-replay-${Date.now()}`);
+const apiKey = await mintApiKey(api, `trace-replay-${Date.now()}`, PASSWORD);
 console.log("✓ minted ingest key (MFA enrolled, used, removed)");
 
 // ── replay ──────────────────────────────────────────────────────────

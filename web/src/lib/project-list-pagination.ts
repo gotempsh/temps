@@ -44,6 +44,15 @@ export function projectPageCount(total: number, pageSize: number): number {
   return Math.max(1, Math.ceil(total / pageSize))
 }
 
+/**
+ * Whether the list needs pagination controls at all. A list that fits on the
+ * first page at the smallest page size has nothing to page through or resize,
+ * and "Page 1 of 1" with a page-size picker under one card is noise.
+ */
+export function showsProjectPagination(total: number, page: number): boolean {
+  return page > 1 || total > Math.min(...PROJECT_PAGE_SIZE_OPTIONS)
+}
+
 export function withProjectPagination(
   current: URLSearchParams,
   pagination: ProjectPagination
