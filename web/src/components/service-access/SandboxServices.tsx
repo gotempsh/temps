@@ -8,6 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Button,
+  CodeBlock,
   Input,
   Skeleton,
   Select,
@@ -168,6 +169,38 @@ export function SandboxServices({
           {problemDetail(error, 'Check your permissions and retry.')}
         </Callout>
       )}
+      <details
+        hidden={!capability.data?.configured}
+        className="rounded-md border p-3 text-sm"
+      >
+        <summary className="cursor-pointer font-medium">
+          Use an approved service from Terminal
+        </summary>
+        <p className="my-3 text-muted-foreground">
+          Wait for Active, then run the command inside this sandbox. Replace the
+          example URL with an approved destination. Temps supplies the
+          credential; do not add an API token. These options apply only to this
+          command.
+        </p>
+        <CodeBlock
+          language="shell"
+          title="HTTPS API"
+          defaultWrap
+          disableWrapToggle
+          code={
+            'curl --proxy http://127.0.0.1:3128 --cacert /run/temps-service-access/ca.pem "https://api.example.com/v1"'
+          }
+        />
+        <CodeBlock
+          language="shell"
+          title="GitHub clone (read-only Git grant)"
+          defaultWrap
+          disableWrapToggle
+          code={
+            'GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.proxy=http://127.0.0.1:3128 -c http.sslCAInfo=/run/temps-service-access/ca.pem clone "https://github.com/<owner>/<private-repo>.git"'
+          }
+        />
+      </details>
       <form
         className="flex flex-col gap-2 sm:flex-row sm:items-end"
         onSubmit={form.handleSubmit((values) => request.mutate(values))}

@@ -89,6 +89,23 @@ test('sandbox lifetime approval and revocation use exact versions without claimi
     await waitFor(() =>
       expect(within(view.container).getByText('Awaiting approval')).toBeTruthy()
     )
+    const usage = within(view.container)
+      .getByText('Use an approved service from Terminal')
+      .closest('details')
+    expect(usage).toBeTruthy()
+    expect(usage?.hidden).toBe(false)
+    fireEvent.click(
+      within(view.container).getByText('Use an approved service from Terminal')
+    )
+    expect(usage?.textContent).toContain('Wait for Active')
+    expect(usage?.textContent).toContain('curl --proxy http://127.0.0.1:3128')
+    expect(usage?.textContent).toContain(
+      '--cacert /run/temps-service-access/ca.pem'
+    )
+    expect(usage?.textContent).toContain('https://api.example.com/v1')
+    expect(usage?.textContent).toContain(
+      'http.sslCAInfo=/run/temps-service-access/ca.pem'
+    )
     await act(async () => {
       fireEvent.click(
         within(view.container).getByRole('button', { name: 'Approve access' })
