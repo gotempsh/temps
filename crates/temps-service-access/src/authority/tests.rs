@@ -50,10 +50,15 @@ fn input(node: Uuid, incarnation: Uuid, origins: &[&str]) -> AuthorizedBinding {
             grant_id: format!("grant_{}", Uuid::new_v4().simple()),
             service_id: format!("svc_{}", Uuid::new_v4().simple()),
             service_version: 1,
-            policy: SandboxAccessPolicy {
-                origin: (*origin).into(),
-                path_prefixes: vec!["/v1".into()],
-                methods: vec![AccessMethod::Get],
+            policy: if *origin == "https://github.com" {
+                crate::github::tests::policy(crate::types::GithubAccessProtocol::Git)
+            } else {
+                SandboxAccessPolicy {
+                    github_repository: None,
+                    origin: (*origin).into(),
+                    path_prefixes: vec!["/v1".into()],
+                    methods: vec![AccessMethod::Get],
+                }
             },
             expires_at: now + chrono::Duration::seconds(30 + index as i64),
             max_ttl_seconds: 60,
@@ -205,7 +210,11 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
     let binding = input(
         row.sdk_node_id,
         incarnation,
-        &["https://api.github.com", "https://api.example.com"],
+        &[
+            "https://api.github.com",
+            "https://api.example.com",
+            "https://github.com",
+        ],
     );
     let expected_deadlines: Vec<_> = binding
         .plan
@@ -230,7 +239,7 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
     assert!(!snapshot.body.contains("upstream-test-secret"));
     assert!(!format!("{issued:?}").contains(&delivery.session));
     let body = snapshot.verify(&snapshot_key.verifying_key()).unwrap();
-    assert_eq!(body.rules.len(), 2);
+    assert_eq!(body.rules.len(), 3);
     assert_eq!(body.lease_secs, 30);
     assert_eq!(
         body.unmatched_host_policy,
@@ -245,9 +254,22 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
         assert_eq!(rule.not_after, Some(deadline));
         let aad = rule_aad(&body.node_id, &rule.rule_id, &rule.credential_id);
         let headers = open(&secret, &rule.headers, &aad).unwrap();
-        assert!(std::str::from_utf8(&headers)
-            .unwrap()
-            .contains("Bearer upstream-test-secret"));
+        let headers: tokenless_core::injection::InjectedHeaders =
+            serde_json::from_slice(&headers).unwrap();
+        let authorization = headers
+            .headers
+            .iter()
+            .find(|header| header.name == "authorization")
+            .unwrap();
+        if rule.allow.git.is_some() {
+            let value = authorization.value.strip_prefix("Basic ").unwrap();
+            assert_eq!(
+                STANDARD.decode(value).unwrap(),
+                b"x-access-token:upstream-test-secret"
+            );
+        } else {
+            assert_eq!(authorization.value, "Bearer upstream-test-secret");
+        }
         let (_, other) = self::identity();
         assert!(open(&other, &rule.headers, &aad).is_err());
     }

@@ -392,3 +392,170 @@ test('invalid path prefixes stay beside the field and block the request until co
     api.restore()
   }
 })
+
+test('GitHub clone/fetch saves a project-bound source without a bearer credential', async () => {
+  let submitted: CreateAccessServiceData['body'] | undefined
+  const api = mockApi({
+    'GET /projects/7': () =>
+      jsonResponse({
+        id: 7,
+        git_provider_connection_id: 9,
+        git_provider_type: 'github',
+        repo_owner: 'owner',
+        repo_name: 'repo',
+      }),
+    'POST /projects/7/access-services': async (request) => {
+      submitted = (await request.json()) as CreateAccessServiceData['body']
+      return jsonResponse(service, 201)
+    },
+  })
+  render(
+    provider(
+      <AccessServiceEditor
+        projectId={7}
+        canUseProjectGithub
+        onClose={() => {}}
+        onSaved={() => {}}
+      />
+    )
+  )
+  await click('GitHub clone/fetch')
+  await waitFor(() =>
+    expect(
+      (within(document.body).getByLabelText('Name') as HTMLInputElement).value
+    ).toBe('GitHub clone/fetch')
+  )
+  expect(
+    (within(document.body).getByLabelText('HTTPS origin') as HTMLInputElement)
+      .readOnly
+  ).toBe(true)
+  await click('Save service')
+  await waitFor(() => expect(submitted).toBeDefined())
+  expect(submitted?.policy.github_repository).toEqual({
+    connection_id: 9,
+    owner: 'owner',
+    repository: 'repo',
+    protocol: 'git',
+  })
+  expect(submitted?.policy.path_prefixes).toEqual([
+    '/owner/repo',
+    '/owner/repo.git',
+  ])
+  expect(submitted?.policy.methods).toEqual(['GET', 'POST'])
+  expect(submitted?.credential).toBeUndefined()
+  api.restore()
+})
+
+test('editing a GitHub service preserves its connection reference', async () => {
+  const github = {
+    connection_id: 9,
+    owner: 'owner',
+    repository: 'repo',
+    protocol: 'api' as const,
+  }
+  let submitted: CreateAccessServiceData['body'] | undefined
+  const api = mockApi({
+    'PUT /projects/7/access-services/svc_test': async (request) => {
+      submitted = (await request.json()) as CreateAccessServiceData['body']
+      return jsonResponse(service)
+    },
+  })
+  render(
+    provider(
+      <AccessServiceEditor
+        projectId={7}
+        canUseProjectGithub
+        service={{
+          ...service,
+          policy: {
+            origin: 'https://api.github.com',
+            path_prefixes: ['/repos/owner/repo'],
+            methods: ['GET', 'HEAD'],
+            github_repository: github,
+          },
+        }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />
+    )
+  )
+  await editName()
+  await click('Save service')
+  await waitFor(() =>
+    expect(submitted?.policy.github_repository).toEqual(github)
+  )
+  expect(submitted?.credential).toBeUndefined()
+  api.restore()
+})
+
+test('missing GitHub configuration preserves the draft and explains how to connect it', async () => {
+  const api = mockApi({
+    'GET /projects/7': () => jsonResponse({ id: 7, repo_owner: null }),
+  })
+  try {
+    render(
+      provider(
+        <AccessServiceEditor
+          projectId={7}
+          canUseProjectGithub
+          service={service}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />
+      )
+    )
+    await editName()
+    await click('GitHub API reads')
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        'Connect this project to GitHub, then try again.'
+      )
+    )
+    expect(
+      (within(document.body).getByLabelText('Name') as HTMLInputElement).value
+    ).toBe('Updated API')
+    expect(
+      (within(document.body).getByLabelText('HTTPS origin') as HTMLInputElement)
+        .value
+    ).toBe(service.policy.origin)
+    expect(api.called('PUT', '/projects/7/access-services/svc_test')).toBe(
+      false
+    )
+  } finally {
+    api.restore()
+  }
+})
+
+test('GitHub source actions explain and enforce missing repository permission', async () => {
+  const api = mockApi({})
+  try {
+    render(
+      provider(
+        <AccessServiceEditor
+          projectId={7}
+          service={service}
+          onClose={() => {}}
+          onSaved={() => {}}
+        />
+      )
+    )
+    expect(
+      (
+        within(document.body).getByRole('button', {
+          name: 'GitHub API reads',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    expect(
+      (
+        within(document.body).getByRole('button', {
+          name: 'GitHub clone/fetch',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+    expect(document.body.textContent).toContain('repository read')
+    expect(api.called('GET', '/projects/7')).toBe(false)
+  } finally {
+    api.restore()
+  }
+})

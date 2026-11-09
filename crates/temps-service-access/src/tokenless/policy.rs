@@ -17,7 +17,8 @@ fn invalid(field: &'static str, reason: &'static str) -> AccessError {
 
 /// Validate again at the SDK boundary, including policies loaded from storage.
 /// At most 32 prefixes become 64 patterns; no wildcard host or method is added.
-/// This is generic HTTPS scope, not a Git read/write or MCP tool policy.
+/// GitHub adds an explicit read-only Git scope. Generic HTTP policies do not
+/// claim to inspect MCP tools or other application payloads.
 pub fn compile_policy(
     policy: &SandboxAccessPolicy,
 ) -> Result<(SandboxAccessPolicy, RuleScope), AccessError> {
@@ -64,8 +65,11 @@ pub fn compile_policy(
         hosts: vec![host],
         paths,
         methods,
-        mcp_tools: Some(Vec::new()),
-        git: None,
+        // Some(empty) activates MCP JSON-RPC parsing for every POST, rejecting
+        // Git upload-pack and ordinary API bodies before they reach upstream.
+        // These policies authorize HTTP paths/methods, not MCP tool names.
+        mcp_tools: None,
+        git: crate::github::scope(&policy)?,
     };
     scope.validate("sandbox service access").map_err(|_| {
         invalid(

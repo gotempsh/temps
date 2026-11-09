@@ -146,7 +146,7 @@ Control-plane features: a service layer plus HTTP handlers for one product area.
 | [`temps-external-plugins`](../../crates/temps-external-plugins) | External plugin host: discovers, installs, spawns and supervises standalone plugin binaries and proxies HTTP and events to them | **1**: cli |  |
 | [`temps-flags`](../../crates/temps-flags) | Feature flags: per-project flags with per-environment values, evaluation and bucketing, changed without a redeploy | **1**: cli |  |
 | [`temps-geo`](../../crates/temps-geo) | IP geolocation: MaxMind GeoIP lookups, database refresh, IP address info and the geolocation settings | **6**: analytics-events, analytics-performance, audit, cli, error-tracking, proxy |  |
-| [`temps-git`](../../crates/temps-git) | Git provider integrations (GitHub, GitLab, Bitbucket, Gitea): connections, repository access, webhooks and PR comments | **8**: ai-agents, ai-chat, cli, deployments, import, project-groups, projects, sandbox |  |
+| [`temps-git`](../../crates/temps-git) | Git provider integrations (GitHub, GitLab, Bitbucket, Gitea): connections, repository access, webhooks and PR comments | **9**: ai-agents, ai-chat, cli, deployments, import, project-groups, projects, sandbox, service-access |  |
 | [`temps-infra`](../../crates/temps-infra) | Platform info and DNS lookup endpoints: server public and private IPs, Docker platform features and A-record resolution | **1**: cli |  |
 | [`temps-ingress`](../../crates/temps-ingress) | Ingress connectors (Cloudflare Tunnel, Tailscale): control-plane providers and node-facing handlers for non-public cluster entry | **1**: cli |  |
 | [`temps-kv`](../../crates/temps-kv) | Project-isolated key-value store service and HTTP API backed by on-demand Redis containers | **1**: cli |  |

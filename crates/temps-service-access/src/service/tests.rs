@@ -35,6 +35,7 @@ fn request() -> SaveAccessService {
 }
 fn policy() -> SandboxAccessPolicy {
     SandboxAccessPolicy {
+        github_repository: None,
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
         methods: vec![AccessMethod::Get],

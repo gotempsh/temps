@@ -87,10 +87,11 @@ impl ServiceAccessCoordinator {
         service: Arc<ServiceAccessService>,
         transport: Arc<WorkerTransport>,
         checker: Option<Arc<dyn ProjectAccessChecker>>,
+        github: Arc<dyn crate::github::GithubCredentialResolver>,
     ) -> Self {
         Self {
             authority: AuthorityStore::new(db.clone(), encryption.clone(), audit.clone()),
-            planner: PolicyPlanner::new(db.clone(), encryption, checker),
+            planner: PolicyPlanner::new(db.clone(), encryption, checker, github),
             queue: DeliveryQueue::new(db.clone()),
             db,
             service,
@@ -108,15 +109,7 @@ impl ServiceAccessCoordinator {
         &self,
         consent: FreshConsent,
     ) -> Result<AuthorizedGrant, CoordinatorError> {
-        if consent.request_id.is_nil()
-            || consent.user_id <= 0
-            || !(60..=86400).contains(&consent.request.ttl_seconds)
-        {
-            return Err(AccessError::Validation {
-                field: "consent",
-                reason: "a non-nil request ID, user and lifetime between 60 and 86400 seconds are required",
-            }.into());
-        }
+        consent.validate()?;
         let _permit = self.admit(&consent.sandbox_id)?;
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(&consent.sandbox_id))

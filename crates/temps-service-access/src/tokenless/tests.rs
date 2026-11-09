@@ -6,6 +6,7 @@ use crate::types::AccessMethod;
 
 fn policy(prefix: &str) -> SandboxAccessPolicy {
     SandboxAccessPolicy {
+        github_repository: None,
         origin: "https://api.example.com".into(),
         path_prefixes: vec![prefix.into()],
         methods: vec![AccessMethod::Get],
@@ -46,7 +47,31 @@ fn sdk_policy_preserves_segment_boundaries_and_denies_other_destinations() {
     assert!(!scope.allows("other.example.com", 443, "GET", "/v1"));
     assert!(!scope.allows("api.example.com", 8443, "GET", "/v1"));
     assert!(!scope.allows("api.example.com", 443, "POST", "/v1"));
-    assert!(!scope.allows_tool("arbitrary-tool"));
+    assert!(scope.mcp_tools.is_none());
+}
+
+#[test]
+fn http_posts_and_git_upload_pack_do_not_require_mcp_json_rpc_bodies() {
+    let mut input = policy("/v1");
+    input.methods = vec![AccessMethod::Post];
+    let (_, http) = compile_policy(&input).unwrap();
+    assert!(http.allows("api.example.com", 443, "POST", "/v1"));
+    assert!(
+        http.mcp_tools.is_none(),
+        "MCP filtering would reject ordinary POST payloads"
+    );
+    assert!(!http.allows("api.example.com", 443, "POST", "/v2"));
+    let (_, git) = compile_policy(&crate::github::tests::policy(
+        crate::types::GithubAccessProtocol::Git,
+    ))
+    .unwrap();
+    assert!(
+        git.mcp_tools.is_none(),
+        "Git packet lines are not MCP JSON-RPC"
+    );
+    let git = git.git.unwrap();
+    assert!(git.allows("POST", "/owner/repo.git/git-upload-pack", None));
+    assert!(!git.allows("POST", "/owner/repo.git/git-receive-pack", None));
 }
 
 #[test]

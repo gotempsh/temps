@@ -3,10 +3,7 @@
 
 use super::*;
 use sea_orm::{ConnectionTrait, DatabaseBackend, MockDatabase};
-use std::{
-    collections::BTreeSet,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn encryption() -> Arc<EncryptionService> {
     Arc::new(EncryptionService::new(&"ab".repeat(32)).unwrap())
@@ -16,6 +13,7 @@ fn planner(checker: Option<Arc<dyn ProjectAccessChecker>>) -> PolicyPlanner {
         Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
         encryption(),
         checker,
+        Arc::new(crate::github::NoGithub),
     )
 }
 fn candidate(user: i32, project: i32) -> Candidate {
@@ -30,7 +28,7 @@ fn candidate(user: i32, project: i32) -> Candidate {
         policy: serde_json::json!({}),
         max_ttl_seconds: 60,
         expires_at: Utc::now() + chrono::Duration::seconds(60),
-        credential_encrypted: "secret-ciphertext".into(),
+        credential_encrypted: Some("secret-ciphertext".into()),
     }
 }
 struct Checker {
@@ -97,12 +95,12 @@ async fn permission_batches_deduplicate_and_require_both_scoped_permissions() {
     ];
     assert_eq!(
         planner.recheck(boot, &candidates).await.unwrap(),
-        BTreeSet::from([(1, 1), (1, 2), (2, 1)])
+        BTreeMap::from([((1, 1), false), ((1, 2), false), ((2, 1), false)])
     );
     assert_eq!(checker.batches.load(Ordering::SeqCst), 2);
     checker.deny.store(true, Ordering::SeqCst);
     assert!(planner.recheck(boot, &candidates).await.unwrap().is_empty());
-    assert_eq!(planner.recheck(boot, &[]).await.unwrap(), BTreeSet::new());
+    assert_eq!(planner.recheck(boot, &[]).await.unwrap(), BTreeMap::new());
 }
 
 #[tokio::test]
@@ -113,14 +111,14 @@ async fn permission_fallback_and_admin_bypass_match_handler_contract() {
             .recheck(Uuid::new_v4(), &candidates)
             .await
             .unwrap(),
-        BTreeSet::from([(1, 1)])
+        BTreeMap::from([((1, 1), true)])
     );
     assert_eq!(
         planner(None)
             .recheck(Uuid::new_v4(), &candidates)
             .await
             .unwrap(),
-        BTreeSet::from([(1, 1), (1, 2)])
+        BTreeMap::from([((1, 1), true), ((1, 2), true)])
     );
     let mut admin = candidate(2, 3);
     admin.admin = true;
@@ -158,18 +156,28 @@ async fn invalid_missing_and_failed_authority_reads_have_context() {
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results([Vec::<temps_entities::sandbox_access_authorities::Model>::new()])
         .into_connection();
-    let error = PolicyPlanner::new(Arc::new(db), encryption(), None)
-        .prepare(boot)
-        .await
-        .unwrap_err();
+    let error = PolicyPlanner::new(
+        Arc::new(db),
+        encryption(),
+        None,
+        Arc::new(crate::github::NoGithub),
+    )
+    .prepare(boot)
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains("missing or closed"));
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_errors([sea_orm::DbErr::Custom("private database detail".into())])
         .into_connection();
-    let error = PolicyPlanner::new(Arc::new(db), encryption(), None)
-        .prepare(boot)
-        .await
-        .unwrap_err();
+    let error = PolicyPlanner::new(
+        Arc::new(db),
+        encryption(),
+        None,
+        Arc::new(crate::github::NoGithub),
+    )
+    .prepare(boot)
+    .await
+    .unwrap_err();
     assert!(error.to_string().contains(&boot.to_string()));
     assert!(error.to_string().contains("read authority"));
     assert!(!error.to_string().contains("private database detail"));
@@ -212,7 +220,12 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
         .await
         .unwrap();
     let checker = Checker::new(0);
-    let planner = PolicyPlanner::new(db.clone(), encryption(), Some(checker.clone()));
+    let planner = PolicyPlanner::new(
+        db.clone(),
+        encryption(),
+        Some(checker.clone()),
+        Arc::new(crate::github::NoGithub),
+    );
     let incarnation = Uuid::new_v4();
     let mut grants = Vec::new();
     let mut services = Vec::new();
@@ -224,6 +237,7 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
                 SaveAccessService {
                     name: "API".into(),
                     policy: SandboxAccessPolicy {
+                        github_repository: None,
                         origin: origin.into(),
                         path_prefixes: vec!["/user".into()],
                         methods: vec![AccessMethod::Get],
@@ -419,7 +433,12 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
             1
         );
     }
-    let slow = PolicyPlanner::new(db.clone(), encryption(), Some(Checker::new(4)));
+    let slow = PolicyPlanner::new(
+        db.clone(),
+        encryption(),
+        Some(Checker::new(4)),
+        Arc::new(crate::github::NoGithub),
+    );
     let error = tokio::time::timeout(Duration::from_secs(12), slow.prepare(identity.boot_id))
         .await
         .unwrap()

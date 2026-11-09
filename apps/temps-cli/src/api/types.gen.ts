@@ -28,6 +28,10 @@ export type AccessCapability = {
      */
     can_manage_services: boolean;
     can_save_requests: boolean;
+    /**
+     * Caller may use the project-bound GitHub credential source.
+     */
+    can_use_project_github: boolean;
     configured: boolean;
     reason: string;
     setup_path?: string | null;
@@ -15855,6 +15859,8 @@ export type GitSourcePlan = {
     repo: string;
 };
 
+export type GithubAccessProtocol = 'api' | 'git';
+
 /**
  * Response of [`start_github_manifest_flow`].
  */
@@ -15864,6 +15870,17 @@ export type GithubManifestStartResponse = {
      * to the callback, which accepts the manifest code only together with it.
      */
     state: string;
+};
+
+/**
+ * Immutable reference to the project's existing GitHub repository connection.
+ * Changing the connection or repository requires a new policy and fresh consent.
+ */
+export type GithubRepositoryAccess = {
+    connection_id: number;
+    owner: string;
+    protocol: GithubAccessProtocol;
+    repository: string;
 };
 
 export type GlobalAnalyticsResponse = {
@@ -28245,6 +28262,7 @@ export type S3SourceResponse = {
  * against its supported protocols before installing a policy.
  */
 export type SandboxAccessPolicy = {
+    github_repository?: GithubRepositoryAccess | null;
     methods: Array<AccessMethod>;
     /**
      * HTTPS origin only; no path, userinfo, query, fragment or non-443 port.

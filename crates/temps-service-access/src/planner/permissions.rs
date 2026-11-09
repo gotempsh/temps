@@ -10,7 +10,7 @@ impl PolicyPlanner {
         &self,
         boot_id: Uuid,
         grants: &[Candidate],
-    ) -> Result<BTreeSet<(i32, i32)>, PlanError> {
+    ) -> Result<BTreeMap<(i32, i32), bool>, PlanError> {
         let mut projects_by_user: BTreeMap<i32, BTreeSet<i32>> = BTreeMap::new();
         for grant in grants.iter().filter(|g| !g.admin) {
             projects_by_user
@@ -18,7 +18,7 @@ impl PolicyPlanner {
                 .or_default()
                 .insert(grant.project_id);
         }
-        let mut allowed = BTreeSet::new();
+        let mut allowed = BTreeMap::new();
         // Same instance role ceiling as current_session_role. A scoped project
         // permission can narrow this ceiling, never widen it.
         if !Role::User
@@ -32,7 +32,14 @@ impl PolicyPlanner {
         }
         for (user_id, projects) in projects_by_user {
             let Some(checker) = &self.checker else {
-                allowed.extend(projects.into_iter().map(|project| (user_id, project)));
+                allowed.extend(projects.into_iter().map(|project| {
+                    (
+                        (user_id, project),
+                        Role::User
+                            .permissions()
+                            .contains(&Permission::GitRepositoriesRead),
+                    )
+                }));
                 continue;
             };
             let projects: Vec<_> = projects.into_iter().collect();
@@ -76,15 +83,26 @@ impl PolicyPlanner {
                 ));
             }
             for project in projects {
+                let base_permissions = [Permission::ProjectsWrite, Permission::SandboxesWrite];
                 let permit = match permissions.get(&project) {
-                    Some(Some(perms)) => [Permission::ProjectsWrite, Permission::SandboxesWrite]
+                    Some(Some(perms)) => base_permissions
                         .iter()
                         .all(|p| perms.contains(&p.to_string())),
                     Some(None) => access.get(&project) == Some(&true),
                     None => false,
                 };
                 if permit {
-                    allowed.insert((user_id, project));
+                    let github = Role::User
+                        .permissions()
+                        .contains(&Permission::GitRepositoriesRead)
+                        && match permissions.get(&project) {
+                            Some(Some(perms)) => {
+                                perms.contains(&Permission::GitRepositoriesRead.to_string())
+                            }
+                            Some(None) => true,
+                            None => false,
+                        };
+                    allowed.insert((user_id, project), github);
                 }
             }
         }

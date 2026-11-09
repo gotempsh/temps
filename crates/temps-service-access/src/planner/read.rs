@@ -66,6 +66,8 @@ impl PolicyPlanner {
             JOIN sandboxes b ON b.id=r.sandbox_id AND b.project_id=r.project_id
             JOIN projects p ON p.id=a.project_id
             JOIN users u ON u.id=a.approved_by
+            LEFT JOIN git_provider_connections c ON c.id=p.git_provider_connection_id
+            LEFT JOIN git_providers v ON v.id=c.provider_id
             WHERE r.authority_id=$1 AND r.closed_at IS NULL
               AND r.node_id IS NOT DISTINCT FROM $2
               AND b.node_id IS NOT DISTINCT FROM r.node_id AND b.status='running'
@@ -78,7 +80,14 @@ impl PolicyPlanner {
                   SELECT 1 FROM user_roles ur JOIN roles role ON role.id=ur.role_id
                   WHERE ur.user_id=a.approved_by AND role.name='admin'))
               AND g.revoked_at IS NULL AND g.expires_at > now() + interval '1 second'
-              AND s.enabled AND s.credential_encrypted IS NOT NULL
+              AND s.enabled AND (
+                (s.policy->'github_repository' IS NULL AND s.credential_encrypted IS NOT NULL) OR
+                (s.policy->'github_repository'->'connection_id'=to_jsonb(c.id)
+                 AND lower(s.policy->'github_repository'->>'owner')=lower(p.repo_owner)
+                 AND lower(s.policy->'github_repository'->>'repository')=lower(p.repo_name)
+                 AND c.is_active AND NOT c.is_expired AND v.is_active AND v.provider_type='github'
+                 AND (v.base_url IS NULL OR v.base_url IN ('https://github.com','https://github.com/'))
+                 AND (v.api_url IS NULL OR v.api_url IN ('https://api.github.com','https://api.github.com/'))))
               AND s.version=g.service_version AND s.policy=g.policy_snapshot
             ORDER BY r.id,g.id LIMIT $3"#,
             [boot_id.into(), authority.node_id.into(), ((MAX_GRANTS + 1) as i64).into()]))

@@ -84,6 +84,7 @@ fn state_with_db(db: Arc<sea_orm::DatabaseConnection>, audit: Arc<Audit>) -> Arc
             crate::coordinator::tests::provider::Provider::new(),
         )),
         None,
+        Arc::new(crate::github::NoGithub),
     ));
     Arc::new(AccessAppState {
         coordinator,
@@ -337,6 +338,7 @@ use temps_entities::{
 
 fn policy() -> SandboxAccessPolicy {
     SandboxAccessPolicy {
+        github_repository: None,
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
         methods: vec![AccessMethod::Get],
@@ -800,6 +802,7 @@ async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
             SaveAccessService {
                 name: "API".into(),
                 policy: SandboxAccessPolicy {
+                    github_repository: None,
                     origin: "https://api.example.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],
@@ -906,4 +909,32 @@ async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
         assert!(events.iter().all(|e| !e.contains("fixture-credential")));
     }
     test.cleanup().await;
+}
+
+#[tokio::test]
+async fn github_policy_writes_require_git_read_permission_before_database_access() {
+    let body = serde_json::json!({"name":"GitHub", "policy":crate::github::tests::policy(GithubAccessProtocol::Git), "max_ttl_seconds":900,"enabled":true});
+    for (method, path) in [
+        ("POST", "/projects/7/access-services"),
+        ("PUT", "/projects/7/access-services/svc_test"),
+    ] {
+        let response = send(
+            method,
+            path,
+            &body.to_string(),
+            Some(AuthContext::new_api_key(
+                test_user(),
+                None,
+                Some(vec![Permission::ProjectsWrite, Permission::SandboxesWrite]),
+                "key".into(),
+                1,
+            )),
+            state(
+                MockDatabase::new(DatabaseBackend::Postgres),
+                Arc::new(Audit::default()),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }

@@ -33,6 +33,18 @@ pub struct FreshConsent {
     pub request: RequestServiceGrant,
 }
 
+impl FreshConsent {
+    pub fn validate(&self) -> Result<(), AccessError> {
+        if self.request_id.is_nil()
+            || self.user_id <= 0
+            || !(60..=86400).contains(&self.request.ttl_seconds)
+        {
+            return Err(AccessError::Validation { field: "consent", reason: "a non-nil request ID, user and lifetime between 60 and 86400 seconds are required" });
+        }
+        Ok(())
+    }
+}
+
 /// Internal receipt of persisted intent, not evidence that traffic is enabled.
 #[derive(Debug)]
 pub struct AuthorizedGrant {
@@ -86,7 +98,7 @@ impl ServiceAccessService {
                 version: request.service_version,
             });
         }
-        if !service.enabled || service.credential_encrypted.is_none() {
+        if !service.enabled {
             return Err(invalid(
                 "service_id",
                 "the service must be enabled and have a credential before connecting",
@@ -108,6 +120,14 @@ impl ServiceAccessService {
                 }
             })?;
         crate::tokenless::compile_policy(&policy)?;
+        if let Some(source) = &policy.github_repository {
+            crate::github::validate_binding(&tx, project_id, source).await?;
+        } else if service.credential_encrypted.is_none() {
+            return Err(invalid(
+                "service_id",
+                "the service needs a credential before connecting",
+            ));
+        }
         let mut sandbox_query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(sandbox_id))
             .filter(sandboxes::Column::ProjectId.eq(project_id));

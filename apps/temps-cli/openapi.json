@@ -35,6 +35,10 @@
           "can_save_requests": {
             "type": "boolean"
           },
+          "can_use_project_github": {
+            "description": "Caller may use the project-bound GitHub credential source.",
+            "type": "boolean"
+          },
           "configured": {
             "type": "boolean"
           },
@@ -56,6 +60,7 @@
           "configured",
           "can_save_requests",
           "can_manage_services",
+          "can_use_project_github",
           "can_manage_requests",
           "reason"
         ],
@@ -33503,6 +33508,13 @@
         ],
         "type": "object"
       },
+      "GithubAccessProtocol": {
+        "enum": [
+          "api",
+          "git"
+        ],
+        "type": "string"
+      },
       "GithubManifestStartResponse": {
         "description": "Response of [`start_github_manifest_flow`].",
         "properties": {
@@ -33513,6 +33525,32 @@
         },
         "required": [
           "state"
+        ],
+        "type": "object"
+      },
+      "GithubRepositoryAccess": {
+        "additionalProperties": false,
+        "description": "Immutable reference to the project's existing GitHub repository connection.\nChanging the connection or repository requires a new policy and fresh consent.",
+        "properties": {
+          "connection_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/GithubAccessProtocol"
+          },
+          "repository": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "owner",
+          "repository",
+          "protocol"
         ],
         "type": "object"
       },
@@ -60741,6 +60779,17 @@
         "additionalProperties": false,
         "description": "Exact destination and request scope. The broker must validate this again\nagainst its supported protocols before installing a policy.",
         "properties": {
+          "github_repository": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GithubRepositoryAccess",
+                "description": "Use the project-bound GitHub connection on the host. No provider token is returned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "methods": {
             "items": {
               "$ref": "#/components/schemas/AccessMethod"

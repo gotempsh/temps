@@ -19,11 +19,13 @@ import { problemDetail } from '@/lib/api-problem'
 function Editor({
   projectId,
   service,
+  canUseProjectGithub,
   onClose,
   onSaved,
 }: {
   projectId: number
   service?: AccessServiceResponse
+  canUseProjectGithub: boolean
   onClose: () => void
   onSaved: () => void
 }) {
@@ -34,6 +36,7 @@ function Editor({
     <AccessServiceEditor
       projectId={projectId}
       service={initialService}
+      canUseProjectGithub={canUseProjectGithub}
       onClose={onClose}
       onSaved={onSaved}
     />
@@ -172,6 +175,9 @@ export default function AccessServicePage() {
               key={editorKey}
               projectId={projectId}
               service={service.data}
+              canUseProjectGithub={
+                capability.data?.can_use_project_github === true
+              }
               onClose={back}
               onSaved={saved}
             />

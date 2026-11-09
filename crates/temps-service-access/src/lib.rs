@@ -6,6 +6,7 @@ pub mod broker;
 pub mod coordinator;
 pub mod delivery;
 pub mod error;
+pub mod github;
 pub mod handlers;
 pub mod planner;
 mod plugin;

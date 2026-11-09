@@ -15,6 +15,29 @@ pub struct SandboxAccessPolicy {
     /// Segment-boundary path prefixes, for example `/owner/private-repo`.
     pub path_prefixes: Vec<String>,
     pub methods: Vec<AccessMethod>,
+    /// Use the project-bound GitHub connection on the host. No provider token is returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_repository: Option<GithubRepositoryAccess>,
+}
+
+/// Immutable reference to the project's existing GitHub repository connection.
+/// Changing the connection or repository requires a new policy and fresh consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GithubRepositoryAccess {
+    pub connection_id: i32,
+    pub owner: String,
+    pub repository: String,
+    pub protocol: GithubAccessProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAccessProtocol {
+    /// Read repository REST endpoints using GET and HEAD.
+    Api,
+    /// Clone/fetch over Git smart HTTPS; push and Git LFS are denied.
+    Git,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

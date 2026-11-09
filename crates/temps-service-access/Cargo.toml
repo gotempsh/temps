@@ -10,6 +10,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+temps-git = { path = "../temps-git" }
 temps-core = { path = "../temps-core" }
 temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }

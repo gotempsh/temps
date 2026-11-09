@@ -15748,6 +15748,7 @@ dependencies = [
  "temps-authz",
  "temps-core",
  "temps-entities",
+ "temps-git",
  "temps-sandbox-providers",
  "temps-service-access-runtime",
  "temps-test-utils",

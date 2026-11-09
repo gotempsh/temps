@@ -137,6 +137,9 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::database("begin service save", project_id, e))?;
         self.project(&tx, project_id).await?;
+        if let Some(source) = &request.policy.github_repository {
+            crate::github::validate_binding(&tx, project_id, source).await?;
+        }
         let now = Utc::now();
         let updating = id.is_some();
         let mut model = if let Some(id) = id {
@@ -164,6 +167,9 @@ impl ServiceAccessService {
                 ..Default::default()
             }
         };
+        if request.policy.github_repository.is_some() {
+            model.credential_encrypted = Set(None);
+        }
         model.name = Set(request.name);
         model.policy = Set(serde_json::to_value(&request.policy).map_err(|source| {
             AccessError::StoredPolicy {
@@ -410,6 +416,11 @@ pub fn validate_service(request: &mut SaveAccessService) -> Result<(), AccessErr
     if !(60..=86400).contains(&request.max_ttl_seconds) {
         return Err(invalid("max_ttl_seconds", "must be between 60 and 86400"));
     }
+    if request.policy.github_repository.is_some()
+        && (request.credential.is_some() || request.clear_credential)
+    {
+        return Err(invalid("credential", "GitHub services use the project connection; do not supply or clear a bearer credential"));
+    }
     if request.clear_credential && request.credential.is_some() {
         return Err(invalid(
             "credential",
@@ -431,7 +442,7 @@ pub fn validate_service(request: &mut SaveAccessService) -> Result<(), AccessErr
 }
 
 fn service_response(model: services::Model) -> Result<AccessServiceResponse, AccessError> {
-    let policy =
+    let policy: SandboxAccessPolicy =
         serde_json::from_value(model.policy).map_err(|source| AccessError::StoredPolicy {
             id: model.id.clone(),
             project_id: model.project_id,
@@ -441,10 +452,10 @@ fn service_response(model: services::Model) -> Result<AccessServiceResponse, Acc
         id: model.id,
         project_id: model.project_id,
         name: model.name,
+        has_credential: model.credential_encrypted.is_some() || policy.github_repository.is_some(),
         policy,
         max_ttl_seconds: model.max_ttl_seconds,
         enabled: model.enabled,
-        has_credential: model.credential_encrypted.is_some(),
         version: model.version,
         created_at: model.created_at,
         updated_at: model.updated_at,

@@ -140,7 +140,17 @@ impl AuthorityStore {
                 let headers = InjectedHeaders {
                     headers: vec![InjectedHeader {
                         name: "authorization".into(),
-                        value: format!("Bearer {}", credential.expose()),
+                        value: if grant.rule().git.is_some() {
+                            use base64::Engine;
+                            let basic =
+                                Zeroizing::new(format!("x-access-token:{}", credential.expose()));
+                            format!(
+                                "Basic {}",
+                                base64::engine::general_purpose::STANDARD.encode(basic.as_bytes())
+                            )
+                        } else {
+                            format!("Bearer {}", credential.expose())
+                        },
                     }],
                     substitutions: Vec::new(),
                 };

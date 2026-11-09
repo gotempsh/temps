@@ -95,21 +95,32 @@ pub async fn approve_service_grant(
         project_id,
         &state.project_access_checker
     );
-    let receipt = state
-        .coordinator
-        .connect(FreshConsent {
-            request_id: request.request_id,
-            project_id,
-            sandbox_id: sandbox_id.clone(),
-            user_id: auth.user_id(),
-            admin: auth.is_admin(),
-            request: RequestServiceGrant {
-                service_id: request.service_id,
-                service_version: request.service_version,
-                ttl_seconds: request.ttl_seconds,
-            },
-        })
+    let consent = FreshConsent {
+        request_id: request.request_id,
+        project_id,
+        sandbox_id: sandbox_id.clone(),
+        user_id: auth.user_id(),
+        admin: auth.is_admin(),
+        request: RequestServiceGrant {
+            service_id: request.service_id,
+            service_version: request.service_version,
+            ttl_seconds: request.ttl_seconds,
+        },
+    };
+    consent.validate()?;
+    let service = state
+        .service
+        .get_service(project_id, &consent.request.service_id)
         .await?;
+    if service.policy.github_repository.is_some() {
+        project_permission_guard!(
+            auth,
+            GitRepositoriesRead,
+            project_id,
+            &state.project_access_checker
+        );
+    }
+    let receipt = state.coordinator.connect(consent).await?;
     audit(
         &state,
         &auth,

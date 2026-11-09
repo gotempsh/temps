@@ -182,6 +182,19 @@ pub async fn access_capability(
             }
             .await,
         )?;
+    capability.can_use_project_github = capability.can_manage_services
+        && permission_available(
+            async {
+                project_permission_guard!(
+                    auth,
+                    GitRepositoriesRead,
+                    project_id,
+                    &state.project_access_checker
+                );
+                Ok(())
+            }
+            .await,
+        )?;
     Ok(Json(capability))
 }
 
@@ -242,6 +255,14 @@ pub async fn create_access_service(
         project_id,
         &state.project_access_checker
     );
+    if request.policy.github_repository.is_some() {
+        project_permission_guard!(
+            auth,
+            GitRepositoriesRead,
+            project_id,
+            &state.project_access_checker
+        );
+    }
     let response = state
         .service
         .save_service(project_id, None, request)
@@ -277,6 +298,14 @@ pub async fn update_access_service(
         project_id,
         &state.project_access_checker
     );
+    if request.policy.github_repository.is_some() {
+        project_permission_guard!(
+            auth,
+            GitRepositoriesRead,
+            project_id,
+            &state.project_access_checker
+        );
+    }
     let response = state
         .service
         .save_service(project_id, Some(service_id), request)

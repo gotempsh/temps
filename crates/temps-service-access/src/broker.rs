@@ -27,6 +27,8 @@ pub struct AccessCapability {
     pub can_save_requests: bool,
     /// Caller may edit service policies in this project. Set by the handler.
     pub can_manage_services: bool,
+    /// Caller may use the project-bound GitHub credential source.
+    pub can_use_project_github: bool,
     /// Caller has project and sandbox write permissions. Ownership is still
     /// checked on each sandbox mutation.
     pub can_manage_requests: bool,
@@ -53,6 +55,7 @@ impl ServiceAccessBroker for UnavailableTokenlessBroker {
             configured: false,
             can_save_requests: true,
             can_manage_services: false,
+            can_use_project_github: false,
             can_manage_requests: false,
             reason: UNAVAILABLE_REASON.into(),
             setup_path: None,

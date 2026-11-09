@@ -27,6 +27,35 @@ impl ServiceAccessPlugin {
     pub fn new() -> Self {
         Self
     }
+    pub(crate) fn register_with_credentials(
+        &self,
+        context: &ServiceRegistrationContext,
+        github: Arc<dyn crate::github::GithubCredentialResolver>,
+    ) {
+        let db = context.require_service::<DatabaseConnection>();
+        let encryption = context.require_service::<temps_core::EncryptionService>();
+        let service = Arc::new(ServiceAccessService::new(
+            Arc::clone(&db),
+            Arc::clone(&encryption),
+            Arc::new(crate::broker::UnavailableTokenlessBroker),
+        ));
+        let transport = Arc::new(WorkerTransport::new(
+            context.require_service::<dyn temps_sandbox_providers::SandboxProvider>(),
+        ));
+        context.register_service(Arc::new(ServiceAccessCoordinator::new(
+            db,
+            encryption,
+            context.require_service::<dyn AuditLogger>(),
+            Arc::clone(&service),
+            transport,
+            context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+            github,
+        )));
+        context.register_service(service);
+        context.register_service(Arc::new(ServiceAccessReconciler::default()));
+
+        debug!("Sandbox service access plugin services registered successfully");
+    }
 }
 
 impl Default for ServiceAccessPlugin {
@@ -45,28 +74,10 @@ impl TempsPlugin for ServiceAccessPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            let db = context.require_service::<DatabaseConnection>();
-            let encryption = context.require_service::<temps_core::EncryptionService>();
-            let service = Arc::new(ServiceAccessService::new(
-                Arc::clone(&db),
-                Arc::clone(&encryption),
-                Arc::new(crate::broker::UnavailableTokenlessBroker),
+            let github = Arc::new(crate::github::ProjectGithubCredentials::new(
+                context.require_service::<dyn temps_git::services::git_provider_manager_trait::GitProviderManagerTrait>(),
             ));
-            let transport = Arc::new(WorkerTransport::new(
-                context.require_service::<dyn temps_sandbox_providers::SandboxProvider>(),
-            ));
-            context.register_service(Arc::new(ServiceAccessCoordinator::new(
-                db,
-                encryption,
-                context.require_service::<dyn AuditLogger>(),
-                Arc::clone(&service),
-                transport,
-                context.get_service::<dyn temps_core::ProjectAccessChecker>(),
-            )));
-            context.register_service(service);
-            context.register_service(Arc::new(ServiceAccessReconciler::default()));
-
-            debug!("Sandbox service access plugin services registered successfully");
+            self.register_with_credentials(context, github);
             Ok(())
         })
     }

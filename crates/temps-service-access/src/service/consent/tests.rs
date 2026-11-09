@@ -112,6 +112,7 @@ async fn postgres_fresh_consent_is_scoped_atomic_bounded_and_preserves_retiremen
             SaveAccessService {
                 name: "API".into(),
                 policy: SandboxAccessPolicy {
+                    github_repository: None,
                     origin: "https://api.github.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],

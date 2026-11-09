@@ -57,6 +57,13 @@ pub enum PlanError {
         #[source]
         source: temps_core::EncryptionError,
     },
+    #[error("Cannot resolve GitHub credential for service {service_id} on worker boot {boot_id}")]
+    Github {
+        boot_id: Uuid,
+        service_id: String,
+        #[source]
+        source: crate::github::GithubCredentialError,
+    },
     #[error("Cannot decode stored policy for service {service_id} on worker boot {boot_id}")]
     Policy {
         boot_id: Uuid,
@@ -103,6 +110,7 @@ pub struct WorkerPlan {
 pub struct PolicyPlanner {
     db: Arc<DatabaseConnection>,
     encryption: Arc<EncryptionService>,
+    github: Arc<dyn crate::github::GithubCredentialResolver>,
     // Optional by the ProjectAccessChecker contract; OSS may have no checker.
     checker: Option<Arc<dyn ProjectAccessChecker>>,
 }
@@ -111,11 +119,13 @@ impl PolicyPlanner {
         db: Arc<DatabaseConnection>,
         encryption: Arc<EncryptionService>,
         checker: Option<Arc<dyn ProjectAccessChecker>>,
+        github: Arc<dyn crate::github::GithubCredentialResolver>,
     ) -> Self {
         Self {
             db,
             encryption,
             checker,
+            github,
         }
     }
 
@@ -158,7 +168,12 @@ impl PolicyPlanner {
         let now = Utc::now();
         let mut grouped: BTreeMap<Uuid, Vec<Candidate>> = BTreeMap::new();
         for candidate in candidates {
-            if (candidate.admin || allowed.contains(&(candidate.approved_by, candidate.project_id)))
+            let permissions = allowed.get(&(candidate.approved_by, candidate.project_id));
+            let needs_git = candidate
+                .policy
+                .get("github_repository")
+                .is_some_and(|value| !value.is_null());
+            if (candidate.admin || permissions.is_some_and(|git| !needs_git || *git))
                 && candidate.expires_at > now + chrono::Duration::seconds(1)
             {
                 grouped
@@ -167,6 +182,7 @@ impl PolicyPlanner {
                     .push(candidate);
             }
         }
+        let mut resolved_github = BTreeMap::<i32, SecretString>::new();
         let mut bindings = Vec::new();
         let mut retire = Vec::new();
         for runtime in runtimes {
@@ -193,33 +209,57 @@ impl PolicyPlanner {
                         service_id: grant.service_id.clone(),
                         source,
                     })?;
-                let bytes = Zeroizing::new(
-                    self.encryption
-                        .decrypt(&grant.credential_encrypted)
-                        .map_err(|source| PlanError::Encryption {
-                            boot_id,
-                            service_id: grant.service_id.clone(),
-                            source,
-                        })?,
-                );
-                let value = std::str::from_utf8(&bytes).map_err(|_| {
-                    invalid(
-                        boot_id,
-                        "decode service credential",
-                        "stored credential is not UTF-8",
-                    )
-                })?;
-                if value.is_empty()
-                    || value.len() > 16384
-                    || !value.bytes().all(|b| (33..=126).contains(&b))
-                {
-                    return Err(invalid(
-                        boot_id,
-                        "validate service credential",
-                        "stored bearer credential is invalid",
-                    ));
-                }
-                credentials.insert(grant.grant_id.clone(), SecretString::new(value));
+                let credential =
+                    if let Some(source) = &policy.github_repository {
+                        if let Some(credential) = resolved_github.get(&source.connection_id) {
+                            credential.clone()
+                        } else {
+                            let credential =
+                                self.github.resolve(source.connection_id).await.map_err(
+                                    |source| PlanError::Github {
+                                        boot_id,
+                                        service_id: grant.service_id.clone(),
+                                        source,
+                                    },
+                                )?;
+                            resolved_github.insert(source.connection_id, credential.clone());
+                            credential
+                        }
+                    } else {
+                        let encrypted = grant.credential_encrypted.as_deref().ok_or_else(|| {
+                            invalid(
+                                boot_id,
+                                "decode service credential",
+                                "stored bearer credential is missing",
+                            )
+                        })?;
+                        let bytes = Zeroizing::new(self.encryption.decrypt(encrypted).map_err(
+                            |source| PlanError::Encryption {
+                                boot_id,
+                                service_id: grant.service_id.clone(),
+                                source,
+                            },
+                        )?);
+                        let value = std::str::from_utf8(&bytes).map_err(|_| {
+                            invalid(
+                                boot_id,
+                                "decode service credential",
+                                "stored credential is not UTF-8",
+                            )
+                        })?;
+                        if value.is_empty()
+                            || value.len() > 16384
+                            || !value.bytes().all(|b| (33..=126).contains(&b))
+                        {
+                            return Err(invalid(
+                                boot_id,
+                                "validate service credential",
+                                "stored bearer credential is invalid",
+                            ));
+                        }
+                        SecretString::new(value)
+                    };
+                credentials.insert(grant.grant_id.clone(), credential);
                 requests.push(PrepareSession {
                     target: BindingTarget {
                         project_id: runtime.project_id,
@@ -277,7 +317,7 @@ struct Candidate {
     policy: serde_json::Value,
     max_ttl_seconds: i32,
     expires_at: DateTime<Utc>,
-    credential_encrypted: String,
+    credential_encrypted: Option<String>,
 }
 
 #[cfg(test)]

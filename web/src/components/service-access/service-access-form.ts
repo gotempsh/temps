@@ -72,6 +72,14 @@ export const accessServiceSchema = z
     enabled: z.boolean(),
     credential: z.string().max(16384),
     clearCredential: z.boolean(),
+    githubRepository: z
+      .object({
+        connection_id: z.number().int().positive(),
+        owner: z.string().min(1),
+        repository: z.string().min(1),
+        protocol: z.enum(['api', 'git']),
+      })
+      .optional(),
   })
   .refine((value) => !(value.credential && value.clearCredential), {
     message: 'Choose a new credential or remove the current one',
@@ -91,6 +99,7 @@ export function serviceDefaults(
     enabled: service?.enabled ?? true,
     credential: '',
     clearCredential: false,
+    githubRepository: service?.policy.github_repository ?? undefined,
   }
 }
 export function serviceBody(
@@ -103,6 +112,7 @@ export function serviceBody(
       origin: values.origin,
       path_prefixes: pathPrefixes(values.paths),
       methods: values.methods,
+      github_repository: values.githubRepository,
     },
     max_ttl_seconds: values.maxTtl,
     enabled: values.enabled,

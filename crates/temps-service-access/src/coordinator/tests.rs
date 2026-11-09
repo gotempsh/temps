@@ -26,6 +26,7 @@ fn coordinator(db: Arc<DatabaseConnection>, provider: Arc<Provider>) -> ServiceA
         service,
         Arc::new(WorkerTransport::new(provider)),
         None,
+        Arc::new(crate::github::NoGithub),
     )
 }
 fn consent(id: &str) -> FreshConsent {
@@ -81,7 +82,7 @@ async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_
     let provider: Arc<dyn temps_sandbox_providers::SandboxProvider> = Provider::new();
     context.register_service(provider);
     let plugin = crate::ServiceAccessPlugin::new();
-    plugin.register_services(&context).await.unwrap();
+    plugin.register_with_credentials(&context, Arc::new(crate::github::NoGithub));
     let read_context = context.create_plugin_context();
     let coordinator = context.require_service::<ServiceAccessCoordinator>();
     let weak = Arc::downgrade(&coordinator);
@@ -135,6 +136,7 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
                     SaveAccessService {
                         name: "API".into(),
                         policy: SandboxAccessPolicy {
+                            github_repository: None,
                             origin: origin.into(),
                             path_prefixes: vec!["/user".into()],
                             methods: vec![AccessMethod::Get],
@@ -278,6 +280,7 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
             SaveAccessService {
                 name: "API".into(),
                 policy: SandboxAccessPolicy {
+                    github_repository: None,
                     origin: "https://api.github.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],
