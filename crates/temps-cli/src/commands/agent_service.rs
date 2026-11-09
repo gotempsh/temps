@@ -218,6 +218,21 @@ fn uninstall() -> anyhow::Result<()> {
     let _ = Command::new("systemctl")
         .args(["disable", "--now", SERVICE_NAME])
         .status();
+    // The agent is stopped, so nothing reinstalls it (ADR-098 D3). Its
+    // liveness would expire within 90 s anyway; removing it says so now.
+    // Before the unit goes, so a failure below still leaves no redirect.
+    match remove_internal_proxy_redirect() {
+        RedirectRemoval::Removed => println!(
+            "Removed the internal proxy's port-80 redirect (nftables table ip {}).",
+            temps_node_agent::internal_redirect::TABLE
+        ),
+        RedirectRemoval::NoNft => {}
+        RedirectRemoval::Failed(error) => eprintln!(
+            "Warning: could not remove the internal proxy's port-80 redirect: {error}. It stops \
+             matching within 90 s on its own; to remove it now run `sudo nft delete table ip {}`.",
+            temps_node_agent::internal_redirect::TABLE
+        ),
+    }
     std::fs::remove_file(unit)?;
     let guard = Path::new(GUARD_UNIT_PATH);
     if guard.exists() {
@@ -230,6 +245,96 @@ fn uninstall() -> anyhow::Result<()> {
     systemctl(&["daemon-reload"])?;
     println!("Removed {SERVICE_NAME}.");
     Ok(())
+}
+
+/// What removing the internal proxy's redirect did.
+#[derive(Debug, PartialEq, Eq)]
+enum RedirectRemoval {
+    Removed,
+    /// No `nft` on the host, so no table can exist.
+    NoNft,
+    Failed(String),
+}
+
+/// Delete the agent's nftables redirect table (idempotent).
+fn remove_internal_proxy_redirect() -> RedirectRemoval {
+    let Some(nft) = NFT_CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+    else {
+        return RedirectRemoval::NoNft;
+    };
+    apply_removal(nft, &temps_node_agent::internal_redirect::removal_ruleset())
+}
+
+/// Longest `nft` may take to delete the table before uninstall gives up on it.
+const NFT_REMOVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn apply_removal(nft: &Path, ruleset: &str) -> RedirectRemoval {
+    apply_removal_within(nft, ruleset, NFT_REMOVAL_TIMEOUT)
+}
+
+fn apply_removal_within(
+    nft: &Path,
+    ruleset: &str,
+    timeout: std::time::Duration,
+) -> RedirectRemoval {
+    use std::io::{Read as _, Write as _};
+    let child = Command::new(nft)
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return RedirectRemoval::Failed(format!("running {}: {error}", nft.display()))
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // The script is two short lines: it fits the pipe, so this cannot
+        // block on a program that never reads.
+        if let Err(error) = stdin.write_all(ruleset.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return RedirectRemoval::Failed(format!("writing to {}: {error}", nft.display()));
+        }
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return RedirectRemoval::Failed(format!(
+                    "{} did not finish within {} s and was stopped",
+                    nft.display(),
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                return RedirectRemoval::Failed(format!("waiting for {}: {error}", nft.display()))
+            }
+        }
+    };
+    if status.success() {
+        return RedirectRemoval::Removed;
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    RedirectRemoval::Failed(format!(
+        "{} exited {status}: {}",
+        nft.display(),
+        stderr.trim()
+    ))
 }
 
 /// The systemd unit for the agent, running `binary agent` with `data_dir`.
@@ -1466,6 +1571,62 @@ mod tests {
             interval
         ));
         assert_eq!(samples, 3, "stops at the first sample that is down");
+    }
+
+    /// Uninstall reports what `nft` did with the removal script: fake `nft`
+    /// programs that read it and succeed or fail, and one that is missing.
+    #[cfg(unix)]
+    #[test]
+    fn removing_the_redirect_reports_what_nft_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let script = dir.path().join("script");
+        let ok = fake(
+            "nft-ok",
+            &format!(
+                "[ \"$1 $2\" = \"-f -\" ] || exit 2\ncat > '{}'",
+                script.display()
+            ),
+        );
+        let refused = fake(
+            "nft-refused",
+            "cat >/dev/null\necho 'Error: nope' >&2\nexit 1",
+        );
+        let ruleset = temps_node_agent::internal_redirect::removal_ruleset();
+
+        assert_eq!(apply_removal(&ok, &ruleset), RedirectRemoval::Removed);
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), ruleset);
+        match apply_removal(&refused, &ruleset) {
+            RedirectRemoval::Failed(error) => {
+                assert!(
+                    error.contains("exited") && error.contains("Error: nope"),
+                    "{error}"
+                )
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        match apply_removal(Path::new("/nonexistent/nft"), &ruleset) {
+            RedirectRemoval::Failed(error) => {
+                assert!(error.contains("/nonexistent/nft"), "{error}")
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        // A hung nft does not hang the uninstall.
+        let hung = fake("nft-hung", "cat >/dev/null\nexec sleep 30");
+        let started = std::time::Instant::now();
+        match apply_removal_within(&hung, &ruleset, std::time::Duration::from_millis(300)) {
+            RedirectRemoval::Failed(error) => {
+                assert!(error.contains("did not finish"), "{error}")
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     /// A restart of the agent must not kill the sandbox VMs it started.

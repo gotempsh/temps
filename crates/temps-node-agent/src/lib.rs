@@ -24,6 +24,8 @@ mod exec_timeout;
 pub mod gate;
 pub mod handlers;
 pub mod internal_proxy;
+pub mod internal_redirect;
+pub mod internal_routing;
 pub mod labels;
 pub mod mac_worker;
 pub mod mesh_listener;

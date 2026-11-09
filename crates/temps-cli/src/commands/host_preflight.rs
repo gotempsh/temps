@@ -13,6 +13,7 @@
 use std::net::SocketAddr;
 
 use temps_network::overlay_name::{self, DEFAULT_OVERLAY_NETWORK_NAME};
+use temps_node_agent::internal_routing::INTERNAL_PROXY_PORT;
 
 /// A Docker network on the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +187,8 @@ pub enum Finding {
     },
     /// A port the worker serves on is already held. `serves_public` is
     /// whether the worker's ingress mode listens for public traffic; with
-    /// `off` only the overlay's internal proxy needs the port.
+    /// `off` only the overlay's internal proxy needs a port, its own
+    /// (ADR-098).
     PortInUse {
         port: u16,
         address: SocketAddr,
@@ -275,27 +277,33 @@ impl Finding {
                     .as_deref()
                     .map(|process| format!(" by {process}"))
                     .unwrap_or_default();
-                if *serves_public {
+                if *port == INTERNAL_PROXY_PORT {
+                    format!(
+                        "port {port} is already in use on {address}{holder}. The overlay's \
+                         internal proxy listens on port {port} of its bridge address, and \
+                         containers' calls to port 80 of that address are redirected to it; \
+                         while the port is held the agent falls back to listening on port 80 \
+                         of the bridge address itself. Stop what holds port {port}, or move it \
+                         to another port."
+                    )
+                } else if *serves_public {
                     format!(
                         "port {port} is already in use on {address}{holder}. The worker serves \
-                         public traffic on 80/443 and the overlay's internal proxy on port 80 \
-                         of its bridge address; while it is held they fail to start. Stop what \
-                         holds it, or use `temps agent ingress` to move public traffic to other \
-                         ports."
-                    )
-                } else if *port == 80 {
-                    format!(
-                        "port {port} is already in use on {address}{holder}. The worker takes \
-                         no public traffic, but the overlay's internal proxy serves port 80 of \
-                         its bridge address and fails to start while it is held. Stop what \
-                         holds it."
+                         public traffic on 80/443, and its public listener fails to start while \
+                         the port is held. Stop what holds it, or use `temps agent ingress` to \
+                         move public traffic to other ports."
                     )
                 } else {
+                    let protocol = if *port == temps_core::worker_ingress::PRIVATE_HTTP_PORT {
+                        "HTTP"
+                    } else {
+                        "HTTPS"
+                    };
                     format!(
-                        "port {port} is already in use on {address}{holder}. The worker's \
-                         private listener (ingress `private`) serves HTTPS on port {port} of \
-                         its private address and fails to start while it is held. Stop what \
-                         holds it."
+                        "port {port} is already in use on {address}{holder}. The worker takes \
+                         no public traffic, but its private listener (ingress `private`) serves \
+                         {protocol} on port {port} of its private address and fails to start \
+                         while it is held. Stop what holds it."
                     )
                 }
             }
@@ -345,18 +353,30 @@ pub enum Purpose<'a> {
 }
 
 /// The ports a worker with `ingress` serves on, sorted, and whether its
-/// ingress mode listens for public traffic. Port 80 always: the overlay's
-/// internal proxy binds it on the bridge address. `off` binds no public
-/// listener, so 443 and the ingress ports cannot stop it. `private` binds
-/// only its fixed private ports (ADR 064 D5), and takes no public traffic.
+/// ingress mode listens for public traffic. [`INTERNAL_PROXY_PORT`] always:
+/// the overlay's internal proxy binds it on the bridge address, and
+/// containers' port-80 calls are redirected to it (ADR-098), so port 80 is
+/// checked only for a mode that listens on it. `off` binds no public
+/// listener. `private` binds only its fixed private ports (ADR 064 D5), and
+/// takes no public traffic.
 pub fn served_ports(ingress: &temps_core::worker_ingress::LocalIngress) -> (Vec<u16>, bool) {
     use temps_core::worker_ingress::{IngressMode, PRIVATE_HTTPS_PORT, PRIVATE_HTTP_PORT};
     let (mut ports, serves_public) = match ingress.mode {
-        IngressMode::Off => (vec![80], false),
-        IngressMode::Private => (vec![80, PRIVATE_HTTP_PORT, PRIVATE_HTTPS_PORT], false),
-        IngressMode::Fixed | IngressMode::Delegated => {
-            (vec![80, 443, ingress.http_port, ingress.https_port], true)
-        }
+        IngressMode::Off => (vec![INTERNAL_PROXY_PORT], false),
+        IngressMode::Private => (
+            vec![INTERNAL_PROXY_PORT, PRIVATE_HTTP_PORT, PRIVATE_HTTPS_PORT],
+            false,
+        ),
+        IngressMode::Fixed | IngressMode::Delegated => (
+            vec![
+                INTERNAL_PROXY_PORT,
+                80,
+                443,
+                ingress.http_port,
+                ingress.https_port,
+            ],
+            true,
+        ),
     };
     ports.sort_unstable();
     ports.dedup();
@@ -1159,20 +1179,21 @@ mod tests {
             .contains("public traffic on 80/443"));
     }
 
-    /// Ingress `off` binds no public listener: 443 held cannot stop the
-    /// worker, and the message about 80 does not blame public traffic.
+    /// Ingress `off` binds no public listener and the internal proxy has a
+    /// port of its own (ADR-098): a web server on 80 or 443 cannot stop the
+    /// worker, and only the proxy's port is checked.
     #[test]
     fn ingress_off_checks_only_the_overlay_proxy_port() {
         use temps_core::worker_ingress::{IngressMode, LocalIngress};
         let off = LocalIngress::default();
-        assert_eq!(served_ports(&off), (vec![80], false));
+        assert_eq!(served_ports(&off), (vec![591], false));
         let fixed = LocalIngress {
             mode: IngressMode::Fixed,
             http_port: 8080,
             https_port: 8443,
             ..LocalIngress::default()
         };
-        assert_eq!(served_ports(&fixed), (vec![80, 443, 8080, 8443], true));
+        assert_eq!(served_ports(&fixed), (vec![80, 443, 591, 8080, 8443], true));
         // `private` serves its own fixed ports, never the public ingress
         // ports, and takes no public traffic on them.
         let private = LocalIngress {
@@ -1181,7 +1202,7 @@ mod tests {
             https_port: 8443,
             ..LocalIngress::default()
         };
-        assert_eq!(served_ports(&private), (vec![80, 443], false));
+        assert_eq!(served_ports(&private), (vec![80, 443, 591], false));
 
         let facts = HostFacts {
             listeners: vec![
@@ -1198,17 +1219,57 @@ mod tests {
         };
         let (ports, serves_public) = served_ports(&off);
         let assessment = assess(&facts, Purpose::ServiceInstall, &ports, serves_public);
+        assert_eq!(
+            assessment.findings,
+            Vec::new(),
+            "80 and 443 belong to the operator"
+        );
+
+        let held = HostFacts {
+            listeners: vec![Listener {
+                address: "0.0.0.0:591".parse().unwrap(),
+                process: Some("httpd (pid 9)".into()),
+            }],
+            ..admin()
+        };
+        let assessment = assess(&held, Purpose::ServiceInstall, &ports, serves_public);
         assert!(matches!(
             assessment.findings.as_slice(),
             [Finding::PortInUse {
-                port: 80,
+                port: 591,
                 serves_public: false,
                 ..
             }]
         ));
         let message = assessment.findings[0].message();
-        assert!(message.contains("no public traffic"), "{message}");
+        assert!(message.contains("httpd (pid 9)"), "{message}");
+        assert!(
+            message.contains("internal proxy listens on port 591"),
+            "{message}"
+        );
+        assert!(message.contains("redirected"), "{message}");
         assert!(!message.contains("80/443"), "{message}");
+
+        // `private` holds port 80 of its private address: that message is
+        // about the private listener, not the internal proxy.
+        let (ports, serves_public) = served_ports(&private);
+        let assessment = assess(&facts, Purpose::ServiceInstall, &ports, serves_public);
+        let messages: Vec<String> = assessment.findings.iter().map(Finding::message).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages[0].contains("serves HTTP on port 80"),
+            "{}",
+            messages[0]
+        );
+        assert!(
+            messages[1].contains("serves HTTPS on port 443"),
+            "{}",
+            messages[1]
+        );
+        assert!(
+            messages.iter().all(|m| !m.contains("internal proxy")),
+            "{messages:?}"
+        );
     }
 
     #[test]

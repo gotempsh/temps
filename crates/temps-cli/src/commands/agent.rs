@@ -538,15 +538,19 @@ impl AgentCommand {
                 }
             }
 
-            // Internal edge proxy bound to the overlay bridge gateway.
+            // Internal routing on the overlay bridge gateway (ADR-098).
             // Watches two sources for the bridge IP, taking whichever
             // appears first:
             //   1. `overlay_bridge_address` — populated by network_sync
             //      after the CP returns this node's compute_cidr.
-            //   2. The kernel directly (`br-temps0` interface) — works
-            //      across CP-outage cold starts, because the bridge is
-            //      preserved by the kernel even when the agent restarts
-            //      with CP unreachable.
+            //   2. The kernel directly (the overlay bridge's interface) —
+            //      works across CP-outage cold starts, because the bridge
+            //      is preserved by the kernel even when the agent restarts
+            //      with CP unreachable. The bridge is the one named in
+            //      agent.json when `temps join` chose another overlay name
+            //      (ADR-059): the default `br-temps0` may then belong to
+            //      another Temps install on this host, and redirecting its
+            //      port 80 (ADR-098) would break that install's routing.
             // Without (2) the proxy would refuse to bind whenever the
             // agent reboots while the CP is down, which is exactly when
             // serving stale-but-correct routes from disk matters most.
@@ -555,6 +559,7 @@ impl AgentCommand {
                 let store = route_store.clone();
                 let proxy_docker = docker.clone();
                 let proxy_shutdown = route_sync_shutdown.clone();
+                let saved_bridge = saved_overlay_bridge(config.overlay_network_name.as_deref());
                 tokio::spawn(async move {
                     let bridge_ip = loop {
                         if let Some(ip) = *bridge_slot
@@ -568,7 +573,9 @@ impl AgentCommand {
                         // address. Read it directly so the proxy can
                         // bind without waiting for CP to confirm the
                         // allocation.
-                        let bridge = temps_network::overlay_name::current().bridge;
+                        let bridge = saved_bridge
+                            .clone()
+                            .unwrap_or_else(|| temps_network::overlay_name::current().bridge);
                         if let Some(ip) = read_bridge_ip_from_kernel(&bridge).await {
                             tracing::info!(
                                 bridge = %ip,
@@ -578,13 +585,14 @@ impl AgentCommand {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     };
-                    // Retried until it binds: something else holding port 80
-                    // (or Docker not answering yet) must not disable
-                    // `*.temps.local` routing for the agent's lifetime. Each
-                    // attempt's outcome rides on the heartbeat.
-                    temps_node_agent::internal_proxy::spawn_supervised(
+                    // The proxy listens on its own port of the bridge address
+                    // and nftables redirects containers' port-80 calls to it
+                    // (ADR-098), so another program on port 80 of this host
+                    // keeps its port. Without the redirect the agent falls
+                    // back to binding port 80 directly. Supervised for the
+                    // agent's lifetime; each pass rides on the heartbeat.
+                    temps_node_agent::internal_routing::supervise(
                         bridge_ip,
-                        80,
                         store,
                         proxy_docker,
                         proxy_shutdown,
@@ -933,6 +941,18 @@ async fn wait_for_mac_sidecar(worker: temps_node_agent::mac_worker::MacWorker) {
     }
 }
 
+/// The overlay bridge `temps join` recorded in agent.json, used to find the
+/// bridge address before the first network sync. `None` (use the names the
+/// sync loop reconciled, else the defaults) when nothing usable was saved.
+fn saved_overlay_bridge(saved: Option<&str>) -> Option<String> {
+    let names = temps_network::OverlayNames::new(saved?)
+        .map_err(|error| {
+            tracing::warn!(%error, "agent.json names an unusable overlay network; ignoring it")
+        })
+        .ok()?;
+    Some(names.bridge)
+}
+
 async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
     use tokio::process::Command;
     let out = Command::new("ip")
@@ -966,6 +986,20 @@ async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another overlay name chosen at join must be what a cold start looks
+    /// for: the default bridge may be another Temps install's (ADR-098).
+    #[test]
+    fn a_cold_start_looks_for_the_overlay_bridge_join_chose() {
+        let other = temps_network::OverlayNames::new("temps1").unwrap();
+        assert_eq!(
+            saved_overlay_bridge(Some("temps1")),
+            Some(other.bridge.clone())
+        );
+        assert_ne!(other.bridge, temps_network::OverlayNames::default().bridge);
+        assert_eq!(saved_overlay_bridge(None), None);
+        assert_eq!(saved_overlay_bridge(Some("br0; rm -rf")), None);
+    }
 
     #[test]
     fn labels_reload_only_from_this_agents_own_agent_json() {
