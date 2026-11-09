@@ -1416,7 +1416,9 @@ const queryClient = new QueryClient({
       // `meta` and `mutationKey` arrive in the fourth argument; the third is
       // the `onMutate` result, which is `undefined` for these mutations.
       onError: (error: unknown, _variables, _onMutateResult, context) => {
-        const problemDetails = error as ProblemDetails
+        const problemDetails = error as ProblemDetails & {
+          extensions?: Record<string, unknown>
+        }
 
         // Sensitive mutations own this response: they open a step-up dialog
         // and retry after verification. A global error toast would be both

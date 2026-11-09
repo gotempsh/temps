@@ -32,8 +32,9 @@ use crate::repository::{self, RepositoryError};
 /// Service that manages the external plugin lifecycle and provides data
 /// to the handler layer.
 pub struct ExternalPluginsService {
-    manager: Arc<ExternalPluginManager>,
-    db: Arc<sea_orm::DatabaseConnection>,
+    pub(crate) manager: Arc<ExternalPluginManager>,
+    pub(crate) db: Arc<sea_orm::DatabaseConnection>,
+    pub(crate) ai_tools: Arc<temps_ai_api_tools::PluginToolsRegistry>,
     /// Cached manifests from discovery — refreshed on reload.
     manifests: RwLock<Vec<PluginManifest>>,
     /// Event listener that delivers platform events to subscribing plugins
@@ -44,7 +45,8 @@ pub struct ExternalPluginsService {
     /// are reflected without restarting the server.
     proxy_router: Arc<RwLock<Router>>,
     /// Serializes discovery, reload, and install/promotion lifecycles.
-    lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) ai_recovery: crate::ai_tools::ConsentRecovery,
     /// Serializes every read/compare/write mutation of the persisted registry
     /// trust state. Catalogue requests can overlap on the network, but they
     /// must be committed in a single monotonic order with installations.
@@ -53,7 +55,7 @@ pub struct ExternalPluginsService {
     install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
-    closing: AtomicBool,
+    pub(crate) closing: Arc<AtomicBool>,
     /// Compiles plugins on a worker node when this process has no Docker.
     remote_builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
 }
@@ -505,6 +507,8 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
         let actor_id = candidate_actor_id;
@@ -553,12 +557,14 @@ impl ExternalPluginsService {
             event_listener: RwLock::new(None),
             queue,
             proxy_router: Arc::new(RwLock::new(Router::new())),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
-            closing: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
             remote_builder: None,
+            ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         }
     }
 
@@ -612,6 +618,7 @@ impl ExternalPluginsService {
                 let mut cached = self.manifests.write().await;
                 *cached = manifests;
             }
+            self.rebuild_ai_tools().await;
         });
     }
 
@@ -647,20 +654,24 @@ impl ExternalPluginsService {
         // Build the initial proxy router
         let proxy_router = Self::build_proxy_router_from(&manager, &manifests).await;
 
-        Self {
+        let service = Self {
             manager,
             db,
             manifests: RwLock::new(manifests),
             event_listener: RwLock::new(event_listener),
             queue,
             proxy_router: Arc::new(RwLock::new(proxy_router)),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
-            closing: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
             remote_builder: None,
-        }
+            ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
+        };
+        service.rebuild_ai_tools().await;
+        service
     }
 
     /// Get a snapshot of the current plugin manifests.
@@ -719,6 +730,8 @@ impl ExternalPluginsService {
             }
         }
 
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         // Reload all plugins via manager (shutdown + re-discover + re-start)
         let result = self.manager.reload_all().await;
         let new_manifests = &result.manifests;
@@ -754,6 +767,7 @@ impl ExternalPluginsService {
             *manifests = new_manifests.clone();
         }
 
+        self.rebuild_ai_tools().await;
         Ok(result)
     }
 
@@ -968,6 +982,8 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
         let actor_id = candidate_actor_id;
@@ -1001,12 +1017,32 @@ impl ExternalPluginsService {
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
-            return Err(ExternalPluginsError::NotInstalled {
-                name: name.to_string(),
-            });
+        let active_path = self
+            .manager
+            .config()
+            .plugins_dir
+            .join(name)
+            .join("active.json");
+        match tokio::fs::symlink_metadata(&active_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ExternalPluginsError::NotInstalled { name: name.into() });
+            }
+            Err(error) => {
+                return Err(ExternalPluginsError::Install(InstallError::Io {
+                    plugin: name.into(),
+                    path: active_path.display().to_string(),
+                    reason: error.to_string(),
+                }))
+            }
         }
-        self.manager.shutdown_plugin(name).await;
+        // Invalidate before the cancellable write: a lost acknowledgement can
+        // mean revocation committed. Recovery reloads authoritative consent.
+        self.ai_tools
+            .publish(self.ai_tools.snapshot().without_plugin(name));
+        self.schedule_consent_recovery();
+        // Persist revocation before removing the installation. A database failure
+        // leaves the installation intact so reinstall cannot inherit stale consent.
         crate::grants::PluginGrantService::new(self.db.clone())
             .revoke_actor(name)
             .await
@@ -1018,6 +1054,13 @@ impl ExternalPluginsService {
                 })
             })?;
 
+        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
+            return Err(ExternalPluginsError::NotInstalled {
+                name: name.to_string(),
+            });
+        }
+        self.manager.shutdown_plugin(name).await;
+
         self.refresh_runtime_surfaces().await;
         Ok(())
     }
@@ -1025,7 +1068,15 @@ impl ExternalPluginsService {
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         self.closing.store(true, Ordering::Release);
+        self.ai_recovery.cancel();
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         let _lifecycle = self.lifecycle.lock().await;
+        self.ai_recovery.cancel();
+        // A lifecycle operation already holding the lock may have published
+        // after the early revocation. Revoke its snapshot before stopping.
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         let mut listener = self.event_listener.write().await;
         if let Some(l) = listener.take() {
             l.stop().await;
@@ -1122,6 +1173,7 @@ impl ExternalPluginsService {
         *self.proxy_router.write().await = router;
         *self.event_listener.write().await = listener;
         *self.manifests.write().await = manifests;
+        self.rebuild_ai_tools().await;
     }
 
     /// Start event listener if any plugins subscribe to events.
@@ -2230,6 +2282,44 @@ except Exception:
     }
 
     #[tokio::test]
+    async fn failed_uninstall_revocation_preserves_installation_until_retry() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
+        let temp = tempfile::tempdir().unwrap();
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        let active = config.plugins_dir.join("reports/active.json");
+        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
+        std::fs::write(&active, b"fixture active selection").unwrap();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([DbErr::Custom("revocation unavailable".into())])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<temps_entities::external_plugin_actors::Model>::new()])
+            .into_connection();
+        let service = ExternalPluginsService::new_empty(config, None, Arc::new(db));
+        let before = service.ai_tools.snapshot();
+        assert!(service.uninstall_plugin("reports").await.is_err());
+        assert!(
+            active.is_file(),
+            "a failed revocation must not remove the active installation"
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &service.ai_tools.snapshot()),
+            "an uncertain revocation must invalidate the prior AI snapshot"
+        );
+        service.uninstall_plugin("reports").await.unwrap();
+        assert!(
+            !active.exists(),
+            "deactivation follows durable revocation on retry"
+        );
+        assert!(!Arc::ptr_eq(&before, &service.ai_tools.snapshot()));
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn protocol_v2_install_activates_and_promotes_verified_binary() {
         if !std::path::Path::new("/usr/bin/python3").exists() {
@@ -2487,5 +2577,145 @@ except Exception:
             !plugins_dir.exists(),
             "a rejected queued install must not create plugin state"
         );
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn installed_plugin_tools_are_discoverable_gated_and_callable_over_http() {
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsRegistry,
+            ProjectSelectorScope,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let signing = SigningKey::from_bytes(&[63; 32]);
+        let spec = serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{"description":"List reports"},"responses":{"200":{"description":"ok"}}}}}});
+        let original = String::from_utf8(protocol_v2_fixture("reports", "1.0.0")).unwrap();
+        let (setup, worker) = original
+            .split_once("connection, _ = server.accept()\n")
+            .unwrap();
+        let setup = setup.replace(
+            "args = dict",
+            &format!(
+                "READY = json.dumps(dict(json.loads(READY), openapi=json.loads({})))\nargs = dict",
+                serde_json::to_string(&spec.to_string()).unwrap()
+            ),
+        );
+        let worker = worker.replace("websocket_key = headers[\"sec-websocket-key\"]", r#"if "sec-websocket-key" not in headers:
+    body = json.dumps({"reports": [], "user_id": headers.get("x-temps-user-id")}).encode()
+    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    connection.close()
+    return
+websocket_key = headers["sec-websocket-key"]"#);
+        let worker = worker
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+        let binary = format!("{setup}import threading\ndef respond(connection):\n{worker}\nwhile True:\n    connection, _ = server.accept()\n    threading.Thread(target=respond, args=(connection,), daemon=True).start()\n").into_bytes();
+        let url = serve_artifact_once(binary.clone()).await;
+        let registry_config = crate::catalog::RegistryConfig::local(
+            url.clone(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let mut config =
+            ExternalPluginConfig::new(temp.path().into(), "postgres://localhost/test".into())
+                .with_registry(registry_config);
+        // Keep Unix sockets short on every platform.
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        config.sockets_dir = sockets.path().into();
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping installed plugin AI tools test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let service = ExternalPluginsService::new_empty(config, None, database.connection_arc());
+        service
+            .install_selected(selected_plugin(
+                url, &binary, "reports", "1.0.0", 1, &signing,
+            ))
+            .await
+            .unwrap();
+        let settings = service.plugin_ai_tools("reports").await.unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.tools.len(), 1);
+        let registry: Arc<PluginToolsRegistry> = service.ai_tools.clone();
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        let spec = serde_json::from_value(spec).unwrap();
+        registry.bind(
+            InternalApiCaller::new_allowlisted(
+                service.proxy_router.read().await.clone(),
+                &spec,
+                vec![],
+            ),
+            PluginToolAccess::Read,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        let user = serde_json::from_value(serde_json::json!({"id":42,"name":"Reader","email":"reader@example.test","email_verified":true,"must_change_password":false,"mfa_enabled":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now()})).unwrap();
+        let scope = ApiCallScope {
+            auth: temps_auth::context::AuthContext::new_session(
+                user,
+                temps_auth::permissions::Role::Admin,
+            ),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        assert!(!handle.get().unwrap().search("plugin.reports", &scope)[0].enabled);
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id.clone(),
+                    installation_revision: settings.installation_revision.clone(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let result = handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .unwrap();
+        assert_eq!(result.body["user_id"], "42");
+        service.reload_plugins().await.unwrap();
+        assert!(service.plugin_ai_tools("reports").await.unwrap().enabled);
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id,
+                    installation_revision: settings.installation_revision,
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+        service.uninstall_plugin("reports").await.unwrap();
+        assert!(handle
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        service.shutdown_all().await;
     }
 }

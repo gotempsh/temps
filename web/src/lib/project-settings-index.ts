@@ -471,3 +471,20 @@ export function projectSettingUrl(entry: ProjectSettingEntry): string {
   const query = params.toString()
   return `${entry.page}${query ? `?${query}` : ''}#${entry.anchor}`
 }
+
+/** Per-installation settings join the command palette without a project prefix. */
+export function pluginAiToolSetting(name: string): ProjectSettingEntry {
+  return {
+    anchor: 'setting-plugin-ai-tools',
+    title: `${name}: AI chat tools`,
+    page: `/plugins/${encodeURIComponent(name)}`,
+    keywords: [
+      'plugin AI access',
+      'AI tools',
+      'chat tools',
+      'consent',
+      'allow AI',
+      name,
+    ],
+  }
+}

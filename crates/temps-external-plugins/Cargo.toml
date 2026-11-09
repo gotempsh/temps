@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
@@ -51,6 +52,7 @@ tempfile = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 temps-test-utils = { path = "../temps-test-utils" }
 tracing-subscriber = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }

@@ -4,6 +4,8 @@
 import type { ProblemDetails } from '@/api/client'
 
 type MfaChallengeProblem = ProblemDetails & {
+  // Compatibility with clients that represented extension members as a nested map.
+  extensions?: Record<string, unknown>
   error_code?: string
 }
 

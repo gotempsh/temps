@@ -288,7 +288,7 @@ impl ConversationService {
         let write_handle = self
             .write_support
             .as_ref()
-            .and_then(|ws| ws.write_handle.get());
+            .map(|ws| ws.write_handle.clone());
         let on_assistant = conv.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE;
 
         // The turn runs independently of the SSE reader (a browser refresh

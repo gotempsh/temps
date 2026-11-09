@@ -509,6 +509,7 @@ fn productive_results_are_distinguished_from_rejections() {
 
 fn inline_action(status: &str, error: Option<&str>) -> temps_entities::ai_pending_actions::Model {
     temps_entities::ai_pending_actions::Model {
+        plugin_revision: None,
         id: 1,
         public_id: "action-1".to_string(),
         conversation_id: 1,
@@ -6921,4 +6922,170 @@ fn prompt_composition_logging_accepts_empty_and_populated_prompts() {
         ],
         &managed_process_tools(),
     );
+}
+
+#[tokio::test]
+async fn plugin_write_waits_for_approval_then_executes_and_audits() {
+    use temps_ai_api_tools::{
+        InternalApiCaller, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry,
+    };
+    use temps_entities::ai_pending_actions;
+    #[derive(Default)]
+    struct Audit(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for Audit {
+        async fn create_audit_log(
+            &self,
+            op: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            self.0.lock().unwrap().push(op.serialize()?);
+            Ok(())
+        }
+    }
+    let audit = Arc::new(Audit::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let router = axum::Router::new().route(
+        "/x/reports/create",
+        axum::routing::post(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(serde_json::json!({"created":true})) }
+        }),
+    );
+    let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+    let registry = Arc::new(PluginToolsRegistry::default());
+    let handle = Arc::new(temps_ai_api_tools::WriteApiToolsHandle::new());
+    let target = handle.clone();
+    registry.bind(
+        InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+        PluginToolAccess::Write,
+        audit.clone(),
+        move |caller| target.set(caller),
+    );
+    registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+    let auth = test_auth();
+    let prepared = match handle.get().unwrap().prepare_write_cli(
+        "plugin.reports.create",
+        &temps_ai_api_tools::ApiCallScope {
+            auth: auth.clone(),
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        },
+    ) {
+        temps_ai_api_tools::WritePrepareOutcome::Prepared(prepared) => prepared,
+        _ => panic!("plugin operation should be preparable"),
+    };
+    let row = ai_pending_actions::Model {
+        plugin_revision: prepared.plugin_revision,
+        id: 1,
+        public_id: "plugin-approval".into(),
+        conversation_id: 1,
+        message_id: None,
+        project_id: None,
+        plan_public_id: None,
+        step_index: 0,
+        operation_id: "plugin.reports.create".into(),
+        method: "POST".into(),
+        summary: "Create report".into(),
+        params: serde_json::json!({}),
+        required_permission: None,
+        status: "awaiting_inline_approval".into(),
+        result: None,
+        error: None,
+        created_by: auth.user_id(),
+        confirmed_by: None,
+        created_at: chrono::Utc::now(),
+        confirmed_at: None,
+        executed_at: None,
+    };
+    let mut executed = row.clone();
+    executed.status = "executed".into();
+    executed.result = Some(serde_json::json!({"created":true}));
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![row.clone()], vec![row], vec![executed]])
+        .append_exec_results([sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
+        .into_connection();
+    let db = Arc::new(db);
+    let pending = PendingActionService::new(
+        db.clone(),
+        handle.clone(),
+        Arc::new(temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap()),
+    );
+    let call = ToolCall {
+        id: "plugin-write".into(),
+        name: "temps_write".into(),
+        arguments: r#"{"command":"plugin.reports.create"}"#.into(),
+    };
+    let caller = handle.get().unwrap();
+    let mut execution = ToolExecutionState::default();
+    let missing = dispatch_conversation_tool(
+        &call,
+        None,
+        1,
+        "assistant",
+        &auth,
+        None,
+        None,
+        None,
+        None,
+        Some(&caller),
+        Some(&pending),
+        None,
+        None,
+        &mut execution,
+    )
+    .await;
+    assert!(missing.contains("cannot request approval"), "{missing}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // A later turn with an approval channel has a fresh duplicate-call cache.
+    execution = ToolExecutionState::default();
+    let approval_calls = calls.clone();
+    let approval_audit = audit.clone();
+    let approval_auth = auth.clone();
+    let interactions: PlatformInteractionExecutor = Arc::new(move |request| {
+        assert_eq!(request.tool_name, "temps_write");
+        assert_eq!(request.input["operation"], "plugin.reports.create");
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 0);
+        assert!(approval_audit.0.lock().unwrap().is_empty());
+        let auth = approval_auth.clone();
+        Box::pin(async move {
+            Ok(PermissionResolution {
+                decision: PermissionDecision::AllowTool,
+                auth,
+                metadata: test_request_metadata(),
+            })
+        })
+    });
+    let result = dispatch_conversation_tool(
+        &call,
+        None,
+        1,
+        "assistant",
+        &auth,
+        None,
+        None,
+        None,
+        None,
+        Some(&caller),
+        Some(&pending),
+        None,
+        Some(&interactions),
+        &mut execution,
+    )
+    .await;
+    assert!(result.contains("executed"), "{result}");
+    drop(pending);
+    let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{result} {transactions:?}");
+    let events = audit.0.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(serde_json::from_str::<serde_json::Value>(&events[0]).unwrap()["succeeded"].is_null());
+    let event: serde_json::Value = serde_json::from_str(&events[1]).unwrap();
+    assert_eq!(event["plugin"], "reports");
+    assert_eq!(event["user_id"], auth.user_id());
+    assert_eq!(event["succeeded"], true);
 }

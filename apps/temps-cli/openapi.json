@@ -2819,6 +2819,25 @@
         },
         "type": "object"
       },
+      "AiToolInfo": {
+        "properties": {
+          "access": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "access"
+        ],
+        "type": "object"
+      },
       "AiWorkspaceFileLimitsSettings": {
         "description": "Runtime limits for workspace file transfer and browser previews.\n\nThe HTTP layer additionally enforces absolute ceilings so a malformed or\nlegacy settings row cannot turn a configurable limit into unbounded control\nplane memory use.",
         "properties": {
@@ -4254,6 +4273,14 @@
               "null"
             ]
           },
+          "expose_platform_identity": {
+            "default": null,
+            "description": "Opt in to platform identity in proxy responses. Missing values preserve the stored choice.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "external_url": {
             "default": null,
             "type": [
@@ -4632,6 +4659,10 @@
             "$ref": "#/components/schemas/MetricsStoreKind",
             "description": "Storage backend actually used for proxy logs, OTel spans, and OTel\nmetrics. OTel logs remain TimescaleDB-backed. Unlike resource metrics,\nthese domains switch to ClickHouse whenever the server-level ClickHouse\nconnection is configured; they do not use the monitoring store toggle."
           },
+          "expose_platform_identity": {
+            "description": "Opt in to proxy-added platform branding in public application responses.",
+            "type": "boolean"
+          },
           "external_url": {
             "type": [
               "string",
@@ -4785,6 +4816,7 @@
           "security_headers",
           "rate_limiting",
           "trust_loopback_forwarded_ip",
+          "expose_platform_identity",
           "docker_registry",
           "disk_space_alert",
           "container_logs",
@@ -50490,6 +50522,33 @@
         ],
         "type": "object"
       },
+      "PluginAiToolsResponse": {
+        "properties": {
+          "actor_id": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "installation_revision": {
+            "description": "Binary revision returned by GET; a changed binary requires fresh consent.",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/AiToolInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "actor_id",
+          "installation_revision",
+          "enabled",
+          "tools"
+        ],
+        "type": "object"
+      },
       "PluginGrantConfig": {
         "properties": {
           "ai_daily_call_limit": {
@@ -51201,6 +51260,9 @@
         "type": "object"
       },
       "ProblemDetails": {
+        "additionalProperties": {
+          "description": "Additional properties of the problem"
+        },
         "description": "Representation of a Problem error to return to the client.\nFollows RFC 7807 - Problem Details for HTTP APIs",
         "example": {
           "additional_info": "Custom field with additional details",
@@ -51217,11 +51279,6 @@
               "string",
               "null"
             ]
-          },
-          "extensions": {
-            "additionalProperties": true,
-            "description": "Additional properties of the problem",
-            "type": "object"
           },
           "instance": {
             "description": "A URI reference that identifies the specific occurrence of the problem",
@@ -51255,8 +51312,7 @@
           }
         },
         "required": [
-          "title",
-          "extensions"
+          "title"
         ],
         "type": "object"
       },
@@ -75414,6 +75470,27 @@
         },
         "required": [
           "permission_mode"
+        ],
+        "type": "object"
+      },
+      "UpdatePluginAiTools": {
+        "properties": {
+          "actor_id": {
+            "description": "Current actor_id returned by GET; replacing the installation requires fresh consent.",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "installation_revision": {
+            "description": "Binary revision returned by GET; a changed binary requires fresh consent.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actor_id",
+          "installation_revision",
+          "enabled"
         ],
         "type": "object"
       },
@@ -169676,6 +169753,114 @@
         "summary": "Trigger weekly digest generation manually",
         "tags": [
           "Notification Preferences"
+        ]
+      }
+    },
+    "/x/plugins/{name}/ai-tools": {
+      "get": {
+        "operationId": "get_plugin_ai_tools",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAiToolsResponse"
+                }
+              }
+            }
+          },
+          "401": {},
+          "403": {},
+          "404": {},
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      },
+      "put": {
+        "operationId": "put_plugin_ai_tools",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePluginAiTools"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginAiToolsResponse"
+                }
+              }
+            }
+          },
+          "400": {},
+          "401": {},
+          "403": {},
+          "404": {},
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Plugin actor replaced; reload current actor_id before choosing consent again"
+          },
+          "413": {},
+          "415": {},
+          "422": {},
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recent sensitive-action verification required"
+          },
+          "500": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
         ]
       }
     },
