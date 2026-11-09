@@ -207,7 +207,22 @@ export function resolverHealthMeta(health: ResolverHealth): HealthMeta {
 }
 
 /**
- * A worker's internal edge proxy, which serves the HTTP behind its
+ * Served, but through the agent's fallback on port 80 because the port-80
+ * redirect to the internal proxy is missing (ADR-098): the agent holds port
+ * 80 of the bridge address, and `redirect_error` says why.
+ */
+export function redirectMissing(
+  proxy: InternalProxyState | null | undefined
+): boolean {
+  return (
+    proxy?.listening === true &&
+    proxy.mode === 'direct' &&
+    proxy.redirect === 'missing'
+  )
+}
+
+/**
+ * A worker's internal routing, which serves the HTTP behind its
  * `*.temps.local` names. The control plane has none (`null`): its main
  * proxy does this.
  */
@@ -215,10 +230,13 @@ export function internalProxyMeta(
   proxy: InternalProxyState | null | undefined
 ): { label: string; tone: StatusTone } | null {
   if (!proxy) return null
-  if (proxy.listening === true) return { label: 'Listening', tone: 'ok' }
-  if (proxy.listening === false)
-    return { label: 'Not listening', tone: 'error' }
-  return { label: 'Not reported', tone: 'idle' }
+  if (proxy.listening === false) return { label: 'Down', tone: 'error' }
+  if (proxy.listening !== true) return { label: 'Not reported', tone: 'idle' }
+  if (redirectMissing(proxy))
+    return { label: 'Direct on port 80', tone: 'warn' }
+  if (proxy.mode === 'redirect') return { label: 'Redirected', tone: 'ok' }
+  // An agent older than ADR-098, or one that cannot redirect (not Linux).
+  return { label: 'Listening', tone: 'ok' }
 }
 
 /** Down or degraded resolvers, worst first, for the page's verdict. */
@@ -251,6 +269,17 @@ export function resolverVerdict(
     return {
       tone: 'warn',
       label: `${degraded} ${degraded === 1 ? 'resolver needs' : 'resolvers need'} attention`,
+    }
+  // Served, but the agent holds port 80 of the bridge address.
+  const direct = resolvers.filter(
+    (r) =>
+      redirectMissing(r.internal_proxy) &&
+      (r.node_status === 'active' || r.node_status === 'draining')
+  ).length
+  if (direct > 0)
+    return {
+      tone: 'warn',
+      label: `Port-80 redirect missing on ${direct} ${direct === 1 ? 'node' : 'nodes'}`,
     }
   return { tone: 'ok', label: 'All resolvers healthy' }
 }

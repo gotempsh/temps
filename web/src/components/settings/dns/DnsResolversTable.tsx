@@ -7,6 +7,7 @@ import { Link } from 'react-router'
 import {
   formatAge,
   internalProxyMeta,
+  redirectMissing,
   resolverHealthMeta,
   type DnsResolverEntry,
 } from '@/lib/dns-observability'
@@ -39,6 +40,13 @@ function NodeCell({ resolver }: { resolver: DnsResolverEntry }) {
           Internal routing down on{' '}
           {resolver.internal_proxy.address ?? 'its bridge address'}:{' '}
           {resolver.internal_proxy.error ?? 'no error reported'}
+        </p>
+      ) : null}
+      {redirectMissing(resolver.internal_proxy) ? (
+        <p className="text-xs text-amber-700 dark:text-amber-400 [overflow-wrap:anywhere]">
+          Serving port 80 directly, so this worker holds port 80 of its bridge
+          address:{' '}
+          {resolver.internal_proxy?.redirect_error ?? 'no reason reported'}
         </p>
       ) : null}
       {/* What the hidden columns say, for a narrow table. */}
@@ -80,6 +88,10 @@ const columns: DataTableColumn<DnsResolverEntry>[] = [
           {resolver.internal_proxy?.address ? (
             <span className="block font-mono text-xs text-muted-foreground">
               {resolver.internal_proxy.address}
+              {resolver.internal_proxy.mode === 'redirect' &&
+              resolver.internal_proxy.proxy_address
+                ? ` → ${resolver.internal_proxy.proxy_address}`
+                : ''}
             </span>
           ) : null}
         </span>

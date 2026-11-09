@@ -8,6 +8,7 @@ import {
   formatLatencyUs,
   formatPercent,
   internalProxyMeta,
+  redirectMissing,
   outcomeLabel,
   outcomeTone,
   recordOwner,
@@ -162,14 +163,79 @@ describe('internal routing', () => {
     ).toEqual({ tone: 'ok', label: 'All resolvers healthy' })
   })
 
-  test('labels: listening, not listening, not reported, main proxy', () => {
+  test('labels: redirected, direct, listening, down, not reported, main proxy', () => {
+    expect(
+      internalProxyMeta({
+        listening: true,
+        mode: 'redirect',
+        redirect: 'installed',
+        proxy_address: '10.205.0.1:591',
+      })
+    ).toEqual({ label: 'Redirected', tone: 'ok' })
+    expect(
+      internalProxyMeta({
+        listening: true,
+        mode: 'direct',
+        redirect: 'missing',
+        redirect_error: 'nft (nftables) is not installed on this worker',
+      })
+    ).toEqual({ label: 'Direct on port 80', tone: 'warn' })
+    // Not Linux: direct is all there is, nothing to fix.
+    expect(
+      internalProxyMeta({
+        listening: true,
+        mode: 'direct',
+        redirect: 'unsupported',
+      })
+    ).toEqual({ label: 'Listening', tone: 'ok' })
+    // An agent from before ADR-098.
     expect(internalProxyMeta({ listening: true })).toEqual({
       label: 'Listening',
       tone: 'ok',
     })
-    expect(internalProxyMeta({ listening: false })?.tone).toBe('error')
+    expect(internalProxyMeta({ listening: false })).toEqual({
+      label: 'Down',
+      tone: 'error',
+    })
     expect(internalProxyMeta({})?.label).toBe('Not reported')
     expect(internalProxyMeta(null)).toBeNull()
+  })
+
+  test('a missing redirect warns but does not fail the verdict', () => {
+    const fallback = {
+      listening: true,
+      mode: 'direct' as const,
+      redirect: 'missing' as const,
+      redirect_error: 'nft (nftables) is not installed on this worker',
+    }
+    expect(redirectMissing(fallback)).toBe(true)
+    expect(redirectMissing({ ...fallback, redirect: 'unsupported' })).toBe(
+      false
+    )
+    expect(redirectMissing({ ...fallback, listening: false })).toBe(false)
+    expect(
+      resolverVerdict(
+        [
+          resolver({}),
+          resolver({
+            node_id: 4,
+            is_control_plane: false,
+            internal_proxy: fallback,
+          }),
+        ],
+        true
+      )
+    ).toEqual({ tone: 'warn', label: 'Port-80 redirect missing on 1 node' })
+    // A node that is down wins over the warning.
+    expect(
+      resolverVerdict(
+        [
+          resolver({ node_id: 4, internal_proxy: fallback }),
+          resolver({ node_id: 5, internal_proxy: { listening: false } }),
+        ],
+        true
+      ).tone
+    ).toBe('error')
   })
 })
 
