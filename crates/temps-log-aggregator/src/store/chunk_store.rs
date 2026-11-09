@@ -419,7 +419,8 @@ fn count_head_lines(
         if filter.level_mask & level_bit(line.level) == 0 {
             continue;
         }
-        if !filter.text_matches(&line.msg, &mut scratch) || !filter.attrs_match(line.fields.as_ref())
+        if !filter.text_matches(&line.msg, &mut scratch)
+            || !filter.attrs_match(line.fields.as_ref())
         {
             continue;
         }
@@ -1135,7 +1136,14 @@ impl LogLineStore for ChunkStore {
             let Some(snapshot) = self.heads.snapshot(&labels.container_id).await else {
                 continue;
             };
-            count_head_lines(&snapshot, &labels, &filter, bucket_secs, group_by, &mut counts);
+            count_head_lines(
+                &snapshot,
+                &labels,
+                &filter,
+                bucket_secs,
+                group_by,
+                &mut counts,
+            );
         }
         Ok(counts
             .into_iter()
@@ -1892,7 +1900,14 @@ mod tests {
 
         let mut counts = BTreeMap::new();
         let filter = LineFilter::compile(&q);
-        count_head_lines(&snap, &labels, &filter, 60, Some(FacetField::Level), &mut counts);
+        count_head_lines(
+            &snap,
+            &labels,
+            &filter,
+            60,
+            Some(FacetField::Level),
+            &mut counts,
+        );
         let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
         // Epoch-aligned minutes, lowercase level names, the out-of-window
         // line dropped.
@@ -1906,7 +1921,14 @@ mod tests {
 
         q.text = Some("cart".into());
         let mut counts = BTreeMap::new();
-        count_head_lines(&snap, &labels, &LineFilter::compile(&q), 3600, None, &mut counts);
+        count_head_lines(
+            &snap,
+            &labels,
+            &LineFilter::compile(&q),
+            3600,
+            None,
+            &mut counts,
+        );
         assert_eq!(
             counts.into_iter().collect::<Vec<_>>(),
             vec![((at("2026-01-01T00:00:00Z"), None), 2)]
