@@ -3,9 +3,11 @@
 
 pub mod authority;
 pub mod broker;
+pub mod coordinator;
 pub mod delivery;
 pub mod error;
 pub mod handlers;
+pub mod planner;
 mod plugin;
 pub mod service;
 pub mod tokenless;

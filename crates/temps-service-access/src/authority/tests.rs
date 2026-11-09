@@ -268,7 +268,10 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
 async fn invalid_credential_and_duplicate_incarnation_fail_before_version_reservation() {
     let (identity, _) = identity();
     let store = empty_store();
-    for value in ["", "line\nbreak", "white space", &"a".repeat(8193)] {
+    let mut maximum = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
+    *maximum.credentials.values_mut().next().unwrap() = SecretString::new("a".repeat(16384));
+    super::issue::validate_bindings(identity.boot_id, &[maximum], Utc::now()).unwrap();
+    for value in ["", "line\nbreak", "white space", &"a".repeat(16385)] {
         let mut binding = input(Uuid::new_v4(), Uuid::new_v4(), &["https://api.example.com"]);
         *binding.credentials.values_mut().next().unwrap() = SecretString::new(value);
         assert!(store

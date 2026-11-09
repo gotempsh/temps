@@ -50,6 +50,33 @@ async fn receipt_and_retry_database_errors_include_the_failed_operation() {
 }
 
 #[tokio::test]
+async fn retirement_cannot_be_superseded_or_treated_as_a_live_lease() {
+    let mut row = claimed_row();
+    row.operation = DeliveryOperation::Retire;
+    let claim = DeliveryClaim {
+        claim_id: row.claim_id.unwrap(),
+        command: row,
+    };
+    let queue = DeliveryQueue::new(Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+    ));
+    assert!(matches!(
+        queue.supersede(&claim).await,
+        Err(DeliveryError::Invalid { .. })
+    ));
+    assert!(matches!(
+        queue
+            .complete_applied(
+                &claim,
+                1,
+                chrono::Utc::now() + chrono::Duration::seconds(10)
+            )
+            .await,
+        Err(DeliveryError::Invalid { .. })
+    ));
+}
+
+#[tokio::test]
 async fn rejects_invalid_batches_and_preserves_database_failure_context() {
     let queue = DeliveryQueue::new(Arc::new(
         MockDatabase::new(DatabaseBackend::Postgres)

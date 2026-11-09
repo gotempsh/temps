@@ -43,6 +43,7 @@ struct IssuedBinding {
 pub struct IssuedPolicy {
     authority: WorkerAuthority,
     snapshot_version: u64,
+    lease_expires_at: chrono::DateTime<chrono::Utc>,
     policy: PolicyEnvelope,
     bindings: Vec<IssuedBinding>,
 }
@@ -58,6 +59,10 @@ impl std::fmt::Debug for IssuedPolicy {
 impl IssuedPolicy {
     pub fn snapshot_version(&self) -> u64 {
         self.snapshot_version
+    }
+    /// Absolute signed lease deadline; receipt latency cannot extend it.
+    pub fn lease_expires_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.lease_expires_at
     }
     pub fn delivery(&self, incarnation: Uuid) -> Result<SessionDelivery, AuthorityError> {
         let binding = self
@@ -220,6 +225,8 @@ impl AuthorityStore {
         Ok(IssuedPolicy {
             authority,
             snapshot_version,
+            lease_expires_at: body.issued_at
+                + chrono::Duration::seconds(i64::from(body.lease_secs)),
             policy: snapshot.into(),
             bindings: issued,
         })
@@ -263,13 +270,13 @@ pub(super) fn validate_bindings(
             })?;
             let value = credential.expose();
             if value.is_empty()
-                || value.len() > 8192
+                || value.len() > 16384
                 || !value.bytes().all(|b| (33..=126).contains(&b))
             {
                 return Err(invalid(
                     boot_id,
                     "validate credential",
-                    "bearer credential must be 1 to 8192 printable non-space ASCII bytes",
+                    "bearer credential must be 1 to 16384 printable non-space ASCII bytes",
                 ));
             }
         }

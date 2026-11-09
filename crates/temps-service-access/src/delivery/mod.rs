@@ -119,6 +119,42 @@ impl DeliveryQueue {
     /// Call only after the assigned worker confirms installation or a cut; an
     /// RPC delivery/queue acknowledgement is not sufficient.
     pub async fn complete(&self, claim: &DeliveryClaim) -> Result<(), DeliveryError> {
+        self.complete_receipt(claim, None, None).await
+    }
+
+    /// Records the signed lease deadline only after the transport has verified
+    /// an exact binding/snapshot ACK. Never derive this from the receive time.
+    pub async fn complete_applied(
+        &self,
+        claim: &DeliveryClaim,
+        expected_revision: i64,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), DeliveryError> {
+        let now = chrono::Utc::now();
+        if claim.command.operation != DeliveryOperation::Reconcile
+            || expected_revision < 0
+            || lease_expires_at <= now
+            || lease_expires_at
+                > now
+                    + chrono::Duration::seconds(i64::from(
+                        temps_service_access_runtime::MAX_POLICY_LEASE_SECONDS,
+                    ))
+        {
+            return Err(DeliveryError::Invalid {
+                operation: "record applied lease",
+                reason: "a reconcile receipt requires a current signed lease of at most 30 seconds",
+            });
+        }
+        self.complete_receipt(claim, Some(lease_expires_at), Some(expected_revision))
+            .await
+    }
+
+    async fn complete_receipt(
+        &self,
+        claim: &DeliveryClaim,
+        lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        expected_revision: Option<i64>,
+    ) -> Result<(), DeliveryError> {
         let command = &claim.command;
         let txn = self
             .db
@@ -144,15 +180,66 @@ impl DeliveryQueue {
                 command_id: command.id,
             });
         }
-        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE sandbox_access_runtimes SET applied_version=$2,updated_at=now() WHERE id=$1 AND desired_version=$2 AND node_id IS NOT DISTINCT FROM $3 AND (($4 AND closed_at IS NOT NULL) OR (NOT $4 AND closed_at IS NULL))",
-            [command.runtime_id.into(),command.desired_version.into(),command.node_id.into(),(command.operation==DeliveryOperation::Retire).into()])).await
+        let applied = txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE sandbox_access_runtimes SET applied_version=$2,lease_expires_at=$5,updated_at=now() WHERE id=$1 AND desired_version=$2 AND node_id IS NOT DISTINCT FROM $3 AND (($4 AND closed_at IS NOT NULL) OR (NOT $4 AND closed_at IS NULL)) AND ($6::bigint IS NULL OR ($5>clock_timestamp() AND EXISTS (SELECT 1 FROM sandbox_access_authorities a WHERE a.id=sandbox_access_runtimes.authority_id AND a.closed_at IS NULL AND a.desired_revision=$6)))",
+            [command.runtime_id.into(),command.desired_version.into(),command.node_id.into(),(command.operation==DeliveryOperation::Retire).into(),lease_expires_at.into(),expected_revision.into()])).await
             .map_err(|e| database("record applied version", command.runtime_id, e))?;
+        if expected_revision.is_some() && applied.rows_affected() != 1 {
+            return Err(DeliveryError::RuntimeChanged {
+                runtime_id: command.runtime_id,
+                version: command.desired_version,
+            });
+        }
         txn.commit()
             .await
             .map_err(|e| database("commit receipt", command.id, e))?;
         tracing::debug!(command_id=command.id,runtime_id=%command.runtime_id,version=command.desired_version,"Sandbox service access enforcement receipt recorded");
         Ok(())
+    }
+
+    /// An obsolete reconcile needs no delivery. This NEVER records enforcement
+    /// or skips a retirement: its exact old target must still be cut on worker.
+    pub async fn supersede(&self, claim: &DeliveryClaim) -> Result<(), DeliveryError> {
+        if claim.command.operation != DeliveryOperation::Reconcile {
+            return Err(DeliveryError::Invalid {
+                operation: "supersede command",
+                reason: "retirement requires a worker cut receipt",
+            });
+        }
+        let command = &claim.command;
+        let tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| database("begin supersession", command.id, e))?;
+        let row = tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "SELECT desired_version,closed_at FROM sandbox_access_runtimes WHERE id=$1 FOR UPDATE", [command.runtime_id.into()]))
+            .await.map_err(|e| database("lock superseded runtime", command.runtime_id, e))?;
+        if let Some(row) = row {
+            let version: i64 = row
+                .try_get("", "desired_version")
+                .map_err(|e| database("read superseded version", command.runtime_id, e))?;
+            let closed: Option<chrono::DateTime<chrono::Utc>> = row
+                .try_get("", "closed_at")
+                .map_err(|e| database("read superseded state", command.runtime_id, e))?;
+            if version <= command.desired_version && closed.is_none() {
+                return Err(DeliveryError::RuntimeChanged {
+                    runtime_id: command.runtime_id,
+                    version: command.desired_version,
+                });
+            }
+        }
+        let changed = tx.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE sandbox_access_delivery SET completed_at=now(),claim_id=NULL,claimed_until=NULL WHERE id=$1 AND claim_id=$2 AND completed_at IS NULL AND claimed_until>clock_timestamp()",
+            [command.id.into(),claim.claim_id.into()])).await.map_err(|e| database("supersede command", command.id, e))?;
+        if changed.rows_affected() != 1 {
+            return Err(DeliveryError::StaleClaim {
+                command_id: command.id,
+            });
+        }
+        tx.commit()
+            .await
+            .map_err(|e| database("commit supersession", command.id, e))
     }
 
     /// Schedule a transient delivery failure with exponential backoff, capped
