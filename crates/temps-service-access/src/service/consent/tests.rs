@@ -27,7 +27,7 @@ fn observation(worker: &WorkerControl, incarnation: Uuid) -> HostObservation {
         incarnation,
         node_id: None,
         container_id: "immutable-container".into(),
-        container_name: "temps-sandbox-sbx_consent".into(),
+        container_name: "temps-sandbox-consent".into(),
         backend: "docker".into(),
     }
 }

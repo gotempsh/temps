@@ -262,7 +262,7 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
                     incarnation,
                     node_id: None,
                     container_id: "immutable-planner-container".into(),
-                    container_name: "temps-sandbox-sbx_planner".into(),
+                    container_name: "temps-sandbox-planner".into(),
                     backend: "docker".into(),
                 },
             )

@@ -69,7 +69,10 @@ impl PolicyPlanner {
             WHERE r.authority_id=$1 AND r.closed_at IS NULL
               AND r.node_id IS NOT DISTINCT FROM $2
               AND b.node_id IS NOT DISTINCT FROM r.node_id AND b.status='running'
-              AND b.backend=r.provider_backend AND r.provider_name='temps-sandbox-' || b.public_id
+              AND b.backend=r.provider_backend AND r.provider_name='temps-sandbox-' ||
+                  CASE WHEN b.agent_run_id IS NOT NULL THEN b.agent_run_id::text
+                       WHEN left(b.public_id,4)='sbx_' THEN substring(b.public_id FROM 5)
+                       ELSE b.public_id END
               AND NOT p.is_deleted AND p.deleted_at IS NULL AND u.deleted_at IS NULL
               AND (b.user_id=a.approved_by OR EXISTS(
                   SELECT 1 FROM user_roles ur JOIN roles role ON role.id=ur.role_id

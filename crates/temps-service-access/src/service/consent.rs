@@ -123,7 +123,11 @@ impl ServiceAccessService {
         if sandbox.status != "running"
             || sandbox.node_id != observed.node_id
             || sandbox.backend.as_deref() != Some(observed.backend.as_str())
-            || observed.container_name != format!("temps-sandbox-{}", sandbox.public_id)
+            || observed.container_name
+                != format!(
+                    "temps-sandbox-{}",
+                    crate::transport::sandbox_label(&sandbox)
+                )
         {
             return Err(invalid(
                 "sandbox_id",

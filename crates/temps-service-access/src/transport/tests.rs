@@ -49,7 +49,12 @@ impl SandboxProvider for Provider {
         name: &str,
     ) -> Result<Option<SandboxHandle>, AgentError> {
         self.recoveries.lock().unwrap().push((node_id, name.into()));
-        Ok(self.handle.lock().unwrap().clone())
+        Ok(self
+            .handle
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|handle| handle.sandbox_name == format!("temps-sandbox-{name}")))
     }
     async fn create(&self, _: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         panic!("unexpected create")
@@ -147,7 +152,7 @@ fn target() -> StoredTarget {
         Some(7),
         Some(Uuid::new_v4()),
         Some("original-container"),
-        Some("temps-sandbox-sbx_test"),
+        Some("temps-sandbox-test"),
         Some("docker"),
     )
     .unwrap()
@@ -187,6 +192,22 @@ fn delivery(target: &StoredTarget) -> SessionDelivery {
     }
 }
 #[tokio::test]
+async fn inspection_uses_the_agent_run_label_instead_of_the_public_id() {
+    let mut target = target();
+    target.handle.sandbox_name = "temps-sandbox-123".into();
+    let provider = provider(&target);
+    let transport = WorkerTransport::new(provider.clone());
+    let mut sandbox = sandbox();
+    sandbox.agent_run_id = Some(123);
+    let observed = transport.inspect(&sandbox).await.unwrap();
+    assert_eq!(observed.container_name, "temps-sandbox-123");
+    assert_eq!(
+        provider.recoveries.lock().unwrap().as_slice(),
+        &[(Some(7), "123".into())]
+    );
+}
+
+#[tokio::test]
 async fn inspection_preserves_owner_and_checks_recovered_identity() {
     let target = target();
     let provider = provider(&target);
@@ -196,7 +217,7 @@ async fn inspection_preserves_owner_and_checks_recovered_identity() {
     assert_eq!(observed.node_id, Some(7));
     assert_eq!(
         provider.recoveries.lock().unwrap().as_slice(),
-        &[(Some(7), "temps-sandbox-sbx_test".into())]
+        &[(Some(7), "test".into())]
     );
     for handle in [
         None,

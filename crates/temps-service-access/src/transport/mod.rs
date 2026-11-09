@@ -130,6 +130,22 @@ impl StoredTarget {
 fn valid_text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
+
+/// Provider recovery accepts a label, and adds its own `temps-sandbox-`
+/// prefix. Standalone labels omit `sbx_`; agent-run labels retain the run ID.
+/// Matches the sandbox registry and its agent-run lifecycle.
+pub(crate) fn sandbox_label(sandbox: &sandboxes::Model) -> String {
+    sandbox.agent_run_id.map_or_else(
+        || {
+            sandbox
+                .public_id
+                .strip_prefix("sbx_")
+                .unwrap_or(&sandbox.public_id)
+                .into()
+        },
+        |id| id.to_string(),
+    )
+}
 fn parse_backend(value: Option<&str>) -> Option<SandboxBackend> {
     match value {
         Some("docker") => Some(SandboxBackend::Docker),
@@ -202,11 +218,12 @@ impl WorkerTransport {
                 "sandbox must be running with a valid owner and identity",
             ));
         }
-        let name = format!("temps-sandbox-{id}");
+        let label = sandbox_label(sandbox);
+        let name = format!("temps-sandbox-{label}");
         self.bounded(id, "inspect", 10, async {
             let handle = self
                 .provider
-                .recover_by_name_on(sandbox.node_id, &name)
+                .recover_by_name_on(sandbox.node_id, &label)
                 .await
                 .map_err(|source| Self::provider_error(id, "recover owner", source))?
                 .ok_or_else(|| {

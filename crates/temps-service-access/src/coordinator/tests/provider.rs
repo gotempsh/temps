@@ -33,7 +33,7 @@ impl Provider {
         SandboxHandle {
             node_id: None,
             sandbox_id: "fixture-container".into(),
-            sandbox_name: "temps-sandbox-sbx_dispatch".into(),
+            sandbox_name: "temps-sandbox-dispatch".into(),
             work_dir: "/workspace".into(),
             backend: SandboxBackend::Docker,
             image: String::new(),
@@ -127,7 +127,7 @@ impl SandboxProvider for Provider {
         name: &str,
     ) -> Result<Option<SandboxHandle>, AgentError> {
         assert_eq!(node, None);
-        assert_eq!(name, self.handle().sandbox_name);
+        assert_eq!(format!("temps-sandbox-{name}"), self.handle().sandbox_name);
         Ok(Some(self.handle()))
     }
     async fn create(&self, _: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
