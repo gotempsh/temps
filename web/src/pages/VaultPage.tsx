@@ -318,6 +318,7 @@ function VaultCollection() {
                   {...form.register('name')}
                   {...props}
                   placeholder="Development"
+                  disabled={create.isPending}
                   autoFocus
                 />
               )}
