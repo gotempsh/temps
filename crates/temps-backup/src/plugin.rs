@@ -321,6 +321,9 @@ impl TempsPlugin for BackupPlugin {
                     db: db.clone(),
                     encryption_service: encryption_service.clone(),
                     config_service: config_service.clone(),
+                    // Without Docker the dump runs from this server's
+                    // PostgreSQL client instead (ADR-100).
+                    docker: docker_handle.cloned().map(|docker| docker.as_ref().clone()),
                 })))
                 // ADR-055 Phase 9: databases on worker nodes, backed up by a
                 // job on their node through the workload plane. Needs no
@@ -416,13 +419,16 @@ impl TempsPlugin for BackupPlugin {
                 executor_builder = executor_builder
                     .with_unavailable_engines(DOCKER_BACKED_ENGINES, reason.clone());
 
+                // control_plane needs Docker or a local PostgreSQL client;
+                // say which this server has rather than that it needs
+                // neither.
+                let control_plane = crate::engines::control_plane::no_docker_summary().await;
                 warn!(
                     engines = %DOCKER_BACKED_ENGINES.join(", "),
-                    "BackupExecutor: registered only the engines that need no local Docker \
-                     (control_plane, and the worker engines postgres_workload_job, worker_agent \
-                     and postgres_walg for worker services) — {}. Backups requesting one of these \
-                     engines fail immediately with that reason",
-                    reason,
+                    "BackupExecutor: no local Docker. {control_plane}. The worker engines \
+                     postgres_workload_job, worker_agent and postgres_walg (for worker services) \
+                     need no local Docker. The other engines are unavailable — {reason}. Backups \
+                     requesting one of them fail immediately with that reason",
                 );
             }
 

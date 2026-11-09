@@ -13,6 +13,12 @@
 //!    out through the Docker archive API into an attempt-scoped host dir
 //!    under `<data_dir>/backups/tmp` (see `dump_capture`); the sidecar is
 //!    removed on every path.
+//!
+//!    On a server without Docker (a microVM control plane) the same two
+//!    commands run from this server's PostgreSQL client instead, streamed
+//!    into the same `.sql.gz` (see `local_pg_dump`, ADR-100). A missing or
+//!    too-old client fails the backup before anything else, naming the
+//!    version to install.
 //! 3. Upload the resulting `.sql.gz` to S3 (single-part or multipart).
 //! 4. Write a `metadata.json` companion object.
 //!
@@ -42,6 +48,7 @@ use sea_orm::DatabaseConnection;
 use tracing::{info, warn};
 
 use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
+use super::local_pg_dump::{self, LocalDumpArgs, LocalPgClient};
 use super::oneshot::OneShotSpec;
 use super::v2_common;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
@@ -102,6 +109,17 @@ pub struct ControlPlaneDeps {
     pub db: Arc<DatabaseConnection>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     pub config_service: Arc<temps_config::ConfigService>,
+    /// This server's Docker daemon, for the dump sidecar. `None` on a server
+    /// without one: the dump then runs from the local PostgreSQL client.
+    pub docker: Option<bollard::Docker>,
+}
+
+/// How this attempt takes the dump.
+enum DumpRoute {
+    /// The `postgres:<major>` sidecar, through this server's Docker.
+    Sidecar(bollard::Docker),
+    /// This server's own `pg_dump` and `pg_dumpall` (no Docker here).
+    Local(LocalPgClient),
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -130,6 +148,22 @@ impl BackupEngine for ControlPlaneEngine {
 
         // ── Params + S3 client ───────────────────────────────────────────────
         let s3_source_id = v2_common::require_i32_param(&ctx.params, "s3_source_id")?;
+
+        // Match the running server's major so the dump tools are
+        // version-compatible, and settle how the dump runs before any other
+        // work: without Docker and without a usable client nothing below can
+        // succeed, so say so now.
+        let pg_tag = detect_postgres_version(&deps).await;
+        let major = pg_tag.trim_start_matches("pg");
+        let server_major: u32 = major.parse().unwrap_or(DEFAULT_PG_MAJOR);
+        let route = match &deps.docker {
+            Some(docker) => DumpRoute::Sidecar(docker.clone()),
+            None => DumpRoute::Local(local_pg_dump::require_client(
+                local_pg_dump::probe().await,
+                server_major,
+                backup_id,
+            )?),
+        };
         let (s3_source, s3_client) = v2_common::load_and_build_s3_client(
             deps.db.as_ref(),
             &deps.encryption_service,
@@ -154,11 +188,7 @@ impl BackupEngine for ControlPlaneEngine {
         let target =
             ControlPlaneTarget::from_database_url(&deps.config_service.get_database_url())?;
 
-        // Match the running server's major so pg_dumpall is version-compatible.
-        let pg_tag = detect_postgres_version(&deps).await;
-        let major = pg_tag.trim_start_matches("pg");
         let image_tag = format!("postgres:{}", major);
-        super::image_pull::ensure_image_pulled_v2(&image_tag, ENGINE_KEY).await?;
 
         // ── Attempt-scoped working dir + container command ───────────────────
         //
@@ -181,29 +211,56 @@ impl BackupEngine for ControlPlaneEngine {
             patterns = excluded.patterns.len(),
             "ControlPlaneEngine: dumping schema-only for high-volume tables",
         );
-        let spec =
-            control_plane_dump_spec(&attempt, backup_id, &image_tag, &target, &excluded.patterns);
-
-        let docker =
-            bollard::Docker::connect_with_local_defaults().map_err(|e| BackupError::Failed {
-                reason: format!("failed to connect to Docker: {}", e),
-            })?;
-
-        let file_size = capture_dump(
-            &docker,
-            CaptureRequest {
-                tool: CONTROL_PLANE_TOOL,
-                spec,
-                container_path: attempt.container_path(SIDECAR_DUMP_GZ),
-                host_path: host_dump_path.clone(),
-                failure_log: Some((
-                    attempt.container_path(SIDECAR_STDERR),
-                    attempt.host_path(SIDECAR_STDERR),
-                )),
-            },
-            &ctx.cancel,
-        )
-        .await?;
+        let file_size = match route {
+            DumpRoute::Sidecar(docker) => {
+                super::image_pull::ensure_image_pulled_v2(&image_tag, ENGINE_KEY).await?;
+                let spec = control_plane_dump_spec(
+                    &attempt,
+                    backup_id,
+                    &image_tag,
+                    &target,
+                    &excluded.patterns,
+                );
+                capture_dump(
+                    &docker,
+                    CaptureRequest {
+                        tool: CONTROL_PLANE_TOOL,
+                        spec,
+                        container_path: attempt.container_path(SIDECAR_DUMP_GZ),
+                        host_path: host_dump_path.clone(),
+                        failure_log: Some((
+                            attempt.container_path(SIDECAR_STDERR),
+                            attempt.host_path(SIDECAR_STDERR),
+                        )),
+                    },
+                    &ctx.cancel,
+                )
+                .await?
+            }
+            DumpRoute::Local(client) => {
+                info!(
+                    backup_id,
+                    client_major = client.major,
+                    server_major,
+                    "ControlPlaneEngine: no Docker here, dumping with the local PostgreSQL client",
+                );
+                local_pg_dump::dump_to_gzip(
+                    &client,
+                    &LocalDumpArgs {
+                        host: &target.host,
+                        port: target.port,
+                        username: &target.username,
+                        database: &target.database,
+                        password: &target.password,
+                        exclude_patterns: &excluded.patterns,
+                    },
+                    &host_dump_path,
+                    backup_id,
+                    &ctx.cancel,
+                )
+                .await?
+            }
+        };
         let file_size = i64::try_from(file_size).map_err(|_| BackupError::Failed {
             reason: format!(
                 "control-plane dump for backup {backup_id} is larger than i64::MAX bytes"
@@ -279,6 +336,12 @@ impl BackupEngine for ControlPlaneEngine {
             compression: "gzip".to_string(),
         })
     }
+}
+
+/// What control-plane backups will do on a server without Docker, for the
+/// startup log: probes this server's PostgreSQL client once.
+pub(crate) async fn no_docker_summary() -> String {
+    local_pg_dump::no_docker_summary(&local_pg_dump::probe().await)
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
@@ -495,6 +558,9 @@ pub async fn resolve_excluded_data(db: &DatabaseConnection) -> Result<ExcludedDa
 
     Ok(ExcludedData { tables, patterns })
 }
+
+/// Major version assumed when the server's cannot be read.
+const DEFAULT_PG_MAJOR: u32 = 18;
 
 /// Detect the PostgreSQL major version via `current_setting('server_version')`.
 /// Falls back to `"pg18"` if detection fails — pg_dumpall is

@@ -32,6 +32,7 @@ pub mod control_plane;
 pub mod dispatch;
 pub mod dump_capture;
 pub mod image_pull;
+mod local_pg_dump;
 pub mod mariadb_dump;
 pub mod mariadb_exec;
 pub mod mariadb_physical;
