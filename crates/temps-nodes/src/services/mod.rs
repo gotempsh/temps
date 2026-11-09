@@ -5,6 +5,7 @@ pub mod cluster_dns;
 pub mod cluster_network;
 pub mod compose_placement;
 pub mod edge_routes;
+pub mod internal_access_check;
 pub mod node_health;
 pub mod node_pairing;
 pub mod node_pairing_admin;
