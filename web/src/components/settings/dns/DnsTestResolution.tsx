@@ -3,8 +3,17 @@
 
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { Button, Callout, Status } from '@temps-sdk/ds'
+import { Button, Callout, Status, useUrlState } from '@temps-sdk/ds'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@temps-sdk/ui'
 import { Search } from 'lucide-react'
+import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import {
   Form,
@@ -25,11 +34,16 @@ import {
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { problemDetail } from '@/lib/api-problem'
 import {
+  DNS_PARAMS,
   DNS_TEST_RECORD_TYPES,
+  nodeDnsHealth,
   outcomeLabel,
+  outcomeMeaning,
   outcomeTone,
   testDnsResolution,
   testResolutionSchema,
+  testValuesFromUrl,
+  type DnsParam,
   type DnsResolveResponse,
   type DnsResolverEntry,
   type TestResolutionValues,
@@ -37,55 +51,104 @@ import {
 
 function ResolveResult({ result }: { result: DnsResolveResponse }) {
   return (
-    <div className="space-y-3 rounded-md border p-3" aria-live="polite">
-      <div className="flex flex-wrap items-center gap-2">
+    <section
+      aria-label="Result"
+      aria-live="polite"
+      className="space-y-3 rounded-md border p-4"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <Status
           tone={outcomeTone(result.outcome)}
-          label={outcomeLabel(result.outcome)}
+          label={outcomeMeaning(result.outcome, result.record_type)}
         />
+        <span className="font-mono text-xs text-muted-foreground">
+          {result.rcode || outcomeLabel(result.outcome)}
+        </span>
         <span className="text-sm text-muted-foreground tabular-nums">
           {result.latency_ms.toFixed(1)} ms
-          {result.authoritative ? ' · authoritative' : ''}
+          {result.authoritative ? ' · answered from the internal zone' : ''}
           {result.asked_as ? ` · asked as ${result.asked_as}` : ''}
         </span>
       </div>
       {result.answers.length > 0 ? (
-        <ul className="space-y-1 font-mono text-xs">
-          {result.answers.map((answer, index) => (
-            <li
-              key={`${answer.name}-${answer.record_type}-${index}`}
-              className="[overflow-wrap:anywhere]"
-            >
-              {answer.name} {answer.ttl} {answer.record_type}{' '}
-              <span className="font-semibold">{answer.data}</span>
-            </li>
-          ))}
-        </ul>
+        <div className="@container rounded-md border">
+          <Table aria-label="Answers">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead className="w-0">Type</TableHead>
+                <TableHead>Answer</TableHead>
+                <TableHead className="hidden w-0 @md:table-cell">TTL</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {result.answers.map((answer, index) => (
+                <TableRow key={`${answer.name}-${answer.record_type}-${index}`}>
+                  <TableCell className="font-mono text-xs [overflow-wrap:anywhere]">
+                    {answer.name}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {answer.record_type}
+                  </TableCell>
+                  <TableCell className="font-mono text-xs font-semibold [overflow-wrap:anywhere]">
+                    {answer.data}
+                  </TableCell>
+                  <TableCell className="hidden font-mono text-xs text-muted-foreground tabular-nums @md:table-cell">
+                    {answer.ttl}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
       ) : (
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-muted-foreground [overflow-wrap:anywhere]">
           No {result.record_type} records for {result.name}
         </p>
       )}
       {result.note ? <Callout tone="info">{result.note}</Callout> : null}
-    </div>
+    </section>
   )
 }
 
-/** Ask one node's resolver a name, optionally as a project's container would. */
+/** The option label for a node, saying when it cannot answer. */
+function nodeOptionLabel(resolver: DnsResolverEntry): string {
+  const health = nodeDnsHealth(resolver, true)
+  if (health.note)
+    return `${resolver.node_name} (${health.label.toLowerCase()})`
+  if (health.lookups.tone === 'error')
+    return `${resolver.node_name} (lookups down)`
+  return resolver.node_name
+}
+
+/**
+ * Every field is a flex column: a select's hidden native `<select>` would
+ * take a `space-y` margin, and a block label sits on a taller line box,
+ * either of which puts one label out of line with its neighbours.
+ */
+const FIELD_ITEM = 'flex flex-col gap-2 space-y-0'
+
+/**
+ * Ask one node's resolver a name, optionally as a project's container
+ * would. The fields come from the URL, so a record's Test link opens this
+ * prefilled, and a lookup that ran is a link that runs it again.
+ */
 export function DnsTestResolution({
   resolvers,
 }: {
   resolvers: DnsResolverEntry[]
 }) {
+  const { get, patch } = useUrlState<DnsParam>()
+  const fromUrl = testValuesFromUrl(get, resolvers)
+  const urlKey = JSON.stringify(fromUrl)
   const form = useForm<TestResolutionValues>({
     resolver: zodResolver(testResolutionSchema),
-    defaultValues: {
-      node_id: resolvers[0]?.node_id ?? 0,
-      name: '',
-      record_type: 'A',
-      project_id: null,
-    },
+    defaultValues: fromUrl,
   })
+  // Back/forward, or another tab's Test link, changes the URL under us.
+  useEffect(() => {
+    form.reset(JSON.parse(urlKey) as TestResolutionValues)
+  }, [urlKey, form])
   const resolve = useMutation({
     mutationFn: (values: TestResolutionValues) =>
       testDnsResolution({
@@ -95,19 +158,29 @@ export function DnsTestResolution({
         project_id: values.project_id ?? undefined,
       }),
   })
+  const onSubmit = (values: TestResolutionValues) => {
+    patch({
+      [DNS_PARAMS.testName]: values.name.trim(),
+      [DNS_PARAMS.testType]:
+        values.record_type === 'A' ? undefined : values.record_type,
+      [DNS_PARAMS.testNode]: values.node_id,
+      [DNS_PARAMS.testProject]: values.project_id ?? undefined,
+    })
+    resolve.mutate(values)
+  }
 
   return (
     <div className="space-y-4">
       <Form {...form}>
         <form
-          onSubmit={form.handleSubmit((values) => resolve.mutate(values))}
+          onSubmit={form.handleSubmit(onSubmit)}
           className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr_1fr_auto] lg:items-end"
         >
           <FormField
             control={form.control}
             name="name"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className={FIELD_ITEM}>
                 <FormLabel>Name</FormLabel>
                 <FormControl>
                   <Input
@@ -125,7 +198,7 @@ export function DnsTestResolution({
             control={form.control}
             name="record_type"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className={FIELD_ITEM}>
                 <FormLabel>Type</FormLabel>
                 <Select value={field.value} onValueChange={field.onChange}>
                   <FormControl>
@@ -149,7 +222,7 @@ export function DnsTestResolution({
             control={form.control}
             name="node_id"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className={FIELD_ITEM}>
                 <FormLabel>From node</FormLabel>
                 <Select
                   value={String(field.value)}
@@ -166,7 +239,7 @@ export function DnsTestResolution({
                         key={resolver.node_id}
                         value={String(resolver.node_id)}
                       >
-                        {resolver.node_name}
+                        {nodeOptionLabel(resolver)}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -179,7 +252,7 @@ export function DnsTestResolution({
             control={form.control}
             name="project_id"
             render={({ field }) => (
-              <FormItem>
+              <FormItem className={FIELD_ITEM}>
                 <FormLabel>As project</FormLabel>
                 <ProjectSelect
                   ariaLabel="As project"

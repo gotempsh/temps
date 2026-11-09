@@ -7,13 +7,20 @@ import {
   formatAge,
   formatLatencyUs,
   formatPercent,
-  internalProxyMeta,
+  defaultResolverNode,
+  dnsSummary,
+  nodeDnsHealth,
   outcomeLabel,
+  outcomeMeaning,
   outcomeTone,
   recordOwner,
   recordTarget,
-  resolverHealthMeta,
-  resolverVerdict,
+  parseDnsTab,
+  parseIntParam,
+  parsePageSize,
+  recordTestParams,
+  testValuesFromUrl,
+  withParams,
   trafficPoints,
   trafficTotals,
   type DnsRecordEntry,
@@ -64,112 +71,283 @@ function record(overrides: Partial<DnsRecordEntry>): DnsRecordEntry {
   }
 }
 
-describe('resolverVerdict', () => {
-  test('says Cluster DNS is off before judging resolvers', () => {
-    expect(resolverVerdict([resolver({ health: 'down' })], false)).toEqual({
-      tone: 'idle',
-      label: 'Cluster DNS is off',
+/**
+ * A worker whose resolver answers but whose internal routing proxy cannot
+ * bind its address: the case that showed a green "Healthy" beside a red
+ * error. Test data only; the reason is whatever the agent reported.
+ */
+const master = resolver({
+  node_id: 4,
+  node_name: 'master',
+  is_control_plane: false,
+  listen_address: '10.205.0.1:53',
+  internal_proxy: {
+    listening: false,
+    address: '10.205.0.1:80',
+    error: 'another program already listens on 10.205.0.1:80',
+  },
+})
+
+/** A hosted control plane: no containers run on it, so no resolver. */
+const hostedControlPlane = resolver({
+  health: 'no_local_resolver',
+  health_reason:
+    'The control plane runs no resolver of its own: no containers run on it, so none was started.',
+})
+
+describe('nodeDnsHealth', () => {
+  test('working lookups and down routing make one "Not working" health', () => {
+    const health = nodeDnsHealth(master, true)
+    expect(health.tone).toBe('error')
+    expect(health.label).toBe('Not working')
+    expect(health.lookups).toMatchObject({ tone: 'ok', label: 'Working' })
+    expect(health.routing).toMatchObject({ tone: 'error', label: 'Down' })
+    // The reason is the agent's own text, never advice the page made up.
+    expect(health.problem).toMatchObject({
+      area: 'routing',
+      reason: 'another program already listens on 10.205.0.1:80',
     })
+    expect(health.problem?.why).toContain('10.205.0.1:80')
+    expect(health.note).toBeNull()
   })
 
-  test('a down resolver outranks a degraded one', () => {
-    const verdict = resolverVerdict(
-      [
-        resolver({ health: 'stale' }),
-        resolver({ node_id: 2, health: 'down' }),
-        resolver({ node_id: 3, health: 'down' }),
-      ],
+  test('a control plane that runs no apps is calm, never a warning', () => {
+    const health = nodeDnsHealth(hostedControlPlane, true)
+    expect(health.tone).toBe('idle')
+    expect(health.label).toBe('Not needed')
+    expect(health.note).toBe('This control plane runs no apps')
+    expect(health.noteWhy).toContain('no containers run on it')
+    expect(health.problem).toBeNull()
+  })
+
+  test('lookups down outrank routing down, and lead', () => {
+    const health = nodeDnsHealth(
+      resolver({
+        ...master,
+        health: 'down',
+        health_reason: 'The resolver is not running',
+      }),
       true
     )
-    expect(verdict).toEqual({ tone: 'error', label: '2 resolvers down' })
+    expect(health.tone).toBe('error')
+    expect(health.problem).toMatchObject({
+      area: 'lookups',
+      reason: 'The resolver is not running',
+    })
   })
 
   test('stale, too old and silent resolvers need attention', () => {
-    expect(
-      resolverVerdict(
-        [resolver({ health: 'stale' }), resolver({ health: 'not_reporting' })],
-        true
-      )
-    ).toEqual({ tone: 'warn', label: '2 resolvers need attention' })
-    expect(
-      resolverVerdict([resolver({ health: 'agent_too_old' })], true)
-    ).toEqual({ tone: 'warn', label: '1 resolver needs attention' })
+    for (const health of ['stale', 'agent_too_old', 'not_reporting'] as const)
+      expect(nodeDnsHealth(resolver({ health }), true)).toMatchObject({
+        tone: 'warn',
+        label: 'Needs attention',
+      })
   })
 
-  test('a control plane that runs no resolver is not a problem', () => {
-    // A hosted plane: no containers run on the control plane.
-    const controlPlane = resolver({
-      node_id: 0,
-      is_control_plane: true,
-      health: 'no_local_resolver',
-    })
-    expect(resolverHealthMeta('no_local_resolver')).toEqual({
-      label: 'No local resolver',
+  test('the control plane routes with its main proxy', () => {
+    const health = nodeDnsHealth(resolver({}), true)
+    expect(health).toMatchObject({ tone: 'ok', label: 'Working' })
+    expect(health.routing).toBeNull()
+  })
+
+  test('an unreported proxy is unknown, not down', () => {
+    const health = nodeDnsHealth(
+      resolver({ node_id: 5, is_control_plane: false, internal_proxy: {} }),
+      true
+    )
+    expect(health.tone).toBe('ok')
+    expect(health.routing).toMatchObject({
       tone: 'idle',
+      label: 'Not reported',
     })
-    expect(
-      resolverVerdict([controlPlane, resolver({ node_id: 1 })], true)
-    ).toEqual({ tone: 'ok', label: 'All resolvers healthy' })
   })
 
-  test('off and unavailable nodes do not make the cluster unhealthy', () => {
+  test('off and unavailable nodes are a note, not a problem', () => {
+    expect(nodeDnsHealth(master, false)).toMatchObject({
+      tone: 'idle',
+      label: 'Off',
+      problem: null,
+    })
     expect(
-      resolverVerdict(
-        [resolver({}), resolver({ node_id: 4, health: 'node_unavailable' })],
+      nodeDnsHealth(
+        resolver({
+          ...master,
+          node_status: 'offline',
+          health: 'node_unavailable',
+          health_reason: 'The node is offline',
+        }),
         true
       )
-    ).toEqual({ tone: 'ok', label: 'All resolvers healthy' })
+    ).toMatchObject({
+      tone: 'idle',
+      label: 'Unavailable',
+      note: 'The node is offline',
+      problem: null,
+    })
   })
 })
 
-describe('internal routing', () => {
-  test('a worker whose proxy cannot listen fails the verdict', () => {
-    const verdict = resolverVerdict(
-      [
-        resolver({}),
-        resolver({
-          node_id: 4,
-          is_control_plane: false,
-          internal_proxy: {
-            listening: false,
-            address: '10.205.0.1:80',
-            error: 'another program already listens on 10.205.0.1:80',
-          },
-        }),
-      ],
-      true
-    )
-    expect(verdict).toEqual({
-      tone: 'error',
-      label: 'Internal routing down on 1 node',
+describe('dnsSummary', () => {
+  test('says Cluster DNS is off before judging nodes', () => {
+    expect(dnsSummary([resolver({ health: 'down' })], false)).toMatchObject({
+      tone: 'idle',
+      label: 'Cluster DNS is off',
+      affected: [],
     })
   })
 
-  test('an offline node or an unreported proxy does not', () => {
+  test('routing down on master: the badge names it and points at the row', () => {
+    const summary = dnsSummary([hostedControlPlane, master], true)
+    expect(summary.tone).toBe('error')
+    expect(summary.label).toBe('Internal routing down on 1 node')
+    expect(summary.detail).toContain('master')
+    expect(summary.affected.map((node) => node.nodeId)).toEqual([4])
+    // The hosted control plane is not among the problems.
+    expect(summary.nodes[0].label).toBe('Not needed')
+  })
+
+  test('lookups down, and both kinds at once', () => {
+    const down = resolver({ node_id: 2, health: 'down' })
     expect(
-      resolverVerdict(
+      dnsSummary([down, resolver({ node_id: 3, health: 'down' })], true)
+    ).toMatchObject({ label: 'Name lookups down on 2 nodes' })
+    expect(dnsSummary([down, master], true)).toMatchObject({
+      label: 'Internal DNS not working on 2 nodes',
+    })
+  })
+
+  test('degraded nodes need attention', () => {
+    expect(
+      dnsSummary(
         [
-          resolver({
-            node_id: 4,
-            node_status: 'offline',
-            health: 'node_unavailable',
-            internal_proxy: { listening: false },
-          }),
-          resolver({ node_id: 5, internal_proxy: {} }),
+          resolver({ health: 'stale' }),
+          resolver({ node_id: 2, health: 'not_reporting' }),
         ],
         true
       )
-    ).toEqual({ tone: 'ok', label: 'All resolvers healthy' })
+    ).toMatchObject({ tone: 'warn', label: '2 nodes need attention' })
   })
 
-  test('labels: listening, not listening, not reported, main proxy', () => {
-    expect(internalProxyMeta({ listening: true })).toEqual({
-      label: 'Listening',
-      tone: 'ok',
+  test('a hosted control plane and healthy workers are working everywhere', () => {
+    expect(
+      dnsSummary(
+        [hostedControlPlane, resolver({ node_id: 1, is_control_plane: false })],
+        true
+      )
+    ).toMatchObject({ tone: 'ok', label: 'Working on all nodes' })
+  })
+
+  test('a hosted control plane with no workers yet is not an alarm', () => {
+    expect(dnsSummary([hostedControlPlane], true)).toMatchObject({
+      tone: 'idle',
+      label: 'No node runs apps yet',
     })
-    expect(internalProxyMeta({ listening: false })?.tone).toBe('error')
-    expect(internalProxyMeta({})?.label).toBe('Not reported')
-    expect(internalProxyMeta(null)).toBeNull()
+  })
+
+  test('an unavailable node is counted, not alarmed', () => {
+    expect(
+      dnsSummary(
+        [resolver({}), resolver({ node_id: 4, health: 'node_unavailable' })],
+        true
+      )
+    ).toMatchObject({ tone: 'ok', label: 'Working on 1 of 2 nodes' })
+  })
+})
+
+describe('tabs and links', () => {
+  test('the tab comes from ?tab=, Overview by default', () => {
+    expect(parseDnsTab(null)).toBe('overview')
+    expect(parseDnsTab('records')).toBe('records')
+    expect(parseDnsTab('queries')).toBe('queries')
+    expect(parseDnsTab('test')).toBe('test')
+    expect(parseDnsTab('traffic')).toBe('overview')
+  })
+
+  test('withParams keeps other params and deletes undefined ones', () => {
+    const current = new URLSearchParams('tab=records&rq=shop&node=4')
+    expect(withParams(current, { tab: undefined, node: 7 })).toBe(
+      '?rq=shop&node=7'
+    )
+    expect(withParams(new URLSearchParams(), { tab: undefined })).toBe('?')
+  })
+
+  test('page sizes and numbers from the URL fall back safely', () => {
+    expect(parsePageSize('50')).toBe(50)
+    expect(parsePageSize('37')).toBe(20)
+    expect(parsePageSize(null)).toBe(20)
+    expect(parseIntParam('7')).toBe(7)
+    expect(parseIntParam('x')).toBeUndefined()
+    expect(parseIntParam('')).toBeUndefined()
+  })
+
+  test('a record is tested from the node that serves it', () => {
+    const resolvers = [hostedControlPlane, master]
+    expect(
+      recordTestParams(
+        record({ fqdn: 'primary.pg-orders.temps.local', node_id: 4 }),
+        resolvers
+      )
+    ).toEqual({ name: 'primary.pg-orders.temps.local', type: 'A', from: 4 })
+  })
+
+  test('a control-plane record on a hosted plane is tested from a worker', () => {
+    // The control plane runs no resolver, so asking it would only fail.
+    expect(
+      recordTestParams(record({ record_type: 'SRV' }), [
+        hostedControlPlane,
+        master,
+      ])
+    ).toEqual({ name: 'production.shop.temps.local', type: 'SRV', from: 4 })
+  })
+
+  test('a record type the test cannot ask falls back to A', () => {
+    expect(
+      recordTestParams(record({ record_type: 'PTR' }), [resolver({})]).type
+    ).toBe('A')
+  })
+
+  test('the Test form reads its fields from the URL', () => {
+    const params = new URLSearchParams(
+      'name=production.shop.temps.local&type=AAAA&from=4&project=3'
+    )
+    const get = (key: string) => params.get(key)
+    expect(testValuesFromUrl(get, [hostedControlPlane, master])).toEqual({
+      name: 'production.shop.temps.local',
+      record_type: 'AAAA',
+      node_id: 4,
+      project_id: 3,
+    })
+    // Nothing in the URL: an empty name, A, the first node that answers.
+    expect(testValuesFromUrl(() => null, [hostedControlPlane, master])).toEqual(
+      { name: '', record_type: 'A', node_id: 4, project_id: null }
+    )
+    // An unknown node or type is not trusted.
+    params.set('from', '99')
+    params.set('type', 'MX')
+    expect(testValuesFromUrl(get, [resolver({})])).toMatchObject({
+      record_type: 'A',
+      node_id: 0,
+    })
+  })
+
+  test('the default node skips resolvers that cannot answer', () => {
+    expect(defaultResolverNode([hostedControlPlane, master])).toBe(4)
+    expect(defaultResolverNode([resolver({}), master], 4)).toBe(4)
+    expect(defaultResolverNode([resolver({}), master], 99)).toBe(0)
+    expect(defaultResolverNode([hostedControlPlane])).toBe(0)
+  })
+})
+
+describe('outcomeMeaning', () => {
+  test('says what an answer means in plain words', () => {
+    expect(outcomeMeaning('noerror', 'A')).toBe('Found')
+    expect(outcomeMeaning('nxdomain', 'A')).toBe('No such name')
+    expect(outcomeMeaning('nodata', 'AAAA')).toBe(
+      'The name exists, but has no AAAA record'
+    )
+    expect(outcomeMeaning('servfail', 'A')).toBe(
+      'The resolver failed to answer'
+    )
   })
 })
 

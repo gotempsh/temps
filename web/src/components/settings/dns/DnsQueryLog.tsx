@@ -6,9 +6,12 @@ import {
   DataTable,
   PageState,
   Status,
+  useUrlSearchText,
+  useUrlState,
   type DataTableColumn,
 } from '@temps-sdk/ds'
 import {
+  Button,
   Input,
   Select,
   SelectContent,
@@ -18,18 +21,25 @@ import {
 } from '@temps-sdk/ui'
 import { format } from 'date-fns'
 import { ScrollText } from 'lucide-react'
-import { useState } from 'react'
+import { Link } from 'react-router'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { useDebounce } from '@/hooks/useDebounce'
 import {
   askedBy,
   DNS_OUTCOMES,
+  DNS_PAGE_SIZES,
+  DNS_PARAMS,
+  DNS_ZONES,
   dnsKeys,
   formatLatencyUs,
   getDnsQueries,
   outcomeLabel,
+  parseIntParam,
+  parsePageSize,
+  withParams,
   outcomeTone,
   type DnsOutcome,
+  type DnsParam,
   type DnsQueriesParams,
   type DnsQueryLogEntry,
   type DnsResolverEntry,
@@ -38,7 +48,6 @@ import {
 import { isForbiddenRead } from '@/lib/read-failure'
 
 const ALL = 'all'
-const PAGE_SIZE_OPTIONS = [20, 50, 100] as const
 
 function NameCell({ entry }: { entry: DnsQueryLogEntry }) {
   const who = askedBy(entry)
@@ -76,7 +85,7 @@ const columns: DataTableColumn<DnsQueryLogEntry>[] = [
   },
   {
     key: 'outcome',
-    header: 'Outcome',
+    header: 'Result',
     render: (entry) => (
       <Status
         variant="dot"
@@ -120,20 +129,48 @@ const columns: DataTableColumn<DnsQueryLogEntry>[] = [
   },
 ]
 
-/** Recent queries, newest first, filterable by node, outcome, zone and name. */
-export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
-  const [params, setParams] = useState<DnsQueriesParams>({
-    page: 1,
-    page_size: 20,
+function parseOutcome(value: string | null): DnsOutcome | undefined {
+  return (DNS_OUTCOMES as readonly string[]).includes(value ?? '')
+    ? (value as DnsOutcome)
+    : undefined
+}
+
+function parseZone(value: string | null): DnsZone | undefined {
+  return (DNS_ZONES as readonly string[]).includes(value ?? '')
+    ? (value as DnsZone)
+    : undefined
+}
+
+/**
+ * Recent queries, newest first, filterable by node, result, zone and name.
+ * The filters live in the URL, so "NXDOMAIN on worker-a" is a link.
+ */
+export function DnsQueryLog({
+  resolvers,
+  enabled,
+}: {
+  resolvers: DnsResolverEntry[]
+  enabled: boolean
+}) {
+  const urlState = useUrlState<DnsParam>()
+  const { get, patch, params: search } = urlState
+  const [name, setName] = useUrlSearchText(DNS_PARAMS.queryName, {
+    resetKeys: [DNS_PARAMS.queryPage],
+    urlState,
   })
-  const [name, setName] = useState('')
   const debouncedName = useDebounce(name.trim(), 300)
-  const update = (patch: Partial<DnsQueriesParams>) =>
-    setParams((current) => ({ ...current, page: 1, ...patch }))
+  const page = Math.max(1, parseIntParam(get(DNS_PARAMS.queryPage)) ?? 1)
+  const pageSize = parsePageSize(get(DNS_PARAMS.queryPageSize))
   const request: DnsQueriesParams = {
-    ...params,
+    page,
+    page_size: pageSize,
+    node_id: parseIntParam(get(DNS_PARAMS.queryNode)),
+    outcome: parseOutcome(get(DNS_PARAMS.queryOutcome)),
+    zone: parseZone(get(DNS_PARAMS.queryZone)),
     name: debouncedName || undefined,
   }
+  const update = (values: Partial<Record<DnsParam, string | number>>) =>
+    patch({ [DNS_PARAMS.queryPage]: undefined, ...values })
 
   const query = useQuery({
     queryKey: dnsKeys.queries(request),
@@ -145,10 +182,19 @@ export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
 
   const total = query.data?.total ?? 0
   const filtered =
-    params.node_id !== undefined ||
-    params.outcome !== undefined ||
-    params.zone !== undefined ||
+    request.node_id !== undefined ||
+    request.outcome !== undefined ||
+    request.zone !== undefined ||
     Boolean(request.name)
+  const clearFilters = () => {
+    setName('')
+    patch({
+      [DNS_PARAMS.queryNode]: undefined,
+      [DNS_PARAMS.queryOutcome]: undefined,
+      [DNS_PARAMS.queryZone]: undefined,
+      [DNS_PARAMS.queryPage]: undefined,
+    })
+  }
 
   return (
     <div className="space-y-4">
@@ -158,15 +204,14 @@ export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
           placeholder="Name contains…"
           className="w-full sm:w-[240px]"
           value={name}
-          onChange={(event) => {
-            setName(event.target.value)
-            setParams((current) => ({ ...current, page: 1 }))
-          }}
+          onChange={(event) => setName(event.target.value)}
         />
         <Select
-          value={params.node_id === undefined ? ALL : String(params.node_id)}
+          value={request.node_id === undefined ? ALL : String(request.node_id)}
           onValueChange={(value) =>
-            update({ node_id: value === ALL ? undefined : Number(value) })
+            update({
+              [DNS_PARAMS.queryNode]: value === ALL ? undefined : value,
+            })
           }
         >
           <SelectTrigger className="w-full sm:w-[200px]" aria-label="Node">
@@ -185,18 +230,18 @@ export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
           </SelectContent>
         </Select>
         <Select
-          value={params.outcome ?? ALL}
+          value={request.outcome ?? ALL}
           onValueChange={(value) =>
             update({
-              outcome: value === ALL ? undefined : (value as DnsOutcome),
+              [DNS_PARAMS.queryOutcome]: value === ALL ? undefined : value,
             })
           }
         >
-          <SelectTrigger className="w-full sm:w-[180px]" aria-label="Outcome">
+          <SelectTrigger className="w-full sm:w-[180px]" aria-label="Result">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value={ALL}>All outcomes</SelectItem>
+            <SelectItem value={ALL}>All results</SelectItem>
             {DNS_OUTCOMES.map((outcome) => (
               <SelectItem key={outcome} value={outcome}>
                 {outcomeLabel(outcome)}
@@ -205,9 +250,11 @@ export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
           </SelectContent>
         </Select>
         <Select
-          value={params.zone ?? ALL}
+          value={request.zone ?? ALL}
           onValueChange={(value) =>
-            update({ zone: value === ALL ? undefined : (value as DnsZone) })
+            update({
+              [DNS_PARAMS.queryZone]: value === ALL ? undefined : value,
+            })
           }
         >
           <SelectTrigger className="w-full sm:w-[200px]" aria-label="Zone">
@@ -238,11 +285,32 @@ export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
           variant="empty"
           size="compact"
           icon={ScrollText}
-          title={filtered ? 'No queries match these filters' : 'No queries yet'}
+          title={
+            filtered
+              ? 'No queries match these filters'
+              : enabled
+                ? 'No queries yet'
+                : 'Cluster DNS is off'
+          }
           description={
             filtered
               ? undefined
-              : `Queries for *.temps.local names, and failed forwarded queries, appear here and are kept for ${query.data?.retention_hours ?? 24} hours.`
+              : enabled
+                ? `Queries for *.temps.local names, and failed forwarded queries, appear here and are kept for ${query.data?.retention_hours ?? 24} hours.`
+                : 'Turn on cluster DNS in Overview, and the queries apps make for *.temps.local names appear here.'
+          }
+          action={
+            filtered ? (
+              <Button size="sm" variant="outline" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            ) : enabled ? undefined : (
+              <Button asChild size="sm" variant="outline">
+                <Link to={withParams(search, { tab: undefined })}>
+                  Go to Overview
+                </Link>
+              </Button>
+            )
           }
         />
       ) : (
@@ -253,14 +321,17 @@ export function DnsQueryLog({ resolvers }: { resolvers: DnsResolverEntry[] }) {
           rowKey={(entry) => entry.id}
           isLoading={query.isPending}
           pagination={{
-            page: params.page,
-            pageSize: params.page_size,
+            page,
+            pageSize,
             total,
-            totalPages: Math.max(1, Math.ceil(total / params.page_size)),
-            onPageChange: (page) =>
-              setParams((current) => ({ ...current, page })),
-            onPageSizeChange: (pageSize) => update({ page_size: pageSize }),
-            pageSizeOptions: PAGE_SIZE_OPTIONS,
+            totalPages: Math.max(1, Math.ceil(total / pageSize)),
+            onPageChange: (next) =>
+              patch({ [DNS_PARAMS.queryPage]: next === 1 ? undefined : next }),
+            onPageSizeChange: (next) =>
+              update({
+                [DNS_PARAMS.queryPageSize]: next === 20 ? undefined : next,
+              }),
+            pageSizeOptions: DNS_PAGE_SIZES,
             ariaLabel: 'DNS query log pages',
           }}
         />

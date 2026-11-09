@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useQuery, keepPreviousData } from '@tanstack/react-query'
-import { TimeChart, type TimeChartSeries } from '@temps-sdk/ds'
+import { TimeChart, useUrlState, type TimeChartSeries } from '@temps-sdk/ds'
 import {
   Select,
   SelectContent,
@@ -14,12 +14,16 @@ import {
 import { seriesLineColor } from '@/components/charts/chart-colors'
 import { ReadFailure } from '@/components/ui/read-failure'
 import {
+  DNS_PARAMS,
   DNS_TRAFFIC_RANGES,
+  defaultResolverNode,
   dnsKeys,
   formatPercent,
   getDnsTraffic,
+  parseIntParam,
   trafficPoints,
   trafficTotals,
+  type DnsParam,
   type DnsResolverEntry,
   type DnsTrafficRange,
 } from '@/lib/dns-observability'
@@ -73,27 +77,36 @@ function Legend({ series }: { series: TimeChartSeries[] }) {
   )
 }
 
+function parseRange(value: string | null): DnsTrafficRange {
+  return (DNS_TRAFFIC_RANGES as readonly string[]).includes(value ?? '')
+    ? (value as DnsTrafficRange)
+    : '1h'
+}
+
 /**
  * Counters over time for one resolver: internal queries by outcome, and
  * the NXDOMAIN rate on its own chart (a rate and a count never share an
- * axis).
+ * axis). The node and range live in the URL (`tnode`, `trange`); with no
+ * node chosen it charts the first resolver that runs.
  */
-export function DnsTraffic({
-  resolvers,
-  nodeId,
-  range,
-  onNodeChange,
-  onRangeChange,
-}: {
-  resolvers: DnsResolverEntry[]
-  nodeId: number
-  range: DnsTrafficRange
-  onNodeChange: (nodeId: number) => void
-  onRangeChange: (range: DnsTrafficRange) => void
-}) {
+export function DnsTraffic({ resolvers }: { resolvers: DnsResolverEntry[] }) {
+  const { get, patch } = useUrlState<DnsParam>()
+  const chosen = parseIntParam(get(DNS_PARAMS.trafficNode))
+  // An explicitly chosen node is kept even when its resolver cannot answer:
+  // its empty chart is what the user asked to see.
+  const node =
+    chosen !== undefined && resolvers.some((r) => r.node_id === chosen)
+      ? chosen
+      : defaultResolverNode(resolvers)
+  const range = parseRange(get(DNS_PARAMS.trafficRange))
+  const onNodeChange = (value: number) =>
+    patch({ [DNS_PARAMS.trafficNode]: value })
+  const onRangeChange = (value: DnsTrafficRange) =>
+    patch({ [DNS_PARAMS.trafficRange]: value === '1h' ? undefined : value })
+
   const query = useQuery({
-    queryKey: dnsKeys.traffic(nodeId, range),
-    queryFn: () => getDnsTraffic(nodeId, range),
+    queryKey: dnsKeys.traffic(node, range),
+    queryFn: () => getDnsTraffic(node, range),
     placeholderData: keepPreviousData,
     refetchInterval: 30_000,
     meta: { errorTitle: 'Could not load the DNS traffic' },
@@ -107,7 +120,7 @@ export function DnsTraffic({
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
         <Select
-          value={String(nodeId)}
+          value={String(node)}
           onValueChange={(value) => onNodeChange(Number(value))}
         >
           <SelectTrigger className="w-full sm:w-[220px]" aria-label="Node">
