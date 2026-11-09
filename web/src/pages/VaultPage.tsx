@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
@@ -46,6 +46,13 @@ export default function VaultPage() {
   return <VaultCollection key={projectId ?? 'projects'} />
 }
 function VaultCollection() {
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
   const { projectId: rawId } = useParams()
   const projectId = Number(rawId)
   const valid =
@@ -127,6 +134,7 @@ function VaultCollection() {
     },
     onSuccess: ({ data }) => {
       void client.invalidateQueries({ queryKey: [{ _id: 'listAccessVaults' }] })
+      if (!mounted.current) return
       setOpen(false)
       form.reset()
       toast.success('Vault created')

@@ -3,6 +3,7 @@
 
 //! Bounded authorization reads for one worker. Saved intentions never become
 //! live policy: only fresh consent tied to the current incarnation is eligible.
+mod credentials;
 mod permissions;
 mod read;
 
@@ -15,7 +16,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use sea_orm::{DatabaseConnection, FromQueryResult};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -190,8 +191,9 @@ impl PolicyPlanner {
             })?;
         let allowed = self.recheck(boot_id, &candidates).await?;
         let now = Utc::now();
-        let mut grouped: BTreeMap<Uuid, Vec<Candidate>> = BTreeMap::new();
-        for candidate in candidates {
+        let mut grouped: BTreeMap<Uuid, Vec<(Candidate, SandboxAccessPolicy)>> = BTreeMap::new();
+        let mut github_connections = BTreeSet::new();
+        for mut candidate in candidates {
             let permissions = allowed.get(&(candidate.approved_by, candidate.project_id));
             let needs_git = candidate
                 .policy
@@ -200,14 +202,24 @@ impl PolicyPlanner {
             if (candidate.admin || permissions.is_some_and(|git| !needs_git || *git))
                 && candidate.expires_at > now + chrono::Duration::seconds(1)
             {
+                let policy: SandboxAccessPolicy = serde_json::from_value(std::mem::take(
+                    &mut candidate.policy,
+                ))
+                .map_err(|source| PlanError::Policy {
+                    boot_id,
+                    service_id: candidate.service_id.clone(),
+                    source,
+                })?;
+                if let Some(source) = &policy.github_repository {
+                    github_connections.insert(source.connection_id);
+                }
                 grouped
                     .entry(candidate.runtime_id)
                     .or_default()
-                    .push(candidate);
+                    .push((candidate, policy));
             }
         }
-        let mut resolved_github = BTreeMap::<i32, Option<SecretString>>::new();
-        let credential_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let resolved_github = self.resolve_github(boot_id, github_connections).await;
         let mut bindings = Vec::new();
         let mut retire = Vec::new();
         for runtime in runtimes {
@@ -233,29 +245,8 @@ impl PolicyPlanner {
                 })?;
             let mut requests = Vec::with_capacity(grants.len());
             let mut credentials = BTreeMap::new();
-            for grant in grants {
-                let policy: SandboxAccessPolicy =
-                    serde_json::from_value(grant.policy).map_err(|source| PlanError::Policy {
-                        boot_id,
-                        service_id: grant.service_id.clone(),
-                        source,
-                    })?;
+            for (grant, policy) in grants {
                 let credential = if let Some(source) = &policy.github_repository {
-                    if let std::collections::btree_map::Entry::Vacant(entry) =
-                        resolved_github.entry(source.connection_id)
-                    {
-                        let credential = tokio::time::timeout_at(
-                            credential_deadline,
-                            self.github.resolve(source.connection_id),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok);
-                        if credential.is_none() {
-                            tracing::warn!(%boot_id, connection_id=source.connection_id, "GitHub credential unavailable; omitting affected grants from this lease");
-                        }
-                        entry.insert(credential);
-                    }
                     let Some(credential) = resolved_github
                         .get(&source.connection_id)
                         .and_then(Option::as_ref)

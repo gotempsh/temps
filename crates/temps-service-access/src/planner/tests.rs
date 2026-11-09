@@ -5,6 +5,8 @@ use super::*;
 use sea_orm::{ConnectionTrait, DatabaseBackend, MockDatabase};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod credential_isolation;
+
 fn encryption() -> Arc<EncryptionService> {
     Arc::new(EncryptionService::new(&"ab".repeat(32)).unwrap())
 }

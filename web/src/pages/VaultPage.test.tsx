@@ -12,7 +12,7 @@ import {
 import { installBrowserWindow } from '@/test/dom'
 installBrowserWindow()
 import { renderToStaticMarkup } from 'react-dom/server'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import {
@@ -117,6 +117,101 @@ test('vault creation freezes the name while pending and preserves it after failu
         within(view.container).getByRole('heading', { name: 'Created vault' })
       ).toBeTruthy()
     )
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
+test('leaving during vault creation keeps the new location and still invalidates the vault list', async () => {
+  let finish: ((response: Response) => void) | undefined
+  let leave: () => void = () => {
+    throw new Error('Router not mounted')
+  }
+  function Navigation() {
+    const navigate = useNavigate()
+    leave = () => navigate(-1)
+    return null
+  }
+  const api = mockApi({
+    'GET /projects/7': () => jsonResponse({ id: 7, name: 'Example project' }),
+    'GET /projects/7/access-vaults': () =>
+      jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
+    'GET /projects/7/service-access/capability': () =>
+      jsonResponse({ can_manage_services: true }),
+    'POST /projects/7/access-vaults': () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve
+      }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  try {
+    const view = mount(
+      <QueryClientProvider client={client}>
+        <MemoryRouter
+          initialEntries={['/elsewhere', '/vault/projects/7']}
+          initialIndex={1}
+        >
+          <BreadcrumbProvider>
+            <Navigation />
+            <Routes>
+              <Route
+                path="/vault/projects/:projectId"
+                element={<VaultPage />}
+              />
+              <Route path="/elsewhere" element={<h1>Other work</h1>} />
+              <Route
+                path="/vault/projects/:projectId/vaults/:vaultId"
+                element={<h1>Created vault</h1>}
+              />
+            </Routes>
+          </BreadcrumbProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const open = within(view.container).getByRole('button', {
+      name: 'Create vault',
+    }) as HTMLButtonElement
+    await waitFor(() => expect(open.disabled).toBe(false))
+    await act(async () => {
+      fireEvent.click(open)
+    })
+    const dialog = within(document.body).getByRole('dialog')
+    await act(async () => {
+      fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), {
+        target: { value: 'Development' },
+      })
+    })
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole('button', { name: 'Create vault' })
+      )
+    })
+    await waitFor(() => expect(finish).toBeDefined())
+    await act(async () => {
+      leave()
+    })
+    expect(
+      within(view.container).getByRole('heading', { name: 'Other work' })
+    ).toBeTruthy()
+    await act(async () => {
+      finish?.(jsonResponse({ id: 'vault_example', name: 'Development' }))
+    })
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    expect(
+      within(view.container).getByRole('heading', { name: 'Other work' })
+    ).toBeTruthy()
+    expect(
+      client.getQueryState(
+        listAccessVaultsOptions({
+          path: { project_id: 7 },
+          query: { page: 1, page_size: 20 },
+        }).queryKey
+      )?.isInvalidated
+    ).toBe(true)
   } finally {
     cleanup()
     client.clear()
