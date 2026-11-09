@@ -36,6 +36,77 @@ struct Fixture {
     rule: RuleId,
     proxy: WorkerProxy,
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authenticated_worker_registration_enforces_node_binding_and_shutdown() {
+    let f = Fixture::new().await;
+    let worker = WorkerControl::new(Arc::new(Audit));
+    let identity = worker.identity();
+    let registered = f
+        .control
+        .nodes
+        .register_embedded(
+            &f.caller,
+            "registered-worker",
+            &encode_public_key(&SealPublicKey::from(identity.seal_public_key)),
+        )
+        .await
+        .unwrap();
+    worker
+        .configure(WorkerAuthority {
+            boot_id: identity.boot_id,
+            node_id: registered.node.id.0,
+            snapshot_verify_key: registered.snapshot_verify_key.to_bytes(),
+        })
+        .await
+        .unwrap();
+    // A snapshot sealed for another node is not usable even though the same
+    // control plane signed it. An old boot cannot deliver a new snapshot.
+    let wrong_node = f.control.nodes.build_snapshot(&f.node).await.unwrap();
+    assert!(worker.install(identity.boot_id, &wrong_node).await.is_err());
+    let token = f
+        .control
+        .sessions
+        .mint(
+            &f.caller,
+            &f.vault,
+            MintSession {
+                rule_ids: vec![f.rule],
+                node_id: Some(registered.node.id),
+                binding: Some(SessionBinding {
+                    id: "sandbox:test-incarnation".into(),
+                    generation: 1,
+                }),
+                strict: true,
+                ttl_secs: Some(60),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .token;
+    let snapshot = f
+        .control
+        .nodes
+        .build_snapshot(&registered.node)
+        .await
+        .unwrap();
+    assert!(worker
+        .install(uuid::Uuid::new_v4(), &snapshot)
+        .await
+        .is_err());
+    let version = worker.install(identity.boot_id, &snapshot).await.unwrap();
+    let binding = worker
+        .bind(identity.boot_id, f.spec(token), version)
+        .await
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
+    let guest = idle_guest_tunnel(&attachment).await;
+    drop(worker);
+    assert_guest_closed(guest).await;
+}
 impl Fixture {
     async fn new() -> Self {
         Self::with_lease(30).await

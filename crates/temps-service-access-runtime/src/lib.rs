@@ -4,6 +4,8 @@
 //! Trusted worker proxy. Only authenticated host code installs snapshots and
 //! creates attachments. Guest byte streams receive a specific binding and may
 //! never select their own identity, session or node.
+mod control;
+pub use control::{WorkerAuthority, WorkerControl, WorkerIdentity};
 #[cfg(unix)]
 mod attachment;
 #[cfg(unix)]
