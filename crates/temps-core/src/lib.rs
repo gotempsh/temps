@@ -272,6 +272,93 @@ mod unmaintained_dependency_guard_tests {
             .collect()
     }
 
+    /// Versions of every locked package named `name`, as `(major, minor, patch)`.
+    /// Pre-release and build suffixes are dropped; they don't occur on the
+    /// crates these guards check.
+    fn locked_versions(lock: &str, name: &str) -> Vec<(u64, u64, u64)> {
+        let name_line = format!("name = \"{name}\"");
+        lock.split("[[package]]")
+            .skip(1)
+            .filter(|block| block.lines().map(str::trim).any(|line| line == name_line))
+            .filter_map(|block| {
+                block.lines().map(str::trim).find_map(|line| {
+                    line.strip_prefix("version = \"")
+                        .and_then(|l| l.strip_suffix('"'))
+                })
+            })
+            .filter_map(|version| {
+                let core = version.split(['-', '+']).next()?;
+                let mut parts = core.split('.').map(str::parse::<u64>);
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => {
+                        Some((major, minor, patch))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether an `arrow-data` version has the RUSTSEC-2026-0442 fix (bounds
+    /// validation of RunEndEncoded arrays). Mirrors the advisory's
+    /// `patched`/`unaffected` ranges: each supported major got its own fix.
+    fn arrow_data_is_patched((major, minor, patch): (u64, u64, u64)) -> bool {
+        match major {
+            0..=32 => true,
+            57 => (minor, patch) >= (3, 2),
+            58 => (minor, patch) >= (4, 1),
+            59 => (minor, patch) >= (3, 2),
+            60 => (minor, patch) >= (1, 0),
+            61.. => true,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn locked_versions_reads_lockfile_entries() {
+        let lock = "[[package]]\nname = \"a\"\nversion = \"60.1.0\"\n\n[[package]]\n\
+                    name = \"a\"\nversion = \"2.0.0-rc.5\"\n\n[[package]]\nname = \"ab\"\n\
+                    version = \"9.9.9\"\n";
+        assert_eq!(locked_versions(lock, "a"), vec![(60, 1, 0), (2, 0, 0)]);
+        assert!(locked_versions(lock, "missing").is_empty());
+    }
+
+    #[test]
+    fn arrow_data_is_patched_follows_advisory_ranges() {
+        for unpatched in [(60, 0, 0), (59, 3, 1), (58, 4, 0), (57, 3, 1), (40, 0, 0)] {
+            assert!(!arrow_data_is_patched(unpatched), "{unpatched:?}");
+        }
+        for patched in [
+            (60, 1, 0),
+            (59, 3, 2),
+            (58, 4, 1),
+            (57, 3, 2),
+            (32, 0, 0),
+            (61, 0, 0),
+        ] {
+            assert!(arrow_data_is_patched(patched), "{patched:?}");
+        }
+    }
+
+    /// RUSTSEC-2026-0442: `ArrayData::validate_values` accepted RunEndEncoded
+    /// arrays whose run ends point past the values child, so a read such as
+    /// `TypedRunArray::value` could go out of bounds. arrow is only in the
+    /// graph through sea-orm 2's optional `sea-orm-arrow`, but the lockfile is
+    /// what `dependency-scan.yml` audits, and a feature flip would compile it.
+    #[test]
+    fn locked_arrow_data_has_run_end_encoding_fix() {
+        let unpatched: Vec<_> = locked_versions(CARGO_LOCK, "arrow-data")
+            .into_iter()
+            .filter(|version| !arrow_data_is_patched(*version))
+            .collect();
+        assert!(
+            unpatched.is_empty(),
+            "Cargo.lock pins arrow-data {unpatched:?}, which is affected by RUSTSEC-2026-0442 \
+             (out-of-bounds read via unvalidated RunEndEncoded arrays). Run \
+             `cargo update -p arrow-data` to move to a patched release (>= 60.1.0)."
+        );
+    }
+
     #[test]
     fn dependents_of_reads_lockfile_entries() {
         let lock = "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\ndependencies = [\n \
