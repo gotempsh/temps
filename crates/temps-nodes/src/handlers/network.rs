@@ -218,6 +218,47 @@ pub struct PeerListResponse {
     /// Managed WireGuard mesh, when enabled on the cluster.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wireguard: Option<WireguardMeshEntry>,
+    /// The cluster's VXLAN network ID and port (ADR 062). Agents treat an
+    /// absent field (a control plane older than this) as 42/4789.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vxlan: Option<VxlanEntry>,
+}
+
+/// The VXLAN network ID and UDP port every overlay of this cluster uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct VxlanEntry {
+    pub vni: u32,
+    pub port: u16,
+}
+
+impl VxlanEntry {
+    /// The stored values, checked against the range VXLAN allows.
+    pub fn from_config(config: &temps_entities::network_config::Model) -> Result<Self, String> {
+        let vni = u32::try_from(config.vxlan_vni)
+            .map_err(|_| format!("network_config.vxlan_vni {} is negative", config.vxlan_vni))?;
+        let port = u16::try_from(config.vxlan_port).map_err(|_| {
+            format!(
+                "network_config.vxlan_port {} is outside 0..=65535",
+                config.vxlan_port
+            )
+        })?;
+        temps_network::validate_vxlan(vni, port).map_err(|error| error.to_string())?;
+        Ok(Self { vni, port })
+    }
+}
+
+/// The `vxlan` section of the peer list: the stored network ID and port, or
+/// none when they are out of range. Agents read an absent section as
+/// 42/4789, which is what every agent ran before ADR 062, so a bad row never
+/// stops a cluster's polling; it is logged for the operator to fix.
+fn peer_list_vxlan(config: &temps_entities::network_config::Model) -> Option<VxlanEntry> {
+    match VxlanEntry::from_config(config) {
+        Ok(entry) => Some(entry),
+        Err(reason) => {
+            error!("invalid cluster VXLAN settings, peer lists fall back to 42/4789: {reason}");
+            None
+        }
+    }
 }
 
 /// `GET /internal/nodes/{node_id}/network/peers`
@@ -254,7 +295,7 @@ pub async fn list_peers(
     if node.mesh_wg_address.is_some() && node.compute_cidr.is_none() {
         allocate_after_mesh_registration(&app_state, node_id).await;
     }
-    let cluster_network_name = temps_entities::network_config::Entity::find_by_id(1)
+    let cluster_row = temps_entities::network_config::Entity::find_by_id(1)
         .one(app_state.db.as_ref())
         .await
         .map_err(|e| {
@@ -262,8 +303,9 @@ pub async fn list_peers(
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Database Error")
                 .with_detail(e.to_string())
-        })?
-        .map(|config| config.docker_network_name);
+        })?;
+    let vxlan = cluster_row.as_ref().and_then(peer_list_vxlan);
+    let cluster_network_name = cluster_row.map(|config| config.docker_network_name);
     let overlay_network_name = effective_overlay_network_name(
         node.overlay_network_name.as_deref(),
         cluster_network_name.as_deref(),
@@ -333,6 +375,7 @@ pub async fn list_peers(
         peers,
         cluster_dns_enabled,
         wireguard,
+        vxlan,
     }))
 }
 
@@ -764,10 +807,90 @@ mod tests {
             peers: vec![],
             cluster_dns_enabled: false,
             wireguard: None,
+            vxlan: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("alloc"), "alloc should be omitted: {}", json);
         assert!(json.contains("\"peers\":[]"));
+    }
+
+    fn network_config_row(vni: i32, port: i32) -> temps_entities::network_config::Model {
+        temps_entities::network_config::Model {
+            id: 1,
+            compute_pool_cidr: "10.202.0.0/16".into(),
+            subnet_prefix_len: 24,
+            transport: "vxlan".into(),
+            vxlan_vni: vni,
+            vxlan_port: port,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: None,
+            control_plane_underlay_address: None,
+            control_plane_overlay_ready: false,
+            control_plane_setup_generation: 0,
+            wireguard_enabled: false,
+            wireguard_cidr: "10.201.0.0/16".into(),
+            wireguard_port: 51820,
+            control_plane_wg_public_key: None,
+            control_plane_wg_endpoint: None,
+            node_api_port: None,
+            mesh_hub_node_id: None,
+            mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    // ADR 062: the peer list carries the cluster's network ID; agents read
+    // an absent field as 42/4789.
+    #[test]
+    fn the_peer_list_carries_the_cluster_network_id() {
+        let entry = VxlanEntry::from_config(&network_config_row(5_000_123, 4789)).unwrap();
+        assert_eq!(
+            entry,
+            VxlanEntry {
+                vni: 5_000_123,
+                port: 4789
+            }
+        );
+        let resp = PeerListResponse {
+            network: NetworkPoolEntry {
+                compute_pool_cidr: "10.202.0.0/16".into(),
+                subnet_prefix_len: 24,
+            },
+            alloc: None,
+            peers: vec![],
+            cluster_dns_enabled: false,
+            wireguard: None,
+            vxlan: Some(entry),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["vxlan"],
+            serde_json::json!({"vni": 5_000_123, "port": 4789})
+        );
+        for (vni, port) in [
+            (0, 4789),
+            (-1, 4789),
+            (16_777_216, 4789),
+            (42, 70_000),
+            (42, 53),
+        ] {
+            assert!(
+                VxlanEntry::from_config(&network_config_row(vni, port)).is_err(),
+                "vni {vni} port {port} must be refused"
+            );
+            // ...and the peer list then says nothing, which agents read as
+            // the 42/4789 they ran before, rather than failing every poll.
+            assert_eq!(peer_list_vxlan(&network_config_row(vni, port)), None);
+        }
+        assert_eq!(
+            peer_list_vxlan(&network_config_row(42, 4789)),
+            Some(VxlanEntry {
+                vni: 42,
+                port: 4789
+            })
+        );
     }
 
     #[test]
@@ -787,6 +910,7 @@ mod tests {
             peers: vec![],
             cluster_dns_enabled: false,
             wireguard: None,
+            vxlan: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"alloc\""));
@@ -806,6 +930,7 @@ mod tests {
             peers: vec![],
             cluster_dns_enabled: false,
             wireguard: None,
+            vxlan: None,
         };
         let json = serde_json::to_string(&resp_disabled).unwrap();
         assert!(
@@ -823,6 +948,7 @@ mod tests {
             peers: vec![],
             cluster_dns_enabled: true,
             wireguard: None,
+            vxlan: None,
         };
         let json = serde_json::to_string(&resp_enabled).unwrap();
         assert!(

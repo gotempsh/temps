@@ -8,10 +8,16 @@
  */
 import { z } from 'zod'
 
-import type { ClusterNetworkNode } from '@/api/client/types.gen'
+import type {
+  ClusterNetworkNode,
+  ClusterNetworkStatus,
+  NetworkIdChange,
+} from '@/api/client/types.gen'
 
 export type {
   ClusterNetworkChangeResponse,
+  ClusterNetworkIdChangeResponse,
+  NetworkIdChange,
   ClusterNetworkControlPlane,
   ClusterNetworkNode,
   ClusterNetworkReassignment,
@@ -158,4 +164,40 @@ function overlayStatusOf(node: ClusterNetworkNode): OverlayStatusView {
     description:
       'Its agent has not reported the cross-node network yet. Upgrade the agent if this persists.',
   }
+}
+
+/**
+ * Whether the "Give this cluster its own network ID" action applies (ADR
+ * 062), and why it is refused when it does: a node whose overlay is down
+ * because another VXLAN device on its host holds the cluster's network ID is
+ * fixed by a new one, which every node must be able to follow.
+ */
+export interface NetworkIdAction {
+  /** Some node is blocked by a network ID in use on its host. */
+  offered: boolean
+  /** The nodes blocked that way. */
+  blockedNodes: string[]
+  /** Whether a new network ID can be assigned now. */
+  canChange: boolean
+  /** Why not: the nodes that could not follow it, and the fix. */
+  refusedBecause: string[]
+}
+
+export function networkIdAction(
+  status: ClusterNetworkStatus | undefined
+): NetworkIdAction {
+  const blockedNodes = (status?.nodes ?? [])
+    .filter((node) => node.vxlan_id_in_use)
+    .map((node) => node.name)
+  return {
+    offered: blockedNodes.length > 0,
+    blockedNodes,
+    canChange: status?.can_change_network_id ?? false,
+    refusedBecause: status?.network_id_change_blocked_by ?? [],
+  }
+}
+
+/** What the operator is told once the cluster has a new network ID. */
+export function networkIdChangedMessage(change: NetworkIdChange): string {
+  return `This cluster now uses network ID ${change.to} (was ${change.from}). Each node rebuilds its cross-node network on it at its next poll, within about 30 seconds; cross-node traffic pauses until then.`
 }

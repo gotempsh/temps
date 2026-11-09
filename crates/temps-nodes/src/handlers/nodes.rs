@@ -371,6 +371,11 @@ pub struct HeartbeatApiRequest {
     /// when the set changes. Absent from older agents.
     #[serde(default)]
     pub overlay_addresses: Option<Vec<OverlayAddressReport>>,
+    /// The VXLAN network ID this node's overlay follows (ADR 062): that of
+    /// the last peer list it acted on. Absent from older agents, which run
+    /// every overlay on 42.
+    #[serde(default)]
+    pub overlay_vxlan_vni: Option<u32>,
 }
 
 /// One running container's overlay address, from a heartbeat.
@@ -404,6 +409,20 @@ where
             })
             .collect()
     }))
+}
+
+/// A reported network ID outside VXLAN's 24 bits is dropped (and logged),
+/// not stored: it is what the change gate reads.
+fn reported_vxlan_vni(node_id: i32, reported: Option<u32>) -> Option<u32> {
+    let vni = reported?;
+    if vni == 0 || vni > temps_network::MAX_VXLAN_VNI {
+        warn!(
+            node_id,
+            vni, "ignoring an out-of-range overlay VXLAN network ID"
+        );
+        return None;
+    }
+    Some(vni)
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -797,6 +816,7 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
         crate::handlers::cluster_network::get_cluster_network,
         crate::handlers::cluster_network::update_cluster_network,
+        crate::handlers::cluster_network::change_cluster_network_id,
         crate::handlers::node_pairings::create_node_pairing,
         crate::handlers::node_pairings::list_node_pairings,
         crate::handlers::node_pairings::cancel_node_pairing,
@@ -819,6 +839,7 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::network::AllocEntry,
         crate::handlers::network::PeerListResponse,
         crate::handlers::network::WireguardMeshEntry,
+        crate::handlers::network::VxlanEntry,
         crate::handlers::network::WireguardMeshSelfEntry,
         crate::handlers::network::WireguardMeshPeerEntry,
         crate::handlers::network::RegisterWireguardMeshRequest,
@@ -860,6 +881,8 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::cluster_network::ClusterNetworkReassignment,
         crate::handlers::cluster_network::ClusterNetworkChangeResponse,
         crate::handlers::cluster_network::UpdateClusterNetworkRequest,
+        crate::handlers::cluster_network::ClusterNetworkIdChangeResponse,
+        crate::services::cluster_network::NetworkIdChange,
         OccupiedRangeReport,
         OverlayAddressReport,
         OverlayHeartbeat,
@@ -1008,6 +1031,10 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
             "/settings/cluster-network",
             get(crate::handlers::cluster_network::get_cluster_network)
                 .put(crate::handlers::cluster_network::update_cluster_network),
+        )
+        .route(
+            "/settings/cluster-network/network-id",
+            post(crate::handlers::cluster_network::change_cluster_network_id),
         )
         .route(
             "/nodes/pairings",
@@ -2298,6 +2325,14 @@ pub struct PlaneIdentityResponse {
     /// The control plane's WireGuard mesh public key. `None` while the mesh
     /// is off or not up yet.
     pub control_plane_wg_public_key: Option<String>,
+    /// The cluster's VXLAN network ID (ADR 062), so a join can warn before
+    /// spending its token when a device on the host already holds it. Not
+    /// secret: it is in every overlay packet. `None` from an older plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vxlan_vni: Option<u32>,
+    /// The cluster's VXLAN UDP port, with `vxlan_vni`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vxlan_port: Option<u16>,
 }
 
 /// Identify this control plane to a joining worker (ADR 060)
@@ -2365,9 +2400,25 @@ async fn plane_identity(
                     ));
             }
         };
+    // Best-effort: the join only uses it for a warning.
+    let vxlan = match app_state.node_service.cluster_network_config().await {
+        Ok(row) => row.and_then(|config| {
+            crate::handlers::network::VxlanEntry::from_config(&config)
+                .map_err(
+                    |reason| warn!(%reason, "invalid cluster VXLAN settings for plane-identity"),
+                )
+                .ok()
+        }),
+        Err(error) => {
+            warn!(%error, "could not read the cluster VXLAN settings for plane-identity");
+            None
+        }
+    };
     Ok(Json(PlaneIdentityResponse {
         ca_fingerprint,
         control_plane_wg_public_key,
+        vxlan_vni: vxlan.map(|entry| entry.vni),
+        vxlan_port: vxlan.map(|entry| entry.port),
     }))
 }
 
@@ -2570,6 +2621,7 @@ async fn node_heartbeat(
             .occupied_ranges
             .map(|reports| occupied_ranges_from_report(Some(node_id), reports)),
         deployments_without_resolver: request.deployments_without_resolver,
+        overlay_vxlan_vni: reported_vxlan_vni(node_id, request.overlay_vxlan_vni),
     };
 
     let architecture_change = app_state
@@ -4583,6 +4635,18 @@ mod join_telemetry_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reported_network_id_outside_24_bits_is_dropped() {
+        assert_eq!(super::reported_vxlan_vni(1, None), None);
+        assert_eq!(super::reported_vxlan_vni(1, Some(0)), None);
+        assert_eq!(super::reported_vxlan_vni(1, Some(16_777_216)), None);
+        assert_eq!(super::reported_vxlan_vni(1, Some(42)), Some(42));
+        assert_eq!(
+            super::reported_vxlan_vni(1, Some(16_777_215)),
+            Some(16_777_215)
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -5169,6 +5233,7 @@ mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

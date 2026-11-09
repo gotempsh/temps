@@ -35,6 +35,7 @@ import {
   type ClusterNetworkStatus,
 } from '@/lib/cluster-network'
 import { isForbiddenRead } from '@/lib/read-failure'
+import { ClusterNetworkIdSection } from '@/components/nodes/NetworkIdAction'
 
 /**
  * Settings -> Worker Nodes -> Cluster network (ADR 056): the compute pool
@@ -261,6 +262,7 @@ export function ClusterNetworkForm({
           />
         </div>
       )}
+      <ClusterNetworkIdSection status={status} />
       {verificationDialog}
     </div>
   )

@@ -170,14 +170,17 @@ fn host_cannot_run_mesh(error: &ControlPlaneOverlayReconcileError) -> Option<&'s
 /// The message names the colliding range, its owner and both fixes. It is
 /// not waited out like a misconfiguration, because the operator can also fix
 /// it on the host (remove the Docker network, move the route) without touching
-/// the cluster settings; so the setup is retried with backoff.
+/// the cluster settings; so the setup is retried with backoff. A VXLAN
+/// network ID another overlay on this host holds (ADR 062) is the same kind
+/// of failure: its message names the holder and both fixes.
 fn overlay_subnet_collision(error: &ControlPlaneOverlayReconcileError) -> Option<String> {
     use temps_network::control_plane::ControlPlaneSetupError;
     use temps_network::NetworkError;
     match error {
         ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
             collision @ (NetworkError::HostRouteCollision { .. }
-            | NetworkError::DockerCidrCollision { .. }),
+            | NetworkError::DockerCidrCollision { .. }
+            | NetworkError::VxlanIdInUse { .. }),
         )) => Some(collision.to_string()),
         _ => None,
     }
@@ -327,7 +330,7 @@ fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
                         tracing::error!(
                             error = %message,
                             retry_secs = delay.as_secs(),
-                            "control-plane overlay subnet collides with a range this host \
+                            "control-plane overlay collides with something this host \
                              already uses; local deployments keep working, cross-node \
                              networking stays off until it is fixed"
                         );
@@ -882,6 +885,24 @@ mod tests {
         ));
         let shown = overlay_subnet_collision(&docker).expect("a collision is actionable");
         assert!(shown.contains("shop_default"), "{shown}");
+
+        let id_in_use = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
+            NetworkError::VxlanIdInUse {
+                device: "vxlan-temps1".into(),
+                holder: "vxlan-temps0".into(),
+                vni: 42,
+                port: 4789,
+                diagnosis: temps_network::vxlan_holder::describe(
+                    &temps_network::vxlan_holder::HolderFacts::device_only("vxlan-temps0"),
+                    "vxlan-temps1",
+                    42,
+                    4789,
+                ),
+            },
+        ));
+        let shown = overlay_subnet_collision(&id_in_use).expect("an ID in use is actionable");
+        assert!(shown.contains("vxlan-temps0"), "{shown}");
+        assert!(shown.contains("own network ID"), "{shown}");
 
         let transient = nft_failure("install_baseline", "nft exited with status 1");
         assert_eq!(overlay_subnet_collision(&transient), None);

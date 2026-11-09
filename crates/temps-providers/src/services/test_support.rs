@@ -144,6 +144,7 @@ pub(super) fn nodes_test_model(id: i32) -> nodes::Model {
         overlay_ready_cidr: None,
         overlay_remediation: None,
         overlay_network_name: None,
+        overlay_vxlan_vni: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

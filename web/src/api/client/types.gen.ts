@@ -5513,6 +5513,14 @@ export type ClusterNetworkControlPlane = {
 };
 
 /**
+ * `POST /settings/cluster-network/network-id` answer.
+ */
+export type ClusterNetworkIdChangeResponse = {
+    change: NetworkIdChange;
+    status: ClusterNetworkStatus;
+};
+
+/**
  * One worker's view of the overlay.
  */
 export type ClusterNetworkNode = {
@@ -5549,6 +5557,17 @@ export type ClusterNetworkNode = {
      * `ready`, `unavailable`, or `None` when its agent never reported it.
      */
     overlay_status?: string | null;
+    /**
+     * Whether its overlay is unavailable because another VXLAN device on
+     * its host holds the cluster's network ID; giving the cluster its own
+     * network ID fixes that without touching the host.
+     */
+    vxlan_id_in_use: boolean;
+    /**
+     * The VXLAN network ID its agent reports it follows (ADR 062). `None`:
+     * its agent predates per-cluster network IDs, or never reported.
+     */
+    vxlan_network_id?: number | null;
 };
 
 /**
@@ -5585,6 +5604,11 @@ export type ClusterNetworkStatus = {
      */
     can_change: boolean;
     /**
+     * Whether `POST /settings/cluster-network/network-id` can assign a new
+     * network ID now, and why not: the nodes that could not follow it.
+     */
+    can_change_network_id: boolean;
+    /**
      * Why it cannot: the members using the pool, or a control-plane setup
      * in progress.
      */
@@ -5600,6 +5624,7 @@ export type ClusterNetworkStatus = {
      * The WireGuard mesh pool; a compute pool may not overlap it.
      */
     mesh_pool_cidr: string;
+    network_id_change_blocked_by: Array<string>;
     nodes: Array<ClusterNetworkNode>;
     /**
      * The cluster's overlay network name (ADR 059): the Docker network
@@ -5613,6 +5638,11 @@ export type ClusterNetworkStatus = {
      */
     pool_confirmed: boolean;
     subnet_prefix_len: number;
+    /**
+     * The cluster's VXLAN network ID and UDP port (ADR 062).
+     */
+    vxlan_network_id: number;
+    vxlan_port: number;
 };
 
 /**
@@ -17002,6 +17032,12 @@ export type HeartbeatApiRequest = {
      * when the set changes. Absent from older agents.
      */
     overlay_addresses?: Array<OverlayAddressReport> | null;
+    /**
+     * The VXLAN network ID this node's overlay follows (ADR 062): that of
+     * the last peer list it acted on. Absent from older agents, which run
+     * every overlay on 42.
+     */
+    overlay_vxlan_vni?: number | null;
     public_ingress?: PublicIngressHeartbeat | null;
 };
 
@@ -20820,6 +20856,14 @@ export type NetworkConfiguration = {
 };
 
 /**
+ * `POST /settings/cluster-network/network-id` answer.
+ */
+export type NetworkIdChange = {
+    from: number;
+    to: number;
+};
+
+/**
  * Information about a network interface
  */
 export type NetworkInterface = {
@@ -23248,6 +23292,7 @@ export type PeerListResponse = {
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
     peers: Array<PeerEntry>;
+    vxlan?: VxlanEntry | null;
     wireguard?: WireguardMeshEntry | null;
 };
 
@@ -23845,6 +23890,16 @@ export type PlaneIdentityResponse = {
      * is off or not up yet.
      */
     control_plane_wg_public_key?: string | null;
+    /**
+     * The cluster's VXLAN UDP port, with `vxlan_vni`.
+     */
+    vxlan_port?: number | null;
+    /**
+     * The cluster's VXLAN network ID (ADR 062), so a join can warn before
+     * spending its token when a device on the host already holds it. Not
+     * secret: it is in every overlay packet. `None` from an older plane.
+     */
+    vxlan_vni?: number | null;
 };
 
 /**
@@ -37453,6 +37508,14 @@ export type VulnerabilityResponse = {
     title: string;
     type?: string | null;
     vulnerability_id: string;
+};
+
+/**
+ * The VXLAN network ID and UDP port every overlay of this cluster uses.
+ */
+export type VxlanEntry = {
+    port: number;
+    vni: number;
 };
 
 /**
@@ -86956,6 +87019,45 @@ export type ClusterNetworkUpdateResponses = {
 };
 
 export type ClusterNetworkUpdateResponse = ClusterNetworkUpdateResponses[keyof ClusterNetworkUpdateResponses];
+
+export type ClusterNetworkIdChangeData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network/network-id';
+};
+
+export type ClusterNetworkIdChangeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * A node cannot follow a new network ID yet; the detail names it and the fix
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkIdChangeResponses = {
+    /**
+     * Network ID changed
+     */
+    200: ClusterNetworkIdChangeResponse;
+};
+
+export type ClusterNetworkIdChangeResponse2 = ClusterNetworkIdChangeResponses[keyof ClusterNetworkIdChangeResponses];
 
 export type GetDiskStatusData = {
     body?: never;

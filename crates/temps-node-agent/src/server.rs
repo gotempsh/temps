@@ -847,6 +847,11 @@ fn spawn_heartbeat_loop(
             if let Some(overlay) = &overlay_snapshot.overlay {
                 body["overlay"] = serde_json::json!(overlay);
             }
+            // ADR 062: the network ID this node follows, from the first poll
+            // on, so the control plane knows it can change the cluster's.
+            if let Some(vni) = overlay_snapshot.vxlan_vni {
+                body["overlay_vxlan_vni"] = serde_json::json!(vni);
+            }
             let occupied_to_send = overlay_snapshot
                 .occupied_ranges
                 .filter(|ranges| occupied_sent.as_ref() != Some(ranges));

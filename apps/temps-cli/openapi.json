@@ -11264,6 +11264,22 @@
         ],
         "type": "object"
       },
+      "ClusterNetworkIdChangeResponse": {
+        "description": "`POST /settings/cluster-network/network-id` answer.",
+        "properties": {
+          "change": {
+            "$ref": "#/components/schemas/NetworkIdChange"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ClusterNetworkStatus"
+          }
+        },
+        "required": [
+          "change",
+          "status"
+        ],
+        "type": "object"
+      },
       "ClusterNetworkNode": {
         "description": "One worker's view of the overlay.",
         "properties": {
@@ -11322,6 +11338,19 @@
               "string",
               "null"
             ]
+          },
+          "vxlan_id_in_use": {
+            "description": "Whether its overlay is unavailable because another VXLAN device on\nits host holds the cluster's network ID; giving the cluster its own\nnetwork ID fixes that without touching the host.",
+            "type": "boolean"
+          },
+          "vxlan_network_id": {
+            "description": "The VXLAN network ID its agent reports it follows (ADR 062). `None`:\nits agent predates per-cluster network IDs, or never reported.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -11329,7 +11358,8 @@
           "name",
           "overlay_network_name",
           "in_use",
-          "occupied_ranges"
+          "occupied_ranges",
+          "vxlan_id_in_use"
         ],
         "type": "object"
       },
@@ -11393,6 +11423,10 @@
             "description": "Whether `PUT` can change the pool now.",
             "type": "boolean"
           },
+          "can_change_network_id": {
+            "description": "Whether `POST /settings/cluster-network/network-id` can assign a new\nnetwork ID now, and why not: the nodes that could not follow it.",
+            "type": "boolean"
+          },
           "change_blocked_by": {
             "description": "Why it cannot: the members using the pool, or a control-plane setup\nin progress.",
             "items": {
@@ -11417,6 +11451,12 @@
             "description": "The WireGuard mesh pool; a compute pool may not overlap it.",
             "type": "string"
           },
+          "network_id_change_blocked_by": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "nodes": {
             "items": {
               "$ref": "#/components/schemas/ClusterNetworkNode"
@@ -11435,6 +11475,17 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "vxlan_network_id": {
+            "description": "The cluster's VXLAN network ID and UDP port (ADR 062).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "vxlan_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -11444,6 +11495,10 @@
           "mesh_pool_cidr",
           "mesh_enabled",
           "overlay_network_name",
+          "vxlan_network_id",
+          "vxlan_port",
+          "can_change_network_id",
+          "network_id_change_blocked_by",
           "pool_confirmed",
           "can_change",
           "change_blocked_by",
@@ -36292,6 +36347,15 @@
               "null"
             ]
           },
+          "overlay_vxlan_vni": {
+            "description": "The VXLAN network ID this node's overlay follows (ADR 062): that of\nthe last peer list it acted on. Absent from older agents, which run\nevery overlay on 42.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "public_ingress": {
             "oneOf": [
               {
@@ -44652,6 +44716,26 @@
         ],
         "type": "object"
       },
+      "NetworkIdChange": {
+        "description": "`POST /settings/cluster-network/network-id` answer.",
+        "properties": {
+          "from": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
       "NetworkInterface": {
         "description": "Information about a network interface",
         "properties": {
@@ -49844,6 +49928,17 @@
             },
             "type": "array"
           },
+          "vxlan": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/VxlanEntry",
+                "description": "The cluster's VXLAN network ID and port (ADR 062). Agents treat an\nabsent field (a control plane older than this) as 42/4789."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "wireguard": {
             "oneOf": [
               {
@@ -51247,6 +51342,24 @@
             "description": "The control plane's WireGuard mesh public key. `None` while the mesh\nis off or not up yet.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "vxlan_port": {
+            "description": "The cluster's VXLAN UDP port, with `vxlan_vni`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "vxlan_vni": {
+            "description": "The cluster's VXLAN network ID (ADR 062), so a join can warn before\nspending its token when a device on the host already holds it. Not\nsecret: it is in every overlay packet. `None` from an older plane.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -79962,6 +80075,26 @@
           "severity",
           "title",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "VxlanEntry": {
+        "description": "The VXLAN network ID and UDP port every overlay of this cluster uses.",
+        "properties": {
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "vni": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "vni",
+          "port"
         ],
         "type": "object"
       },
@@ -162435,6 +162568,48 @@
         ]
       }
     },
+    "/settings/cluster-network/network-id": {
+      "post": {
+        "description": "Assigns a fresh random network ID. Every node's overlay, and the control\nplane's, is rebuilt on it at its next reconcile; cross-node traffic pauses\nuntil each one has. Refused while a node's agent has not reported that it\ncan follow a new network ID.",
+        "operationId": "ClusterNetworkIdChange",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterNetworkIdChangeResponse"
+                }
+              }
+            },
+            "description": "Network ID changed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "A node cannot follow a new network ID yet; the detail names it and the fix"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Give this cluster its own VXLAN network ID (ADR 062)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/settings/disk-status": {
       "get": {
         "description": "Returns live disk usage for the monitored path along with any disks that\nmeet or exceed the configured alert threshold. Read-only — does not send\nnotifications. Used by the dashboard to surface a low-disk-space warning.",
@@ -171427,6 +171602,14 @@
       "name": "Metrics"
     },
     {
+      "description": "Key-Value storage operations",
+      "name": "KV Store"
+    },
+    {
+      "description": "KV service management operations",
+      "name": "KV Management"
+    },
+    {
       "description": "Blob storage operations",
       "name": "Blob"
     },
@@ -171563,6 +171746,10 @@
       "name": "Logs"
     },
     {
+      "description": "Import workloads from external sources",
+      "name": "Imports"
+    },
+    {
       "description": "Status page and monitoring endpoints",
       "name": "Status Page"
     },
@@ -171653,18 +171840,6 @@
     {
       "description": "What each workload may reach, and whether a node enforces it",
       "name": "Network Policy"
-    },
-    {
-      "description": "Key-Value storage operations",
-      "name": "KV Store"
-    },
-    {
-      "description": "KV service management operations",
-      "name": "KV Management"
-    },
-    {
-      "description": "Import workloads from external sources",
-      "name": "Imports"
     }
   ]
 }

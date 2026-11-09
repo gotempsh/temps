@@ -3030,9 +3030,23 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
     assert_eq!(pool, "10.202.0.0/16");
     assert_eq!(prefix, 24);
     assert_eq!(transport, "vxlan");
-    assert_eq!(vni, 42);
+    // ADR 062: a cluster with no node yet gets its own random network ID.
+    assert!(
+        (4096..=0x00FF_FFFF).contains(&vni),
+        "a new cluster must get a random VXLAN network ID, got {vni}"
+    );
     assert_eq!(port, 4789);
     assert_eq!(mtu, 1500);
+
+    // ----- CHECK keeps the network ID within 24 bits -----
+    for bad in ["0", "16777216"] {
+        let result = db
+            .execute_unprepared(&format!(
+                "UPDATE network_config SET vxlan_vni = {bad} WHERE id = 1"
+            ))
+            .await;
+        assert!(result.is_err(), "vxlan_vni = {bad} must be rejected");
+    }
 
     // ----- CHECK (id = 1) prevents inserting a second row -----
     let second = db
@@ -7734,5 +7748,140 @@ async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
         ))
         .await?;
     assert_eq!(rows.len(), 1);
+    Ok(())
+}
+
+/// ADR 062: only a brand-new database gets a random VXLAN network ID. An
+/// install that already ran (it has a user or a node) keeps 42, so no running
+/// cluster's network changes on upgrade, and `down` puts the cluster back on
+/// 42, which binaries older than this assume for every agent.
+#[tokio::test]
+async fn test_cluster_vxlan_network_id_only_moves_a_new_database() -> anyhow::Result<()> {
+    const TARGET: &str = "m20261109_000001_cluster_vxlan_network_id";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping cluster VXLAN network ID migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let steps = steps_back_to(TARGET);
+    let before = Migrator::migrations().len() as u32 - steps;
+    Migrator::up(&db, Some(before)).await?;
+
+    async fn vni(db: &DatabaseConnection) -> anyhow::Result<i32> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT vxlan_vni FROM network_config WHERE id = 1".to_string(),
+            ))
+            .await?
+            .expect("network_config row");
+        Ok(row.try_get("", "vxlan_vni")?)
+    }
+    async fn has_column(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'nodes' AND column_name = 'overlay_vxlan_vni') AS present"
+                    .to_string(),
+            ))
+            .await?
+            .expect("exists row");
+        Ok(row.try_get("", "present")?)
+    }
+    assert_eq!(vni(&db).await?, 42, "seeded before this migration");
+
+    // An install that already ran, with no worker yet: keeps 42.
+    db.execute_unprepared(
+        "INSERT INTO users (name, email, created_at, updated_at) \
+         VALUES ('Existing admin', 'admin@example.test', now(), now())",
+    )
+    .await?;
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        vni(&db).await?,
+        42,
+        "an existing install keeps network ID 42"
+    );
+    assert!(has_column(&db).await?);
+
+    // An install with a worker and no user row (say, users purged): keeps 42.
+    Migrator::down(&db, Some(1)).await?;
+    db.execute_unprepared("DELETE FROM users").await?;
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address, role, status, labels, capacity) \
+         VALUES ('worker-1', 'h1', '127.0.0.1', '10.0.0.1', 'worker', 'online', '{}', '{}')",
+    )
+    .await?;
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        vni(&db).await?,
+        42,
+        "a cluster with a node keeps network ID 42"
+    );
+
+    // A database nothing ran on yet: a random ID, never 42.
+    Migrator::down(&db, Some(1)).await?;
+    db.execute_unprepared("DELETE FROM nodes").await?;
+    Migrator::up(&db, Some(1)).await?;
+    let fresh = vni(&db).await?;
+    assert!(
+        (4096..=0x00FF_FFFF).contains(&fresh),
+        "a new database gets a random network ID, got {fresh}"
+    );
+
+    // The checks keep both columns within 24 bits.
+    for bad in ["0", "16777216"] {
+        assert!(
+            db.execute_unprepared(&format!(
+                "UPDATE network_config SET vxlan_vni = {bad} WHERE id = 1"
+            ))
+            .await
+            .is_err(),
+            "network_config.vxlan_vni = {bad} must be rejected"
+        );
+        assert!(
+            db.execute_unprepared(&format!(
+                "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+                 labels, capacity, overlay_vxlan_vni) \
+                 VALUES ('bad-{bad}', 'h-{bad}', '127.0.0.9', '10.0.0.9', 'worker', 'online', \
+                 '{{}}', '{{}}', {bad})"
+            ))
+            .await
+            .is_err(),
+            "nodes.overlay_vxlan_vni = {bad} must be rejected"
+        );
+    }
+
+    // Down: the column goes and the cluster is back on 42.
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(vni(&db).await?, 42);
+    assert!(!has_column(&db).await?);
     Ok(())
 }

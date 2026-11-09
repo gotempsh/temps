@@ -81,6 +81,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [059](./059-configurable-overlay-network-name.md) | A configurable overlay network name, and a join that looks first | Accepted |  |
 | [060](./060-rejoining-the-same-control-plane.md) | Re-joining the same control plane, and removing an empty node | Accepted |  |
 | [061](./061-worker-metrics.md) | Worker proxy and host metrics, pulled by the control plane | Accepted |  |
+| [062](./062-one-host-several-clusters-overlays.md) | One host, several clusters' overlays | Accepted |  |
 | [063](./063-sandboxes-on-a-control-plane-without-workloads.md) | Sandboxes on a control plane that runs no workloads | Accepted |  |
 | [064](./064-making-a-project-reachable.md) | Making a project reachable: who first, then how | Proposed |  |
 | [065](./065-tailnet-names-and-signed-in-addresses.md) | Tailnet names, tailnet users and signed-in addresses | Proposed |  |

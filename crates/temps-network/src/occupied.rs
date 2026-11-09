@@ -136,7 +136,7 @@ pub fn first_overlap<'a>(
 }
 
 /// Collect this host's occupied ranges: unicast routes on devices not in
-/// `owned_devices` and every Docker network except `owned_docker_network`.
+/// `owned_devices` and every Docker network not in `owned_docker_networks`.
 ///
 /// With `docker` absent only routes are collected. A Docker call that fails
 /// fails the whole collection, so a daemon that is restarting is never
@@ -144,11 +144,11 @@ pub fn first_overlap<'a>(
 pub async fn collect(
     docker: Option<&bollard::Docker>,
     owned_devices: &[&str],
-    owned_docker_network: &str,
+    owned_docker_networks: &[&str],
 ) -> crate::Result<Vec<OccupiedRange>> {
     let mut ranges = host_routes(owned_devices).await?;
     if let Some(docker) = docker {
-        ranges.extend(crate::docker::occupied_docker_subnets(docker, owned_docker_network).await?);
+        ranges.extend(crate::docker::occupied_docker_subnets(docker, owned_docker_networks).await?);
     }
     Ok(normalize(ranges))
 }
