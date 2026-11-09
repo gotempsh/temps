@@ -94,23 +94,69 @@ pub enum HealthMonitorError {
     },
 }
 
-/// A worker MariaDB's binary-log archiving credential and what it was minted
-/// for.
-struct BinlogArchiveCredential {
+/// How long before a scoped credential's own expiry the monitor stops
+/// reusing it, so a run never starts with one about to lapse.
+const BINLOG_CREDENTIAL_EXPIRY_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// What a worker MariaDB's binary-log credential was minted for: reused
+/// only while every part still matches, so a change to the source (its
+/// bucket, base path, keys or worker credentials setting all bump
+/// `updated_at`), the service's name or its node mints a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinlogCredentialGrant {
     s3_source_id: i32,
+    s3_source_updated_at: chrono::DateTime<Utc>,
     node_id: i32,
-    minted_at: Instant,
+    bucket: String,
+    prefix: String,
+}
+
+impl BinlogCredentialGrant {
+    fn of(service_name: &str, node_id: i32, s3_source: &s3_sources::Model) -> Self {
+        Self {
+            s3_source_id: s3_source.id,
+            s3_source_updated_at: s3_source.updated_at,
+            node_id,
+            bucket: s3_source.bucket_name.clone(),
+            prefix: crate::externalsvc::mariadb_node::binlog_key_prefix(
+                &s3_source.bucket_path,
+                service_name,
+            ),
+        }
+    }
+}
+
+/// A worker MariaDB's binary-log archiving credential, what it was minted
+/// for, and until when it may be reused.
+struct BinlogArchiveCredential {
+    grant: BinlogCredentialGrant,
+    reuse_until: Instant,
     destination: crate::remote_service_client::WorkerS3Destination,
 }
 
-impl BinlogArchiveCredential {
-    /// Whether a run for `s3_source_id` on `node_id` may reuse it.
-    fn reusable_for(&self, s3_source_id: i32, node_id: i32) -> bool {
-        self.s3_source_id == s3_source_id
-            && self.node_id == node_id
-            && self.minted_at.elapsed()
-                < crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL
-    }
+/// How long a freshly minted binary-log credential may be reused: the
+/// refresh interval, cut short [`BINLOG_CREDENTIAL_EXPIRY_MARGIN`] before
+/// its own expiry (a store may grant less than asked). `None` for one not
+/// worth keeping: the source's full credential (never cached, so a source
+/// switched to scoped stops receiving it on the next run) or one already
+/// about to expire.
+fn binlog_credential_reuse_window(
+    scope: &crate::worker_s3_scope::WorkerCredentialScope,
+    now: chrono::DateTime<Utc>,
+) -> Option<Duration> {
+    use crate::worker_s3_scope::{WorkerCredentialScope, ARCHIVE_CREDENTIAL_REFRESH_INTERVAL};
+    let WorkerCredentialScope::Scoped { expires_at, .. } = scope else {
+        return None;
+    };
+    let window = match expires_at {
+        Some(expires_at) => (*expires_at - now)
+            .to_std()
+            .ok()?
+            .checked_sub(BINLOG_CREDENTIAL_EXPIRY_MARGIN)?
+            .min(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL),
+        None => ARCHIVE_CREDENTIAL_REFRESH_INTERVAL,
+    };
+    (!window.is_zero()).then_some(window)
 }
 
 /// Background loop that keeps `external_services.health_status` in sync with
@@ -1066,37 +1112,46 @@ impl ExternalServiceHealthMonitor {
 
     /// The cached binary-log archiving credential of `service` on `node_id`
     /// for `s3_source`, or a new one from the manager when there is none,
-    /// it is due for refresh, or it was minted for another node or source.
+    /// its reuse window has passed, or it was minted for anything else
+    /// ([`BinlogCredentialGrant`]).
     async fn binlog_archive_destination(
         &self,
         service: &external_services::Model,
         node_id: i32,
         s3_source: &s3_sources::Model,
     ) -> Result<crate::remote_service_client::WorkerS3Destination, String> {
+        let grant = BinlogCredentialGrant::of(&service.name, node_id, s3_source);
         if let Some(cached) = self
             .binlog_archive_credentials
             .lock()
             .await
             .get(&service.id)
-            .filter(|cached| cached.reusable_for(s3_source.id, node_id))
+            .filter(|cached| cached.grant == grant && Instant::now() < cached.reuse_until)
         {
             return Ok(cached.destination.clone());
         }
-        let destination = self
+        let scoped = self
             .manager
             .mariadb_binlog_archive_destination(service, node_id, s3_source)
             .await
             .map_err(|error| error.to_string())?;
-        self.binlog_archive_credentials.lock().await.insert(
-            service.id,
-            BinlogArchiveCredential {
-                s3_source_id: s3_source.id,
-                node_id,
-                minted_at: Instant::now(),
-                destination: destination.clone(),
-            },
-        );
-        Ok(destination)
+        let mut cache = self.binlog_archive_credentials.lock().await;
+        match binlog_credential_reuse_window(&scoped.scope, Utc::now()) {
+            Some(window) => {
+                cache.insert(
+                    service.id,
+                    BinlogArchiveCredential {
+                        grant,
+                        reuse_until: Instant::now() + window,
+                        destination: scoped.destination.clone(),
+                    },
+                );
+            }
+            None => {
+                cache.remove(&service.id);
+            }
+        }
+        Ok(scoped.destination)
     }
 
     /// Run the WAL/archive probe for a standalone Postgres service.
@@ -1323,31 +1378,107 @@ mod tests {
         assert_eq!(lifecycle_probe("something-new"), LifecycleProbe::Down);
     }
 
-    /// A worker MariaDB's binary-log credential is reused only for the node
-    /// and source it was minted for, and only inside the refresh interval.
-    #[test]
-    fn a_binlog_credential_is_reused_only_where_and_while_it_was_minted() {
-        let credential = |minted_at: Instant| BinlogArchiveCredential {
-            s3_source_id: 4,
-            node_id: 2,
-            minted_at,
-            destination: crate::remote_service_client::WorkerS3Destination {
-                bucket: "b".to_string(),
-                region: "us-east-1".to_string(),
-                endpoint: None,
-                force_path_style: true,
-                access_key_id: "scoped".to_string(),
-                secret_access_key: "scoped".to_string(),
-                session_token: Some("t".to_string()),
-            },
-        };
-        let fresh = credential(Instant::now());
-        assert!(fresh.reusable_for(4, 2));
-        assert!(!fresh.reusable_for(5, 2), "another source");
-        assert!(!fresh.reusable_for(4, 3), "another node");
-        let refresh = crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL;
-        if let Some(due) = Instant::now().checked_sub(refresh + Duration::from_secs(1)) {
-            assert!(!credential(due).reusable_for(4, 2), "due for refresh");
+    fn binlog_source(updated_at: chrono::DateTime<Utc>) -> s3_sources::Model {
+        s3_sources::Model {
+            id: 4,
+            name: "archive".to_string(),
+            bucket_name: "b".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: "fleet".to_string(),
+            access_key_id: String::new(),
+            secret_key: String::new(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            worker_credentials: s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+            created_at: updated_at,
+            updated_at,
+            backing_service_id: None,
         }
+    }
+
+    /// A worker MariaDB's binary-log credential is reused only for exactly
+    /// what it was minted for: the same source, unchanged, the same bucket
+    /// and prefix (the service's name), the same node.
+    #[test]
+    fn a_binlog_credential_is_reused_only_for_what_it_was_minted_for() {
+        let now = Utc::now();
+        let source = binlog_source(now);
+        let grant = BinlogCredentialGrant::of("shop", 2, &source);
+        assert_eq!(grant.prefix, "fleet/external_services/mariadb/shop/binlog/");
+        assert_eq!(grant, BinlogCredentialGrant::of("shop", 2, &source));
+        assert_ne!(
+            grant,
+            BinlogCredentialGrant::of("shop", 3, &source),
+            "another node"
+        );
+        let edited = binlog_source(now + chrono::Duration::seconds(1));
+        assert_ne!(
+            grant,
+            BinlogCredentialGrant::of("shop", 2, &edited),
+            "an edited source"
+        );
+        let moved = s3_sources::Model {
+            bucket_name: "other".to_string(),
+            ..source.clone()
+        };
+        assert_ne!(
+            grant,
+            BinlogCredentialGrant::of("shop", 2, &moved),
+            "another bucket"
+        );
+        assert_ne!(
+            grant,
+            BinlogCredentialGrant::of("renamed", 2, &source),
+            "a renamed service"
+        );
+    }
+
+    /// A scoped credential is reused for the refresh interval, cut short
+    /// before its own expiry; a full one, or one about to expire, never.
+    #[test]
+    fn a_binlog_credential_is_reused_within_its_lifetime_only() {
+        use crate::worker_s3_scope::{WorkerCredentialScope, ARCHIVE_CREDENTIAL_REFRESH_INTERVAL};
+        let now = Utc::now();
+        let scoped = |expires_at| WorkerCredentialScope::Scoped {
+            minted_by: "sts",
+            expires_at,
+        };
+        assert_eq!(
+            binlog_credential_reuse_window(&scoped(None), now),
+            Some(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL)
+        );
+        assert_eq!(
+            binlog_credential_reuse_window(&scoped(Some(now + chrono::Duration::hours(24))), now),
+            Some(ARCHIVE_CREDENTIAL_REFRESH_INTERVAL)
+        );
+        assert_eq!(
+            binlog_credential_reuse_window(&scoped(Some(now + chrono::Duration::hours(1))), now),
+            Some(Duration::from_secs(50 * 60)),
+            "a store that grants an hour"
+        );
+        assert_eq!(
+            binlog_credential_reuse_window(&scoped(Some(now + chrono::Duration::minutes(5))), now),
+            None
+        );
+        assert_eq!(
+            binlog_credential_reuse_window(&scoped(Some(now - chrono::Duration::minutes(5))), now),
+            None
+        );
+        assert_eq!(
+            binlog_credential_reuse_window(
+                &WorkerCredentialScope::Full {
+                    reason: "no STS".to_string()
+                },
+                now
+            ),
+            None,
+            "the source's own credential is never cached"
+        );
     }
 }

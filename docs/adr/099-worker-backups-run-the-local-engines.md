@@ -176,17 +176,34 @@ The hard cases, and how they are resolved:
   falls back to an archive under the stream's grant.
 - **MariaDB binary logs** are shipped on every archive interval, not once
   per job. The health monitor reuses one archive-class credential per
-  service and mints another every two hours, after a run that failed, or
-  when the service moves to another node or source. Pruning stays on the
-  control plane with its own credential, because the grant carries no
-  delete.
+  service, and only while everything it was minted for is unchanged: the
+  same node, the same source (any edit bumps its `updated_at`), the same
+  bucket and `binlog/` prefix. It mints another every two hours, ten
+  minutes before the credential's own expiry if that comes sooner, and
+  after a run that failed. A source's full credential (`allow_full`) is
+  never cached, so switching the source to scoped takes effect on the next
+  run. Pruning stays on the control plane with its own credential, because
+  the grant carries no delete.
 - **Cross-service PITR** reads the binary logs of the service the base was
   taken of. The read grant is derived from the backup's layout the same way
   the node derives which logs to replay (`binlog_read_prefix`), so the
   credential reaches exactly those logs.
 
+A restore's read grant must sit at least three segments below the
+source's base path (`external_services/<engine>/<service>/`), whatever a
+backup row's location says. A location whose grant would span more than
+one service's backups is refused, never granted.
+
 No grant includes `s3:DeleteObject`. Retention and pruning run on the
-control plane.
+control plane. What remains, by design:
+
+- A restore of another service's backup gives the target's node read
+  access to the origin's whole WAL-G repository, plus its whole `binlog/`
+  prefix for a point-in-time recovery, for the job's 12-hour lifetime, not
+  only the chosen base.
+- A write grant on a repository can overwrite, though not delete, earlier
+  objects of the same service. Only bucket versioning or object lock
+  protects against a compromised node doing that.
 
 This refines ADR-093's table for these engines. A WAL-G stream writes the
 service's repository, as PostgreSQL's does, not a per-backup directory,

@@ -136,6 +136,28 @@ pub fn restore_read_prefix(location: &str, bucket: &str) -> Option<String> {
     (!prefix.is_empty()).then_some(prefix)
 }
 
+/// How deep below the source's base path a restore's read grant must sit:
+/// `external_services/<engine>/<service>/` at least, so a grant never spans
+/// more than one service's backups, whatever a backup row's location says.
+pub const MIN_RESTORE_PREFIX_DEPTH: usize = 3;
+
+/// Whether `prefix` sits at least [`MIN_RESTORE_PREFIX_DEPTH`] path
+/// segments below `bucket_path` (the S3 source's base path).
+pub fn within_one_service(prefix: &str, bucket_path: &str) -> bool {
+    let root = bucket_path.trim_matches('/');
+    let prefix = prefix.trim_matches('/');
+    let below = if root.is_empty() {
+        Some(prefix)
+    } else {
+        prefix
+            .strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+    };
+    below.is_some_and(|below| {
+        below.split('/').filter(|part| !part.is_empty()).count() >= MIN_RESTORE_PREFIX_DEPTH
+    })
+}
+
 /// The S3 destination a worker job receives (ADR-093): a credential the
 /// control plane derives for `grant` (the job's prefixes, read or write, a
 /// lifetime), never the source's own unless the source allows it and cannot
@@ -457,6 +479,33 @@ mod tests {
             "   ",
         ] {
             assert_eq!(restore_read_prefix(refused, "backups"), None, "{refused:?}");
+        }
+    }
+
+    /// A read grant spans one service's backups at most, under an empty
+    /// base path too.
+    #[test]
+    fn a_restore_grant_stays_within_one_service() {
+        assert!(within_one_service(
+            "base/external_services/mongodb/orders/walg/",
+            "/base/"
+        ));
+        assert!(within_one_service(
+            "external_services/mariadb/shop/binlog/",
+            ""
+        ));
+        assert!(within_one_service("external_services/mongodb/orders/", ""));
+        for (prefix, bucket_path) in [
+            ("external_services/mongodb/", ""),
+            ("base/external_services/mongodb/", "base"),
+            ("base/", "base"),
+            ("other/external_services/mongodb/orders/", "base"),
+            ("basement/external_services/mongodb/orders/", "base"),
+        ] {
+            assert!(
+                !within_one_service(prefix, bucket_path),
+                "{prefix:?} under {bucket_path:?}"
+            );
         }
     }
 

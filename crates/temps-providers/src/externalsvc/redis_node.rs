@@ -214,7 +214,8 @@ fn tail(text: &str) -> String {
 }
 
 /// One WAL-G stream backup of a Redis service.
-#[derive(Debug, Clone)]
+/// `Debug` redacts the password.
+#[derive(Clone)]
 pub struct RedisWalgBackup {
     pub service_id: i32,
     pub service: String,
@@ -223,6 +224,19 @@ pub struct RedisWalgBackup {
     pub password: String,
     pub s3: S3Credentials,
     pub backup_uuid: String,
+}
+
+impl std::fmt::Debug for RedisWalgBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisWalgBackup")
+            .field("service_id", &self.service_id)
+            .field("service", &self.service)
+            .field("container_name", &self.container_name)
+            .field("password", &"[REDACTED]")
+            .field("s3", &self.s3)
+            .field("backup_uuid", &self.backup_uuid)
+            .finish()
+    }
 }
 
 /// Push a WAL-G stream backup of `backup`'s Redis from its container on
@@ -275,7 +289,8 @@ pub async fn redis_walg_backup(
 }
 
 /// One RDB backup of a Redis service.
-#[derive(Debug, Clone)]
+/// `Debug` redacts the password.
+#[derive(Clone)]
 pub struct RedisRdbBackup {
     pub service_id: i32,
     pub service: String,
@@ -285,6 +300,19 @@ pub struct RedisRdbBackup {
     pub destination: WorkerS3Destination,
     /// The `…/dump.rdb.gz` object it writes.
     pub key: String,
+}
+
+impl std::fmt::Debug for RedisRdbBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisRdbBackup")
+            .field("service_id", &self.service_id)
+            .field("service", &self.service)
+            .field("container_name", &self.container_name)
+            .field("password", &"[REDACTED]")
+            .field("destination", &self.destination)
+            .field("key", &self.key)
+            .finish()
+    }
 }
 
 /// Whether `key` is an RDB backup of `service` (`…/external_services/redis/
@@ -624,6 +652,42 @@ mod tests {
             bucket_name: "backups".to_string(),
             bucket_path: "fleet".to_string(),
             force_path_style: true,
+        }
+    }
+
+    /// A Redis backup printed for a log or an error carries neither the
+    /// server's password nor the S3 secret.
+    #[test]
+    fn redis_backups_debug_print_no_secret() {
+        let walg = RedisWalgBackup {
+            service_id: 8,
+            service: "cache".to_string(),
+            container_name: "redis-cache".to_string(),
+            password: "redis-secret".to_string(),
+            s3: credentials(Some("token-secret")),
+            backup_uuid: "u-1".to_string(),
+        };
+        let rdb = RedisRdbBackup {
+            service_id: 8,
+            service: "cache".to_string(),
+            container_name: "redis-cache".to_string(),
+            password: "redis-secret".to_string(),
+            destination: WorkerS3Destination {
+                bucket: "backups".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                force_path_style: true,
+                access_key_id: "AKID".to_string(),
+                secret_access_key: "SECRET".to_string(),
+                session_token: Some("token-secret".to_string()),
+            },
+            key: "fleet/external_services/redis/cache/u-1/dump.rdb.gz".to_string(),
+        };
+        for printed in [format!("{walg:?}"), format!("{rdb:?}")] {
+            for secret in ["redis-secret", "SECRET", "token-secret"] {
+                assert!(!printed.contains(secret), "{printed}");
+            }
+            assert!(printed.contains("redis-cache"), "{printed}");
         }
     }
 

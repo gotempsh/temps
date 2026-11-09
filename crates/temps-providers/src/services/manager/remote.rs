@@ -1298,13 +1298,30 @@ impl ExternalServiceManager {
     /// mints another every
     /// [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`](crate::worker_s3_scope::ARCHIVE_CREDENTIAL_REFRESH_INTERVAL).
     /// A source that cannot scope one is refused unless its worker
-    /// credentials setting allows the full credential, which is then logged.
+    /// credentials setting allows the full credential, which is then logged;
+    /// the returned scope says which it is, and when a scoped one expires.
+    /// An endpoint on this server's loopback is refused before anything is
+    /// minted.
     pub async fn mariadb_binlog_archive_destination(
         &self,
         service: &temps_entities::external_services::Model,
         node_id: i32,
         s3_source: &temps_entities::s3_sources::Model,
-    ) -> Result<crate::remote_service_client::WorkerS3Destination, ExternalServiceError> {
+    ) -> Result<crate::worker_s3_scope::ScopedWorkerDestination, ExternalServiceError> {
+        if let Some(endpoint) = s3_source
+            .endpoint
+            .as_deref()
+            .filter(|endpoint| is_loopback_endpoint(endpoint))
+        {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: service.id,
+                reason: format!(
+                    "the S3 source's endpoint {endpoint} is this server's loopback address, \
+                     which worker node {node_id} cannot reach for MariaDB binary-log \
+                     archiving; use an address the node can reach"
+                ),
+            });
+        }
         let scoped = self
             .worker_credentials
             .destination(
@@ -1329,7 +1346,7 @@ impl ExternalServiceManager {
         if let Some(warning) = scoped.warning(&s3_source.name, node_id) {
             warn!(service_id = service.id, node_id, "{warning}");
         }
-        Ok(scoped.destination)
+        Ok(scoped)
     }
 
     /// Ship the binary logs of MariaDB service `service_id`, which runs on a

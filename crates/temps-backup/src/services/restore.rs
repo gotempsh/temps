@@ -3791,7 +3791,10 @@ pub(super) struct WorkerRestoreDeps<'a> {
 /// read-only credential for `backup`'s own location (its WAL-G repository,
 /// or its object's directory) and for `extra_prefixes` (a point-in-time
 /// recovery's binary logs), never the source's own. A location outside the
-/// source's bucket, or with no directory of its own, is refused.
+/// source's bucket, with no directory of its own, or whose grant would span
+/// more than one service's backups
+/// ([`within_one_service`](crate::engines::worker_agent::within_one_service)),
+/// is refused.
 pub(super) async fn worker_read_destination(
     db: &Arc<DatabaseConnection>,
     scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
@@ -3818,6 +3821,21 @@ pub(super) async fn worker_read_destination(
             ),
         });
     };
+    // However the row's location reads, the grant spans one service's
+    // backups at most.
+    if let Some(wide) = std::iter::once(&read_prefix)
+        .chain(extra_prefixes)
+        .find(|prefix| !worker_agent::within_one_service(prefix, &s3_source.bucket_path))
+    {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} at '{}' would need read access to '{wide}' in S3 source {}, which is \
+                 not inside one service's backups under '{}'; a restore on worker node \
+                 {node_id} is refused rather than given it",
+                backup.id, backup.s3_location, backup.s3_source_id, s3_source.bucket_path
+            ),
+        });
+    }
     let mut grant = temps_providers::worker_s3_scope::WorkerS3Grant::job(
         target_id,
         node_id,

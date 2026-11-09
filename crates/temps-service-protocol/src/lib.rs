@@ -736,7 +736,9 @@ pub enum MongodbBackupResult {
 /// backup-fetch` inside the container, a mongodump archive (an object key) is
 /// downloaded and replayed by a `mongorestore --drop` sidecar. No command
 /// comes from the caller.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// `Debug` prints neither password: only the service's name stands for its
+/// configuration, and the origin's password is redacted.
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MongodbRestoreRequest {
     pub service_id: i32,
@@ -754,6 +756,22 @@ pub struct MongodbRestoreRequest {
     /// The backup: a WAL-G repository `s3://<source's bucket>/…`, or a
     /// mongodump archive's key in the source's bucket.
     pub location: String,
+}
+
+impl std::fmt::Debug for MongodbRestoreRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongodbRestoreRequest")
+            .field("service_id", &self.service_id)
+            .field("node_id", &self.node_id)
+            .field("service", &self.service_config.name)
+            .field(
+                "origin_password",
+                &self.origin_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("source", &self.source)
+            .field("location", &self.location)
+            .finish()
+    }
 }
 
 impl MongodbRestoreRequest {
@@ -1226,6 +1244,43 @@ pub trait NodeServiceRuntime: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A MongoDB restore request printed for a log or an error shows which
+    /// service and backup, never a password or the S3 secret.
+    #[test]
+    fn a_mongodb_restore_request_debug_prints_no_secret() {
+        let request = MongodbRestoreRequest {
+            service_id: 8,
+            node_id: 2,
+            service_config: ServiceConfig {
+                name: "orders".to_string(),
+                service_type: ServiceType::Mongodb,
+                version: None,
+                parameters: serde_json::json!({ "password": "target-secret" }),
+            },
+            origin_password: Some("origin-secret".to_string()),
+            source: WorkerS3Destination {
+                bucket: "b".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: None,
+                force_path_style: true,
+                access_key_id: "AKID".to_string(),
+                secret_access_key: "s3-secret".to_string(),
+                session_token: Some("token-secret".to_string()),
+            },
+            location: "fleet/external_services/mongodb/orders/walg".to_string(),
+        };
+        let printed = format!("{request:?}");
+        for secret in [
+            "target-secret",
+            "origin-secret",
+            "s3-secret",
+            "token-secret",
+        ] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert!(printed.contains("orders"), "{printed}");
+    }
 
     #[test]
     fn service_type_names_round_trip_and_an_unknown_one_is_not_repeated() {
