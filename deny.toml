@@ -36,7 +36,7 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; only the pinned microsandbox SDK uses it" },
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26 is a shim re-exporting the fixed 1.0.10 roots" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only reached by aws-sigv4 SigV4A, which Temps does not use" },
-    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite via sea-orm's sqlx-sqlite; the server only connects to PostgreSQL, SQLite is in-memory test use" },
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite: no patched libsqlite3-sys is reachable; sea-orm's use is in-memory tests, microsandbox's WAL catalog sits in the 0700 Temps-owned SDK home" },
 ]
 
 [licenses]
