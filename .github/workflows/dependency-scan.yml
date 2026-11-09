@@ -122,13 +122,13 @@ jobs:
       #   vulnerability is reported against bincode 2.0.1. A temps-core
       #   Cargo.lock guard test fails if anything else starts depending on it.
       #
-      # The five below are vulnerability/unsoundness advisories (not "unmaintained"
+      # The six below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices). A version bump here cannot clear any of them: either no fix is
       # released, or an upstream crate still requires the affected copy.
       # Reachability analysis for RUSTSEC-2023-0071, RUSTSEC-2026-0235 and
       # RUSTSEC-2026-0253 lives in the root Cargo.toml under "Dependency
-      # Overrides - Security Fixes"; for RUSTSEC-2026-0381 and RUSTSEC-2026-0387
-      # it is the note on the entry itself. Re-verify that analysis before
+      # Overrides - Security Fixes"; for RUSTSEC-2026-0381, RUSTSEC-2026-0387
+      # and RUSTSEC-2026-0459 it is the note on the entry itself. Re-verify that analysis before
       # removing/renewing these on advisory-db updates:
       # - RUSTSEC-2023-0071 (rsa, Marvin Attack). Locked paths and how each
       #   uses RSA:
@@ -205,6 +205,22 @@ jobs:
       #   this repository makes are signed with plain SigV4 (HMAC-SHA256),
       #   which does not touch it. Drop this entry once aws-sigv4 moves to
       #   crypto-bigint >= 0.7.6.
+      # - RUSTSEC-2026-0459 (libsqlite3-sys: bundled SQLite < 3.54.0 can
+      #   return uninitialized page-cache memory when it opens a database
+      #   together with a crafted sibling `-wal` file of a different page
+      #   size; fixed in >= 0.39.0). The only copy, 0.30.1, comes from
+      #   sqlx-sqlite 0.8, which sea-orm 1.1 enables via its `sqlx-sqlite`
+      #   feature; sqlx 0.8 requires libsqlite3-sys 0.30 and the crate is
+      #   `links = "sqlite3"`, so no second, patched copy can coexist and
+      #   0.30 has no patched release. Exposure needs a process that opens an
+      #   on-disk database plus `-wal` that a less trusted party wrote. The
+      #   server never does: temps-database only accepts postgres:// URLs
+      #   (connection.rs parse_database_url), and SQLite is used through
+      #   `sqlite::memory:` connections in tests, which have no files. The
+      #   legacy SQLite branch of the backup restore (temps-backup
+      #   restore.rs) only runs for a sqlite: database URL, which the server
+      #   cannot start with. Drop this entry once sea-orm/sqlx move to
+      #   libsqlite3-sys >= 0.39.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
@@ -220,7 +236,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459
 
   cargo-deny:
     name: Rust Licences, Sources & Bans (cargo-deny)
