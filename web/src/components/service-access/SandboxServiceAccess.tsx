@@ -25,6 +25,7 @@ import {
   type ServiceGrantResponse,
 } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
+import { CodeBlock } from '@/components/ui/code-block'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   DropdownMenu,
@@ -33,7 +34,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { ServiceGrantEditor } from './ServiceGrantEditor'
-import { grantLabels } from './service-access-form'
+import { grantLabels, enforcementLabels } from './service-access-form'
 
 function pageNumber(raw: string | null) {
   const parsed = Number(raw)
@@ -63,6 +64,7 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
     const query = new URLSearchParams({ sandbox: sandboxId })
     navigate(`/projects/${projectId}/access-services/${suffix}?${query}`)
   }
+  const [grantMode, setGrantMode] = useState<'request' | 'approve'>('request')
   const [requesting, setRequesting] = useState<AccessServiceResponse>()
   const capability = useQuery({
     ...accessCapabilityOptions({ path: { project_id: projectId ?? 0 } }),
@@ -103,7 +105,9 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
     },
     onSuccess: () => {
       setRevokeTarget(undefined)
-      toast.success('Saved access request revoked')
+      toast.success('Revocation requested', {
+        description: 'Waiting for worker confirmation or signed lease expiry.',
+      })
       refresh()
     },
     onError: (error) =>
@@ -146,7 +150,14 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
         <div className="space-y-6">
           {capability.isLoading && <Skeleton className="h-20 w-full" />}
           {capability.data && (
-            <Callout tone="warning" title="Sandbox connections unavailable">
+            <Callout
+              tone={capability.data.configured ? 'info' : 'warning'}
+              title={
+                capability.data.configured
+                  ? 'Approve sandbox service access'
+                  : 'Sandbox connections unavailable'
+              }
+            >
               {capability.data.reason}
               {capability.data.setup_path && (
                 <Link
@@ -163,6 +174,33 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
               Editing services requires project write permission. Ask a project
               administrator for access.
             </Callout>
+          )}
+          {capability.data?.configured && (
+            <details className="rounded-md border p-3 text-sm">
+              <summary className="cursor-pointer font-medium">
+                Use an approved service from Terminal
+              </summary>
+              <p className="my-3 text-muted-foreground">
+                Wait for Connected, then run the command inside this sandbox.
+                Replace the example URL with an approved destination. No API
+                token is needed. These options apply only to this command; other
+                traffic keeps the sandbox’s existing network policy.
+              </p>
+              <CodeBlock
+                language="shell"
+                title="HTTPS API"
+                code={
+                  'curl --proxy http://127.0.0.1:3128 --cacert /run/temps-service-access/ca.pem "https://api.example.com/v1"'
+                }
+              />
+              <CodeBlock
+                language="shell"
+                title="GitHub clone (read-only Git grant)"
+                code={
+                  'GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.proxy=http://127.0.0.1:3128 -c http.sslCAInfo=/run/temps-service-access/ca.pem clone "https://github.com/<owner>/<private-repo>.git"'
+                }
+              />
+            </details>
           )}
           {capability.data && !capability.data.can_manage_requests && (
             <Callout title="Access requests are read-only">
@@ -240,10 +278,23 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
                       <Button
                         size="sm"
                         variant="outline"
-                        disabled={!mayRequest || !row.enabled}
-                        onClick={() => setRequesting(row)}
+                        disabled={
+                          !mayRequest ||
+                          !row.enabled ||
+                          (capability.data?.configured &&
+                            !!row.policy.github_repository &&
+                            !capability.data.can_use_project_github)
+                        }
+                        onClick={() => {
+                          setGrantMode(
+                            capability.data?.configured ? 'approve' : 'request'
+                          )
+                          setRequesting(row)
+                        }}
                       >
-                        Request access
+                        {capability.data?.configured
+                          ? 'Grant access'
+                          : 'Request access'}
                       </Button>
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
@@ -259,6 +310,17 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
+                          {capability.data?.configured && (
+                            <DropdownMenuItem
+                              disabled={!mayRequest || !row.enabled}
+                              onSelect={() => {
+                                setGrantMode('request')
+                                setRequesting(row)
+                              }}
+                            >
+                              Save request for review
+                            </DropdownMenuItem>
+                          )}
                           <DropdownMenuItem
                             disabled={!mayEdit}
                             onSelect={() => openEditor(row.id)}
@@ -294,7 +356,7 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
               size="compact"
               icon={PlugZap}
               title="No access requests"
-              description="Choose Request access on a service and set a lifetime. Saved requests do not connect this sandbox yet."
+              description="Choose a service and review its policy and lifetime. Operator approval is separate from saving a request."
             />
           ) : (
             <DataTable
@@ -311,12 +373,19 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
                       <p className="font-medium">{row.service_name}</p>
                       <Status
                         tone={
-                          row.status === 'integration_unavailable' ||
-                          row.status === 'policy_changed'
-                            ? 'warn'
-                            : 'idle'
+                          row.enforcement === 'active'
+                            ? 'ok'
+                            : row.enforcement === 'stopping' ||
+                                row.status === 'integration_unavailable' ||
+                                row.status === 'policy_changed'
+                              ? 'warn'
+                              : 'idle'
                         }
-                        label={grantLabels[row.status]}
+                        label={
+                          row.enforcement && row.enforcement !== 'not_requested'
+                            ? enforcementLabels[row.enforcement]
+                            : grantLabels[row.status]
+                        }
                       />
                       <p className="text-xs text-muted-foreground">
                         {row.reason}
@@ -374,7 +443,7 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
         resourceType="access request"
         resourceName={revokeTarget?.service_name ?? ''}
         verb="Revoke"
-        consequences="This cancels the saved request. Create a new request if you need access later."
+        consequences="This requests removal of the grant. Access stops after worker confirmation or signed lease expiry, within 30 seconds without renewal. New access requires another approval."
         isPending={revoke.isPending}
         onConfirm={() => {
           if (mayRevoke && revokeTarget) revoke.mutate(revokeTarget)
@@ -384,6 +453,7 @@ function ServiceAccessPanel({ projectId, sandboxId }: PanelProps) {
         projectId={projectId}
         sandboxId={sandboxId}
         service={mayRequest ? requesting : undefined}
+        mode={grantMode}
         onClose={() => setRequesting(undefined)}
         onSaved={refresh}
       />

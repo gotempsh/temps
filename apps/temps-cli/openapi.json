@@ -68,6 +68,7 @@
       },
       "AccessCapabilityState": {
         "enum": [
+          "available",
           "integration_unavailable"
         ],
         "type": "string"
@@ -34607,6 +34608,17 @@
         ],
         "type": "object"
       },
+      "GrantEnforcement": {
+        "description": "Observed worker enforcement, independent of the requested authorization.",
+        "enum": [
+          "not_requested",
+          "pending",
+          "active",
+          "stopping",
+          "stopped"
+        ],
+        "type": "string"
+      },
       "GroupEnvVarResponse": {
         "description": "A group variable as returned by the API. `value` is `\"***\"` in lists,\nplaintext only in the create/update response of a non-secret variable,\nand always `null` for secrets.",
         "properties": {
@@ -63720,12 +63732,15 @@
       "ServiceGrantResponse": {
         "properties": {
           "connected": {
-            "description": "Always false until an enforcement adapter is implemented.",
+            "description": "True only for a current, live acknowledgment of this exact grant.",
             "type": "boolean"
           },
           "created_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "enforcement": {
+            "$ref": "#/components/schemas/GrantEnforcement"
           },
           "expires_at": {
             "format": "date-time",
@@ -63777,6 +63792,7 @@
           "policy",
           "status",
           "reason",
+          "enforcement",
           "connected",
           "version",
           "created_at",
@@ -63786,6 +63802,8 @@
       },
       "ServiceGrantStatus": {
         "enum": [
+          "pending_approval",
+          "approved",
           "integration_unavailable",
           "expired",
           "revoked",

@@ -125,11 +125,24 @@ pub struct RevokeServiceGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceGrantStatus {
+    PendingApproval,
+    Approved,
     IntegrationUnavailable,
     Expired,
     Revoked,
     ServiceDisabled,
     PolicyChanged,
+}
+
+/// Observed worker enforcement, independent of the requested authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantEnforcement {
+    NotRequested,
+    Pending,
+    Active,
+    Stopping,
+    Stopped,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -142,7 +155,8 @@ pub struct ServiceGrantResponse {
     pub policy: SandboxAccessPolicy,
     pub status: ServiceGrantStatus,
     pub reason: String,
-    /// Always false until an enforcement adapter is implemented.
+    pub enforcement: GrantEnforcement,
+    /// True only for a current, live acknowledgment of this exact grant.
     pub connected: bool,
     pub version: i32,
     #[schema(value_type = String, format = DateTime)]

@@ -300,6 +300,12 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
         assert!(prepared.claims().exp <= grant.expires_at);
         assert!(prepared.claims().exp > grant.expires_at - chrono::Duration::seconds(2));
     }
+    let applied_ids: Vec<String> = plan.bindings[0]
+        .plan
+        .grants()
+        .iter()
+        .map(|g| g.grant_id().to_owned())
+        .collect();
     let revision = plan.expected_revision;
     let issued = store
         .issue(
@@ -338,16 +344,16 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
             assert!(queue.supersede(claim).await.is_err());
             for deadline in [Utc::now(), Utc::now() + chrono::Duration::seconds(31)] {
                 assert!(queue
-                    .complete_applied(claim, revision, deadline)
+                    .complete_applied(claim, revision, deadline, &applied_ids)
                     .await
                     .is_err());
             }
             assert!(queue
-                .complete_applied(claim, revision + 1, issued.lease_expires_at())
+                .complete_applied(claim, revision + 1, issued.lease_expires_at(), &applied_ids)
                 .await
                 .is_err());
             queue
-                .complete_applied(claim, revision, issued.lease_expires_at())
+                .complete_applied(claim, revision, issued.lease_expires_at(), &applied_ids)
                 .await
                 .unwrap();
         }

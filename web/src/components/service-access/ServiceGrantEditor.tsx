@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
@@ -15,7 +15,11 @@ import {
   Input,
 } from '@temps-sdk/ui'
 import { toast } from 'sonner'
-import { requestServiceGrant, type AccessServiceResponse } from '@/api/client'
+import {
+  approveServiceGrant,
+  requestServiceGrant,
+  type AccessServiceResponse,
+} from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 import { grantRequestSchema } from './service-access-form'
 
@@ -25,13 +29,23 @@ export function ServiceGrantEditor({
   service,
   onClose,
   onSaved,
+  mode = 'request',
 }: {
   projectId?: number | null
   sandboxId: string
+  mode?: 'request' | 'approve'
   service?: AccessServiceResponse
   onClose: () => void
   onSaved: () => void
 }) {
+  const mounted = useRef(true)
+  const approval = useRef<{ key: string; id: string } | null>(null)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
   const form = useForm<{ ttl: number }>({
     resolver: zodResolver(grantRequestSchema),
     defaultValues: { ttl: 900 },
@@ -42,6 +56,22 @@ export function ServiceGrantEditor({
         throw new Error('Choose a service before requesting access')
       if (ttl > service.max_ttl_seconds)
         throw new Error('Lifetime exceeds this service’s maximum')
+      const path = { project_id: projectId, sandbox_id: sandboxId }
+      const body = {
+        service_id: service.id,
+        service_version: service.version,
+        ttl_seconds: ttl,
+      }
+      if (mode === 'approve') {
+        const key = JSON.stringify({ path, body })
+        if (approval.current?.key !== key)
+          approval.current = { key, id: crypto.randomUUID() }
+        return approveServiceGrant({
+          path,
+          body: { ...body, request_id: approval.current.id },
+          throwOnError: true,
+        })
+      }
       return requestServiceGrant({
         path: { project_id: projectId, sandbox_id: sandboxId },
         body: {
@@ -53,10 +83,17 @@ export function ServiceGrantEditor({
       })
     },
     onSuccess: () => {
-      toast.success('Access request saved', {
-        description: 'The sandbox is not connected. The lifetime starts now.',
-      })
       onSaved()
+      if (!mounted.current) return
+      toast.success(
+        mode === 'approve' ? 'Access approved' : 'Access request saved',
+        {
+          description:
+            mode === 'approve'
+              ? 'Waiting for the assigned worker to confirm access. The lifetime starts now.'
+              : 'The sandbox is not connected. Operator approval is required.',
+        }
+      )
       onClose()
     },
   })
@@ -64,7 +101,8 @@ export function ServiceGrantEditor({
   useEffect(() => {
     form.reset({ ttl: Math.min(900, service?.max_ttl_seconds ?? 900) })
     resetMutation()
-  }, [service, form, resetMutation])
+    approval.current = null
+  }, [service, form, resetMutation, mode])
   return (
     <Dialog
       open={!!service}
@@ -74,18 +112,23 @@ export function ServiceGrantEditor({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Request access to {service?.name}</DialogTitle>
+          <DialogTitle>
+            {mode === 'approve' ? 'Approve access to' : 'Request access to'}{' '}
+            {service?.name}
+          </DialogTitle>
           <DialogDescription>
-            The Tokenless integration is not installed. This saves a request; it
-            will not connect automatically when the integration becomes
-            available.
+            {mode === 'approve'
+              ? 'Approve the displayed service policy for this sandbox and lifetime. Credentials stay on the host. Access begins only after the worker confirms it.'
+              : 'Save a request for operator review. Saving alone does not connect the sandbox or approve access.'}
           </DialogDescription>
         </DialogHeader>
         <Settings
           embedded
           title="Access lifetime"
           saving={save.isPending}
-          saveLabel="Save access request"
+          saveLabel={
+            mode === 'approve' ? 'Approve access' : 'Save access request'
+          }
           errors={{ 'Lifetime (seconds)': form.formState.errors.ttl?.message }}
           onSubmit={form.handleSubmit((values) => save.mutate(values))}
         >
@@ -98,6 +141,7 @@ export function ServiceGrantEditor({
                 )}
               </Callout>
             )}
+            <p className="break-all text-sm">Sandbox: {sandboxId}</p>
             <p className="break-all text-sm">
               {service?.policy.origin} · {service?.policy.methods.join(', ')} ·{' '}
               {service?.policy.path_prefixes.join(', ')}
@@ -118,7 +162,9 @@ export function ServiceGrantEditor({
               )}
             </Field>
             <p className="text-xs text-muted-foreground">
-              No sandbox connection will be created.
+              {mode === 'approve'
+                ? 'A new sandbox incarnation requires another approval. You can revoke this grant at any time.'
+                : 'No sandbox connection will be created.'}
             </p>
           </fieldset>
         </Settings>

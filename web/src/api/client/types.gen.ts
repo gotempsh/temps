@@ -38,7 +38,7 @@ export type AccessCapability = {
     state: AccessCapabilityState;
 };
 
-export type AccessCapabilityState = 'integration_unavailable';
+export type AccessCapabilityState = 'available' | 'integration_unavailable';
 
 export type AccessMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
@@ -16272,6 +16272,11 @@ export type GoalResponse = {
 };
 
 /**
+ * Observed worker enforcement, independent of the requested authorization.
+ */
+export type GrantEnforcement = 'not_requested' | 'pending' | 'active' | 'stopping' | 'stopped';
+
+/**
  * A group variable as returned by the API. `value` is `"***"` in lists,
  * plaintext only in the create/update response of a non-secret variable,
  * and always `null` for secrets.
@@ -30157,10 +30162,11 @@ export type ServiceGrantList = {
 
 export type ServiceGrantResponse = {
     /**
-     * Always false until an enforcement adapter is implemented.
+     * True only for a current, live acknowledgment of this exact grant.
      */
     connected: boolean;
     created_at: string;
+    enforcement: GrantEnforcement;
     expires_at: string;
     id: string;
     policy: SandboxAccessPolicy;
@@ -30174,7 +30180,7 @@ export type ServiceGrantResponse = {
     version: number;
 };
 
-export type ServiceGrantStatus = 'integration_unavailable' | 'expired' | 'revoked' | 'service_disabled' | 'policy_changed';
+export type ServiceGrantStatus = 'pending_approval' | 'approved' | 'integration_unavailable' | 'expired' | 'revoked' | 'service_disabled' | 'policy_changed';
 
 export type ServiceHealthResponse = {
     /**

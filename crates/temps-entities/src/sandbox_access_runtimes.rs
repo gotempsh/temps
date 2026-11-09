@@ -22,6 +22,9 @@ pub struct Model {
     pub lease_expires_at: Option<temps_core::DBDateTime>,
     pub desired_version: i64,
     pub applied_version: i64,
+    /// Revision and exact grants from the last verified worker receipt.
+    pub applied_revision: Option<i64>,
+    pub applied_grant_ids: Vec<String>,
     /// Closed incarnations never accept further grants.
     pub closed_at: Option<temps_core::DBDateTime>,
     pub created_at: temps_core::DBDateTime,

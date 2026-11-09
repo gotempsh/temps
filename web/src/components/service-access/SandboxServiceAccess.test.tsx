@@ -127,6 +127,7 @@ test('a stale-policy request displays its reason and absolute expiry', () => {
           methods: ['GET'],
         },
         status: 'policy_changed',
+        enforcement: 'not_requested',
         reason: 'Review the changed policy.',
         connected: false,
         created_at: '2026-01-01T00:00:00Z',
@@ -213,6 +214,87 @@ function seed(
   })
   c.setQueryData(grantKey, { items: [], total: 0, page: 1, page_size: 20 })
 }
+
+test('a configured service opens explicit approval for the selected sandbox', async () => {
+  const c = client()
+  seed(c, true, true)
+  c.setQueryData(capabilityKey, {
+    configured: true,
+    can_save_requests: true,
+    can_manage_services: true,
+    can_use_project_github: false,
+    can_manage_requests: true,
+    state: 'available',
+    reason: 'Approve a service for the assigned worker.',
+    setup_path: null,
+  })
+  mount(
+    <QueryClientProvider client={c}>
+      <MemoryRouter>
+        <SandboxServiceAccess projectId={7} sandboxId="sbx_test" />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await act(async () =>
+    fireEvent.click(
+      within(document.body).getByRole('button', { name: 'Grant access' })
+    )
+  )
+  const dialog = within(document.body).getByRole('dialog')
+  expect(document.body.textContent).toContain(
+    'Use an approved service from Terminal'
+  )
+  expect(document.body.textContent).toContain(
+    '/run/temps-service-access/ca.pem'
+  )
+  expect(dialog.textContent).toContain('Sandbox: sbx_test')
+  expect(dialog.textContent).toContain('https://api.example.com')
+  expect(
+    within(dialog).getByRole('button', { name: 'Approve access' })
+  ).toBeTruthy()
+  expect(
+    within(dialog).queryByRole('button', { name: 'Save access request' })
+  ).toBeNull()
+  c.clear()
+})
+
+test.each([
+  ['pending', 'Connecting'],
+  ['active', 'Connected'],
+  ['stopping', 'Revoking'],
+  ['stopped', 'Disconnected'],
+] as const)(
+  'worker enforcement %s determines the displayed status',
+  (enforcement, label) => {
+    const c = client()
+    seed(c, true, true)
+    c.setQueryData(grantKey, {
+      items: [
+        {
+          id: 'grant_test',
+          service_id: testService.id,
+          service_name: testService.name,
+          sandbox_id: 'sbx_test',
+          service_version: 1,
+          version: 1,
+          policy: testService.policy,
+          status: 'approved',
+          enforcement,
+          connected: enforcement === 'active',
+          reason: 'Worker receipt status.',
+          created_at: '2026-01-01T00:00:00Z',
+          expires_at: '2026-01-01T00:30:00Z',
+          revoked_at: null,
+        },
+      ],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    })
+    expect(render(c, 7)).toContain(label)
+    c.clear()
+  }
+)
 
 test.each([
   [false, false],

@@ -240,6 +240,16 @@ impl ServiceAccessCoordinator {
                 reason: "authorization changed during planning; retry with the current version",
             });
         }
+        let grant_ids: Vec<String> = selected
+            .map(|binding| {
+                binding
+                    .plan
+                    .grants()
+                    .iter()
+                    .map(|grant| grant.grant_id().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         let revision = plan.expected_revision;
         let issued = self
             .authority
@@ -266,7 +276,7 @@ impl ServiceAccessCoordinator {
             return Err(error.into());
         }
         self.queue
-            .complete_applied(claim, revision, issued.lease_expires_at())
+            .complete_applied(claim, revision, issued.lease_expires_at(), &grant_ids)
             .await?;
         Ok(DispatchOutcome::Applied)
     }

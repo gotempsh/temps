@@ -69,7 +69,8 @@ async fn retirement_cannot_be_superseded_or_treated_as_a_live_lease() {
             .complete_applied(
                 &claim,
                 1,
-                chrono::Utc::now() + chrono::Duration::seconds(10)
+                chrono::Utc::now() + chrono::Duration::seconds(10),
+                &["grant_test".into()]
             )
             .await,
         Err(DeliveryError::Invalid { .. })

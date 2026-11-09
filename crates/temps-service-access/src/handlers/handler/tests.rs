@@ -434,7 +434,8 @@ async fn management_routes_return_typed_success_and_audit_each_write() {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![sandbox()]])
                 .append_query_results([vec![count()]])
-                .append_query_results([vec![(grant(), row())]]),
+                .append_query_results([vec![(grant(), row())]])
+                .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]),
             200,
             false,
         ),

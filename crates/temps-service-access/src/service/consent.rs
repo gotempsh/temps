@@ -240,6 +240,8 @@ impl ServiceAccessService {
                     lease_expires_at: Set(None),
                     desired_version: Set(0),
                     applied_version: Set(0),
+                    applied_revision: Set(None),
+                    applied_grant_ids: Set(Vec::new()),
                     closed_at: Set(None),
                     created_at: Set(now),
                     updated_at: Set(now),

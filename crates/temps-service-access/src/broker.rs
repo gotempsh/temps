@@ -1,14 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Integration seam only. Saving a request is deliberately separate from
-//! provisioning it. A future adapter must reauthorize a fresh request, bind it
-//! to a sandbox incarnation, and acknowledge enforcement before reporting ready.
-use crate::{
-    error::AccessError,
-    tokenless::{PreparedSession, RevokeSession},
-};
-use async_trait::async_trait;
+//! Capability reporting only. The coordinator owns fresh consent, delivery and
+//! verified worker receipts; saving a request never calls the data plane.
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -17,6 +11,7 @@ pub(crate) const UNAVAILABLE_REASON: &str = "Tokenless policy preparation is ava
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessCapabilityState {
+    Available,
     IntegrationUnavailable,
 }
 
@@ -36,18 +31,24 @@ pub struct AccessCapability {
     pub setup_path: Option<String>,
 }
 
-#[async_trait]
 pub trait ServiceAccessBroker: Send + Sync {
     fn capability(&self) -> AccessCapability;
-    /// No implementation may interpret an old saved intent as fresh consent.
-    /// Preparation alone does not authorize activation.
-    async fn provision(&self, session: &PreparedSession) -> Result<(), AccessError>;
-    /// Must not acknowledge until the runtime has stopped forwarding traffic.
-    async fn revoke(&self, session: &RevokeSession) -> Result<(), AccessError>;
+}
+
+/// Production adapter: Linux Docker workers support host-bound proxy sockets.
+/// The approval path checks the selected sandbox's actual provider support.
+pub struct EmbeddedTokenlessBroker;
+impl ServiceAccessBroker for EmbeddedTokenlessBroker {
+    fn capability(&self) -> AccessCapability {
+        let mut capability = UnavailableTokenlessBroker.capability();
+        capability.state = AccessCapabilityState::Available;
+        capability.configured = true;
+        capability.reason = "Approve time-limited access for Docker sandboxes on Linux workers. MicroVMs and Docker Desktop hosts do not yet support the proxy attachment. Approval checks the assigned worker; a saved request alone grants no access.".into();
+        capability
+    }
 }
 
 pub struct UnavailableTokenlessBroker;
-#[async_trait]
 impl ServiceAccessBroker for UnavailableTokenlessBroker {
     fn capability(&self) -> AccessCapability {
         AccessCapability {
@@ -61,45 +62,20 @@ impl ServiceAccessBroker for UnavailableTokenlessBroker {
             setup_path: None,
         }
     }
-    async fn provision(&self, session: &PreparedSession) -> Result<(), AccessError> {
-        Err(AccessError::BrokerUnavailable {
-            operation: "provision",
-            grant_id: session.grant_id().to_string(),
-        })
-    }
-    async fn revoke(&self, session: &RevokeSession) -> Result<(), AccessError> {
-        Err(AccessError::BrokerUnavailable {
-            operation: "revoke",
-            grant_id: session.grant_id.to_string(),
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn unavailable_adapter_never_claims_enforcement() {
-        let broker = UnavailableTokenlessBroker;
-        assert!(!broker.capability().configured);
-        assert!(broker
-            .capability()
-            .reason
-            .contains("live access is not enabled"));
-        assert!(broker.capability().reason.contains("new request"));
-        let session = crate::tokenless::tests::prepared_session();
-        let grant_id = session.grant_id().to_string();
-        let revoke = RevokeSession {
-            target: session.target().clone(),
-            grant_id: session.grant_id().into(),
-        };
-        for result in [
-            broker.provision(&session).await,
-            broker.revoke(&revoke).await,
-        ] {
-            assert!(
-                matches!(result, Err(AccessError::BrokerUnavailable { grant_id: id, .. }) if id == grant_id)
-            );
-        }
+    #[test]
+    fn capabilities_distinguish_saved_requests_from_embedded_approval() {
+        let unavailable = UnavailableTokenlessBroker.capability();
+        assert!(!unavailable.configured);
+        assert!(unavailable.can_save_requests);
+        let embedded = EmbeddedTokenlessBroker.capability();
+        assert!(embedded.configured);
+        assert_eq!(embedded.state, AccessCapabilityState::Available);
+        assert!(embedded.reason.contains("MicroVMs"));
+        assert!(!embedded.can_manage_requests);
     }
 }

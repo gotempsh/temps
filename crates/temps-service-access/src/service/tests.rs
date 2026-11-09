@@ -192,14 +192,14 @@ fn rejects_secret_and_lifetime_boundaries() {
     assert!(validate_service(&mut req).is_err());
 }
 #[test]
-fn typed_status_is_never_connected_and_expiry_is_exact() {
+fn intent_status_does_not_claim_enforcement_and_expiry_is_exact() {
     let s = row();
     let g = grant();
     let now = g.created_at;
     let result = grant_response(g.clone(), &s, "sbx_test", now).unwrap();
     assert!(!result.connected);
-    assert_eq!(result.status, ServiceGrantStatus::IntegrationUnavailable);
-    assert!(result.reason.contains("live access is not enabled"));
+    assert_eq!(result.status, ServiceGrantStatus::PendingApproval);
+    assert!(result.reason.contains("has not been approved"));
     assert_eq!(
         grant_response(g.clone(), &s, "sbx_test", g.expires_at)
             .unwrap()
@@ -328,7 +328,7 @@ async fn grant_creation_pins_policy_and_never_provisions() {
         .request_grant(7, "sbx_test", 1, false, grant_request())
         .await
         .unwrap();
-    assert_eq!(result.status, ServiceGrantStatus::IntegrationUnavailable);
+    assert_eq!(result.status, ServiceGrantStatus::PendingApproval);
     assert_eq!(result.policy, policy());
     assert!(!result.connected);
     let log = format!(
@@ -375,6 +375,8 @@ async fn revoke_is_scoped_versioned_and_idempotent() {
         .await
         .unwrap();
     assert_eq!(response.status, ServiceGrantStatus::Revoked);
+    assert_eq!(response.enforcement, GrantEnforcement::Stopping);
+    assert!(!response.connected);
     assert_eq!(response.version, 2);
     let s = service(
         db().append_query_results([vec![sandbox()]])
@@ -424,7 +426,8 @@ async fn list_grants_joins_services_without_n_plus_one() {
                 "num_items".to_string(),
                 1_i64.into(),
             )])]])
-            .append_query_results([vec![(grant(), row())]]),
+            .append_query_results([vec![(grant(), row())]])
+            .append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]),
     );
     let result = s
         .list_grants(7, "sbx_test", 1, false, page())

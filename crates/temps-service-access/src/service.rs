@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod consent;
+mod status;
 pub use consent::{AuthorizedGrant, FreshConsent, HostObservation};
 
 use crate::{
@@ -248,7 +249,7 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::database("list grants", project_id, e))?;
         let now = Utc::now();
-        let items = rows
+        let mut items: Vec<ServiceGrantResponse> = rows
             .into_iter()
             .map(|(grant, service)| {
                 let service = service
@@ -256,6 +257,8 @@ impl ServiceAccessService {
                 grant_response(grant, &service, sandbox_id, now)
             })
             .collect::<Result<_, _>>()?;
+        self.observe_grants(project_id, sandbox.id, &mut items)
+            .await?;
         Ok(ServiceGrantList {
             items,
             total,
@@ -372,8 +375,8 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::database("find grant service", project_id, e))?
             .ok_or_else(|| not_found("service", grant.service_id.clone(), project_id))?;
-        // These are never-provisioned intents. Future enforcement must use a
-        // separate revoke/ack state machine, not this database-only operation.
+        // The database trigger wakes reconciliation. This write is a request
+        // to remove access, not a receipt that the worker has stopped traffic.
         let now = Utc::now();
         let grant = if grant.revoked_at.is_none() {
             let mut model = grant.into_active_model();
@@ -386,7 +389,10 @@ impl ServiceAccessService {
         } else {
             grant
         };
-        let result = grant_response(grant, &service, sandbox_id, now)?;
+        let mut result = grant_response(grant, &service, sandbox_id, now)?;
+        // This mutation acknowledges intent only. The list endpoint resolves
+        // whether the worker has removed it or its signed lease has expired.
+        result.enforcement = GrantEnforcement::Stopping;
         tx.commit()
             .await
             .map_err(|e| AccessError::database("commit request revocation", project_id, e))?;
@@ -471,7 +477,7 @@ fn grant_response(
     let (status, reason) = if grant.revoked_at.is_some() {
         (
             ServiceGrantStatus::Revoked,
-            "This saved request was revoked.",
+            "Revocation was requested. Refresh worker status to confirm that access has stopped.",
         )
     } else if grant.expires_at <= now {
         (
@@ -490,8 +496,8 @@ fn grant_response(
         )
     } else {
         (
-            ServiceGrantStatus::IntegrationUnavailable,
-            crate::broker::UNAVAILABLE_REASON,
+            ServiceGrantStatus::PendingApproval,
+            "This request has not been approved. Review the service and lifetime before granting access.",
         )
     };
     let policy = serde_json::from_value(grant.policy_snapshot).map_err(|source| {
@@ -510,6 +516,7 @@ fn grant_response(
         policy,
         status,
         reason: reason.into(),
+        enforcement: GrantEnforcement::NotRequested,
         connected: false,
         version: grant.version,
         created_at: grant.created_at,

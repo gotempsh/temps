@@ -37,7 +37,7 @@ impl ServiceAccessPlugin {
         let service = Arc::new(ServiceAccessService::new(
             Arc::clone(&db),
             Arc::clone(&encryption),
-            Arc::new(crate::broker::UnavailableTokenlessBroker),
+            Arc::new(crate::broker::EmbeddedTokenlessBroker),
         ));
         let transport = Arc::new(WorkerTransport::new(
             context.require_service::<dyn temps_sandbox_providers::SandboxProvider>(),

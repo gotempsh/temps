@@ -173,6 +173,22 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         .unwrap()
         .unwrap();
     assert_eq!(runtime.applied_version, first.desired_version);
+    assert_eq!(runtime.applied_grant_ids, vec![first.grant_id.clone()]);
+    assert!(runtime.applied_revision.is_some());
+    let page = || crate::types::AccessPageQuery {
+        page: None,
+        page_size: None,
+    };
+    let listed = coordinator
+        .service
+        .list_grants(9801, "sbx_dispatch", 9801, false, page())
+        .await
+        .unwrap();
+    assert!(listed.items[0].connected);
+    assert_eq!(
+        listed.items[0].enforcement,
+        crate::types::GrantEnforcement::Active
+    );
     assert!(runtime.lease_expires_at.unwrap() > chrono::Utc::now());
     let second = coordinator.connect(consent(&services[1].id)).await.unwrap();
     assert_eq!(
@@ -187,6 +203,21 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         .revoke_grant(9801, "sbx_dispatch", &first.grant_id, 9801, false, 1)
         .await
         .unwrap();
+    let listed = coordinator
+        .service
+        .list_grants(9801, "sbx_dispatch", 9801, false, page())
+        .await
+        .unwrap();
+    let revoked = listed
+        .items
+        .iter()
+        .find(|g| g.id == first.grant_id)
+        .unwrap();
+    assert_eq!(
+        revoked.enforcement,
+        crate::types::GrantEnforcement::Stopping
+    );
+    assert!(!revoked.connected);
     let (a, b) = tokio::join!(coordinator.maintain(), coordinator.maintain());
     assert_eq!(a.unwrap() + b.unwrap(), 1);
     assert_eq!(
@@ -199,6 +230,25 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
         .await
         .unwrap();
     assert_eq!(active.bindings[0].plan.grants().len(), 1);
+    let listed = coordinator
+        .service
+        .list_grants(9801, "sbx_dispatch", 9801, false, page())
+        .await
+        .unwrap();
+    let revoked = listed
+        .items
+        .iter()
+        .find(|g| g.id == first.grant_id)
+        .unwrap();
+    assert_eq!(revoked.enforcement, crate::types::GrantEnforcement::Stopped);
+    assert!(
+        listed
+            .items
+            .iter()
+            .find(|g| g.id == second.grant_id)
+            .unwrap()
+            .connected
+    );
     assert_eq!(
         active.bindings[0].plan.grants()[0].grant_id(),
         second.grant_id

@@ -559,3 +559,60 @@ test('GitHub source actions explain and enforce missing repository permission', 
     api.restore()
   }
 })
+
+test('operator approval is explicit and retries the same consent without extending it', async () => {
+  const bodies: Array<{ request_id: string; ttl_seconds: number }> = []
+  let saved = 0
+  const api = mockApi({
+    'POST /projects/7/sandboxes/sbx_test/service-grants/approve': async (
+      request
+    ) => {
+      bodies.push(
+        (await request.json()) as { request_id: string; ttl_seconds: number }
+      )
+      return bodies.length === 1
+        ? jsonResponse({ detail: 'Worker temporarily unavailable.' }, 503)
+        : jsonResponse(
+            {
+              grant_id: 'grant_test',
+              sandbox_id: 'sbx_test',
+              expires_at: '2026-01-01T00:02:00Z',
+            },
+            202
+          )
+    },
+  })
+  try {
+    render(
+      provider(
+        <ServiceGrantEditor
+          projectId={7}
+          sandboxId="sbx_test"
+          service={service}
+          mode="approve"
+          onClose={() => {}}
+          onSaved={() => {
+            saved++
+          }}
+        />
+      )
+    )
+    expect(document.body.textContent).toContain('Sandbox: sbx_test')
+    await click('Approve access')
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        'Worker temporarily unavailable.'
+      )
+    )
+    await click('Approve access')
+    await waitFor(() => expect(saved).toBe(1))
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0].request_id).toBe(bodies[1].request_id)
+    expect(bodies[0].ttl_seconds).toBe(120)
+    expect(
+      api.called('POST', '/projects/7/sandboxes/sbx_test/service-grants')
+    ).toBe(false)
+  } finally {
+    api.restore()
+  }
+})

@@ -124,7 +124,17 @@ export function serviceBody(
 export const grantRequestSchema = z.object({
   ttl: z.number().int().min(60).max(86400),
 })
+export const enforcementLabels = {
+  not_requested: 'Awaiting approval',
+  pending: 'Connecting',
+  active: 'Connected',
+  stopping: 'Revoking',
+  stopped: 'Disconnected',
+} as const
+
 export const grantLabels: Record<ServiceGrantStatus, string> = {
+  pending_approval: 'Awaiting approval',
+  approved: 'Approved',
   integration_unavailable: 'Not connected',
   expired: 'Expired',
   revoked: 'Revoked',

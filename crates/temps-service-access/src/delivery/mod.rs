@@ -120,7 +120,7 @@ impl DeliveryQueue {
     /// Call only after the assigned worker confirms installation or a cut; an
     /// RPC delivery/queue acknowledgement is not sufficient.
     pub async fn complete(&self, claim: &DeliveryClaim) -> Result<(), DeliveryError> {
-        self.complete_receipt(claim, None, None).await
+        self.complete_receipt(claim, None, None, &[]).await
     }
 
     /// Records the signed lease deadline only after the transport has verified
@@ -130,9 +130,13 @@ impl DeliveryQueue {
         claim: &DeliveryClaim,
         expected_revision: i64,
         lease_expires_at: chrono::DateTime<chrono::Utc>,
+        grant_ids: &[String],
     ) -> Result<(), DeliveryError> {
         let now = chrono::Utc::now();
-        if claim.command.operation != DeliveryOperation::Reconcile
+        if grant_ids.is_empty()
+            || grant_ids.len() > crate::tokenless::MAX_BINDING_GRANTS
+            || grant_ids.iter().any(|id| id.is_empty() || id.len() > 100)
+            || claim.command.operation != DeliveryOperation::Reconcile
             || expected_revision < 0
             || lease_expires_at <= now
             || lease_expires_at
@@ -146,8 +150,13 @@ impl DeliveryQueue {
                 reason: "a reconcile receipt requires a current signed lease of at most 30 seconds",
             });
         }
-        self.complete_receipt(claim, Some(lease_expires_at), Some(expected_revision))
-            .await
+        self.complete_receipt(
+            claim,
+            Some(lease_expires_at),
+            Some(expected_revision),
+            grant_ids,
+        )
+        .await
     }
 
     async fn complete_receipt(
@@ -155,6 +164,7 @@ impl DeliveryQueue {
         claim: &DeliveryClaim,
         lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
         expected_revision: Option<i64>,
+        grant_ids: &[String],
     ) -> Result<(), DeliveryError> {
         let command = &claim.command;
         let txn = self
@@ -182,8 +192,8 @@ impl DeliveryQueue {
             });
         }
         let applied = txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE sandbox_access_runtimes SET applied_version=$2,lease_expires_at=$5,updated_at=now() WHERE id=$1 AND desired_version=$2 AND node_id IS NOT DISTINCT FROM $3 AND (($4 AND closed_at IS NOT NULL) OR (NOT $4 AND closed_at IS NULL)) AND ($6::bigint IS NULL OR ($5>clock_timestamp() AND EXISTS (SELECT 1 FROM sandbox_access_authorities a WHERE a.id=sandbox_access_runtimes.authority_id AND a.closed_at IS NULL AND a.desired_revision=$6)))",
-            [command.runtime_id.into(),command.desired_version.into(),command.node_id.into(),(command.operation==DeliveryOperation::Retire).into(),lease_expires_at.into(),expected_revision.into()])).await
+            "UPDATE sandbox_access_runtimes SET applied_version=$2,lease_expires_at=$5,applied_revision=$6,applied_grant_ids=$7,updated_at=now() WHERE id=$1 AND desired_version=$2 AND node_id IS NOT DISTINCT FROM $3 AND (($4 AND closed_at IS NOT NULL) OR (NOT $4 AND closed_at IS NULL)) AND ($6::bigint IS NULL OR ($5>clock_timestamp() AND EXISTS (SELECT 1 FROM sandbox_access_authorities a WHERE a.id=sandbox_access_runtimes.authority_id AND a.closed_at IS NULL AND a.desired_revision=$6)))",
+            [command.runtime_id.into(),command.desired_version.into(),command.node_id.into(),(command.operation==DeliveryOperation::Retire).into(),lease_expires_at.into(),expected_revision.into(),grant_ids.to_vec().into()])).await
             .map_err(|e| database("record applied version", command.runtime_id, e))?;
         if expected_revision.is_some() && applied.rows_affected() != 1 {
             return Err(DeliveryError::RuntimeChanged {

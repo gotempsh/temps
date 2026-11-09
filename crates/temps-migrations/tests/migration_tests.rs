@@ -8021,3 +8021,37 @@ INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity,
     assert!(row.try_get::<bool>("", "inactive")?);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sandbox_access_receipts_default_unknown_and_round_trip() -> anyhow::Result<()> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("sandbox access receipts");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261109_000005_sandbox_access_receipts";
+    let migrations = Migrator::migrations();
+    let migration = migrations.iter().find(|m| m.name() == target).unwrap();
+    let manager = SchemaManager::new(&db);
+    Migrator::up(&db, Some(migrations.len() as u32 - steps_back_to(target))).await?;
+    db.execute_unprepared(r#"
+INSERT INTO users (id,name,email) VALUES (9901,'Test user','user@example.com');
+INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9901,'Receipts','repo','owner','/','main','nodejs','receipts',now(),now());
+INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9901,'sbx_receipts','receipts',9901,9901,'running','docker');
+INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000601',9901,9901,'container');
+"#).await?;
+    migration.up(&manager).await?;
+    migration.up(&manager).await?;
+    let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,"SELECT applied_revision IS NULL AND cardinality(applied_grant_ids)=0 AS unknown FROM sandbox_access_runtimes")).await?.unwrap();
+    assert!(row.try_get::<bool>("", "unknown")?);
+    assert!(db.execute_unprepared("UPDATE sandbox_access_runtimes SET applied_grant_ids=array_fill('grant'::text,ARRAY[17])").await.is_err());
+    db.execute_unprepared("UPDATE sandbox_access_runtimes SET applied_revision=3,applied_grant_ids=ARRAY['grant_test']").await?;
+    migration.down(&manager).await?;
+    migration.down(&manager).await?;
+    migration.up(&manager).await?;
+    let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,"SELECT applied_revision IS NULL AND cardinality(applied_grant_ids)=0 AS unknown FROM sandbox_access_runtimes")).await?.unwrap();
+    assert!(row.try_get::<bool>("", "unknown")?);
+    Ok(())
+}
