@@ -511,6 +511,7 @@ export function VisitorsList({
       )}
       {(activeFilters.length > 0 || environment || !activityOnly) && (
         <div
+          role="group"
           className="flex flex-wrap items-center gap-2"
           aria-label="Active visitor filters"
         >
