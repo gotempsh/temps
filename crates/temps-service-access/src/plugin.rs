@@ -42,15 +42,20 @@ impl ServiceAccessPlugin {
         let transport = Arc::new(WorkerTransport::new(
             context.require_service::<dyn temps_sandbox_providers::SandboxProvider>(),
         ));
-        context.register_service(Arc::new(ServiceAccessCoordinator::new(
-            db,
-            encryption,
-            context.require_service::<dyn AuditLogger>(),
-            Arc::clone(&service),
-            transport,
-            context.get_service::<dyn temps_core::ProjectAccessChecker>(),
-            github,
-        )));
+        let project_access = Arc::new(crate::planner::ProjectAccessBinding::default());
+        context.register_service(Arc::clone(&project_access));
+        context.register_service(Arc::new(
+            ServiceAccessCoordinator::new(
+                db,
+                encryption,
+                context.require_service::<dyn AuditLogger>(),
+                Arc::clone(&service),
+                transport,
+                None,
+                github,
+            )
+            .with_project_access_binding(project_access),
+        ));
         context.register_service(service);
         context.register_service(Arc::new(ServiceAccessReconciler::default()));
 
@@ -87,6 +92,11 @@ impl TempsPlugin for ServiceAccessPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            // Phase two sees checkers registered by extensions after built-ins.
+            context
+                .require_service::<crate::planner::ProjectAccessBinding>()
+                .0
+                .get_or_init(|| context.get_service::<dyn temps_core::ProjectAccessChecker>());
             context
                 .require_service::<ServiceAccessReconciler>()
                 .start(context.require_service::<ServiceAccessCoordinator>());

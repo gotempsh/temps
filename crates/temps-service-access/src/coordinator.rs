@@ -102,6 +102,14 @@ impl ServiceAccessCoordinator {
         }
     }
 
+    pub(crate) fn with_project_access_binding(
+        mut self,
+        binding: Arc<crate::planner::ProjectAccessBinding>,
+    ) -> Self {
+        self.planner.bind_project_access(binding);
+        self
+    }
+
     /// The caller must first authorize both effective project and sandbox write
     /// permissions, and audit the new grant. Identity is resolved host-side,
     /// then rechecked transactionally before fresh consent is persisted.

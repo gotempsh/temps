@@ -553,3 +553,29 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
     drop(db);
     test.cleanup().await;
 }
+
+#[tokio::test]
+async fn deferred_project_permissions_fail_closed_then_follow_current_checker() {
+    let binding = Arc::new(ProjectAccessBinding::default());
+    let mut planner = planner(None);
+    planner.bind_project_access(binding.clone());
+    let boot = Uuid::new_v4();
+    let grants = [candidate(1, 1)];
+    assert!(planner
+        .recheck(boot, &grants)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not been initialized"));
+    let checker = Checker::new(0);
+    binding.0.get_or_init(|| Some(checker.clone()));
+    assert_eq!(planner.recheck(boot, &grants).await.unwrap().len(), 1);
+    checker.deny.store(true, Ordering::SeqCst);
+    assert!(planner.recheck(boot, &grants).await.unwrap().is_empty());
+    assert_eq!(checker.batches.load(Ordering::SeqCst), 2);
+
+    let oss = Arc::new(ProjectAccessBinding::default());
+    planner.bind_project_access(oss.clone());
+    oss.0.get_or_init(|| None);
+    assert_eq!(planner.recheck(boot, &grants).await.unwrap().len(), 1);
+}

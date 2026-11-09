@@ -11,6 +11,13 @@ impl PolicyPlanner {
         boot_id: Uuid,
         grants: &[Candidate],
     ) -> Result<BTreeMap<(i32, i32), bool>, PlanError> {
+        let checker = self.checker.0.get().ok_or_else(|| {
+            invalid(
+                boot_id,
+                "recheck project permissions",
+                "project access checker has not been initialized",
+            )
+        })?;
         let mut projects_by_user: BTreeMap<i32, BTreeSet<i32>> = BTreeMap::new();
         for grant in grants.iter().filter(|g| !g.admin) {
             projects_by_user
@@ -31,7 +38,7 @@ impl PolicyPlanner {
             return Ok(allowed);
         }
         for (user_id, projects) in projects_by_user {
-            let Some(checker) = &self.checker else {
+            let Some(checker) = checker else {
                 allowed.extend(projects.into_iter().map(|project| {
                     (
                         (user_id, project),

@@ -83,6 +83,22 @@ async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_
     context.register_service(provider);
     let plugin = crate::ServiceAccessPlugin::new();
     plugin.register_with_credentials(&context, Arc::new(crate::github::NoGithub));
+    let binding = context.require_service::<crate::planner::ProjectAccessBinding>();
+    assert!(binding.0.get().is_none());
+    // Extension plugins register after built-ins, before phase two begins.
+    struct LateChecker;
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for LateChecker {
+        async fn user_can_access_project(
+            &self,
+            _user: i32,
+            _project: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+    }
+    let late: Arc<dyn ProjectAccessChecker> = Arc::new(LateChecker);
+    context.register_service(late.clone());
     let read_context = context.create_plugin_context();
     let coordinator = context.require_service::<ServiceAccessCoordinator>();
     let weak = Arc::downgrade(&coordinator);
@@ -95,6 +111,10 @@ async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_
         .initialize_plugin_services(&read_context)
         .await
         .unwrap();
+    assert!(Arc::ptr_eq(
+        binding.0.get().unwrap().as_ref().unwrap(),
+        &late
+    ));
     assert_eq!(Arc::strong_count(&coordinator), before + 4);
     tokio::task::yield_now().await;
     assert!(weak.upgrade().is_some());
@@ -508,5 +528,86 @@ async fn applied_delivery_with_lost_receipt_retries_with_a_new_binding_version()
     drop(coordinator);
     drop(provider);
     drop(db);
+    test.cleanup().await;
+}
+
+#[tokio::test]
+async fn late_extension_checker_revokes_background_policy_permissions() {
+    use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping extension permission test: Docker unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO users (id,name,email) VALUES (9801,'Test user','user@example.com'); INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9801,'Dispatch','repo','owner','/','main','nodejs','dispatch',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9801,'sbx_dispatch','dispatch',9801,9801,'running','docker')").await.unwrap();
+    struct Checker(AtomicBool);
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for Checker {
+        async fn user_can_access_project(
+            &self,
+            _user: i32,
+            _project: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+    let context = ServiceRegistrationContext::new();
+    context.register_service(db);
+    context.register_service(Arc::new(EncryptionService::new(&"ab".repeat(32)).unwrap()));
+    context.register_service::<dyn AuditLogger>(Arc::new(NoopAuditLogger));
+    let provider = Provider::new();
+    context.register_service::<dyn temps_sandbox_providers::SandboxProvider>(provider.clone());
+    let plugin = crate::ServiceAccessPlugin::new();
+    plugin.register_with_credentials(&context, Arc::new(crate::github::NoGithub));
+    let checker = Arc::new(Checker(AtomicBool::new(true)));
+    context.register_service::<dyn ProjectAccessChecker>(checker.clone());
+    let coordinator = context.require_service::<ServiceAccessCoordinator>();
+    plugin
+        .initialize_plugin_services(&context.create_plugin_context())
+        .await
+        .unwrap();
+    // Drop the task owner before yielding: exercise planning deterministically.
+    drop(context);
+    let service = coordinator
+        .service
+        .save_service(
+            9801,
+            None,
+            SaveAccessService {
+                vault_id: None,
+                name: "API".into(),
+                policy: SandboxAccessPolicy {
+                    provider: None,
+                    github_repository: None,
+                    origin: "https://api.example.com".into(),
+                    path_prefixes: vec!["/".into()],
+                    methods: vec![AccessMethod::Get],
+                },
+                max_ttl_seconds: 60,
+                enabled: true,
+                credential: Some(SecretString::new("fixture-credential")),
+                clear_credential: false,
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut request = consent(&service.id);
+    request.admin = false;
+    let grant = coordinator.connect(request).await.unwrap();
+    let boot = provider.worker.identity().boot_id;
+    let permitted = coordinator.planner.prepare(boot).await.unwrap();
+    assert_eq!(permitted.bindings.len(), 1);
+    assert!(permitted.retire.is_empty());
+    checker.0.store(false, Ordering::SeqCst);
+    let denied = coordinator.planner.prepare(boot).await.unwrap();
+    assert!(denied.bindings.is_empty());
+    assert_eq!(denied.retire.len(), 1);
+    assert_eq!(denied.retire[0].id, grant.runtime_id);
     test.cleanup().await;
 }

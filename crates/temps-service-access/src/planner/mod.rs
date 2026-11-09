@@ -14,7 +14,11 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use sea_orm::{DatabaseConnection, FromQueryResult};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use temps_core::{secret_string::SecretString, EncryptionService, ProjectAccessChecker};
 use temps_entities::sandbox_access_runtimes;
 use temps_service_access_runtime::{WorkerIdentity, MAX_WORKER_BINDINGS};
@@ -108,12 +112,16 @@ pub struct WorkerPlan {
     pub retire: Vec<sandbox_access_runtimes::Model>,
 }
 
+/// Filled after every plugin has registered; unset must never mean OSS access.
+#[derive(Default)]
+pub(crate) struct ProjectAccessBinding(pub OnceLock<Option<Arc<dyn ProjectAccessChecker>>>);
+
 pub struct PolicyPlanner {
     db: Arc<DatabaseConnection>,
     encryption: Arc<EncryptionService>,
     github: Arc<dyn crate::github::GithubCredentialResolver>,
     // Optional by the ProjectAccessChecker contract; OSS may have no checker.
-    checker: Option<Arc<dyn ProjectAccessChecker>>,
+    checker: Arc<ProjectAccessBinding>,
 }
 impl PolicyPlanner {
     pub fn new(
@@ -125,9 +133,13 @@ impl PolicyPlanner {
         Self {
             db,
             encryption,
-            checker,
+            checker: Arc::new(ProjectAccessBinding(OnceLock::from(checker))),
             github,
         }
+    }
+
+    pub(crate) fn bind_project_access(&mut self, binding: Arc<ProjectAccessBinding>) {
+        self.checker = binding;
     }
 
     /// Control-plane work only. At most 128 bindings / 2048 grants, three DB
