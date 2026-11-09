@@ -11066,7 +11066,7 @@ export type DnsCompletionResponse = {
 export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
 
 /**
- * Whether the asking project may call an internal route (ADR 100 D7).
+ * Whether the asking project may call an internal route (ADR 101 D7).
  */
 export type DnsInternalAccess = {
     /**
