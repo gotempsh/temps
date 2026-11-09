@@ -23,11 +23,13 @@ The startup log on such a server made it worse. It said the executor had
 registered "the engines that need no local Docker (control_plane, ...)",
 which is true of the worker engines and false of `control_plane`.
 
-The Temps image installs `postgresql-client` next to the binary, so the two
-tools are usually already there. The catch is the version: `pg_dump`
+The Alpine image (`Dockerfile`) installed `postgresql-client` next to the
+binary, and the release image (`Dockerfile.release`) installed no client at
+all. Even where the tools are present, the version is the catch: `pg_dump`
 refuses to dump a server with a newer major version than its own, and the
 client a base image packages can lag the TimescaleDB major the control
-plane runs.
+plane runs (Alpine 3.22's is 17, Debian bookworm's 15; the control plane
+runs 18).
 
 ## Decision
 
@@ -47,6 +49,12 @@ plane runs.
 - The startup log on a server without Docker probes the tools once and says
   what control-plane backups will do: run with the PostgreSQL N client, or
   fail and why.
+- Both runtime images ship the PostgreSQL 18 client tools: the release
+  image from the PostgreSQL apt repository (`postgresql-client-18`), the
+  Alpine image from Alpine 3.23 (`postgresql18-client`). Each build fails
+  if the tools report another major version, so a base image change cannot
+  silently downgrade them. Moving the control plane to a newer PostgreSQL
+  major means raising `PG_CLIENT_MAJOR` in both Dockerfiles first.
 
 ## Consequences
 
