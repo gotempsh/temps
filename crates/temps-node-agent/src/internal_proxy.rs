@@ -66,6 +66,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
+use crate::internal_access::{AccessDecision, DenyReason, CROSS_PROJECT_DENIED};
 use crate::route_store::{RouteEntry, SharedRouteStore};
 use crate::worker_metrics::RequestRecorder;
 
@@ -824,12 +825,31 @@ async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Respo
         }
     };
 
-    if !caller_may_access_route(&state, req.extensions(), &entry).await {
-        warn!(%host, route_project_id = ?entry.project_id, "blocked cross-project internal proxy request");
-        return error_body(
-            StatusCode::FORBIDDEN,
-            "internal route is not accessible from this workload",
-        );
+    match caller_access(&state, req.extensions(), &entry).await {
+        AccessDecision::SameProject { .. } => {}
+        AccessDecision::Granted {
+            caller_project_id,
+            caller_environment_id,
+        } => {
+            debug!(
+                %host,
+                route_project_id = ?entry.project_id,
+                route_environment_id = ?entry.environment_id,
+                caller_project_id,
+                caller_environment_id = ?caller_environment_id,
+                "internal proxy request allowed by an internal access grant"
+            );
+        }
+        AccessDecision::Denied(reason) => {
+            warn!(
+                %host,
+                route_project_id = ?entry.project_id,
+                route_has_grants = !entry.allowed_callers.is_empty(),
+                reason = reason.as_str(),
+                "blocked cross-project internal proxy request"
+            );
+            return error_body(StatusCode::FORBIDDEN, CROSS_PROJECT_DENIED);
+        }
     }
 
     if entry.backends.is_empty() {
@@ -1265,34 +1285,34 @@ fn cache_acme_result(state: &ProxyState, key: String, value: Option<String>, ttl
     });
 }
 
-async fn caller_may_access_route(
+/// Who the caller is and whether it may call `entry` (ADR 100 D6). The
+/// Docker re-check runs only for an allowed caller, charged to the caller's
+/// own project.
+async fn caller_access(
     state: &ProxyState,
     extensions: &axum::http::Extensions,
     entry: &RouteEntry,
-) -> bool {
-    let Some(route_project_id) = entry.project_id else {
-        // Legacy or malformed snapshots without project metadata are not
-        // safe to expose through the workload-to-workload proxy.
-        return false;
-    };
+) -> AccessDecision {
     let Some(peer) = extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0) else {
-        return false;
+        return AccessDecision::Denied(DenyReason::UnknownCaller);
     };
-    let Some(container_id) = candidate_container_id(&state.caller_identities, peer.ip()) else {
-        return false;
-    };
-    // Reject cross-project callers from memory before they can consume any
-    // Docker inspection capacity.
-    if !state
-        .store
-        .container_id_has_project(&container_id, route_project_id)
-    {
-        return false;
-    }
-    if !source_container_is_current(state, peer.ip(), &container_id, route_project_id).await {
-        return false;
-    }
-    true
+    let container_id = candidate_container_id(&state.caller_identities, peer.ip());
+    let container = container_id.as_deref();
+    crate::internal_access::authorize(
+        &state.store,
+        container,
+        entry,
+        |caller_project_id| async move {
+            match container {
+                Some(container_id) => {
+                    source_container_is_current(state, peer.ip(), container_id, caller_project_id)
+                        .await
+                }
+                None => false,
+            }
+        },
+    )
+    .await
 }
 
 /// Verify the cached candidate against Docker's current running-container and
@@ -2259,6 +2279,7 @@ mod tests {
             environment_id: Some(project_id * 100),
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         }
     }
 
@@ -2525,6 +2546,7 @@ mod tests {
                 environment_id: Some(1),
                 gate: None,
                 shield: None,
+                allowed_callers: Vec::new(),
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request

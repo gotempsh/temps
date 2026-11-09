@@ -157,6 +157,10 @@ struct SnapshotRoute {
     gate: Option<temps_core::gate::GatePolicy>,
     #[serde(default)]
     shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
+    /// ADR 100 D5: absent from a control plane that predates grants, which
+    /// leaves the route admitting its own project only.
+    #[serde(default)]
+    allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -574,6 +578,7 @@ fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
         environment_id: route.environment_id,
         gate: route.gate,
         shield: route.shield,
+        allowed_callers: route.allowed_callers,
     }
 }
 
@@ -649,6 +654,7 @@ mod tests {
             environment_id: Some(3),
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
         }
     }
 
