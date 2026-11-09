@@ -36,6 +36,7 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; only the pinned microsandbox SDK uses it" },
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26 is a shim re-exporting the fixed 1.0.10 roots" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only reached by aws-sigv4 SigV4A, which Temps does not use" },
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite, no patched libsqlite3-sys reachable; on-disk DBs (temps edge analytics.db, microsandbox catalog) are only writable by the Temps user" },
 ]
 
 [licenses]
