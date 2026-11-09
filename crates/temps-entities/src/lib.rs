@@ -151,6 +151,7 @@ pub mod project_delivery_settings;
 pub mod project_deployment_counters;
 pub mod project_edge_rules;
 pub mod project_ip_access_rules;
+pub mod internal_access_grants;
 pub mod project_services;
 pub mod project_telemetry_write_intervals;
 pub mod projects;
