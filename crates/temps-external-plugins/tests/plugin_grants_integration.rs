@@ -309,6 +309,8 @@ async fn test_consume_ai_call_concurrent_requests_allow_exact_daily_limit() {
 
 #[tokio::test]
 async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
+    use sea_orm::EntityTrait;
+    use temps_entities::external_plugin_actors;
     use temps_migrations::{Migrator, MigratorTrait, SchemaManager};
 
     let Some(database) = boot_database().await else {
@@ -384,7 +386,14 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .await
         .expect("create actor after migration reapplication");
     assert_ne!(recreated.actor.id, grants.actor.id);
-    assert!(!recreated.actor.ai_tools_enabled);
+    let recreated_id =
+        uuid::Uuid::parse_str(&recreated.actor.id).expect("recreated actor has a valid UUID");
+    let persisted = external_plugin_actors::Entity::find_by_id(recreated_id)
+        .one(db.as_ref())
+        .await
+        .expect("read recreated actor consent")
+        .expect("recreated actor is persisted");
+    assert!(!persisted.ai_tools_enabled);
     assert!(recreated.config.permissions.is_empty());
     eprintln!("Actor migration: populated up -> down (all three tables absent, users preserved) -> up passed");
 }
