@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, mock } from "bun:test";
 import { z } from "zod";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -27,7 +27,7 @@ async function request(
   const req = Readable.from([body]) as IncomingMessage;
   req.method = method;
   req.url = path;
-  const res = { writeHead: vi.fn(), end: vi.fn() };
+  const res = { writeHead: mock(), end: mock() };
   await (
     await p.handler({} as PluginContext)
   )(req, res as unknown as ServerResponse);
@@ -49,7 +49,7 @@ describe("endpoint AI tools", () => {
     expect(count.content["application/json"].schema).toBeDefined();
   });
   it("awaits async refinements before invoking the handler", async () => {
-    const handler = vi.fn((input) => input);
+    const handler = mock((input) => input);
     const p = plugin().tool({
       name: "create",
       description: "Create report",
@@ -145,7 +145,7 @@ describe("endpoint AI tools", () => {
   });
   it("defaults to write, validates JSON and rejects malformed input before handler execution", async () => {
     const p = plugin();
-    const handler = vi.fn(() => ({ ok: true }));
+    const handler = mock(() => ({ ok: true }));
     p.tool({
       name: "create",
       description: "Create report",
