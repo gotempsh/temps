@@ -117,6 +117,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [097](./097-internal-dns-canary-corrections.md) | Internal DNS canary corrections | Accepted | amends [011](./011-internal-dns-ha-databases.md); amends [024](./024-control-plane-dns-resolver.md); amends [095](./095-internal-dns-observability.md) |
 | [098](./098-internal-proxy-own-port.md) | The worker's internal proxy listens on its own port, and containers' port 80 is redirected to it | Proposed | amends [095](./095-internal-dns-observability.md) |
 | [099](./099-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [093](./093-scoped-s3-credentials-for-worker-jobs.md) |
+| [100](./100-internal-access-grants.md) | Internal access grants let another project call a project's `*.temps.local` routes | Proposed |  |
 
 ## Supporting documents
 
