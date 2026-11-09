@@ -2,28 +2,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useQuery } from '@tanstack/react-query'
-import { Callout, PageHeader, Status } from '@temps-sdk/ds'
+import {
+  PageHeader,
+  Status,
+  StatusDot,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  useUrlState,
+} from '@temps-sdk/ds'
 import { Skeleton } from '@temps-sdk/ui'
-import { formatDistanceToNow } from 'date-fns'
 import { Bell } from 'lucide-react'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { Link } from 'react-router'
-import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { DnsOverview } from '@/components/settings/dns/DnsOverview'
 import { DnsQueryLog } from '@/components/settings/dns/DnsQueryLog'
 import { DnsRecordsTable } from '@/components/settings/dns/DnsRecordsTable'
-import { DnsResolversTable } from '@/components/settings/dns/DnsResolversTable'
 import { DnsTestResolution } from '@/components/settings/dns/DnsTestResolution'
 import { DnsTraffic } from '@/components/settings/dns/DnsTraffic'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  CONTROL_PLANE_NODE_ID,
+  DNS_PARAMS,
   dnsKeys,
+  dnsSummary,
   getDnsResolvers,
-  resolverVerdict,
-  type ClusterDnsResolversResponse,
-  type DnsTrafficRange,
+  parseDnsTab,
+  withParams,
+  type DnsParam,
+  type DnsSummary,
+  type DnsTab,
 } from '@/lib/dns-observability'
 import { isForbiddenRead } from '@/lib/read-failure'
 
@@ -41,7 +51,7 @@ function Section({
   return (
     <section aria-labelledby={id} className="space-y-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 id={id} className="text-base font-semibold">
+        <h2 id={id} className="text-sm font-medium">
           {title}
         </h2>
         {aside}
@@ -51,38 +61,36 @@ function Section({
   )
 }
 
-/** Open DNS alerts, each linking to its alarm, and where they are sent. */
-function OpenAlerts({ data }: { data: ClusterDnsResolversResponse }) {
-  if (data.open_alerts.length === 0) return null
-  const critical = data.open_alerts.some(
-    (alert) => alert.severity === 'critical'
-  )
+/**
+ * The header's one-glance verdict. When nodes are affected it links to the
+ * first one's row in Overview, opened.
+ */
+function SummaryBadge({
+  summary,
+  search,
+}: {
+  summary: DnsSummary | undefined
+  search: URLSearchParams
+}) {
+  if (!summary) return <Skeleton className="h-6 w-44" />
+  const badge = <Status tone={summary.tone} label={summary.label} />
+  const first = summary.affected[0]
+  if (!first) return badge
   return (
-    <Callout
-      tone={critical ? 'error' : 'warning'}
-      title={`${data.open_alerts.length} open DNS ${data.open_alerts.length === 1 ? 'alert' : 'alerts'}`}
+    <Link
+      to={withParams(search, { tab: undefined, node: first.nodeId })}
+      aria-label={`${summary.label}: show ${first.nodeName}`}
+      className="w-fit rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
-      <ul className="space-y-1">
-        {data.open_alerts.map((alert) => (
-          <li key={alert.id} className="[overflow-wrap:anywhere]">
-            <span className="font-medium">{alert.title}</span>
-            <span className="text-muted-foreground">
-              {' '}
-              ·{' '}
-              {formatDistanceToNow(new Date(alert.fired_at), {
-                addSuffix: true,
-              })}
-            </span>
-          </li>
-        ))}
-      </ul>
-    </Callout>
+      {badge}
+    </Link>
   )
 }
 
 /**
- * Settings → DNS (ADR-095): the internal resolver on every node, its
- * records, recent queries, traffic and alerts, and a name to test.
+ * Settings → DNS (ADR-095), in four tabs whose choice lives in `?tab=`:
+ * Overview (is internal DNS working, and what to do if not), Records,
+ * Queries (traffic and the query log) and Test resolution.
  */
 export function DnsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -91,8 +99,16 @@ export function DnsPage() {
     setBreadcrumbs([{ label: 'Settings', href: '/settings' }, { label: 'DNS' }])
   }, [setBreadcrumbs])
 
-  const [trafficNode, setTrafficNode] = useState(CONTROL_PLANE_NODE_ID)
-  const [trafficRange, setTrafficRange] = useState<DnsTrafficRange>('1h')
+  const { get, patch, params: search } = useUrlState<DnsParam>()
+  const tab = parseDnsTab(get(DNS_PARAMS.tab))
+  const onTabChange = (value: string) => {
+    const next: DnsTab = parseDnsTab(value)
+    // Each tab is a history entry, so Back returns to the previous one.
+    patch(
+      { [DNS_PARAMS.tab]: next === 'overview' ? undefined : next },
+      { replace: false }
+    )
+  }
 
   const resolvers = useQuery({
     queryKey: dnsKeys.resolvers,
@@ -131,78 +147,72 @@ export function DnsPage() {
 
   const data = resolvers.data
   const rows = data?.resolvers ?? []
-  const verdict = data
-    ? resolverVerdict(rows, data.cluster_dns_enabled)
-    : undefined
+  const enabled = data?.cluster_dns_enabled ?? true
+  const summary = data ? dnsSummary(rows, data.cluster_dns_enabled) : undefined
+  const alarming = summary?.tone === 'error' || summary?.tone === 'warn'
 
   return (
-    <div className="w-full min-w-0 space-y-8">
-      <PageHeader title="DNS" actions={alertRouting} />
+    <div className="w-full min-w-0 space-y-4">
+      <PageHeader
+        title="DNS"
+        verdict={<SummaryBadge summary={summary} search={search} />}
+        actions={alertRouting}
+      />
 
-      <ClusterDnsCard />
-      {data ? <OpenAlerts data={data} /> : null}
+      <Tabs value={tab} onValueChange={onTabChange}>
+        <TabsList aria-label="DNS views" className="flex-wrap">
+          <TabsTrigger value="overview">
+            Overview
+            {alarming && summary ? <StatusDot tone={summary.tone} /> : null}
+          </TabsTrigger>
+          <TabsTrigger value="records" count={data?.zone_record_count}>
+            Records
+          </TabsTrigger>
+          <TabsTrigger value="queries">Queries</TabsTrigger>
+          <TabsTrigger value="test">
+            {/* One row of tabs on a phone: the short name below `sm`. */}
+            <span className="sm:hidden">Test</span>
+            <span className="max-sm:hidden">Test resolution</span>
+          </TabsTrigger>
+        </TabsList>
 
-      <Section
-        id="dns-resolvers"
-        title="Resolvers"
-        aside={
-          verdict ? (
-            <Status tone={verdict.tone} label={verdict.label} />
+        <TabsContent value="overview">
+          <DnsOverview data={data} summary={summary} search={search} />
+        </TabsContent>
+
+        <TabsContent value="records">
+          <DnsRecordsTable resolvers={rows} />
+        </TabsContent>
+
+        <TabsContent value="queries" className="space-y-8">
+          <Section id="dns-traffic" title="Traffic">
+            {data ? (
+              <DnsTraffic resolvers={rows} />
+            ) : (
+              <Skeleton className="h-64 w-full" />
+            )}
+          </Section>
+          <Section
+            id="dns-queries"
+            title="Recent queries"
+            aside={
+              <span className="text-xs text-muted-foreground">
+                Kept 24 hours · forwarded names are not logged
+              </span>
+            }
+          >
+            <DnsQueryLog resolvers={rows} enabled={enabled} />
+          </Section>
+        </TabsContent>
+
+        <TabsContent value="test">
+          {data ? (
+            <DnsTestResolution resolvers={rows} />
           ) : (
-            <Skeleton className="h-6 w-40" />
-          )
-        }
-      >
-        <DnsResolversTable resolvers={rows} isLoading={resolvers.isPending} />
-      </Section>
-
-      <Section id="dns-test" title="Test resolution">
-        {data ? (
-          <DnsTestResolution resolvers={rows} />
-        ) : (
-          <Skeleton className="h-16 w-full" />
-        )}
-      </Section>
-
-      <Section id="dns-traffic" title="Traffic">
-        {data ? (
-          <DnsTraffic
-            resolvers={rows}
-            nodeId={trafficNode}
-            range={trafficRange}
-            onNodeChange={setTrafficNode}
-            onRangeChange={setTrafficRange}
-          />
-        ) : (
-          <Skeleton className="h-64 w-full" />
-        )}
-      </Section>
-
-      <Section
-        id="dns-queries"
-        title="Recent queries"
-        aside={
-          <span className="text-xs text-muted-foreground">
-            Kept 24 hours · forwarded names are not logged
-          </span>
-        }
-      >
-        <DnsQueryLog resolvers={rows} />
-      </Section>
-
-      <Section
-        id="dns-records"
-        title="Records"
-        aside={
-          data ? (
-            <span className="text-xs text-muted-foreground tabular-nums">
-              {data.zone_record_count.toLocaleString()} in the zone
-            </span>
-          ) : undefined
-        }
-      >
-        <DnsRecordsTable resolvers={rows} />
-      </Section>
+            <Skeleton className="h-16 w-full" />
+          )}
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }

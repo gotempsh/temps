@@ -2,8 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { DataTable, PageState, type DataTableColumn } from '@temps-sdk/ds'
 import {
+  DataTable,
+  PageState,
+  useUrlSearchText,
+  useUrlState,
+  type DataTableColumn,
+} from '@temps-sdk/ds'
+import {
+  Button,
   Input,
   Select,
   SelectContent,
@@ -12,17 +19,24 @@ import {
   SelectValue,
 } from '@temps-sdk/ui'
 import { formatDistanceToNow } from 'date-fns'
-import { BookOpen } from 'lucide-react'
-import { useState } from 'react'
+import { BookOpen, Search } from 'lucide-react'
+import { Link } from 'react-router'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { useDebounce } from '@/hooks/useDebounce'
 import {
+  DNS_PAGE_SIZES,
+  DNS_PARAMS,
   DNS_RECORD_OWNER_KINDS,
   dnsKeys,
   getDnsRecords,
+  parseIntParam,
+  parsePageSize,
   recordOwner,
   recordTarget,
+  recordTestParams,
+  withParams,
+  type DnsParam,
   type DnsRecordEntry,
   type DnsRecordsParams,
   type DnsResolverEntry,
@@ -30,7 +44,6 @@ import {
 import { isForbiddenRead } from '@/lib/read-failure'
 
 const ALL = 'all'
-const PAGE_SIZE_OPTIONS = [20, 50, 100] as const
 
 function NameCell({ record }: { record: DnsRecordEntry }) {
   return (
@@ -50,66 +63,96 @@ function NameCell({ record }: { record: DnsRecordEntry }) {
   )
 }
 
-const columns: DataTableColumn<DnsRecordEntry>[] = [
-  {
-    key: 'name',
-    header: 'Name',
-    render: (record) => <NameCell record={record} />,
-  },
-  {
-    key: 'target',
-    header: 'Target',
-    render: (record) => (
-      <span className="font-mono text-xs [overflow-wrap:anywhere]">
-        <span className="mr-1.5 text-muted-foreground">
-          {record.record_type}
+function recordColumns(
+  testHref: (record: DnsRecordEntry) => string
+): DataTableColumn<DnsRecordEntry>[] {
+  return [
+    {
+      key: 'name',
+      header: 'Name',
+      render: (record) => <NameCell record={record} />,
+    },
+    {
+      key: 'target',
+      header: 'Target',
+      render: (record) => (
+        <span className="font-mono text-xs [overflow-wrap:anywhere]">
+          <span className="mr-1.5 text-muted-foreground">
+            {record.record_type}
+          </span>
+          {recordTarget(record)}
+          <span className="ml-1.5 text-muted-foreground">TTL {record.ttl}</span>
         </span>
-        {recordTarget(record)}
-        <span className="ml-1.5 text-muted-foreground">TTL {record.ttl}</span>
-      </span>
-    ),
-  },
-  {
-    key: 'owner',
-    header: 'Owner',
-    className: 'hidden @2xl:table-cell',
-    render: (record) => (
-      <span className="[overflow-wrap:anywhere]">{recordOwner(record)}</span>
-    ),
-  },
-  {
-    key: 'node',
-    header: 'Node',
-    className: 'hidden @3xl:table-cell',
-    render: (record) => record.node_name ?? 'Control plane',
-  },
-  {
-    key: 'updated',
-    header: 'Last updated',
-    className: 'hidden @4xl:table-cell text-muted-foreground',
-    render: (record) =>
-      formatDistanceToNow(new Date(record.updated_at), { addSuffix: true }),
-  },
-]
+      ),
+    },
+    {
+      key: 'owner',
+      header: 'Owner',
+      className: 'hidden @2xl:table-cell',
+      render: (record) => (
+        <span className="[overflow-wrap:anywhere]">{recordOwner(record)}</span>
+      ),
+    },
+    {
+      key: 'node',
+      header: 'Node',
+      className: 'hidden @3xl:table-cell',
+      render: (record) => record.node_name ?? 'Control plane',
+    },
+    {
+      key: 'updated',
+      header: 'Last updated',
+      className: 'hidden @4xl:table-cell text-muted-foreground',
+      render: (record) =>
+        formatDistanceToNow(new Date(record.updated_at), { addSuffix: true }),
+    },
+    {
+      key: 'test',
+      header: <span className="sr-only">Actions</span>,
+      className: 'w-0 text-right',
+      render: (record) => (
+        <Button asChild size="sm" variant="ghost">
+          <Link
+            to={testHref(record)}
+            aria-label={`Test ${record.fqdn}`}
+            title={`Test ${record.fqdn}`}
+          >
+            <Search className="size-4" aria-hidden />
+            <span className="max-sm:sr-only">Test</span>
+          </Link>
+        </Button>
+      ),
+    },
+  ]
+}
 
-/** Every name the resolvers answer, what it points to and who owns it. */
+/**
+ * Every name the resolvers answer, what it points to and who owns it, with
+ * filters in the URL and a Test link that opens the Test tab prefilled.
+ */
 export function DnsRecordsTable({
   resolvers,
 }: {
   resolvers: DnsResolverEntry[]
 }) {
-  const [params, setParams] = useState<DnsRecordsParams>({
-    page: 1,
-    page_size: 20,
-  })
-  const [search, setSearch] = useState('')
-  const debouncedSearch = useDebounce(search.trim(), 300)
+  const urlState = useUrlState<DnsParam>()
+  const { get, params: search, patch } = urlState
+  const [searchText, setSearchText] = useUrlSearchText(
+    DNS_PARAMS.recordSearch,
+    { resetKeys: [DNS_PARAMS.recordPage], urlState }
+  )
+  const debouncedSearch = useDebounce(searchText.trim(), 300)
+  const page = Math.max(1, parseIntParam(get(DNS_PARAMS.recordPage)) ?? 1)
+  const pageSize = parsePageSize(get(DNS_PARAMS.recordPageSize))
   const request: DnsRecordsParams = {
-    ...params,
+    page,
+    page_size: pageSize,
     search: debouncedSearch || undefined,
+    owner_kind: get(DNS_PARAMS.recordOwner) ?? undefined,
+    node_id: parseIntParam(get(DNS_PARAMS.recordNode)),
   }
-  const update = (patch: Partial<DnsRecordsParams>) =>
-    setParams((current) => ({ ...current, page: 1, ...patch }))
+  const update = (values: Partial<Record<DnsParam, string | number>>) =>
+    patch({ [DNS_PARAMS.recordPage]: undefined, ...values })
 
   const query = useQuery({
     queryKey: dnsKeys.records(request),
@@ -124,6 +167,24 @@ export function DnsRecordsTable({
     request.owner_kind !== undefined
   // Records on a worker carry its id; the control plane's carry none.
   const workers = resolvers.filter((resolver) => !resolver.is_control_plane)
+  const testHref = (record: DnsRecordEntry) => {
+    const test = recordTestParams(record, resolvers)
+    return withParams(search, {
+      tab: 'test',
+      name: test.name,
+      type: test.type,
+      from: test.from,
+      project: undefined,
+    })
+  }
+  const clearFilters = () => {
+    setSearchText('')
+    patch({
+      [DNS_PARAMS.recordOwner]: undefined,
+      [DNS_PARAMS.recordNode]: undefined,
+      [DNS_PARAMS.recordPage]: undefined,
+    })
+  }
 
   return (
     <div className="space-y-4">
@@ -132,16 +193,15 @@ export function DnsRecordsTable({
           aria-label="Search records"
           placeholder="Search names…"
           className="w-full sm:w-[240px]"
-          value={search}
-          onChange={(event) => {
-            setSearch(event.target.value)
-            setParams((current) => ({ ...current, page: 1 }))
-          }}
+          value={searchText}
+          onChange={(event) => setSearchText(event.target.value)}
         />
         <Select
-          value={params.owner_kind ?? ALL}
+          value={request.owner_kind ?? ALL}
           onValueChange={(value) =>
-            update({ owner_kind: value === ALL ? undefined : value })
+            update({
+              [DNS_PARAMS.recordOwner]: value === ALL ? undefined : value,
+            })
           }
         >
           <SelectTrigger className="w-full sm:w-[200px]" aria-label="Owner">
@@ -158,9 +218,13 @@ export function DnsRecordsTable({
         </Select>
         {workers.length > 0 ? (
           <Select
-            value={params.node_id === undefined ? ALL : String(params.node_id)}
+            value={
+              request.node_id === undefined ? ALL : String(request.node_id)
+            }
             onValueChange={(value) =>
-              update({ node_id: value === ALL ? undefined : Number(value) })
+              update({
+                [DNS_PARAMS.recordNode]: value === ALL ? undefined : value,
+              })
             }
           >
             <SelectTrigger className="w-full sm:w-[200px]" aria-label="Node">
@@ -204,23 +268,33 @@ export function DnsRecordsTable({
               ? undefined
               : 'A record appears for each environment, database and node once it is deployed, for example production.shop.temps.local.'
           }
+          action={
+            filtered ? (
+              <Button size="sm" variant="outline" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            ) : undefined
+          }
         />
       ) : (
         <DataTable
           aria-label="DNS records"
-          columns={columns}
+          columns={recordColumns(testHref)}
           rows={query.data?.items ?? []}
           rowKey={(record) => record.id}
           isLoading={query.isPending}
           pagination={{
-            page: params.page,
-            pageSize: params.page_size,
+            page,
+            pageSize,
             total,
-            totalPages: Math.max(1, Math.ceil(total / params.page_size)),
-            onPageChange: (page) =>
-              setParams((current) => ({ ...current, page })),
-            onPageSizeChange: (pageSize) => update({ page_size: pageSize }),
-            pageSizeOptions: PAGE_SIZE_OPTIONS,
+            totalPages: Math.max(1, Math.ceil(total / pageSize)),
+            onPageChange: (next) =>
+              patch({ [DNS_PARAMS.recordPage]: next === 1 ? undefined : next }),
+            onPageSizeChange: (next) =>
+              update({
+                [DNS_PARAMS.recordPageSize]: next === 20 ? undefined : next,
+              }),
+            pageSizeOptions: DNS_PAGE_SIZES,
             ariaLabel: 'DNS record pages',
           }}
         />

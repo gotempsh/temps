@@ -1,11 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import {
+  cleanup,
+  fireEvent,
+  render as renderDom,
+  waitFor,
+} from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation } from 'react-router'
+import { installBrowserWindow } from '@/test/dom'
+import { mockApi } from '@/test/fetch-mock'
 import type { UserResponse } from '@/api/client'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
@@ -181,9 +189,15 @@ function fail(client: QueryClient, queryKey: QueryKey, error: unknown) {
     .setState({ status: 'error', error: error as Error, fetchStatus: 'idle' })
 }
 
-function render(client: QueryClient) {
+function Page({
+  client,
+  url = '/settings/dns',
+}: {
+  client: QueryClient
+  url?: string
+}) {
   const user = { id: 1, role: 'admin' } as unknown as UserResponse
-  return renderToStaticMarkup(
+  return (
     <QueryClientProvider client={client}>
       <AuthContext.Provider
         value={{
@@ -194,9 +208,10 @@ function render(client: QueryClient) {
           refetch: () => {},
         }}
       >
-        <MemoryRouter>
+        <MemoryRouter initialEntries={[url]}>
           <BreadcrumbProvider>
             <DnsPage />
+            <Search />
           </BreadcrumbProvider>
         </MemoryRouter>
       </AuthContext.Provider>
@@ -204,50 +219,185 @@ function render(client: QueryClient) {
   )
 }
 
+/** The current query string, so a test can assert what the URL holds. */
+function Search() {
+  const { search } = useLocation()
+  return <output data-testid="search">{search}</output>
+}
+
+function render(client: QueryClient, url?: string) {
+  return renderToStaticMarkup(<Page client={client} url={url} />)
+}
+
+/**
+ * The reported shape: the resolver answers, but the internal routing proxy
+ * cannot bind its address (here because another program holds it), beside
+ * a hosted control plane that runs no apps.
+ */
+const masterCase: ClusterDnsResolversResponse = {
+  cluster_dns_enabled: true,
+  zone_record_count: 3,
+  report_interval_secs: 30,
+  open_alerts: [],
+  resolvers: [
+    {
+      node_id: 0,
+      node_name: 'control-plane',
+      node_status: 'active',
+      is_control_plane: true,
+      health: 'no_local_resolver',
+      health_reason:
+        'The control plane runs no resolver of its own: no containers run on it, so none was started.',
+      running: false,
+      tasks_alive: false,
+      consecutive_sync_failures: 0,
+      dropped_log_entries: 0,
+    },
+    {
+      node_id: 4,
+      node_name: 'master',
+      node_status: 'active',
+      is_control_plane: false,
+      health: 'healthy',
+      listen_address: '10.205.0.1:53',
+      build_version: '0.9.1',
+      record_count: 3,
+      last_sync_age_secs: 4,
+      reported_at: '2026-11-08T10:00:00Z',
+      internal_proxy: {
+        listening: false,
+        address: '10.205.0.1:80',
+        error: 'another program already listens on 10.205.0.1:80',
+      },
+      running: true,
+      tasks_alive: true,
+      consecutive_sync_failures: 0,
+      dropped_log_entries: 0,
+    },
+  ],
+}
+
 describe('DnsPage', () => {
-  test('shows each resolver, the open alert and the verdict', () => {
+  test('Overview: one health per node, the alert and the verdict', () => {
     const client = createClient()
     seed(client)
     const html = render(client)
     expect(html).toContain('control-plane')
     expect(html).toContain('worker-a')
     expect(html).toContain('The resolver is not running: port 53 is in use')
-    expect(html).toContain('1 resolver down')
+    expect(html).toContain('Internal DNS not working on 1 node')
     expect(html).toContain('DNS resolver down on worker-a')
     expect(html).toContain('href="/settings/notifications"')
     expect(html).toContain('href="/settings/nodes/7"')
-    // The proxy that cannot listen is named with its address and reason.
-    expect(html).toContain('Internal routing down on')
-    expect(html).toContain('another program already listens on 10.205.0.1:80')
     expect(html).toContain('Main proxy')
-    // The cluster-DNS switch is on this page too.
+    // The cluster-DNS switch is on this tab too.
     expect(html).toContain('Cluster DNS')
+    // The other tabs are not rendered until chosen.
+    expect(html).not.toContain('staging.shop.temps.local')
+    expect(html).not.toContain('production.shop.temps.local')
     client.clear()
   })
 
-  test('logs internal names and withholds forwarded ones', () => {
+  test('master: working lookups never sit as a green badge beside a red error', () => {
+    const client = createClient()
+    client.setQueryData(dnsKeys.resolvers, masterCase)
+    const html = render(client)
+    expect(html).toContain('Internal routing down on 1 node')
+    expect(html).toContain('Not working')
+    expect(html).not.toContain('Healthy')
+    expect(html).toContain('Name lookups')
+    // The reason is the agent's, shown as reported.
+    expect(html).toContain('another program already listens on 10.205.0.1:80')
+    // The badge links to master's row in Overview.
+    expect(html).toContain('href="/settings/dns?node=4"')
+    expect(html).toContain('id="dns-node-4"')
+    // The hosted control plane is calm.
+    expect(html).toContain('This control plane runs no apps')
+    expect(html).not.toContain('Not reporting')
+    // Secondary details stay closed until the row is opened.
+    expect(html).not.toContain('Listens on')
+    client.clear()
+  })
+
+  test('?node= opens that row with its details', () => {
+    const client = createClient()
+    client.setQueryData(dnsKeys.resolvers, masterCase)
+    const html = render(client, '/settings/dns?node=4')
+    expect(html).toContain('Listens on')
+    expect(html).toContain('10.205.0.1:53')
+    expect(html).toContain('0.9.1')
+    expect(html).toContain(
+      'href="/settings/dns?node=4&amp;tab=test&amp;from=4"'
+    )
+    client.clear()
+  })
+
+  test('Queries: logs internal names, withholds forwarded ones, charts traffic', () => {
     const client = createClient()
     seed(client)
-    const html = render(client)
+    const html = render(client, '/settings/dns?tab=queries')
     expect(html).toContain('staging.shop.temps.local')
     expect(html).toContain('NXDOMAIN')
     expect(html).toContain('SERVFAIL')
     expect(html).toContain('Forwarded name (not logged)')
     expect(html).toContain('shop')
-    client.clear()
-  })
-
-  test('lists records with their owner and traffic totals', () => {
-    const client = createClient()
-    seed(client)
-    const html = render(client)
-    expect(html).toContain('production.shop.temps.local')
-    expect(html).toContain('shop / production')
-    expect(html).toContain('12 in the zone')
     expect(html).toContain('Internal queries')
     // 2 NXDOMAIN of 20 internal queries.
     expect(html).toContain('10.0%')
-    expect(html).toContain('Test resolution')
+    client.clear()
+  })
+
+  test('Queries: filters come from the URL', () => {
+    const client = createClient()
+    seed(client)
+    client.setQueryData(
+      dnsKeys.queries({
+        page: 1,
+        page_size: 20,
+        outcome: 'nxdomain',
+        node_id: 0,
+      }),
+      { ...queries, items: [queries.items[0]], total: 1 }
+    )
+    const html = render(
+      client,
+      '/settings/dns?tab=queries&qresult=nxdomain&qnode=0'
+    )
+    expect(html).toContain('staging.shop.temps.local')
+    expect(html).not.toContain('Forwarded name (not logged)')
+    client.clear()
+  })
+
+  test('Records: owners, the zone count and a Test link per record', () => {
+    const client = createClient()
+    seed(client)
+    const html = render(client, '/settings/dns?tab=records')
+    expect(html).toContain('production.shop.temps.local')
+    expect(html).toContain('shop / production')
+    expect(html).toMatch(/Records<span[^>]*>12<\/span>/)
+    expect(html).toContain(
+      'href="/settings/dns?tab=test&amp;name=production.shop.temps.local&amp;type=A&amp;from=0"'
+    )
+    client.clear()
+  })
+
+  test('Test resolution: the fields come prefilled from the URL', () => {
+    const client = createClient()
+    seed(client)
+    const html = render(
+      client,
+      '/settings/dns?tab=test&name=production.shop.temps.local&type=AAAA&from=7'
+    )
+    expect(html).toContain('value="production.shop.temps.local"')
+    expect(html).toContain('Resolve')
+    client.clear()
+  })
+
+  test('an unknown tab falls back to Overview', () => {
+    const client = createClient()
+    seed(client)
+    const html = render(client, '/settings/dns?tab=nope')
+    expect(html).toContain('Alert: DNS resolver down on worker-a')
     client.clear()
   })
 
@@ -272,6 +422,57 @@ describe('DnsPage', () => {
     })
     const html = render(client)
     expect(html).toContain('Retry')
+    client.clear()
+  })
+})
+
+describe('DnsPage interactions', () => {
+  installBrowserWindow()
+  afterEach(cleanup)
+
+  test('choosing a tab writes ?tab=, and Overview clears it', async () => {
+    const api = mockApi({})
+    const client = createClient()
+    seed(client)
+    const view = renderDom(<Page client={client} />)
+    const search = () => view.getByTestId('search').textContent
+    expect(search()).toBe('')
+    const records = view.getByRole('tab', { name: /Records/ })
+    fireEvent.mouseDown(records, { button: 0 })
+    fireEvent.click(records)
+    await waitFor(() => expect(search()).toBe('?tab=records'))
+    await waitFor(() =>
+      expect(view.getByText('production.shop.temps.local')).toBeTruthy()
+    )
+    const overview = view.getByRole('tab', { name: /Overview/ })
+    fireEvent.mouseDown(overview, { button: 0 })
+    fireEvent.click(overview)
+    await waitFor(() => expect(search()).toBe(''))
+    api.restore()
+    client.clear()
+  })
+
+  test("a record's Test link opens the Test tab prefilled", async () => {
+    const api = mockApi({})
+    const client = createClient()
+    seed(client)
+    const view = renderDom(
+      <Page client={client} url="/settings/dns?tab=records" />
+    )
+    fireEvent.click(
+      view.getByRole('link', { name: 'Test production.shop.temps.local' })
+    )
+    await waitFor(() =>
+      expect(
+        view
+          .getByRole('tab', { name: /Test resolution/ })
+          .getAttribute('aria-selected')
+      ).toBe('true')
+    )
+    const name = view.getByLabelText('Name') as HTMLInputElement
+    expect(name.value).toBe('production.shop.temps.local')
+    expect(view.getByTestId('search').textContent).toContain('from=0')
+    api.restore()
     client.clear()
   })
 })
