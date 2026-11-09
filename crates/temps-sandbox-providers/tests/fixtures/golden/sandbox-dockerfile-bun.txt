@@ -149,7 +149,8 @@ USER root
 # the terminal handler.
 COPY --from=pty-agent-builder /build/target/release/temps-pty-agent /usr/local/bin/temps-pty-agent
 COPY pty-agent/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh
+COPY pty-agent/vault-git.sh /usr/local/bin/git
+RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh /usr/local/bin/git
 LABEL sh.temps.service-access.protocol="1"
 # In-sandbox git credential pipeline. Read-only mount the binaries to
 # `/usr/local/bin` (root:root, mode 0755 — they hold no secrets, the

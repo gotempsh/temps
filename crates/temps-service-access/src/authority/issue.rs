@@ -35,6 +35,7 @@ struct IssuedBinding {
     incarnation: Uuid,
     version: u64,
     session: SecretString,
+    github_git: bool,
 }
 
 /// One bounded snapshot shared by the worker's bindings. It deliberately has
@@ -81,6 +82,7 @@ impl IssuedPolicy {
             policy: self.policy.clone(),
             version: binding.version,
             session: binding.session.expose().into(),
+            github_git: binding.github_git,
         })
     }
 }
@@ -122,9 +124,42 @@ impl AuthorityStore {
             operation,
             source,
         };
-        let mut rules = Vec::new();
+        let ca_key = self.decrypt(row.id, &row.ca_key_encrypted)?;
+        let snapshot_version = u64::try_from(row.snapshot_version).map_err(|_| {
+            invalid(
+                row.id,
+                "issue policy",
+                "stored snapshot version is negative",
+            )
+        })?;
+        let mut body = SnapshotBody {
+            format: format_for(&[]),
+            version: snapshot_version,
+            node_id: sdk_node,
+            issued_at: chrono::Utc::now(),
+            lease_secs: MAX_POLICY_LEASE_SECONDS,
+            session_keys: vec![PublishedKey::from_key(&session_signer.verifying_key())],
+            revoked_sessions: Vec::new(),
+            limited_sessions: Vec::new(),
+            unmatched_host_policy: UnmatchedHostPolicy::Deny,
+            egress: EgressPolicy::default(),
+            passthrough_hosts: Vec::new(),
+            interception_ca: InterceptionCa {
+                cert_der: row.ca_certificate,
+                key: seal(&seal_key, &ca_key, &ca_aad(&sdk_node))
+                    .map_err(|source| sdk("seal interception key", source))?,
+            },
+            rules: Vec::new(),
+        };
+        let mut snapshot_bytes = serde_json::to_vec(&body)
+            .map_err(|source| AuthorityError::Encoding {
+                boot_id: row.id,
+                source,
+            })?
+            .len();
         let mut issued = Vec::with_capacity(bindings.len());
         for binding in bindings {
+            let mut rules = Vec::new();
             for grant in binding.plan.grants() {
                 let credential = binding.credentials.get(grant.grant_id()).ok_or_else(|| {
                     invalid(
@@ -180,6 +215,25 @@ impl AuthorityStore {
                     not_after: Some(grant.claims().exp),
                 });
             }
+            let binding_bytes = rules
+                .iter()
+                .try_fold(0usize, |size, rule| {
+                    serde_json::to_vec(rule).map(|encoded| size + encoded.len() + 1)
+                })
+                .map_err(|source| AuthorityError::Encoding {
+                    boot_id: row.id,
+                    source,
+                })?;
+            // Admit whole bindings only. An oversized addition must not prevent
+            // the already admitted worker bindings from renewing their leases.
+            // Reserve a small allowance for a format-version change.
+            if snapshot_bytes + binding_bytes + 128 > MAX_SNAPSHOT_BYTES {
+                tracing::warn!(boot_id=%row.id, runtime_id=%binding.plan.target().incarnation_id,
+                    binding_bytes, "Worker snapshot capacity exceeded; omitting binding from this lease");
+                continue;
+            }
+            snapshot_bytes += binding_bytes;
+            body.rules.extend(rules);
             let session = session_signer
                 .sign(binding.plan.claims())
                 .map_err(|source| sdk("sign binding session", source))?;
@@ -191,38 +245,13 @@ impl AuthorityStore {
                 ));
             }
             issued.push(IssuedBinding {
+                github_git: binding.plan.grants().iter().any(|g| g.rule().git.is_some()),
                 incarnation: binding.plan.target().incarnation_id,
                 version: binding.plan.version(),
                 session: SecretString::new(session),
             });
         }
-        let ca_key = self.decrypt(row.id, &row.ca_key_encrypted)?;
-        let snapshot_version = u64::try_from(row.snapshot_version).map_err(|_| {
-            invalid(
-                row.id,
-                "issue policy",
-                "stored snapshot version is negative",
-            )
-        })?;
-        let body = SnapshotBody {
-            format: format_for(&rules),
-            version: snapshot_version,
-            node_id: sdk_node,
-            issued_at: chrono::Utc::now(),
-            lease_secs: MAX_POLICY_LEASE_SECONDS,
-            session_keys: vec![PublishedKey::from_key(&session_signer.verifying_key())],
-            revoked_sessions: Vec::new(),
-            limited_sessions: Vec::new(),
-            unmatched_host_policy: UnmatchedHostPolicy::Deny,
-            egress: EgressPolicy::default(),
-            passthrough_hosts: Vec::new(),
-            interception_ca: InterceptionCa {
-                cert_der: row.ca_certificate,
-                key: seal(&seal_key, &ca_key, &ca_aad(&sdk_node))
-                    .map_err(|source| sdk("seal interception key", source))?,
-            },
-            rules,
-        };
+        body.format = format_for(&body.rules);
         let snapshot = SignedSnapshot::sign(&body, &snapshot_key)
             .map_err(|source| sdk("sign policy snapshot", source))?;
         if snapshot.body.len() > MAX_SNAPSHOT_BYTES {

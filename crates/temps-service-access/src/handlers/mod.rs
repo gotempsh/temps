@@ -13,3 +13,8 @@ pub struct AccessAppState {
     /// Optional organization/team authorization extension, absent in OSS.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
+
+mod vaults;
+
+mod assignments;
+mod sessions;

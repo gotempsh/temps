@@ -21,7 +21,8 @@ use temps_service_access_runtime::{WorkerIdentity, MAX_WORKER_BINDINGS};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-const MAX_GRANTS: usize = MAX_WORKER_BINDINGS * crate::tokenless::MAX_BINDING_GRANTS;
+// Read one overflow binding so old excess rows can be retired without blocking renewals.
+const MAX_GRANTS: usize = (MAX_WORKER_BINDINGS + 1) * crate::tokenless::MAX_BINDING_GRANTS;
 const PLAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +154,17 @@ impl PolicyPlanner {
 
     async fn prepare_inner(&self, boot_id: Uuid) -> Result<WorkerPlan, PlanError> {
         let (authority, runtimes, candidates) = self.read(boot_id).await?;
+        self.prepare_rows(boot_id, authority, runtimes, candidates)
+            .await
+    }
+
+    async fn prepare_rows(
+        &self,
+        boot_id: Uuid,
+        authority: temps_entities::sandbox_access_authorities::Model,
+        runtimes: Vec<sandbox_access_runtimes::Model>,
+        candidates: Vec<Candidate>,
+    ) -> Result<WorkerPlan, PlanError> {
         let seal_public_key: [u8; 32] = STANDARD
             .decode(&authority.seal_public_key)
             .ok()
@@ -182,7 +194,8 @@ impl PolicyPlanner {
                     .push(candidate);
             }
         }
-        let mut resolved_github = BTreeMap::<i32, SecretString>::new();
+        let mut resolved_github = BTreeMap::<i32, Option<SecretString>>::new();
+        let credential_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let mut bindings = Vec::new();
         let mut retire = Vec::new();
         for runtime in runtimes {
@@ -190,6 +203,12 @@ impl PolicyPlanner {
                 retire.push(runtime);
                 continue;
             };
+            if bindings.len() >= MAX_WORKER_BINDINGS {
+                // Admission prevents new overflow. Drain legacy excess in bounded
+                // batches while retaining the existing bindings selected first.
+                retire.push(runtime);
+                continue;
+            }
             let version = u64::try_from(runtime.desired_version)
                 .ok()
                 .filter(|v| *v > 0)
@@ -209,56 +228,64 @@ impl PolicyPlanner {
                         service_id: grant.service_id.clone(),
                         source,
                     })?;
-                let credential =
-                    if let Some(source) = &policy.github_repository {
-                        if let Some(credential) = resolved_github.get(&source.connection_id) {
-                            credential.clone()
-                        } else {
-                            let credential =
-                                self.github.resolve(source.connection_id).await.map_err(
-                                    |source| PlanError::Github {
-                                        boot_id,
-                                        service_id: grant.service_id.clone(),
-                                        source,
-                                    },
-                                )?;
-                            resolved_github.insert(source.connection_id, credential.clone());
-                            credential
+                let credential = if let Some(source) = &policy.github_repository {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        resolved_github.entry(source.connection_id)
+                    {
+                        let credential = tokio::time::timeout_at(
+                            credential_deadline,
+                            self.github.resolve(source.connection_id),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                        if credential.is_none() {
+                            tracing::warn!(%boot_id, connection_id=source.connection_id, "GitHub credential unavailable; omitting affected grants from this lease");
                         }
-                    } else {
-                        let encrypted = grant.credential_encrypted.as_deref().ok_or_else(|| {
-                            invalid(
-                                boot_id,
-                                "decode service credential",
-                                "stored bearer credential is missing",
-                            )
-                        })?;
-                        let bytes = Zeroizing::new(self.encryption.decrypt(encrypted).map_err(
-                            |source| PlanError::Encryption {
+                        entry.insert(credential);
+                    }
+                    let Some(credential) = resolved_github
+                        .get(&source.connection_id)
+                        .and_then(Option::as_ref)
+                    else {
+                        continue;
+                    };
+                    credential.clone()
+                } else {
+                    let encrypted = grant.credential_encrypted.as_deref().ok_or_else(|| {
+                        invalid(
+                            boot_id,
+                            "decode service credential",
+                            "stored bearer credential is missing",
+                        )
+                    })?;
+                    let bytes =
+                        Zeroizing::new(self.encryption.decrypt(encrypted).map_err(|source| {
+                            PlanError::Encryption {
                                 boot_id,
                                 service_id: grant.service_id.clone(),
                                 source,
-                            },
-                        )?);
-                        let value = std::str::from_utf8(&bytes).map_err(|_| {
-                            invalid(
-                                boot_id,
-                                "decode service credential",
-                                "stored credential is not UTF-8",
-                            )
-                        })?;
-                        if value.is_empty()
-                            || value.len() > 16384
-                            || !value.bytes().all(|b| (33..=126).contains(&b))
-                        {
-                            return Err(invalid(
-                                boot_id,
-                                "validate service credential",
-                                "stored bearer credential is invalid",
-                            ));
-                        }
-                        SecretString::new(value)
-                    };
+                            }
+                        })?);
+                    let value = std::str::from_utf8(&bytes).map_err(|_| {
+                        invalid(
+                            boot_id,
+                            "decode service credential",
+                            "stored credential is not UTF-8",
+                        )
+                    })?;
+                    if value.is_empty()
+                        || value.len() > 16384
+                        || !value.bytes().all(|b| (33..=126).contains(&b))
+                    {
+                        return Err(invalid(
+                            boot_id,
+                            "validate service credential",
+                            "stored bearer credential is invalid",
+                        ));
+                    }
+                    SecretString::new(value)
+                };
                 credentials.insert(grant.grant_id.clone(), credential);
                 requests.push(PrepareSession {
                     target: BindingTarget {
@@ -274,6 +301,11 @@ impl PolicyPlanner {
                     expires_at: grant.expires_at,
                     max_ttl_seconds: grant.max_ttl_seconds,
                 });
+            }
+            // A transient credential outage does not revoke consent. Omit the
+            // unavailable binding now and retry on its next renewal command.
+            if requests.is_empty() {
+                continue;
             }
             let plan = PreparedBinding::prepare(requests, version, now).map_err(|source| {
                 PlanError::Binding {

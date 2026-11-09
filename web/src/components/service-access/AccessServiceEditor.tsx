@@ -1,22 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { Callout, Field, Settings } from '@temps-sdk/ds'
+import { Callout, Field, Settings, CredentialProviderMark } from '@temps-sdk/ds'
 import { Input, Textarea, Checkbox, Button } from '@temps-sdk/ui'
 import { toast } from 'sonner'
 import {
   createAccessService,
-  getProject,
   updateAccessService,
   type AccessServiceResponse,
 } from '@/api/client'
+import { VaultRepositoryPicker } from './VaultRepositoryPicker'
+import { serviceProviders } from './service-provider-registry'
 import { problemDetail } from '@/lib/api-problem'
 import {
-  accessServiceSchema,
+  serviceEditorSchema,
   serviceDefaults,
   serviceBody,
   type AccessServiceValues,
@@ -24,11 +25,13 @@ import {
 
 export function AccessServiceEditor({
   projectId,
+  vaultId,
   service,
   canUseProjectGithub = false,
   onClose,
   onSaved,
 }: {
+  vaultId?: string
   projectId?: number | null
   service?: AccessServiceResponse
   canUseProjectGithub?: boolean
@@ -42,77 +45,65 @@ export function AccessServiceEditor({
       mounted.current = false
     }
   }, [])
+  const [sourceMode, setSourceMode] = useState<'bearer' | 'api' | 'git'>(
+    service?.policy.github_repository?.protocol ?? 'bearer'
+  )
+  const [connectionId, setConnectionId] = useState<number | null>(
+    service?.policy.github_repository?.connection_id ?? null
+  )
   const form = useForm<AccessServiceValues>({
-    resolver: zodResolver(accessServiceSchema),
+    resolver: zodResolver(serviceEditorSchema(service, sourceMode)),
     defaultValues: serviceDefaults(service),
   })
+  const provider = useWatch({ control: form.control, name: 'provider' })
   const github = useWatch({ control: form.control, name: 'githubRepository' })
-  const source = useMutation({
-    mutationFn: async (protocol: 'api' | 'git') => {
-      if (!projectId || !canUseProjectGithub)
-        throw new Error(
-          'Project write and Git repository read permissions are required'
-        )
-      const { data } = await getProject({
-        path: { id: projectId },
-        throwOnError: true,
-      })
-      if (
-        !data.git_provider_connection_id ||
-        !['github', 'github_app'].includes(data.git_provider_type ?? '') ||
-        !data.repo_owner ||
-        !data.repo_name
-      ) {
-        throw new Error('Connect this project to a GitHub repository first')
-      }
-      return {
-        connection_id: data.git_provider_connection_id,
-        owner: data.repo_owner,
-        repository: data.repo_name,
-        protocol,
-      }
-    },
-    onSuccess: (reference) => {
-      if (!mounted.current) return
-      const repo = `${reference.owner}/${reference.repository}`
-      form.setValue('githubRepository', reference, { shouldDirty: true })
+  function selectRepository(
+    reference: NonNullable<AccessServiceValues['githubRepository']>
+  ) {
+    const repo = `${reference.owner}/${reference.repository}`
+    form.setValue('githubRepository', reference, {
+      shouldDirty: true,
+      shouldValidate: true,
+    })
+    form.setValue('provider', 'github', { shouldDirty: true })
+    form.setValue(
+      'origin',
+      reference.protocol === 'git'
+        ? 'https://github.com'
+        : 'https://api.github.com',
+      { shouldDirty: true }
+    )
+    form.setValue(
+      'paths',
+      reference.protocol === 'git'
+        ? `/${repo}\n/${repo}.git`
+        : `/repos/${repo}`,
+      { shouldDirty: true }
+    )
+    form.setValue(
+      'methods',
+      reference.protocol === 'git' ? ['GET', 'POST'] : ['GET', 'HEAD'],
+      { shouldDirty: true }
+    )
+    form.setValue('credential', '')
+    form.setValue('clearCredential', false)
+    if (!form.getValues('name'))
       form.setValue(
-        'origin',
+        'name',
         reference.protocol === 'git'
-          ? 'https://github.com'
-          : 'https://api.github.com',
+          ? 'GitHub clone/fetch'
+          : 'GitHub repository API',
         { shouldDirty: true }
       )
-      form.setValue(
-        'paths',
-        reference.protocol === 'git'
-          ? `/${repo}\n/${repo}.git`
-          : `/repos/${repo}`,
-        { shouldDirty: true }
-      )
-      form.setValue(
-        'methods',
-        reference.protocol === 'git' ? ['GET', 'POST'] : ['GET', 'HEAD'],
-        { shouldDirty: true }
-      )
-      form.setValue('credential', '')
-      form.setValue('clearCredential', false)
-      if (!form.getValues('name'))
-        form.setValue(
-          'name',
-          reference.protocol === 'git'
-            ? 'GitHub clone/fetch'
-            : 'GitHub repository API',
-          { shouldDirty: true }
-        )
-      toast.success('Project GitHub connection selected')
-    },
-  })
+  }
   const save = useMutation({
     mutationFn: async (values: AccessServiceValues) => {
       if (!projectId)
         throw new Error('Select a project before saving a service')
-      const body = serviceBody(values, service?.version)
+      const body = {
+        ...serviceBody(values, service?.version),
+        vault_id: service ? undefined : vaultId,
+      }
       if (service)
         return updateAccessService({
           path: { project_id: projectId, service_id: service.id },
@@ -142,14 +133,10 @@ export function AccessServiceEditor({
       title={service ? 'Edit service' : 'Add service'}
       description="Save a scoped service. Connecting a sandbox requires a separate approval."
       onCancel={() => {
-        if (!save.isPending && !source.isPending) onClose()
+        if (!save.isPending) onClose()
       }}
       onSubmit={form.handleSubmit((values) => {
-        if (
-          !source.isPending &&
-          !save.isPending &&
-          (!github || canUseProjectGithub)
-        )
+        if (!save.isPending && (!github || canUseProjectGithub))
           save.mutate(values)
       })}
       dirty={
@@ -157,7 +144,7 @@ export function AccessServiceEditor({
         !!projectId &&
         (!github || canUseProjectGithub)
       }
-      saving={save.isPending || source.isPending}
+      saving={save.isPending}
       saveLabel="Save service"
       errors={{
         Name: form.formState.errors.name?.message,
@@ -166,12 +153,10 @@ export function AccessServiceEditor({
         'Allowed HTTP methods': form.formState.errors.methods?.message,
         'Maximum access lifetime': form.formState.errors.maxTtl?.message,
         'Bearer credential': form.formState.errors.credential?.message,
+        Repository: form.formState.errors.githubRepository?.message,
       }}
     >
-      <fieldset
-        disabled={save.isPending || source.isPending}
-        className="space-y-4"
-      >
+      <fieldset disabled={save.isPending} className="space-y-4">
         {save.isError && (
           <Callout tone="error" title="Could not save service">
             {problemDetail(
@@ -180,9 +165,42 @@ export function AccessServiceEditor({
             )}
           </Callout>
         )}
+        <Field label="Service provider">
+          {(props) => (
+            <div
+              {...props}
+              role="group"
+              className="grid grid-cols-1 gap-2 lg:grid-cols-3"
+            >
+              {[
+                ...serviceProviders,
+                {
+                  id: 'custom' as const,
+                  name: 'Custom HTTP service',
+                  origin: '',
+                },
+              ].map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  aria-pressed={provider === p.id}
+                  disabled={!!github}
+                  className={`flex items-center gap-3 rounded-md border p-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${provider === p.id ? 'border-foreground bg-muted' : 'hover:bg-muted/50'}`}
+                  onClick={() => {
+                    form.setValue('provider', p.id, { shouldDirty: true })
+                    form.setValue('origin', p.origin, { shouldDirty: true })
+                  }}
+                >
+                  <CredentialProviderMark provider={p.id} />
+                  <span>{p.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </Field>
         <Field
           label="Credential source"
-          description="GitHub uses this project’s connection on the host. No token is copied into the sandbox."
+          description="Choose a stored bearer credential or an explicit repository from a GitHub connection. Credentials stay on the host."
         >
           {(props) => (
             <div
@@ -192,9 +210,10 @@ export function AccessServiceEditor({
             >
               <Button
                 type="button"
-                variant={!github ? 'default' : 'outline'}
+                variant={sourceMode === 'bearer' ? 'default' : 'outline'}
                 onClick={() => {
-                  if (source.isPending || save.isPending) return
+                  if (save.isPending) return
+                  setSourceMode('bearer')
                   form.setValue('githubRepository', undefined, {
                     shouldDirty: true,
                   })
@@ -208,13 +227,13 @@ export function AccessServiceEditor({
                 <Button
                   key={protocol}
                   type="button"
-                  variant={
-                    github?.protocol === protocol ? 'default' : 'outline'
-                  }
+                  variant={sourceMode === protocol ? 'default' : 'outline'}
                   disabled={!canUseProjectGithub}
                   onClick={() => {
-                    if (!source.isPending && !save.isPending)
-                      source.mutate(protocol)
+                    setSourceMode(protocol)
+                    form.setValue('credential', '')
+                    form.setValue('clearCredential', false)
+                    if (github) selectRepository({ ...github, protocol })
                   }}
                 >
                   {protocol === 'api'
@@ -231,16 +250,41 @@ export function AccessServiceEditor({
             permissions.
           </p>
         )}
-        {source.isError && (
-          <Callout tone="error" title="Could not use project GitHub connection">
-            {problemDetail(
-              source.error,
-              'Connect this project to GitHub, then try again.'
-            )}{' '}
-            <a className="underline" href={`/projects/${projectId}`}>
-              Open project
-            </a>
-          </Callout>
+        {sourceMode !== 'bearer' && canUseProjectGithub && (
+          <Field
+            label="Repository"
+            error={form.formState.errors.githubRepository?.message}
+            description="Select the repository this service may access. Clone/fetch is read-only; push is not allowed."
+          >
+            {() => (
+              <div className="space-y-3">
+                {github && (
+                  <p role="status">
+                    Selected: {github.owner}/{github.repository}
+                  </p>
+                )}
+                <VaultRepositoryPicker
+                  connectionId={connectionId}
+                  onConnectionChange={(id) => {
+                    setConnectionId(id)
+                    form.setValue('githubRepository', undefined, {
+                      shouldDirty: true,
+                    })
+                  }}
+                  onRepositorySelect={(repository) => {
+                    if (repository.git_provider_connection_id !== connectionId)
+                      return
+                    selectRepository({
+                      connection_id: repository.git_provider_connection_id,
+                      owner: repository.owner,
+                      repository: repository.name,
+                      protocol: sourceMode,
+                    })
+                  }}
+                />
+              </div>
+            )}
+          </Field>
         )}
         <Field label="Name" error={form.formState.errors.name?.message}>
           {(props) => (
@@ -258,7 +302,7 @@ export function AccessServiceEditor({
           {(props) => (
             <Input
               {...form.register('origin')}
-              readOnly={!!github}
+              readOnly={sourceMode !== 'bearer'}
               {...props}
               placeholder="https://api.example.com"
             />
@@ -272,7 +316,7 @@ export function AccessServiceEditor({
           {(props) => (
             <Textarea
               {...form.register('paths')}
-              readOnly={!!github}
+              readOnly={sourceMode !== 'bearer'}
               {...props}
               placeholder="/v1"
             />
@@ -328,46 +372,55 @@ export function AccessServiceEditor({
             />
           )}
         </Field>
-        <Field
-          label={
-            service?.has_credential
-              ? 'Replace bearer credential'
-              : 'Bearer credential (optional)'
-          }
-          error={form.formState.errors.credential?.message}
-          description="Encrypted when saved; never displayed again. Leave empty to keep the existing credential."
-        >
-          {(props) => (
-            <Input
-              {...form.register('credential')}
-              disabled={!!github}
-              {...props}
-              type="password"
-              autoComplete="new-password"
-            />
-          )}
-        </Field>
-        <Controller
-          control={form.control}
-          name="clearCredential"
-          render={({ field, fieldState }) => (
+        {sourceMode === 'bearer' && (
+          <>
             <Field
-              label="Remove stored credential"
-              error={fieldState.error?.message}
+              label={
+                service?.has_credential && !service.policy.github_repository
+                  ? 'Replace bearer credential'
+                  : 'Bearer credential'
+              }
+              error={form.formState.errors.credential?.message}
+              description={
+                service?.has_credential && !service.policy.github_repository
+                  ? 'Leave empty to keep the stored credential. Enter a new value to replace it.'
+                  : 'Required to enable access requests. Encrypted when saved; never displayed again.'
+              }
             >
               {(props) => (
-                <Checkbox
-                  {...props}
+                <Input
+                  {...form.register('credential')}
                   disabled={!!github}
-                  checked={field.value}
-                  onCheckedChange={(checked) =>
-                    field.onChange(checked === true)
-                  }
+                  {...props}
+                  type="password"
+                  autoComplete="new-password"
                 />
               )}
             </Field>
-          )}
-        />
+            {service?.has_credential && !service.policy.github_repository && (
+              <Controller
+                control={form.control}
+                name="clearCredential"
+                render={({ field, fieldState }) => (
+                  <Field
+                    label="Remove stored credential"
+                    error={fieldState.error?.message}
+                  >
+                    {(props) => (
+                      <Checkbox
+                        {...props}
+                        checked={field.value}
+                        onCheckedChange={(checked) =>
+                          field.onChange(checked === true)
+                        }
+                      />
+                    )}
+                  </Field>
+                )}
+              />
+            )}
+          </>
+        )}
         <Controller
           control={form.control}
           name="enabled"

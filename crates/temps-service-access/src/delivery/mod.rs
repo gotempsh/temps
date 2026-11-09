@@ -95,7 +95,7 @@ impl DeliveryQueue {
 
     /// At most 32 commands, with a fixed 30-second lease. A crashed dispatcher
     /// needs no repair job: the next claim reclaims its expired work. Claims are
-    /// safe across concurrent dispatchers through SKIP LOCKED. The DB clock is
+    /// serialized per worker by short claim transactions. The DB clock is
     /// authoritative; a worker cannot extend a claim or grant deadline.
     pub async fn claim(&self, limit: u32) -> Result<Vec<DeliveryClaim>, DeliveryError> {
         if !(1..=32).contains(&limit) {
@@ -104,15 +104,48 @@ impl DeliveryQueue {
                 reason: "batch size must be between 1 and 32",
             });
         }
-        let claim_id = Uuid::new_v4();
-        let rows = delivery::Entity::find().from_raw_sql(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "WITH next AS (SELECT id FROM sandbox_access_delivery WHERE completed_at IS NULL AND available_at<=now() AND (claimed_until IS NULL OR claimed_until<=now()) ORDER BY (operation='retire') DESC,available_at,id LIMIT $1 FOR UPDATE SKIP LOCKED) UPDATE sandbox_access_delivery AS d SET claim_id=$2, claimed_until=now()+interval '30 seconds', attempts=LEAST(d.attempts,2147483646)+1 FROM next WHERE d.id=next.id RETURNING d.*",
-            [i64::from(limit).into(),claim_id.into()])).all(self.db.as_ref()).await
+        let candidates = delivery::Entity::find().from_raw_sql(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT d.* FROM sandbox_access_delivery d WHERE d.completed_at IS NULL AND d.available_at<=now() AND (d.claimed_until IS NULL OR d.claimed_until<=now()) AND NOT EXISTS (SELECT 1 FROM sandbox_access_delivery busy WHERE busy.worker_boot_id=d.worker_boot_id AND busy.completed_at IS NULL AND busy.claimed_until>now()) ORDER BY (d.operation='retire') DESC,d.available_at,d.id LIMIT $1",
+            [i64::from(limit).into()])).all(self.db.as_ref()).await
             .map_err(|e| database("claim commands", "pending queue", e))?;
-        Ok(rows
-            .into_iter()
-            .map(|command| DeliveryClaim { command, claim_id })
-            .collect())
+        let mut claims = Vec::new();
+        for candidate in candidates {
+            let tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|e| database("begin claim", candidate.id, e))?;
+            if let Some(worker) = candidate.worker_boot_id {
+                // Serialize only the short claim transaction. Recheck occupancy
+                // in a separate READ COMMITTED statement after acquiring the lock.
+                let lock = tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 739214)) AS acquired",
+                    [worker.to_string().into()])).await
+                    .map_err(|e| database("lock worker claim", worker, e))?;
+                let acquired = lock
+                    .map(|row| row.try_get::<bool>("", "acquired"))
+                    .transpose()
+                    .map_err(|e| database("decode worker claim", worker, e))?
+                    .unwrap_or(false);
+                if !acquired {
+                    continue;
+                }
+            }
+            let claim_id = Uuid::new_v4();
+            let command = delivery::Entity::find().from_raw_sql(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE sandbox_access_delivery d SET claim_id=$2,claimed_until=now()+interval '30 seconds',attempts=LEAST(d.attempts,2147483646)+1 WHERE d.id=$1 AND d.completed_at IS NULL AND d.available_at<=now() AND (d.claimed_until IS NULL OR d.claimed_until<=now()) AND NOT EXISTS (SELECT 1 FROM sandbox_access_delivery busy WHERE busy.worker_boot_id=d.worker_boot_id AND busy.completed_at IS NULL AND busy.claimed_until>now()) RETURNING d.*",
+                [candidate.id.into(),claim_id.into()])).one(&tx).await
+                .map_err(|e| database("claim worker command", candidate.id, e))?;
+            tx.commit()
+                .await
+                .map_err(|e| database("commit worker claim", candidate.id, e))?;
+            if let Some(command) = command {
+                claims.push(DeliveryClaim { command, claim_id });
+            }
+        }
+        Ok(claims)
     }
 
     /// Persist an authenticated enforcement receipt. A delayed receipt can

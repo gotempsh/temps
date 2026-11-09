@@ -31,14 +31,19 @@ impl DockerSandboxProvider {
             )
         })?;
         if let ServiceAccessCommand::Retire { expected, boot_id } = command {
-            if boot_id != mounts.control.identity().boot_id
-                || expected.container_id != handle.sandbox_id
-            {
+            if expected.container_id != handle.sandbox_id {
                 return Err(failure(
                     &handle.sandbox_id,
                     "retire binding",
-                    "worker boot or container identity changed",
+                    "container identity changed",
                 ));
+            }
+            if boot_id != mounts.control.identity().boot_id {
+                // This authenticated provider owns a fresh, process-local control
+                // plane. Bindings from another boot cannot survive in it. Acknowledge
+                // only the saved target; never retire its replacement incarnation.
+                tracing::info!(container_id = %expected.container_id, incarnation = %expected.incarnation, retired_boot = %boot_id, "Obsolete worker boot retirement confirmed");
+                return Ok(ServiceAccessReply::Retired { target: expected });
             }
             self.retire_service_access_target(&expected).await?;
             tracing::info!(container_id = %expected.container_id, incarnation = %expected.incarnation, "Sandbox service access retired");
@@ -179,6 +184,12 @@ impl DockerSandboxProvider {
                 .attachment
                 .publish_certificate(&certificate)
                 .map_err(|_| rejected("publish public CA"))?;
+            if delivery.github_git {
+                entry
+                    .attachment
+                    .publish_github_git_route()
+                    .map_err(|_| rejected("publish Git routing ownership"))?;
+            }
             drop(entries);
             mounts.activate(&info, &expected, Arc::clone(&binding))?;
             let mut entries = mounts.entries();

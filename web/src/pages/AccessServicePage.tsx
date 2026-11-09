@@ -18,12 +18,14 @@ import { problemDetail } from '@/lib/api-problem'
 
 function Editor({
   projectId,
+  vaultId,
   service,
   canUseProjectGithub,
   onClose,
   onSaved,
 }: {
   projectId: number
+  vaultId?: string
   service?: AccessServiceResponse
   canUseProjectGithub: boolean
   onClose: () => void
@@ -35,6 +37,7 @@ function Editor({
   return (
     <AccessServiceEditor
       projectId={projectId}
+      vaultId={vaultId}
       service={initialService}
       canUseProjectGithub={canUseProjectGithub}
       onClose={onClose}
@@ -80,9 +83,14 @@ export default function AccessServicePage() {
   }
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Projects', href: '/projects' },
+      { label: 'Vault', href: '/vault' },
       ...(valid
-        ? [{ label: `Project ${projectId}`, href: `/projects/${projectId}` }]
+        ? [
+            {
+              label: `Project ${projectId}`,
+              href: `/vault/projects/${projectId}`,
+            },
+          ]
         : []),
       {
         label: serviceId
@@ -93,12 +101,17 @@ export default function AccessServicePage() {
     return () => setBreadcrumbs([])
   }, [projectId, valid, serviceId, service.data?.name, setBreadcrumbs])
   const back = () => {
+    const vault = params.get('vault')
     const sandbox = params.get('sandbox')
     navigate(
-      sandbox ? `/sandboxes/${encodeURIComponent(sandbox)}` : '/sandboxes'
+      valid
+        ? `/vault/projects/${projectId}${vault ? `/vaults/${encodeURIComponent(vault)}` : ''}${sandbox ? `?sandbox=${encodeURIComponent(sandbox)}` : ''}`
+        : '/vault'
     )
   }
   const saved = () => {
+    void client.invalidateQueries({ queryKey: [{ _id: 'listAccessVaults' }] })
+    void client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
     void client.invalidateQueries({ queryKey: [{ _id: 'listAccessServices' }] })
     void client.invalidateQueries({ queryKey: [{ _id: 'listServiceGrants' }] })
     void client.invalidateQueries({ queryKey: [{ _id: 'getAccessService' }] })
@@ -115,13 +128,13 @@ export default function AccessServicePage() {
               ? 'The project ID in this link is invalid.'
               : problemDetail(
                   service.error,
-                  'Check project access or return to the sandbox to select a service.'
+                  'Check project access or return to Vault to select a service.'
                 )
           }
           action={
             <div className="flex gap-2">
               <Button variant="outline" onClick={back}>
-                Back to sandboxes
+                Back to Vault
               </Button>
               {valid && (
                 <Button onClick={() => void service.refetch()}>Retry</Button>
@@ -153,7 +166,7 @@ export default function AccessServicePage() {
           description="Editing services requires project write permission. Ask a project administrator for access."
           action={
             <Button variant="outline" onClick={back}>
-              Back to sandboxes
+              Back to Vault
             </Button>
           }
         />
@@ -174,6 +187,7 @@ export default function AccessServicePage() {
             <Editor
               key={editorKey}
               projectId={projectId}
+              vaultId={params.get('vault') ?? undefined}
               service={service.data}
               canUseProjectGithub={
                 capability.data?.can_use_project_github === true

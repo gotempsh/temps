@@ -286,7 +286,7 @@ List pages in settings (secrets, tokens, variables, access) use one
 `PageHeader` with the primary action on the right, then the list itself on the
 page; they never repeat the page title as a section heading.
 
-Use open sections with section headings on the left and controls on the right
+On full settings forms only, use open sections with section headings on the left and controls on the right
 on desktop; stack headings above controls on mobile. Separate groups with
 spacing instead of a card or divider around each one. Keep short forms at a
 readable width (the settings reference uses a `max-w-5xl` grid with one-third
@@ -421,7 +421,24 @@ Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/lo
 vector pinned to [Simple Icons 13.0.0](https://github.com/simple-icons/simple-icons/blob/13.0.0/icons/anthropic.svg)).
 The company marks remain the property of their respective owners.
 
-For a form embedded in a record page, use `Settings embedded`: a section heading,
-no nested page gutters, and a save footer contained by the section surface.
-Use `SettingsGroup headingLevel="h3"` under its `h2`; keep standard page settings
-at the default heading levels. Bound short controls and stack groups on mobile.
+For a small form embedded in a record page, use `Field` and `FormErrors`
+in the record layout with a local save footer. Do not introduce left/right
+settings columns. Route extensive forms to a dedicated settings page.
+
+
+
+The left/right heading-and-controls layout is reserved for full settings forms.
+Never use `SettingsSection` or `SettingsGroup` as a wrapper for a read-only
+record, resource list, grant table, or operational panel. Detail and collection
+pages keep one consistent full-width content layout; link to a dedicated
+settings route for extensive editing. Small inline forms use `Field` and
+`FormErrors` in the surrounding layout without introducing settings columns.
+Vault owns Services, Access bundles, and Sessions. Services hold provider
+configuration and credentials; bundles define reusable service selections and
+access limits; sessions authorize identified consumers for a bounded lifetime.
+Session details expose the allowed consumers, effective restrictions, expiry,
+and revocation state. Sandbox detail pages show only that sandbox's access and
+link to the owning Vault sessions; a sandbox picker is not a Vault navigation tab.
+Keep session records distinct from individual grants and internal proxy tokens.
+Creation and editing use dedicated form pages; operational details use the
+full-width record layout.

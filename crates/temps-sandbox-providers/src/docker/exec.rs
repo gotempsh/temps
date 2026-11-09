@@ -239,6 +239,35 @@ pub(super) fn write_probe_script(dir: &str) -> String {
     )
 }
 
+/// Non-TTY relay stdout is Docker-multiplexed. Unframed Console output is a
+/// runtime diagnostic (for example, an OCI exec failure), never PTY frames.
+fn relay_output_chunk(
+    chunk: Result<LogOutput, bollard::errors::Error>,
+    sandbox_id: &str,
+    operation: &str,
+    relay: &str,
+) -> Result<bytes::Bytes, AgentError> {
+    match chunk {
+        Ok(LogOutput::StdOut { message }) => Ok(message),
+        Ok(LogOutput::StdErr { message } | LogOutput::Console { message }) => {
+            Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: sandbox_id.to_string(),
+                reason: format!(
+                    "{relay} error: {}",
+                    String::from_utf8_lossy(&message).trim()
+                ),
+            })
+        }
+        Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+        Err(error) => Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: sandbox_id.to_string(),
+            reason: format!("{operation} stream failed: {error}"),
+        }),
+    }
+}
+
 impl DockerSandboxProvider {
     /// Run `cmd` in the sandbox as `SANDBOX_USER` with its stdio attached,
     /// as a plain binary pipe (no TTY: Docker would mangle the bytes with
@@ -291,25 +320,8 @@ impl DockerSandboxProvider {
         match started {
             StartExecResults::Attached { output, input } => {
                 let sandbox_id = handle.sandbox_id.clone();
-                let output = output.map(move |chunk| match chunk {
-                    Ok(LogOutput::StdOut { message }) => Ok(message),
-                    Ok(LogOutput::Console { message }) => Ok(message),
-                    Ok(LogOutput::StdErr { message }) => Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: sandbox_id.clone(),
-                        reason: format!(
-                            "{} error: {}",
-                            relay,
-                            String::from_utf8_lossy(&message).trim()
-                        ),
-                    }),
-                    Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
-                    Err(e) => Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: sandbox_id.clone(),
-                        reason: format!("{} stream failed: {}", operation, e),
-                    }),
-                });
+                let output = output
+                    .map(move |chunk| relay_output_chunk(chunk, &sandbox_id, operation, relay));
                 Ok(PtyAttachment {
                     output: Box::pin(output),
                     input,
@@ -736,5 +748,53 @@ impl DockerSandboxProvider {
             stdout: stdout_output.into_output(),
             stderr: stderr_output.into_output(),
         })
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_diagnostics_are_errors_not_terminal_protocol_bytes() {
+        let diagnostic = bytes::Bytes::from_static(
+            b"OCI runtime exec failed: exec: socat: executable file not found in PATH\n",
+        );
+        for chunk in [
+            LogOutput::Console {
+                message: diagnostic.clone(),
+            },
+            LogOutput::StdErr {
+                message: diagnostic.clone(),
+            },
+        ] {
+            let error =
+                relay_output_chunk(Ok(chunk), "sandbox-test", "PTY attach", "PTY agent relay")
+                    .expect_err("runtime diagnostic must not enter the PTY frame decoder");
+            match error {
+                AgentError::SandboxExecFailed {
+                    sandbox_id, reason, ..
+                } => {
+                    assert_eq!(sandbox_id, "sandbox-test");
+                    assert_eq!(reason, "PTY agent relay error: OCI runtime exec failed: exec: socat: executable file not found in PATH");
+                }
+                other => panic!("unexpected error: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relay_stdout_preserves_binary_frames() {
+        let frame = bytes::Bytes::from_static(b"\0\0\0\x04\xff\0\r\n");
+        let output = relay_output_chunk(
+            Ok(LogOutput::StdOut {
+                message: frame.clone(),
+            }),
+            "sandbox-test",
+            "PTY attach",
+            "PTY agent relay",
+        )
+        .expect("valid stdout");
+        assert_eq!(output, frame);
     }
 }

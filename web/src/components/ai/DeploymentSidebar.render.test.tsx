@@ -111,3 +111,36 @@ test('following the latest deployment of a project with none yet waits instead o
   expect(html).toContain('This project has no deployment yet.')
   expect(html).not.toContain('could not load this deployment')
 })
+
+test('chat working tabs retain every label and wrap without a scrolling strip', () => {
+  const client = new QueryClient()
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <DeploymentSidebar
+          deployments={[]}
+          conversationPublicId="test-conversation"
+          initialSelected="made"
+          onClose={() => undefined}
+        />
+      </QueryClientProvider>
+    </MemoryRouter>
+  )
+  expect(html.match(/role="tab"/g)?.length).toBe(6)
+  for (const label of [
+    'Architecture',
+    'Made here',
+    'Preview',
+    'Files',
+    'Changes',
+    'Terminal',
+  ]) {
+    expect(html).toContain(`>${label}</span>`)
+  }
+  const list = html.match(/<div[^>]*role="tablist"[^>]*>/)?.[0] ?? ''
+  expect(list).toContain('flex-wrap')
+  expect(list).toContain('h-auto')
+  expect(list).not.toContain('overflow-x-auto')
+  expect(html).not.toContain('sr-only')
+  expect(html).toContain('aria-label="Close working tabs"')
+})

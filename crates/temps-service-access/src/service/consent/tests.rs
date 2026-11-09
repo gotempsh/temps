@@ -110,8 +110,10 @@ async fn postgres_fresh_consent_is_scoped_atomic_bounded_and_preserves_retiremen
             9601,
             None,
             SaveAccessService {
+                vault_id: None,
                 name: "API".into(),
                 policy: SandboxAccessPolicy {
+                    provider: None,
                     github_repository: None,
                     origin: "https://api.github.com".into(),
                     path_prefixes: vec!["/user".into()],
@@ -300,5 +302,141 @@ async fn postgres_fresh_consent_is_scoped_atomic_bounded_and_preserves_retiremen
     drop(queue);
     drop(worker);
     drop(db);
+    test.cleanup().await;
+}
+
+#[tokio::test]
+async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping fresh sandbox consent: Docker unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO users (id,name,email) VALUES (9601,'Test user','user@example.com'); INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9601,'Consent','repo','owner','/','main','nodejs','consent',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9601,'sbx_consent','consent',9601,9601,'running','docker')").await.unwrap();
+    let service = ServiceAccessService::new(
+        Arc::clone(&db),
+        encryption(),
+        Arc::new(UnavailableTokenlessBroker),
+    );
+    let definition = service
+        .save_service(
+            9601,
+            None,
+            SaveAccessService {
+                vault_id: None,
+                name: "API".into(),
+                policy: SandboxAccessPolicy {
+                    provider: None,
+                    github_repository: None,
+                    origin: "https://api.github.com".into(),
+                    path_prefixes: vec!["/user".into()],
+                    methods: vec![AccessMethod::Get],
+                },
+                max_ttl_seconds: 60,
+                enabled: true,
+                credential: Some(SecretString::new("fixture-token")),
+                clear_credential: false,
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = WorkerControl::new(Arc::new(HostAudit));
+    let store = AuthorityStore::new(Arc::clone(&db), encryption(), Arc::new(NoopAuditLogger));
+    store.register(None, &worker.identity()).await.unwrap();
+
+    use crate::{delivery::DeliveryQueue, planner::PolicyPlanner};
+    use temps_entities::sandbox_access_delivery::DeliveryOperation;
+    let healthy = service
+        .authorize_grant(
+            consent(&definition.id),
+            observation(&worker, Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+    // Seed historical open runtimes left behind by destroyed sandboxes.
+    db.execute_unprepared("INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) SELECT n,'sbx_capacity_'||n,'capacity',9601,9601,'destroyed','docker' FROM generate_series(10001,10128) n").await.unwrap();
+    let boot = worker.identity().boot_id;
+    db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) SELECT gen_random_uuid(),9601,id,'{boot}','container-'||id,'temps-sandbox-capacity_'||id,'docker' FROM sandboxes WHERE id BETWEEN 10001 AND 10127")).await.unwrap();
+    db.execute_unprepared("UPDATE sandboxes SET status='running' WHERE id=10128")
+        .await
+        .unwrap();
+    let mut extra = consent(&definition.id);
+    extra.sandbox_id = "sbx_capacity_10128".into();
+    let mut target = observation(&worker, Uuid::new_v4());
+    target.container_name = "temps-sandbox-capacity_10128".into();
+    let error = service.authorize_grant(extra, target).await.unwrap_err();
+    assert!(error.to_string().contains("128 open bindings"));
+    assert_eq!(
+        runtimes::Entity::find()
+            .filter(runtimes::Column::ClosedAt.is_null())
+            .count(db.as_ref())
+            .await
+            .unwrap(),
+        128
+    );
+    // Existing authorization remains renewable at capacity.
+    service
+        .authorize_grant(
+            consent(&definition.id),
+            observation(&worker, healthy.runtime_id),
+        )
+        .await
+        .unwrap();
+    // Simulate an excess row accepted by an older version. Neither scheduling nor
+    // planning may reject the entire worker before retiring these stale rows.
+    db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes(id,project_id,sandbox_id,authority_id,provider_identity,provider_name,provider_backend) VALUES(gen_random_uuid(),9601,10128,'{boot}','container-extra','temps-sandbox-capacity_10128','docker')")).await.unwrap();
+    let queue = DeliveryQueue::new(db.clone());
+    assert!(queue.schedule_due(16).await.unwrap() > 0);
+    let planner = PolicyPlanner::new(
+        db.clone(),
+        encryption(),
+        None,
+        Arc::new(crate::github::NoGithub),
+    );
+    let plan = planner.prepare(boot).await.unwrap();
+    assert_eq!(plan.bindings.len(), 1);
+    assert_eq!(plan.retire.len(), 128);
+    // Even a legacy overflow of fully eligible bindings must be bounded at
+    // issuance, rather than poisoning every policy renewal on the worker.
+    db.execute_unprepared("UPDATE sandboxes SET status='running' WHERE id BETWEEN 10001 AND 10128")
+        .await
+        .unwrap();
+    db.execute_unprepared(&format!(r#"
+INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at)
+SELECT 'grant_'||replace(gen_random_uuid()::text,'-',''),9601,g.service_id,r.sandbox_id,g.service_version,g.policy_snapshot,9601,now()+interval '60 seconds'
+FROM sandbox_access_runtimes r CROSS JOIN sandbox_service_grants g
+WHERE r.sandbox_id BETWEEN 10001 AND 10128 AND g.id='{}';
+INSERT INTO sandbox_access_authorizations(grant_id,request_id,requested_ttl,runtime_id,project_id,sandbox_id,approved_by)
+SELECT g.id,gen_random_uuid(),60,r.id,9601,r.sandbox_id,9601
+FROM sandbox_access_runtimes r JOIN sandbox_service_grants g ON g.sandbox_id=r.sandbox_id WHERE r.sandbox_id BETWEEN 10001 AND 10128;
+"#, healthy.grant_id)).await.unwrap();
+    let overflow = planner.prepare(boot).await.unwrap();
+    assert_eq!(overflow.bindings.len(), 128);
+    assert_eq!(overflow.retire.len(), 1);
+    assert!(overflow
+        .bindings
+        .iter()
+        .any(|binding| binding.plan.target().incarnation_id == healthy.runtime_id));
+    for stale in plan.retire {
+        let tx = db.begin().await.unwrap();
+        DeliveryQueue::advance(
+            &tx,
+            stale.id,
+            stale.desired_version,
+            DeliveryOperation::Retire,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let recovered = planner.prepare(boot).await.unwrap();
+    assert_eq!(recovered.bindings.len(), 1);
+    assert!(recovered.retire.is_empty());
     test.cleanup().await;
 }

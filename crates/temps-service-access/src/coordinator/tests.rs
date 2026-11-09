@@ -95,7 +95,7 @@ async fn plugin_registers_the_coordinator_starts_once_and_aborts_owned_tasks_on_
         .initialize_plugin_services(&read_context)
         .await
         .unwrap();
-    assert_eq!(Arc::strong_count(&coordinator), before + 3);
+    assert_eq!(Arc::strong_count(&coordinator), before + 4);
     tokio::task::yield_now().await;
     assert!(weak.upgrade().is_some());
     drop(read_context);
@@ -134,8 +134,10 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
                     9801,
                     None,
                     SaveAccessService {
+                        vault_id: None,
                         name: "API".into(),
                         policy: SandboxAccessPolicy {
+                            provider: None,
                             github_repository: None,
                             origin: origin.into(),
                             path_prefixes: vec!["/user".into()],
@@ -163,6 +165,32 @@ async fn postgres_coordinator_delivers_approved_scope_and_cuts_unconfirmed_incar
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     let first = coordinator.connect(consent(&services[0].id)).await.unwrap();
+    // Another dispatcher/process owns this worker until its delivery ACK.
+    // A competing claim must retry without issuing policy or retiring consent.
+    let lock = db.begin().await.unwrap();
+    lock.query_one(sea_orm::Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 739214))",
+        [provider.worker.identity().boot_id.to_string().into()],
+    ))
+    .await
+    .unwrap();
+    let calls = provider.calls.load(Ordering::SeqCst);
+    assert_eq!(coordinator.dispatch_one().await.unwrap(), None);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+    assert!(runtimes::Entity::find_by_id(first.runtime_id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .closed_at
+        .is_none());
+    lock.rollback().await.unwrap();
+    db.execute_unprepared(
+        "UPDATE sandbox_access_delivery SET available_at=now() WHERE completed_at IS NULL",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Applied)
@@ -328,8 +356,10 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
             9801,
             None,
             SaveAccessService {
+                vault_id: None,
                 name: "API".into(),
                 policy: SandboxAccessPolicy {
+                    provider: None,
                     github_repository: None,
                     origin: "https://api.github.com".into(),
                     path_prefixes: vec!["/user".into()],
@@ -401,6 +431,80 @@ async fn postgres_last_revoked_grant_requires_a_cut_ack_before_retirement_comple
     assert!(retired.lease_expires_at.is_none());
     assert_eq!(coordinator.dispatch_one().await.unwrap(), None);
     drop(binding);
+    drop(coordinator);
+    drop(provider);
+    drop(db);
+    test.cleanup().await;
+}
+
+#[tokio::test]
+async fn applied_delivery_with_lost_receipt_retries_with_a_new_binding_version() {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping service-access coordinator: Docker unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO users (id,name,email) VALUES (9801,'Test user','user@example.com'); INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9801,'Dispatch','repo','owner','/','main','nodejs','dispatch',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9801,'sbx_dispatch','dispatch',9801,9801,'running','docker')").await.unwrap();
+    let provider = Provider::new();
+    let coordinator = coordinator(db.clone(), provider.clone());
+    let mut services = Vec::new();
+    for origin in ["https://api.github.com", "https://api.example.com"] {
+        services.push(
+            coordinator
+                .service
+                .save_service(
+                    9801,
+                    None,
+                    SaveAccessService {
+                        vault_id: None,
+                        name: "API".into(),
+                        policy: SandboxAccessPolicy {
+                            provider: None,
+                            github_repository: None,
+                            origin: origin.into(),
+                            path_prefixes: vec!["/user".into()],
+                            methods: vec![AccessMethod::Get],
+                        },
+                        max_ttl_seconds: 60,
+                        enabled: true,
+                        credential: Some(SecretString::new("fixture-credential")),
+                        clear_credential: false,
+                        expected_version: None,
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    let first = coordinator.connect(consent(&services[0].id)).await.unwrap();
+    assert_eq!(
+        coordinator.dispatch_one().await.unwrap(),
+        Some(DispatchOutcome::Applied)
+    );
+    // Simulate the worker's successful install surviving a lost receipt commit.
+    db.execute_unprepared("UPDATE sandbox_access_runtimes SET applied_version=0,lease_expires_at=NULL; UPDATE sandbox_access_delivery SET completed_at=NULL,available_at=now() WHERE operation='reconcile'").await.unwrap();
+    assert_eq!(
+        coordinator.dispatch_one().await.unwrap(),
+        Some(DispatchOutcome::Superseded)
+    );
+    assert_eq!(
+        coordinator.dispatch_one().await.unwrap(),
+        Some(DispatchOutcome::Applied)
+    );
+    let runtime = runtimes::Entity::find_by_id(first.runtime_id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(runtime.closed_at.is_none());
+    assert_eq!(runtime.applied_version, 2);
+    assert_eq!(runtime.desired_version, 2);
     drop(coordinator);
     drop(provider);
     drop(db);

@@ -7,6 +7,7 @@
 mod control;
 pub use control::{PublicCertificate, WorkerAuthority, WorkerControl, WorkerIdentity};
 mod protocol;
+mod workload_tls;
 pub use protocol::{HostAudit, PolicyEnvelope, SessionDelivery};
 #[cfg(unix)]
 mod attachment;
@@ -39,6 +40,18 @@ pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("Could not issue workload certificate for binding {binding}")]
+    WorkloadCertificate {
+        binding: String,
+        #[source]
+        source: rcgen::Error,
+    },
+    #[error("Could not configure workload TLS for binding {binding}")]
+    WorkloadTls {
+        binding: String,
+        #[source]
+        source: rustls::Error,
+    },
     #[error("Worker credential proxy could not {operation} for binding {binding}")]
     Attachment {
         operation: &'static str,
@@ -68,6 +81,9 @@ pub enum RuntimeError {
 /// replace its signed sessions without the worker's validation.
 pub struct SandboxBinding {
     inner: Binding,
+    workload_tls: arc_swap::ArcSwap<workload_tls::WorkloadTls>,
+    tls_connections: Arc<Semaphore>,
+    own_connections: Semaphore,
     _admission: OwnedSemaphorePermit,
     owner: Arc<()>,
 }
@@ -89,19 +105,55 @@ impl SandboxBinding {
     pub fn status(&self) -> BindingStatus {
         self.inner.status()
     }
-    pub async fn serve<S>(&self, stream: S) -> Result<(), RuntimeError>
+    pub async fn serve<S>(&self, mut stream: S) -> Result<(), RuntimeError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        self.inner
-            .serve(stream)
+        let full = |_| RuntimeError::Invalid {
+            operation: "admit workload connection",
+            binding: self.id().into(),
+            reason: "connection capacity is full",
+        };
+        let _global = self.tls_connections.try_acquire().map_err(full)?;
+        let _own = self.own_connections.try_acquire().map_err(full)?;
+        let workload_tls = self.workload_tls.load_full();
+        // Only the host-owned attachment calls this connector. Guest traffic
+        // cannot select the credential or bypass certificate verification.
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let handshake = async {
+            tokio::try_join!(
+                async {
+                    workload_tls
+                        .connector
+                        .connect(workload_tls::WorkloadTls::server_name(), client)
+                        .await
+                        .map_err(|source| RuntimeError::Attachment {
+                            operation: "connect workload TLS",
+                            binding: self.id().into(),
+                            source,
+                        })
+                },
+                workload_tls.accept(server)
+            )
+        };
+        let (mut client, server) = tokio::time::timeout(Duration::from_secs(5), handshake)
             .await
-            .map_err(|source| RuntimeError::DataPlane {
-                operation: "forward traffic",
+            .map_err(|_| RuntimeError::Invalid {
+                operation: "connect workload TLS",
                 binding: self.id().into(),
-                source,
-            })
+                reason: "handshake deadline exceeded",
+            })??;
+        let (_, result) = tokio::join!(
+            tokio::io::copy_bidirectional(&mut stream, &mut client),
+            self.inner.serve(server)
+        );
+        result.map_err(|source| RuntimeError::DataPlane {
+            operation: "forward traffic",
+            binding: self.id().into(),
+            source,
+        })
     }
+
     pub async fn revoke_and_wait(&self, timeout: Duration) -> Result<CutReport, RuntimeError> {
         self.inner
             .revoke_and_wait(timeout)
@@ -130,6 +182,7 @@ pub struct WorkerProxy {
     snapshot_key: VerifyingKey,
     installed: Mutex<Installed>,
     bindings: Arc<Semaphore>,
+    tls_connections: Arc<Semaphore>,
     owner: Arc<()>,
 }
 
@@ -180,6 +233,7 @@ impl WorkerProxy {
         Ok(Self {
             plane: Some(plane),
             bindings: Arc::new(Semaphore::new(MAX_WORKER_BINDINGS)),
+            tls_connections: Arc::new(Semaphore::new(MAX_WORKER_CONNECTIONS)),
             owner: Arc::new(()),
             installer,
             snapshot_key,
@@ -254,7 +308,11 @@ impl WorkerProxy {
         let binding = {
             let installed = self.installed.lock().await;
             validate_sessions(&installed, &spec.sessions, &id)?;
+            let workload_tls = workload_tls::WorkloadTls::new(&id)?;
             Arc::new(SandboxBinding {
+                workload_tls: arc_swap::ArcSwap::from_pointee(workload_tls),
+                tls_connections: Arc::clone(&self.tls_connections),
+                own_connections: Semaphore::new(spec.max_connections),
                 _admission: admission,
                 inner: self
                     .plane
@@ -303,6 +361,11 @@ impl WorkerProxy {
         }
         let installed = self.installed.lock().await;
         validate_sessions(&installed, &update.sessions, binding.id())?;
+        if binding.workload_tls.load().needs_renewal() {
+            binding
+                .workload_tls
+                .store(Arc::new(workload_tls::WorkloadTls::new(binding.id())?));
+        }
         binding
             .inner
             .update(update)

@@ -124,6 +124,57 @@ fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
             "/projects/7/sandboxes/sbx_test/service-grants/approve",
             r#"{"request_id":"00000000-0000-4000-8000-000000000001","service_id":"svc_test","service_version":1,"ttl_seconds":900}"#,
         ),
+        ("GET", "/projects/7/access-vaults", ""),
+        ("GET", "/projects/7/access-vaults/vault_test", ""),
+        (
+            "POST",
+            "/projects/7/access-vaults",
+            r#"{"name":"Vault","service_ids":[]}"#,
+        ),
+        (
+            "PUT",
+            "/projects/7/access-vaults/vault_test",
+            r#"{"name":"Vault","service_ids":[],"expected_version":1}"#,
+        ),
+        ("GET", "/projects/7/access-vaults/vault_test/bundles", ""),
+        (
+            "POST",
+            "/projects/7/access-vaults/vault_test/bundles",
+            r#"{"name":"Bundle","service_ids":["svc_test"],"ttl_seconds":900}"#,
+        ),
+        (
+            "PUT",
+            "/projects/7/access-vaults/vault_test/bundles/bundle_test",
+            r#"{"name":"Bundle","service_ids":["svc_test"],"ttl_seconds":900,"expected_version":1}"#,
+        ),
+        ("GET", "/projects/7/access-sessions", ""),
+        ("GET", "/projects/7/access-sessions/session_test", ""),
+        (
+            "POST",
+            "/projects/7/access-sessions/session_test/revoke",
+            "",
+        ),
+        (
+            "POST",
+            "/projects/7/access-vaults/vault_test/sessions",
+            r#"{"request_id":"00000000-0000-4000-8000-000000000001","bundle_id":"bundle_test","bundle_version":1,"consumer":{"kind":"sandbox","sandbox_id":"sbx_test"},"ttl_seconds":60,"services":[{"service_id":"svc_test","version":1}]}"#,
+        ),
+        ("GET", "/projects/7/sandboxes/sbx_test/services", ""),
+        (
+            "POST",
+            "/projects/7/sandboxes/sbx_test/services",
+            r#"{"service_id":"svc_test","service_version":1}"#,
+        ),
+        (
+            "POST",
+            "/projects/7/sandboxes/sbx_test/services/access_test/approve",
+            r#"{"expected_version":1,"service_version":1}"#,
+        ),
+        (
+            "POST",
+            "/projects/7/sandboxes/sbx_test/services/access_test/revoke",
+            r#"{"expected_version":1}"#,
+        ),
     ]
 }
 async fn send(
@@ -338,6 +389,7 @@ use temps_entities::{
 
 fn policy() -> SandboxAccessPolicy {
     SandboxAccessPolicy {
+        provider: None,
         github_repository: None,
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
@@ -361,6 +413,7 @@ fn row() -> services::Model {
 fn grant() -> grants::Model {
     let now = Utc::now();
     grants::Model {
+        assignment_id: None,
         id: "grant_test".into(),
         project_id: 7,
         service_id: "svc_test".into(),
@@ -685,7 +738,7 @@ async fn assistant_cannot_approve_access_even_with_admin_permissions() {
                 .method("POST")
                 .uri("/projects/7/sandboxes/sbx_test/service-grants/approve")
                 .header("content-type", "application/json")
-                .body(Body::from(routes().last().unwrap().2))
+                .body(Body::from(routes()[8].2))
                 .unwrap(),
         )
         .await
@@ -801,8 +854,10 @@ async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
             9801,
             None,
             SaveAccessService {
+                vault_id: None,
                 name: "API".into(),
                 policy: SandboxAccessPolicy {
+                    provider: None,
                     github_repository: None,
                     origin: "https://api.example.com".into(),
                     path_prefixes: vec!["/user".into()],
@@ -909,33 +964,284 @@ async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
         );
         assert!(events.iter().all(|e| !e.contains("fixture-credential")));
     }
+    // The chat marker uses the same user-scoped write path as the console.
+    // Declaration alone is inert; explicit approval and revocation are audited.
+    let chat = configure_routes()
+        .with_state(state.clone())
+        .layer(Extension(test_metadata()))
+        .layer(Extension(actor()))
+        .layer(Extension(temps_core::ai_tool_call::AiToolCall));
+    let mut access_id = String::new();
+    for (operation, expected_version, expected_status) in [
+        (
+            "",
+            0,
+            crate::assignment_types::SandboxServiceStatus::PendingApproval,
+        ),
+        (
+            "approve",
+            1,
+            crate::assignment_types::SandboxServiceStatus::Approved,
+        ),
+        (
+            "revoke",
+            2,
+            crate::assignment_types::SandboxServiceStatus::Revoked,
+        ),
+    ] {
+        let base = "/projects/9801/sandboxes/sbx_dispatch/services";
+        let (uri, body) = if operation.is_empty() {
+            (
+                base.to_string(),
+                serde_json::json!({"service_id":service.id,"service_version":1}),
+            )
+        } else if operation == "approve" {
+            (
+                format!("{base}/{access_id}/{operation}"),
+                serde_json::json!({"expected_version":expected_version,"service_version":1}),
+            )
+        } else {
+            (
+                format!("{base}/{access_id}/{operation}"),
+                serde_json::json!({"expected_version":expected_version}),
+            )
+        };
+        let response = chat
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("fixture-credential"));
+        let result: crate::assignment_types::SandboxServiceResponse =
+            serde_json::from_slice(&raw).unwrap();
+        assert_eq!(result.status, expected_status);
+        assert!(!result.connected);
+        assert!(result.expires_at.is_none());
+        access_id = result.id;
+    }
+    {
+        let events = audit.0.lock().unwrap();
+        for op in [
+            "SANDBOX_SERVICE_ACCESS_REQUESTED",
+            "SANDBOX_SERVICE_ACCESS_APPROVED",
+            "SANDBOX_SERVICE_ACCESS_REVOKED",
+        ] {
+            assert_eq!(events.iter().filter(|e| e.contains(op)).count(), 1);
+        }
+        assert!(events.iter().all(|e| !e.contains("fixture-credential")));
+    }
     test.cleanup().await;
 }
 
 #[tokio::test]
 async fn github_policy_writes_require_git_read_permission_before_database_access() {
     let body = serde_json::json!({"name":"GitHub", "policy":crate::github::tests::policy(GithubAccessProtocol::Git), "max_ttl_seconds":900,"enabled":true});
-    for (method, path) in [
-        ("POST", "/projects/7/access-services"),
-        ("PUT", "/projects/7/access-services/svc_test"),
+    for git_permissions in [
+        vec![],
+        vec![Permission::GitRepositoriesRead],
+        vec![Permission::GitConnectionsRead],
     ] {
-        let response = send(
-            method,
-            path,
-            &body.to_string(),
-            Some(AuthContext::new_api_key(
-                test_user(),
-                None,
-                Some(vec![Permission::ProjectsWrite, Permission::SandboxesWrite]),
-                "key".into(),
-                1,
-            )),
-            state(
-                MockDatabase::new(DatabaseBackend::Postgres),
-                Arc::new(Audit::default()),
-            ),
+        for (method, path) in [
+            ("POST", "/projects/7/access-services"),
+            ("PUT", "/projects/7/access-services/svc_test"),
+        ] {
+            let response = send(
+                method,
+                path,
+                &body.to_string(),
+                Some(AuthContext::new_api_key(
+                    test_user(),
+                    None,
+                    Some(
+                        [
+                            vec![Permission::ProjectsWrite, Permission::SandboxesWrite],
+                            git_permissions.clone(),
+                        ]
+                        .concat(),
+                    ),
+                    "key".into(),
+                    1,
+                )),
+                state(
+                    MockDatabase::new(DatabaseBackend::Postgres),
+                    Arc::new(Audit::default()),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_service_approval_uses_user_authorization_instead_of_a_screen_gate() {
+    let response = configure_routes()
+        .with_state(state(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("test storage unavailable".into())]),
+            Arc::new(Audit::default()),
+        ))
+        .layer(Extension(test_metadata()))
+        .layer(Extension(AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "key".into(),
+            1,
+        )))
+        .layer(Extension(temps_core::ai_tool_call::AiToolCall))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/projects/7/sandboxes/sbx_test/services/access_test/approve")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"expected_version":1,"service_version":1}"#))
+                .unwrap(),
         )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        .await
+        .unwrap();
+    // It reaches scoped storage, rather than rejecting the trusted assistant
+    // marker. Unauthorized users are exercised by the shared route guard tests.
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), 8192).await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("HUMAN_CALLER_REQUIRED"));
+}
+
+#[tokio::test]
+async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
+    use std::collections::BTreeMap;
+    use temps_entities::{access_vaults, sandbox_service_assignments};
+    // The key belongs to an admin, but its own grant excludes Git permissions.
+    // A future requested version must not reach a second read that could see Git.
+    for route in ["assignment", "grant", "session"] {
+        for (git_policy, requested_version, git_permissions, expected) in [
+            (false, 2, vec![], StatusCode::CONFLICT),
+            (true, 1, vec![], StatusCode::FORBIDDEN),
+            (
+                true,
+                1,
+                vec![Permission::GitRepositoriesRead],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                true,
+                1,
+                vec![Permission::GitConnectionsRead],
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let now = Utc::now();
+            let mut service = row();
+            if git_policy {
+                service.policy =
+                    serde_json::to_value(crate::github::tests::policy(GithubAccessProtocol::Git))
+                        .unwrap();
+            }
+            let project = BTreeMap::from([("id", sea_orm::Value::Int(Some(7)))]);
+            let mut db = MockDatabase::new(DatabaseBackend::Postgres);
+            let (path, body) = match route {
+                "assignment" => {
+                    db = db
+                        .append_query_results([vec![sandbox()]])
+                        .append_query_results([vec![sandbox_service_assignments::Model {
+                            id: "access_test".into(),
+                            project_id: 7,
+                            sandbox_id: 42,
+                            service_id: service.id.clone(),
+                            service_version: 1,
+                            requested_by: Some(1),
+                            approved_by: None,
+                            approved_at: None,
+                            expires_at: None,
+                            revoked_at: None,
+                            version: 1,
+                            grant_id: None,
+                            next_reconcile_at: now,
+                            created_at: now,
+                            updated_at: now,
+                        }]])
+                        .append_query_results([vec![project]])
+                        .append_query_results([vec![service]]);
+                    (
+                        "/projects/7/sandboxes/sbx_test/services/access_test/approve",
+                        serde_json::json!({"expected_version":1,"service_version":requested_version}),
+                    )
+                }
+                "grant" => {
+                    db = db
+                        .append_query_results([vec![project]])
+                        .append_query_results([vec![service]]);
+                    (
+                        "/projects/7/sandboxes/sbx_test/service-grants/approve",
+                        serde_json::json!({"request_id":uuid::Uuid::new_v4(),"service_id":"svc_test","service_version":requested_version,"ttl_seconds":60}),
+                    )
+                }
+                _ => {
+                    db = db
+                        .append_query_results([vec![project]])
+                        .append_query_results([vec![access_vaults::Model {
+                            id: "vault_test".into(),
+                            project_id: 7,
+                            name: "Test vault".into(),
+                            service_ids: vec!["svc_test".into()],
+                            version: 1,
+                            created_at: now,
+                            updated_at: now,
+                        }]])
+                        .append_query_results([vec![service]]);
+                    (
+                        "/projects/7/access-vaults/vault_test/sessions",
+                        serde_json::json!({"request_id":uuid::Uuid::new_v4(),"bundle_id":"bundle_test","bundle_version":1,"consumer":{"kind":"sandbox","sandbox_id":"sbx_test"},"ttl_seconds":60,"services":[{"service_id":"svc_test","version":requested_version}]}),
+                    )
+                }
+            };
+            let audit = Arc::new(Audit::default());
+            let auth = AuthContext::new_api_key(
+                test_user(),
+                Some(Role::Admin),
+                Some(
+                    [
+                        vec![Permission::ProjectsWrite, Permission::SandboxesWrite],
+                        git_permissions,
+                    ]
+                    .concat(),
+                ),
+                "restricted-key".into(),
+                1,
+            );
+            let response = send(
+                "POST",
+                path,
+                &body.to_string(),
+                Some(auth),
+                state(db, audit.clone()),
+            )
+            .await;
+            let status = response.status();
+            let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+            assert_eq!(
+                status,
+                expected,
+                "{route}: {}",
+                String::from_utf8_lossy(&raw)
+            );
+            let problem: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert!(problem["title"]
+                .as_str()
+                .is_some_and(|title| !title.is_empty()));
+            assert!(
+                audit.0.lock().unwrap().is_empty(),
+                "rejected authorization must not audit a successful approval"
+            );
+        }
     }
 }

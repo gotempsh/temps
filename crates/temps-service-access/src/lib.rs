@@ -16,3 +16,8 @@ pub mod tokenless;
 pub mod transport;
 pub mod types;
 pub use plugin::ServiceAccessPlugin;
+
+pub mod vault_types;
+
+pub mod assignment_types;
+pub mod session_types;

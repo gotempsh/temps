@@ -18,6 +18,7 @@ pub(crate) fn policy(protocol: GithubAccessProtocol) -> SandboxAccessPolicy {
         ),
     };
     SandboxAccessPolicy {
+        provider: None,
         origin: origin.into(),
         path_prefixes: paths,
         methods,
@@ -103,7 +104,7 @@ async fn binding_errors_retain_project_operation_without_exposing_database_detai
 }
 
 #[tokio::test]
-async fn postgres_github_binding_requires_current_project_repository_and_active_provider() {
+async fn postgres_github_binding_requires_selected_repository_and_active_provider() {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
     {
@@ -115,17 +116,36 @@ async fn postgres_github_binding_requires_current_project_repository_and_active_
         .unwrap();
     let db = test.connection_arc();
     db.execute_unprepared("INSERT INTO git_providers (id,name,provider_type,auth_method,auth_config,is_active,is_default,created_at,updated_at) VALUES (9901,'GitHub','github','pat','{}',true,false,now(),now()); INSERT INTO git_provider_connections (id,provider_id,account_name,account_type,is_active,is_expired,created_at,updated_at) VALUES (9901,9901,'test-account','User',true,false,now(),now()); INSERT INTO projects (id,name,repo_name,repo_owner,git_provider_connection_id,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9901,'Source','repo','owner',9901,'/','main','nodejs','source',now(),now())").await.unwrap();
+
+    db.execute_unprepared("INSERT INTO repositories (git_provider_connection_id,owner,name,full_name,private,fork,created_at,updated_at,pushed_at,size,stargazers_count,watchers_count,default_branch,open_issues_count,topics,repo_object) VALUES (9901,'owner','repo','owner/repo',true,false,now(),now(),now(),0,0,0,'main',0,'[]','{}')").await.unwrap();
     let source = policy(GithubAccessProtocol::Api).github_repository.unwrap();
+    db.execute_unprepared(
+        "UPDATE projects SET repo_name='different', git_provider_connection_id=NULL WHERE id=9901",
+    )
+    .await
+    .unwrap();
     assert!(validate_binding(db.as_ref(), 9901, &source).await.is_ok());
     assert!(validate_binding(db.as_ref(), 9902, &source).await.is_err());
+    let selected = vec![source.clone(); 16];
+    assert!(validate_bindings(db.as_ref(), 9901, &selected)
+        .await
+        .is_ok());
+    let mut missing = selected.clone();
+    missing[15].repository = "missing".into();
+    assert!(validate_bindings(db.as_ref(), 9901, &missing)
+        .await
+        .is_err());
+    assert!(validate_bindings(db.as_ref(), 9902, &selected)
+        .await
+        .is_err());
     for (change, reset) in [
         (
-            "UPDATE projects SET repo_name='other' WHERE id=9901",
-            "UPDATE projects SET repo_name='repo' WHERE id=9901",
+            "UPDATE repositories SET name='other' WHERE git_provider_connection_id=9901",
+            "UPDATE repositories SET name='repo' WHERE git_provider_connection_id=9901",
         ),
         (
-            "UPDATE projects SET git_provider_connection_id=NULL WHERE id=9901",
-            "UPDATE projects SET git_provider_connection_id=9901 WHERE id=9901",
+            "UPDATE projects SET is_deleted=true WHERE id=9901",
+            "UPDATE projects SET is_deleted=false WHERE id=9901",
         ),
         (
             "UPDATE git_provider_connections SET is_active=false WHERE id=9901",
@@ -146,6 +166,9 @@ async fn postgres_github_binding_requires_current_project_repository_and_active_
     ] {
         db.execute_unprepared(change).await.unwrap();
         assert!(validate_binding(db.as_ref(), 9901, &source).await.is_err());
+        assert!(validate_bindings(db.as_ref(), 9901, &selected)
+            .await
+            .is_err());
         db.execute_unprepared(reset).await.unwrap();
         assert!(validate_binding(db.as_ref(), 9901, &source).await.is_ok());
     }
@@ -184,6 +207,8 @@ async fn postgres_github_consent_is_host_resolved_and_unlinking_stops_renewal() 
         .unwrap();
     let db = test.connection_arc();
     db.execute_unprepared("INSERT INTO users (id,name,email) VALUES (9901,'Test user','source@example.test'); INSERT INTO git_providers (id,name,provider_type,auth_method,auth_config,is_active,is_default,created_at,updated_at) VALUES (9901,'GitHub','github','pat','{}',true,false,now(),now()); INSERT INTO git_provider_connections (id,provider_id,account_name,account_type,is_active,is_expired,created_at,updated_at) VALUES (9901,9901,'test-account','User',true,false,now(),now()); INSERT INTO projects (id,name,repo_name,repo_owner,git_provider_connection_id,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9901,'Source','repo','owner',9901,'/','main','nodejs','source',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9901,'sbx_source','source',9901,9901,'running','docker')").await.unwrap();
+
+    db.execute_unprepared("INSERT INTO repositories (git_provider_connection_id,owner,name,full_name,private,fork,created_at,updated_at,pushed_at,size,stargazers_count,watchers_count,default_branch,open_issues_count,topics,repo_object) VALUES (9901,'owner','repo','owner/repo',true,false,now(),now(),now(),0,0,0,'main',0,'[]','{}')").await.unwrap();
     let encryption = Arc::new(EncryptionService::new(&"ab".repeat(32)).unwrap());
     let service = ServiceAccessService::new(
         db.clone(),
@@ -195,6 +220,7 @@ async fn postgres_github_consent_is_host_resolved_and_unlinking_stops_renewal() 
             9901,
             None,
             SaveAccessService {
+                vault_id: None,
                 name: "GitHub clone/fetch".into(),
                 policy: policy(GithubAccessProtocol::Git),
                 max_ttl_seconds: 900,
@@ -253,12 +279,12 @@ async fn postgres_github_consent_is_host_resolved_and_unlinking_stops_renewal() 
         .unwrap()
         .body
         .contains("fixture-provider-token"));
-    // Current project binding, connection state and provider state are all
+    // Selected repository, connection state and provider state are all
     // rechecked by the actual joined planner read, not just on service save.
     for (change, reset) in [
         (
-            "UPDATE projects SET git_provider_connection_id=NULL WHERE id=9901",
-            "UPDATE projects SET git_provider_connection_id=9901 WHERE id=9901",
+            "UPDATE projects SET is_deleted=true WHERE id=9901",
+            "UPDATE projects SET is_deleted=false WHERE id=9901",
         ),
         (
             "UPDATE git_provider_connections SET is_active=false WHERE id=9901",

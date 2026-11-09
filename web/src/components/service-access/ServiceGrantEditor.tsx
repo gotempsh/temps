@@ -30,7 +30,9 @@ export function ServiceGrantEditor({
   onClose,
   onSaved,
   mode = 'request',
+  defaultTtl = 900,
 }: {
+  defaultTtl?: number
   projectId?: number | null
   sandboxId: string
   mode?: 'request' | 'approve'
@@ -99,10 +101,10 @@ export function ServiceGrantEditor({
   })
   const resetMutation = save.reset
   useEffect(() => {
-    form.reset({ ttl: Math.min(900, service?.max_ttl_seconds ?? 900) })
+    form.reset({ ttl: Math.min(defaultTtl, service?.max_ttl_seconds ?? 900) })
     resetMutation()
     approval.current = null
-  }, [service, form, resetMutation, mode])
+  }, [service, form, resetMutation, mode, defaultTtl])
   return (
     <Dialog
       open={!!service}

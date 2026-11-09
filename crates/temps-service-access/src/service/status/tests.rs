@@ -10,6 +10,7 @@ fn grant() -> ServiceGrantResponse {
         sandbox_id: "sbx_test".into(),
         service_version: 1,
         policy: SandboxAccessPolicy {
+            provider: None,
             origin: "https://api.example.com".into(),
             path_prefixes: vec!["/v1".into()],
             methods: vec![AccessMethod::Get],
@@ -78,7 +79,7 @@ fn revocation_waits_for_removal_ack_or_signed_expiry() {
     r.installed = true;
     r.lease_expires_at = Some(now);
     apply_receipt(&mut g, &r, now);
-    assert_eq!(g.enforcement, GrantEnforcement::Stopped);
+    assert_eq!(g.enforcement, GrantEnforcement::Stopping);
     r.lease_expires_at = None;
     r.closed = true;
     r.cut_confirmed = true;
@@ -107,4 +108,19 @@ async fn receipt_reads_are_bounded_scoped_and_preserve_database_error_context() 
         .contains("read worker enforcement receipts"));
     assert!(error.to_string().contains('7'));
     assert!(!error.to_string().contains("sensitive driver detail"));
+}
+
+#[test]
+fn stale_snapshot_receipt_does_not_prove_a_shared_binding_stopped() {
+    let now = Utc::now();
+    let mut r = receipt();
+    r.lease_expires_at = Some(now - Duration::seconds(1));
+    r.current_receipt = false;
+    let mut g = grant();
+    apply_receipt(&mut g, &r, now);
+    assert_eq!(g.enforcement, GrantEnforcement::Pending);
+    assert!(!g.connected);
+    g.expires_at = now;
+    apply_receipt(&mut g, &r, now);
+    assert_eq!(g.enforcement, GrantEnforcement::Stopped);
 }

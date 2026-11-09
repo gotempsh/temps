@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { vaultAuditLabel } from '@/lib/vault-audit'
 import { HighlightedCode } from '@/components/ui/code-block'
 import { AuditLogUserInfo } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
@@ -241,6 +242,8 @@ function describe(
     : undefined
   const failureReason = get<string>(data, 'reason')
 
+  const vaultLabel = vaultAuditLabel(op)
+  if (vaultLabel) return vaultLabel
   switch (op) {
     case 'EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED':
     case 'EXTERNAL_PLUGIN_HOST_OPERATION_DENIED':

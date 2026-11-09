@@ -80,6 +80,19 @@ impl UnixAttachment {
             .map_err(|e| failure(e.error))?;
         Ok(())
     }
+    /// Sticky routing ownership: API-only deliveries never change Git routing.
+    /// Keep this marker after revocation so assigned Git traffic cannot silently
+    /// fall back to the independent project credential helper.
+    pub fn publish_github_git_route(&self) -> Result<(), RuntimeError> {
+        std::fs::write(self.directory().join("github-git"), b"vault\n").map_err(|source| {
+            RuntimeError::Attachment {
+                operation: "publish Git routing ownership",
+                binding: self.slot.id.clone(),
+                source,
+            }
+        })
+    }
+
     /// `parent` is an operator-owned directory outside every sandbox mount.
     /// It must not be writable by a sandbox user. A fresh, unpredictable child
     /// is created on every invocation; existing paths are never replaced.

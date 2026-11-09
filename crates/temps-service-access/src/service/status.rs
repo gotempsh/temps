@@ -67,8 +67,9 @@ fn apply_receipt(
     if grant.status == ServiceGrantStatus::PendingApproval {
         grant.status = ServiceGrantStatus::Approved;
     }
+    // Another binding can renew the worker-wide snapshot without updating this
+    // runtime's receipt. Its recorded lease expiry does not prove access stopped.
     let (enforcement, reason) = if row.cut_confirmed
-        || row.lease_expires_at.is_some_and(|expiry| expiry <= now)
         || (row.current_receipt && !row.installed)
         || grant.expires_at <= now
     {
@@ -83,7 +84,7 @@ fn apply_receipt(
     {
         (GrantEnforcement::Active, "The assigned worker acknowledged this grant. Access ends at the grant deadline or earlier on revocation.")
     } else if !eligible {
-        (GrantEnforcement::Stopping, "Access is being removed. Waiting for the worker to confirm; its last signed lease expires within 30 seconds without renewal.")
+        (GrantEnforcement::Stopping, "Access is being removed. Waiting for the worker to confirm removal or for the grant deadline to expire.")
     } else {
         (GrantEnforcement::Pending, "Approval is saved. Waiting for a current acknowledgment from the assigned worker; connectivity is not yet confirmed.")
     };

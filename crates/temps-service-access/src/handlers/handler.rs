@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::{approval::approve_service_grant, audit::AccessAudit, AccessAppState};
+use crate::assignment_types::*;
+use crate::session_types::*;
+use crate::vault_types::*;
 use crate::{
     broker::{AccessCapability, AccessCapabilityState},
     error::AccessError,
@@ -16,7 +19,8 @@ use axum::{
 };
 use std::sync::Arc;
 use temps_authz::{
-    deny_deployment_token, project_permission_guard, project_scope_guard, RequireAuth,
+    deny_deployment_token, permission_guard, project_permission_guard, project_scope_guard,
+    RequireAuth,
 };
 use temps_core::{
     problemdetails::{self, Problem},
@@ -25,13 +29,58 @@ use temps_core::{
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
-#[openapi(paths(super::approval::approve_service_grant, access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
-    components(schemas(ApproveServiceGrant, ServiceGrantApproval, AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
+#[openapi(paths(super::assignments::list_sandbox_services, super::assignments::request_sandbox_service, super::assignments::approve_sandbox_service, super::assignments::revoke_sandbox_service,super::sessions::list_access_sessions, super::sessions::get_access_session, super::sessions::create_access_session, super::sessions::revoke_access_session,super::vaults::list_access_vaults,super::vaults::get_access_vault,super::vaults::create_access_vault,super::vaults::update_access_vault,super::vaults::list_access_bundles,super::vaults::create_access_bundle,super::vaults::update_access_bundle,super::approval::approve_service_grant, access_capability, get_access_service, list_access_services, create_access_service, update_access_service, list_service_grants, request_service_grant, revoke_service_grant),
+    components(schemas(RequestSandboxService, ApproveSandboxService, RevokeSandboxService, SandboxServiceResponse, SandboxServiceList, SandboxServiceStatus,CreateAccessSession, AccessSessionConsumer, SessionServiceVersion, AccessSessionResponse, AccessSessionStatus, AccessSessionDetail, AccessSessionList,AccessVaultResponse, AccessVaultOverview, AccessVaultList, AccessVaultDetail, SaveAccessVault, AccessBundleResponse, AccessBundleList, SaveAccessBundle,ApproveServiceGrant, ServiceGrantApproval, AccessCapability, AccessCapabilityState, SandboxAccessPolicy, AccessMethod, SaveAccessService, AccessServiceResponse, AccessServiceList, RequestServiceGrant, RevokeServiceGrant, ServiceGrantResponse, ServiceGrantList, ServiceGrantStatus)),
     tags((name="Sandbox service access", description="Saved service policies and time-limited access requests; runtime integration is not installed")))]
 pub struct ServiceAccessApiDoc;
 
 pub fn configure_routes() -> Router<Arc<AccessAppState>> {
     Router::new()
+        .route(
+            "/projects/{project_id}/sandboxes/{sandbox_id}/services",
+            get(super::assignments::list_sandbox_services)
+                .post(super::assignments::request_sandbox_service),
+        )
+        .route(
+            "/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/approve",
+            post(super::assignments::approve_sandbox_service),
+        )
+        .route(
+            "/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/revoke",
+            post(super::assignments::revoke_sandbox_service),
+        )
+        .route(
+            "/projects/{project_id}/access-sessions",
+            get(super::sessions::list_access_sessions),
+        )
+        .route(
+            "/projects/{project_id}/access-sessions/{session_id}",
+            get(super::sessions::get_access_session),
+        )
+        .route(
+            "/projects/{project_id}/access-sessions/{session_id}/revoke",
+            post(super::sessions::revoke_access_session),
+        )
+        .route(
+            "/projects/{project_id}/access-vaults/{vault_id}/sessions",
+            post(super::sessions::create_access_session),
+        )
+        .route(
+            "/projects/{project_id}/access-vaults",
+            get(super::vaults::list_access_vaults).post(super::vaults::create_access_vault),
+        )
+        .route(
+            "/projects/{project_id}/access-vaults/{vault_id}",
+            get(super::vaults::get_access_vault).put(super::vaults::update_access_vault),
+        )
+        .route(
+            "/projects/{project_id}/access-vaults/{vault_id}/bundles",
+            get(super::vaults::list_access_bundles).post(super::vaults::create_access_bundle),
+        )
+        .route(
+            "/projects/{project_id}/access-vaults/{vault_id}/bundles/{bundle_id}",
+            axum::routing::put(super::vaults::update_access_bundle),
+        )
         .route(
             "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve",
             post(approve_service_grant),
@@ -183,6 +232,8 @@ pub async fn access_capability(
             .await,
         )?;
     capability.can_use_project_github = capability.can_manage_services
+        && auth.has_permission(&temps_authz::Permission::GitRepositoriesRead)
+        && auth.has_permission(&temps_authz::Permission::GitConnectionsRead)
         && permission_available(
             async {
                 project_permission_guard!(
@@ -256,6 +307,8 @@ pub async fn create_access_service(
         &state.project_access_checker
     );
     if request.policy.github_repository.is_some() {
+        permission_guard!(auth, GitRepositoriesRead);
+        permission_guard!(auth, GitConnectionsRead);
         project_permission_guard!(
             auth,
             GitRepositoriesRead,
@@ -299,6 +352,8 @@ pub async fn update_access_service(
         &state.project_access_checker
     );
     if request.policy.github_repository.is_some() {
+        permission_guard!(auth, GitRepositoriesRead);
+        permission_guard!(auth, GitConnectionsRead);
         project_permission_guard!(
             auth,
             GitRepositoriesRead,

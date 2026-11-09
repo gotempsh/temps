@@ -4000,6 +4000,7 @@ mod tests {
                 container_id: remote_handle().sandbox_id,
             },
             delivery: Box::new(SessionDelivery {
+                github_git: false,
                 authority: WorkerAuthority {
                     boot_id: uuid::Uuid::new_v4(),
                     node_id: uuid::Uuid::new_v4(),

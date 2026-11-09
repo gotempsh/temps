@@ -4,6 +4,7 @@
 import { expect, test } from 'bun:test'
 import {
   accessServiceSchema,
+  serviceEditorSchema,
   serviceDefaults,
   serviceBody,
   grantRequestSchema,
@@ -122,4 +123,61 @@ test('path validation rejects backend-invalid prefixes before submission', () =>
       true
     )
   }
+})
+
+test('bearer credentials are required for new enabled services and preserved on edit', () => {
+  const values = serviceDefaults(service)
+  expect(
+    serviceEditorSchema(undefined, 'bearer').safeParse(values).success
+  ).toBe(false)
+  expect(
+    serviceEditorSchema(undefined, 'bearer').safeParse({
+      ...values,
+      credential: 'fixture-token',
+    }).success
+  ).toBe(true)
+  expect(serviceEditorSchema(service, 'bearer').safeParse(values).success).toBe(
+    true
+  )
+  expect(
+    serviceEditorSchema(service, 'bearer').safeParse({
+      ...values,
+      clearCredential: true,
+    }).success
+  ).toBe(false)
+  expect(
+    serviceEditorSchema(service, 'bearer').safeParse({
+      ...values,
+      enabled: false,
+      clearCredential: true,
+    }).success
+  ).toBe(true)
+})
+
+test('repository selection is explicit and generic bearer mode cannot masquerade as Git clone access', () => {
+  const values = serviceDefaults(service)
+  expect(serviceEditorSchema(undefined, 'git').safeParse(values).success).toBe(
+    false
+  )
+  expect(
+    serviceEditorSchema(service, 'bearer').safeParse({
+      ...values,
+      origin: 'https://github.com',
+    }).success
+  ).toBe(false)
+  const github = {
+    ...service,
+    policy: {
+      ...service.policy,
+      github_repository: {
+        connection_id: 9,
+        owner: 'owner',
+        repository: 'repo',
+        protocol: 'git' as const,
+      },
+    },
+  }
+  expect(serviceEditorSchema(github, 'bearer').safeParse(values).success).toBe(
+    false
+  )
 })

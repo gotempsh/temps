@@ -20,6 +20,7 @@ import type {
   CreateAccessServiceData,
   RequestServiceGrant,
 } from '@/api/client'
+import { PresetContext } from '@/contexts/PresetContext-shared'
 import { AccessServiceEditor } from './AccessServiceEditor'
 import { ServiceGrantEditor } from './ServiceGrantEditor'
 
@@ -47,7 +48,18 @@ function provider(children: ReactNode) {
   })
   return (
     <QueryClientProvider client={client}>
-      <MemoryRouter>{children}</MemoryRouter>
+      <MemoryRouter>
+        <PresetContext.Provider
+          value={{
+            presets: [],
+            isLoading: false,
+            error: null,
+            getPresetBySlug: () => undefined,
+          }}
+        >
+          {children}
+        </PresetContext.Provider>
+      </MemoryRouter>
     </QueryClientProvider>
   )
 }
@@ -393,16 +405,45 @@ test('invalid path prefixes stay beside the field and block the request until co
   }
 })
 
-test('GitHub clone/fetch saves a project-bound source without a bearer credential', async () => {
+test('GitHub clone/fetch requires an explicit repository and saves no bearer credential', async () => {
   let submitted: CreateAccessServiceData['body'] | undefined
   const api = mockApi({
-    'GET /projects/7': () =>
+    'GET /git-providers': () =>
+      jsonResponse([
+        { id: 1, name: 'GitHub', provider_type: 'github', is_active: true },
+      ]),
+    'GET /git-connections': () =>
       jsonResponse({
-        id: 7,
-        git_provider_connection_id: 9,
-        git_provider_type: 'github',
-        repo_owner: 'owner',
-        repo_name: 'repo',
+        connections: [
+          {
+            id: 9,
+            provider_id: 1,
+            account_name: 'Example account',
+            account_type: 'User',
+            is_active: true,
+            is_expired: false,
+          },
+        ],
+        page: 1,
+        per_page: 20,
+        total_count: 1,
+      }),
+    'GET /git-connections/9/repositories': () =>
+      jsonResponse({
+        repositories: [
+          {
+            id: 12,
+            git_provider_connection_id: 9,
+            owner: 'owner',
+            name: 'repo',
+            full_name: 'owner/repo',
+            private: true,
+            updated_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        page: 1,
+        per_page: 15,
+        total_count: 1,
       }),
     'POST /projects/7/access-services': async (request) => {
       submitted = (await request.json()) as CreateAccessServiceData['body']
@@ -420,6 +461,32 @@ test('GitHub clone/fetch saves a project-bound source without a bearer credentia
     )
   )
   await click('GitHub clone/fetch')
+  expect(
+    (
+      within(document.body).getByLabelText(
+        'Allowed path prefixes'
+      ) as HTMLInputElement
+    ).value
+  ).toBe('/')
+  expect(api.called('GET', '/projects/7')).toBe(false)
+  const connection = await within(document.body).findByRole('combobox', {
+    name: 'Git connection',
+  })
+  await act(async () => {
+    fireEvent.keyDown(connection, { key: 'ArrowDown' })
+  })
+  await act(async () => {
+    fireEvent.click(
+      await within(document.body).findByRole('option', {
+        name: /Example account/,
+      })
+    )
+  })
+  await act(async () => {
+    fireEvent.click(
+      await within(document.body).findByRole('button', { name: /repo owner/ })
+    )
+  })
   await waitFor(() =>
     expect(
       (within(document.body).getByLabelText('Name') as HTMLInputElement).value
@@ -490,7 +557,9 @@ test('editing a GitHub service preserves its connection reference', async () => 
 
 test('missing GitHub configuration preserves the draft and explains how to connect it', async () => {
   const api = mockApi({
-    'GET /projects/7': () => jsonResponse({ id: 7, repo_owner: null }),
+    'GET /git-providers': () => jsonResponse([]),
+    'GET /git-connections': () =>
+      jsonResponse({ connections: [], page: 1, per_page: 20, total_count: 0 }),
   })
   try {
     render(
@@ -508,7 +577,7 @@ test('missing GitHub configuration preserves the draft and explains how to conne
     await click('GitHub API reads')
     await waitFor(() =>
       expect(document.body.textContent).toContain(
-        'Connect this project to GitHub, then try again.'
+        'Connect a GitHub account and sync its repositories'
       )
     )
     expect(

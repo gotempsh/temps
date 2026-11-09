@@ -66,6 +66,9 @@ pub struct SessionDelivery {
     #[schema(write_only)]
     pub session: String,
     pub version: u64,
+    /// Host routing hint; never authorizes traffic. Sticky after Git assignment.
+    #[serde(default)]
+    pub github_git: bool,
 }
 
 impl std::fmt::Debug for SessionDelivery {
@@ -143,6 +146,7 @@ mod tests {
     use super::*;
     fn delivery() -> SessionDelivery {
         SessionDelivery {
+            github_git: false,
             authority: WorkerAuthority {
                 boot_id: uuid::Uuid::new_v4(),
                 node_id: uuid::Uuid::new_v4(),

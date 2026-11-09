@@ -6,6 +6,7 @@ use crate::types::AccessMethod;
 
 fn policy(prefix: &str) -> SandboxAccessPolicy {
     SandboxAccessPolicy {
+        provider: None,
         github_repository: None,
         origin: "https://api.example.com".into(),
         path_prefixes: vec![prefix.into()],

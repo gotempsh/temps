@@ -18,6 +18,20 @@ function pathPrefixes(value: string): string[] {
 export const accessServiceSchema = z
   .object({
     name: z.string().trim().min(1).max(80),
+    provider: z.enum([
+      'custom',
+      'github',
+      'gitlab',
+      'openai',
+      'anthropic',
+      'stripe',
+      'resend',
+      'sendgrid',
+      'vercel',
+      'netlify',
+      'mistral',
+      'groq',
+    ]),
     origin: z.url().refine((value) => {
       try {
         const url = new URL(value)
@@ -87,11 +101,53 @@ export const accessServiceSchema = z
   })
 export type AccessServiceValues = z.infer<typeof accessServiceSchema>
 
+export function serviceEditorSchema(
+  service: AccessServiceResponse | undefined,
+  source: 'bearer' | 'api' | 'git'
+) {
+  return accessServiceSchema.superRefine((values, context) => {
+    if (source !== 'bearer' && !values.githubRepository) {
+      context.addIssue({
+        code: 'custom',
+        path: ['githubRepository'],
+        message: 'Select a GitHub connection and repository',
+      })
+    }
+    if (
+      source === 'bearer' &&
+      values.enabled &&
+      !values.credential &&
+      !(
+        service?.has_credential &&
+        !service.policy.github_repository &&
+        !values.clearCredential
+      )
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['credential'],
+        message: 'Provide a bearer credential or disable access requests',
+      })
+    }
+    if (source === 'bearer' && values.origin === 'https://github.com') {
+      context.addIssue({
+        code: 'custom',
+        path: ['credential'],
+        message:
+          'For GitHub clone/fetch, select the GitHub clone/fetch credential source and a repository',
+      })
+    }
+  })
+}
+
 export function serviceDefaults(
   service?: AccessServiceResponse
 ): AccessServiceValues {
   return {
     name: service?.name ?? '',
+    provider:
+      service?.policy.provider ??
+      (service?.policy.github_repository ? 'github' : 'custom'),
     origin: service?.policy.origin ?? '',
     paths: service?.policy.path_prefixes.join('\n') ?? '/',
     methods: service?.policy.methods ?? ['GET', 'HEAD'],
@@ -110,6 +166,7 @@ export function serviceBody(
     name: values.name,
     policy: {
       origin: values.origin,
+      provider: values.provider === 'custom' ? undefined : values.provider,
       path_prefixes: pathPrefixes(values.paths),
       methods: values.methods,
       github_repository: values.githubRepository,

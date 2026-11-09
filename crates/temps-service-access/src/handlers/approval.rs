@@ -112,6 +112,15 @@ pub async fn approve_service_grant(
         .service
         .get_service(project_id, &consent.request.service_id)
         .await?;
+    // The transaction must accept the same immutable policy version whose
+    // permissions are checked here, never a caller's predicted future version.
+    if service.version != consent.request.service_version {
+        return Err(crate::error::AccessError::Conflict {
+            id: service.id,
+            version: consent.request.service_version,
+        }
+        .into());
+    }
     if service.policy.github_repository.is_some() {
         project_permission_guard!(
             auth,
@@ -119,6 +128,7 @@ pub async fn approve_service_grant(
             project_id,
             &state.project_access_checker
         );
+        temps_authz::permission_guard!(auth, GitConnectionsRead);
     }
     let receipt = state.coordinator.connect(consent).await?;
     audit(

@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub(crate) mod assignments;
 mod consent;
+pub(crate) mod sessions;
 mod status;
+mod vaults;
 pub use consent::{AuthorizedGrant, FreshConsent, HostObservation};
 
 use crate::{
@@ -116,6 +119,9 @@ impl ServiceAccessService {
         mut request: SaveAccessService,
     ) -> Result<AccessServiceResponse, AccessError> {
         validate_service(&mut request)?;
+        if id.is_some() && request.vault_id.is_some() {
+            return Err(invalid("vault_id", "only accepted when creating a service"));
+        }
         if id.is_some() != request.expected_version.is_some() {
             return Err(invalid(
                 "expected_version",
@@ -141,6 +147,18 @@ impl ServiceAccessService {
         if let Some(source) = &request.policy.github_repository {
             crate::github::validate_binding(&tx, project_id, source).await?;
         }
+        let vault = if let Some(vault_id) = &request.vault_id {
+            let vault = self.vault(&tx, project_id, vault_id, true).await?;
+            if vault.service_ids.len() >= 100 || vault.version == i32::MAX {
+                return Err(invalid(
+                    "vault_id",
+                    "this vault cannot accept another service",
+                ));
+            }
+            Some(vault)
+        } else {
+            None
+        };
         let now = Utc::now();
         let updating = id.is_some();
         let mut model = if let Some(id) = id {
@@ -194,6 +212,19 @@ impl ServiceAccessService {
         }
         .map_err(|e| AccessError::database("save service", project_id, e))?;
         let result = service_response(saved)?;
+        if let Some(vault) = vault {
+            let version = vault.version;
+            let mut ids = vault.service_ids.clone();
+            ids.push(result.id.clone());
+            let mut model = vault.into_active_model();
+            model.service_ids = Set(ids);
+            model.version = Set(version + 1);
+            model.updated_at = Set(now);
+            model
+                .update(&tx)
+                .await
+                .map_err(|e| AccessError::database("attach service to vault", project_id, e))?;
+        }
         tx.commit()
             .await
             .map_err(|e| AccessError::database("commit service save", project_id, e))?;
@@ -316,6 +347,7 @@ impl ServiceAccessService {
         }
         let now = Utc::now();
         let grant = grants::ActiveModel {
+            assignment_id: Set(None),
             id: Set(format!("grant_{}", uuid::Uuid::new_v4().simple())),
             project_id: Set(project_id),
             service_id: Set(service.id.clone()),
@@ -363,6 +395,12 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::database("lock grant request", project_id, e))?
             .ok_or_else(|| not_found("grant", grant_id.into(), project_id))?;
+        if grant.assignment_id.is_some() {
+            return Err(invalid(
+                "grant_id",
+                "revoke the owning sandbox service approval to stop automatic renewal",
+            ));
+        }
         if grant.version != version || version == i32::MAX {
             return Err(AccessError::Conflict {
                 id: grant_id.into(),

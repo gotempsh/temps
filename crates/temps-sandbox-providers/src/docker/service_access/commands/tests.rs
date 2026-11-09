@@ -133,6 +133,7 @@ async fn deliveries(
         .await
         .unwrap();
     let first = SessionDelivery {
+        github_git: false,
         authority: WorkerAuthority {
             boot_id: worker.boot_id,
             node_id: registered.node.id.0,
@@ -364,4 +365,48 @@ async fn invalid_session_update_closes_previously_active_binding() {
     assert_ne!(current, target);
     assert!(!connected);
     assert_eq!(version, None);
+}
+
+#[tokio::test]
+async fn obsolete_boot_retirement_completes_without_cutting_current_binding() {
+    let f = Fixture::new().await;
+    let (target, worker, _, _) = f.inspect().await;
+    f.apply(&target, deliveries(&worker, &target.incarnation).await.0)
+        .await
+        .unwrap();
+    let mut obsolete = target.clone();
+    obsolete.incarnation = Uuid::new_v4().to_string();
+    let old_boot = Uuid::new_v4();
+    for _ in 0..2 {
+        let reply = f
+            .provider
+            .service_access(
+                &f.handle,
+                ServiceAccessCommand::Retire {
+                    expected: obsolete.clone(),
+                    boot_id: old_boot,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, ServiceAccessReply::Retired { target: retired } if retired == obsolete)
+        );
+        let (current, _, connected, version) = f.inspect().await;
+        assert_eq!(current, target);
+        assert!(connected);
+        assert_eq!(version, Some(1));
+    }
+    obsolete.container_id = "another-container".into();
+    assert!(f
+        .provider
+        .service_access(
+            &f.handle,
+            ServiceAccessCommand::Retire {
+                expected: obsolete,
+                boot_id: old_boot,
+            }
+        )
+        .await
+        .is_err());
 }

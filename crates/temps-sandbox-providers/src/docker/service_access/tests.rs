@@ -215,7 +215,10 @@ async fn retirement_is_fenced_and_stop_failure_still_closes_access() {
     provider.retire_service_access_target(&first).await.unwrap();
     provider.retire_service_access_target(&first).await.unwrap();
     let second = mounts.recover(&info).unwrap();
-    assert!(provider.retire_service_access_target(&first).await.is_err());
+    for _ in 0..2 {
+        provider.retire_service_access_target(&first).await.unwrap();
+        assert_eq!(mounts.target(&info).unwrap(), second);
+    }
     assert_eq!(mounts.target(&info).unwrap(), second);
     fake.respond(
         Method::POST,
@@ -232,6 +235,25 @@ async fn retirement_is_fenced_and_stop_failure_still_closes_access() {
         image: String::new(),
         conditions: vec![],
     };
+    for _ in 0..2 {
+        let reply = provider
+            .service_access(
+                &handle,
+                crate::service_access::ServiceAccessCommand::Retire {
+                    expected: first.clone(),
+                    boot_id: mounts.control.identity().boot_id,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(reply, crate::service_access::ServiceAccessReply::Retired { target } if target == first)
+        );
+        assert_eq!(
+            mounts.target(&info).unwrap().incarnation,
+            second.incarnation
+        );
+    }
     assert!(provider.stop(&handle).await.is_err());
     assert!(mounts.target(&info).is_err());
     mounts.remove_detached(mount_id(&info).unwrap()).unwrap();

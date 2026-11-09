@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Three owned tasks, no per-sandbox sidecars or unbounded task spawning. The
+//! Four owned tasks, no per-sandbox sidecars or unbounded task spawning. The
 //! durable queue survives shutdown; worker leases expire without renewal.
 use crate::coordinator::ServiceAccessCoordinator;
 use std::{
@@ -18,7 +18,7 @@ impl ServiceAccessReconciler {
     /// Idempotent startup after all provider services have initialized.
     pub fn start(&self, coordinator: Arc<ServiceAccessCoordinator>) {
         self.tasks.get_or_init(|| {
-            let mut tasks = Vec::with_capacity(3);
+            let mut tasks = Vec::with_capacity(4);
             let scheduler = Arc::clone(&coordinator);
             tasks.push(tokio::spawn(async move {
                 loop {
@@ -28,6 +28,17 @@ impl ServiceAccessReconciler {
                         Err(_) => tracing::warn!("Sandbox service-access maintenance deadline exceeded"),
                     }
                     scheduler.wait_for_work().await;
+                }
+            }));
+            let approvals = Arc::clone(&coordinator);
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(90), approvals.maintain_assignments()).await {
+                        Ok(Ok(count)) => { wait_after_approval_batch(count).await; continue; },
+                        Ok(Err(error)) => tracing::warn!(%error, "Cannot maintain sandbox service approvals"),
+                        Err(_) => tracing::warn!("Sandbox service approval maintenance timed out"),
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }));
             for dispatcher in 0..2 {
@@ -55,5 +66,29 @@ impl Drop for ServiceAccessReconciler {
                 task.abort();
             }
         }
+    }
+}
+
+// Yield between bounded batches; only an empty queue needs the polling delay.
+async fn wait_after_approval_batch(count: usize) {
+    if count == 0 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    } else {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn backlog_does_not_spend_short_grant_lifetimes_sleeping() {
+        let start = tokio::time::Instant::now();
+        for _ in 0..16 {
+            wait_after_approval_batch(8).await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        wait_after_approval_batch(0).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
     }
 }

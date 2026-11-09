@@ -54,6 +54,7 @@ fn input(node: Uuid, incarnation: Uuid, origins: &[&str]) -> AuthorizedBinding {
                 crate::github::tests::policy(crate::types::GithubAccessProtocol::Git)
             } else {
                 SandboxAccessPolicy {
+                    provider: None,
                     github_repository: None,
                     origin: (*origin).into(),
                     path_prefixes: vec!["/v1".into()],
@@ -234,6 +235,7 @@ async fn signed_policy_seals_credentials_and_preserves_independent_scope_and_dea
     assert_eq!(issued.snapshot_version(), 7);
     assert!(issued.delivery(Uuid::new_v4()).is_err());
     let delivery = issued.delivery(incarnation).unwrap();
+    assert!(delivery.github_git);
     delivery.validate().unwrap();
     let snapshot = delivery.policy.into_snapshot().unwrap();
     assert!(!snapshot.body.contains("upstream-test-secret"));
@@ -384,6 +386,7 @@ async fn postgres_registration_races_restart_versions_and_real_worker_binding() 
         .await
         .unwrap();
     let delivery = policy.delivery(incarnation).unwrap();
+    assert!(!delivery.github_git);
     let version = worker
         .install(identity.boot_id, &delivery.policy.into_snapshot().unwrap())
         .await
@@ -546,4 +549,53 @@ async fn registration_audit_failure_does_not_replace_or_discard_winning_keys() {
         .into_connection();
     let store = AuthorityStore::new(Arc::new(db), encryption(), Arc::new(FailingAudit));
     assert_eq!(store.register(None, &identity).await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn oversized_worker_additions_do_not_block_healthy_binding_renewal() {
+    let (identity, _) = identity();
+    let mut row = empty_store().generate(None, &identity).unwrap();
+    row.snapshot_version = 1;
+    let key = empty_store()
+        .signing_key(row.id, &row.snapshot_key_encrypted)
+        .unwrap();
+    let healthy = Uuid::new_v4();
+    let tail = Uuid::new_v4();
+    let mut bindings = vec![input(
+        row.sdk_node_id,
+        healthy,
+        &["https://api.example.com"],
+    )];
+    let mut additions = Vec::new();
+    for _ in 0..16 {
+        let id = Uuid::new_v4();
+        additions.push(id);
+        let mut binding = input(row.sdk_node_id, id, &["https://api.example.com"; 16]);
+        for credential in binding.credentials.values_mut() {
+            *credential = SecretString::new("x".repeat(16384));
+        }
+        bindings.push(binding);
+    }
+    bindings.push(input(row.sdk_node_id, tail, &["https://api.example.com"]));
+    let store = store(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection(),
+    );
+    let issued = store.issue(None, &identity, 0, bindings).await.unwrap();
+    let delivery = issued.delivery(healthy).unwrap();
+    assert!(issued.delivery(tail).is_ok());
+    let admitted = additions
+        .iter()
+        .filter(|id| issued.delivery(**id).is_ok())
+        .count();
+    assert!(admitted > 0 && admitted < additions.len());
+    let snapshot = delivery.policy.into_snapshot().unwrap();
+    assert!(snapshot.body.len() <= temps_service_access_runtime::MAX_SNAPSHOT_BYTES);
+    let body = snapshot.verify(&key.verifying_key()).unwrap();
+    assert_eq!(
+        body.rules.len(),
+        2 + admitted * 16,
+        "bindings are admitted atomically"
+    );
 }

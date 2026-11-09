@@ -11,6 +11,7 @@ pub struct Model {
     pub id: String,
     pub project_id: i32,
     pub service_id: String,
+    pub assignment_id: Option<String>,
     pub sandbox_id: i32,
     pub service_version: i32,
     pub policy_snapshot: Json,

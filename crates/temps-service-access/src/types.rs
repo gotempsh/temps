@@ -10,17 +10,20 @@ use utoipa::{IntoParams, ToSchema};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxAccessPolicy {
+    /// Explicit provider identity selected by the operator; never inferred from a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<AccessServiceProvider>,
     /// HTTPS origin only; no path, userinfo, query, fragment or non-443 port.
     pub origin: String,
     /// Segment-boundary path prefixes, for example `/owner/private-repo`.
     pub path_prefixes: Vec<String>,
     pub methods: Vec<AccessMethod>,
-    /// Use the project-bound GitHub connection on the host. No provider token is returned.
+    /// Use the selected GitHub connection on the host. No provider token is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_repository: Option<GithubRepositoryAccess>,
 }
 
-/// Immutable reference to the project's existing GitHub repository connection.
+/// Immutable reference to an explicitly selected GitHub connection and synced repository.
 /// Changing the connection or repository requires a new policy and fresh consent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +57,9 @@ pub enum AccessMethod {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SaveAccessService {
+    /// Add a newly created service to this vault in the same transaction.
+    #[serde(default)]
+    pub vault_id: Option<String>,
     pub name: String,
     pub policy: SandboxAccessPolicy,
     /// Maximum lifetime of a request, between 60 and 86400 seconds.
@@ -193,4 +199,20 @@ pub struct ServiceGrantList {
     pub page: u64,
     pub page_size: u64,
     pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessServiceProvider {
+    Github,
+    Gitlab,
+    Openai,
+    Anthropic,
+    Stripe,
+    Resend,
+    Sendgrid,
+    Vercel,
+    Netlify,
+    Mistral,
+    Groq,
 }

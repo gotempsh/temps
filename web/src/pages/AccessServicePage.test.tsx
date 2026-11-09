@@ -102,8 +102,8 @@ function mount(
               element={<AccessServicePage />}
             />
             <Route
-              path="/sandboxes/:sandboxId"
-              element={<div>Returned to sandbox</div>}
+              path="/vault/projects/:projectId"
+              element={<div>Returned to Vault</div>}
             />
           </Routes>
         </BreadcrumbProvider>
@@ -154,7 +154,7 @@ test('direct editor URL loads masked service and preserves edits and version acr
       )
     )
     await waitFor(() =>
-      expect(document.body.textContent).toContain('Returned to sandbox')
+      expect(document.body.textContent).toContain('Returned to Vault')
     )
     expect(submitted?.name).toBe('Local edit')
     expect(submitted?.expected_version).toBe(4)
@@ -300,8 +300,8 @@ test('service editor routes populate and clear the shared breadcrumb trail', asy
           .textContent ?? '[]'
       )
     ).toEqual([
-      { label: 'Projects', href: '/projects' },
-      { label: 'Project 7', href: '/projects/7' },
+      { label: 'Vault', href: '/vault' },
+      { label: 'Project 7', href: '/vault/projects/7' },
       { label: 'API' },
     ])
     await act(async () =>

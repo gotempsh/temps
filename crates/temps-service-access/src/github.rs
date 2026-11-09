@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Project-bound GitHub credentials stay on the control plane and worker. The
-//! policy pins a connection and repository; changing project source cannot
-//! transfer an old approval to a different account or repository.
+//! GitHub credentials stay on the control plane and worker. Each Vault policy
+//! pins an explicitly selected connection and repository, independently of the
+//! project source. Every issuance rechecks that connection and repository.
 use crate::{
     error::AccessError,
     types::{AccessMethod, GithubAccessProtocol, GithubRepositoryAccess, SandboxAccessPolicy},
@@ -73,12 +73,40 @@ pub(crate) async fn validate_binding<C: ConnectionTrait>(
     source: &GithubRepositoryAccess,
 ) -> Result<(), AccessError> {
     let found = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-        "SELECT p.id FROM projects p JOIN git_provider_connections c ON c.id=p.git_provider_connection_id JOIN git_providers v ON v.id=c.provider_id WHERE p.id=$1 AND NOT p.is_deleted AND p.deleted_at IS NULL AND c.id=$2 AND lower(p.repo_owner)=lower($3) AND lower(p.repo_name)=lower($4) AND c.is_active AND NOT c.is_expired AND v.is_active AND v.provider_type='github' AND (v.base_url IS NULL OR v.base_url IN ('https://github.com','https://github.com/')) AND (v.api_url IS NULL OR v.api_url IN ('https://api.github.com','https://api.github.com/'))",
+        "SELECT p.id FROM projects p JOIN git_provider_connections c ON c.id=$2 JOIN git_providers v ON v.id=c.provider_id WHERE p.id=$1 AND NOT p.is_deleted AND p.deleted_at IS NULL AND EXISTS (SELECT 1 FROM repositories r WHERE r.git_provider_connection_id=c.id AND lower(r.owner)=lower($3) AND lower(r.name)=lower($4)) AND c.is_active AND NOT c.is_expired AND v.is_active AND v.provider_type='github' AND (v.base_url IS NULL OR v.base_url IN ('https://github.com','https://github.com/')) AND (v.api_url IS NULL OR v.api_url IN ('https://api.github.com','https://api.github.com/'))",
         [project_id.into(),source.connection_id.into(),source.owner.clone().into(),source.repository.clone().into()]))
         .await.map_err(|e| AccessError::database("validate project GitHub credential source",project_id,e))?;
     if found.is_none() {
         return Err(invalid(
-            "the active GitHub connection and repository must match this project's current source",
+            "select a synced repository from an active GitHub connection",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate all selected repository/connection pairs in one metadata-only query.
+pub(crate) async fn validate_bindings<C: ConnectionTrait>(
+    db: &C,
+    project_id: i32,
+    sources: &[GithubRepositoryAccess],
+) -> Result<(), AccessError> {
+    if sources.is_empty() {
+        return Ok(());
+    }
+    let connections: Vec<i32> = sources.iter().map(|s| s.connection_id).collect();
+    let owners: Vec<String> = sources.iter().map(|s| s.owner.clone()).collect();
+    let repositories: Vec<String> = sources.iter().map(|s| s.repository.clone()).collect();
+    let row = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "SELECT NOT EXISTS (SELECT 1 FROM unnest($2::integer[], $3::text[], $4::text[]) AS selected(connection_id, owner, repository) WHERE NOT EXISTS (SELECT 1 FROM projects p JOIN git_provider_connections c ON c.id=selected.connection_id JOIN git_providers v ON v.id=c.provider_id WHERE p.id=$1 AND NOT p.is_deleted AND p.deleted_at IS NULL AND EXISTS (SELECT 1 FROM repositories r WHERE r.git_provider_connection_id=c.id AND lower(r.owner)=lower(selected.owner) AND lower(r.name)=lower(selected.repository)) AND c.is_active AND NOT c.is_expired AND v.is_active AND v.provider_type='github' AND (v.base_url IS NULL OR v.base_url IN ('https://github.com','https://github.com/')) AND (v.api_url IS NULL OR v.api_url IN ('https://api.github.com','https://api.github.com/')))) AS valid",
+        [project_id.into(), connections.into(), owners.into(), repositories.into()]))
+        .await.map_err(|e| AccessError::database("validate selected GitHub credential sources", project_id, e))?
+        .ok_or_else(|| invalid("cannot validate the selected GitHub credential sources"))?;
+    let valid: bool = row.try_get("", "valid").map_err(|e| {
+        AccessError::database("read selected GitHub source validation", project_id, e)
+    })?;
+    if !valid {
+        return Err(invalid(
+            "select synced repositories from active GitHub connections",
         ));
     }
     Ok(())

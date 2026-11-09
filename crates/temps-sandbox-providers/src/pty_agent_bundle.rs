@@ -24,6 +24,11 @@ pub struct BundleFile {
 /// [`super::docker::dockerfile_for_runtime`].
 pub const BUNDLE: &[BundleFile] = &[
     BundleFile {
+        path: "pty-agent/vault-git.sh",
+        contents: include_bytes!("../../temps-pty-agent/docker/vault-git.sh"),
+        mode: 0o755,
+    },
+    BundleFile {
         path: "pty-agent/Cargo.toml",
         contents: include_bytes!("../../temps-pty-agent/Cargo.docker.toml"),
         mode: 0o644,

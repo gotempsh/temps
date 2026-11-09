@@ -3,6 +3,7 @@
 
 import { type SearchableSelectOption } from '@/components/ui/searchable-select'
 
+import { VAULT_AUDIT_OPERATIONS } from '@/lib/vault-audit'
 import { PERMISSION_DENIED_FILTER } from '@/lib/audit-operation-filters'
 
 export type OperationGroup = {
@@ -11,6 +12,7 @@ export type OperationGroup = {
 }
 
 export const OPERATION_GROUPS: OperationGroup[] = [
+  { label: 'Vault', operations: [...VAULT_AUDIT_OPERATIONS] },
   {
     label: 'Plugins',
     operations: [

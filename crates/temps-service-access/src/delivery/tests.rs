@@ -293,3 +293,45 @@ async fn postgres_delivery_fences_claims_versions_and_survives_runtime_deletion(
     );
     test.cleanup().await;
 }
+
+#[tokio::test]
+async fn worker_claim_excludes_other_sandboxes_until_release() {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    let worker = temps_service_access_runtime::WorkerControl::new(Arc::new(
+        temps_service_access_runtime::HostAudit,
+    ));
+    crate::authority::AuthorityStore::new(
+        db.clone(),
+        Arc::new(temps_core::EncryptionService::new(&"ab".repeat(32)).unwrap()),
+        Arc::new(temps_core::NoopAuditLogger),
+    )
+    .register(None, &worker.identity())
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9401,'Claims','repo','owner','/','main','nodejs','claims',now(),now()); INSERT INTO sandboxes (id,public_id,name,project_id) VALUES (9401,'sbx_one','one',9401),(9402,'sbx_two','two',9401)").await.unwrap();
+    for sandbox in [9401, 9402] {
+        let id = Uuid::new_v4();
+        db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name) VALUES ('{id}',9401,{sandbox},'container-{sandbox}','{}','docker','sandbox-{sandbox}')",worker.identity().boot_id)).await.unwrap();
+        let tx = db.begin().await.unwrap();
+        DeliveryQueue::advance(&tx, id, 0, DeliveryOperation::Reconcile)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let queue = DeliveryQueue::new(db.clone());
+    let (a, b) = tokio::join!(queue.claim(2), queue.claim(2));
+    let claims: Vec<_> = a.unwrap().into_iter().chain(b.unwrap()).collect();
+    assert_eq!(claims.len(), 1);
+    assert!(queue.claim(2).await.unwrap().is_empty());
+    queue.retry(&claims[0]).await.unwrap();
+    assert_eq!(queue.claim(2).await.unwrap().len(), 1);
+    test.cleanup().await;
+}

@@ -24,6 +24,7 @@ fn project_row() -> BTreeMap<String, sea_orm::Value> {
 }
 fn request() -> SaveAccessService {
     SaveAccessService {
+        vault_id: None,
         name: " API ".into(),
         policy: policy(),
         max_ttl_seconds: 900,
@@ -35,6 +36,7 @@ fn request() -> SaveAccessService {
 }
 fn policy() -> SandboxAccessPolicy {
     SandboxAccessPolicy {
+        provider: None,
         github_repository: None,
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
@@ -58,6 +60,7 @@ fn row() -> services::Model {
 fn grant() -> grants::Model {
     let now = Utc::now();
     grants::Model {
+        assignment_id: None,
         id: "grant_test".into(),
         project_id: 7,
         service_id: "svc_test".into(),

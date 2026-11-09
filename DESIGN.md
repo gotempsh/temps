@@ -559,3 +559,20 @@ Official sources: [GitHub brand toolkit](https://brand.github.com/foundations/lo
 [Anthropic's company site](https://www.anthropic.com/) (compact company symbol;
 vector pinned to [Simple Icons 13.0.0](https://github.com/simple-icons/simple-icons/blob/13.0.0/icons/anthropic.svg)).
 The company marks remain the property of their respective owners.
+
+
+The left/right heading-and-controls layout is reserved for full settings forms.
+Never use `SettingsSection` or `SettingsGroup` as a wrapper for a read-only
+record, resource list, grant table, or operational panel. Detail and collection
+pages keep one consistent full-width content layout; link to a dedicated
+settings route for extensive editing. Small inline forms use `Field` and
+`FormErrors` in the surrounding layout without introducing settings columns.
+Vault owns Services, Access bundles, and Sessions. Services hold provider
+configuration and credentials; bundles define reusable service selections and
+access limits; sessions authorize identified consumers for a bounded lifetime.
+Session details expose the allowed consumers, effective restrictions, expiry,
+and revocation state. Sandbox detail pages show only that sandbox's access and
+link to the owning Vault sessions; a sandbox picker is not a Vault navigation tab.
+Keep session records distinct from individual grants and internal proxy tokens.
+Creation and editing use dedicated form pages; operational details use the
+full-width record layout.

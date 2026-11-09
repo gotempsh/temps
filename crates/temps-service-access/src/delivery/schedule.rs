@@ -64,12 +64,8 @@ impl DeliveryQueue {
             .all(&tx)
             .await
             .map_err(|e| database("lock worker incarnations", id, e))?;
-        if runtime_ids.len() > temps_service_access_runtime::MAX_WORKER_BINDINGS {
-            return Err(DeliveryError::Invalid {
-                operation: "schedule worker",
-                reason: "worker exceeds the 128 incarnation limit",
-            });
-        }
+        // Legacy overflow must still reach the planner, which retires stale or
+        // excess incarnations instead of stopping renewal for the whole worker.
         let authority = tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             "SELECT id FROM sandbox_access_authorities WHERE id=$1 AND closed_at IS NULL AND next_reconcile_at<=clock_timestamp() FOR UPDATE", [id.into()]))
             .await.map_err(|e| database("lock due worker", id, e))?;

@@ -113,6 +113,11 @@ async fn authenticated_worker_registration_enforces_node_binding_and_shutdown() 
     let root = tempfile::tempdir().unwrap();
     let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
     attachment.publish_certificate(&certificate).unwrap();
+    assert!(!attachment.directory().join("github-git").exists());
+    attachment.publish_github_git_route().unwrap();
+    assert!(attachment.directory().join("github-git").exists());
+    attachment.publish_certificate(&certificate).unwrap();
+    assert!(attachment.directory().join("github-git").exists());
     let published = std::fs::read(attachment.directory().join("ca.pem")).unwrap();
     let certs = rustls_pemfile::certs(&mut published.as_slice())
         .collect::<Result<Vec<_>, _>>()

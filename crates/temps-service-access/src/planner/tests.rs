@@ -235,8 +235,10 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
                 9701,
                 None,
                 SaveAccessService {
+                    vault_id: None,
                     name: "API".into(),
                     policy: SandboxAccessPolicy {
+                        provider: None,
                         github_repository: None,
                         origin: origin.into(),
                         path_prefixes: vec!["/user".into()],
@@ -284,6 +286,70 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
             .unwrap();
         grants.push(approved);
         services.push(definition);
+    }
+    struct UnavailableGithub {
+        calls: AtomicUsize,
+        stall: bool,
+    }
+    #[async_trait::async_trait]
+    impl crate::github::GithubCredentialResolver for UnavailableGithub {
+        async fn resolve(
+            &self,
+            connection_id: i32,
+        ) -> Result<SecretString, crate::github::GithubCredentialError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
+            Err(crate::github::GithubCredentialError { connection_id })
+        }
+    }
+    for stall in [false, true] {
+        let resolver = Arc::new(UnavailableGithub {
+            calls: AtomicUsize::new(0),
+            stall,
+        });
+        let isolated = PolicyPlanner::new(
+            db.clone(),
+            encryption(),
+            Some(checker.clone()),
+            resolver.clone(),
+        );
+        let (authority, mut runtimes, mut candidates) =
+            planner.read(identity.boot_id).await.unwrap();
+        candidates[0].admin = true; // Credential lookup must actually be attempted.
+        candidates[0].policy["github_repository"] = serde_json::json!({"connection_id": 1,"owner":"example","repository":"repo","protocol":"api"});
+        // Put the healthy grant in another sandbox/project on the same worker.
+        let mut other = runtimes[0].clone();
+        other.id = Uuid::new_v4();
+        other.project_id += 1;
+        other.sandbox_id += 1;
+        candidates[1].runtime_id = other.id;
+        candidates[1].project_id = other.project_id;
+        let healthy_id = other.id;
+        runtimes.push(other);
+        let degraded = tokio::time::timeout(
+            Duration::from_secs(5),
+            isolated.prepare_rows(identity.boot_id, authority, runtimes, candidates),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            degraded.retire.is_empty(),
+            "credential outages must not revoke consent"
+        );
+        assert_eq!(degraded.bindings.len(), 1);
+        assert_eq!(
+            degraded.bindings[0].plan.target().incarnation_id,
+            healthy_id
+        );
+        assert_eq!(
+            degraded.bindings[0].plan.grants().len(),
+            1,
+            "healthy bearer grant survives GitHub outage"
+        );
     }
     let plan = planner.prepare(identity.boot_id).await.unwrap();
     assert_eq!(plan.bindings.len(), 1);
@@ -335,9 +401,10 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
         .unwrap();
     binding.ready(version).await.unwrap();
     let queue = crate::delivery::DeliveryQueue::new(db.clone());
-    let claims = queue.claim(32).await.unwrap();
-    assert_eq!(claims.len(), 2);
-    for claim in &claims {
+    for _ in 0..2 {
+        let claims = queue.claim(32).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = &claims[0];
         if claim.command().desired_version == 1 {
             queue.supersede(claim).await.unwrap();
         } else {

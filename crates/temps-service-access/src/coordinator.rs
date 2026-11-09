@@ -135,8 +135,49 @@ impl ServiceAccessCoordinator {
         Ok(grant)
     }
 
+    /// Issue one immutable Vault session using a single authenticated worker
+    /// observation. The service commits every selected grant atomically.
+    pub async fn connect_session(
+        &self,
+        project_id: i32,
+        vault_id: &str,
+        user_id: i32,
+        admin: bool,
+        request: crate::session_types::CreateAccessSession,
+    ) -> Result<crate::session_types::AccessSessionResponse, CoordinatorError> {
+        crate::service::sessions::validate(&request)?;
+        let sandbox_id = request.consumer.sandbox_id();
+        let _permit = self.admit(sandbox_id)?;
+        let mut query = sandboxes::Entity::find()
+            .filter(sandboxes::Column::PublicId.eq(sandbox_id))
+            .filter(sandboxes::Column::ProjectId.eq(project_id));
+        if !admin {
+            query = query.filter(sandboxes::Column::UserId.eq(user_id));
+        }
+        let sandbox = query
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| database(sandbox_id, "resolve session consumer", e))?
+            .ok_or_else(|| AccessError::NotFound {
+                kind: "sandbox",
+                id: sandbox_id.into(),
+                project_id,
+            })?;
+        let observed = self.transport.inspect(&sandbox).await?;
+        self.authority
+            .register(observed.node_id, &observed.worker)
+            .await?;
+        let session = self
+            .service
+            .authorize_session(project_id, vault_id, user_id, admin, request, observed)
+            .await?;
+        self.wake.notify_waiters();
+        Ok(session)
+    }
+
     /// One bounded command. The caller schedules subsequent ticks; there is no
-    /// unbounded background task or network operation inside a DB transaction.
+    /// unbounded background task. The durable claim excludes other commands for the worker; no database
+    /// transaction is held during transport I/O.
     pub async fn dispatch_one(&self) -> Result<Option<DispatchOutcome>, CoordinatorError> {
         let _permit = self.admit("delivery queue")?;
         let Some(claim) = self.queue.claim(1).await?.pop() else {
@@ -162,6 +203,36 @@ impl ServiceAccessCoordinator {
             self.wake.notify_waiters();
         }
         Ok(queued)
+    }
+
+    pub(crate) async fn maintain_assignments(&self) -> Result<usize, CoordinatorError> {
+        let assignments = self.service.due_assignments().await?;
+        let count = assignments.len();
+        for assignment in assignments {
+            let result = async {
+                let Some(sandbox) = self.service.assignment_sandbox(&assignment).await? else {
+                    return Ok::<_, CoordinatorError>(());
+                };
+                let observed = self.transport.inspect(&sandbox).await?;
+                self.authority
+                    .register(observed.node_id, &observed.worker)
+                    .await?;
+                self.service
+                    .renew_assignment(
+                        &assignment.id,
+                        assignment.project_id,
+                        assignment.sandbox_id,
+                        observed,
+                    )
+                    .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(assignment_id=%assignment.id, %error, "Service access renewal unavailable; existing short leases fail closed");
+            }
+        }
+        Ok(count)
     }
 
     pub(crate) async fn wait_for_work(&self) {
@@ -207,6 +278,27 @@ impl ServiceAccessCoordinator {
                 operation: "resolve pending authority",
                 reason: "legacy saved intention has no worker authority",
             })?;
+        // A reclaimed command may have reached the worker before its ACK was
+        // persisted. Allocate a fresh binding version before any further I/O.
+        if command.attempts > 1 {
+            let tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|e| database(command.runtime_id, "begin delivery recovery", e))?;
+            DeliveryQueue::advance(
+                &tx,
+                command.runtime_id,
+                command.desired_version,
+                DeliveryOperation::Reconcile,
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|e| database(command.runtime_id, "commit delivery recovery", e))?;
+            self.queue.supersede(claim).await?;
+            return Ok(DispatchOutcome::Superseded);
+        }
         let mut plan = self.planner.prepare(boot_id).await?;
         if !plan.retire.is_empty() {
             for retired in &plan.retire {

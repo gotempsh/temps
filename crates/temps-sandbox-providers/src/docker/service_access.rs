@@ -520,11 +520,10 @@ impl DockerSandboxProvider {
             let entries = mounts.entries();
             if let Some(entry) = entries.get(&target.container_id) {
                 if entry.target != *target {
-                    return Err(failure(
-                        &target.container_id,
-                        "retire grant",
-                        "sandbox incarnation changed",
-                    ));
+                    // Adoption requires the previous attachment to be closed first.
+                    // Under the per-container operation guard, a different current
+                    // incarnation proves this saved target is already gone.
+                    return Ok(());
                 }
             }
         }

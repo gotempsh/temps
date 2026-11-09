@@ -177,6 +177,7 @@ fn provider(target: &StoredTarget) -> Arc<Provider> {
 }
 fn delivery(target: &StoredTarget) -> SessionDelivery {
     SessionDelivery {
+        github_git: false,
         authority: WorkerAuthority {
             boot_id: target.boot_id,
             node_id: Uuid::new_v4(),
