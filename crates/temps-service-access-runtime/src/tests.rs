@@ -96,13 +96,29 @@ async fn authenticated_worker_registration_enforces_node_binding_and_shutdown() 
         .install(uuid::Uuid::new_v4(), &snapshot)
         .await
         .is_err());
-    let version = worker.install(identity.boot_id, &snapshot).await.unwrap();
+    let mut tampered = snapshot.clone();
+    tampered.body.push(' ');
+    assert!(worker
+        .install_with_certificate(identity.boot_id, &tampered)
+        .await
+        .is_err());
+    let (version, certificate) = worker
+        .install_with_certificate(identity.boot_id, &snapshot)
+        .await
+        .unwrap();
     let binding = worker
         .bind(identity.boot_id, f.spec(token), version)
         .await
         .unwrap();
     let root = tempfile::tempdir().unwrap();
     let attachment = UnixAttachment::bind(root.path(), binding).unwrap();
+    attachment.publish_certificate(&certificate).unwrap();
+    let published = std::fs::read(attachment.directory().join("ca.pem")).unwrap();
+    let certs = rustls_pemfile::certs(&mut published.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(certs.len(), 1);
+    assert!(!String::from_utf8_lossy(&published).contains("PRIVATE KEY"));
     let guest = idle_guest_tunnel(&attachment).await;
     drop(worker);
     assert_guest_closed(guest).await;

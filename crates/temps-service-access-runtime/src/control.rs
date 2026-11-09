@@ -19,9 +19,10 @@ use uuid::Uuid;
 
 /// Public material only. Read through the authenticated worker channel, never
 /// accept a guest's asserted worker identity when authorizing a grant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerIdentity {
+    #[schema(value_type = String, format = "uuid")]
     pub boot_id: Uuid,
     pub seal_public_key: [u8; 32],
 }
@@ -29,10 +30,12 @@ pub struct WorkerIdentity {
 /// Control-plane registration for exactly one worker boot. The caller must
 /// authenticate the control plane before invoking `configure`. A different
 /// signing authority cannot replace an initialized worker in place.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerAuthority {
+    #[schema(value_type = String, format = "uuid")]
     pub boot_id: Uuid,
+    #[schema(value_type = String, format = "uuid")]
     pub node_id: Uuid,
     pub snapshot_verify_key: [u8; 32],
 }
@@ -40,6 +43,16 @@ pub struct WorkerAuthority {
 struct Initialized {
     authority: WorkerAuthority,
     proxy: WorkerProxy,
+}
+
+/// Constructed only from a verified, successfully installed SDK policy. The
+/// sealed private key is never part of this value or the guest mount.
+#[derive(Debug)]
+pub struct PublicCertificate(String);
+impl PublicCertificate {
+    pub fn as_pem(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Construct once per trusted worker process, not once per request. Keys stay
@@ -131,6 +144,35 @@ impl WorkerControl {
         snapshot: &SignedSnapshot,
     ) -> Result<u64, RuntimeError> {
         self.initialized(boot_id)?.proxy.install(snapshot).await
+    }
+
+    pub async fn install_with_certificate(
+        &self,
+        boot_id: Uuid,
+        snapshot: &SignedSnapshot,
+    ) -> Result<(u64, PublicCertificate), RuntimeError> {
+        let initialized = self.initialized(boot_id)?;
+        if snapshot.body.len() > crate::MAX_SNAPSHOT_BYTES {
+            return Err(self.invalid("install policy", "snapshot exceeds delivery limit"));
+        }
+        let key = VerifyingKey::from_bytes(&initialized.authority.snapshot_verify_key)
+            .map_err(|_| self.invalid("install policy", "invalid pinned signing key"))?;
+        let body = snapshot.verify(&key)?;
+        let der = body.interception_ca.cert_der;
+        if der.len() > 16 * 1024 {
+            return Err(self.invalid("publish CA", "public certificate exceeds 16 KiB"));
+        }
+        let version = initialized.proxy.install(snapshot).await?;
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        // The SDK has decoded and validated this certificate before success.
+        for chunk in der.as_bytes().chunks(64) {
+            let text = std::str::from_utf8(chunk)
+                .map_err(|_| self.invalid("publish CA", "certificate encoding is invalid"))?;
+            pem.push_str(text);
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        Ok((version, PublicCertificate(pem)))
     }
 
     pub async fn bind(

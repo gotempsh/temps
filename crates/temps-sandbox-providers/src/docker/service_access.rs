@@ -6,7 +6,7 @@
 use super::*;
 use std::{os::unix::fs::DirBuilderExt, sync::Mutex, time::Duration};
 use temps_service_access_runtime::{
-    MountDirectory, SandboxBinding, UnixAttachment, MAX_WORKER_BINDINGS,
+    HostAudit, MountDirectory, SandboxBinding, UnixAttachment, WorkerControl, MAX_WORKER_BINDINGS,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -14,21 +14,18 @@ use uuid::Uuid;
 pub(super) const MOUNT_LABEL: &str = "sh.temps.sandbox.service-access.mount";
 pub(super) const GUEST_DIRECTORY: &str = "/run/temps-service-access";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceAccessTarget {
-    /// Fresh on every provider-managed start or worker-process recovery.
-    pub incarnation: String,
-    pub container_id: String,
-}
+pub use crate::service_access::ServiceAccessTarget;
 
 struct Entry {
     target: ServiceAccessTarget,
     started_at: String,
     attachment: UnixAttachment,
+    binding: Option<(Arc<SandboxBinding>, u64)>,
     _permit: OwnedSemaphorePermit,
 }
 
 pub(super) struct AccessMounts {
+    control: WorkerControl,
     root: PathBuf,
     entries: Mutex<HashMap<String, Entry>>,
     permits: Arc<Semaphore>,
@@ -67,6 +64,7 @@ fn failure(id: &str, operation: &str, error: impl std::fmt::Display) -> AgentErr
 impl AccessMounts {
     pub(super) fn new(root: PathBuf) -> Self {
         Self {
+            control: WorkerControl::new(Arc::new(HostAudit)),
             root,
             entries: Mutex::new(HashMap::new()),
             permits: Arc::new(Semaphore::new(MAX_WORKER_BINDINGS)),
@@ -239,6 +237,7 @@ impl AccessMounts {
                 target: target.clone(),
                 started_at,
                 attachment: pending.attachment,
+                binding: None,
                 _permit: permit,
             },
         );
@@ -263,6 +262,17 @@ impl AccessMounts {
                 &id,
                 "resolve incarnation",
                 "container restarted; fresh consent is required",
+            ));
+        }
+        if entry
+            .binding
+            .as_ref()
+            .is_some_and(|(binding, _)| binding.status().revoked)
+        {
+            return Err(failure(
+                &id,
+                "resolve incarnation",
+                "binding was retired or interrupted; fresh consent is required",
             ));
         }
         verify_mount(
@@ -605,6 +615,7 @@ impl DockerSandboxProvider {
 }
 
 mod cleanup;
+mod commands;
 use cleanup::MountCleanup;
 
 fn directory_id(attachment: &UnixAttachment) -> Result<String, AgentError> {

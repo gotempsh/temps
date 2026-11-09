@@ -7,6 +7,22 @@ use super::*;
 
 #[async_trait]
 impl SandboxProvider for DockerSandboxProvider {
+    async fn service_access(
+        &self,
+        handle: &SandboxHandle,
+        command: crate::service_access::ServiceAccessCommand,
+    ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.service_access_command(handle, command),
+        )
+        .await
+        .map_err(|_| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: "service access command exceeded its 20-second deadline".into(),
+        })?
+    }
     async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
         let info = self
             .docker

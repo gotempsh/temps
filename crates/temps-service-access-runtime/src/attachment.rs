@@ -58,6 +58,28 @@ impl AttachmentSlot {
 }
 
 impl UnixAttachment {
+    /// Atomic public trust-bundle publication. The mount is read-only in the
+    /// guest; a failed write leaves the preceding certificate intact.
+    pub fn publish_certificate(
+        &self,
+        certificate: &crate::PublicCertificate,
+    ) -> Result<(), RuntimeError> {
+        use std::io::Write;
+        let failure = |source| RuntimeError::Attachment {
+            operation: "publish public CA certificate",
+            binding: self.slot.id.clone(),
+            source,
+        };
+        let mut file = tempfile::NamedTempFile::new_in(self.directory()).map_err(failure)?;
+        file.write_all(certificate.as_pem().as_bytes())
+            .map_err(failure)?;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .map_err(failure)?;
+        file.persist(self.directory().join("ca.pem"))
+            .map_err(|e| failure(e.error))?;
+        Ok(())
+    }
     /// `parent` is an operator-owned directory outside every sandbox mount.
     /// It must not be writable by a sandbox user. A fresh, unpredictable child
     /// is created on every invocation; existing paths are never replaced.

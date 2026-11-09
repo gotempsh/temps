@@ -298,10 +298,9 @@ pub fn build_router(
 }
 
 /// ADR-048 sandbox host API — same auth as every other agent route. File
-/// and directory uploads travel base64-encoded in JSON, so only those two
-/// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
-/// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
-/// other route keeps axum's 2 MiB default.
+/// and directory uploads travel base64-encoded in JSON and use upload slots.
+/// Signed service-access policies have a separate eight MiB/two-slot budget;
+/// other routes keep axum's two MiB default.
 pub(crate) fn sandbox_router(
     sandbox_state: Arc<SandboxHostState>,
     auth: Arc<AgentAuth>,
@@ -311,6 +310,12 @@ pub(crate) fn sandbox_router(
         || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
     Router::new()
         .route("/agent/sandboxes", post(sandbox_handlers::create_sandbox))
+        .route(
+            sandbox_handlers::service_access::PATH,
+            post(sandbox_handlers::service_access::command).layer(
+                axum::extract::DefaultBodyLimit::max(sandbox_handlers::service_access::BODY_LIMIT),
+            ),
+        )
         .route(
             "/agent/sandboxes/exec",
             post(sandbox_handlers::exec_sandbox),
@@ -403,6 +408,10 @@ pub(crate) fn sandbox_router(
             sandbox_handlers::redact_host_paths,
         ))
         .layer(middleware::from_fn(open_sealed_requests))
+        .layer(middleware::from_fn_with_state(
+            sandbox_state.clone(),
+            sandbox_handlers::service_access::limit,
+        ))
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
         .layer(Extension(sealed_requests))
@@ -1856,7 +1865,8 @@ pub(crate) mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 19] = [
+    const SANDBOX_ROUTES: [&str; 20] = [
+        "/agent/sandboxes/service-access",
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -2303,7 +2313,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn only_upload_routes_accept_bodies_over_two_mib() {
+    async fn only_upload_and_bounded_policy_routes_accept_bodies_over_two_mib() {
         use tower::ServiceExt;
         let (app, _root) = sandbox_app();
         // Valid JSON just over axum's 2 MiB default.
@@ -2320,7 +2330,7 @@ pub(crate) mod tests {
                 .oneshot(post_json(route, Some("secret"), big.clone()))
                 .await
                 .unwrap();
-            if UPLOAD_ROUTES.contains(&route) {
+            if UPLOAD_ROUTES.contains(&route) || route == sandbox_handlers::service_access::PATH {
                 assert_ne!(
                     response.status(),
                     axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -2334,5 +2344,74 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn service_access_bounds_decoding_and_registers_its_openapi_contract() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
+        let held = state
+            .access_permits
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let app = sandbox_router(
+            state,
+            Arc::new(AgentAuth::new("secret")),
+            Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "test-node".into(),
+            }),
+        );
+        let path = sandbox_handlers::service_access::PATH;
+        let response = app
+            .clone()
+            .oneshot(post_json(path, Some("secret"), b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let response = app
+            .clone()
+            .oneshot(post_json(path, None, b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        drop(held);
+        let response = app
+            .oneshot(post_json(
+                path,
+                Some("secret"),
+                vec![b' '; sandbox_handlers::service_access::BODY_LIMIT + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(AgentApiDoc::openapi().paths.paths.contains_key(path));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn slow_service_access_body_times_out_and_releases_delivery_capacity() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
+        let app = sandbox_router(
+            state.clone(),
+            Arc::new(AgentAuth::new("secret")),
+            Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "test-node".into(),
+            }),
+        );
+        let body = axum::body::Body::from_stream(futures::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let request = axum::http::Request::post(sandbox_handlers::service_access::PATH)
+            .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(state.access_permits.available_permits(), 2);
     }
 }

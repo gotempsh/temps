@@ -15671,6 +15671,8 @@ dependencies = [
  "temps-workload",
  "temps-workload-netpol",
  "thiserror 2.0.21",
+ "tokenless-control",
+ "tokenless-core",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tracing",
@@ -15774,6 +15776,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 

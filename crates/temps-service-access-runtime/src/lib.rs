@@ -5,7 +5,9 @@
 //! creates attachments. Guest byte streams receive a specific binding and may
 //! never select their own identity, session or node.
 mod control;
-pub use control::{WorkerAuthority, WorkerControl, WorkerIdentity};
+pub use control::{PublicCertificate, WorkerAuthority, WorkerControl, WorkerIdentity};
+mod protocol;
+pub use protocol::{HostAudit, PolicyEnvelope, SessionDelivery};
 #[cfg(unix)]
 mod attachment;
 #[cfg(unix)]
@@ -71,6 +73,16 @@ pub struct SandboxBinding {
 }
 
 impl SandboxBinding {
+    pub async fn ready(&self, snapshot_version: u64) -> Result<(), RuntimeError> {
+        self.inner
+            .ready(snapshot_version, Duration::from_secs(5))
+            .await
+            .map_err(|source| RuntimeError::DataPlane {
+                operation: "confirm installed policy",
+                binding: self.id().into(),
+                source,
+            })
+    }
     pub fn id(&self) -> &str {
         self.inner.id()
     }

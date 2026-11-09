@@ -77,6 +77,17 @@ impl NodeRoutingSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for NodeRoutingSandboxProvider {
+    async fn service_access(
+        &self,
+        handle: &SandboxHandle,
+        command: crate::service_access::ServiceAccessCommand,
+    ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+        self.owner_of(handle)
+            .await?
+            .service_access(handle, command)
+            .await
+    }
+
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         let node_id = config.node_id;
         let handle = self.for_node(node_id).await?.create(config).await?;
@@ -809,6 +820,22 @@ mod tests {
 
     #[async_trait]
     impl SandboxProvider for Recorder {
+        async fn service_access(
+            &self,
+            handle: &SandboxHandle,
+            _: crate::service_access::ServiceAccessCommand,
+        ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:service_access", self.label));
+            Ok(crate::service_access::ServiceAccessReply::Retired {
+                target: crate::service_access::ServiceAccessTarget {
+                    incarnation: "test-incarnation".into(),
+                    container_id: handle.sandbox_id.clone(),
+                },
+            })
+        }
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             self.calls
                 .lock()
@@ -1076,6 +1103,34 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "nothing may run locally: {:?}",
             calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn service_access_stays_on_its_worker_and_never_falls_back() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = router(&calls);
+        for id in [None, Some(7)] {
+            router
+                .service_access(
+                    &worker_handle(id),
+                    crate::service_access::ServiceAccessCommand::Inspect,
+                )
+                .await
+                .unwrap();
+        }
+        assert_unreachable(
+            router
+                .service_access(
+                    &worker_handle(Some(99)),
+                    crate::service_access::ServiceAccessCommand::Inspect,
+                )
+                .await,
+            "service_access",
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["local:service_access", "worker7:service_access"]
         );
     }
 
