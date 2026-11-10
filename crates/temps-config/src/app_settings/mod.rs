@@ -1879,8 +1879,6 @@ pub enum MetricsStoreKind {
     ClickHouse,
 }
 
-/// Global metrics observability configuration.
-///
 /// Longest accepted `monitoring.scrape_interval_secs`.
 ///
 /// Windowed metrics are computed from the deltas between scrapes: the
@@ -1892,6 +1890,8 @@ pub enum MetricsStoreKind {
 /// stop.
 pub const MAX_SCRAPE_INTERVAL_SECS: u64 = 300;
 
+/// Global metrics observability configuration.
+///
 /// Controls whether the MetricsScraper and AlertEvaluator background tasks
 /// are active, which storage backend they write to, and how long data is kept
 /// at each retention tier.

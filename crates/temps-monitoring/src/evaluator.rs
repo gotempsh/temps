@@ -1300,15 +1300,17 @@ pub const REDIS_FRAGMENTATION_MIN_USED_BYTES: f64 = 100.0 * 1024.0 * 1024.0;
 pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 
 /// Shared-buffer block accesses (hits + reads) in the cache hit ratio's
-/// trailing window (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`)
+/// trailing 15-minute window (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`)
 /// before the Postgres cache hit ratio is evaluated. Both metrics cover the
-/// same window, so a nearly idle database, whose ratio rests on a handful of
-/// reads, never raises the alarm.
-pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 100_000.0;
+/// same window, so this is a rate: about 11 block accesses per second,
+/// sustained. A nearly idle database (health checks, autovacuum ticks), whose
+/// ratio rests on a handful of reads, never raises the alarm; a small
+/// application database doing tens of accesses per second is evaluated.
+pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 10_000.0;
 
 /// Lifetime InnoDB buffer pool read requests before the MariaDB buffer pool
-/// hit ratio is evaluated, for the same reason as
-/// [`PG_CACHE_HIT_RATIO_MIN_BLOCKS`].
+/// hit ratio is evaluated: a new instance's first reads all miss, so its
+/// early ratio says nothing about the buffer pool size.
 pub const MARIADB_BUFFER_POOL_MIN_READ_REQUESTS: f64 = 100_000.0;
 
 /// Requests in one proxy sample interval before error-rate and latency
@@ -2513,6 +2515,21 @@ mod tests {
             ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
         ]);
         assert!(meets_volume_gate("pg.cache_hit_ratio", &busy));
+
+        // A small application database: 60 block accesses per second over
+        // the 15-minute window is a real workload and must be evaluated.
+        let small_app = latest(&[
+            ("pg.cache_hit_ratio", 0.4),
+            ("pg.cache_blocks_accessed", 60.0 * 15.0 * 60.0),
+        ]);
+        assert!(meets_volume_gate("pg.cache_hit_ratio", &small_app));
+
+        // One access every couple of seconds is an idle database.
+        let idle = latest(&[
+            ("pg.cache_hit_ratio", 0.2),
+            ("pg.cache_blocks_accessed", 450.0),
+        ]);
+        assert!(!meets_volume_gate("pg.cache_hit_ratio", &idle));
     }
 
     #[test]
