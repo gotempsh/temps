@@ -6575,6 +6575,23 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_scrape_interval_minimum_is_the_one_saves_accept() {
+        // Generated clients validate against the schema: advertising a lower
+        // minimum than the save accepts turns those values into a 400.
+        let schema = serde_json::to_value(<MonitoringSettings as utoipa::PartialSchema>::schema())
+            .expect("the schema serializes");
+        let minimum = schema["properties"]["scrape_interval_secs"]["minimum"]
+            .as_u64()
+            .expect("scrape_interval_secs documents a minimum");
+        let at = |secs| MonitoringSettings {
+            scrape_interval_secs: secs,
+            ..Default::default()
+        };
+        assert!(validate_monitoring_settings(&at(minimum)).is_ok());
+        assert!(validate_monitoring_settings(&at(minimum - 1)).is_err());
+    }
+
+    #[test]
     fn a_stored_scrape_interval_above_the_maximum_does_not_block_other_saves() {
         // Stored before the maximum existed; the save merges it back unchanged.
         let stored = MonitoringSettings {

@@ -1912,7 +1912,7 @@ pub struct MonitoringSettings {
     /// above 300 s stored before that limit is kept
     /// when a save leaves it unchanged, and the MetricsScraper clamps it to
     /// 300 s at runtime, as it clamps anything below 10 s to 10 s.
-    #[schema(minimum = 10, example = 30)]
+    #[schema(minimum = 15, example = 30)]
     pub scrape_interval_secs: u64,
 
     /// How many days of raw (30 s resolution) metric data to keep.

@@ -44126,7 +44126,7 @@
             "description": "How often the MetricsScraper collects data from all sources, in seconds.\nSaving accepts 15 to 300 s: windowed metrics such as the Postgres\ncache hit ratio need several scrapes in their 15 minutes. A value\nabove 300 s stored before that limit is kept\nwhen a save leaves it unchanged, and the MetricsScraper clamps it to\n300 s at runtime, as it clamps anything below 10 s to 10 s.",
             "example": 30,
             "format": "int64",
-            "minimum": 10,
+            "minimum": 15,
             "type": "integer"
           },
           "store": {
