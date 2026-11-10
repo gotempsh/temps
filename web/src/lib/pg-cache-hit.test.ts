@@ -61,7 +61,7 @@ describe('metricTileValue', () => {
   test('an empty window hides a ratio stored before it', () => {
     const values = lookup({
       'pg.cache_hit_ratio': 0.3,
-      'pg.cache_blocks_accessed': 0,
+      'pg.cache_blocks_accessed_15m': 0,
     })
     expect(metricTileValue('pg.cache_hit_ratio', values)).toBeUndefined()
   })
@@ -69,21 +69,25 @@ describe('metricTileValue', () => {
   test('a window with traffic shows its ratio', () => {
     const values = lookup({
       'pg.cache_hit_ratio': 0.99,
-      'pg.cache_blocks_accessed': 150_000,
+      'pg.cache_blocks_accessed_15m': 150_000,
     })
     expect(metricTileValue('pg.cache_hit_ratio', values)).toBe(0.99)
   })
 
-  test('without a volume reading the ratio is shown as stored', () => {
-    expect(
-      metricTileValue('pg.cache_hit_ratio', lookup({ 'pg.cache_hit_ratio': 1 }))
-    ).toBe(1)
+  test('without a whole window a ratio stored before it is hidden', () => {
+    // Right after an upgrade, the lifetime ratio and lifetime volume an
+    // earlier version stored are the latest values, under the old name.
+    const values = lookup({
+      'pg.cache_hit_ratio': 0.3,
+      'pg.cache_blocks_accessed': 50_000,
+    })
+    expect(metricTileValue('pg.cache_hit_ratio', values)).toBeUndefined()
   })
 
   test('other metrics are passed through', () => {
     const values = lookup({
       'pg.connections': 4,
-      'pg.cache_blocks_accessed': 0,
+      'pg.cache_blocks_accessed_15m': 0,
     })
     expect(metricTileValue('pg.connections', values)).toBe(4)
   })

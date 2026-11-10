@@ -36,7 +36,7 @@ function renderCard(latest: Record<string, number>) {
 test('the cache hit tile says it covers the last 15 min of all databases', async () => {
   renderCard({
     'pg.cache_hit_ratio': 0.991,
-    'pg.cache_blocks_accessed': 150_000,
+    'pg.cache_blocks_accessed_15m': 150_000,
   })
 
   const label = await screen.findByText(
@@ -47,7 +47,18 @@ test('the cache hit tile says it covers the last 15 min of all databases', async
 })
 
 test('a window without block access shows no ratio, not an older one', async () => {
-  renderCard({ 'pg.cache_hit_ratio': 0.3, 'pg.cache_blocks_accessed': 0 })
+  renderCard({ 'pg.cache_hit_ratio': 0.3, 'pg.cache_blocks_accessed_15m': 0 })
+
+  const label = await screen.findByText(
+    'Cache hit ratio (last 15 min, all databases)'
+  )
+  expect(label.nextElementSibling?.textContent).toBe('—')
+  expect(screen.queryByText('30.0%')).toBeNull()
+})
+
+test('a lifetime ratio stored before an upgrade is not shown as the last 15 min', async () => {
+  // An earlier version stored the lifetime volume under the old name.
+  renderCard({ 'pg.cache_hit_ratio': 0.3, 'pg.cache_blocks_accessed': 50_000 })
 
   const label = await screen.findByText(
     'Cache hit ratio (last 15 min, all databases)'

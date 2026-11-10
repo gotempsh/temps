@@ -217,6 +217,8 @@ impl MetricsScraper {
                     30
                 }
             };
+            lock_unpoisoned(&self.cache_hit)
+                .set_scrape_interval(chrono::Duration::seconds(interval_secs as i64));
 
             if let Err(e) = self.run_cycle().await {
                 error!("MetricsScraper: cycle failed: {e}");
@@ -1246,7 +1248,7 @@ mod tests {
         }
         let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
         assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
-        assert!(served(&last, "pg.cache_blocks_accessed").unwrap() >= 20_000.0);
+        assert!(served(&last, "pg.cache_blocks_accessed_15m").unwrap() >= 20_000.0);
     }
 
     // ── windowed Postgres cache hit ratio ──────────────────────────────────
@@ -1388,7 +1390,7 @@ mod tests {
         let ratio = served(&tuned, "pg.cache_hit_ratio").unwrap();
         assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
         assert_eq!(
-            served(&tuned, "pg.cache_blocks_accessed"),
+            served(&tuned, "pg.cache_blocks_accessed_15m"),
             Some(15.0 * 10_000.0)
         );
         // Only the derived gauges are persisted, never the raw block counters.
@@ -1396,7 +1398,7 @@ mod tests {
         assert_eq!(tuned.len(), 4, "per-database and instance-wide gauges");
         assert_eq!(
             names,
-            HashSet::from(["pg.cache_hit_ratio", "pg.cache_blocks_accessed"])
+            HashSet::from(["pg.cache_hit_ratio", "pg.cache_blocks_accessed_15m"])
         );
     }
 
@@ -1440,7 +1442,7 @@ mod tests {
 
         let ratio = served(&after_drop, "pg.cache_hit_ratio").unwrap();
         assert!(ratio > 0.98, "the live workload still dominates: {ratio}");
-        let accessed = served(&after_drop, "pg.cache_blocks_accessed").unwrap();
+        let accessed = served(&after_drop, "pg.cache_blocks_accessed_15m").unwrap();
         assert!(
             accessed < 200_000.0,
             "no lifetime totals in the window: {accessed}"
@@ -1479,7 +1481,10 @@ mod tests {
         // 9,900 / 1,100 is left out; minutes 3 to 16 are 10,000 / 10,000 each,
         // 280,000 accesses over 14 minutes, reported for the whole 15.
         assert_eq!(served(&last, "pg.cache_hit_ratio"), Some(0.5));
-        assert_eq!(served(&last, "pg.cache_blocks_accessed"), Some(300_000.0));
+        assert_eq!(
+            served(&last, "pg.cache_blocks_accessed_15m"),
+            Some(300_000.0)
+        );
         assert!(
             last.iter().all(|p| p.name != "pg.stats_reset"),
             "never persisted"
@@ -1546,13 +1551,17 @@ mod tests {
             .await;
             if minute < 15 {
                 assert_eq!(served(&last, "pg.cache_hit_ratio"), None, "{minute}");
-                assert_eq!(served(&last, "pg.cache_blocks_accessed"), None, "{minute}");
+                assert_eq!(
+                    served(&last, "pg.cache_blocks_accessed_15m"),
+                    None,
+                    "{minute}"
+                );
             }
         }
         let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
         assert!((ratio - 0.7).abs() < 1e-9, "{ratio}");
         assert_eq!(
-            served(&last, "pg.cache_blocks_accessed"),
+            served(&last, "pg.cache_blocks_accessed_15m"),
             Some(15.0 * 12_000.0)
         );
     }
@@ -1586,7 +1595,7 @@ mod tests {
         )
         .await;
         assert_eq!(served(&after_outage, "pg.cache_hit_ratio"), None);
-        assert_eq!(served(&after_outage, "pg.cache_blocks_accessed"), None);
+        assert_eq!(served(&after_outage, "pg.cache_blocks_accessed_15m"), None);
 
         // The window refills from minute 45 and serves again once whole.
         let refilling = scrape_minutes(

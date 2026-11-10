@@ -100,7 +100,14 @@ pub const PG_STATS_RESET: &str = "pg.stats_reset";
 pub const PG_CACHE_HIT_RATIO: &str = "pg.cache_hit_ratio";
 
 /// Block accesses (hits + reads) over [`CACHE_HIT_WINDOW`].
-pub const PG_CACHE_BLOCKS_ACCESSED: &str = "pg.cache_blocks_accessed";
+///
+/// Not `pg.cache_blocks_accessed`: earlier versions stored the lifetime count
+/// under that name, and after an upgrade its last rows stay the latest value
+/// until the first whole window is written. Read as a window's volume, a
+/// young database's lifetime count would pass the alarm's volume gate and
+/// let its lifetime ratio raise the alarm. Under a new name the gate finds
+/// no volume and waits.
+pub const PG_CACHE_BLOCKS_ACCESSED: &str = "pg.cache_blocks_accessed_15m";
 
 /// Label naming the database of a per-database block counter.
 pub const PG_DATABASE_LABEL: &str = "datname";
@@ -152,8 +159,14 @@ impl Series {
     /// Record an interval and drop every interval no longer entirely inside
     /// the window ending at `interval.end`. Returns the sums over the window,
     /// or `None` when nothing is left in it (the new interval itself started
-    /// before the window).
-    fn push(&mut self, interval: Interval, window: Duration) -> Option<WindowSum> {
+    /// before the window). `scrape_interval` is the interval the scraper
+    /// sleeps between scrapes, when known.
+    fn push(
+        &mut self,
+        interval: Interval,
+        window: Duration,
+        scrape_interval: Option<Duration>,
+    ) -> Option<WindowSum> {
         // Scrapes of one service never run concurrently, so time only goes
         // backwards if the clock was stepped. Restart the window rather than
         // keep intervals that may now be in the future.
@@ -190,15 +203,24 @@ impl Series {
         // The interval that straddled the cutoff was dropped, so the window
         // begins less than that interval after its start. A normal scrape is
         // the configured interval plus a cycle that varies by seconds, at
-        // most half as long again as the current one; a missed scrape is at
-        // least twice as long, and after a gap shorter than the window the
-        // dropped interval is the gap and the rest may cover only the minutes
-        // since. Then the window must reach back to within a tenth of its
-        // length, whatever the scrape interval.
-        let current = interval.end - interval.start;
+        // most half as long again as the configured interval; a missed scrape
+        // is at least twice as long, and after a gap shorter than the window
+        // the dropped interval is the gap and the rest may cover only the
+        // minutes since. Then the window must reach back to within a tenth of
+        // its length, whatever the scrape interval. The reference is never
+        // the current interval: it may be a second outage, against which the
+        // first one would pass for a scrape. Without a configured interval,
+        // the shortest one still in the window stands in for it.
+        let reference = scrape_interval.unwrap_or_else(|| {
+            self.intervals
+                .iter()
+                .map(|i| i.end - i.start)
+                .min()
+                .unwrap_or(interval.end - interval.start)
+        });
         let dropped_a_scrape = self
             .dropped_before
-            .is_some_and(|dropped| dropped * 2 <= current * 3);
+            .is_some_and(|dropped| dropped * 2 <= reference * 3);
         let uncovered = self
             .intervals
             .front()
@@ -236,6 +258,9 @@ pub struct CacheHitWindows {
     last_scrape: HashMap<i32, DateTime<Utc>>,
     /// Last [`PG_STATS_RESET`] seen for each database series.
     stats_reset: HashMap<SeriesKey, f64>,
+    /// How long the scraper sleeps between scrapes; see
+    /// [`CacheHitWindows::set_scrape_interval`].
+    scrape_interval: Option<Duration>,
 }
 
 impl Default for CacheHitWindows {
@@ -253,7 +278,16 @@ impl CacheHitWindows {
             series: HashMap::new(),
             last_scrape: HashMap::new(),
             stats_reset: HashMap::new(),
+            scrape_interval: None,
         }
+    }
+
+    /// Record the scrape interval in effect. It tells a scrape from a missed
+    /// one when an interval leaves the window: one at most half as long again
+    /// is a scrape. The scraper sets it every cycle; until then the shortest
+    /// interval in each window stands in for it.
+    pub fn set_scrape_interval(&mut self, interval: Duration) {
+        self.scrape_interval = Some(interval);
     }
 
     /// Replace the [`PG_BLKS_HIT`] / [`PG_BLKS_READ`] delta points of one
@@ -376,12 +410,11 @@ impl CacheHitWindows {
         interval: Interval,
         out: &mut Vec<MetricPoint>,
     ) {
-        let Some(sum) = self
-            .series
-            .entry((source_id, key))
-            .or_default()
-            .push(interval, self.window)
-        else {
+        let Some(sum) = self.series.entry((source_id, key)).or_default().push(
+            interval,
+            self.window,
+            self.scrape_interval,
+        ) else {
             return;
         };
         if !sum.full {
@@ -793,6 +826,91 @@ mod tests {
             );
             let ratio = value(&last, PG_CACHE_HIT_RATIO, None).unwrap();
             assert!((ratio - 0.9).abs() < 1e-12, "{interval_secs} s: {ratio}");
+        }
+    }
+
+    /// Scrape `app` every 30 s for the 16 minutes up to `at(0)`, then only at
+    /// `scrapes_secs` seconds after it: a long step between two of them is an
+    /// outage. Returns the windowed points of the last scrape.
+    fn scrape_through_outages(
+        windows: &mut CacheHitWindows,
+        scrapes_secs: &[i64],
+    ) -> Vec<MetricPoint> {
+        for scrape in -32..=0 {
+            windows.derive(
+                1,
+                deltas(27.0, 3.0, at(0) + Duration::seconds(scrape * 30), "app"),
+            );
+        }
+        let mut previous = 0;
+        let mut out = Vec::new();
+        for &secs in scrapes_secs {
+            // 1 block access a second, at 90%, whatever the interval.
+            let blocks = (secs - previous) as f64;
+            previous = secs;
+            out = windows.derive(
+                1,
+                deltas(
+                    blocks * 0.9,
+                    blocks * 0.1,
+                    at(0) + Duration::seconds(secs),
+                    "app",
+                ),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn a_second_outage_does_not_make_the_minutes_between_them_a_window() {
+        // 30 s scrapes; unreachable for 10 minutes, one scrape, unreachable
+        // for 8 more. When the first outage leaves the window, what is left
+        // covers 10:00 to 18:30, not 15 minutes. Measured against the second
+        // outage, the first one looked like a scrape.
+        for scrape_interval in [Some(Duration::seconds(30)), None] {
+            let mut windows = CacheHitWindows::default();
+            if let Some(interval) = scrape_interval {
+                windows.set_scrape_interval(interval);
+            }
+            let out = scrape_through_outages(&mut windows, &[600, 630, 1_110]);
+            assert!(
+                out.is_empty(),
+                "{scrape_interval:?}: 8.5 minutes are not the window: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn back_to_back_outages_do_not_make_the_second_one_a_window() {
+        // As above with no scrape in between: only the 8-minute outage is
+        // left, so no interval in the window is a normal scrape.
+        let mut windows = CacheHitWindows::default();
+        windows.set_scrape_interval(Duration::seconds(30));
+        let out = scrape_through_outages(&mut windows, &[600, 1_080]);
+        assert!(out.is_empty(), "8 minutes are not the window: {out:?}");
+    }
+
+    #[test]
+    fn jittered_scrapes_keep_the_window_whole_against_the_scrape_interval() {
+        // With the interval known, a scrape whose cycle ran late still counts.
+        for interval_secs in [10, 60, 300] {
+            let mut windows = CacheHitWindows::default();
+            windows.set_scrape_interval(Duration::seconds(interval_secs));
+            let mut time = at(0);
+            windows.derive(1, deltas(90.0, 10.0, time, "app"));
+            for scrape in 0..(3_600 / interval_secs) {
+                // Every third cycle takes the whole 5 s collector timeout.
+                let late = if scrape % 3 == 0 { 5 } else { 0 };
+                time += Duration::seconds(interval_secs + late);
+                let out = windows.derive(1, deltas(90.0, 10.0, time, "app"));
+                if time - at(0) >= CACHE_HIT_WINDOW {
+                    assert_eq!(
+                        value(&out, PG_CACHE_HIT_RATIO, None),
+                        Some(0.9),
+                        "{interval_secs} s, scrape {scrape}: {out:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -917,7 +917,7 @@ impl AlertEvaluator {
             None => {
                 // A gated ratio can be absent because its volume metric shows
                 // too little traffic to compute one: an idle Postgres window
-                // writes `pg.cache_blocks_accessed = 0` and no ratio. That is
+                // writes `pg.cache_blocks_accessed_15m = 0` and no ratio. That is
                 // the same healthy state as a present ratio below the gate,
                 // so resolve an alarm it fired. Zero volume over the ratio's
                 // own window resolves an edited rule too, which is never
@@ -1321,8 +1321,10 @@ pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 /// ratio rests on a handful of reads, never raises the alarm; a small
 /// application database doing tens of accesses per second is evaluated. The
 /// scraper writes the ratio and the volume only for a whole window, never for
-/// one still refilling after a restart, a failover or a scrape gap, so the latest pair always
-/// describes the same 15 minutes.
+/// one still refilling after a restart, a failover or a scrape gap, so a
+/// latest pair describes the same 15 minutes. After an upgrade the latest
+/// ratio is a lifetime one until the first whole window; the windowed volume
+/// has its own name, so it is missing then and the rule is not evaluated.
 pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 10_000.0;
 
 /// Lifetime InnoDB buffer pool read requests before the MariaDB buffer pool
@@ -1356,7 +1358,10 @@ pub fn volume_gate(metric_name: &str) -> Option<VolumeGate> {
             REDIS_FRAGMENTATION_MIN_USED_BYTES,
         ),
         "redis.keyspace_hit_ratio" => ("redis.keyspace_lookups", REDIS_HIT_RATIO_MIN_LOOKUPS),
-        "pg.cache_hit_ratio" => ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
+        "pg.cache_hit_ratio" => (
+            "pg.cache_blocks_accessed_15m",
+            PG_CACHE_HIT_RATIO_MIN_BLOCKS,
+        ),
         "mariadb.buffer_pool_hit_ratio" => (
             "mariadb.buffer_pool_read_requests",
             MARIADB_BUFFER_POOL_MIN_READ_REQUESTS,
@@ -1415,7 +1420,7 @@ fn latest_metric_names(group: &[&monitoring_alert_rules::Model]) -> Vec<String> 
 /// cache hit ratio: the proxy's request count, for one, covers a single
 /// sample, and an idle sample says nothing about the error rate before it.
 fn window_volume_metric(metric_name: &str) -> Option<&'static str> {
-    (metric_name == "pg.cache_hit_ratio").then_some("pg.cache_blocks_accessed")
+    (metric_name == "pg.cache_hit_ratio").then_some("pg.cache_blocks_accessed_15m")
 }
 
 /// Whether the window behind `metric_name` saw no traffic at all, so no ratio
@@ -2559,13 +2564,16 @@ mod tests {
     fn pg_cache_hit_ratio_needs_volume_in_its_window() {
         let quiet = latest(&[
             ("pg.cache_hit_ratio", 0.2),
-            ("pg.cache_blocks_accessed", 500.0),
+            ("pg.cache_blocks_accessed_15m", 500.0),
         ]);
         assert!(!meets_volume_gate("pg.cache_hit_ratio", &quiet));
 
         let busy = latest(&[
             ("pg.cache_hit_ratio", 0.2),
-            ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
+            (
+                "pg.cache_blocks_accessed_15m",
+                PG_CACHE_HIT_RATIO_MIN_BLOCKS,
+            ),
         ]);
         assert!(meets_volume_gate("pg.cache_hit_ratio", &busy));
 
@@ -2573,14 +2581,14 @@ mod tests {
         // the 15-minute window is a real workload and must be evaluated.
         let small_app = latest(&[
             ("pg.cache_hit_ratio", 0.4),
-            ("pg.cache_blocks_accessed", 60.0 * 15.0 * 60.0),
+            ("pg.cache_blocks_accessed_15m", 60.0 * 15.0 * 60.0),
         ]);
         assert!(meets_volume_gate("pg.cache_hit_ratio", &small_app));
 
         // One access every couple of seconds is an idle database.
         let idle = latest(&[
             ("pg.cache_hit_ratio", 0.2),
-            ("pg.cache_blocks_accessed", 450.0),
+            ("pg.cache_blocks_accessed_15m", 450.0),
         ]);
         assert!(!meets_volume_gate("pg.cache_hit_ratio", &idle));
     }
@@ -2776,9 +2784,9 @@ mod tests {
     }
 
     /// Evaluate `rule`, whose alarm 99 is firing, against an idle window:
-    /// `pg.cache_blocks_accessed = 0` and no ratio. Whether the alarm resolved.
+    /// `pg.cache_blocks_accessed_15m = 0` and no ratio. Whether the alarm resolved.
     async fn idle_cache_hit_window_resolves(rule: monitoring_alert_rules::Model) -> bool {
-        cache_hit_alarm_resolves(rule, &[("pg.cache_blocks_accessed", 0.0)]).await
+        cache_hit_alarm_resolves(rule, &[("pg.cache_blocks_accessed_15m", 0.0)]).await
     }
 
     /// Evaluate `rule`, whose alarm 99 is firing, against `values`. Whether
@@ -2829,7 +2837,7 @@ mod tests {
         !still_firing
     }
 
-    /// An idle window writes no ratio, only `pg.cache_blocks_accessed = 0`.
+    /// An idle window writes no ratio, only `pg.cache_blocks_accessed_15m = 0`.
     /// Once the last ratio has aged out of the latest values, that zero is
     /// still proof the database is idle, so a fired alarm resolves.
     #[tokio::test]
@@ -2870,7 +2878,7 @@ mod tests {
                 rule,
                 &[
                     ("pg.cache_hit_ratio", 0.0),
-                    ("pg.cache_blocks_accessed", 0.0)
+                    ("pg.cache_blocks_accessed_15m", 0.0)
                 ],
             )
             .await,
@@ -2892,7 +2900,7 @@ mod tests {
             names.sort();
             assert_eq!(
                 names,
-                ["pg.cache_blocks_accessed", "pg.cache_hit_ratio"],
+                ["pg.cache_blocks_accessed_15m", "pg.cache_hit_ratio"],
                 "threshold {}",
                 rule.threshold
             );
@@ -2963,7 +2971,7 @@ mod tests {
         evaluator
             .evaluate_rule(
                 &rule,
-                &latest(&[("pg.cache_blocks_accessed", 500.0)]),
+                &latest(&[("pg.cache_blocks_accessed_15m", 500.0)]),
                 (Some(1), None, None, Some(1)),
             )
             .await
@@ -2973,6 +2981,33 @@ mod tests {
             evaluator.firing_alarms.read().await.get(&rule.id),
             Some(&99)
         );
+    }
+
+    /// Right after an upgrade the latest values are the last ones an earlier
+    /// version wrote: a lifetime ratio and, under the old name, the lifetime
+    /// volume. A young database's 50,000 lifetime accesses would pass the
+    /// window's gate, so the stale lifetime ratio must not open a breach.
+    #[tokio::test]
+    async fn a_lifetime_ratio_stored_before_an_upgrade_opens_no_breach() {
+        let rule = low_cache_hit_ratio_rule();
+        assert!(default_volume_gate(&rule).is_some());
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[
+                    ("pg.cache_hit_ratio", 0.8),
+                    ("pg.cache_blocks_accessed", 50_000.0),
+                ]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert!(!evaluator.breach_start.read().await.contains_key(&rule.id));
+        assert!(!evaluator.firing_alarms.read().await.contains_key(&rule.id));
     }
 
     /// Without the volume metric there is no evidence either way: keep the

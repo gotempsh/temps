@@ -12,9 +12,10 @@ export const PG_CACHE_HIT_RATIO_METRIC = 'pg.cache_hit_ratio'
 /**
  * Block accesses in the same window. The scraper writes it with the ratio,
  * on every scrape once the window is whole (not while it refills after a
- * restart), including when the window saw no block access.
+ * restart), including when the window saw no block access. Named apart from
+ * the lifetime `pg.cache_blocks_accessed` that earlier versions stored.
  */
-export const PG_CACHE_BLOCKS_ACCESSED_METRIC = 'pg.cache_blocks_accessed'
+export const PG_CACHE_BLOCKS_ACCESSED_METRIC = 'pg.cache_blocks_accessed_15m'
 
 export const PG_CACHE_HIT_WINDOW_MINUTES = 15
 
@@ -25,7 +26,9 @@ export const PG_CACHE_HIT_WINDOW_MINUTES = 15
  * so the latest stored ratio can be older than the window it is labelled
  * with. The block-access count keeps being written: when it says the
  * current window is empty, the ratio is "no data", whatever was stored
- * before.
+ * before. Without a count there is no whole window yet, and the only ratio
+ * stored can be one an earlier version computed over the database's lifetime,
+ * which the "last 15 min" label would misdescribe.
  */
 export function metricTileValue(
   name: string,
@@ -33,7 +36,8 @@ export function metricTileValue(
 ): number | undefined {
   const value = lookup(name)
   if (name !== PG_CACHE_HIT_RATIO_METRIC) return value
-  return lookup(PG_CACHE_BLOCKS_ACCESSED_METRIC) === 0 ? undefined : value
+  const accessed = lookup(PG_CACHE_BLOCKS_ACCESSED_METRIC)
+  return accessed !== undefined && accessed > 0 ? value : undefined
 }
 
 /** Which databases a value covers: the whole server, or one database. */
