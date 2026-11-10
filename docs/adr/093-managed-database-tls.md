@@ -99,7 +99,9 @@ Either can be rotated without touching the other.
   a row lock (`SELECT … FOR UPDATE`), so two concurrent lifecycle operations
   cannot each deliver a different certificate.
 - **Delivery into the service's volume**: a helper container that mounts the
-  data volume is *created and never started*. Docker's archive API reads the
+  data volume is *created and never started*. Each install names its helper
+  uniquely and removes only the container it created, by ID, so it can never
+  touch an operator's container or a concurrent install's helper. Docker's archive API reads the
   image's own `/etc/passwd` to resolve the engine user's uid/gid (999 in the
   Debian PostgreSQL images, other values elsewhere), then uploads a tar whose
   headers set owner and mode: directory `0700`, certificate `0644`, key `0600`.
@@ -111,6 +113,15 @@ Either can be rotated without touching the other.
   (`server_tls_mode`, `server_tls_material`) only on container lifecycle paths.
   Engines never serialize those keys back, the parameter strategy rejects them
   from clients at creation and update, and `Debug` prints only the fingerprint.
+- Missing keys mean "not said", never `off`. Engine paths that rebuild a
+  container from the stored parameters, such as a backup recreating it to turn
+  WAL archiving on, or an in-place restore removing and recreating it, keep
+  the TLS the replaced container served. Its certificate stays on the data
+  volume outside PGDATA, which both reuse. Start-time drift repair leaves such
+  a container's TLS alone.
+- A major upgrade starts the new server with the service's certificate
+  installed in the new data volume, so clients that require TLS keep
+  connecting.
 
 #### HA PostgreSQL clusters
 
@@ -150,6 +161,13 @@ node agent's exec on a worker. The steps:
 6. The script reads the certificate the member actually serves
    (`openssl s_client -starttls postgres`) and reports success only when its
    fingerprint matches.
+
+Each script runs under `timeout` inside the member, which kills its whole
+process group before the control plane stops waiting. A Docker exec cannot be
+killed from outside, so when the control plane gives up on a member, nothing
+is left running there. A mode change holds a per-service lock from reading the
+current mode through its rollback, and every apply pass takes the same lock and
+reads the setting under it, so no older change or pass lands after a newer one.
 
 `off` points pg_autoctl back at its self-signed pair in PGDATA and removes the
 managed files. HBA rules are never touched, so plaintext stays accepted in
@@ -293,10 +311,12 @@ working.
 
    New standalone PostgreSQL services and new clusters default to `available`.
    `required` is rejected as not yet supported. Linked apps' `POSTGRES_URL` is
-   unchanged.
+   unchanged. TLS is kept through backups, in-place restores and major
+   upgrades. A service created by restoring into a new service starts `off`.
+   Temps' own connections encrypt but do not verify the managed CA yet.
 2. **PostgreSQL `required`**: client trust distribution (D5); every internal
    consumer (D6); `hostnossl … reject` in pg_hba; the renewal job with hot
-   reload (D7); major upgrades and restore-to-new-service carry the TLS state.
+   reload (D7); restore-to-new-service carries the TLS state.
 3. **Redis, MariaDB, MongoDB**: the same model, with the engine-specific settings
    and reloads in D4. Standalone services on worker nodes: the agent receives the
    material over the existing mTLS channel (as cluster members already do

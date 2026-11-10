@@ -153,6 +153,31 @@ fi"#;
 /// success it prints [`SERVED_FINGERPRINT_MARKER`] with the fingerprint now
 /// served; it exits [`NOT_INITIALIZED_EXIT_CODE`] on a member that is not
 /// an initialized data node yet, and non-zero with the reason otherwise.
+/// How long the apply script may run inside the data node before it and
+/// every process it started are killed. The control plane waits longer than
+/// this plus [`MEMBER_KILL_GRACE_SECS`], so when it gives up on a member the
+/// script is already gone: a Docker exec cannot be killed from outside, and
+/// a script left running could switch the certificate after a newer pass.
+pub const MEMBER_APPLY_DEADLINE_SECS: u64 = 90;
+/// The same bound for the read-only status script.
+pub const MEMBER_STATUS_DEADLINE_SECS: u64 = 8;
+/// Seconds between the polite stop at a deadline and the forced kill.
+pub const MEMBER_KILL_GRACE_SECS: u64 = 5;
+
+/// `script` run by bash under GNU `timeout`, which signals the whole process
+/// group it starts (bash, pg_autoctl, openssl), not only bash.
+fn bounded_bash(deadline_secs: u64, script: String) -> Vec<String> {
+    vec![
+        "timeout".to_string(),
+        "-k".to_string(),
+        MEMBER_KILL_GRACE_SECS.to_string(),
+        deadline_secs.to_string(),
+        "bash".to_string(),
+        "-c".to_string(),
+        script,
+    ]
+}
+
 pub fn server_tls_apply_command(target: ClusterServerCertificate) -> Vec<String> {
     let mut script = vec![
         PREAMBLE.to_string(),
@@ -169,7 +194,7 @@ pub fn server_tls_apply_command(target: ClusterServerCertificate) -> Vec<String>
         script.push(r#"rm -rf "$TLS_DIR""#.to_string());
     }
     script.push(format!(r#"echo "{SERVED_FINGERPRINT_MARKER}$EXPECTED""#));
-    vec!["bash".to_string(), "-c".to_string(), script.join("\n")]
+    bounded_bash(MEMBER_APPLY_DEADLINE_SECS, script.join("\n"))
 }
 
 /// The command printing the fingerprint of the certificate a data node
@@ -185,7 +210,7 @@ pub fn served_certificate_command() -> Vec<String> {
         SERVED_FINGERPRINT_FN.to_string(),
         format!(r#"echo "{SERVED_FINGERPRINT_MARKER}$(served_fingerprint)""#),
     ];
-    vec!["bash".to_string(), "-c".to_string(), script.join("\n")]
+    bounded_bash(MEMBER_STATUS_DEADLINE_SECS, script.join("\n"))
 }
 
 /// The served fingerprint a script printed: `Some("")` when the member
@@ -204,8 +229,8 @@ mod tests {
 
     fn script(target: ClusterServerCertificate) -> String {
         let cmd = server_tls_apply_command(target);
-        assert_eq!(cmd[..2], ["bash".to_string(), "-c".to_string()]);
-        cmd[2].clone()
+        assert_eq!(cmd[4..6], ["bash".to_string(), "-c".to_string()]);
+        cmd[6].clone()
     }
 
     #[test]
@@ -287,10 +312,36 @@ mod tests {
 
     #[test]
     fn status_reports_a_member_that_is_not_accepting_connections() {
-        let status = &served_certificate_command()[2];
+        let status = &served_certificate_command()[6];
         let ready = status.find("pg_isready -q -h 127.0.0.1").unwrap();
         assert!(ready < status.find("served_fingerprint)").unwrap());
         assert!(status.contains("exit 11"));
+    }
+
+    #[test]
+    fn every_member_script_dies_at_its_own_deadline() {
+        for (cmd, deadline) in [
+            (
+                server_tls_apply_command(ClusterServerCertificate::Managed),
+                MEMBER_APPLY_DEADLINE_SECS,
+            ),
+            (
+                server_tls_apply_command(ClusterServerCertificate::SelfSigned),
+                MEMBER_APPLY_DEADLINE_SECS,
+            ),
+            (served_certificate_command(), MEMBER_STATUS_DEADLINE_SECS),
+        ] {
+            assert_eq!(
+                cmd[..4],
+                [
+                    "timeout".to_string(),
+                    "-k".to_string(),
+                    MEMBER_KILL_GRACE_SECS.to_string(),
+                    deadline.to_string(),
+                ],
+                "{cmd:?}"
+            );
+        }
     }
 
     #[test]
@@ -305,8 +356,8 @@ mod tests {
         );
         assert_eq!(parse_served_fingerprint("nothing here"), None);
         let status = served_certificate_command();
-        assert!(status[2].contains("openssl s_client -starttls postgres"));
-        assert!(!status[2].contains("config set"));
+        assert!(status[6].contains("openssl s_client -starttls postgres"));
+        assert!(!status[6].contains("config set"));
     }
 }
 

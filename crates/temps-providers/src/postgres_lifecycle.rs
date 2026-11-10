@@ -439,10 +439,37 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
-        let labels = HashMap::from([
+        let mut labels = HashMap::from([
             (service_label_key, "postgres".to_string()),
             (name_label_key, svc.name.clone()),
         ]);
+
+        // ADR 093: the upgraded server serves the service's certificate, as
+        // every other container of the service does. Installed before the
+        // server that reads it starts.
+        let server_tls = self
+            .manager
+            .standalone_server_tls_material(&svc)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(material) = &server_tls {
+            temps_providers_core::externalsvc::server_tls::install_tls_directory(
+                &docker,
+                temps_providers_postgres::postgres::standalone_server_tls_target(
+                    &svc.name,
+                    image,
+                    &volume_name,
+                ),
+                material,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            labels.insert(
+                temps_providers_core::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL
+                    .to_string(),
+                material.fingerprint_sha256.clone(),
+            );
+        }
 
         let env_vars = vec![
             format!("POSTGRES_USER={}", cfg.username),
@@ -483,19 +510,10 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             exposed_ports: Some(vec!["5432/tcp".to_string()]),
             env: Some(env_vars),
             labels: Some(labels),
-            cmd: Some(vec![
-                "postgres".to_string(),
-                "-c".to_string(),
-                format!("max_connections={}", cfg.max_connections),
-                // Enable pg_stat_statements at provision time so the extension
-                // can be created after startup. A restart (not just a reload)
-                // is required to change shared_preload_libraries, so this is
-                // set once at container-creation time. Existing services that
-                // were provisioned before this change need a container restart
-                // (via the restart endpoint) for the change to take effect.
-                "-c".to_string(),
-                "shared_preload_libraries=pg_stat_statements".to_string(),
-            ]),
+            cmd: Some(upgraded_container_cmd(
+                cfg.max_connections,
+                server_tls.is_some(),
+            )),
             host_config: Some(host_config),
             networking_config,
             healthcheck: Some(bollard::models::HealthConfig {
@@ -626,3 +644,50 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
 // `externalsvc::postgres`, which owns their unit tests
 // (`healthcheck_cmd_pins_database_when_it_differs_from_username`,
 // `healthcheck_cmd_escapes_single_quotes_in_username_and_database`).
+
+/// The CMD of the container a major upgrade starts on the new image. With
+/// `serve_tls` it serves the service's certificate (ADR 093), so clients that
+/// require TLS keep connecting after the upgrade.
+fn upgraded_container_cmd(max_connections: u32, serve_tls: bool) -> Vec<String> {
+    let mut cmd = vec![
+        "postgres".to_string(),
+        "-c".to_string(),
+        format!("max_connections={max_connections}"),
+        // Enable pg_stat_statements at provision time so the extension
+        // can be created after startup. A restart (not just a reload)
+        // is required to change shared_preload_libraries, so this is
+        // set once at container-creation time. Existing services that
+        // were provisioned before this change need a container restart
+        // (via the restart endpoint) for the change to take effect.
+        "-c".to_string(),
+        "shared_preload_libraries=pg_stat_statements".to_string(),
+    ];
+    if serve_tls {
+        cmd.extend(temps_providers_postgres::postgres::standalone_server_tls_cmd_args());
+    }
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_upgraded_container_keeps_serving_tls() {
+        let with_tls = upgraded_container_cmd(50, true);
+        let ssl = with_tls.iter().position(|t| t == "ssl=on").unwrap();
+        assert_eq!(with_tls[ssl - 1], "-c");
+        assert!(with_tls
+            .iter()
+            .any(|t| t == "ssl_cert_file=/var/lib/postgresql/tls/server.crt"));
+        assert!(with_tls
+            .iter()
+            .any(|t| t == "ssl_key_file=/var/lib/postgresql/tls/server.key"));
+
+        let without = upgraded_container_cmd(50, false);
+        assert!(!without.iter().any(|t| t.starts_with("ssl")), "{without:?}");
+        // TLS only adds settings; the rest is unchanged.
+        assert_eq!(&with_tls[..without.len()], without.as_slice());
+        assert!(without.contains(&"max_connections=50".to_string()));
+    }
+}

@@ -259,8 +259,7 @@ pub async fn install_tls_directory(
     target: TlsInstallTarget<'_>,
     material: &ServerTlsMaterial,
 ) -> Result<(), TlsInstallError> {
-    let helper = format!("{}-tls-install", target.volume);
-    remove_helper(docker, &helper).await;
+    let helper = helper_container_name(target.volume);
     let created = docker
         .create_container(
             Some(
@@ -288,16 +287,26 @@ pub async fn install_tls_directory(
             },
         )
         .await;
-    if let Err(e) = created {
-        return Err(TlsInstallError::CreateHelper {
-            service: target.service_name.to_string(),
-            volume: target.volume.to_string(),
-            reason: e.to_string(),
-        });
-    }
-    let result = install_through_helper(docker, &helper, target, material).await;
-    remove_helper(docker, &helper).await;
+    // Only the container this call created is ever removed, by its ID.
+    let helper_id = match created {
+        Ok(response) => response.id,
+        Err(e) => {
+            return Err(TlsInstallError::CreateHelper {
+                service: target.service_name.to_string(),
+                volume: target.volume.to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
+    let result = install_through_helper(docker, &helper_id, target, material).await;
+    remove_helper(docker, &helper_id).await;
     result
+}
+
+/// A name no other container has: a fixed name could belong to an
+/// operator's container or to a concurrent install.
+fn helper_container_name(volume: &str) -> String {
+    format!("{volume}-tls-install-{}", uuid::Uuid::new_v4().simple())
 }
 
 async fn install_through_helper(
@@ -378,10 +387,11 @@ async fn read_small_file(
     Err(format!("{path} is not a regular file"))
 }
 
-async fn remove_helper(docker: &bollard::Docker, helper: &str) {
+/// Remove the helper this module created, by the ID Docker returned for it.
+async fn remove_helper(docker: &bollard::Docker, helper_id: &str) {
     let _ = docker
         .remove_container(
-            helper,
+            helper_id,
             Some(bollard::query_parameters::RemoveContainerOptions {
                 force: true,
                 ..Default::default()
@@ -400,6 +410,16 @@ mod tests {
             key_pem: "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n".into(),
             fingerprint_sha256: "ab12".into(),
         }
+    }
+
+    #[test]
+    fn every_install_uses_its_own_helper_name() {
+        let first = helper_container_name("postgres-orders_data");
+        let second = helper_container_name("postgres-orders_data");
+        assert_ne!(first, second);
+        // Never the fixed name an operator's container could already have.
+        assert_ne!(first, "postgres-orders_data-tls-install");
+        assert!(first.starts_with("postgres-orders_data-tls-install-"));
     }
 
     #[test]

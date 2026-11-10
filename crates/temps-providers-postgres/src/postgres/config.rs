@@ -108,10 +108,13 @@ pub struct PostgresInputConfig {
 
     /// Server-side TLS mode (ADR 093). Injected by the control plane from the
     /// service's TLS record when it (re)creates the container; never part of
-    /// the create form and never stored in the parameter blob. Absent = `off`.
+    /// the create form and never stored in the parameter blob. Absent means
+    /// "not said" (a path that rebuilds from stored parameters, such as a
+    /// backup enabling WAL archiving), never `off`: a replacement container
+    /// then keeps the TLS the one it replaces serves.
     #[serde(default, rename = "server_tls_mode")]
     #[schemars(skip)]
-    pub server_tls_mode: ServerTlsMode,
+    pub server_tls_mode: Option<ServerTlsMode>,
 
     /// Certificate and key to install when `server_tls_mode` offers TLS.
     /// Transient, injected alongside `server_tls_mode`.
@@ -141,7 +144,7 @@ pub struct PostgresConfig {
     /// serialized config is what `init()` persists as inferred parameters,
     /// and the TLS record, not the parameter blob, is the source of truth.
     #[serde(default, skip_serializing)]
-    pub server_tls_mode: ServerTlsMode,
+    pub server_tls_mode: Option<ServerTlsMode>,
     /// See `PostgresInputConfig::server_tls_material`. Never serialized, so
     /// the key can never be written back into stored parameters.
     #[serde(default, skip_serializing)]
@@ -153,7 +156,9 @@ impl PostgresConfig {
     /// mode asks for it, the control plane supplied it, and Temps manages the
     /// container (an imported container is never reconfigured).
     pub(crate) fn effective_server_tls(&self) -> Option<&ServerTlsMaterial> {
-        if !self.server_tls_mode.offers_tls() || self.container_name.is_some() {
+        if !self.server_tls_mode.is_some_and(ServerTlsMode::offers_tls)
+            || self.container_name.is_some()
+        {
             return None;
         }
         self.server_tls_material.as_ref()
@@ -167,7 +172,9 @@ impl PostgresConfig {
         if self.container_name.is_some() {
             return None;
         }
-        if !self.server_tls_mode.offers_tls() {
+        // Not said: nothing to compare the running container against.
+        let mode = self.server_tls_mode?;
+        if !mode.offers_tls() {
             return Some(DesiredServerTls::Off);
         }
         self.server_tls_material
@@ -758,7 +765,7 @@ mod tests {
             ssl_mode: default_ssl_mode(),
             docker_image: None,
             container_name: None,
-            server_tls_mode: ServerTlsMode::Off,
+            server_tls_mode: None,
             server_tls_material: None,
         };
 
@@ -787,7 +794,7 @@ mod tests {
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("timescale/timescaledb-ha:pg18".to_string()),
             container_name: None,
-            server_tls_mode: ServerTlsMode::Off,
+            server_tls_mode: None,
             server_tls_material: None,
         };
 

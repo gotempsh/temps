@@ -924,6 +924,15 @@ impl PostgresService {
                     service_name: self.name.clone(),
                     reason: format!("invalid restored service resource limits: {reason}"),
                 })?;
+            // ADR 093: restore rebuilds from stored parameters, which never
+            // say what TLS should be; keep what the container served. Its
+            // certificate lives outside PGDATA and survives the swap.
+            let kept_tls = if postgres_config.server_tls_mode.is_none() {
+                self.installed_server_tls(&self.docker, &container_name)
+                    .await
+            } else {
+                None
+            };
             self.docker
                 .remove_container(
                     &container_name,
@@ -937,8 +946,14 @@ impl PostgresService {
                     service_name: self.name.clone(),
                     reason: format!("could not recreate the restored managed container: {error}"),
                 })?;
-            self.create_container_once(&self.docker, &postgres_config, &limits, false)
-                .await?;
+            self.create_container_once_keeping_tls(
+                &self.docker,
+                &postgres_config,
+                &limits,
+                false,
+                kept_tls.as_ref(),
+            )
+            .await?;
         }
         // Docker's running state alone is not SQL readiness for an imported
         // container without a healthcheck. Authenticate with the restored login

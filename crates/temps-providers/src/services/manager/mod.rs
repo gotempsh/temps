@@ -23,4 +23,4 @@ mod readiness;
 mod remote;
 mod runtime_limits;
 mod server_tls;
-pub(super) use server_tls::ClusterTlsLocks;
+pub(super) use server_tls::ServiceTlsLocks;

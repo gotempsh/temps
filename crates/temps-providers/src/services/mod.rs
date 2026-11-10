@@ -115,12 +115,10 @@ pub struct ExternalServiceManager {
             HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
         >,
     >,
-    /// One lock per cluster, held while its data nodes are switched to the
-    /// certificate its TLS setting asks for (ADR 093), so a background
-    /// follow-up and a mode change never interleave and the last pass to
-    /// run is the one that read the latest setting. One small entry per
-    /// cluster that ever had the setting applied.
-    cluster_tls_locks: Arc<manager::ClusterTlsLocks>,
+    /// One lock per service, held by a TLS mode change (through its
+    /// rollback) and by every pass that switches a cluster's data nodes
+    /// (ADR 093), so they never interleave and none acts on a stale setting.
+    service_tls_locks: Arc<manager::ServiceTlsLocks>,
     /// The control plane's cluster resolver address (ADR-024), published by
     /// the deployer's probe only while cluster DNS is enabled and the
     /// resolver answers. Empty otherwise, and on processes that run no
@@ -157,7 +155,7 @@ impl ExternalServiceManager {
             local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            cluster_tls_locks: Arc::default(),
+            service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -179,7 +177,7 @@ impl ExternalServiceManager {
             local_workloads_enabled,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            cluster_tls_locks: Arc::default(),
+            service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
     }

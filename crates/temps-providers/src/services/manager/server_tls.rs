@@ -25,15 +25,27 @@ use temps_providers_core::externalsvc::server_tls::{
 };
 use temps_providers_postgres::postgres_cluster_tls::{
     parse_served_fingerprint, served_certificate_command, server_tls_apply_command,
-    ClusterServerCertificate, CLUSTER_TLS_CERT_ENV, CLUSTER_TLS_KEY_ENV, NOT_INITIALIZED_EXIT_CODE,
+    ClusterServerCertificate, CLUSTER_TLS_CERT_ENV, CLUSTER_TLS_KEY_ENV,
+    MEMBER_APPLY_DEADLINE_SECS, MEMBER_KILL_GRACE_SECS, MEMBER_STATUS_DEADLINE_SECS,
+    NOT_INITIALIZED_EXIT_CODE,
 };
 use tracing::{debug, info, warn};
 
-/// Upper bound for applying the setting on one data node. The script itself
-/// gives up after about 60 s of waiting for PostgreSQL to serve the pair.
+/// Upper bound for applying the setting on one data node. Longer than the
+/// script's own deadline inside the node plus its kill grace
+/// ([`MEMBER_APPLY_DEADLINE_SECS`]), so a pass that gives up on a member
+/// never releases the service's TLS lock while that script still runs.
 const MEMBER_APPLY_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Upper bound for reading the certificate one data node serves.
+// A pass gives up on a member only after its script is dead inside the node.
+const _: () =
+    assert!(MEMBER_APPLY_TIMEOUT.as_secs() > MEMBER_APPLY_DEADLINE_SECS + MEMBER_KILL_GRACE_SECS);
+const _: () = assert!(
+    MEMBER_INSPECT_TIMEOUT.as_secs() > MEMBER_STATUS_DEADLINE_SECS + MEMBER_KILL_GRACE_SECS
+);
+
+/// Upper bound for reading the certificate one data node serves (the script
+/// dies at [`MEMBER_STATUS_DEADLINE_SECS`] inside the node).
 const MEMBER_INSPECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How often, and for how long, a cluster whose data nodes were still being
@@ -260,6 +272,31 @@ impl ExternalServiceManager {
         Ok(out)
     }
 
+    /// The certificate a standalone PostgreSQL container of `service` must
+    /// serve, for container builders outside the engine's lifecycle (the
+    /// major-upgrade adapter). `None` when its mode does not offer TLS or it
+    /// cannot use managed TLS (a cluster, an imported container).
+    pub(crate) async fn standalone_server_tls_material(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<Option<ServerTlsMaterial>, ExternalServiceError> {
+        let parameters = self.get_service_parameters(service.id).await?;
+        let material = self
+            .server_tls_parameters(service, &parameters)
+            .await?
+            .into_iter()
+            .find(|(key, _)| key == SERVER_TLS_MATERIAL_PARAM)
+            .map(|(_, value)| serde_json::from_value::<ServerTlsMaterial>(value))
+            .transpose()
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to decode the server TLS material of service {} ('{}'): {}",
+                    service.id, service.name, e
+                ),
+            })?;
+        Ok(material)
+    }
+
     /// The effective server TLS status of a service.
     pub async fn get_service_tls_status(
         &self,
@@ -374,10 +411,20 @@ impl ExternalServiceManager {
         &self,
         service: &external_services::Model,
     ) -> Result<ClusterTlsApplyReport, ServerTlsError> {
-        // Serialize per cluster and read the setting under the lock, so an
+        // Serialize per service and read the setting under the lock, so an
         // older pass can never land after a newer one.
-        let lock = self.cluster_tls_locks.for_service(service.id).await;
-        let _serialized = lock.lock().await;
+        let lock = self.service_tls_locks.for_service(service.id).await;
+        let held = lock.lock().await;
+        self.apply_cluster_server_tls_holding(service, &held).await
+    }
+
+    /// [`Self::apply_cluster_server_tls`] for a caller that already holds
+    /// the service's TLS lock (a mode change, through to its rollback).
+    async fn apply_cluster_server_tls_holding(
+        &self,
+        service: &external_services::Model,
+        _held: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<ClusterTlsApplyReport, ServerTlsError> {
         let tls = self.managed_tls();
         let record = tls.record(service.id).await?;
         let members = self.get_service_members(service.id).await?;
@@ -454,6 +501,13 @@ impl ExternalServiceManager {
         if self.converge_cluster_server_tls(service_id, trigger).await {
             return;
         }
+        self.spawn_cluster_tls_follow_up(service_id, trigger);
+    }
+
+    /// The bounded background retry of [`Self::reconcile_cluster_server_tls`].
+    /// Each pass takes the service's TLS lock, so it waits for a mode change
+    /// in progress and then reads the setting that change left.
+    fn spawn_cluster_tls_follow_up(&self, service_id: i32, trigger: &'static str) {
         let manager = self.clone();
         tokio::spawn(async move {
             for attempt in 1..=FOLLOW_UP_ATTEMPTS {
@@ -587,6 +641,11 @@ impl ExternalServiceManager {
         service_id: i32,
         mode: ServerTlsMode,
     ) -> Result<(ServerTlsMode, ServiceTlsStatus), ServerTlsError> {
+        // One change (with its rollback) at a time per service, and never
+        // while an apply pass runs: the mode read, written, applied and
+        // restored below is always the latest one.
+        let lock = self.service_tls_locks.for_service(service_id).await;
+        let held = lock.lock().await;
         let service = self.get_service(service_id).await.map_err(|e| match e {
             ExternalServiceError::ServiceNotFound { .. } => ServerTlsError::NotFound { service_id },
             other => ServerTlsError::Service(other),
@@ -614,7 +673,7 @@ impl ExternalServiceManager {
         let previous = tls.set_mode(service_id, mode).await?;
         if service.topology == "cluster" {
             if service.status == "running" {
-                self.apply_cluster_mode_change(&service, mode, previous)
+                self.apply_cluster_mode_change(&service, mode, previous, &held)
                     .await?;
             }
         } else if service.status != "stopped" {
@@ -659,8 +718,9 @@ impl ExternalServiceManager {
         service: &external_services::Model,
         mode: ServerTlsMode,
         previous: ServerTlsMode,
+        held: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<(), ServerTlsError> {
-        let failures = match self.apply_cluster_server_tls(service).await {
+        let failures = match self.apply_cluster_server_tls_holding(service, held).await {
             Ok(report) if report.failed.is_empty() => {
                 if !report.skipped.is_empty() {
                     info!(
@@ -671,8 +731,8 @@ impl ExternalServiceManager {
                     );
                 }
                 if !report.initializing.is_empty() {
-                    self.reconcile_cluster_server_tls(service.id, "TLS mode change")
-                        .await;
+                    // Runs once this change releases the lock.
+                    self.spawn_cluster_tls_follow_up(service.id, "TLS mode change");
                 }
                 return Ok(());
             }
@@ -688,7 +748,7 @@ impl ExternalServiceManager {
         );
         let tls = self.managed_tls();
         match tls.set_mode(service.id, previous).await {
-            Ok(_) => match self.apply_cluster_server_tls(service).await {
+            Ok(_) => match self.apply_cluster_server_tls_holding(service, held).await {
                 Ok(report) if report.failed.is_empty() => {}
                 Ok(report) => warn!(
                     service_id = service.id,
@@ -717,16 +777,17 @@ impl ExternalServiceManager {
     }
 }
 
-/// One async lock per cluster, so the passes that switch its data nodes'
-/// certificates run one at a time. Holds one small entry per cluster that ever
-/// had the setting applied.
+/// One async lock per service, held by a TLS mode change from reading the
+/// current mode through its rollback, and by every pass that switches a
+/// cluster's data nodes, so they run one at a time and none acts on a stale
+/// setting. One small entry per service whose TLS was changed or applied.
 #[derive(Debug, Default)]
-pub(crate) struct ClusterTlsLocks {
+pub(crate) struct ServiceTlsLocks {
     locks: tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>,
 }
 
-impl ClusterTlsLocks {
-    /// The lock for one cluster; the same lock every time for the same id.
+impl ServiceTlsLocks {
+    /// The lock for one service; the same lock every time for the same id.
     pub(crate) async fn for_service(&self, service_id: i32) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
@@ -755,8 +816,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_tls_passes_for_one_cluster_run_one_at_a_time() {
-        let locks = ClusterTlsLocks::default();
+    async fn tls_passes_for_one_service_run_one_at_a_time() {
+        let locks = ServiceTlsLocks::default();
         let first = locks.for_service(7).await;
         let held = first.lock().await;
         // A second pass for the same cluster waits for the first.
@@ -765,6 +826,46 @@ mod tests {
         assert!(locks.for_service(8).await.try_lock().is_ok());
         drop(held);
         assert!(locks.for_service(7).await.try_lock().is_ok());
+    }
+
+    fn manager_without_data() -> ExternalServiceManager {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        ExternalServiceManager::new_with_handle(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "server-tls-lock-test",
+            )),
+            Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "server TLS lock test",
+            )),
+            true,
+            Arc::new(temps_dns::DnsRegistry::new(db)),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_waits_while_another_change_or_pass_holds_the_service() {
+        let manager = manager_without_data();
+        let lock = manager.service_tls_locks.for_service(7).await;
+        let held = lock.lock().await;
+        let change = manager.set_service_tls_mode(7, ServerTlsMode::Off);
+        tokio::pin!(change);
+        // The mock database has no rows: a change that did not wait would
+        // fail at once looking the service up, instead of still pending.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut change)
+                .await
+                .is_err(),
+            "the change must not read or write anything while the lock is held"
+        );
+        drop(held);
+        assert!(matches!(
+            change.await,
+            Err(ServerTlsError::Service(_)) | Err(ServerTlsError::NotFound { .. })
+        ));
     }
 
     #[test]

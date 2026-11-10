@@ -11,6 +11,7 @@ pub use temps_providers_core::externalsvc::naming::{
 
 use super::*;
 use crate::externalsvc::port_util::{find_available_port_async, is_port_conflict_error};
+use crate::externalsvc::server_tls::ServerTlsMode;
 use crate::externalsvc::{ServiceConfig, ServiceResourceLimits};
 use crate::utils::ensure_network_exists;
 use bollard::query_parameters::InspectContainerOptions;
@@ -146,6 +147,28 @@ impl PostgresService {
         resource_limits: &ServiceResourceLimits,
         enable_archiving: bool,
     ) -> Result<()> {
+        self.create_container_once_keeping_tls(
+            docker,
+            config,
+            resource_limits,
+            enable_archiving,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_container_once`] for a caller that removed the
+    /// container itself and read its TLS first ([`Self::installed_server_tls`]):
+    /// a new container created from a config that does not say what TLS
+    /// should be serves `kept_tls` again (ADR 093).
+    pub(super) async fn create_container_once_keeping_tls(
+        &self,
+        docker: &Docker,
+        config: &PostgresConfig,
+        resource_limits: &ServiceResourceLimits,
+        enable_archiving: bool,
+        kept_tls: Option<&InstalledServerTls>,
+    ) -> Result<()> {
         let container_name = self.get_container_name();
 
         // Check if container already exists
@@ -199,7 +222,8 @@ impl PostgresService {
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
             .map_err(|e| EngineError::failed(&self.name, e))?;
-        self.create_fresh_container(docker, config, resource_limits, enable_archiving)
+        let kept_tls = kept_tls.filter(|_| config.server_tls_mode.is_none());
+        self.create_fresh_container(docker, config, resource_limits, enable_archiving, kept_tls)
             .await
     }
 
@@ -240,6 +264,15 @@ impl PostgresService {
         }
         let container_name = self.get_container_name();
         let replacement = self.replacement_storage(config)?;
+        // ADR 093: a config that does not say what TLS should be (built from
+        // stored parameters, e.g. by a backup enabling WAL archiving) keeps
+        // what the container being replaced serves. Its certificate stays on
+        // the data volume the guard requires the replacement to mount.
+        let kept_tls = if config.server_tls_mode.is_none() {
+            self.installed_server_tls(docker, &container_name).await
+        } else {
+            None
+        };
         // Pull while the original still serves: a pull failure must not
         // cost any downtime.
         info!("Pulling PostgreSQL image {}", config.docker_image);
@@ -255,20 +288,65 @@ impl PostgresService {
                 replacement,
                 operation,
             },
-            || self.create_fresh_container(docker, config, resource_limits, enable_archiving),
+            || {
+                self.create_fresh_container(
+                    docker,
+                    config,
+                    resource_limits,
+                    enable_archiving,
+                    kept_tls.as_ref(),
+                )
+            },
         )
         .await?;
         Ok(report)
     }
 
+    /// The TLS a managed container serves, read from how it was created.
+    /// `None` when it serves none, or when it cannot be inspected (logged):
+    /// the replacement then starts without TLS and the TLS status reports it.
+    pub(super) async fn installed_server_tls(
+        &self,
+        docker: &Docker,
+        container_name: &str,
+    ) -> Option<InstalledServerTls> {
+        match docker
+            .inspect_container(
+                container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => {
+                let config = info.config.unwrap_or_default();
+                installed_server_tls(
+                    config.cmd.as_deref().unwrap_or_default(),
+                    config.labels.as_ref(),
+                )
+            }
+            Err(e) => {
+                warn!(
+                    service = %self.name,
+                    container = container_name,
+                    error = %e,
+                    "Could not read the server TLS of PostgreSQL container before \
+                     replacing it; the replacement starts without TLS"
+                );
+                None
+            }
+        }
+    }
+
     /// Pull, create, start and wait for a new container. The caller has made
-    /// sure no container with this name exists.
+    /// sure no container with this name exists. `kept_tls` is the TLS of the
+    /// container this one replaces, served again when `config` does not say.
     async fn create_fresh_container(
         &self,
         docker: &Docker,
         config: &PostgresConfig,
         resource_limits: &ServiceResourceLimits,
         enable_archiving: bool,
+        kept_tls: Option<&InstalledServerTls>,
     ) -> Result<()> {
         let container_name = self.get_container_name();
         let volume_name = format!("{}_data", container_name);
@@ -303,14 +381,7 @@ impl PostgresService {
         if let Some(material) = server_tls {
             crate::externalsvc::server_tls::install_tls_directory(
                 docker,
-                crate::externalsvc::server_tls::TlsInstallTarget {
-                    service_name: &self.name,
-                    image: &config.docker_image,
-                    volume: &volume_name,
-                    mount_target: POSTGRES_VOLUME_MOUNT,
-                    dir: POSTGRES_TLS_DIR_NAME,
-                    owner_user: "postgres",
-                },
+                standalone_server_tls_target(&self.name, &config.docker_image, &volume_name),
                 material,
             )
             .await
@@ -325,10 +396,27 @@ impl PostgresService {
                 "Installed server TLS certificate for PostgreSQL container {}",
                 container_name
             );
-        } else if config.server_tls_mode.offers_tls() && config.container_name.is_none() {
+        } else if let Some(kept) = kept_tls {
+            if let Some(fingerprint) = &kept.fingerprint_sha256 {
+                container_labels.insert(
+                    crate::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL.to_string(),
+                    fingerprint.clone(),
+                );
+            }
+            info!(
+                service = %self.name,
+                fingerprint = ?kept.fingerprint_sha256,
+                "Keeping the installed server TLS certificate for replacement PostgreSQL container {}",
+                container_name
+            );
+        } else if config
+            .server_tls_mode
+            .is_some_and(ServerTlsMode::offers_tls)
+            && config.container_name.is_none()
+        {
             warn!(
                 service = %self.name,
-                mode = %config.server_tls_mode,
+                mode = ?config.server_tls_mode,
                 "PostgreSQL service asks for server TLS but no certificate was supplied; \
                  creating container {} without TLS",
                 container_name
@@ -395,7 +483,11 @@ impl PostgresService {
             // the container if this value drifts. This makes the bad combo
             // (archive_mode=on, archive_command='') unrepresentable for any
             // service that's been Stop+Start'd at least once.
-            cmd: Some(postgres_container_cmd(config, enable_archiving)),
+            cmd: Some(postgres_container_cmd_serving(
+                config,
+                enable_archiving,
+                server_tls.is_some() || kept_tls.is_some(),
+            )),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -993,6 +1085,33 @@ pub(crate) fn server_tls_settings() -> [String; 3] {
     ]
 }
 
+/// Where a standalone PostgreSQL container's server certificate is installed
+/// in its data volume `volume` (ADR 093). Public for container builders
+/// outside this crate, such as the major-upgrade adapter.
+pub fn standalone_server_tls_target<'a>(
+    service_name: &'a str,
+    image: &'a str,
+    volume: &'a str,
+) -> crate::externalsvc::server_tls::TlsInstallTarget<'a> {
+    crate::externalsvc::server_tls::TlsInstallTarget {
+        service_name,
+        image,
+        volume,
+        mount_target: POSTGRES_VOLUME_MOUNT,
+        dir: POSTGRES_TLS_DIR_NAME,
+        owner_user: "postgres",
+    }
+}
+
+/// The `-c` arguments that make a standalone PostgreSQL container serve the
+/// certificate installed at [`standalone_server_tls_target`].
+pub fn standalone_server_tls_cmd_args() -> Vec<String> {
+    server_tls_settings()
+        .into_iter()
+        .flat_map(|setting| ["-c".to_string(), setting])
+        .collect()
+}
+
 /// The CMD of a standalone PostgreSQL container built from `config`.
 ///
 /// archive_mode is computed from on-disk truth, not stored state:
@@ -1003,10 +1122,29 @@ pub(crate) fn server_tls_settings() -> [String; 3] {
 /// unrepresentable for any service that's been Stop+Start'd at least once.
 ///
 /// TLS settings are added only when [`PostgresConfig::effective_server_tls`]
-/// has material to serve (ADR 093).
+/// has material to serve (ADR 093). Containers are built through
+/// [`postgres_container_cmd_serving`], which also covers a replacement that
+/// keeps an installed certificate.
+#[cfg(test)]
 pub(crate) fn postgres_container_cmd(
     config: &PostgresConfig,
     enable_archiving: bool,
+) -> Vec<String> {
+    postgres_container_cmd_serving(
+        config,
+        enable_archiving,
+        config.effective_server_tls().is_some(),
+    )
+}
+
+/// The CMD of a standalone PostgreSQL container built from `config`, with
+/// the TLS settings when `serve_tls`: material is installed now, or a
+/// replacement keeps the certificate already installed
+/// ([`InstalledServerTls`]).
+pub(crate) fn postgres_container_cmd_serving(
+    config: &PostgresConfig,
+    enable_archiving: bool,
+    serve_tls: bool,
 ) -> Vec<String> {
     let mut cmd = vec![
         "postgres".to_string(),
@@ -1035,13 +1173,38 @@ pub(crate) fn postgres_container_cmd(
             PostgresService::shared_preload_libraries_for_image(&config.docker_image)
         ),
     ];
-    if config.effective_server_tls().is_some() {
-        for setting in server_tls_settings() {
-            cmd.push("-c".to_string());
-            cmd.push(setting);
-        }
+    if serve_tls {
+        cmd.extend(standalone_server_tls_cmd_args());
     }
     cmd
+}
+
+/// The server TLS a managed PostgreSQL container was created with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstalledServerTls {
+    /// The certificate's fingerprint label, absent on containers created
+    /// before the label existed.
+    pub(crate) fingerprint_sha256: Option<String>,
+}
+
+/// Read from a container's CMD and labels: TLS is installed when the CMD
+/// turns `ssl=on` with the managed certificate paths.
+pub(crate) fn installed_server_tls(
+    cmd: &[String],
+    labels: Option<&HashMap<String, String>>,
+) -> Option<InstalledServerTls> {
+    let settings = server_tls_settings();
+    let has = |setting: &String| cmd.iter().any(|token| token.trim() == setting);
+    if !settings.iter().all(has) {
+        return None;
+    }
+    Some(InstalledServerTls {
+        fingerprint_sha256: labels
+            .and_then(|labels| {
+                labels.get(crate::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL)
+            })
+            .cloned(),
+    })
 }
 
 /// Whether a container with this CMD and these labels is out of step with

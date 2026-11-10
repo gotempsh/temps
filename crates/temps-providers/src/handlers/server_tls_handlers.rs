@@ -329,7 +329,16 @@ pub async fn update_service_tls(
     Json(request): Json<UpdateServiceTlsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
-    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    // Membership of a linked project is not enough to change how its
+    // database accepts connections: the caller's role in that project must
+    // grant the write as well.
+    super::metrics_handlers::assert_service_permission_for_caller(
+        id,
+        &auth,
+        &app_state,
+        temps_auth::Permission::ExternalServicesWrite,
+    )
+    .await?;
     let (previous, status) = app_state
         .external_service_manager
         .set_service_tls_mode(id, request.mode)
@@ -561,6 +570,14 @@ mod tests {
     }
 
     fn state(db: MockDatabase, audit: RecordingAuditLogger) -> Arc<AppState> {
+        state_with_project_roles(db, audit, None)
+    }
+
+    fn state_with_project_roles(
+        db: MockDatabase,
+        audit: RecordingAuditLogger,
+        project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    ) -> Arc<AppState> {
         let db = Arc::new(db.into_connection());
         let docker = Arc::new(temps_core::DockerHandle::disabled(
             "control-plane",
@@ -590,7 +607,7 @@ mod tests {
             api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
             config_service: None,
             telemetry: Arc::new(temps_core::NoopTelemetryReporter),
-            project_access_checker: None,
+            project_access_checker,
             application_network_reconciler: None,
             notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
                 destinations: Some(0),
@@ -668,6 +685,70 @@ mod tests {
             assert!(body["detail"].is_string(), "Problem Details body: {body}");
             assert!(audit.operations.lock().unwrap().is_empty());
         }
+    }
+
+    /// Scoped project roles: a member of every project whose role there
+    /// grants only reading external services.
+    struct ReadOnlyProjectRole;
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for ReadOnlyProjectRole {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(vec![
+                temps_auth::Permission::ExternalServicesRead.to_string()
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_only_role_in_the_linked_project_cannot_change_the_mode() {
+        let audit = RecordingAuditLogger::default();
+        let svc = service("postgres", "running");
+        let link = project_services::Model {
+            id: 1,
+            project_id: 99,
+            service_id: 7,
+            database_provisioning_mode: "shared".into(),
+            custom_database_name: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        // Only the ownership lookups: reading or writing the TLS row would
+        // run out of mock results and fail with a 500, not a 403.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![svc.clone()]])
+            .append_query_results([vec![link]]);
+        let app = state_with_project_roles(db, audit.clone(), Some(Arc::new(ReadOnlyProjectRole)));
+        // An instance User holds ExternalServicesWrite and passes the
+        // instance-level guard; the project role must still refuse.
+        let (status, body) = body_json(
+            update_service_tls(
+                RequireAuth(auth(temps_auth::Role::User)),
+                State(app),
+                Path(7),
+                Extension(metadata()),
+                Json(UpdateServiceTlsRequest {
+                    mode: ServerTlsMode::Off,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["detail"].is_string(), "Problem Details body: {body}");
+        assert!(audit.operations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
