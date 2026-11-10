@@ -220,9 +220,15 @@ impl MetricsScraper {
             lock_unpoisoned(&self.cache_hit)
                 .set_scrape_interval(chrono::Duration::seconds(interval_secs as i64));
 
+            let cycle_started = std::time::Instant::now();
             if let Err(e) = self.run_cycle().await {
                 error!("MetricsScraper: cycle failed: {e}");
             }
+            // The sleep starts after the cycle, so sources are scraped every
+            // interval plus this: the cache hit window must expect it.
+            let cycle = chrono::Duration::from_std(cycle_started.elapsed())
+                .unwrap_or_else(|_| chrono::Duration::zero());
+            lock_unpoisoned(&self.cache_hit).record_cycle(chrono::Utc::now(), cycle);
 
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }

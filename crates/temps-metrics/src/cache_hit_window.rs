@@ -159,13 +159,14 @@ impl Series {
     /// Record an interval and drop every interval no longer entirely inside
     /// the window ending at `interval.end`. Returns the sums over the window,
     /// or `None` when nothing is left in it (the new interval itself started
-    /// before the window). `scrape_interval` is the interval the scraper
-    /// sleeps between scrapes, when known.
+    /// before the window). `expected_gap` is how far apart two scrapes of
+    /// the source are expected to be, when known: the scrape interval plus
+    /// the scrape cycle's duration.
     fn push(
         &mut self,
         interval: Interval,
         window: Duration,
-        scrape_interval: Option<Duration>,
+        expected_gap: Option<Duration>,
     ) -> Option<WindowSum> {
         // Scrapes of one service never run concurrently, so time only goes
         // backwards if the clock was stepped. Restart the window rather than
@@ -202,16 +203,16 @@ impl Series {
         });
         // The interval that straddled the cutoff was dropped, so the window
         // begins less than that interval after its start. A normal scrape is
-        // the configured interval plus a cycle that varies by seconds, at
-        // most half as long again as the configured interval; a missed scrape
-        // is at least twice as long, and after a gap shorter than the window
+        // the configured interval plus a cycle whose length varies, at most
+        // half as long again as the expected gap; a missed scrape is at least
+        // twice as long, and after a gap shorter than the window
         // the dropped interval is the gap and the rest may cover only the
         // minutes since. Then the window must reach back to within a tenth of
         // its length, whatever the scrape interval. The reference is never
         // the current interval: it may be a second outage, against which the
-        // first one would pass for a scrape. Without a configured interval,
-        // the shortest one still in the window stands in for it.
-        let reference = scrape_interval.unwrap_or_else(|| {
+        // first one would pass for a scrape. Without an expected gap, the
+        // shortest interval still in the window stands in for it.
+        let reference = expected_gap.unwrap_or_else(|| {
             self.intervals
                 .iter()
                 .map(|i| i.end - i.start)
@@ -261,6 +262,9 @@ pub struct CacheHitWindows {
     /// How long the scraper sleeps between scrapes; see
     /// [`CacheHitWindows::set_scrape_interval`].
     scrape_interval: Option<Duration>,
+    /// When each recent scrape cycle ended and how long it ran, for the
+    /// last two windows; see [`CacheHitWindows::record_cycle`].
+    cycles: VecDeque<(DateTime<Utc>, Duration)>,
 }
 
 impl Default for CacheHitWindows {
@@ -279,6 +283,7 @@ impl CacheHitWindows {
             last_scrape: HashMap::new(),
             stats_reset: HashMap::new(),
             scrape_interval: None,
+            cycles: VecDeque::new(),
         }
     }
 
@@ -288,6 +293,37 @@ impl CacheHitWindows {
     /// interval in each window stands in for it.
     pub fn set_scrape_interval(&mut self, interval: Duration) {
         self.scrape_interval = Some(interval);
+    }
+
+    /// Record that a scrape cycle ending at `ended_at` ran for `duration`.
+    /// The scraper sleeps only after a whole cycle, so a source is scraped
+    /// every scrape interval plus the cycle's duration: on a large fleet,
+    /// 30 s of sleep and 100 s cycles are scrapes 130 s apart, none missed.
+    /// The longest cycle of the last two windows (one dropped interval ago
+    /// and since) is added to the scrape interval to tell a scrape from a
+    /// missed one. Bounded: one entry per cycle, at most 180 at the 10 s
+    /// minimum interval.
+    pub fn record_cycle(&mut self, ended_at: DateTime<Utc>, duration: Duration) {
+        self.cycles
+            .push_back((ended_at, duration.max(Duration::zero())));
+        let horizon = ended_at - self.window * 2;
+        while self.cycles.front().is_some_and(|(at, _)| *at < horizon) {
+            self.cycles.pop_front();
+        }
+    }
+
+    /// How far apart two scrapes of a source are expected to be: the scrape
+    /// interval plus the longest recent cycle. `None` until the scraper has
+    /// set the interval.
+    fn expected_scrape_gap(&self) -> Option<Duration> {
+        let longest_cycle = self
+            .cycles
+            .iter()
+            .map(|(_, duration)| *duration)
+            .max()
+            .unwrap_or_else(Duration::zero);
+        self.scrape_interval
+            .map(|interval| interval + longest_cycle)
     }
 
     /// Replace the [`PG_BLKS_HIT`] / [`PG_BLKS_READ`] delta points of one
@@ -410,10 +446,11 @@ impl CacheHitWindows {
         interval: Interval,
         out: &mut Vec<MetricPoint>,
     ) {
+        let expected_gap = self.expected_scrape_gap();
         let Some(sum) = self.series.entry((source_id, key)).or_default().push(
             interval,
             self.window,
-            self.scrape_interval,
+            expected_gap,
         ) else {
             return;
         };
@@ -912,6 +949,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Scrape `app` every 30 s of sleep plus a 100 s cycle, as on a large
+    /// fleet, recording each cycle. `skip` names scrapes that fail. Returns
+    /// the windowed points of every scrape with its time since `at(0)`.
+    fn scrape_with_long_cycles(skip: &[i64]) -> Vec<(i64, Vec<MetricPoint>)> {
+        let mut windows = CacheHitWindows::default();
+        windows.set_scrape_interval(Duration::seconds(30));
+        let mut outs = Vec::new();
+        let mut previous = 0;
+        windows.derive(1, deltas(0.0, 0.0, at(0), "app"));
+        for scrape in 1..=40 {
+            let secs = scrape * 130;
+            windows.record_cycle(at(0) + Duration::seconds(secs), Duration::seconds(100));
+            if skip.contains(&scrape) {
+                continue;
+            }
+            let blocks = (secs - previous) as f64;
+            previous = secs;
+            let time = at(0) + Duration::seconds(secs);
+            outs.push((
+                secs,
+                windows.derive(1, deltas(blocks * 0.9, blocks * 0.1, time, "app")),
+            ));
+        }
+        outs
+    }
+
+    #[test]
+    fn long_scrape_cycles_without_a_missed_scrape_keep_the_window_whole() {
+        for (secs, out) in scrape_with_long_cycles(&[]) {
+            if secs >= 900 {
+                assert_eq!(
+                    value(&out, PG_CACHE_HIT_RATIO, None),
+                    Some(0.9),
+                    "{secs} s: {out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_missed_scrape_between_long_cycles_still_leaves_the_window_partial() {
+        // Scrape 20 fails: the interval from 2,470 s to 2,730 s spans two
+        // cycles, longer than half again the expected 130 s. Once it leaves,
+        // the window starts 250 s, then 120 s late; then a scrape leaves.
+        let outs: HashMap<i64, Vec<MetricPoint>> =
+            scrape_with_long_cycles(&[20]).into_iter().collect();
+        for secs in [3_380, 3_510] {
+            assert!(outs[&secs].is_empty(), "{secs} s: {:?}", outs[&secs]);
+        }
+        assert_eq!(value(&outs[&3_640], PG_CACHE_HIT_RATIO, None), Some(0.9));
+    }
+
+    #[test]
+    fn only_the_last_two_windows_of_cycles_are_kept() {
+        let mut windows = CacheHitWindows::default();
+        windows.set_scrape_interval(Duration::seconds(30));
+        windows.record_cycle(at(0), Duration::seconds(100));
+        for minute in 1..=31 {
+            windows.record_cycle(at(minute), Duration::seconds(1));
+        }
+        assert_eq!(windows.cycles.len(), 31, "the 100 s cycle aged out");
+        assert_eq!(windows.expected_scrape_gap(), Some(Duration::seconds(31)));
     }
 
     #[test]
