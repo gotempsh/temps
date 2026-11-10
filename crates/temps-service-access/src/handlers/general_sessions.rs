@@ -147,6 +147,7 @@ pub async fn create_access_session_general(
         s.policy.github_repository.is_some()
             && request.services.iter().any(|v| v.service_id == s.id)
     }) {
+        let mut checked_sources = std::collections::BTreeSet::new();
         for service in vault.services.iter().filter(|s| {
             s.policy.github_repository.is_some()
                 && request.services.iter().any(|v| v.service_id == s.id)
@@ -156,6 +157,9 @@ pub async fn create_access_session_general(
                     .detail("GitHub service has no credential source project")
                     .build()
             })?;
+            if !checked_sources.insert(source_project) {
+                continue;
+            }
             // GitHub grants retain the source project's worker authorization,
             // including when coverage comes from a direct sandbox link.
             project_permission_guard!(

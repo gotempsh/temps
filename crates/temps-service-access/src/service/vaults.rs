@@ -80,9 +80,8 @@ impl ServiceAccessService {
         }
         let rows = services::Entity::find()
             .filter(services::Column::RetiredAt.is_null())
-            .apply_if(project_id, |q, id| {
-                q.filter(services::Column::ProjectId.eq(id))
-            })
+            // Vault authorization has already established the consumer scope.
+            // Service membership is general, including in migrated vaults.
             .filter(services::Column::Id.is_in(ids.to_vec()))
             .order_by_desc(services::Column::CreatedAt)
             .order_by_desc(services::Column::Id)
@@ -523,9 +522,34 @@ mod database_tests {
             )
             .await
             .unwrap();
+        let general = service
+            .save_service(
+                None,
+                None,
+                SaveAccessService {
+                    vault_id: Some(vault.id.clone()),
+                    name: "General API".into(),
+                    policy: SandboxAccessPolicy {
+                        provider: None,
+                        origin: "https://api.example.com".into(),
+                        path_prefixes: vec!["/v1".into()],
+                        methods: vec![AccessMethod::Get],
+                        github_repository: None,
+                    },
+                    max_ttl_seconds: 900,
+                    enabled: true,
+                    credential: None,
+                    clear_credential: false,
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(general.project_id.is_none());
         let detail = service.get_vault(9602, &vault.id).await.unwrap();
-        assert_eq!(detail.vault.version, 2);
-        assert_eq!(detail.services.len(), 1);
+        assert_eq!(detail.vault.version, 3);
+        assert_eq!(detail.services.len(), 2);
+        assert!(detail.services.iter().any(|s| s.id == general.id));
         assert!(service.get_vault(9603, &vault.id).await.is_err());
         assert!(service
             .save_vault(
@@ -565,11 +589,12 @@ mod database_tests {
                 None,
                 &vault.id,
                 None,
-                make(vec![definition.id.clone()], 900),
+                make(vec![definition.id.clone(), general.id.clone()], 900),
             )
             .await
             .unwrap();
-        assert_eq!(bundle.service_ids, vec![definition.id.clone()]);
+        assert_eq!(bundle.service_ids.len(), 2);
+        assert!(bundle.service_ids.contains(&general.id));
         assert!(bundle.project_id.is_none());
         let updated = service
             .save_bundle(
@@ -593,7 +618,7 @@ mod database_tests {
                 SaveAccessVault {
                     name: "Work".into(),
                     service_ids: vec![],
-                    expected_version: Some(2)
+                    expected_version: Some(3)
                 }
             )
             .await
@@ -612,7 +637,7 @@ mod database_tests {
                 .items[0]
                 .services
                 .len(),
-            1
+            2
         );
         assert_eq!(
             service

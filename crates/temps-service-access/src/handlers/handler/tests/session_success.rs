@@ -79,10 +79,13 @@ async fn session_route(projectless: bool, removal: &str) {
     }
     let mut selections = Vec::new();
     for name in ["API", "Other API"] {
+        // A migrated project vault can contain newly created general services;
+        // its legacy approval route must still issue the unchanged bundle.
+        let service_context = if name == "Other API" { None } else { context };
         let service = state
             .service
             .save_service(
-                context,
+                service_context,
                 None,
                 SaveAccessService {
                     vault_id: Some(vault.id.clone()),
@@ -436,7 +439,8 @@ async fn session_route(projectless: bool, removal: &str) {
 
 #[tokio::test]
 async fn direct_github_session_checks_source_project_permissions_before_issuance() {
-    struct SourcePermissions(Vec<String>);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct SourcePermissions(Vec<String>, Arc<AtomicUsize>);
     #[async_trait::async_trait]
     impl temps_core::ProjectAccessChecker for SourcePermissions {
         async fn user_can_access_project(
@@ -453,6 +457,7 @@ async fn direct_github_session_checks_source_project_permissions_before_issuance
             project_id: i32,
         ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
             assert_eq!((user_id, project_id), (1, 7));
+            self.1.fetch_add(1, Ordering::SeqCst);
             Ok(Some(self.0.clone()))
         }
     }
@@ -466,6 +471,8 @@ async fn direct_github_session_checks_source_project_permissions_before_issuance
         let mut service = row();
         service.policy =
             serde_json::to_value(crate::github::tests::policy(GithubAccessProtocol::Git)).unwrap();
+        let mut second_service = service.clone();
+        second_service.id = "svc_second".into();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![sandbox()]])
             .append_query_results([vec![temps_entities::access_vault_links::Model {
@@ -480,13 +487,13 @@ async fn direct_github_session_checks_source_project_permissions_before_issuance
                 id: "vault_test".into(),
                 project_id: None,
                 name: "Git APIs".into(),
-                service_ids: vec!["svc_test".into()],
+                service_ids: vec!["svc_test".into(), "svc_second".into()],
                 version: 1,
                 retired_at: None,
                 created_at: now,
                 updated_at: now,
             }]])
-            .append_query_results([vec![service]])
+            .append_query_results([vec![service, second_service]])
             // The fully authorized case reaches issuance; no consent is written
             // because the coordinator's first storage operation fails here.
             .append_query_errors([sea_orm::DbErr::Custom(
@@ -494,6 +501,7 @@ async fn direct_github_session_checks_source_project_permissions_before_issuance
             )]);
         let audit = Arc::new(Audit::default());
         let mut state = state(db, audit.clone());
+        let permission_reads = Arc::new(AtomicUsize::new(0));
         Arc::get_mut(&mut state).unwrap().project_access_checker =
             Some(Arc::new(SourcePermissions(
                 [
@@ -505,9 +513,10 @@ async fn direct_github_session_checks_source_project_permissions_before_issuance
                 .filter(|p| Some(*p) != missing)
                 .map(|p| p.to_string())
                 .collect(),
+                permission_reads.clone(),
             )));
         let response = send("POST", "/access-vaults/vault_test/sessions",
-            &serde_json::json!({"request_id":uuid::Uuid::new_v4(),"bundle_id":"bundle_test","bundle_version":1,"consumer":{"kind":"sandbox","sandbox_id":"sbx_test"},"ttl_seconds":60,"services":[{"service_id":"svc_test","version":1}]}).to_string(),
+            &serde_json::json!({"request_id":uuid::Uuid::new_v4(),"bundle_id":"bundle_test","bundle_version":1,"consumer":{"kind":"sandbox","sandbox_id":"sbx_test"},"ttl_seconds":60,"services":[{"service_id":"svc_test","version":1},{"service_id":"svc_second","version":1}]}).to_string(),
             Some(AuthContext::new_session(test_user(), Role::User)), state).await;
         assert_eq!(
             response.status(),
@@ -530,6 +539,13 @@ async fn direct_github_session_checks_source_project_permissions_before_issuance
                 .as_str()
                 .unwrap()
                 .contains(&permission.to_string()));
+        }
+        if missing.is_none() {
+            assert_eq!(
+                permission_reads.load(Ordering::SeqCst),
+                3,
+                "permissions are checked once per source project, not per service"
+            );
         }
         assert!(audit.0.lock().unwrap().is_empty());
     }
