@@ -15,6 +15,10 @@ export function ProjectVaultAccess({ projectId }: { projectId: number }) {
       query: { page, page_size: 20 },
     })
   )
+  if (vaults.isSuccess && !vaults.isFetching) {
+    const lastPage = Math.max(1, Math.ceil(vaults.data.total / 20))
+    if (page > lastPage) setPage(lastPage)
+  }
   return (
     <section className="space-y-3" aria-label="Linked vaults">
       <h2 className="font-semibold">Linked vaults</h2>

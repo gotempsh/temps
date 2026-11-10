@@ -23,6 +23,10 @@ export function SandboxVaultAccess({
       query: { page, page_size: 20 },
     })
   )
+  if (vaults.isSuccess && !vaults.isFetching) {
+    const lastPage = Math.max(1, Math.ceil(vaults.data.total / 20))
+    if (page > lastPage) setPage(lastPage)
+  }
   return (
     <section className="space-y-4" aria-label="Sandbox service access">
       <h2 className="font-semibold">Vault access</h2>
