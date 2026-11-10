@@ -81,6 +81,22 @@ pub(crate) struct StubRuntime {
     pub(crate) redis_restores: Mutex<Vec<temps_service_protocol::RedisRestoreRequest>>,
     /// The MariaDB node operations asked for, by route.
     pub(crate) mariadb_operations: Mutex<Vec<(&'static str, i32)>>,
+    /// The write boundary each Redis or MariaDB restore was handed: its
+    /// target, and whether it still let the restore write.
+    pub(crate) write_boundaries: Mutex<Vec<(String, bool)>>,
+}
+
+impl StubRuntime {
+    /// Record the boundary a restore was handed: its target, and whether it
+    /// still lets the restore enter its write phase (it is not past the
+    /// node's deadline).
+    fn record_write_boundary(&self, writes: &temps_service_protocol::TargetWriteBoundary) {
+        let writable = !writes.is_expired();
+        self.write_boundaries
+            .lock()
+            .expect("write_boundaries")
+            .push((writes.target().to_string(), writable));
+    }
 }
 
 fn not_available(operation: &str) -> NodeServiceError {
@@ -311,7 +327,9 @@ impl NodeServiceRuntime for StubRuntime {
         &self,
         request: temps_service_protocol::RedisRestoreRequest,
         _docker: Arc<Docker>,
+        writes: Arc<temps_service_protocol::TargetWriteBoundary>,
     ) -> Result<temps_service_protocol::RedisRestoreResult, NodeServiceError> {
+        self.record_write_boundary(&writes);
         self.redis_restores
             .lock()
             .expect("redis_restores")
@@ -350,7 +368,9 @@ impl NodeServiceRuntime for StubRuntime {
         request: temps_service_protocol::MariadbRestoreRequest,
         _docker: Arc<Docker>,
         _published_address: Option<std::net::IpAddr>,
+        writes: Arc<temps_service_protocol::TargetWriteBoundary>,
     ) -> Result<temps_service_protocol::MariadbRestoreResult, NodeServiceError> {
+        self.record_write_boundary(&writes);
         self.mariadb_operations
             .lock()
             .expect("mariadb_operations")

@@ -311,8 +311,9 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         &self,
         request: RedisRestoreRequest,
         docker: Arc<Docker>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<RedisRestoreResult, NodeServiceError> {
-        Ok(externalsvc::redis_node::restore_on_node(request, docker).await)
+        Ok(externalsvc::redis_node::restore_on_node(request, docker, writes).await)
     }
 
     async fn mariadb_physical_backup(
@@ -344,8 +345,12 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         request: MariadbRestoreRequest,
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<MariadbRestoreResult, NodeServiceError> {
-        Ok(externalsvc::mariadb_node::restore_on_node(request, docker, published_address).await)
+        Ok(
+            externalsvc::mariadb_node::restore_on_node(request, docker, published_address, writes)
+                .await,
+        )
     }
 
     async fn mariadb_binlog_archive(

@@ -26,6 +26,7 @@ use temps_service_protocol::{
     MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbDumpBackupRequest,
     MariadbDumpBackupResult, MariadbPhysicalBackupRequest, MariadbPhysicalBackupResult,
     MariadbRestoreRequest, MariadbRestoreResult, NodeServiceError, NodeServiceRuntime,
+    TargetWriteBoundary,
 };
 
 use crate::handlers::{error_response, AgentResponse, AgentState};
@@ -35,11 +36,14 @@ use crate::service_data_handlers::{
 
 /// Run `engine` with this node's runtime and Docker in a data-operation
 /// slot, detached, or the response that says why it could not run (boxed:
-/// a response is large, and is only built on the way out).
+/// a response is large, and is only built on the way out). A restore
+/// passes its `writes` boundary, so the node's deadline stops it only
+/// before it began writing (see [`run_detached`]).
 async fn run_on_node<T, F, Fut>(
     state: &AgentState,
     operation: &'static str,
     service: &str,
+    writes: Option<Arc<TargetWriteBoundary>>,
     engine: F,
 ) -> Result<T, Box<axum::response::Response>>
 where
@@ -60,7 +64,7 @@ where
         Arc::new(docker.clone()),
         published_address,
     );
-    match run_detached(permit, None, future).await {
+    match run_detached(permit, writes, future).await {
         Detached::Done(Ok(outcome)) => Ok(outcome),
         Detached::Done(Err(error)) => {
             tracing::error!(service, operation, %error, "MariaDB operation could not run");
@@ -142,6 +146,7 @@ pub async fn mariadb_physical_backup(
         &state,
         "physical backup",
         &service,
+        None,
         move |runtime, docker, published| async move {
             runtime
                 .mariadb_physical_backup(request, docker, published)
@@ -194,6 +199,7 @@ pub async fn mariadb_dump_backup(
         &state,
         "dump",
         &service,
+        None,
         move |runtime, docker, published| async move {
             runtime
                 .mariadb_dump_backup(request, docker, published)
@@ -244,12 +250,17 @@ pub async fn mariadb_restore(
         pitr = request.recovery_target.is_some(),
         "Restoring a MariaDB on this node"
     );
+    let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
+    let engine_writes = Arc::clone(&writes);
     let outcome = match run_on_node(
         &state,
         "restore",
         &service,
+        Some(writes),
         move |runtime, docker, published| async move {
-            runtime.mariadb_restore(request, docker, published).await
+            runtime
+                .mariadb_restore(request, docker, published, engine_writes)
+                .await
         },
     )
     .await
@@ -300,6 +311,7 @@ pub async fn mariadb_binlog_archive(
         &state,
         "binary-log archiving",
         &service,
+        None,
         move |runtime, docker, published| async move {
             runtime
                 .mariadb_binlog_archive(request, docker, published)
@@ -458,6 +470,14 @@ mod tests {
                 vec![(operation, 8)],
                 "{route}"
             );
+            // Only a restore is handed a write boundary, so the node's
+            // deadline never drops it once the server was stopped.
+            let boundaries = runtime.write_boundaries.lock().expect("boundaries").clone();
+            if operation == "restore" {
+                assert_eq!(boundaries, vec![("shop".to_string(), true)], "{route}");
+            } else {
+                assert!(boundaries.is_empty(), "{route}: {boundaries:?}");
+            }
         }
     }
 }

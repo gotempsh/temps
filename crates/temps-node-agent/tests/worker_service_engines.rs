@@ -4794,6 +4794,7 @@ async fn a_control_plane_mariadb_is_backed_up_and_restored_by_the_same_engines()
             location,
             target_user_data: None,
             recovery_target,
+            gate: &temps_providers::externalsvc::NoopRestoreGate,
         }
     }
     mariadb

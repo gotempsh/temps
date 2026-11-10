@@ -3666,12 +3666,15 @@ impl MariaDbService {
     /// Logical restore core: download a `.sql[.gz]` backup from S3, decompress
     /// if needed, and feed it to the mariadb client. Shared by the public
     /// `restore_from_s3` and the in-place restore.
+    /// Download a logical dump to a host temp file, then apply it once
+    /// `gate` lets the restore write (see `MariaDbInPlaceRestore::gate`).
     async fn restore_logical_from_s3(
         &self,
         s3_client: &aws_sdk_s3::Client,
         bucket: &str,
         backup_location: &str,
         config: &MariaDbConfig,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         let backup_key = Self::backup_key_from_location(backup_location, bucket);
         let response = s3_client
@@ -3709,6 +3712,7 @@ impl MariaDbService {
             .await?;
         }
 
+        gate.begin_target_writes().await?;
         self.restore_sql_file(config, &sql_path).await
     }
 
@@ -4421,8 +4425,14 @@ impl ExternalService for MariaDbService {
             self.physical_restore_into_container(&config, &mbstream_path)
                 .await?;
         } else {
-            self.restore_logical_from_s3(s3_client, bucket, backup_location, &config)
-                .await?;
+            self.restore_logical_from_s3(
+                s3_client,
+                bucket,
+                backup_location,
+                &config,
+                &super::NoopRestoreGate,
+            )
+            .await?;
         }
 
         info!("MariaDB restore completed successfully");
@@ -4440,6 +4450,9 @@ impl ExternalService for MariaDbService {
                 location: ctx.backup_location,
                 target_user_data: target_user_data.as_deref(),
                 recovery_target: None,
+                // The orchestrator records the write phase itself before it
+                // calls an in-place restore here.
+                gate: &super::NoopRestoreGate,
             },
         )
         .await
@@ -4498,6 +4511,7 @@ impl ExternalService for MariaDbService {
                     location: ctx.backup_location,
                     target_user_data: target_user_data.as_deref(),
                     recovery_target: None,
+                    gate: &super::NoopRestoreGate,
                 },
             )
             .await?;
@@ -4530,6 +4544,7 @@ impl ExternalService for MariaDbService {
             location: ctx.backup_location,
             target_user_data: target_user_data.as_deref(),
             recovery_target: Some(&target),
+            gate: &super::NoopRestoreGate,
         };
 
         if !to_new_service {

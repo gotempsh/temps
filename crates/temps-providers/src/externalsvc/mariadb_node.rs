@@ -726,6 +726,7 @@ pub async fn restore_on_node(
     request: MariadbRestoreRequest,
     docker: Arc<Docker>,
     _published_address: Option<IpAddr>,
+    writes: Arc<temps_service_protocol::TargetWriteBoundary>,
 ) -> MariadbRestoreResult {
     let MariadbRestoreRequest {
         service_id,
@@ -777,6 +778,9 @@ pub async fn restore_on_node(
                 location: &location,
                 target_user_data: target_user_data.as_deref(),
                 recovery_target: recovery_target.as_ref(),
+                // The node's deadline: a restore past it before it began
+                // writing never touches the server.
+                gate: writes.as_ref(),
             },
         )
         .await

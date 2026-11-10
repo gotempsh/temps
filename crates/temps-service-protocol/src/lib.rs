@@ -1279,10 +1279,12 @@ pub trait NodeServiceRuntime: Send + Sync {
 
     /// Run the control plane's Redis in-place restore on this node (see
     /// [`RedisRestoreRequest`]).
+    /// The engine passes `writes` before it touches the container.
     async fn redis_restore(
         &self,
         request: RedisRestoreRequest,
         docker: Arc<Docker>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<RedisRestoreResult, NodeServiceError>;
 
     /// Run the control plane's MariaDB physical (WAL-G) base backup on this
@@ -1305,11 +1307,14 @@ pub trait NodeServiceRuntime: Send + Sync {
 
     /// Run the control plane's in-place MariaDB restore on this node (see
     /// [`MariadbRestoreRequest`]).
+    /// The engine passes `writes` before it stops the server or applies a
+    /// downloaded backup.
     async fn mariadb_restore(
         &self,
         request: MariadbRestoreRequest,
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<MariadbRestoreResult, NodeServiceError>;
 
     /// Run the control plane's binary-log archiver on this node (see

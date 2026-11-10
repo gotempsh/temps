@@ -1716,6 +1716,57 @@ impl RedisService {
         Ok(())
     }
 
+    /// [`ExternalService::restore_from_s3`] with `gate` entered before the
+    /// container is touched (ahead of stopping Redis, its first write; see
+    /// [`restore_swap::SwapRestore::gate`]). A worker's agent passes its
+    /// deadline here, so a restore that stopped Redis is let finish its swap
+    /// or put the original back.
+    pub async fn restore_from_s3_gated(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+        gate: &dyn super::RestoreGate,
+    ) -> Result<()> {
+        info!("Starting Redis restore from S3: {}", backup_location);
+        let keep_target_bookkeeping = restore_swap::keeps_target_bookkeeping(&service_config);
+        // The running server's password, as stored; never a generated one.
+        let password = self.get_redis_probe_config(service_config)?.password;
+
+        match classify_redis_backup_location(backup_location) {
+            RedisBackupLocationKind::Walg => {
+                self.restore_from_walg(
+                    s3_credentials,
+                    backup_location,
+                    &password,
+                    keep_target_bookkeeping,
+                    gate,
+                )
+                .await
+            }
+            RedisBackupLocationKind::RdbGzip => {
+                self.restore_from_legacy(
+                    s3_client,
+                    backup_location,
+                    s3_source,
+                    gate,
+                    &password,
+                    keep_target_bookkeeping,
+                )
+                .await
+            }
+            RedisBackupLocationKind::Unsupported => Err(EngineError::invalid_input(
+                self.instance_name(),
+                format!(
+                    "Redis backup location '{backup_location}' is neither a WAL-G prefix nor a \
+                     .rdb.gz object"
+                ),
+            )),
+        }
+    }
+
     /// The container a restore writes to: the live one of the loaded
     /// configuration, else the managed name.
     async fn restore_container_name(&self) -> String {
@@ -1736,6 +1787,7 @@ impl RedisService {
         walg_s3_prefix: &str,
         password: &str,
         keep_target_bookkeeping: bool,
+        gate: &dyn super::RestoreGate,
     ) -> Result<()> {
         let container_name = self.restore_container_name().await;
         info!(
@@ -1750,6 +1802,7 @@ impl RedisService {
                 prefix: walg_s3_prefix,
                 s3: s3_credentials,
             },
+            gate,
         })
         .await
     }
@@ -1822,6 +1875,7 @@ impl RedisService {
             stage: restore_swap::Stage::Rdb {
                 host_path: &rdb_host_path,
             },
+            gate,
         })
         .await?;
         info!("Redis rdb.gz restore completed successfully");
@@ -2814,6 +2868,9 @@ impl ExternalService for RedisService {
     /// `restore_swap`. The control plane and a worker's agent run this same
     /// method. `service_config` is the target's; it carries
     /// [`restore_swap::KEEP_TARGET_BOOKKEEPING`] for another service's backup.
+    /// This entry point has no cancellation: the orchestrator closes the gate
+    /// before calling a Redis in-place restore. A node bounds its restore by
+    /// [`Self::restore_from_s3_gated`].
     async fn restore_from_s3(
         &self,
         s3_client: &aws_sdk_s3::Client,
@@ -2822,42 +2879,15 @@ impl ExternalService for RedisService {
         s3_source: &temps_entities::s3_sources::Model,
         service_config: ServiceConfig,
     ) -> Result<()> {
-        info!("Starting Redis restore from S3: {}", backup_location);
-        let keep_target_bookkeeping = restore_swap::keeps_target_bookkeeping(&service_config);
-        // The running server's password, as stored; never a generated one.
-        let password = self.get_redis_probe_config(service_config)?.password;
-
-        match classify_redis_backup_location(backup_location) {
-            RedisBackupLocationKind::Walg => {
-                self.restore_from_walg(
-                    s3_credentials,
-                    backup_location,
-                    &password,
-                    keep_target_bookkeeping,
-                )
-                .await
-            }
-            // This entry point has no cancellation: the orchestrator closes
-            // the gate before calling a Redis in-place restore.
-            RedisBackupLocationKind::RdbGzip => {
-                self.restore_from_legacy(
-                    s3_client,
-                    backup_location,
-                    s3_source,
-                    &super::NoopRestoreGate,
-                    &password,
-                    keep_target_bookkeeping,
-                )
-                .await
-            }
-            RedisBackupLocationKind::Unsupported => Err(EngineError::invalid_input(
-                self.instance_name(),
-                format!(
-                    "Redis backup location '{backup_location}' is neither a WAL-G prefix nor a \
-                     .rdb.gz object"
-                ),
-            )),
-        }
+        self.restore_from_s3_gated(
+            s3_client,
+            s3_credentials,
+            backup_location,
+            s3_source,
+            service_config,
+            &super::NoopRestoreGate,
+        )
+        .await
     }
 
     /// Redis supports in-place restore and restore-to-new-service for WAL-G
@@ -3763,6 +3793,84 @@ mod tests {
             matches!(error, EngineError::RestoreCancelled(_)),
             "expected a cancellation, got: {error}"
         );
+    }
+
+    /// A node's restore whose deadline expired before it began writing (its
+    /// gate refuses the write phase) never touches the container: a WAL-G
+    /// restore stops before Redis is stopped or anything is fetched.
+    #[tokio::test]
+    async fn a_refused_write_phase_stops_a_walg_restore_before_redis_is_stopped() {
+        // Never contacted: the restore must stop before any Docker call.
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("lazy Docker client"),
+        );
+        let service = RedisService::new("copy".to_string(), docker);
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .endpoint_url("http://127.0.0.1:9")
+                .build(),
+        );
+        let credentials = super::super::S3Credentials {
+            access_key_id: "AKID".to_string(),
+            secret_key: "SECRET".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_name: "backups".to_string(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        };
+        let now = chrono::Utc::now();
+        let s3_source = temps_entities::s3_sources::Model {
+            id: 1,
+            backing_service_id: None,
+            name: "source-1".to_string(),
+            bucket_name: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: String::new(),
+            access_key_id: "AKID".to_string(),
+            secret_key: "SECRET".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            lifecycle_reconcile_failed_at: None,
+            lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let config = ServiceConfig {
+            name: "copy".to_string(),
+            service_type: ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost", "port": "6380", "password": "pw"}),
+        };
+        for location in [
+            "s3://backups/external_services/redis/copy/walg",
+            "external_services/redis/copy/backup.rdb.gz",
+        ] {
+            let error = service
+                .restore_from_s3_gated(
+                    &s3_client,
+                    &credentials,
+                    location,
+                    &s3_source,
+                    config.clone(),
+                    &CancelledGate,
+                )
+                .await
+                .expect_err("a refused write phase must stop the restore");
+            assert!(
+                matches!(error, EngineError::RestoreCancelled(_)),
+                "{location}: expected a cancellation, got: {error}"
+            );
+        }
     }
 
     #[test]

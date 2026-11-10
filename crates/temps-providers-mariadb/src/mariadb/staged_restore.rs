@@ -67,6 +67,12 @@ pub struct MariaDbInPlaceRestore<'a> {
     pub target_user_data: Option<&'a str>,
     /// The point to recover to; `None` restores the backup as it was.
     pub recovery_target: Option<&'a RecoveryTarget>,
+    /// Entered at the restore's last safe point: before the server is
+    /// stopped for a WAL-G base, after a legacy base or a dump is downloaded
+    /// and before it is applied. A worker's agent passes its deadline here,
+    /// so a restore past it before it began writing never touches the
+    /// server, and one that began is let finish or put the original back.
+    pub gate: &'a dyn crate::RestoreGate,
 }
 
 /// A WAL-G base swapped into a container, the original kept aside until
@@ -129,6 +135,7 @@ impl MariaDbService {
         let key = Self::backup_key_from_location(restore.location, bucket);
         let Some(target) = restore.recovery_target else {
             if Self::is_walg_repository_location(&key) {
+                restore.gate.begin_target_writes().await?;
                 let swap = self
                     .stage_walg_base(
                         config,
@@ -143,11 +150,18 @@ impl MariaDbService {
                 let mbstream_path = temp_dir.path().join("base.mbstream");
                 self.download_and_gunzip_base(restore.s3_client, bucket, &key, &mbstream_path)
                     .await?;
+                restore.gate.begin_target_writes().await?;
                 self.physical_restore_into_container(config, &mbstream_path)
                     .await?;
             } else {
-                self.restore_logical_from_s3(restore.s3_client, bucket, restore.location, config)
-                    .await?;
+                self.restore_logical_from_s3(
+                    restore.s3_client,
+                    bucket,
+                    restore.location,
+                    config,
+                    restore.gate,
+                )
+                .await?;
             }
             info!(service = %self.name, "MariaDB in-place restore completed");
             return Ok(());
@@ -170,6 +184,7 @@ impl MariaDbService {
         });
 
         if Self::is_walg_repository_location(&key) {
+            restore.gate.begin_target_writes().await?;
             let swap = self
                 .stage_walg_base(
                     config,
@@ -239,6 +254,7 @@ impl MariaDbService {
             let mbstream_path = temp_dir.path().join("base.mbstream");
             self.download_and_gunzip_base(restore.s3_client, bucket, &key, &mbstream_path)
                 .await?;
+            restore.gate.begin_target_writes().await?;
             self.physical_restore_into_container(config, &mbstream_path)
                 .await?;
             self.replay_archived_binlogs(
@@ -902,6 +918,86 @@ impl MariaDbService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate that refuses the write phase, as a node's deadline does once
+    /// it expired before the restore began writing.
+    struct Expired;
+
+    #[async_trait::async_trait]
+    impl crate::RestoreGate for Expired {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+
+        async fn begin_target_writes(&self) -> std::result::Result<(), crate::RestoreCancelled> {
+            Err(crate::RestoreCancelled {
+                target: "mariadb-shop".into(),
+            })
+        }
+    }
+
+    /// A WAL-G restore, in place or to a point in time, whose write phase is
+    /// refused stops before the server is stopped: no Docker call is made.
+    #[tokio::test]
+    async fn a_refused_write_phase_stops_a_walg_restore_before_the_server_is_stopped() {
+        // Never contacted: the restore must stop before any Docker call.
+        let docker = Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("lazy Docker client"),
+        );
+        let service = MariaDbService::new("shop".to_string(), docker);
+        let config: MariaDbConfig = serde_json::from_value(serde_json::json!({
+            "host": "localhost",
+            "port": "3306",
+            "database": "shop",
+            "username": "shop",
+            "password": "pw",
+            "root_password": "root-pw",
+            "docker_image": "mariadb:11"
+        }))
+        .expect("a MariaDB config");
+        let s3_client = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .endpoint_url("http://127.0.0.1:9")
+                .build(),
+        );
+        let credentials = S3Credentials {
+            access_key_id: "AKID".to_string(),
+            secret_key: "SECRET".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_name: "backups".to_string(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        };
+        let point = RecoveryTarget::Time {
+            time: chrono::Utc::now(),
+        };
+        for recovery_target in [None, Some(&point)] {
+            let error = service
+                .restore_in_place_on_this_node(
+                    &config,
+                    MariaDbInPlaceRestore {
+                        s3_client: &s3_client,
+                        s3_credentials: &credentials,
+                        location: "s3://backups/external_services/mariadb/shop/walg",
+                        target_user_data: None,
+                        recovery_target,
+                        gate: &Expired,
+                    },
+                )
+                .await
+                .expect_err("a refused write phase must stop the restore");
+            assert!(
+                matches!(error, EngineError::RestoreCancelled(_)),
+                "pitr={}: expected a cancellation, got: {error}",
+                recovery_target.is_some()
+            );
+        }
+    }
 
     #[test]
     fn binlogs_are_those_of_the_service_the_backup_was_taken_of() {

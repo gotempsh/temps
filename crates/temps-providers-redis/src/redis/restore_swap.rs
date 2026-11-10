@@ -98,6 +98,11 @@ pub(super) struct SwapRestore<'a> {
     pub password: &'a str,
     pub keep_target_bookkeeping: bool,
     pub stage: Stage<'a>,
+    /// Entered before the container is touched, ahead of the restore's
+    /// first write (stopping Redis): a restore cancelled (or, on a node,
+    /// past its deadline) before then never stops the server, and one past
+    /// it is let finish its swap or put the original back.
+    pub gate: &'a dyn super::super::RestoreGate,
 }
 
 /// The token naming a restore's kept original: hex only, so it is safe in
@@ -208,6 +213,9 @@ async fn walg_env(
 impl RedisService {
     /// Run `restore` against its container (see the module documentation).
     pub(super) async fn restore_swapped(&self, restore: SwapRestore<'_>) -> Result<()> {
+        // The last safe point: the container is neither read nor written
+        // before it.
+        restore.gate.begin_target_writes().await?;
         let container = restore.container;
         let inspect = self
             .docker

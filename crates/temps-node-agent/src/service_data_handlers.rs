@@ -882,6 +882,7 @@ async fn run_redis_operation<T, F, Fut>(
     service: &str,
     verb: &str,
     label: &str,
+    writes: Option<Arc<TargetWriteBoundary>>,
     engine: F,
 ) -> Result<T, Box<axum::response::Response>>
 where
@@ -898,7 +899,7 @@ where
         return Err(Box::new(docker_missing(verb, service)));
     };
     let future = engine(state.service_runtime.clone(), Arc::new(docker.clone()));
-    match run_detached(permit, None, future).await {
+    match run_detached(permit, writes, future).await {
         Detached::Done(Ok(outcome)) => Ok(outcome),
         Detached::Done(Err(error)) => {
             tracing::error!(service = %service, %error, "{label} could not run");
@@ -972,6 +973,7 @@ pub async fn redis_walg_backup(
         &service,
         "back up",
         LABEL,
+        None,
         |runtime, docker| async move { runtime.redis_walg_backup(request, docker).await },
     )
     .await
@@ -1029,6 +1031,7 @@ pub async fn redis_rdb_backup(
         &service,
         "back up",
         LABEL,
+        None,
         |runtime, docker| async move { runtime.redis_rdb_backup(request, docker).await },
     )
     .await
@@ -1083,12 +1086,21 @@ pub async fn redis_restore(
         keep_target_bookkeeping = request.keep_target_bookkeeping,
         "Restoring a Redis service on this node in place"
     );
+    // Past its write boundary (Redis stopped for the swap), the restore is
+    // let finish or put the original back, whatever the deadline.
+    let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
+    let engine_writes = Arc::clone(&writes);
     let outcome = match run_redis_operation(
         &state,
         &service,
         "restore",
         LABEL,
-        |runtime, docker| async move { runtime.redis_restore(request, docker).await },
+        Some(writes),
+        |runtime, docker| async move {
+            runtime
+                .redis_restore(request, docker, engine_writes)
+                .await
+        },
     )
     .await
     {
@@ -1861,6 +1873,14 @@ mod tests {
                         runtime.redis_restores.lock().expect("restore")[0].keep_target_bookkeeping
                     );
                 }
+            }
+            // Only a restore is handed a write boundary, so the node's
+            // deadline never drops it once Redis was stopped for the swap.
+            let boundaries = runtime.write_boundaries.lock().expect("boundaries").clone();
+            if path == "/agent/services/redis/restore" {
+                assert_eq!(boundaries, vec![("cache".to_string(), true)], "{path}");
+            } else {
+                assert!(boundaries.is_empty(), "{path}: {boundaries:?}");
             }
         }
     }

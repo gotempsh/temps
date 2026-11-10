@@ -40,8 +40,8 @@ use super::worker_data::{
     s3_credentials, s3_source_row, stream_helper_to_s3, StreamedHelper, WorkerDataError,
 };
 use super::{
-    managed_instance_name, EngineError, ExternalService, RedisService, S3Credentials,
-    SensitiveValues, ServiceConfig, ServiceType,
+    managed_instance_name, EngineError, RedisService, S3Credentials, SensitiveValues,
+    ServiceConfig, ServiceType,
 };
 
 /// What `wal-g backup-push` streams. `redis-cli --rdb -` negotiates
@@ -559,6 +559,7 @@ pub async fn rdb_backup_on_node(
 pub async fn restore_on_node(
     request: RedisRestoreRequest,
     docker: Arc<Docker>,
+    writes: Arc<temps_service_protocol::TargetWriteBoundary>,
 ) -> RedisRestoreResult {
     let RedisRestoreRequest {
         service_id,
@@ -622,8 +623,19 @@ pub async fn restore_on_node(
         managed_instance_name(&service_config.name, service_config.service_type),
         docker,
     );
+    // The node's deadline is the restore's gate: entered before the
+    // container is touched, so a restore past it before then never stops
+    // Redis, and one that stopped it is let finish its swap or put the
+    // original back.
     match instance
-        .restore_from_s3(&client, &credentials, &location, &s3_source, service_config)
+        .restore_from_s3_gated(
+            &client,
+            &credentials,
+            &location,
+            &s3_source,
+            service_config,
+            writes.as_ref(),
+        )
         .await
     {
         Ok(()) => RedisRestoreResult::Completed,
@@ -843,6 +855,7 @@ mod tests {
             "s3://other-bucket/external_services/redis/cache/walg",
             "external_services/redis/cache/2026/u/dump.sql.gz",
         ] {
+            let writes = Arc::new(temps_service_protocol::TargetWriteBoundary::new("cache"));
             let result = restore_on_node(
                 RedisRestoreRequest {
                     service_id: 4,
@@ -852,11 +865,16 @@ mod tests {
                     keep_target_bookkeeping: false,
                 },
                 docker(),
+                Arc::clone(&writes),
             )
             .await;
             assert!(
                 matches!(&result, RedisRestoreResult::Refused { reason } if reason.contains("cannot be restored on this node")),
                 "{location}: {result:?}"
+            );
+            assert!(
+                !writes.writes_began(),
+                "{location}: a refused restore never enters its write phase"
             );
         }
     }
