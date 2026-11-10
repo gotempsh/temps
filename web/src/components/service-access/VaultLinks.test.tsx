@@ -202,9 +202,7 @@ for (const kind of ['project', 'sandbox'] as const) {
       )
       const dialog = within(ui.getByRole('dialog'))
       if (kind === 'sandbox')
-        fireEvent.click(
-          dialog.getByRole('button', { name: 'Sandbox' })
-        )
+        fireEvent.click(dialog.getByRole('button', { name: 'Sandbox' }))
       fireEvent.click(dialog.getByRole('button', { name: 'Link consumer' }))
       await waitFor(() =>
         expect(dialog.getByRole('alert').textContent).toBe(`Select a ${kind}.`)
@@ -225,3 +223,36 @@ for (const kind of ['project', 'sandbox'] as const) {
     }
   })
 }
+
+test('empty links keep the status and linking action in the heading row', async () => {
+  const api = mockApi({
+    'GET /access-vaults/vault_fixture/links': () =>
+      jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    render(
+      <QueryClientProvider client={client}>
+        <VaultLinks vaultId="vault_fixture" />
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    await waitFor(() =>
+      expect(ui.getByText('No consumers linked')).toBeTruthy()
+    )
+    const row = ui.getByRole('heading', { name: 'Linked to' }).parentElement!
+    expect(within(row).getByText('No consumers linked')).toBeTruthy()
+    fireEvent.click(
+      within(row).getByRole('button', { name: 'Link project or sandbox' })
+    )
+    await waitFor(() =>
+      expect(ui.getByRole('dialog', { name: 'Link a consumer' })).toBeTruthy()
+    )
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})

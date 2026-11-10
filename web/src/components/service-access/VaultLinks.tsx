@@ -91,10 +91,15 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
   })
   return (
     <section className="space-y-3" aria-label="Linked to">
-      <h2 className="font-semibold">Linked to</h2>
-      <Button variant="outline" onClick={() => setOpen(true)}>
-        Link project or sandbox
-      </Button>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <h2 className="text-sm font-medium">Linked to</h2>
+        {!links.isPending && !links.isError && links.data?.total === 0 && (
+          <p className="text-sm text-muted-foreground">No consumers linked</p>
+        )}
+        <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+          Link project or sandbox
+        </Button>
+      </div>
       {links.isError && (
         <Callout tone="error" title="Could not load links">
           <Button onClick={() => void links.refetch()}>Retry</Button>
@@ -111,12 +116,7 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
             </div>
           ))}
         </div>
-      ) : links.data?.items.length === 0 ? (
-        <p>
-          No consumers linked. Link a project or sandbox before approving
-          sessions.
-        </p>
-      ) : (
+      ) : links.data?.items.length === 0 ? null : (
         <DataTable
           aria-label="Vault links"
           rows={links.data?.items ?? []}

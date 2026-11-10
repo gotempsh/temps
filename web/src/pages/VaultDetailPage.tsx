@@ -6,6 +6,8 @@ import { useQuery } from '@tanstack/react-query'
 import { serviceProviderName } from '@/components/service-access/service-provider-registry'
 import {
   Clock3,
+  Pencil,
+  ExternalLink,
   Plus,
   PlugZap,
   Layers,
@@ -95,7 +97,6 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Vault', href: '/vault' },
       { label: 'Vaults', href: `/vault` },
       { label: vault.data?.vault.name ?? 'Vault' },
     ])
@@ -114,30 +115,43 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
       return p
     })
   return (
-    <PageContainer width="full">
+    <PageContainer width="full" innerClassName="space-y-4">
       <PageHeader
-        title={vault.data?.vault.name ?? 'Vault'}
+        title={
+          <span className="inline-flex max-w-full items-center gap-2">
+            <span className="min-w-0 [overflow-wrap:anywhere]">
+              {vault.data?.vault.name ?? 'Vault'}
+            </span>
+            {canWrite && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0 text-muted-foreground"
+                aria-label="Edit vault"
+                title="Edit vault"
+                disabled={!vault.data || vault.isFetching || vault.isError}
+                onClick={() => {
+                  setEditingVault((selected) => selected ?? vault.data?.vault)
+                  setEditorOpen(true)
+                }}
+              >
+                <Pencil className="size-4" />
+              </Button>
+            )}
+          </span>
+        }
         actions={
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" asChild>
-              <Link to="/audit-logs?range=all">Audit logs</Link>
-            </Button>
-            <Button
-              variant="outline"
-              disabled={
-                !canWrite || !vault.data || vault.isFetching || vault.isError
-              }
-              onClick={() => {
-                setEditingVault((selected) => selected ?? vault.data?.vault)
-                setEditorOpen(true)
-              }}
+          <Button variant="ghost" size="sm" asChild>
+            <Link
+              to="/audit-logs?range=all"
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Audit logs (opens in a new tab)"
             >
-              Edit vault
-            </Button>
-            <Button variant="outline" asChild>
-              <Link to={`/vault`}>All vaults</Link>
-            </Button>
-          </div>
+              Audit logs
+              <ExternalLink className="size-4" />
+            </Link>
+          </Button>
         }
       />
       {canWrite && <VaultLinks vaultId={vaultId} />}

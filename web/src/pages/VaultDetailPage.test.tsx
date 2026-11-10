@@ -11,7 +11,10 @@ import {
 } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
+import {
+  BreadcrumbProvider,
+  useBreadcrumbs,
+} from '@/contexts/BreadcrumbContext'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
@@ -58,6 +61,14 @@ const service: AccessServiceResponse = {
   created_at: date,
   updated_at: date,
 }
+function BreadcrumbProbe() {
+  const { breadcrumbs } = useBreadcrumbs()
+  return (
+    <output aria-label="Breadcrumb trail">
+      {breadcrumbs.map((item) => item.label).join(' → ')}
+    </output>
+  )
+}
 function mount(tab = 'services', write = true, entry?: string) {
   const client = new QueryClient({
     defaultOptions: {
@@ -91,6 +102,7 @@ function mount(tab = 'services', write = true, entry?: string) {
         initialEntries={[entry ?? `/vault/vaults/vault_test?tab=${tab}`]}
       >
         <BreadcrumbProvider>
+          <BreadcrumbProbe />
           <Routes>
             <Route
               path="/access-services/:serviceId/edit"
@@ -217,12 +229,8 @@ test('vault services show provider logos and readers have no add-service navigat
     within(document.body).queryByRole('link', { name: 'Add service' })
   ).toBeNull()
   expect(
-    (
-      within(document.body).getByRole('button', {
-        name: 'Edit vault',
-      }) as HTMLButtonElement
-    ).disabled
-  ).toBe(true)
+    within(document.body).queryByRole('button', { name: 'Edit vault' })
+  ).toBeNull()
 })
 test('bundle save selects services and lifetime without creating a grant', async () => {
   let submitted: unknown
@@ -686,6 +694,32 @@ test('bundle pagination retains the authorized sandbox consumer', async () => {
     await waitFor(() => expect(seen).toContain('2:sbx_fixture'))
   } finally {
     api.restore()
+    client.clear()
+  }
+})
+
+test('compact vault header has one ancestor, adjacent edit icon and external audit link', () => {
+  const client = mount()
+  try {
+    const ui = within(document.body)
+    const heading = ui.getByRole('heading', { level: 1 })
+    expect(
+      within(heading)
+        .getByRole('button', { name: 'Edit vault' })
+        .querySelector('svg')
+    ).toBeTruthy()
+    expect(ui.getByLabelText('Breadcrumb trail').textContent).toBe(
+      'Vaults → Development'
+    )
+    expect(ui.queryByRole('link', { name: 'All vaults' })).toBeNull()
+    const audit = ui.getByRole('link', {
+      name: 'Audit logs (opens in a new tab)',
+    })
+    expect(audit.getAttribute('href')).toBe('/audit-logs?range=all')
+    expect(audit.getAttribute('target')).toBe('_blank')
+    expect(audit.getAttribute('rel')).toContain('noopener')
+    expect(audit.querySelector('svg')).toBeTruthy()
+  } finally {
     client.clear()
   }
 })
