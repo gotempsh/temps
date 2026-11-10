@@ -13,6 +13,7 @@ use temps_core::{ServiceError, ServiceResult};
 use tracing::debug;
 
 mod access_vault_indexes;
+mod audit_scope_indexes;
 pub(crate) use access_vault_indexes::prepare_consumer_constraints;
 
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
@@ -1091,9 +1092,11 @@ where
     let reference = build_reference_indexes(&mut *connection, on_progress).await;
     let foreign_keys = build_project_foreign_key_indexes(&mut *connection, on_progress).await;
     let vaults = access_vault_indexes::build(connection, on_progress).await;
+    let audit_scopes = audit_scope_indexes::build(connection, on_progress).await;
     reference?;
     foreign_keys?;
     vaults?;
+    audit_scopes?;
 
     Ok(())
 }

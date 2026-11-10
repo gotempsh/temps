@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }
+temps-schema = { path = "../temps-schema" }
 # `mock` powers MockDatabase for the handler authorization tests.
 sea-orm = { workspace = true, features = ["mock"] }
 

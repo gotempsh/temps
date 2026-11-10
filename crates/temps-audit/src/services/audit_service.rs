@@ -3,8 +3,8 @@
 
 use chrono::Utc;
 use sea_orm::{
-    prelude::*, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    prelude::*, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -22,6 +22,56 @@ pub struct AuditLogFilter<'a> {
     pub to: Option<UtcDateTime>,
     pub limit: i32,
     pub offset: i32,
+}
+
+// Each branch can use a payload index before loading audit rows or parsing legacy scope.
+// Materialization and the lateral OFFSET fence keep the planner from scanning
+// unrelated history to join the matching IDs back to their timestamps.
+const RESOURCE_IDS_SQL: &str = r"WITH candidate_ids AS MATERIALIZED (
+ SELECT id FROM audit_logs WHERE temps_audit_json(data)->>'resource_id' = $1
+ UNION
+ SELECT id FROM audit_logs WHERE temps_audit_json(data)->>'vault_id' = $1
+ UNION
+ SELECT event.id FROM access_service_audit_scopes scope
+ JOIN audit_logs event ON temps_audit_json(event.data)->>'service_scope_key' = scope.scope_key
+ WHERE scope.vault_id = $1
+ UNION
+ SELECT event.id FROM (
+  SELECT id FROM access_bundles WHERE vault_id = $1
+  UNION SELECT id FROM access_sessions WHERE vault_id = $1
+  UNION SELECT id FROM access_vault_links WHERE vault_id = $1
+  UNION SELECT unnest(service_ids) FROM access_vaults WHERE id = $1
+  UNION SELECT service_id FROM access_vault_service_history WHERE vault_id = $1
+ ) child JOIN audit_logs event ON temps_audit_json(event.data)->>'resource_id' = child.id
+ WHERE NOT (temps_audit_json(event.data) ? 'vault_id' OR temps_audit_json(event.data) ? 'service_scope_key')
+)
+SELECT entry.id FROM candidate_ids ids
+JOIN LATERAL (SELECT id,audit_date,operation_type,user_id FROM audit_logs WHERE id=ids.id OFFSET 0) entry ON true
+WHERE ($2::text IS NULL OR entry.operation_type LIKE $2)
+AND ($3::integer IS NULL OR entry.user_id=$3)
+AND ($4::timestamptz IS NULL OR entry.audit_date >= $4)
+AND ($5::timestamptz IS NULL OR entry.audit_date <= $5)
+ORDER BY entry.audit_date DESC,entry.id DESC LIMIT $6 OFFSET $7";
+
+#[derive(FromQueryResult)]
+struct AuditId {
+    id: i32,
+}
+
+fn resource_ids_statement(resource_id: &str, filter: &AuditLogFilter<'_>) -> Statement {
+    Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        RESOURCE_IDS_SQL,
+        [
+            resource_id.into(),
+            filter.action.map(|action| format!("%{action}%")).into(),
+            filter.user_id.into(),
+            filter.from.into(),
+            filter.to.into(),
+            (audit_page_limit(filter.limit) as i64).into(),
+            (audit_page_offset(filter.offset) as i64).into(),
+        ],
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,6 +262,28 @@ WHERE id IN (SELECT id FROM expired)
         &self,
         filter: AuditLogFilter<'_>,
     ) -> Result<Vec<AuditLogWithDetails>, AuditQueryError> {
+        // Resolve at most one page of IDs through the resource indexes, then
+        // enrich that bounded page with JOINs. This keeps both query count and
+        // decoded row memory bounded independently of unrelated audit history.
+        let ids = if let Some(resource_id) = filter.resource_id {
+            let ids = AuditId::find_by_statement(resource_ids_statement(resource_id, &filter))
+                .all(self.db.as_ref())
+                .await
+                .map_err(|source| AuditQueryError::Read {
+                    resource_id: Some(resource_id.into()),
+                    operation: filter.action.map(str::to_owned),
+                    user_id: filter.user_id,
+                    limit: filter.limit,
+                    offset: filter.offset,
+                    source,
+                })?;
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            Some(ids.into_iter().map(|row| row.id).collect::<Vec<_>>())
+        } else {
+            None
+        };
         let AuditLogFilter {
             action,
             resource_id,
@@ -223,28 +295,8 @@ WHERE id IN (SELECT id FROM expired)
         } = filter;
         let mut query = temps_entities::audit_logs::Entity::find();
 
-        if let Some(resource_id) = resource_id {
-            query = query.filter(Expr::cust_with_values(
-                r#"EXISTS (
-                    SELECT 1 FROM (SELECT temps_audit_json(audit_logs.data) AS payload OFFSET 0) parsed
-                    WHERE
-                    parsed.payload->>'resource_id' = $1 OR
-                    parsed.payload->>'vault_id' = $1 OR
-                    EXISTS(SELECT 1 FROM access_service_audit_scopes
-                        WHERE scope_key = parsed.payload->>'service_scope_key' AND vault_id = $1) OR
-                    (NOT (parsed.payload ? 'vault_id' OR parsed.payload ? 'service_scope_key') AND
-                     parsed.payload->>'resource_id' IN (
-                        SELECT id FROM access_bundles WHERE vault_id = $1
-                        UNION ALL SELECT id FROM access_sessions WHERE vault_id = $1
-                        UNION ALL SELECT id FROM access_vault_links WHERE vault_id = $1
-                        UNION ALL SELECT unnest(service_ids)
-                            FROM access_vaults WHERE id = $1
-                        UNION ALL SELECT service_id
-                            FROM access_vault_service_history WHERE vault_id = $1
-                     ))
-                )"#,
-                [resource_id],
-            ));
+        if let Some(ids) = ids {
+            query = query.filter(audit_logs::Column::Id.is_in(ids));
         }
         // Apply filters
         if let Some(action_filter) = action {
@@ -265,7 +317,11 @@ WHERE id IN (SELECT id FROM expired)
             .order_by_desc(audit_logs::Column::AuditDate)
             .order_by_desc(audit_logs::Column::Id)
             .limit(audit_page_limit(limit))
-            .offset(audit_page_offset(offset))
+            .offset(if resource_id.is_some() {
+                0
+            } else {
+                audit_page_offset(offset)
+            })
             .find_also_related(users::Entity)
             .find_also_related(ip_geolocations::Entity)
             .all(self.db.as_ref())
@@ -380,7 +436,13 @@ mod tests {
     async fn resource_filter_is_bound_before_pagination_and_details_use_joins() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([Vec::<std::collections::BTreeMap<String, Value>>::new()])
+                .append_query_results([
+                    vec![std::collections::BTreeMap::from([(
+                        "id".into(),
+                        Value::Int(Some(7)),
+                    )])],
+                    Vec::<std::collections::BTreeMap<String, Value>>::new(),
+                ])
                 .into_connection(),
         );
         let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
@@ -403,12 +465,13 @@ mod tests {
             .is_empty());
         drop(service);
         let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
-        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions.len(), 2);
         let statement = &transactions[0].statements()[0];
-        assert!(statement.sql.contains("temps_audit_json(audit_logs.data)"));
+        let details = &transactions[1].statements()[0];
+        assert!(statement.sql.contains("temps_audit_json(data)"));
         assert!(statement.sql.contains("->>'resource_id'"));
-        assert!(statement.sql.contains("LEFT JOIN \"users\""));
-        assert!(statement.sql.contains("LEFT JOIN \"ip_geolocations\""));
+        assert!(details.sql.contains("LEFT JOIN \"users\""));
+        assert!(details.sql.contains("LEFT JOIN \"ip_geolocations\""));
         assert!(statement.sql.contains("LIMIT"));
         assert!(statement.sql.contains("OFFSET"));
         assert!(statement
@@ -418,6 +481,61 @@ mod tests {
             .0
             .contains(&Value::from("vault_fixture")));
         assert!(!statement.sql.contains("vault_fixture"));
+    }
+
+    #[tokio::test]
+    async fn vault_filter_uses_indexes_without_examining_unrelated_history() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping indexed vault audit query: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        temps_schema::run_post_migration_indexes(db.as_ref())
+            .await
+            .unwrap();
+        db.execute_unprepared(r#"INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at)
+ SELECT 'fixture','UPDATE_ACCESS_SERVICE',jsonb_build_object('resource_id','svc_unrelated_' || n)::text,now(),now() FROM generate_series(1,20000) n;
+ INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) VALUES('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_fixture"}',now(),now());
+ ANALYZE audit_logs;"#).await.unwrap();
+        let mut statement = resource_ids_statement(
+            "vault_fixture",
+            &AuditLogFilter {
+                action: None,
+                resource_id: Some("vault_fixture"),
+                user_id: None,
+                from: None,
+                to: None,
+                limit: 20,
+                offset: 0,
+            },
+        );
+        statement.sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", statement.sql);
+        let row = db.query_one(statement).await.unwrap().unwrap();
+        let plan: serde_json::Value = row.try_get("", "QUERY PLAN").unwrap();
+        fn examined(node: &serde_json::Value) -> f64 {
+            let own = if node["Relation Name"] == "audit_logs" {
+                (node["Actual Rows"].as_f64().unwrap_or(0.0)
+                    + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0))
+                    * node["Actual Loops"].as_f64().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            own + node["Plans"]
+                .as_array()
+                .map_or(0.0, |children| children.iter().map(examined).sum())
+        }
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
+        assert!(
+            examined(&plan[0]["Plan"]) < 100.0,
+            "unrelated audit history was scanned: {plan}"
+        );
+        assert!(plan.to_string().contains("audit_logs_resource_id"));
+        test.cleanup().await;
     }
 
     #[tokio::test]
