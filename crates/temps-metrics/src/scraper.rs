@@ -1462,9 +1462,12 @@ mod tests {
                 pg_blocks_since(minute, hit, read, reset),
             )
         };
-        scrape(0, 1_000_000.0, 10_000.0, 0.0).await;
-        scrape(1, 2_000_000.0, 20_000.0, 0.0).await;
+        scrape(0, 1_000_000.0, 5_000.0, 0.0).await;
+        scrape(1, 2_000_000.0, 9_000.0, 0.0).await;
         // Reset, then 9,900 hits and 10,100 reads before the next scrape.
+        // Hits fall below their old value, so the delta step sees that reset;
+        // reads (10,100) are above theirs (9,000), so it reports a delta of
+        // 1,100 and only `stats_reset` reveals the reset.
         scrape(2, 9_900.0, 10_100.0, 600.0).await;
         let mut last = Vec::new();
         for minute in 3..=16 {
@@ -1473,7 +1476,7 @@ mod tests {
         }
 
         // At minute 16 the window holds minutes 2 to 16. Minute 2's skewed
-        // 9,900 / 100 is left out; minutes 3 to 16 are 10,000 / 10,000 each.
+        // 9,900 / 1,100 is left out; minutes 3 to 16 are 10,000 / 10,000 each.
         assert_eq!(served(&last, "pg.cache_hit_ratio"), Some(0.5));
         assert_eq!(served(&last, "pg.cache_blocks_accessed"), Some(280_000.0));
         assert!(
