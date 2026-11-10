@@ -96,6 +96,8 @@ test.each([
   expect(controls.classList.contains('self-end')).toBe(true)
   expect(controls.classList.contains('shrink-0')).toBe(true)
   expect(controls.classList.contains('absolute')).toBe(false)
+  expect(controls.classList.contains('opacity-100')).toBe(true)
+  expect(controls.classList.contains('opacity-0')).toBe(false)
   expect(pre.textContent).toBe(command)
 
   if (!props.disableWrapToggle) {

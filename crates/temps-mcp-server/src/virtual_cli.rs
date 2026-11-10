@@ -22,6 +22,7 @@ pub(crate) struct VirtualCli {
     pub audit_service: std::sync::Arc<dyn temps_core::AuditLogger>,
 }
 
+/// Describe the read tool and, when enabled, the proposal/confirmation tools.
 pub(crate) fn tools(write: bool) -> Vec<McpTool> {
     let mut tools = vec![McpTool {
         name: "temps".into(),
@@ -31,7 +32,7 @@ pub(crate) fn tools(write: bool) -> Vec<McpTool> {
     if write {
         tools.push(McpTool {
             name: "temps_write".into(),
-            description: "Propose a Temps write; show the proposal to the human before confirm_action. Start with `temps --help` and drill down. Never executes directly.".into(),
+            description: "Propose a Temps write; show the proposal to the human before confirm_action. Start with command `--help` on this tool and drill down. Never executes directly.".into(),
             input_schema: tools[0].input_schema.clone(),
         });
         tools.push(McpTool {
@@ -43,6 +44,7 @@ pub(crate) fn tools(write: bool) -> Vec<McpTool> {
     tools
 }
 
+/// Preserve the authenticated actor and request origin during REST replay.
 fn scope(auth: &AuthContext, metadata: &temps_core::RequestMetadata) -> ApiCallScope {
     ApiCallScope {
         auth: auth.clone(),
@@ -55,6 +57,7 @@ fn scope(auth: &AuthContext, metadata: &temps_core::RequestMetadata) -> ApiCallS
     }
 }
 
+/// Retain typed failures while masking untrusted upstream response details.
 fn safe_error(error: impl Into<McpError>) -> McpError {
     match error.into() {
         McpError::Cli {
@@ -75,10 +78,12 @@ fn safe_error(error: impl Into<McpError>) -> McpError {
     }
 }
 
+/// Redact structured credentials and cap the displayed tool text.
 fn safe(text: &str) -> String {
     cap_output(redact_json_string(text))
 }
 
+/// Bound output size without splitting a UTF-8 code point.
 fn cap_output(mut text: String) -> String {
     const LIMIT: usize = 16 * 1024;
     if text.len() > LIMIT {
@@ -94,6 +99,7 @@ fn cap_output(mut text: String) -> String {
 
 // The operation comes from the shared caller's result envelope, not the
 // upstream response body. Only successful API data receives its schema policy.
+/// Apply operation-aware redaction to the trusted caller result envelope.
 fn safe_read_result(text: &str) -> String {
     let Ok(mut result) = serde_json::from_str::<Value>(text) else {
         return safe(text);
@@ -120,12 +126,14 @@ struct PendingWrite {
     plugin_revision: Option<String>,
 }
 
+/// Require an API-key identity for owner-bound proposals.
 fn key_id(auth: &AuthContext) -> Result<i32, McpError> {
     auth.api_key_info()
         .map(|(_, id)| id)
         .ok_or(McpError::ProposalOwnerMismatch)
 }
 
+/// Run a read or prepare a write proposal without performing a mutation.
 pub(crate) async fn execute(
     state: &VirtualCli,
     auth: &AuthContext,
@@ -185,6 +193,7 @@ pub(crate) async fn execute(
     }
 }
 
+/// Consume an owner-bound proposal, replay with current auth, and audit the outcome.
 pub(crate) async fn confirm(
     state: &VirtualCli,
     auth: &AuthContext,
@@ -252,6 +261,14 @@ mod tests {
                 let tools = crate::registry::collect_tools(&groups, write);
                 assert!(tools.iter().any(|tool| tool.name == "temps"));
                 assert_eq!(tools.iter().any(|tool| tool.name == "temps_write"), write);
+                if write {
+                    assert!(tools
+                        .iter()
+                        .find(|tool| tool.name == "temps_write")
+                        .unwrap()
+                        .description
+                        .contains("command `--help` on this tool"));
+                }
                 assert_eq!(
                     tools
                         .iter()
@@ -425,6 +442,100 @@ mod tests {
                 assert_eq!(writes.load(Ordering::SeqCst), 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_array_items_do_not_echo_input() {
+        let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/variables":{"post":{"operationId":"create_environment_variable","requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"environment_ids":{"type":"array","items":{"type":"integer"}}}}}}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let (state, writes, _) = fixture();
+        state.write_api_tools.set(
+            temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                axum::Router::new(),
+                &api,
+                vec!["create_environment_variable".into()],
+            ),
+        );
+        for input in [
+            "arbitrary-private-input",
+            "postgres://fixture:private@example.test/db",
+        ] {
+            let error = execute(&state, &auth(3,true), "temps_write", &json!({"command":format!("create_environment_variable --environment_ids 1 {input}")})).await.unwrap_err().to_string();
+            assert!(error.contains("environment_ids"));
+            assert!(error.contains("item 2"));
+            assert!(!error.contains(input));
+            assert!(!error.contains("private"));
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn environment_names_remain_visible_through_mcp() {
+        for operation in [
+            "get_environment_variables",
+            "get_resolved_environment_variables",
+        ] {
+            let router = axum::Router::new().route("/variables", axum::routing::get(|| async {
+                axum::Json(json!([{"key":"DATABASE_URL","value":"fixture-private","value_preview":"fixture-private"}]))
+            }));
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/variables":{"get":{"operationId":operation,"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let (state, _, _) = fixture();
+            state
+                .api_tools
+                .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                    router,
+                    &api,
+                    vec![operation.into()],
+                ));
+            let result = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":operation}),
+            )
+            .await
+            .unwrap();
+            let result: Value = serde_json::from_str(&result.content[0].text).unwrap();
+            assert_eq!(result["data"][0]["key"], "DATABASE_URL");
+            assert_eq!(result["data"][0]["value"], "***");
+            assert_eq!(result["data"][0]["value_preview"], "***");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_confirmations_execute_once() {
+        let (state, writes, _) = fixture();
+        let proposal = execute(
+            &state,
+            &auth(3, true),
+            "temps_write",
+            &json!({"command":"write_fixture"}),
+        )
+        .await
+        .unwrap();
+        let token = proposal.proposal_token.unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let run = || {
+            let args = state.proposals.peek(&token).unwrap().arguments;
+            barrier.wait();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            match runtime.block_on(confirm(&state, &auth(3, true), &metadata(), &token, args)) {
+                Ok(_) => 1,
+                Err(McpError::ProposalNotFound) => 0,
+                Err(error) => panic!("unexpected confirmation error: {error}"),
+            }
+        };
+        let count = std::thread::scope(|scope| {
+            let a = scope.spawn(run);
+            let b = scope.spawn(run);
+            a.join().unwrap() + b.join().unwrap()
+        });
+        assert_eq!(count, 1);
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

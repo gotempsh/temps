@@ -118,7 +118,7 @@ pub enum ApiToolError {
 
     /// A parameter value is not one of the declared enum members.
     #[error(
-        "Parameter '{name}' has value '{value}' which is not one of the allowed values: \
+        "Parameter '{name}' must be one of the allowed values: \
          [{allowed}] for operation '{operation_id}'."
     )]
     BadEnum {

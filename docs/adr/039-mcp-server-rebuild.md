@@ -513,8 +513,9 @@ Rejected: leaves self-hosted users without MCP support.
   for the `mcp add/remove/status` commands.
 - **Migration needed:** yes — delete `mcp/` workspace, delete
   `skills/temps-mcp-setup/`, verify npm deprecation.
-- **Breaking changes:** no — the new endpoint is additive.  Existing skills and
-  CLI commands are unaffected.
+- **Breaking changes:** yes — the endpoint-specific tools, including edge-rule
+  tools, are removed. Refresh client tool discovery and start with `temps --help`.
+  Edge rules remain available through the console and REST API.
 - **Security auditor sign-off required** before Cloud enablement.
 - **Feature flag:** use ADR-034 flag system; default off until security review
   is complete.

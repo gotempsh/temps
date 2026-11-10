@@ -1508,7 +1508,7 @@ fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
                 let mut known: Vec<&str> = shape.variants.keys().map(String::as_str).collect();
                 known.sort_unstable();
                 return Some(format!(
-                    "'{discriminator}' is '{tag}', which is not one of: {}",
+                    "'{discriminator}' must be one of: {}",
                     known.join(", ")
                 ));
             };
@@ -1584,13 +1584,9 @@ fn json_matches_type(value: &Value, ty: &str) -> bool {
     }
 }
 
-/// Render a supplied value compactly for an error message, so the caller can
-/// see that it sent `"0.5"` rather than `0.5`.
+/// Describe only the type of a rejected input; never echo its contents.
 fn render_value(value: &Value) -> String {
-    match value {
-        Value::String(s) => format!("the string \"{s}\""),
-        other => other.to_string(),
-    }
+    json_kind(value).to_string()
 }
 
 /// Name a JSON value's kind, for error messages.
@@ -2506,9 +2502,9 @@ mod tests {
             panic!("expected BadObjectShape, got {err:?}");
         };
         assert!(problem.contains("threshold"), "{problem}");
-        // Showing the quotes is the whole point — `0.5` and `"0.5"` are
-        // indistinguishable in a message that just echoes the value.
-        assert!(problem.contains("the string \"0.5\""), "{problem}");
+        // The type distinguishes a quoted number without exposing the input.
+        assert!(problem.contains("a string"), "{problem}");
+        assert!(!problem.contains("0.5"), "{problem}");
         assert!(problem.contains("number"), "{problem}");
     }
 
@@ -3245,15 +3241,10 @@ mod tests {
             caller.prepare_write_cli_without_secret_input(command, &scope),
             WritePrepareOutcome::Invalid(_)
         ));
-        assert!(caller
-            .execute_approved_write(
-                &prepared.operation_id,
-                prepared.params.clone(),
-                &scope,
-                None
-            )
-            .await
-            .is_err());
+        assert!(matches!(caller.execute_approved_write(
+            &prepared.operation_id, prepared.params.clone(), &scope, None
+        ).await, Err(ApiToolError::SecretsUnavailable { operation_id, field })
+            if operation_id == "create_source" && field == "/secret_key"));
         assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
         scope.secrets = Some(std::sync::Arc::new(Resolver));
         caller

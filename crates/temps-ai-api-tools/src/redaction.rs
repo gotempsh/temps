@@ -56,6 +56,18 @@ pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
 pub fn redact_api_result(operation_id: &str, value: &serde_json::Value) -> serde_json::Value {
     let mut redacted = redact_value(value);
     match operation_id {
+        "get_environment_variables" | "get_resolved_environment_variables" => {
+            if let (Some(original), Some(masked)) = (value.as_array(), redacted.as_array_mut()) {
+                for (original, masked) in original.iter().zip(masked) {
+                    if let (Some(name), Some(object)) = (
+                        original.get("key").and_then(serde_json::Value::as_str),
+                        masked.as_object_mut(),
+                    ) {
+                        object.insert("key".into(), serde_json::Value::String(redact_text(name)));
+                    }
+                }
+            }
+        }
         "query_metrics" => {
             if let (Some(original), Some(masked)) = (
                 value.get("data").and_then(serde_json::Value::as_array),
@@ -120,8 +132,8 @@ pub fn redact_api_proposal(operation_id: &str, params: &serde_json::Value) -> se
     }
 }
 
-// OtelMetricsResponse.data contains MetricBucket values. Restore only the
-// declared measurement types; unexpected strings/objects stay masked.
+/// Restore declared metric measurements and sanitize ordered series labels.
+/// Unexpected strings or objects in numeric fields remain masked.
 fn restore_metric_bucket(original: &serde_json::Value, redacted: &mut serde_json::Value) {
     let Some(object) = redacted.as_object_mut() else {
         return;
@@ -154,6 +166,7 @@ fn restore_metric_bucket(original: &serde_json::Value, redacted: &mut serde_json
     }
 }
 
+/// Preserve known flag configuration while masking nested credential fields.
 fn restore_flag_fields(original: &serde_json::Value, redacted: &mut serde_json::Value) {
     let Some(object) = redacted.as_object_mut() else {
         return;
@@ -200,6 +213,7 @@ pub fn redact_json_string(value: &str) -> String {
 pub fn redact_text(value: &str) -> String {
     static ASSIGNMENT_SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
     static BEARER_SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    static URL_USERINFO: OnceLock<Option<regex::Regex>> = OnceLock::new();
     static PROVIDER_SECRET: OnceLock<Option<regex::Regex>> = OnceLock::new();
 
     let assignments = ASSIGNMENT_SECRET.get_or_init(|| {
@@ -212,7 +226,13 @@ pub fn redact_text(value: &str) -> String {
     let provider = PROVIDER_SECRET
         .get_or_init(|| regex::Regex::new(r"\b(?:sk|key|token)-[A-Za-z0-9._-]{6,}").ok());
 
-    let scrubbed = redact_cli_secret_flags(value);
+    let userinfo = URL_USERINFO
+        .get_or_init(|| regex::Regex::new(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s?#]+@").ok());
+    let scrubbed = userinfo.as_ref().map_or_else(
+        || value.to_string(),
+        |pattern| pattern.replace_all(value, "${1}***@").into_owned(),
+    );
+    let scrubbed = redact_cli_secret_flags(&scrubbed);
     let scrubbed = assignments.as_ref().map_or_else(
         || scrubbed.clone(),
         |pattern| pattern.replace_all(&scrubbed, "$1$2***").into_owned(),
@@ -262,6 +282,7 @@ fn redact_cli_secret_flags(input: &str) -> String {
     output
 }
 
+/// Normalize a CLI token for sensitive-flag detection without executing it.
 fn normalize_cli_token(raw: &str) -> String {
     let mut normalized = String::new();
     let mut quote = None;
@@ -276,6 +297,7 @@ fn normalize_cli_token(raw: &str) -> String {
     normalized
 }
 
+/// Identify flags whose arguments must never be returned in tool output.
 fn is_sensitive_cli_flag(token: &str) -> bool {
     let Some(flag) = token.strip_prefix("--") else {
         return false;
@@ -319,6 +341,38 @@ fn cli_token_spans(input: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_survive_but_environment_values_and_url_credentials_do_not() {
+        for operation in [
+            "get_environment_variables",
+            "get_resolved_environment_variables",
+        ] {
+            let result = redact_api_result(
+                operation,
+                &serde_json::json!([{"key":"DATABASE_URL","value":"private","value_preview":"private"}]),
+            );
+            assert_eq!(result[0]["key"], "DATABASE_URL");
+            assert_eq!(result[0]["value"], "***");
+            assert_eq!(result[0]["value_preview"], "***");
+        }
+        for url in [
+            "postgres://fixture:private@example.test/db",
+            "https://fixture:p%40ss@example.test/path",
+            "https://fixture:p@private@example.test/path",
+            "redis://:private@[::1]:6379",
+        ] {
+            let result = redact_api_result(
+                "query_metrics",
+                &serde_json::json!({"data":[{"series_key":[["db.connection",url],["http.method","GET"]]}]}),
+            );
+            let value = result["data"][0]["series_key"][0][1].as_str().unwrap();
+            assert!(value.contains("://***@"));
+            assert!(!value.contains("private"));
+            assert!(!value.contains("p%40ss"));
+            assert_eq!(result["data"][0]["series_key"][1][1], "GET");
+        }
+    }
 
     #[test]
     fn metric_query_preserves_measurements_and_redacts_credentials() {

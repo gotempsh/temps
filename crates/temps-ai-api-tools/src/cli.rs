@@ -544,9 +544,7 @@ fn parse_flags(tokens: &[String], operation: Option<&ApiOperation>) -> Result<Va
     while i < tokens.len() {
         let t = &tokens[i];
         let Some(rest) = t.strip_prefix("--") else {
-            return Err(format!(
-                "Unexpected argument '{t}'. Flags must look like `--name value` or `--name=value`."
-            ));
+            return Err("Unexpected positional argument. Flags must look like `--name value` or `--name=value`.".to_string());
         };
         let (name, inline) = match rest.split_once('=') {
             Some((k, v)) => (k, Some(v)),
@@ -612,7 +610,7 @@ fn parameter_spec<'a>(operation: Option<&'a ApiOperation>, flag: &str) -> Option
 /// Accepts a single value (`15`), comma-separated values (`15,16`), a JSON array
 /// (`[15,16]`, even when the shell-level tokenizer split it at spaces), or
 /// several tokens (`15 16`). Every item is coerced to `item_ty`; an item that
-/// cannot be is an error naming the flag, the position and the offending value,
+/// cannot be is an error naming the flag, the position and the expected type,
 /// so the model corrects the call instead of sending it to be rejected by the
 /// API after a human approved it.
 fn coerce_array(flag: &str, raw: &[&str], item_ty: Option<&str>) -> Result<Vec<Value>, String> {
@@ -640,8 +638,9 @@ fn coerce_array(flag: &str, raw: &[&str], item_ty: Option<&str>) -> Result<Vec<V
         }
         if chunk.starts_with('[') {
             let parsed = serde_json::from_str::<Vec<Value>>(chunk).map_err(|error| {
+                let (line, column) = (error.line(), error.column());
                 format!(
-                    "Invalid JSON array for `--{flag}`: {error}. Pass a list as \
+                    "Invalid JSON array for `--{flag}`: invalid JSON at line {line}, column {column}. Pass a list as \
                      `--{flag} 1,2` or `--{flag} '[1,2]'`."
                 )
             })?;
@@ -660,7 +659,7 @@ fn coerce_array(flag: &str, raw: &[&str], item_ty: Option<&str>) -> Result<Vec<V
                 let position = items.len() + 1;
                 if piece.is_empty() {
                     return Err(format!(
-                        "Empty item {position} in `--{flag}`: '{chunk}'. Separate values with a \
+                        "Empty item {position} in `--{flag}`. Separate values with a \
                          single comma, for example `--{flag} 1,2`."
                     ));
                 }
@@ -690,13 +689,9 @@ fn coerce_array_item(
     value: Value,
     item_ty: Option<&str>,
 ) -> Result<Value, String> {
-    let mismatch = |expected: &str, value: &Value| {
-        let shown = match value {
-            Value::String(s) => format!("the string \"{s}\""),
-            other => other.to_string(),
-        };
+    let mismatch = |expected: &str, _value: &Value| {
         format!(
-            "Invalid item {position} for `--{flag}`: {shown} is not {expected}. Pass a list as \
+            "Invalid item {position} for `--{flag}`: expected {expected}. Pass a list as \
              `--{flag} a,b`, a JSON array `--{flag} '[a,b]'`, or repeat the flag."
         )
     };
@@ -752,7 +747,8 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
     match expected_type {
         Some("json") => {
             return serde_json::from_str(s.trim()).map_err(|error| {
-                format!("Invalid JSON value for `--{flag}`: {error}. Use a JSON number, boolean, null, object, array or double-quoted string.")
+                let (line, column) = (error.line(), error.column());
+                format!("Invalid JSON value for `--{flag}`: invalid JSON at line {line}, column {column}. Use a JSON number, boolean, null, object, array or double-quoted string.")
             });
         }
         Some("string") => {
@@ -760,7 +756,13 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
             if trimmed.starts_with('"') && trimmed.ends_with('"') {
                 return serde_json::from_str::<String>(trimmed)
                     .map(Value::String)
-                    .map_err(|error| format!("Invalid JSON string for `--{flag}`: {error}."));
+                    .map_err(|error| {
+                        format!(
+                            "Invalid JSON string for `--{flag}` at line {}, column {}.",
+                            error.line(),
+                            error.column()
+                        )
+                    });
             }
             return Ok(Value::String(s.to_string()));
         }
@@ -768,7 +770,7 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
             return s
                 .parse::<i64>()
                 .map(Value::from)
-                .map_err(|error| format!("Invalid integer for `--{flag}`: '{s}' ({error})."));
+                .map_err(|_| format!("Invalid integer for `--{flag}`."));
         }
         Some("number") => {
             return s
@@ -777,14 +779,14 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
                 .filter(|number| number.is_finite())
                 .and_then(serde_json::Number::from_f64)
                 .map(Value::Number)
-                .ok_or_else(|| format!("Invalid number for `--{flag}`: '{s}'."));
+                .ok_or_else(|| format!("Invalid number for `--{flag}`."));
         }
         Some("boolean") => {
             return match s {
                 "true" => Ok(Value::Bool(true)),
                 "false" => Ok(Value::Bool(false)),
                 _ => Err(format!(
-                    "Invalid boolean for `--{flag}`: '{s}'. Use `true` or `false`."
+                    "Invalid boolean for `--{flag}`. Use `true` or `false`."
                 )),
             };
         }
@@ -833,8 +835,9 @@ fn coerce(flag: &str, s: &str, expected_type: Option<&str>) -> Result<Value, Str
 
 fn parse_structured_value(flag: &str, s: &str) -> Result<Value, String> {
     serde_json::from_str::<Value>(s.trim()).map_err(|error| {
+                let (line, column) = (error.line(), error.column());
         format!(
-            "Invalid JSON for `--{flag}`: {error}. Object and array values must be \
+            "Invalid JSON for `--{flag}`: invalid JSON at line {line}, column {column}. Object and array values must be \
              valid JSON with double-quoted keys and string values, for example \
              `--{flag} '{{\"database\":\"postgres\",\"username\":\"postgres\"}}'`."
         )
@@ -853,6 +856,20 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validation_errors_omit_raw_values() {
+        let secret = "arbitrary-private-input";
+        for ty in ["integer", "number", "boolean", "json", "object"] {
+            assert!(!coerce("field", secret, Some(ty))
+                .unwrap_err()
+                .contains(secret));
+        }
+        let error = coerce_array("environment_ids", &["1", secret], Some("integer")).unwrap_err();
+        assert!(error.contains("item 2"));
+        assert!(error.contains("environment_ids"));
+        assert!(!error.contains(secret));
+    }
+
     use utoipa::openapi::{
         path::{OperationBuilder, PathItem, PathsBuilder},
         OpenApiBuilder,
@@ -1359,11 +1376,11 @@ mod tests {
     }
 
     #[test]
-    fn array_item_mismatches_are_typed_errors_naming_flag_position_and_value() {
+    fn array_item_mismatches_name_flag_position_and_type_without_value() {
         let error = parsed("--environment_ids 15,abc", "environment_ids").unwrap_err();
         assert!(error.contains("`--environment_ids`"), "{error}");
         assert!(error.contains("item 2"), "{error}");
-        assert!(error.contains("\"abc\""), "{error}");
+        assert!(!error.contains("abc"), "{error}");
         assert!(error.contains("an integer"), "{error}");
 
         let error = parsed("--environment_ids [1.5]", "environment_ids").unwrap_err();

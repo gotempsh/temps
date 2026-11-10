@@ -190,7 +190,7 @@ export function CodeBlock({
           slightly-lifted tone in the docs; without it the block reads as a
           flat hole in the page. */}
       <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
-        <div className="mt-2 mr-2 flex shrink-0 self-end items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+        <div className="mt-2 mr-2 flex shrink-0 self-end items-center gap-0.5 opacity-100">
           <Button
             size="icon"
             variant="ghost"
