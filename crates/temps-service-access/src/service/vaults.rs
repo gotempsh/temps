@@ -251,9 +251,6 @@ impl ServiceAccessService {
             use sea_orm::sea_query::Expr;
             let conflict = bundles::Entity::find()
                 .filter(bundles::Column::RetiredAt.is_null())
-                .apply_if(project_id, |q, id| {
-                    q.filter(bundles::Column::ProjectId.eq(id))
-                })
                 .filter(bundles::Column::VaultId.eq(&id))
                 .filter(Expr::cust_with_values(
                     "NOT (service_ids <@ $1::text[])",
@@ -333,9 +330,6 @@ impl ServiceAccessService {
         let (page, page_size) = query.normalized();
         let pages = bundles::Entity::find()
             .filter(bundles::Column::RetiredAt.is_null())
-            .apply_if(project_id, |q, id| {
-                q.filter(bundles::Column::ProjectId.eq(id))
-            })
             .filter(bundles::Column::VaultId.eq(vault_id))
             .order_by_desc(bundles::Column::CreatedAt)
             .order_by_desc(bundles::Column::Id)
@@ -407,9 +401,6 @@ impl ServiceAccessService {
         let mut model = if let Some(id) = id {
             let current = bundles::Entity::find_by_id(&id)
                 .filter(bundles::Column::RetiredAt.is_null())
-                .apply_if(project_id, |q, id| {
-                    q.filter(bundles::Column::ProjectId.eq(id))
-                })
                 .filter(bundles::Column::VaultId.eq(vault_id))
                 .lock_exclusive()
                 .one(&tx)
@@ -567,9 +558,11 @@ mod database_tests {
             )
             .await
             .is_err());
+        // General bundles can be created inside a migrated project vault.
+        // Legacy edits must validate their membership too.
         let bundle = service
             .save_bundle(
-                9602,
+                None,
                 &vault.id,
                 None,
                 make(vec![definition.id.clone()], 900),
@@ -577,6 +570,22 @@ mod database_tests {
             .await
             .unwrap();
         assert_eq!(bundle.service_ids, vec![definition.id.clone()]);
+        assert!(bundle.project_id.is_none());
+        let updated = service
+            .save_bundle(
+                9602,
+                &vault.id,
+                Some(bundle.id.clone()),
+                SaveAccessBundle {
+                    name: "Updated APIs".into(),
+                    service_ids: bundle.service_ids.clone(),
+                    ttl_seconds: 900,
+                    expected_version: Some(bundle.version),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.version, 2);
         assert!(service
             .save_vault(
                 9602,

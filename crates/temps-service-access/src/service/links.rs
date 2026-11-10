@@ -64,6 +64,17 @@ impl ServiceAccessService {
         .map_err(|e| {
             AccessError::resource_database("lock vaults for service retirement", service_id, e)
         })?;
+        // Renewal holds its assignment before locking the service. Acquire the
+        // same order so retirement cannot deadlock with an in-flight renewal.
+        tx.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM sandbox_service_assignments WHERE service_id=$1 ORDER BY id FOR UPDATE",
+            [service_id.into()],
+        ))
+        .await
+        .map_err(|e| {
+            AccessError::resource_database("lock assignments for service retirement", service_id, e)
+        })?;
         services::Entity::find_by_id(service_id)
             .lock_exclusive()
             .one(&tx)
@@ -415,11 +426,11 @@ mod tests {
             .unwrap();
         let db = test.connection_arc();
         db.execute_unprepared("INSERT INTO users(id,name,email) VALUES(9911,'Fixture','fixture@example.com'); INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9911,'Fixture','repo','owner','/','main','nodejs','vault-link-fixture',now(),now()); INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9911,'sbx_link_fixture','Fixture',9911,NULL,'running','docker'),(9912,'sbx_project_fixture','Project fixture',9911,9911,'running','docker')").await.unwrap();
-        let service = ServiceAccessService::new(
+        let service = Arc::new(ServiceAccessService::new(
             db.clone(),
             super::super::tests::encryption(),
             Arc::new(UnavailableTokenlessBroker),
-        );
+        ));
         let vault = service
             .save_vault(
                 None,
@@ -539,7 +550,49 @@ mod tests {
         .await
         .unwrap();
         db.execute_unprepared("INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,service_version,requested_by,approved_by,approved_at,next_reconcile_at) VALUES('assignment_retirement',9911,9912,'svc_fixture',1,9911,9911,now(),now())").await.unwrap();
-        service.retire_service("svc_fixture").await.unwrap();
+        // Reproduce renewal's assignment -> service lock order while retirement
+        // waits. The service must remain lockable by the renewal transaction.
+        let renewal = db.begin().await.unwrap();
+        renewal.execute_unprepared("SELECT id FROM sandbox_service_assignments WHERE id='assignment_retirement' FOR UPDATE").await.unwrap();
+        let renewal_pid: i32 = renewal
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_backend_pid() AS pid",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "pid")
+            .unwrap();
+        let retiring = service.clone();
+        let retirement = tokio::spawn(async move { retiring.retire_service("svc_fixture").await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = db.query_one(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))) AS waiting",
+                    [renewal_pid.into()],
+                )).await.unwrap().unwrap().try_get("", "waiting").unwrap();
+                if waiting { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        let locked = renewal
+            .execute_unprepared(
+                "SELECT id FROM sandbox_access_services WHERE id='svc_fixture' FOR UPDATE NOWAIT",
+            )
+            .await;
+        // Always release the renewal before asserting, including a regression.
+        renewal.rollback().await.unwrap();
+        let retired = tokio::time::timeout(std::time::Duration::from_secs(10), retirement)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            locked.is_ok(),
+            "retirement must wait on assignments before locking their service: {locked:?}"
+        );
+        retired.unwrap();
         let assignment = temps_entities::sandbox_service_assignments::Entity::find_by_id(
             "assignment_retirement",
         )

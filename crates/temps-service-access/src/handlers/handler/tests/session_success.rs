@@ -46,11 +46,36 @@ async fn session_route(projectless: bool, removal: &str) {
         .await
         .unwrap();
     if projectless {
-        state
-            .service
-            .link_vault(&vault.id, None, Some(9801))
-            .await
-            .unwrap();
+        let mut manager = test_user();
+        manager.id = 9801;
+        let response = send(
+            "POST",
+            &format!("/access-vaults/{}/links", vault.id),
+            r#"{"sandbox_id":"sbx_dispatch"}"#,
+            Some(AuthContext::new_session(manager, Role::Admin)),
+            state.clone(),
+        )
+        .await;
+        let status = response.status();
+        let raw = to_bytes(response.into_body(), 8192).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&raw)
+        );
+        let linked: crate::link_types::VaultLinkResponse = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(linked.vault_id, vault.id);
+        assert_eq!(linked.sandbox_id, Some(9801));
+        assert_eq!(linked.project_id, None);
+        assert!(linked.revoked_at.is_none());
+        let events = audit.0.lock().unwrap();
+        assert!(events
+            .iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+            .any(|event| event["operation"] == "CREATE_ACCESS_VAULT_LINK"
+                && event["resource_id"] == linked.id
+                && event["context"]["user_id"] == 9801));
     }
     let mut selections = Vec::new();
     for name in ["API", "Other API"] {
@@ -283,11 +308,31 @@ async fn session_route(projectless: bool, removal: &str) {
     .unwrap()
     .unwrap();
     match removal {
-        "unlink" => state
-            .service
-            .unlink_vault(&vault.id, stored.link_id.as_deref().unwrap())
-            .await
-            .unwrap(),
+        "unlink" => {
+            let link_id = stored.link_id.as_deref().unwrap();
+            let mut manager = test_user();
+            manager.id = 9801;
+            let response = send(
+                "DELETE",
+                &format!("/access-vaults/{}/links/{link_id}", vault.id),
+                "",
+                Some(AuthContext::new_session(manager, Role::Admin)),
+                state.clone(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap()
+                .is_empty());
+            let events = audit.0.lock().unwrap();
+            assert!(events
+                .iter()
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .any(|event| event["operation"] == "REVOKE_ACCESS_VAULT_LINK"
+                    && event["resource_id"] == link_id
+                    && event["context"]["user_id"] == 9801));
+        }
         "bundle" => state
             .service
             .retire_vault_resource(&vault.id, Some(&bundle.id))
