@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::control_plane::ControlPlaneTarget;
+use super::dump_capture::WorkdirGuard;
 use super::pg_client_tools::{self, HostTool, HostToolProbe};
 use crate::execution::engine_v2::BackupError;
 
@@ -122,7 +123,10 @@ pub enum HostDumpError {
         stderr: String,
     },
 
-    #[error("`pg_dumpall` and `pg_dump` exited successfully but wrote an empty dump to '{path}'")]
+    #[error(
+        "`pg_dumpall` and `pg_dump` exited successfully but wrote nothing to '{path}'; \
+         refusing to upload an empty control-plane dump"
+    )]
     EmptyDump { path: PathBuf },
 
     #[error("Control-plane host dump cancelled")]
@@ -251,6 +255,9 @@ pub(crate) struct HostDumpRequest<'a> {
     pub gz_path: PathBuf,
     /// Both tools' stderr, read back into the error when one fails.
     pub stderr_path: PathBuf,
+    /// Keeps the attempt directory holding these paths alive until the
+    /// blocking compression is done with it (see [`gzip_file`]).
+    pub workdir: WorkdirGuard,
 }
 
 /// `pg_dumpall --globals-only` arguments, the same as the sidecar's.
@@ -292,8 +299,9 @@ pub(crate) fn pg_dump_args(
 /// Run `pg_dumpall --globals-only` then `pg_dump` into `sql_path`, gzip it
 /// into `gz_path` and return the compressed size.
 ///
-/// Both children are killed when `cancel` fires or this future is dropped
-/// (the executor's wall-clock timeout drops it).
+/// Both children are killed, and the compression stops, when `cancel` fires
+/// or this future is dropped (the executor's wall-clock timeout drops it
+/// without firing `cancel`).
 pub(crate) async fn run_host_dump(
     request: HostDumpRequest<'_>,
     cancel: &CancellationToken,
@@ -325,18 +333,29 @@ pub(crate) async fn run_host_dump(
     .await?;
     drop(outputs);
 
-    let size = gzip_file(&request.sql_path, &request.gz_path, cancel).await?;
+    // Checked on the SQL, not the gzip file: gzip writes a header and a
+    // trailer even for empty input, so a compressed empty dump is not empty.
+    let sql_len = tokio::fs::metadata(&request.sql_path)
+        .await
+        .map_err(|source| HostDumpError::Io {
+            operation: "stat",
+            path: request.sql_path.clone(),
+            source,
+        })?
+        .len();
+    if sql_len == 0 {
+        return Err(HostDumpError::EmptyDump {
+            path: request.sql_path,
+        });
+    }
+
+    let size = gzip_file(&request.sql_path, &request.gz_path, cancel, request.workdir).await?;
     if let Err(error) = tokio::fs::remove_file(&request.sql_path).await {
         // The attempt directory is deleted when the attempt drops.
         debug!(
             path = %request.sql_path.display(),
             "Could not remove the uncompressed control-plane dump early: {error}"
         );
-    }
-    if size == 0 {
-        return Err(HostDumpError::EmptyDump {
-            path: request.gz_path,
-        });
     }
     Ok(size)
 }
@@ -454,17 +473,28 @@ async fn read_tail(path: &Path) -> String {
 }
 
 /// gzip `source` into a new owner-only `target` in a blocking task, in
-/// constant memory, stopping early when `cancel` fires.
+/// constant memory.
+///
+/// Dropping a `spawn_blocking` handle does not stop the task, so the task
+/// checks an attempt-local token between chunks that fires when `cancel`
+/// does *or* when this future is dropped (a wall-clock timeout drops the
+/// backup future without firing `cancel`). It stops within one chunk
+/// either way. The task owns `workdir` until it returns, so the attempt
+/// directory is never deleted underneath its open files.
 async fn gzip_file(
     source: &Path,
     target: &Path,
     cancel: &CancellationToken,
+    workdir: WorkdirGuard,
 ) -> Result<u64, HostDumpError> {
     let source = source.to_path_buf();
     let target = target.to_path_buf();
-    let cancel = cancel.clone();
+    let task_cancel = cancel.child_token();
+    let _stop_task_on_drop = task_cancel.clone().drop_guard();
     let join_target = target.clone();
     tokio::task::spawn_blocking(move || {
+        let _workdir = workdir;
+        let cancel = task_cancel;
         let io = |operation: &'static str, path: &Path| {
             let path = path.to_path_buf();
             move |source| HostDumpError::Io {
@@ -505,6 +535,7 @@ async fn gzip_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::dump_capture::DumpAttempt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ── Selection ────────────────────────────────────────────────────────
@@ -771,6 +802,71 @@ mod tests {
             .all(|arg| !arg.contains("hunter2")));
     }
 
+    // ── Compression ──────────────────────────────────────────────────────
+
+    fn attempt(uuid: &str) -> (tempfile::TempDir, DumpAttempt) {
+        let parent = tempfile::tempdir().expect("attempt parent");
+        let attempt = DumpAttempt::new_in(parent.path(), "Control-plane PostgreSQL", "test", uuid)
+            .expect("attempt");
+        (parent, attempt)
+    }
+
+    /// `len` bytes that do not compress, so gzip has to work for them.
+    fn write_incompressible(path: &Path, len: usize) {
+        let mut file = std::io::BufWriter::new(File::create(path).expect("create source"));
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut chunk = vec![0u8; 1024 * 1024];
+        let mut written = 0;
+        while written < len {
+            for word in chunk.as_chunks_mut::<8>().0 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *word = state.to_le_bytes();
+            }
+            let take = chunk.len().min(len - written);
+            file.write_all(&chunk[..take]).expect("write source");
+            written += take;
+        }
+        file.flush().expect("flush source");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timeout_during_compression_stops_the_blocking_task() {
+        const SOURCE_BYTES: usize = 96 * 1024 * 1024;
+        let (_parent, attempt) = attempt("gzip-timeout");
+        let source = attempt.host_path("backup.sql");
+        let target = attempt.host_path("backup.sql.gz");
+        write_incompressible(&source, SOURCE_BYTES);
+        let cancel = CancellationToken::new();
+
+        // What the executor's wall-clock timeout does: drop the future
+        // without firing the backup's token.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(50),
+            gzip_file(&source, &target, &cancel, attempt.workdir_guard()),
+        )
+        .await;
+        assert!(outcome.is_err(), "compressing 96 MiB must outlast 50ms");
+        assert!(!cancel.is_cancelled());
+
+        // The blocking task notices within one chunk and lets go of the
+        // directory; it does not compress the remaining ~96 MiB first.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while attempt.workdir_shared() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the compression kept running after its future was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let written = std::fs::metadata(&target).expect("partial gz").len();
+        assert!(
+            written < (SOURCE_BYTES / 2) as u64,
+            "compression must stop early, but wrote {written} of ~{SOURCE_BYTES} bytes"
+        );
+    }
+
     // ── Running, against stand-in client tools ───────────────────────────
 
     #[cfg(unix)]
@@ -803,7 +899,7 @@ mod tests {
         }
 
         fn request<'a>(
-            work: &Path,
+            work: &DumpAttempt,
             pg_dump: &'a HostTool,
             pg_dumpall: &'a HostTool,
             target: &'a ControlPlaneTarget,
@@ -814,9 +910,10 @@ mod tests {
                 pg_dumpall,
                 target,
                 exclude_patterns: excludes,
-                sql_path: work.join("backup.sql"),
-                gz_path: work.join("backup.sql.gz"),
-                stderr_path: work.join("pg_dump.stderr"),
+                sql_path: work.host_path("backup.sql"),
+                gz_path: work.host_path("backup.sql.gz"),
+                stderr_path: work.host_path("pg_dump.stderr"),
+                workdir: work.workdir_guard(),
             }
         }
 
@@ -831,12 +928,12 @@ mod tests {
         #[tokio::test]
         async fn globals_then_database_are_gzipped_with_the_password_only_in_the_env() {
             let bin = tempfile::tempdir().expect("bin");
-            let work = tempfile::tempdir().expect("work");
+            let (_parent, work) = attempt("fake");
             let pg_dumpall = script(bin.path(), PG_DUMPALL, "-- GLOBALS");
             let pg_dump = script(bin.path(), PG_DUMP, "-- DATABASE");
             let target = target(PASSWORD);
             let excludes = vec!["public.proxy_logs".to_string()];
-            let req = request(work.path(), &pg_dump, &pg_dumpall, &target, &excludes);
+            let req = request(&work, &pg_dump, &pg_dumpall, &target, &excludes);
             let gz_path = req.gz_path.clone();
             let sql_path = req.sql_path.clone();
 
@@ -867,7 +964,7 @@ mod tests {
         #[tokio::test]
         async fn a_failing_tool_reports_its_exit_code_and_stderr() {
             let bin = tempfile::tempdir().expect("bin");
-            let work = tempfile::tempdir().expect("work");
+            let (_parent, work) = attempt("fake");
             let pg_dumpall = script(bin.path(), PG_DUMPALL, "-- GLOBALS");
             let pg_dump = write_tool(
                 bin.path(),
@@ -875,7 +972,7 @@ mod tests {
                 "#!/bin/sh\necho 'pg_dump: error: connection to server failed' >&2\nexit 1\n",
             );
             let target = target(PASSWORD);
-            let req = request(work.path(), &pg_dump, &pg_dumpall, &target, &[]);
+            let req = request(&work, &pg_dump, &pg_dumpall, &target, &[]);
             let gz_path = req.gz_path.clone();
 
             let error = run_host_dump(req, &CancellationToken::new())
@@ -901,14 +998,14 @@ mod tests {
 
         #[tokio::test]
         async fn a_tool_that_cannot_start_is_a_launch_error() {
-            let work = tempfile::tempdir().expect("work");
+            let (_parent, work) = attempt("fake");
             let gone = HostTool {
-                binary: work.path().join("no-such-pg_dumpall"),
+                binary: work.host_path("no-such-pg_dumpall"),
                 major: 18,
             };
             let target = target(PASSWORD);
             let error = run_host_dump(
-                request(work.path(), &gone, &gone, &target, &[]),
+                request(&work, &gone, &gone, &target, &[]),
                 &CancellationToken::new(),
             )
             .await
@@ -927,9 +1024,34 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn tools_that_print_nothing_fail_as_an_empty_dump_before_compressing() {
+            let bin = tempfile::tempdir().expect("bin");
+            let (_parent, work) = attempt("fake");
+            let silent_dumpall = write_tool(bin.path(), PG_DUMPALL, "#!/bin/sh\nexit 0\n");
+            let silent_dump = write_tool(bin.path(), PG_DUMP, "#!/bin/sh\nexit 0\n");
+            let target = target(PASSWORD);
+            let req = request(&work, &silent_dump, &silent_dumpall, &target, &[]);
+            let (sql_path, gz_path) = (req.sql_path.clone(), req.gz_path.clone());
+
+            let error = run_host_dump(req, &CancellationToken::new())
+                .await
+                .expect_err("an empty dump must not pass");
+
+            assert!(
+                matches!(&error, HostDumpError::EmptyDump { path } if *path == sql_path),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("wrote nothing"), "{error}");
+            assert!(
+                !gz_path.exists(),
+                "a gzip of empty input has a header and trailer, so it must never be written"
+            );
+        }
+
+        #[tokio::test]
         async fn cancellation_kills_a_running_tool() {
             let bin = tempfile::tempdir().expect("bin");
-            let work = tempfile::tempdir().expect("work");
+            let (_parent, work) = attempt("fake");
             let hang = write_tool(bin.path(), PG_DUMPALL, "#!/bin/sh\nexec sleep 30\n");
             let target = target(PASSWORD);
             let cancel = CancellationToken::new();
@@ -940,7 +1062,7 @@ mod tests {
             });
 
             let started = std::time::Instant::now();
-            let error = run_host_dump(request(work.path(), &hang, &hang, &target, &[]), &cancel)
+            let error = run_host_dump(request(&work, &hang, &hang, &target, &[]), &cancel)
                 .await
                 .expect_err("cancelled");
             assert!(matches!(error, HostDumpError::Cancelled), "{error:?}");

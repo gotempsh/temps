@@ -250,6 +250,7 @@ impl BackupEngine for ControlPlaneEngine {
                         sql_path: attempt.host_path(SIDECAR_DUMP_SQL),
                         gz_path: host_dump_path.clone(),
                         stderr_path: attempt.host_path(SIDECAR_STDERR),
+                        workdir: attempt.workdir_guard(),
                     },
                     &ctx.cancel,
                 )
@@ -1354,6 +1355,7 @@ mod dump_tests {
                 sql_path: attempt.host_path(SIDECAR_DUMP_SQL),
                 gz_path: host_path.clone(),
                 stderr_path: attempt.host_path(SIDECAR_STDERR),
+                workdir: attempt.workdir_guard(),
             },
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -1400,6 +1402,7 @@ mod dump_tests {
                 sql_path: retry.host_path(SIDECAR_DUMP_SQL),
                 gz_path: retry.host_path(SIDECAR_DUMP_GZ),
                 stderr_path: retry.host_path(SIDECAR_STDERR),
+                workdir: retry.workdir_guard(),
             },
             &tokio_util::sync::CancellationToken::new(),
         )
