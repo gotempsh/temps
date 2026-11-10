@@ -385,6 +385,31 @@ async fn session_route(projectless: bool, removal: &str) {
                         && event["resource_id"] == id
                         && event["context"]["user_id"] == 9801));
             }
+            if removal == "service" {
+                let key = {
+                    let events = audit.0.lock().unwrap();
+                    let event = events
+                        .iter()
+                        .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                        .find(|event| event["operation"] == "DELETE_ACCESS_SERVICE")
+                        .unwrap();
+                    assert_eq!(
+                        event["service_scope_key"],
+                        format!("{id}:{}", event["version"].as_i64().unwrap())
+                    );
+                    event["service_scope_key"].as_str().unwrap().to_owned()
+                };
+                assert!(
+                    temps_entities::access_service_audit_scopes::Entity::find_by_id((
+                        key,
+                        vault.id.clone()
+                    ))
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some()
+                );
+            }
             let missing = send(
                 "DELETE",
                 &format!("{path}_missing"),

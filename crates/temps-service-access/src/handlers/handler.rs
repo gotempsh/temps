@@ -254,6 +254,7 @@ pub(super) async fn audit<'a>(
         project_id,
         resource_id: resource_id.into(),
         vault_id: resource.vault_id.map(str::to_owned),
+        service_scope_key: resource.service_scope_key,
         version,
         operation,
     };
@@ -418,7 +419,7 @@ pub async fn create_access_service(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        super::audit::AuditResource::service(&response.id, response.version),
         response.version,
         "SANDBOX_ACCESS_SERVICE_CREATED",
     )
@@ -468,7 +469,7 @@ pub async fn update_access_service(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        super::audit::AuditResource::service(&response.id, response.version),
         response.version,
         "SANDBOX_ACCESS_SERVICE_UPDATED",
     )

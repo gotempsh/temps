@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub(crate) mod assignments;
+mod audit_scope;
+use audit_scope::capture_service_audit_scope;
+pub(crate) use audit_scope::service_audit_scope_key;
 mod consent;
 mod links;
 pub(crate) mod sessions;
@@ -164,9 +167,9 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::database("begin service save", project_id, e))?;
         let validate_links = request.policy.github_repository.is_some();
-        if validate_links {
-            self.lock_vault_management(&tx).await?;
-        }
+        // Serialize membership changes through the same lock so the audit scope
+        // describes this write even if another manager moves the service.
+        self.lock_vault_management(&tx).await?;
         self.project(&tx, project_id).await?;
         if let Some(source) = &request.policy.github_repository {
             let source_project = project_id.ok_or_else(|| {
@@ -278,6 +281,7 @@ impl ServiceAccessService {
             self.validate_linked_sources(&tx, None, Some(&result.id))
                 .await?;
         }
+        capture_service_audit_scope(&tx, &result.id, result.version).await?;
         tx.commit()
             .await
             .map_err(|e| AccessError::database("commit service save", project_id, e))?;

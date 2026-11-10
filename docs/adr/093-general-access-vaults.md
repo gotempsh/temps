@@ -152,6 +152,14 @@ available vaults and a Grant access action. Empty states explain missing links
 and deep-link to vault setup. A typed capability response distinguishes missing
 configuration from permission denial.
 
+New service-write audit events reference an immutable scope keyed by service
+version. The service transaction captures active vault membership with a set-based
+insert under the vault-management lock, before retirement removes membership.
+The event references its scope even when that scope is empty, so attaching the
+service later cannot reassign the event. Earlier events without a scope retain
+the historical-membership fallback; their exact event-time membership cannot be
+reconstructed retrospectively.
+
 Handlers authorize and audit; services own all queries and business rules.
 Every successful write records its actor, operation, resource ID and applicable
 project context without credential values. Link and session IDs retain their

@@ -323,6 +323,7 @@ pub mod functions;
 pub mod environment_workload_isolation;
 
 pub mod access_bundles;
+pub mod access_service_audit_scopes;
 pub mod access_sessions;
 pub mod access_vault_links;
 pub mod access_vault_service_history;

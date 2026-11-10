@@ -48,7 +48,7 @@ impl ServiceAccessService {
             .await
     }
 
-    pub async fn retire_service(&self, service_id: &str) -> Result<(), AccessError> {
+    pub async fn retire_service(&self, service_id: &str) -> Result<i32, AccessError> {
         let tx = self.db.begin().await.map_err(|e| {
             AccessError::resource_database("begin service retirement", service_id, e)
         })?;
@@ -75,12 +75,24 @@ impl ServiceAccessService {
         .map_err(|e| {
             AccessError::resource_database("lock assignments for service retirement", service_id, e)
         })?;
-        services::Entity::find_by_id(service_id)
+        let service = services::Entity::find_by_id(service_id)
             .lock_exclusive()
             .one(&tx)
             .await
             .map_err(|e| AccessError::resource_database("read retiring service", service_id, e))?
             .ok_or_else(|| not_found("service", service_id.into(), None))?;
+        let version = if service.retired_at.is_some() {
+            service.version
+        } else {
+            service
+                .version
+                .checked_add(1)
+                .ok_or_else(|| AccessError::Conflict {
+                    id: service_id.into(),
+                    version: service.version,
+                })?
+        };
+        capture_service_audit_scope(&tx, service_id, version).await?;
         for sql in [
             "UPDATE sandbox_service_assignments SET revoked_at=COALESCE(revoked_at,now()),next_reconcile_at=NULL,version=version+1,updated_at=now() WHERE service_id=$1 AND (revoked_at IS NULL OR next_reconcile_at IS NOT NULL)",
             "UPDATE sandbox_service_grants g SET revoked_at=now(),version=version+1 WHERE revoked_at IS NULL AND (service_id=$1 OR EXISTS (SELECT 1 FROM access_sessions s JOIN sandbox_service_grants affected ON s.grant_ids @> ARRAY[affected.id] WHERE affected.service_id=$1 AND s.grant_ids @> ARRAY[g.id]))",
@@ -95,7 +107,7 @@ impl ServiceAccessService {
         tx.commit().await.map_err(|e| {
             AccessError::resource_database("commit service retirement", service_id, e)
         })?;
-        Ok(())
+        Ok(version)
     }
 
     pub async fn retire_vault_resource(

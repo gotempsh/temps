@@ -19,6 +19,13 @@ fn service(db: MockDatabase) -> ServiceAccessService {
 fn db() -> MockDatabase {
     MockDatabase::new(DatabaseBackend::Postgres)
 }
+// Service saves execute the management lock and immutable scope insert.
+fn service_write_db() -> MockDatabase {
+    db().append_exec_results((0..2).map(|_| sea_orm::MockExecResult {
+        last_insert_id: 0,
+        rows_affected: 0,
+    }))
+}
 fn project_row() -> BTreeMap<String, sea_orm::Value> {
     BTreeMap::from([("id".into(), 7.into())])
 }
@@ -272,7 +279,8 @@ async fn saves_only_encrypted_credentials_and_supports_rotation() {
     let mut saved = row();
     saved.credential_encrypted = Some("encrypted".into());
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([vec![saved.clone()]]),
     );
     let mut req = request();
@@ -299,13 +307,15 @@ async fn saves_only_encrypted_credentials_and_supports_rotation() {
     );
 }
 fn db_with_update(old: services::Model, new: services::Model) -> MockDatabase {
-    db().append_query_results([vec![project_row()]])
+    service_write_db()
+        .append_query_results([vec![project_row()]])
         .append_query_results([vec![old], vec![new]])
 }
 #[tokio::test]
 async fn service_update_detects_stale_versions_and_missing_rows() {
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([vec![row()]]),
     );
     let mut req = request();
@@ -315,7 +325,8 @@ async fn service_update_detects_stale_versions_and_missing_rows() {
         Err(AccessError::Conflict { version: 2, .. })
     ));
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([Vec::<services::Model>::new()]),
     );
     let mut req = request();
@@ -447,7 +458,8 @@ async fn list_grants_joins_services_without_n_plus_one() {
 #[tokio::test]
 async fn write_failures_roll_back_without_leaking_driver_details() {
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_errors([DbErr::Custom("secret-write-error".into())]),
     );
     let error = s.save_service(7, None, request()).await.unwrap_err();
@@ -590,7 +602,8 @@ async fn stored_bearer_cannot_follow_an_origin_change() {
     let mut old = row();
     old.credential_encrypted = Some(encryption().encrypt_string("original-test-secret").unwrap());
     let s = service(
-        db().append_query_results([vec![project_row()]])
+        service_write_db()
+            .append_query_results([vec![project_row()]])
             .append_query_results([vec![old]]),
     );
     let mut req = request();

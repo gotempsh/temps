@@ -384,6 +384,10 @@ async fn create_returns_masked_service_and_audits_only_metadata() {
         updated_at: now,
     };
     let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_exec_results((0..2).map(|_| sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }))
         .append_query_results([vec![BTreeMap::from([(
             "id".to_string(),
             sea_orm::Value::Int(Some(7)),
@@ -507,6 +511,10 @@ async fn management_routes_return_typed_success_and_audit_each_write() {
         (
             3,
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results((0..2).map(|_| sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }))
                 .append_query_results([vec![project()]])
                 .append_query_results([vec![row()], vec![updated]]),
             200,
@@ -1467,6 +1475,13 @@ async fn general_management_http_contracts_mask_secrets_and_audit_resource_ids()
         assert!(events
             .iter()
             .all(|event| !event.contains("fixture-bearer-secret")));
+        for (operation, version) in [("CREATE_ACCESS_SERVICE", 1), ("UPDATE_ACCESS_SERVICE", 2)] {
+            assert!(events
+                .iter()
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .any(|event| event["operation"] == operation
+                    && event["service_scope_key"] == format!("{service_id}:{version}")));
+        }
     }
     drop(state);
     drop(db);

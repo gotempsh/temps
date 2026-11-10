@@ -87,7 +87,7 @@ pub async fn create_access_service_general(
         &auth,
         metadata,
         row.project_id,
-        &row.id,
+        super::audit::AuditResource::service(&row.id, row.version),
         row.version,
         "CREATE_ACCESS_SERVICE",
     )
@@ -119,7 +119,7 @@ pub async fn update_access_service_general(
         &auth,
         metadata,
         row.project_id,
-        &row.id,
+        super::audit::AuditResource::service(&row.id, row.version),
         row.version,
         "UPDATE_ACCESS_SERVICE",
     )
@@ -137,14 +137,14 @@ pub async fn delete_access_service_general(
     deny_deployment_token!(auth);
     permission_guard!(auth, ProjectsWrite);
     manager(&auth)?;
-    state.service.retire_service(&service_id).await?;
+    let version = state.service.retire_service(&service_id).await?;
     audit(
         &state,
         &auth,
         metadata,
         None,
-        &service_id,
-        1,
+        super::audit::AuditResource::service(&service_id, version),
+        version,
         "DELETE_ACCESS_SERVICE",
     )
     .await;

@@ -230,7 +230,9 @@ WHERE id IN (SELECT id FROM expired)
                     WHERE
                     parsed.payload->>'resource_id' = $1 OR
                     parsed.payload->>'vault_id' = $1 OR
-                    (NOT (parsed.payload ? 'vault_id') AND
+                    EXISTS(SELECT 1 FROM access_service_audit_scopes
+                        WHERE scope_key = parsed.payload->>'service_scope_key' AND vault_id = $1) OR
+                    (NOT (parsed.payload ? 'vault_id' OR parsed.payload ? 'service_scope_key') AND
                      parsed.payload->>'resource_id' IN (
                         SELECT id FROM access_bundles WHERE vault_id = $1
                         UNION ALL SELECT id FROM access_sessions WHERE vault_id = $1
@@ -416,6 +418,68 @@ mod tests {
             .0
             .contains(&Value::from("vault_fixture")));
         assert!(!statement.sql.contains("vault_fixture"));
+    }
+
+    #[tokio::test]
+    async fn service_events_keep_their_write_scope_after_moves_and_retirement() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping immutable service audit scope: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        db.execute_unprepared(r#"
+INSERT INTO access_vaults(id,name,service_ids) VALUES('vault_first','First',ARRAY['svc_fixture']),('vault_second','Second','{}');
+INSERT INTO access_service_audit_scopes VALUES('svc_fixture:2','vault_first');
+UPDATE access_vaults SET service_ids='{}' WHERE id='vault_first';
+UPDATE access_vaults SET service_ids=ARRAY['svc_fixture'] WHERE id='vault_second';
+INSERT INTO access_service_audit_scopes VALUES('svc_fixture:3','vault_second'),('svc_fixture:4','vault_second');
+UPDATE access_vaults SET service_ids='{}' WHERE id='vault_second';
+INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) VALUES
+('fixture','CREATE_ACCESS_SERVICE','{"resource_id":"svc_fixture","service_scope_key":"svc_fixture:1"}',now(),now()),
+('fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_fixture","service_scope_key":"svc_fixture:2"}',now(),now()),
+('fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_fixture","service_scope_key":"svc_fixture:3"}',now(),now()),
+('fixture','DELETE_ACCESS_SERVICE','{"resource_id":"svc_fixture","service_scope_key":"svc_fixture:4"}',now(),now());
+"#).await.unwrap();
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let service = AuditService::new(
+            db.clone(),
+            Arc::new(IpAddressService::new(db.clone(), geoip)),
+        );
+        for (vault_id, expected) in [
+            ("vault_first", vec!["svc_fixture:2"]),
+            ("vault_second", vec!["svc_fixture:3", "svc_fixture:4"]),
+        ] {
+            let page = service
+                .filter_audit_logs(AuditLogFilter {
+                    action: None,
+                    resource_id: Some(vault_id),
+                    user_id: None,
+                    from: None,
+                    to: None,
+                    limit: 20,
+                    offset: 0,
+                })
+                .await
+                .unwrap();
+            let mut keys: Vec<String> = page
+                .iter()
+                .map(|row| {
+                    serde_json::from_str::<serde_json::Value>(&row.log.data).unwrap()
+                        ["service_scope_key"]
+                        .as_str()
+                        .unwrap()
+                        .into()
+                })
+                .collect();
+            keys.sort();
+            assert_eq!(keys, expected);
+        }
+        test.cleanup().await;
     }
 
     #[tokio::test]

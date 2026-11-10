@@ -10,6 +10,8 @@ pub struct AccessAudit {
     pub resource_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_scope_key: Option<String>,
     pub version: i32,
     pub operation: &'static str,
 }
@@ -35,15 +37,33 @@ impl AuditOperation for AccessAudit {
 pub(super) struct AuditResource<'a> {
     pub id: &'a str,
     pub vault_id: Option<&'a str>,
+    pub service_scope_key: Option<String>,
+}
+impl<'a> AuditResource<'a> {
+    pub(super) fn service(id: &'a str, version: i32) -> Self {
+        Self {
+            id,
+            vault_id: None,
+            service_scope_key: Some(crate::service::service_audit_scope_key(id, version)),
+        }
+    }
 }
 impl<'a> From<&'a String> for AuditResource<'a> {
     fn from(id: &'a String) -> Self {
-        Self { id, vault_id: None }
+        Self {
+            id,
+            vault_id: None,
+            service_scope_key: None,
+        }
     }
 }
 impl<'a> From<&'a str> for AuditResource<'a> {
     fn from(id: &'a str) -> Self {
-        Self { id, vault_id: None }
+        Self {
+            id,
+            vault_id: None,
+            service_scope_key: None,
+        }
     }
 }
 impl<'a> From<(&'a String, &'a String)> for AuditResource<'a> {
@@ -51,6 +71,7 @@ impl<'a> From<(&'a String, &'a String)> for AuditResource<'a> {
         Self {
             id,
             vault_id: Some(vault_id),
+            service_scope_key: None,
         }
     }
 }
