@@ -125,6 +125,9 @@ struct Series {
     /// then on every interval was recorded, so the window is whole once this
     /// is a full window old.
     tracked_since: Option<DateTime<Utc>>,
+    /// Length of the interval dropped last at the window's start, the one
+    /// just before the first interval kept: a scrape, or a gap.
+    dropped_before: Option<Duration>,
 }
 
 /// A series' window after recording an interval.
@@ -132,9 +135,9 @@ struct Series {
 struct WindowSum {
     hits: f64,
     accesses: f64,
-    /// Whether the intervals cover the whole window, short of at most one
-    /// scrape interval or a tenth of the window at its start, rather than
-    /// only the time since it started refilling or since a gap.
+    /// Whether the intervals cover the whole window, short of at most the
+    /// scrape dropped at its start or a tenth of the window, rather than only
+    /// the time since it started refilling or since a gap.
     full: bool,
 }
 
@@ -156,6 +159,7 @@ impl Series {
         }
         if self.intervals.is_empty() {
             self.tracked_since = Some(interval.start);
+            self.dropped_before = None;
         }
         self.intervals.push_back(interval);
         let cutoff = interval.end - window;
@@ -164,35 +168,41 @@ impl Series {
             .front()
             .is_some_and(|i| i.start < cutoff || i.end <= cutoff)
         {
-            self.intervals.pop_front();
+            if let Some(dropped) = self.intervals.pop_front() {
+                self.dropped_before = Some(dropped.end - dropped.start);
+            }
         }
         if self.intervals.is_empty() {
             self.tracked_since = None;
+            self.dropped_before = None;
             return None;
         }
         let (hits, accesses) = self.intervals.iter().fold((0.0, 0.0), |(hits, total), i| {
             (hits + i.hit, total + i.hit + i.read)
         });
         // The interval that straddled the cutoff was dropped, so the window
-        // normally begins up to one scrape after its start; scrapes are the
-        // configured interval plus a cycle that varies by seconds, so that
-        // dropped one can be a little longer than the current one. After a
-        // gap shorter than the window, the dropped one is the gap's long
-        // interval and the rest may cover only the minutes since. Tolerate
-        // one scrape interval or a tenth of the window, whichever is longer:
-        // jitter stays well inside it, a gap of minutes does not.
+        // begins less than that interval after its start. A normal scrape is
+        // the configured interval plus a cycle that varies by seconds, at
+        // most half as long again as the current one; a missed scrape is at
+        // least twice as long, and after a gap shorter than the window the
+        // dropped interval is the gap and the rest may cover only the minutes
+        // since. Then the window must reach back to within a tenth of its
+        // length, whatever the scrape interval.
+        let current = interval.end - interval.start;
+        let dropped_a_scrape = self
+            .dropped_before
+            .is_some_and(|dropped| dropped * 2 <= current * 3);
         let uncovered = self
             .intervals
             .front()
             .map_or(window, |first| first.start - cutoff);
-        let tolerated = (interval.end - interval.start).max(window / 10);
         Some(WindowSum {
             hits,
             accesses,
             full: self
                 .tracked_since
                 .is_some_and(|since| interval.end - since >= window)
-                && uncovered <= tolerated,
+                && (dropped_a_scrape || uncovered <= window / 10),
         })
     }
 }
@@ -699,29 +709,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn uneven_scrape_intervals_without_a_gap_keep_the_window_whole() {
-        // Scrapes are the configured 30 s plus the cycle's own duration,
-        // which varies by up to the 5 s collector timeout: no scrape fails.
+    /// Scrape every `interval_ms` plus a cycle that varies by up to the 5 s
+    /// collector timeout, without a failed scrape, and assert every scrape
+    /// from the window's first whole one on serves the ratio.
+    fn assert_jittered_scrapes_keep_the_window_whole(interval_ms: i64, scrapes: usize) {
         let mut windows = CacheHitWindows::default();
         let start = at(0);
         let mut elapsed_ms: i64 = 0;
         let mut seed: u64 = 0x5eed;
         windows.derive(1, deltas(90.0, 10.0, start, "app"));
-        for _ in 0..1_000 {
+        for _ in 0..scrapes {
             // A fixed linear congruential sequence: reproducible jitter.
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            elapsed_ms += 30_000 + ((seed >> 33) % 5_000) as i64;
+            elapsed_ms += interval_ms + ((seed >> 33) % 5_000) as i64;
             let time = start + Duration::milliseconds(elapsed_ms);
             let out = windows.derive(1, deltas(90.0, 10.0, time, "app"));
             if elapsed_ms >= 900_000 {
                 assert_eq!(
                     value(&out, PG_CACHE_HIT_RATIO, None),
                     Some(0.9),
-                    "{elapsed_ms} ms: {out:?}"
+                    "{interval_ms} ms interval, {elapsed_ms} ms: {out:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn uneven_scrape_intervals_without_a_gap_keep_the_window_whole() {
+        assert_jittered_scrapes_keep_the_window_whole(30_000, 1_000);
+    }
+
+    #[test]
+    fn uneven_long_scrape_intervals_without_a_gap_keep_the_window_whole() {
+        // Above a tenth of the window, the interval left at the window's
+        // start is all the slack there is: jitter alone must not exceed it.
+        for interval_ms in [120_000, 300_000] {
+            assert_jittered_scrapes_keep_the_window_whole(interval_ms, 2_000);
+        }
+    }
+
+    #[test]
+    fn a_missed_long_scrape_still_leaves_the_window_partial() {
+        // At a 5-minute interval one failed scrape is a 10-minute delta; once
+        // it leaves, the rest covers the last 5 to 10 minutes only.
+        let mut windows = CacheHitWindows::default();
+        for minute in [0, 5, 10, 15, 20] {
+            windows.derive(1, deltas(90.0, 10.0, at(minute), "app"));
+        }
+        windows.derive(1, deltas(180.0, 20.0, at(30), "app"));
+        let out = windows.derive(1, deltas(90.0, 10.0, at(35), "app"));
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(300.0));
+        let out = windows.derive(1, deltas(90.0, 10.0, at(40), "app"));
+        assert!(
+            out.is_empty(),
+            "minutes 30 to 40 are not the window: {out:?}"
+        );
+        let out = windows.derive(1, deltas(90.0, 10.0, at(45), "app"));
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(300.0));
     }
 
     #[test]
