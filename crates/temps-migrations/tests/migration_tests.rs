@@ -8415,3 +8415,96 @@ INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,serv
     migration.up(&manager).await?;
     Ok(())
 }
+
+/// ADR-094: the last Cloud session confirmation is a nullable column on
+/// `oidc_providers`. Existing providers start with none on record, and down
+/// removes it without touching the provider.
+#[tokio::test]
+async fn test_oidc_cloud_sessions_confirmed_at_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping Cloud session confirmation migration test: external database configured"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping Cloud session confirmation migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261110_000005_add_cloud_sessions_confirmed_at_to_oidc_providers";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    db.execute_unprepared(
+        "INSERT INTO oidc_providers (id, name, issuer_url, client_id, client_secret_encrypted, \
+         managed_by_cloud) VALUES (7301, 'Temps Cloud', 'https://cloud.example.com', 'client', \
+         'ciphertext', true)",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    async fn confirmed(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT cloud_sessions_confirmed_at IS NOT NULL AS confirmed FROM oidc_providers \
+                 WHERE id = 7301"
+                    .to_string(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("provider 7301 is gone"))?
+            .try_get::<bool>("", "confirmed")?)
+    }
+    assert!(!confirmed(&db).await?, "no confirmation on record");
+    db.execute_unprepared(
+        "UPDATE oidc_providers SET cloud_sessions_confirmed_at = now() WHERE id = 7301",
+    )
+    .await?;
+    assert!(confirmed(&db).await?);
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = \
+             'oidc_providers' AND column_name = 'cloud_sessions_confirmed_at'"
+                .to_string(),
+        ))
+        .await?;
+    assert!(
+        columns.is_empty(),
+        "down must remove cloud_sessions_confirmed_at"
+    );
+    let survivors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM oidc_providers WHERE id = 7301".to_string(),
+        ))
+        .await?;
+    assert_eq!(survivors.len(), 1, "down must keep the provider");
+    Ok(())
+}

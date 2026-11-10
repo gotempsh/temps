@@ -54,7 +54,11 @@ stops trusting its Cloud sessions after a fixed time.
 
 3. **Fail closed.** A network error, timeout, 5xx or 429 changes nothing at
    first. But once no check has succeeded for 10 minutes, every Cloud-issued
-   session ends. Signing in again needs Cloud anyway.
+   session ends. Signing in again needs Cloud anyway. The time of the last
+   successful check is stored on the managed provider's row
+   (`oidc_providers.cloud_sessions_confirmed_at`), so restarting the instance
+   during an outage does not start the 10 minutes again; with none on record,
+   the sessions count as unconfirmed.
 
 Only sessions whose origin is `oidc:<managed provider id>` are affected.
 Password sessions, other OIDC providers, MFA state and every workload are

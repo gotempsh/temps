@@ -13,7 +13,10 @@
 //!   same JWKS that signs Cloud ID tokens. The channel is only a carrier.
 //! - **A periodic re-check**: the instance asks Cloud which of the users behind
 //!   its live Cloud sessions may keep them, and ends the rest. If Cloud has not
-//!   answered for [`CLOUD_SESSION_STALE_AFTER`], every Cloud session ends.
+//!   answered for [`CLOUD_SESSION_STALE_AFTER`], every Cloud session ends. The
+//!   last answer's time is kept on the managed provider's row
+//!   (`cloud_sessions_confirmed_at`), so a restart does not start that bound
+//!   again.
 //!
 //! Only sessions whose origin is `oidc:<managed provider id>` are touched.
 //! Password sessions, other providers and every workload are unaffected, and
@@ -448,6 +451,8 @@ impl OidcService {
 
     /// One re-check pass (ADR-094 §4): ask Cloud about every user behind a
     /// live Cloud session and end the sessions of those it no longer lists.
+    /// Every pass but an unanswered one records the confirmation on the
+    /// managed provider's row ([`Self::cloud_sessions_confirmed_at`]).
     pub async fn check_cloud_sessions(&self) -> Result<CloudSessionCheck, OidcError> {
         let Some(provider) = self
             .managed_cloud_provider()
@@ -456,6 +461,58 @@ impl OidcService {
         else {
             return Ok(CloudSessionCheck::NothingToCheck);
         };
+        let check = self.check_provider_sessions(&provider).await?;
+        if !matches!(check, CloudSessionCheck::Unavailable { .. }) {
+            self.record_cloud_sessions_confirmed(provider.id).await;
+        }
+        Ok(check)
+    }
+
+    /// When Cloud last confirmed this instance's Cloud sessions (answered a
+    /// re-check, or there was nothing to ask it), as recorded on the managed
+    /// provider's row, so it survives a restart. `None` without the managed
+    /// provider or without a confirmation on record.
+    pub async fn cloud_sessions_confirmed_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<Utc>>, OidcError> {
+        Ok(self
+            .managed_cloud_provider()
+            .await?
+            .and_then(|provider| provider.cloud_sessions_confirmed_at))
+    }
+
+    /// Record that Cloud confirmed the sessions of managed provider
+    /// `provider_id` now. Not through the active model: the provider's
+    /// `updated_at` stays the time its configuration changed. A failure is
+    /// logged, never fatal: the sessions were confirmed, and a missed record
+    /// only makes a later outage end them sooner.
+    async fn record_cloud_sessions_confirmed(&self, provider_id: i32) {
+        use sea_orm::sea_query::Expr;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        if let Err(error) = oidc_providers::Entity::update_many()
+            .col_expr(
+                oidc_providers::Column::CloudSessionsConfirmedAt,
+                Expr::value(Utc::now()),
+            )
+            .filter(oidc_providers::Column::Id.eq(provider_id))
+            .exec(self.db.as_ref())
+            .await
+        {
+            tracing::warn!(
+                provider_id,
+                %error,
+                "Temps Cloud confirmed the console sessions, but recording the confirmation on \
+                 OIDC provider {provider_id} failed; a Cloud outage after a restart may end them \
+                 sooner"
+            );
+        }
+    }
+
+    /// [`Self::check_cloud_sessions`] for the enabled managed `provider`.
+    async fn check_provider_sessions(
+        &self,
+        provider: &oidc_providers::Model,
+    ) -> Result<CloudSessionCheck, OidcError> {
         let (subjects, orphaned) = self.live_cloud_subjects(provider.id).await?;
         if subjects.is_empty() {
             return Ok(if orphaned > 0 {
@@ -468,7 +525,7 @@ impl OidcService {
         }
         let mut inactive = Vec::new();
         for batch in subjects.chunks(STATUS_BATCH) {
-            match self.cloud_session_status(&provider, batch).await {
+            match self.cloud_session_status(provider, batch).await {
                 CloudSessionStatus::Active(active) => inactive.extend(
                     batch
                         .iter()
@@ -834,9 +891,62 @@ mod tests {
         assert!(crate::ingress_grants::test_support::is_revoked(&db.db, bob_grant).await);
         assert!(exists(conn, alice_local).await);
         assert_eq!(
+            service.cloud_sessions_confirmed_at().await.expect("read"),
+            None,
+            "no confirmation is on record before a check"
+        );
+        let before = Utc::now();
+        assert_eq!(
             service.check_cloud_sessions().await.expect("check"),
             CloudSessionCheck::NothingToCheck,
             "with no Cloud sessions left, nothing is sent to Cloud"
         );
+        // Nothing to confirm is a confirmation, kept on the provider's row
+        // without touching its configuration time.
+        let confirmed = service
+            .cloud_sessions_confirmed_at()
+            .await
+            .expect("read")
+            .expect("recorded");
+        assert!(confirmed >= before, "{confirmed} < {before}");
+        let row = oidc_providers::Entity::find_by_id(provider.id)
+            .one(conn)
+            .await
+            .expect("query")
+            .expect("provider");
+        assert_eq!(row.updated_at, provider.updated_at);
+
+        // Cloud unreachable: the pass records nothing, so the confirmation
+        // keeps its time.
+        bob_unconfirmed(conn, &provider).await;
+        assert!(matches!(
+            service.check_cloud_sessions().await.expect("check"),
+            CloudSessionCheck::Unavailable { .. }
+        ));
+        assert_eq!(
+            service.cloud_sessions_confirmed_at().await.expect("read"),
+            Some(confirmed)
+        );
+    }
+
+    /// Give Bob a live Cloud session again and point the provider at an
+    /// address the instance refuses to call, so a re-check is unanswered.
+    async fn bob_unconfirmed(conn: &sea_orm::DatabaseConnection, provider: &oidc_providers::Model) {
+        let bob = users::Entity::find()
+            .filter(users::Column::OidcSubject.eq("cloud-bob"))
+            .one(conn)
+            .await
+            .expect("query")
+            .expect("bob");
+        session(conn, bob.id, Some(format!("oidc:{}", provider.id))).await;
+        oidc_providers::Entity::update_many()
+            .col_expr(
+                oidc_providers::Column::IssuerUrl,
+                sea_orm::sea_query::Expr::value("https://127.0.0.1"),
+            )
+            .filter(oidc_providers::Column::Id.eq(provider.id))
+            .exec(conn)
+            .await
+            .expect("point the provider at a refused address");
     }
 }
