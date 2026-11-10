@@ -89,6 +89,13 @@ test('session revocation requires named confirmation, holds pending, and lets a 
           .getAttribute('href')
       ).toBe('/vault/vaults/vault_example?tab=sessions&sandbox=sbx_example')
     )
+    expect(
+      within(view.container)
+        .getByRole('link', { name: 'Read APIs · v1' })
+        .getAttribute('href')
+    ).toBe(
+      '/vault/vaults/vault_example/bundles/bundle_example?sandbox=sbx_example'
+    )
     let dialog = await open()
     expect(dialog.textContent).toContain('Read APIs')
     expect(dialog.textContent).toContain('session_example')

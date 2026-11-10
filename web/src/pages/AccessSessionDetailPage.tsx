@@ -153,7 +153,7 @@ function SessionDetail({
                   label: 'Access bundle',
                   value: (
                     <Link
-                      to={`${base}/bundles/${encodeURIComponent(session.bundle_id)}`}
+                      to={`${base}/bundles/${encodeURIComponent(session.bundle_id)}?${consumerQuery}`}
                       className="underline"
                     >
                       {session.bundle_name} · v{session.bundle_version}
