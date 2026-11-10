@@ -1383,11 +1383,21 @@ async fn general_management_http_contracts_mask_secrets_and_audit_resource_ids()
     let service_path = format!("/access-services/{service_id}");
     assert!(service["project_id"].is_null());
     assert_eq!(service["has_credential"], true);
+    // A migrated bearer keeps provenance even while project deletion is fenced.
+    db.execute_unprepared("INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,is_deleted,created_at,updated_at) VALUES(9917,'Former project','repo','owner','/','main','nodejs','former-project',true,now(),now())").await.unwrap();
+    db.execute(sea_orm::Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE sandbox_access_services SET project_id=9917 WHERE id=$1",
+        [service_id.into()],
+    ))
+    .await
+    .unwrap();
     definition.as_object_mut().unwrap().remove("vault_id");
     definition["expected_version"] = serde_json::json!(1);
     definition["name"] = serde_json::json!("Updated API");
     let updated = call(&state, "PUT", &service_path, definition, StatusCode::OK).await;
     assert_eq!(updated["version"], 2);
+    assert_eq!(updated["project_id"], 9917);
     let detail = call(
         &state,
         "GET",

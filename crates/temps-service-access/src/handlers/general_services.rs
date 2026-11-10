@@ -110,9 +110,16 @@ pub async fn update_access_service_general(
         permission_guard!(auth, GitRepositoriesRead);
     }
     let existing = state.service.get_service(None, &id).await?;
+    // A migrated bearer's historical project is provenance, not its owner.
+    // GitHub credentials still validate the project owning their connection.
+    let source_project_id = request
+        .policy
+        .github_repository
+        .as_ref()
+        .and(existing.project_id);
     let row = state
         .service
-        .save_service(existing.project_id, Some(id), request)
+        .save_service(source_project_id, Some(id), request)
         .await?;
     audit(
         &state,
