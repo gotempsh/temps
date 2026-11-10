@@ -168,4 +168,3 @@ Cover frontend onboarding, read-only project views and manager controls with
 adjacent tests. Regenerate both OpenAPI clients against the changed server and
 run CLI spec checks, Rust checks/tests and web typechecking/tests before marking
 this ADR implemented.
-

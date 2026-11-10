@@ -222,7 +222,7 @@ impl ServiceAccessService {
         } else {
             services::ActiveModel {
                 id: Set(format!("svc_{}", uuid::Uuid::new_v4().simple())),
-                project_id: Set(project_id.into()),
+                project_id: Set(project_id),
                 created_at: Set(now),
                 version: Set(1),
                 credential_encrypted: Set(None),
@@ -399,7 +399,7 @@ impl ServiceAccessService {
         let grant = grants::ActiveModel {
             assignment_id: Set(None),
             id: Set(format!("grant_{}", uuid::Uuid::new_v4().simple())),
-            project_id: Set(project_id.into()),
+            project_id: Set(Some(project_id)),
             service_id: Set(service.id.clone()),
             sandbox_id: Set(sandbox.id),
             service_version: Set(service.version),
