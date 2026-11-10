@@ -10,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use temps_ai_api_tools::{
-    redaction::{redact_json_string, redact_value},
+    redaction::{redact_api_result, redact_json_string, redact_value},
     ApiCallScope, ProjectSelectorScope, WritePrepareOutcome,
 };
 use temps_authz::AuthContext;
@@ -73,7 +73,10 @@ fn safe_error(error: impl Into<McpError>) -> McpError {
 }
 
 fn safe(text: &str) -> String {
-    let mut text = redact_json_string(text);
+    cap_output(redact_json_string(text))
+}
+
+fn cap_output(mut text: String) -> String {
     const LIMIT: usize = 16 * 1024;
     if text.len() > LIMIT {
         let mut end = LIMIT;
@@ -84,6 +87,21 @@ fn safe(text: &str) -> String {
         text.push_str("\n[truncated]");
     }
     text
+}
+
+// The operation comes from the shared caller's result envelope, not the
+// upstream response body. Only successful API data receives its schema policy.
+fn safe_read_result(text: &str) -> String {
+    let Ok(mut result) = serde_json::from_str::<Value>(text) else {
+        return safe(text);
+    };
+    let Some(operation) = result.get("operation").and_then(Value::as_str) else {
+        return safe(text);
+    };
+    let data = redact_api_result(operation, &result["data"]);
+    result = redact_value(&result);
+    result["data"] = data;
+    cap_output(result.to_string())
 }
 
 /// Only server-created data enters the proposal store. The owner is checked
@@ -129,7 +147,7 @@ pub(crate) async fn execute(
         return caller
             .run_cli_result(command, &scope(auth))
             .await
-            .map(|text| McpToolResult::text(safe(&text)))
+            .map(|text| McpToolResult::text(safe_read_result(&text)))
             .map_err(safe_error);
     }
     let caller = state
@@ -201,7 +219,7 @@ pub(crate) async fn confirm(
     if let Err(error) = state.audit_service.create_audit_log(&event).await {
         tracing::error!(operation_id = %event.operation_id, %error, "Failed to audit MCP CLI write");
     }
-    result.map(|response| McpToolResult::text(safe(&json!({"status":response.status,"data":response.body,"truncated":response.truncated}).to_string()))).map_err(safe_error)
+    result.map(|response| McpToolResult::text(cap_output(json!({"status":response.status,"data":redact_api_result(&event.operation_id, &response.body),"truncated":response.truncated}).to_string()))).map_err(safe_error)
 }
 
 #[cfg(test)]
@@ -340,6 +358,97 @@ mod tests {
             audit,
         )
     }
+    #[tokio::test]
+    async fn feature_flag_reads_preserve_keys_types_and_values_through_router_replay() {
+        for operation in ["list_flags", "get_flag", "get_flag_snapshot"] {
+            let flag = json!({"key":"checkout.v2","value_type":"boolean","default_value":false,
+                "environment_value":true,"environments":[{"environment_id":1,"value":true}],
+                "token":"fixture-secret"});
+            let payload = if operation == "get_flag" {
+                flag
+            } else {
+                json!({"flags":[flag]})
+            };
+            let router = axum::Router::new().route(
+                "/flags",
+                axum::routing::get(
+                    move |temps_authz::RequireAuth(auth): temps_authz::RequireAuth| async move {
+                        temps_authz::permission_guard!(auth, ProjectsRead);
+                        Ok::<_, temps_core::problemdetails::Problem>(axum::Json(payload))
+                    },
+                ),
+            );
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/flags":{"get":{"operationId":operation,"tags":["Flags"],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let (state, _, _) = fixture();
+            state
+                .api_tools
+                .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                    router,
+                    &api,
+                    vec![operation.into()],
+                ));
+            let result = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":operation}),
+            )
+            .await
+            .unwrap();
+            let result: Value = serde_json::from_str(&result.content[0].text).unwrap();
+            let flag = if operation == "get_flag" {
+                &result["data"]
+            } else {
+                &result["data"]["flags"][0]
+            };
+            assert_eq!(flag["key"], "checkout.v2");
+            assert_eq!(flag["value_type"], "boolean");
+            assert_eq!(flag["default_value"], false);
+            assert_eq!(flag["environment_value"], true);
+            assert_eq!(flag["environments"][0]["value"], true);
+            assert_eq!(flag["token"], "***");
+        }
+        let large = json!({"operation":"get_flag","data":{"key":"fixture","default_value":"é".repeat(20000)}});
+        assert!(safe_read_result(&large.to_string()).len() < 16500);
+    }
+
+    #[tokio::test]
+    async fn upstream_server_failure_is_an_internal_rpc_error_after_replay() {
+        for status in [500, 503] {
+            let router = axum::Router::new().route(
+                "/projects",
+                axum::routing::get(move || async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        "fixture outage",
+                    )
+                }),
+            );
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/projects":{"get":{"operationId":"read_fixture","tags":["Projects"],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let (state, _, _) = fixture();
+            state
+                .api_tools
+                .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                    router,
+                    &api,
+                    vec!["read_fixture".into()],
+                ));
+            let error = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":"read_fixture"}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.rpc_code(), crate::protocol::INTERNAL_ERROR);
+            assert!(error.to_string().contains("read_fixture"));
+            assert!(error.to_string().contains(&status.to_string()));
+        }
+    }
+
     #[tokio::test]
     async fn help_read_and_invalid_commands_use_shared_caller() {
         let (state, _, _) = fixture();

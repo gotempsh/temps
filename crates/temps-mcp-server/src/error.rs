@@ -71,6 +71,14 @@ impl McpError {
             Self::Cli {
                 source: temps_ai_api_tools::ApiToolError::Upstream { status: 403, .. },
             } => -32006,
+            Self::Cli {
+                source:
+                    temps_ai_api_tools::ApiToolError::Upstream {
+                        status: 500..=599, ..
+                    }
+                    | temps_ai_api_tools::ApiToolError::RouterError { .. }
+                    | temps_ai_api_tools::ApiToolError::BodyReadError { .. },
+            } => crate::protocol::INTERNAL_ERROR,
             Self::Cli { .. } => crate::protocol::INVALID_PARAMS,
             Self::ProposalOwnerMismatch => -32005,
             Self::FeatureDisabled => -32001,
@@ -132,5 +140,51 @@ impl From<McpError> for Problem {
                     .with_detail(error.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_ai_api_tools::ApiToolError;
+
+    #[test]
+    fn cli_failures_keep_server_permission_and_argument_classes_distinct() {
+        for (status, expected) in [
+            (400, -32602),
+            (403, -32006),
+            (422, -32602),
+            (500, -32603),
+            (503, -32603),
+        ] {
+            let error = McpError::from(ApiToolError::Upstream {
+                status,
+                detail: "fixture failure".into(),
+                operation_id: "get_projects".into(),
+            });
+            assert_eq!(error.rpc_code(), expected, "HTTP {status}");
+        }
+        for source in [
+            ApiToolError::RouterError {
+                operation_id: "get_projects".into(),
+                reason: "unavailable".into(),
+            },
+            ApiToolError::BodyReadError {
+                operation_id: "get_projects".into(),
+                reason: "incomplete body".into(),
+            },
+        ] {
+            assert_eq!(
+                McpError::from(source).rpc_code(),
+                crate::protocol::INTERNAL_ERROR
+            );
+        }
+        assert_eq!(
+            McpError::from(ApiToolError::InvalidCommand {
+                detail: "use --help".into()
+            })
+            .rpc_code(),
+            crate::protocol::INVALID_PARAMS
+        );
     }
 }

@@ -51,6 +51,65 @@ pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Preserve known feature-flag configuration fields without weakening credential
+/// masking for other operations or nested credentials in JSON flag values.
+pub fn redact_api_result(operation_id: &str, value: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = redact_value(value);
+    match operation_id {
+        "list_flags" | "get_flag_snapshot" => {
+            if let (Some(original), Some(masked)) = (
+                value.get("flags").and_then(serde_json::Value::as_array),
+                redacted
+                    .get_mut("flags")
+                    .and_then(serde_json::Value::as_array_mut),
+            ) {
+                for (original, masked) in original.iter().zip(masked) {
+                    restore_flag_fields(original, masked);
+                }
+            }
+        }
+        "get_flag"
+        | "create_flag"
+        | "update_flag"
+        | "restore_flag"
+        | "archive_flag"
+        | "set_flag_environment" => restore_flag_fields(value, &mut redacted),
+        _ => {}
+    }
+    redacted
+}
+
+fn restore_flag_fields(original: &serde_json::Value, redacted: &mut serde_json::Value) {
+    let Some(object) = redacted.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "key",
+        "value_type",
+        "default_value",
+        "environment_value",
+        "value",
+    ] {
+        if let Some(value) = original.get(field) {
+            object.insert(field.into(), redact_value(value));
+        }
+    }
+    if let (Some(original), Some(masked)) = (
+        original
+            .get("environments")
+            .and_then(serde_json::Value::as_array),
+        object
+            .get_mut("environments")
+            .and_then(serde_json::Value::as_array_mut),
+    ) {
+        for (original, masked) in original.iter().zip(masked) {
+            if let (Some(value), Some(object)) = (original.get("value"), masked.as_object_mut()) {
+                object.insert("value".into(), redact_value(value));
+            }
+        }
+    }
+}
+
 /// Redact a JSON-encoded tool argument/result when possible. Plain text is
 /// preserved because it commonly contains useful logs rather than structured
 /// credentials; providers must not persist raw structured secret values.
@@ -185,6 +244,41 @@ fn cli_token_spans(input: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_result_policy_preserves_configuration_but_masks_nested_credentials() {
+        let flag = serde_json::json!({"key":"checkout.v2","value_type":"json",
+            "default_value":{"enabled":false,"password":"fixture-password"},
+            "environment_value":true,"environments":[{"environment_id":1,"value":true}],
+            "api_key":"fixture-key"});
+        for operation in [
+            "get_flag",
+            "create_flag",
+            "update_flag",
+            "restore_flag",
+            "archive_flag",
+        ] {
+            let result = redact_api_result(operation, &flag);
+            assert_eq!(result["key"], "checkout.v2");
+            assert_eq!(result["value_type"], "json");
+            assert_eq!(result["default_value"]["enabled"], false);
+            assert_eq!(result["default_value"]["password"], "***");
+            assert_eq!(result["environment_value"], true);
+            assert_eq!(result["environments"][0]["value"], true);
+            assert_eq!(result["api_key"], "***");
+        }
+        for operation in ["list_flags", "get_flag_snapshot"] {
+            let result = redact_api_result(operation, &serde_json::json!({"flags":[flag.clone()]}));
+            assert_eq!(result["flags"][0]["key"], "checkout.v2");
+        }
+        let result = redact_api_result("get_environment_variables", &flag);
+        assert_eq!(result["key"], "***");
+        assert_eq!(result["default_value"], "***");
+        assert_eq!(
+            redact_api_result("set_flag_environment", &serde_json::json!({"value":false}))["value"],
+            false
+        );
+    }
 
     #[test]
     fn notification_provider_credentials_are_redacted_from_review_and_results() {
