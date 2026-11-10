@@ -41,8 +41,14 @@ import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
+import {
+  canGrantPermission,
+  canGrantRole,
+  permissionCeiling,
+} from './api-key-ceiling'
 import { earliestExpiryDate, expiryFromDateInput } from './api-key-expiry'
 
 export default function ApiKeyCreate() {
@@ -58,7 +64,7 @@ export default function ApiKeyCreate() {
   const [step, setStep] = useState(1)
   const [keyName, setKeyName] = useState(searchParams.get('name') ?? '')
   const [expiresAt, setExpiresAt] = useState('')
-  const [selectedRole, setSelectedRole] = useState<string>(
+  const [requestedRole, setSelectedRole] = useState<string>(
     searchParams.get('role') ?? ''
   )
   const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(
@@ -82,6 +88,18 @@ export default function ApiKeyCreate() {
     useApiKeyPermissions()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
+  const userRole = useCurrentUserRole()
+  const ceiling = permissionCeiling(permissionsData?.roles, userRole)
+
+  // A `?role=` link can preselect a role this user may not grant; treat it as
+  // unselected instead of letting the wizard run to a refusal on the last step.
+  const requestedRoleInfo = permissionsData?.roles.find(
+    (r) => r.name === requestedRole
+  )
+  const selectedRole =
+    requestedRoleInfo && !canGrantRole(requestedRoleInfo, ceiling)
+      ? ''
+      : requestedRole
 
   const createMutation = useMutation({
     ...createApiKeyMutation(),
@@ -109,6 +127,8 @@ export default function ApiKeyCreate() {
   })
 
   const handleRoleSelect = (role: string) => {
+    const info = permissionsData?.roles.find((r) => r.name === role)
+    if (info && !canGrantRole(info, ceiling)) return
     setSelectedRole(role)
     setUseCustomPermissions(false)
     const selectedRoleInfo = permissionsData?.roles.find((r) => r.name === role)
@@ -206,6 +226,7 @@ export default function ApiKeyCreate() {
   // Group permissions by category
   const permissionsByCategory = permissionsData?.permissions.reduce(
     (acc, perm) => {
+      if (!canGrantPermission(perm.name, ceiling)) return acc
       if (!acc[perm.category]) {
         acc[perm.category] = []
       }
@@ -466,57 +487,72 @@ export default function ApiKeyCreate() {
                 </div>
               ) : (
                 <div className="grid gap-4">
-                  {permissionsData?.roles.map((role) => (
-                    <div
-                      key={role.name}
-                      className={cn(
-                        'p-4 rounded-lg border-2 cursor-pointer transition-colors',
-                        selectedRole === role.name
-                          ? 'border-primary bg-primary/5'
-                          : 'border-border hover:border-primary/50'
-                      )}
-                      onClick={() => handleRoleSelect(role.name)}
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="space-y-1">
-                          <div className="font-medium">{role.name}</div>
-                          <div className="text-sm text-muted-foreground">
-                            {role.description}
+                  {permissionsData?.roles.map((role) => {
+                    const grantable = canGrantRole(role, ceiling)
+                    return (
+                      <div
+                        key={role.name}
+                        aria-disabled={grantable ? undefined : true}
+                        className={cn(
+                          'p-4 rounded-lg border-2 transition-colors',
+                          !grantable && 'cursor-not-allowed opacity-60',
+                          grantable && 'cursor-pointer',
+                          selectedRole === role.name
+                            ? 'border-primary bg-primary/5'
+                            : grantable
+                              ? 'border-border hover:border-primary/50'
+                              : 'border-border'
+                        )}
+                        onClick={() => handleRoleSelect(role.name)}
+                      >
+                        <div className="flex items-start justify-between">
+                          <div className="space-y-1">
+                            <div className="font-medium">{role.name}</div>
+                            <div className="text-sm text-muted-foreground">
+                              {role.description}
+                            </div>
+                            {!grantable && (
+                              <div className="text-sm text-muted-foreground">
+                                Not available: it includes permissions your own
+                                role{userRole ? ` (${userRole})` : ''} does not
+                                have, and a key cannot grant more than you hold.
+                              </div>
+                            )}
+                            <div className="flex flex-wrap gap-1 mt-2">
+                              {role.permissions.slice(0, 5).map((p) => (
+                                <Badge
+                                  key={p}
+                                  variant="secondary"
+                                  className="text-xs"
+                                >
+                                  {p}
+                                </Badge>
+                              ))}
+                              {role.permissions.length > 5 && (
+                                <Badge variant="outline" className="text-xs">
+                                  +{role.permissions.length - 5} more
+                                </Badge>
+                              )}
+                            </div>
                           </div>
-                          <div className="flex flex-wrap gap-1 mt-2">
-                            {role.permissions.slice(0, 5).map((p) => (
-                              <Badge
-                                key={p}
-                                variant="secondary"
-                                className="text-xs"
-                              >
-                                {p}
-                              </Badge>
-                            ))}
-                            {role.permissions.length > 5 && (
-                              <Badge variant="outline" className="text-xs">
-                                +{role.permissions.length - 5} more
-                              </Badge>
-                            )}
-                          </div>
-                        </div>
-                        <div className="mt-1">
-                          <div
-                            className={cn(
-                              'w-5 h-5 rounded-full border-2',
-                              selectedRole === role.name
-                                ? 'border-primary bg-primary'
-                                : 'border-muted-foreground'
-                            )}
-                          >
-                            {selectedRole === role.name && (
-                              <Check className="h-3 w-3 text-primary-foreground m-auto" />
-                            )}
+                          <div className="mt-1">
+                            <div
+                              className={cn(
+                                'w-5 h-5 rounded-full border-2',
+                                selectedRole === role.name
+                                  ? 'border-primary bg-primary'
+                                  : 'border-muted-foreground'
+                              )}
+                            >
+                              {selectedRole === role.name && (
+                                <Check className="h-3 w-3 text-primary-foreground m-auto" />
+                              )}
+                            </div>
                           </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </CardContent>
