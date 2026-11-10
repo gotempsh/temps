@@ -44,6 +44,20 @@ export function buildLogStreamUrl(
   return url.toString()
 }
 
+// The buffer after `incoming` arrives, bounded to the last `maxLogs` lines.
+// With `replace`, `incoming` starts a reconnected socket's replay of the same
+// tail, so it takes the buffer's place instead of repeating lines already in
+// it.
+export function mergeLogLines<T>(
+  prev: T[],
+  incoming: T[],
+  maxLogs: number,
+  replace: boolean
+): T[] {
+  const next = replace ? incoming : [...prev, ...incoming]
+  return next.length <= maxLogs ? next : next.slice(-maxLogs)
+}
+
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
   filteredLogs: LiveLogLine[]
@@ -150,6 +164,9 @@ export function useLogStream({
   // re-render the virtualizer for every byte and freezes the tab.
   const pendingLogsRef = useRef<LiveLogLine[]>([])
   const flushHandleRef = useRef<number | null>(null)
+  // Set when a reconnected socket starts replaying the tail: the next commit
+  // replaces the visible lines instead of appending to them.
+  const replaceOnFlushRef = useRef(false)
 
   const filteredLogs = useMemo(() => {
     if (selectedLevels.length === 0 && !searchTerm) return logs
@@ -183,6 +200,7 @@ export function useLogStream({
     setBufferedCount(0)
     setConnectionStatus('connecting')
     pendingLogsRef.current = []
+    replaceOnFlushRef.current = false
 
     const scheduleFlush = () => {
       if (flushHandleRef.current != null) return
@@ -202,13 +220,9 @@ export function useLogStream({
           return
         }
         pendingLogsRef.current = []
-        setLogs((prev) => {
-          const next =
-            prev.length + incoming.length <= maxLogs
-              ? [...prev, ...incoming]
-              : [...prev, ...incoming].slice(-maxLogs)
-          return next
-        })
+        const replace = replaceOnFlushRef.current
+        replaceOnFlushRef.current = false
+        setLogs((prev) => mergeLogLines(prev, incoming, maxLogs, replace))
       })
     }
 
@@ -232,7 +246,13 @@ export function useLogStream({
         setErrorMessage(message)
         if (message) onError?.(message)
       },
-      (event) => {
+      (event, replacesBuffer) => {
+        if (replacesBuffer) {
+          // Lines queued from the dropped socket are in the replay too.
+          pendingLogsRef.current = []
+          replaceOnFlushRef.current = true
+          if (pausedRef.current) setBufferedCount(0)
+        }
         try {
           const parsed = JSON.parse(event.data)
 
@@ -261,6 +281,7 @@ export function useLogStream({
         flushHandleRef.current = null
       }
       pendingLogsRef.current = []
+      replaceOnFlushRef.current = false
     }
   }, [wsUrl, onError, showTimestamps, maxLogs, retryGeneration])
 
@@ -298,14 +319,10 @@ export function useLogStream({
     const incoming = pendingLogsRef.current
     pendingLogsRef.current = []
     setBufferedCount(0)
-    if (incoming.length > 0) {
-      setLogs((prev) => {
-        const next =
-          prev.length + incoming.length <= maxLogs
-            ? [...prev, ...incoming]
-            : [...prev, ...incoming].slice(-maxLogs)
-        return next
-      })
+    const replace = replaceOnFlushRef.current
+    replaceOnFlushRef.current = false
+    if (incoming.length > 0 || replace) {
+      setLogs((prev) => mergeLogLines(prev, incoming, maxLogs, replace))
     }
     setAutoScroll(true)
     requestAnimationFrame(() => {

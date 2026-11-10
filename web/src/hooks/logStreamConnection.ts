@@ -5,10 +5,15 @@ type Status = 'connecting' | 'connected' | 'complete' | 'error'
 
 // Keep ownership of callbacks and timers together: a socket closed by an
 // effect cleanup must never overwrite the state of its replacement.
+//
+// Every socket asks for the same bounded tail, so a replacement socket
+// starts by replaying lines the caller already holds. `message` is told,
+// on the first frame of a replacement socket, that the frames from there
+// on replace what it buffered rather than continue it.
 export function connectLogStream(
   create: () => WebSocket,
   status: (state: Status, message?: string) => void,
-  message: (event: MessageEvent) => void,
+  message: (event: MessageEvent, replacesBuffer: boolean) => void,
   schedule: typeof setTimeout = setTimeout,
   cancel: typeof clearTimeout = clearTimeout
 ): () => void {
@@ -16,10 +21,12 @@ export function connectLogStream(
   let socket: WebSocket | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   let failures = 0
+  let sockets = 0
   const connect = () => {
     if (disposed) return
     status('connecting')
     let received = false
+    const replacement = sockets++ > 0
     try {
       const ws = create()
       socket = ws
@@ -29,9 +36,10 @@ export function connectLogStream(
       }
       ws.onmessage = (event) => {
         if (!current()) return
+        const replacesBuffer = replacement && !received
         received = true
         failures = 0
-        message(event)
+        message(event, replacesBuffer)
       }
       // Browsers emit error followed by close. Only close decides whether
       // to retry, avoiding a red flash and duplicate error notifications.

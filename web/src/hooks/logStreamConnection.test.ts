@@ -103,3 +103,36 @@ test('an explicit server failure after an error payload does not retry forever',
   expect(h.delays).toEqual([])
   h.dispose()
 })
+
+test('the first frame of a replacement socket is marked as replacing the buffer', () => {
+  const flags: boolean[] = []
+  const sockets: WebSocket[] = []
+  let retry: (() => void) | undefined
+  const dispose = connectLogStream(
+    () => {
+      const ws = { close() {} } as WebSocket
+      sockets.push(ws)
+      return ws
+    },
+    () => {},
+    (_event, replacesBuffer) => flags.push(replacesBuffer),
+    ((fn: () => void) => {
+      retry = fn
+      return 1
+    }) as unknown as typeof setTimeout,
+    (() => {}) as typeof clearTimeout
+  )
+  const send = (data: string) => {
+    const ws = sockets[sockets.length - 1]!
+    ws.onmessage?.call(ws, { data } as MessageEvent)
+  }
+  send('a')
+  send('b')
+  const first = sockets[0]!
+  first.onclose?.call(first, { code: 1006, reason: '' } as CloseEvent)
+  retry?.()
+  send('a')
+  send('b')
+  expect(flags).toEqual([false, false, true, false])
+  dispose()
+})
