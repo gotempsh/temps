@@ -17,7 +17,7 @@ pub struct SaveAccessVault {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AccessVaultResponse {
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub name: String,
     pub service_ids: Vec<String>,
     pub version: i32,
@@ -57,7 +57,7 @@ pub struct SaveAccessBundle {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AccessBundleResponse {
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub vault_id: String,
     pub name: String,
     pub service_ids: Vec<String>,

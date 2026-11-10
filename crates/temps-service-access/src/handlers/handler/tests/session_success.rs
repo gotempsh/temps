@@ -6,6 +6,13 @@ use sea_orm::{ConnectionTrait, EntityTrait};
 
 #[tokio::test]
 async fn create_session_route_returns_accepted_session_and_audits_issuance() {
+    session_route(false, "unlink").await;
+    for removal in ["unlink", "bundle", "vault", "sandbox"] {
+        session_route(true, removal).await;
+    }
+}
+
+async fn session_route(projectless: bool, removal: &str) {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
     {
@@ -17,12 +24,18 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
         .unwrap();
     let db = test.connection_arc();
     db.execute_unprepared("INSERT INTO users (id,name,email) VALUES (9801,'Test user','user@example.com'); INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9801,'Session','repo','owner','/','main','nodejs','session',now(),now()); INSERT INTO sandboxes (id,public_id,name,user_id,project_id,status,backend) VALUES (9801,'sbx_dispatch','session',9801,9801,'running','docker')").await.unwrap();
+    if projectless {
+        db.execute_unprepared("UPDATE sandboxes SET project_id=NULL WHERE id=9801")
+            .await
+            .unwrap();
+    }
+    let context = if projectless { None } else { Some(9801) };
     let audit = Arc::new(Audit::default());
     let state = state_with_db(db.clone(), audit.clone());
     let vault = state
         .service
         .save_vault(
-            9801,
+            context,
             None,
             SaveAccessVault {
                 name: "Development".into(),
@@ -32,12 +45,19 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
         )
         .await
         .unwrap();
+    if projectless {
+        state
+            .service
+            .link_vault(&vault.id, None, Some(9801))
+            .await
+            .unwrap();
+    }
     let mut selections = Vec::new();
     for name in ["API", "Other API"] {
         let service = state
             .service
             .save_service(
-                9801,
+                context,
                 None,
                 SaveAccessService {
                     vault_id: Some(vault.id.clone()),
@@ -68,7 +88,7 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
     let bundle = state
         .service
         .save_bundle(
-            9801,
+            context,
             &vault.id,
             None,
             SaveAccessBundle {
@@ -81,6 +101,7 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
         .await
         .unwrap();
     let request = CreateAccessSession {
+        authorized_link_id: None,
         request_id: uuid::Uuid::new_v4(),
         bundle_id: bundle.id.clone(),
         bundle_version: bundle.version,
@@ -99,9 +120,26 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
         "key".into(),
         1,
     );
+    let path = if projectless {
+        format!("/access-vaults/{}/sessions", vault.id)
+    } else {
+        format!("/projects/9801/access-vaults/{}/sessions", vault.id)
+    };
+    if projectless {
+        let other = AuthContext::new_session(test_user(), Role::User);
+        let denied = send(
+            "POST",
+            &path,
+            &serde_json::to_string(&request).unwrap(),
+            Some(other),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    }
     let response = send(
         "POST",
-        &format!("/projects/9801/access-vaults/{}/sessions", vault.id),
+        &path,
         &serde_json::to_string(&request).unwrap(),
         Some(auth),
         state.clone(),
@@ -121,7 +159,7 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
         received.id,
         format!("session_{}", request.request_id.simple())
     );
-    assert_eq!(received.project_id, 9801);
+    assert_eq!(received.project_id, context);
     assert_eq!(received.vault_id, vault.id);
     assert_eq!(received.bundle_id, bundle.id);
     assert_eq!(received.bundle_name, "Read APIs");
@@ -148,6 +186,15 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
         .await
         .unwrap()
         .unwrap();
+    let detail = state
+        .service
+        .get_session(None, &received.id, 9801, false)
+        .await
+        .unwrap();
+    assert!(detail
+        .grants
+        .iter()
+        .all(|grant| grant.status == ServiceGrantStatus::Approved));
     assert_eq!(runtime.applied_version, 0);
     assert!(runtime.lease_expires_at.is_none());
     {
@@ -158,12 +205,127 @@ async fn create_session_route_returns_accepted_session_and_audits_issuance() {
             .filter(|event| event["operation"] == "CREATE_ACCESS_SESSION")
             .collect();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0]["project_id"], 9801);
+        assert_eq!(sessions[0]["project_id"], serde_json::json!(context));
         assert_eq!(sessions[0]["resource_id"], received.id);
         assert_eq!(sessions[0]["context"]["user_id"], 9801);
         assert!(events
             .iter()
             .all(|event| !event.contains("fixture-credential")));
+    }
+    // Project permission changes apply to general reads, writes, and listings;
+    // a direct sandbox link remains independent of project membership.
+    struct DeniedProject;
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for DeniedProject {
+        async fn user_can_access_project(
+            &self,
+            _: i32,
+            _: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(false)
+        }
+        async fn effective_project_permissions(
+            &self,
+            _: i32,
+            _: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(vec![]))
+        }
+    }
+    let mut denied_state = state_with_db(db.clone(), audit.clone());
+    Arc::get_mut(&mut denied_state)
+        .unwrap()
+        .project_access_checker = Some(Arc::new(DeniedProject));
+    let mut owner = test_user();
+    owner.id = 9801;
+    for (method, route) in [
+        ("GET", format!("/access-sessions/{}", received.id)),
+        ("POST", format!("/access-sessions/{}/revoke", received.id)),
+    ] {
+        // Do not revoke the direct session yet: that path is tested by unlink below.
+        if projectless && method == "POST" {
+            continue;
+        }
+        let result = send(
+            method,
+            &route,
+            "",
+            Some(AuthContext::new_session(owner.clone(), Role::User)),
+            denied_state.clone(),
+        )
+        .await;
+        assert_eq!(
+            result.status(),
+            if projectless {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+    }
+    let result = send(
+        "GET",
+        "/access-sessions?sandbox_id=sbx_dispatch",
+        "",
+        Some(AuthContext::new_session(owner, Role::User)),
+        denied_state,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::OK);
+    let listing: AccessSessionList =
+        serde_json::from_slice(&to_bytes(result.into_body(), 8192).await.unwrap()).unwrap();
+    assert_eq!(listing.total, if projectless { 1 } else { 0 });
+    let authority_before = temps_entities::sandbox_access_authorities::Entity::find_by_id(
+        runtime.authority_id.unwrap(),
+    )
+    .one(db.as_ref())
+    .await
+    .unwrap()
+    .unwrap();
+    match removal {
+        "unlink" => state
+            .service
+            .unlink_vault(&vault.id, stored.link_id.as_deref().unwrap())
+            .await
+            .unwrap(),
+        "bundle" => state
+            .service
+            .retire_vault_resource(&vault.id, Some(&bundle.id))
+            .await
+            .unwrap(),
+        "vault" => state
+            .service
+            .retire_vault_resource(&vault.id, None)
+            .await
+            .unwrap(),
+        "sandbox" => {
+            db.execute_unprepared("DELETE FROM sandboxes WHERE id=9801")
+                .await
+                .unwrap();
+        }
+        _ => panic!("unknown test removal"),
+    }
+    let authority_after =
+        temps_entities::sandbox_access_authorities::Entity::find_by_id(authority_before.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(authority_after.desired_revision > authority_before.desired_revision);
+    assert!(
+        authority_after.next_reconcile_at.is_some(),
+        "unlink durably schedules worker reconciliation"
+    );
+    for id in stored.grant_ids {
+        let grant = temps_entities::sandbox_service_grants::Entity::find_by_id(id)
+            .one(db.as_ref())
+            .await
+            .unwrap();
+        if removal == "sandbox" {
+            assert!(grant.is_none());
+        } else {
+            assert!(grant.unwrap().revoked_at.is_some());
+        }
     }
     drop(state);
     drop(db);

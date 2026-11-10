@@ -5,7 +5,7 @@
 //! together; expiry and revocation use the existing worker enforcement path.
 use super::*;
 use crate::session_types::*;
-use sea_orm::{sea_query::Expr, JoinType, RelationTrait};
+use sea_orm::{sea_query::Expr, DatabaseBackend, JoinType, RelationTrait, Statement};
 use std::collections::BTreeSet;
 use temps_entities::{access_bundles as bundles, access_sessions as sessions};
 use uuid::Uuid;
@@ -82,13 +82,14 @@ impl ServiceAccessService {
     /// when selected policies use a project GitHub connection.
     pub async fn authorize_session(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         vault_id: &str,
         user_id: i32,
         admin: bool,
         request: CreateAccessSession,
         observed: HostObservation,
     ) -> Result<AccessSessionResponse, AccessError> {
+        let project_id = project_id.into();
         validate(&request)?;
         let tx = self
             .db
@@ -97,7 +98,7 @@ impl ServiceAccessService {
             .map_err(|e| AccessError::database("begin vault session", project_id, e))?;
         self.project(&tx, project_id).await?;
         // Same lock as bundle writers serializes policy selection and retries.
-        self.vault(&tx, project_id, vault_id, true).await?;
+        self.vault(&tx, None, vault_id, true).await?;
         let sandbox = self
             .sandbox(
                 &tx,
@@ -107,6 +108,20 @@ impl ServiceAccessService {
                 admin,
             )
             .await?;
+        let link = self
+            .covering_vault_link_on(&tx, vault_id, sandbox.id, sandbox.project_id)
+            .await?;
+        if request
+            .authorized_link_id
+            .as_ref()
+            .is_some_and(|id| id != &link.id)
+        {
+            return Err(AccessError::Conflict {
+                id: vault_id.into(),
+                version: 0,
+            });
+        }
+        let project_id = sandbox.project_id;
         let id = format!("session_{}", request.request_id.simple());
         let consent =
             serde_json::to_value(&request).map_err(|source| AccessError::StoredPolicy {
@@ -134,7 +149,7 @@ impl ServiceAccessService {
             return Ok(response(existing, Utc::now()));
         }
         let bundle = bundles::Entity::find_by_id(&request.bundle_id)
-            .filter(bundles::Column::ProjectId.eq(project_id))
+            .filter(bundles::Column::RetiredAt.is_null())
             .filter(bundles::Column::VaultId.eq(vault_id))
             .one(&tx)
             .await
@@ -166,7 +181,6 @@ impl ServiceAccessService {
         // Lock every service before taking the sandbox lock in grant issuance.
         // This preserves service -> sandbox ordering across single/batch approvals.
         let locked = services::Entity::find()
-            .filter(services::Column::ProjectId.eq(project_id))
             .filter(services::Column::Id.is_in(ids))
             .order_by_asc(services::Column::Id)
             .lock_exclusive()
@@ -224,6 +238,7 @@ impl ServiceAccessService {
             id: Set(id),
             project_id: Set(project_id),
             vault_id: Set(vault_id.into()),
+            link_id: Set(Some(link.id)),
             bundle_id: Set(bundle.id),
             bundle_name: Set(bundle.name),
             bundle_version: Set(bundle.version),
@@ -247,14 +262,18 @@ impl ServiceAccessService {
     }
 
     fn visible_sessions(
-        project_id: i32,
+        project_id: Option<i32>,
         user_id: i32,
         admin: bool,
     ) -> sea_orm::Select<sessions::Entity> {
         let query = sessions::Entity::find()
             .join(JoinType::InnerJoin, sessions::Relation::Sandbox.def())
-            .filter(sessions::Column::ProjectId.eq(project_id))
-            .filter(sandboxes::Column::ProjectId.eq(project_id));
+            .apply_if(project_id, |q, id| {
+                q.filter(sessions::Column::ProjectId.eq(id))
+            })
+            .apply_if(project_id, |q, id| {
+                q.filter(sandboxes::Column::ProjectId.eq(id))
+            });
         if admin {
             query
         } else {
@@ -264,10 +283,24 @@ impl ServiceAccessService {
 
     pub async fn list_sessions(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         user_id: i32,
         admin: bool,
         query: AccessSessionQuery,
+    ) -> Result<AccessSessionList, AccessError> {
+        self.list_sessions_filtered(project_id.into(), user_id, admin, query, false)
+            .await
+    }
+
+    /// A non-admin global listing is bounded to one owned sandbox. When its
+    /// project permissions are absent, only direct-link sessions are visible.
+    pub async fn list_sessions_filtered(
+        &self,
+        project_id: Option<i32>,
+        user_id: i32,
+        admin: bool,
+        query: AccessSessionQuery,
+        direct_only: bool,
     ) -> Result<AccessSessionList, AccessError> {
         self.project(self.db.as_ref(), project_id).await?;
         let (page, page_size) = AccessPageQuery {
@@ -276,6 +309,9 @@ impl ServiceAccessService {
         }
         .normalized();
         let mut selection = Self::visible_sessions(project_id, user_id, admin);
+        if direct_only {
+            selection = selection.filter(Expr::cust("EXISTS (SELECT 1 FROM access_vault_links l WHERE l.id=access_sessions.link_id AND l.sandbox_id=access_sessions.sandbox_id)"));
+        }
         if let Some(vault_id) = query.vault_id {
             self.vault(self.db.as_ref(), project_id, &vault_id, false)
                 .await?;
@@ -313,11 +349,12 @@ impl ServiceAccessService {
     async fn session<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: &str,
         user_id: i32,
         admin: bool,
     ) -> Result<sessions::Model, AccessError> {
+        let project_id = project_id.into();
         Self::visible_sessions(project_id, user_id, admin)
             .filter(sessions::Column::Id.eq(id))
             .one(db)
@@ -326,20 +363,42 @@ impl ServiceAccessService {
             .ok_or_else(|| not_found("session", id.into(), project_id))
     }
 
+    /// Resolve the immutable authorization context, including revoked links.
+    /// Missing/deleted provenance falls back to the historical project scope.
+    pub async fn session_project_scope(
+        &self,
+        id: &str,
+        user_id: i32,
+        admin: bool,
+    ) -> Result<Option<i32>, AccessError> {
+        let row = self.db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT CASE WHEN l.sandbox_id IS NOT NULL THEN NULL ELSE s.project_id END AS project_id FROM access_sessions s JOIN sandboxes b ON b.id=s.sandbox_id LEFT JOIN access_vault_links l ON l.id=s.link_id WHERE s.id=$1 AND ($2 OR b.user_id=$3)",
+            [id.into(), admin.into(), user_id.into()],
+        )).await.map_err(|source| AccessError::ResourceDatabase { operation: "resolve session project scope", resource_id: id.into(), source })?
+          .ok_or_else(|| not_found("session", id.into(), None))?;
+        row.try_get("", "project_id")
+            .map_err(|source| AccessError::ResourceDatabase {
+                operation: "decode session project scope",
+                resource_id: id.into(),
+                source,
+            })
+    }
+
     pub async fn get_session(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: &str,
         user_id: i32,
         admin: bool,
     ) -> Result<AccessSessionDetail, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let row = self
             .session(self.db.as_ref(), project_id, id, user_id, admin)
             .await?;
         let now = Utc::now();
         let mut grants = grants::Entity::find()
-            .filter(grants::Column::ProjectId.eq(project_id))
             .filter(grants::Column::SandboxId.eq(row.sandbox_id))
             .filter(grants::Column::Id.is_in(row.grant_ids.clone()))
             .order_by_asc(grants::Column::Id)
@@ -354,7 +413,7 @@ impl ServiceAccessService {
                 grant_response(grant, &service, &row.consumer_id, now)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.observe_grants(project_id, row.sandbox_id, &mut grants)
+        self.observe_grants(row.project_id, row.sandbox_id, &mut grants)
             .await?;
         Ok(AccessSessionDetail {
             session: response(row, now),
@@ -364,11 +423,12 @@ impl ServiceAccessService {
 
     pub async fn revoke_session(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: &str,
         user_id: i32,
         admin: bool,
     ) -> Result<AccessSessionResponse, AccessError> {
+        let project_id = project_id.into();
         let tx = self
             .db
             .begin()
@@ -376,8 +436,13 @@ impl ServiceAccessService {
             .map_err(|e| AccessError::database("begin session revocation", project_id, e))?;
         self.project(&tx, project_id).await?;
         let visible = self.session(&tx, project_id, id, user_id, admin).await?;
+        if visible.revoked_at.is_some() {
+            return Ok(response(visible, Utc::now()));
+        }
+        // Serialize with unlink/retirement, then update grants before the session,
+        // matching the revocation trigger's lock order.
+        self.vault(&tx, None, &visible.vault_id, true).await?;
         let row = sessions::Entity::find_by_id(&visible.id)
-            .lock_exclusive()
             .one(&tx)
             .await
             .map_err(|e| AccessError::database("lock session revocation", project_id, e))?
@@ -393,7 +458,6 @@ impl ServiceAccessService {
                 grants::Column::Version,
                 Expr::col(grants::Column::Version).add(1),
             )
-            .filter(grants::Column::ProjectId.eq(project_id))
             .filter(grants::Column::SandboxId.eq(row.sandbox_id))
             .filter(grants::Column::Id.is_in(row.grant_ids.clone()))
             .filter(grants::Column::RevokedAt.is_null())

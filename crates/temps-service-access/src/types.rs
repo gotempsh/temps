@@ -79,7 +79,7 @@ pub struct SaveAccessService {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccessServiceResponse {
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub name: String,
     pub policy: SandboxAccessPolicy,
     pub max_ttl_seconds: i32,

@@ -21,7 +21,7 @@ fn planner(checker: Option<Arc<dyn ProjectAccessChecker>>) -> PolicyPlanner {
 fn candidate(user: i32, project: i32) -> Candidate {
     Candidate {
         runtime_id: Uuid::new_v4(),
-        project_id: project,
+        project_id: Some(project),
         approved_by: user,
         admin: false,
         grant_id: format!("grant_{}", Uuid::new_v4().simple()),
@@ -324,7 +324,7 @@ async fn postgres_planner_rechecks_consent_and_preserves_other_services_on_revoc
         // Put the healthy grant in another sandbox/project on the same worker.
         let mut other = runtimes[0].clone();
         other.id = Uuid::new_v4();
-        other.project_id += 1;
+        other.project_id = other.project_id.map(|id| id + 1);
         other.sandbox_id += 1;
         candidates[1].runtime_id = other.id;
         candidates[1].project_id = other.project_id;

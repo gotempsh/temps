@@ -8,6 +8,7 @@ use temps_service_access_runtime::{HostAudit, WorkerControl};
 
 fn request() -> CreateAccessSession {
     CreateAccessSession {
+        authorized_link_id: None,
         request_id: Uuid::new_v4(),
         bundle_id: "bundle_test".into(),
         bundle_version: 1,
@@ -385,6 +386,14 @@ async fn assert_batched_session_query_budget(
             .append_query_results([vec![scalar("id", session.project_id.into())]])
             .append_query_results([vec![vault.clone()]])
             .append_query_results([vec![sandbox.clone()]])
+            .append_query_results([vec![temps_entities::access_vault_links::Model {
+                id: "link_fixture".into(),
+                vault_id: vault.id.clone(),
+                project_id: sandbox.project_id,
+                sandbox_id: None,
+                created_at: Utc::now(),
+                revoked_at: None,
+            }]])
             .append_query_results([Vec::<sessions::Model>::new()])
             .append_query_results([vec![bundle]])
             .append_query_results([selected])
@@ -427,7 +436,7 @@ async fn assert_batched_session_query_budget(
             .iter()
             .filter(|s| s.sql.starts_with("SELECT"))
             .count();
-        assert!(selects <= 10, "batch {size} used {selects} reads");
+        assert!(selects <= 11, "batch {size} used {selects} reads");
         counts.push(statements.len());
     }
     assert_eq!(

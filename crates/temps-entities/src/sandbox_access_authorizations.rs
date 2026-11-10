@@ -11,7 +11,7 @@ pub struct Model {
     pub request_id: Uuid,
     pub requested_ttl: i32,
     pub runtime_id: Uuid,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub sandbox_id: i32,
     pub approved_by: Option<i32>,
     pub approved_at: temps_core::DBDateTime,

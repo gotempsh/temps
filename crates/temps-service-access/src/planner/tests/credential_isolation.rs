@@ -64,7 +64,7 @@ async fn slow_connections_cannot_starve_healthy_github_bindings() {
         for id in 1..=stalled + 1 {
             let runtime = sandbox_access_runtimes::Model {
                 id: Uuid::new_v4(),
-                project_id: id,
+                project_id: Some(id),
                 sandbox_id: id,
                 node_id: None,
                 provider_identity: format!("container-{id}"),

@@ -71,6 +71,10 @@ async fn fresh_consent_database_failure_retains_project_and_operation() {
     let service = ServiceAccessService::new(
         Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    rows_affected: 1,
+                    ..Default::default()
+                }])
                 .append_query_errors([sea_orm::DbErr::Custom("driver detail".into())])
                 .into_connection(),
         ),

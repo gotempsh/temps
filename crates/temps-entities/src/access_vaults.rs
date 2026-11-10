@@ -7,8 +7,9 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub name: String,
+    pub retired_at: Option<temps_core::DBDateTime>,
     pub service_ids: Vec<String>,
     pub version: i32,
     pub created_at: temps_core::DBDateTime,

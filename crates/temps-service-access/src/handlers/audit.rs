@@ -6,7 +6,7 @@ use temps_core::{AuditContext, AuditOperation};
 #[derive(Serialize)]
 pub struct AccessAudit {
     pub context: AuditContext,
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub resource_id: String,
     pub version: i32,
     pub operation: &'static str,

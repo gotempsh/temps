@@ -95,7 +95,7 @@ fn state_with_db(db: Arc<sea_orm::DatabaseConnection>, audit: Arc<Audit>) -> Arc
     })
 }
 fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
+    let mut routes = vec![
         ("GET", "/projects/7/service-access/capability", ""),
         ("GET", "/projects/7/access-services", ""),
         (
@@ -176,7 +176,34 @@ fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
             "/projects/7/sandboxes/sbx_test/services/access_test/revoke",
             r#"{"expected_version":1}"#,
         ),
-    ]
+    ];
+    let global: Vec<_> = routes
+        .iter()
+        .filter(|(_, path, _)| path.starts_with("/projects/7/access-"))
+        .map(|(method, path, body)| (*method, &path[11..], *body))
+        .collect();
+    routes.extend(global);
+    routes.extend([
+        ("GET", "/service-access/capability", ""),
+        ("GET", "/access-vaults/vault_test/consumers/sbx_test", ""),
+        ("DELETE", "/access-services/svc_test", ""),
+        ("GET", "/sandboxes/sbx_test/access-vaults", ""),
+        ("GET", "/projects/7/linked-vaults", ""),
+        ("GET", "/access-vaults/vault_test/links", ""),
+        (
+            "POST",
+            "/access-vaults/vault_test/links",
+            r#"{"sandbox_id":"sbx_test"}"#,
+        ),
+        ("DELETE", "/access-vaults/vault_test/links/link_test", ""),
+        ("DELETE", "/access-vaults/vault_test", ""),
+        (
+            "DELETE",
+            "/access-vaults/vault_test/bundles/bundle_test",
+            "",
+        ),
+    ]);
+    routes
 }
 async fn send(
     method: &str,
@@ -313,11 +340,11 @@ async fn problem_mapping_never_leaks_database_sources() {
     for error in [
         AccessError::Database {
             operation: "save service",
-            project_id: 7,
+            project_id: Some(7),
             source: sea_orm::DbErr::Custom("secret-driver-payload".into()),
         },
         AccessError::Delivery {
-            project_id: 7,
+            project_id: Some(7),
             sandbox_id: "sbx_test".into(),
             source: Box::new(crate::delivery::DeliveryError::Database {
                 operation: "enqueue policy",
@@ -344,8 +371,9 @@ async fn create_returns_masked_service_and_audits_only_metadata() {
     use std::collections::BTreeMap;
     let now = chrono::Utc::now();
     let model = temps_entities::sandbox_access_services::Model {
+        retired_at: None,
         id: "svc_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         name: "API".into(),
         policy: serde_json::json!({"origin":"https://api.example.com","path_prefixes":["/"],"methods":["GET"]}),
         max_ttl_seconds: 900,
@@ -399,8 +427,9 @@ fn policy() -> SandboxAccessPolicy {
 }
 fn row() -> services::Model {
     services::Model {
+        retired_at: None,
         id: "svc_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         name: "API".into(),
         policy: serde_json::to_value(policy()).unwrap(),
         max_ttl_seconds: 900,
@@ -416,7 +445,7 @@ fn grant() -> grants::Model {
     grants::Model {
         assignment_id: None,
         id: "grant_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         service_id: "svc_test".into(),
         sandbox_id: 42,
         service_version: 1,
@@ -660,7 +689,7 @@ async fn single_service_read_is_masked_and_missing_is_a_problem() {
 async fn capability_reports_effective_write_permissions() {
     for (role, manage_services, manage_requests) in [
         (Role::Reader, false, false),
-        (Role::User, true, true),
+        (Role::User, false, true),
         (Role::PlatformAdmin, false, false),
         (Role::Admin, true, true),
     ] {
@@ -706,7 +735,7 @@ async fn capability_reports_effective_write_permissions() {
             let cap: AccessCapability =
                 serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
                     .unwrap();
-            assert!(cap.can_manage_services);
+            assert!(!cap.can_manage_services);
             assert_eq!(cap.can_manage_requests, sandbox_access);
         }
     }
@@ -814,7 +843,7 @@ async fn coordinator_problem_mapping_preserves_context_and_redacts_driver_source
             CoordinatorError::Access(AccessError::NotFound {
                 kind: "sandbox",
                 id: "sbx_test".into(),
-                project_id: 7,
+                project_id: Some(7),
             }),
             StatusCode::NOT_FOUND,
         ),
@@ -1190,8 +1219,9 @@ async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
                     db = db
                         .append_query_results([vec![project]])
                         .append_query_results([vec![access_vaults::Model {
+                            retired_at: None,
                             id: "vault_test".into(),
-                            project_id: 7,
+                            project_id: Some(7),
                             name: "Test vault".into(),
                             service_ids: vec!["svc_test".into()],
                             version: 1,
@@ -1244,5 +1274,27 @@ async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
                 "rejected authorization must not audit a successful approval"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn project_members_cannot_manage_general_vaults_or_links() {
+    for (method, path, body) in routes().into_iter().filter(|(method, path, _)| {
+        *method != "GET"
+            && (path.contains("/access-services") || path.contains("/access-vaults"))
+            && !path.ends_with("/sessions")
+    }) {
+        let response = send(
+            method,
+            path,
+            body,
+            Some(AuthContext::new_session(test_user(), Role::User)),
+            state(
+                MockDatabase::new(DatabaseBackend::Postgres),
+                Arc::new(Audit::default()),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
 }

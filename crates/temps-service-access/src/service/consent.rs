@@ -57,7 +57,7 @@ pub struct AuthorizedGrant {
 
 /// Service rows must already be locked in ID order in this transaction.
 pub(super) struct LockedConsentBatch {
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub sandbox_id: String,
     pub user_id: i32,
     pub admin: bool,
@@ -80,10 +80,13 @@ impl ServiceAccessService {
             .begin()
             .await
             .map_err(|e| AccessError::database("begin fresh grant", consent.project_id, e))?;
+        self.lock_vault_management(&tx).await?;
+        let service_id = consent.request.service_id.clone();
         let project_id = consent.project_id;
         let result = self
             .authorize_grant_in_transaction(&tx, consent, observed, Utc::now())
             .await?;
+        self.require_standalone_service(&tx, &service_id).await?;
         tx.commit().await.map_err(|e| {
             AccessError::database("commit fresh sandbox authorization", project_id, e)
         })?;
@@ -125,7 +128,7 @@ impl ServiceAccessService {
             .authorize_locked_grants(
                 tx,
                 LockedConsentBatch {
-                    project_id,
+                    project_id: Some(project_id),
                     sandbox_id: sandbox_id.into(),
                     user_id,
                     admin,
@@ -169,7 +172,6 @@ impl ServiceAccessService {
         for (request_id, request, service) in &selections {
             if request_id.is_nil()
                 || !(60..=86400).contains(&request.ttl_seconds)
-                || service.project_id != project_id
                 || service.id != request.service_id
             {
                 return Err(invalid(
@@ -204,6 +206,12 @@ impl ServiceAccessService {
                 })?;
             crate::tokenless::compile_policy(&policy)?;
             if let Some(source) = &policy.github_repository {
+                if service.project_id.is_none() || service.project_id != project_id {
+                    return Err(invalid(
+                        "github_repository",
+                        "GitHub credential source does not cover the sandbox project",
+                    ));
+                }
                 github_sources.push(source.clone());
             } else if service.credential_encrypted.is_none() {
                 return Err(invalid(
@@ -212,10 +220,21 @@ impl ServiceAccessService {
                 ));
             }
         }
-        crate::github::validate_bindings(tx, project_id, &github_sources).await?;
+        if !github_sources.is_empty() {
+            let source_project = project_id.ok_or_else(|| {
+                invalid(
+                    "github_repository",
+                    "GitHub credentials require their source project",
+                )
+            })?;
+            crate::github::validate_bindings(tx, source_project, &github_sources).await?;
+        }
         let mut sandbox_query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(sandbox_id))
-            .filter(sandboxes::Column::ProjectId.eq(project_id));
+            .filter(sea_orm::sea_query::Expr::cust_with_values(
+                "project_id IS NOT DISTINCT FROM $1",
+                [sea_orm::Value::from(project_id)],
+            ));
         if !admin {
             sandbox_query = sandbox_query.filter(sandboxes::Column::UserId.eq(user_id));
         }
@@ -426,7 +445,7 @@ impl ServiceAccessService {
 async fn reserve_worker_capacity(
     tx: &sea_orm::DatabaseTransaction,
     boot_id: Uuid,
-    project_id: i32,
+    project_id: Option<i32>,
 ) -> Result<(), AccessError> {
     let authority = authorities::Entity::find_by_id(boot_id)
         .lock_exclusive()
@@ -456,7 +475,7 @@ async fn reserve_worker_capacity(
 async fn replay_consent(
     tx: &sea_orm::DatabaseTransaction,
     request_id: Uuid,
-    project_id: i32,
+    project_id: Option<i32>,
     sandbox: &sandboxes::Model,
     request: &RequestServiceGrant,
     user_id: i32,
@@ -471,7 +490,7 @@ async fn replay_consent(
         return Ok(None);
     };
     let project_id = authorization.project_id;
-    if Some(project_id) != sandbox.project_id
+    if project_id != sandbox.project_id
         || authorization.sandbox_id != sandbox.id
         || authorization.approved_by != Some(user_id)
         || authorization.runtime_id != incarnation

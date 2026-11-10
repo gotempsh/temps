@@ -50,7 +50,7 @@ pub const BLOCKERS: &[IntegrationBlocker] = &[
 /// Docker and microVM transports must resolve this before attaching streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingTarget {
-    pub project_id: i32,
+    pub project_id: Option<i32>,
     pub sandbox_id: i32,
     pub incarnation_id: Uuid,
     pub node_id: Uuid,
@@ -116,12 +116,12 @@ impl PreparedSession {
             grant_id: request.grant_id.clone(),
             reason,
         };
-        if request.target.project_id <= 0
+        if request.target.project_id.is_some_and(|id| id <= 0)
             || request.target.sandbox_id <= 0
             || request.service_version <= 0
         {
             return Err(invalid(
-                "project ID, sandbox ID and service version must be positive",
+                "sandbox ID, service version and any project ID must be positive",
             ));
         }
         if [request.target.incarnation_id, request.target.node_id]
@@ -164,8 +164,11 @@ impl PreparedSession {
             operation,
             source,
         };
-        let scope = Scope::parse(&format!("temps:project:{}", request.target.project_id))
-            .map_err(|source| sdk("scope compilation", source))?;
+        let scope_name = match request.target.project_id {
+            Some(id) => format!("temps:project:{id}"),
+            None => format!("temps:sandbox:{}", request.target.sandbox_id),
+        };
+        let scope = Scope::parse(&scope_name).map_err(|source| sdk("scope compilation", source))?;
         let binding_id = request.target.incarnation_id.to_string();
         let labels = BTreeMap::from([
             ("grant_id".into(), request.grant_id.to_string()),

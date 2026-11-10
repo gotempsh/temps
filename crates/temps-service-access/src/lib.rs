@@ -21,3 +21,5 @@ pub mod vault_types;
 
 pub mod assignment_types;
 pub mod session_types;
+
+pub mod link_types;

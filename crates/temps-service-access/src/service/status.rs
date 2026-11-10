@@ -21,10 +21,11 @@ pub(super) struct EnforcementRow {
 impl ServiceAccessService {
     pub(super) async fn observe_grants(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         sandbox_id: i32,
         items: &mut [ServiceGrantResponse],
     ) -> Result<(), AccessError> {
+        let project_id = project_id.into();
         if items.is_empty() {
             return Ok(());
         }
@@ -35,12 +36,12 @@ SELECT c.grant_id,r.lease_expires_at,
     c.grant_id=ANY(r.applied_grant_ids) AS installed,
     (r.closed_at IS NOT NULL AND r.applied_version=r.desired_version AND r.applied_version>0 AND r.lease_expires_at IS NULL AND cardinality(r.applied_grant_ids)=0) AS cut_confirmed,
     (r.closed_at IS NOT NULL OR a.closed_at IS NOT NULL) AS closed,
-    (s.status='running' AND s.node_id IS NOT DISTINCT FROM r.node_id AND s.project_id=r.project_id) AS running
+    (s.status='running' AND s.node_id IS NOT DISTINCT FROM r.node_id AND s.project_id IS NOT DISTINCT FROM r.project_id) AS running
 FROM sandbox_access_authorizations c
-JOIN sandbox_access_runtimes r ON r.id=c.runtime_id AND r.project_id=c.project_id AND r.sandbox_id=c.sandbox_id
+JOIN sandbox_access_runtimes r ON r.id=c.runtime_id AND r.project_id IS NOT DISTINCT FROM c.project_id AND r.sandbox_id=c.sandbox_id
 JOIN sandbox_access_authorities a ON a.id=r.authority_id
 JOIN sandboxes s ON s.id=c.sandbox_id
-WHERE c.project_id=$1 AND c.sandbox_id=$2 AND c.grant_id=ANY($3::text[])
+WHERE c.project_id IS NOT DISTINCT FROM $1 AND c.sandbox_id=$2 AND c.grant_id=ANY($3::text[])
 "#, [project_id.into(),sandbox_id.into(),ids.into()]))
             .all(self.db.as_ref()).await.map_err(|e| AccessError::database("read worker enforcement receipts",project_id,e))?;
         let rows: HashMap<_, _> = rows

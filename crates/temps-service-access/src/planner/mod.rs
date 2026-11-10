@@ -194,12 +194,16 @@ impl PolicyPlanner {
         let mut grouped: BTreeMap<Uuid, Vec<(Candidate, SandboxAccessPolicy)>> = BTreeMap::new();
         let mut github_connections = BTreeSet::new();
         for mut candidate in candidates {
-            let permissions = allowed.get(&(candidate.approved_by, candidate.project_id));
+            let permissions = candidate
+                .project_id
+                .and_then(|project_id| allowed.get(&(candidate.approved_by, project_id)));
             let needs_git = candidate
                 .policy
                 .get("github_repository")
                 .is_some_and(|value| !value.is_null());
-            if (candidate.admin || permissions.is_some_and(|git| !needs_git || *git))
+            if (candidate.admin
+                || (candidate.project_id.is_none() && !needs_git)
+                || permissions.is_some_and(|git| !needs_git || *git))
                 && candidate.expires_at > now + chrono::Duration::seconds(1)
             {
                 let policy: SandboxAccessPolicy = serde_json::from_value(std::mem::take(
@@ -343,7 +347,7 @@ impl PolicyPlanner {
 #[derive(FromQueryResult)]
 struct Candidate {
     runtime_id: Uuid,
-    project_id: i32,
+    project_id: Option<i32>,
     approved_by: i32,
     admin: bool,
     grant_id: String,

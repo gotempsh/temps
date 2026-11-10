@@ -3,6 +3,7 @@
 
 pub(crate) mod assignments;
 mod consent;
+mod links;
 pub(crate) mod sessions;
 mod status;
 mod vaults;
@@ -16,7 +17,7 @@ use crate::{
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
     TransactionTrait,
 };
 use std::sync::Arc;
@@ -49,8 +50,12 @@ impl ServiceAccessService {
     async fn project<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
     ) -> Result<(), AccessError> {
+        let project_id = project_id.into();
+        let Some(project_id) = project_id else {
+            return Ok(());
+        };
         if projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .select_only()
@@ -68,12 +73,16 @@ impl ServiceAccessService {
 
     pub async fn get_service(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         service_id: &str,
     ) -> Result<AccessServiceResponse, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let model = services::Entity::find_by_id(service_id)
-            .filter(services::Column::ProjectId.eq(project_id))
+            .filter(services::Column::RetiredAt.is_null())
+            .apply_if(project_id, |q, id| {
+                q.filter(services::Column::ProjectId.eq(id))
+            })
             .one(self.db.as_ref())
             .await
             .map_err(|e| AccessError::database("read service", project_id, e))?
@@ -83,13 +92,17 @@ impl ServiceAccessService {
 
     pub async fn list_services(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         query: AccessPageQuery,
     ) -> Result<AccessServiceList, AccessError> {
+        let project_id = project_id.into();
         self.project(self.db.as_ref(), project_id).await?;
         let (page, page_size) = query.normalized();
         let pages = services::Entity::find()
-            .filter(services::Column::ProjectId.eq(project_id))
+            .filter(services::Column::RetiredAt.is_null())
+            .apply_if(project_id, |q, id| {
+                q.filter(services::Column::ProjectId.eq(id))
+            })
             .order_by_desc(services::Column::CreatedAt)
             .order_by_desc(services::Column::Id)
             .paginate(self.db.as_ref(), page_size);
@@ -114,10 +127,11 @@ impl ServiceAccessService {
 
     pub async fn save_service(
         &self,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         id: Option<String>,
         mut request: SaveAccessService,
     ) -> Result<AccessServiceResponse, AccessError> {
+        let project_id = project_id.into();
         validate_service(&mut request)?;
         if id.is_some() && request.vault_id.is_some() {
             return Err(invalid("vault_id", "only accepted when creating a service"));
@@ -143,12 +157,22 @@ impl ServiceAccessService {
             .begin()
             .await
             .map_err(|e| AccessError::database("begin service save", project_id, e))?;
+        let validate_links = request.policy.github_repository.is_some();
+        if validate_links {
+            self.lock_vault_management(&tx).await?;
+        }
         self.project(&tx, project_id).await?;
         if let Some(source) = &request.policy.github_repository {
-            crate::github::validate_binding(&tx, project_id, source).await?;
+            let source_project = project_id.ok_or_else(|| {
+                invalid(
+                    "github_repository",
+                    "a GitHub credential source project is required",
+                )
+            })?;
+            crate::github::validate_binding(&tx, source_project, source).await?;
         }
         let vault = if let Some(vault_id) = &request.vault_id {
-            let vault = self.vault(&tx, project_id, vault_id, true).await?;
+            let vault = self.vault(&tx, None, vault_id, true).await?;
             if vault.service_ids.len() >= 100 || vault.version == i32::MAX {
                 return Err(invalid(
                     "vault_id",
@@ -163,7 +187,10 @@ impl ServiceAccessService {
         let updating = id.is_some();
         let mut model = if let Some(id) = id {
             let current = services::Entity::find_by_id(&id)
-                .filter(services::Column::ProjectId.eq(project_id))
+                .filter(services::Column::RetiredAt.is_null())
+                .apply_if(project_id, |q, id| {
+                    q.filter(services::Column::ProjectId.eq(id))
+                })
                 .lock_exclusive()
                 .one(&tx)
                 .await
@@ -195,7 +222,7 @@ impl ServiceAccessService {
         } else {
             services::ActiveModel {
                 id: Set(format!("svc_{}", uuid::Uuid::new_v4().simple())),
-                project_id: Set(project_id),
+                project_id: Set(project_id.into()),
                 created_at: Set(now),
                 version: Set(1),
                 credential_encrypted: Set(None),
@@ -241,6 +268,10 @@ impl ServiceAccessService {
                 .await
                 .map_err(|e| AccessError::database("attach service to vault", project_id, e))?;
         }
+        if validate_links {
+            self.validate_linked_sources(&tx, None, Some(&result.id))
+                .await?;
+        }
         tx.commit()
             .await
             .map_err(|e| AccessError::database("commit service save", project_id, e))?;
@@ -250,14 +281,17 @@ impl ServiceAccessService {
     async fn sandbox<C: ConnectionTrait>(
         &self,
         db: &C,
-        project_id: i32,
+        project_id: impl Into<Option<i32>>,
         sandbox_id: &str,
         user_id: i32,
         admin: bool,
     ) -> Result<sandboxes::Model, AccessError> {
+        let project_id = project_id.into();
         let mut query = sandboxes::Entity::find()
             .filter(sandboxes::Column::PublicId.eq(sandbox_id))
-            .filter(sandboxes::Column::ProjectId.eq(project_id));
+            .apply_if(project_id, |q, id| {
+                q.filter(sandboxes::Column::ProjectId.eq(id))
+            });
         if !admin {
             query = query.filter(sandboxes::Column::UserId.eq(user_id));
         }
@@ -365,7 +399,7 @@ impl ServiceAccessService {
         let grant = grants::ActiveModel {
             assignment_id: Set(None),
             id: Set(format!("grant_{}", uuid::Uuid::new_v4().simple())),
-            project_id: Set(project_id),
+            project_id: Set(project_id.into()),
             service_id: Set(service.id.clone()),
             sandbox_id: Set(sandbox.id),
             service_version: Set(service.version),
@@ -457,11 +491,11 @@ impl ServiceAccessService {
 fn invalid(field: &'static str, reason: &'static str) -> AccessError {
     AccessError::Validation { field, reason }
 }
-fn not_found(kind: &'static str, id: String, project_id: i32) -> AccessError {
+fn not_found(kind: &'static str, id: String, project_id: impl Into<Option<i32>>) -> AccessError {
     AccessError::NotFound {
         kind,
         id,
-        project_id,
+        project_id: project_id.into(),
     }
 }
 

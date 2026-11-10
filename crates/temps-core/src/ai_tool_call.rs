@@ -138,3 +138,41 @@ mod tests {
         assert!(assistant_user_agent(None).contains("via Temps AI assistant"));
     }
 }
+
+/// In-process evidence that a pending write was confirmed by its human owner.
+/// Never populated from HTTP headers or model parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfirmedAiWrite;
+
+pub fn require_human_confirmation(
+    ai_call: Option<&AiToolCall>,
+    confirmation: Option<&ConfirmedAiWrite>,
+    operation: &str,
+) -> Result<(), crate::problemdetails::Problem> {
+    if confirmation.is_some() {
+        return Ok(());
+    }
+    require_human_caller(ai_call, operation)
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    #[test]
+    fn assistant_access_requires_confirmed_pending_write() {
+        assert!(require_human_confirmation(None, None, "create_access_session_general").is_ok());
+        assert!(require_human_confirmation(
+            Some(&AiToolCall),
+            None,
+            "create_access_session_general"
+        )
+        .is_err());
+        assert!(require_human_confirmation(
+            Some(&AiToolCall),
+            Some(&ConfirmedAiWrite),
+            "create_access_session_general"
+        )
+        .is_ok());
+        assert!(require_human_caller(Some(&AiToolCall), "confirm_pending_action").is_err());
+    }
+}

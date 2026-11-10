@@ -42,7 +42,7 @@ fn input(node: Uuid, incarnation: Uuid, origins: &[&str]) -> AuthorizedBinding {
         .enumerate()
         .map(|(index, origin)| PrepareSession {
             target: BindingTarget {
-                project_id: 1,
+                project_id: Some(1),
                 sandbox_id: 1,
                 incarnation_id: incarnation,
                 node_id: node,

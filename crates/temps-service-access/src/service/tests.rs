@@ -45,8 +45,9 @@ fn policy() -> SandboxAccessPolicy {
 }
 fn row() -> services::Model {
     services::Model {
+        retired_at: None,
         id: "svc_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         name: "API".into(),
         policy: serde_json::to_value(policy()).unwrap(),
         max_ttl_seconds: 900,
@@ -62,7 +63,7 @@ fn grant() -> grants::Model {
     grants::Model {
         assignment_id: None,
         id: "grant_test".into(),
-        project_id: 7,
+        project_id: Some(7),
         service_id: "svc_test".into(),
         sandbox_id: 42,
         service_version: 1,
@@ -256,7 +257,10 @@ async fn list_not_found_and_database_failures_are_contextual() {
     let s = service(db().append_query_results([Vec::<BTreeMap<String, sea_orm::Value>>::new()]));
     assert!(matches!(
         s.list_services(7, page()).await,
-        Err(AccessError::NotFound { project_id: 7, .. })
+        Err(AccessError::NotFound {
+            project_id: Some(7),
+            ..
+        })
     ));
     let s = service(db().append_query_errors([DbErr::Custom("sensitive-driver-message".into())]));
     let err = s.list_services(7, page()).await.unwrap_err();
@@ -451,7 +455,7 @@ async fn write_failures_roll_back_without_leaking_driver_details() {
         error,
         AccessError::Database {
             operation: "save service",
-            project_id: 7,
+            project_id: Some(7),
             ..
         }
     ));
@@ -468,7 +472,7 @@ async fn grants_missing_resources_and_storage_failures_explain_the_operation() {
     let s = service(db().append_query_results([Vec::<services::Model>::new()]));
     assert!(
         matches!(s.request_grant(7, "sbx_test", 1, false, grant_request()).await,
-        Err(AccessError::NotFound { kind: "service", project_id: 7, id }) if id == "svc_test")
+        Err(AccessError::NotFound { kind: "service", project_id: Some(7), id }) if id == "svc_test")
     );
     let s = service(db().append_query_errors([DbErr::Custom("read error".into())]));
     assert!(matches!(
@@ -544,7 +548,7 @@ fn corrupted_policy_is_a_contextual_error_instead_of_an_empty_scope() {
     let mut service = row();
     service.policy = serde_json::json!({"unexpected": true});
     assert!(
-        matches!(service_response(service), Err(AccessError::StoredPolicy { project_id: 7, id, .. }) if id == "svc_test")
+        matches!(service_response(service), Err(AccessError::StoredPolicy { project_id: Some(7), id, .. }) if id == "svc_test")
     );
 }
 
@@ -566,7 +570,7 @@ async fn single_service_read_scopes_query_and_handles_storage_errors() {
             .append_query_results([Vec::<services::Model>::new()]),
     );
     assert!(
-        matches!(svc.get_service(7, "missing").await, Err(AccessError::NotFound { id, project_id: 7, .. }) if id == "missing")
+        matches!(svc.get_service(7, "missing").await, Err(AccessError::NotFound { id, project_id: Some(7), .. }) if id == "missing")
     );
     let svc = service(
         db().append_query_results([vec![project_row()]])
