@@ -574,6 +574,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_label_discovery_is_rejected_before_replay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let router = axum::Router::new().route(
+            "/labels",
+            axum::routing::get(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"values":["fixture-private"]}))
+                }
+            }),
+        );
+        let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/labels":{"get":{"operationId":"list_metric_label_values","parameters":[{"name":"label_key","in":"query","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let (state, _, _) = fixture();
+        state
+            .api_tools
+            .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                router,
+                &api,
+                vec!["list_metric_label_values".into()],
+            ));
+        for suffix in [
+            "",
+            "--label_key password",
+            "--label_key API_KEY",
+            "--label_key http.authorization",
+        ] {
+            let error = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":format!("list_metric_label_values {suffix}")}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("list_metric_label_values"));
+            assert!(error.contains("--help"));
+            assert!(!error.contains("fixture-private"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn metric_label_discovery_survives_mcp_response_redaction() {
         for (operation, field, values) in [
             ("list_metric_label_keys", "keys", json!(["http.method"])),
@@ -585,7 +631,7 @@ mod tests {
                 axum::routing::get(move || async move { axum::Json(payload) }),
             );
             let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
-                "paths":{"/labels":{"get":{"operationId":operation,"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+                "paths":{"/labels":{"get":{"operationId":operation,"parameters":[{"name":"label_key","in":"query","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
             let (state, _, _) = fixture();
             state
                 .api_tools
@@ -598,7 +644,7 @@ mod tests {
                 &state,
                 &auth(3, false),
                 "temps",
-                &json!({"command":operation}),
+                &json!({"command":format!("{operation} --label_key http.method")}),
             )
             .await
             .unwrap();

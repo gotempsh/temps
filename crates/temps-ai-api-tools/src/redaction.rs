@@ -3,8 +3,8 @@
 
 //! Credential-safe presentation shared by chat and external MCP.
 use std::sync::OnceLock;
-/// Recursively replace values under credential-like keys.
-pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
+/// Whether a field name indicates a credential or private configuration value.
+pub fn is_sensitive_field_name(name: &str) -> bool {
     const SENSITIVE: &[&str] = &[
         "value",
         "secret",
@@ -17,6 +17,12 @@ pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
         "headers",
         "webhook",
     ];
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE.iter().any(|needle| lower.contains(needle))
+}
+
+/// Recursively replace values under credential-like keys.
+pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(object) => {
             // Generic webhook provider configs use the deliberately neutral
@@ -31,8 +37,8 @@ pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
                     .iter()
                     .map(|(key, value)| {
                         let lower = key.to_ascii_lowercase();
-                        let sensitive = SENSITIVE.iter().any(|needle| lower.contains(needle))
-                            || (webhook_config && lower == "url");
+                        let sensitive =
+                            is_sensitive_field_name(key) || (webhook_config && lower == "url");
                         let value = if sensitive {
                             serde_json::Value::String("***".to_string())
                         } else {

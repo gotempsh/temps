@@ -915,6 +915,19 @@ impl InternalApiCaller {
             crate::cli::CliAction::Terminal(text) => Ok(text),
             crate::cli::CliAction::Invalid(detail) => Err(ApiToolError::InvalidCommand { detail }),
             crate::cli::CliAction::Execute(op, params) => {
+                // Label-value responses omit the requested label name. Refuse
+                // credential-like labels while that trusted context is available,
+                // before arbitrary secret strings reach the response redactor.
+                if op.operation_id == "list_metric_label_values"
+                    && params
+                        .get("label_key")
+                        .and_then(Value::as_str)
+                        .is_none_or(crate::redaction::is_sensitive_field_name)
+                {
+                    return Err(ApiToolError::InvalidCommand {
+                        detail: "Operation 'list_metric_label_values' requires a non-sensitive label_key; credential-like label values are unavailable. Use list_metric_label_values --help.".into(),
+                    });
+                }
                 let response = self.call(&op.operation_id, params, scope).await?;
                 Ok(
                     serde_json::json!({"operation": op.operation_id, "status": response.status,
