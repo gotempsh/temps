@@ -3224,7 +3224,9 @@ async fn cancel_new_service(
 /// physical backups also carry the origin's role and database; other engines
 /// retain their existing login-identity behavior.
 struct RestoredServiceCredentials {
-    password: String,
+    /// `None` when the restore keeps the target's own password (a logical
+    /// PostgreSQL restore by a job, [`Self::into_database_only`]).
+    password: Option<String>,
     root_password: Option<String>,
     username: Option<String>,
     database: Option<String>,
@@ -3234,7 +3236,7 @@ impl RestoredServiceCredentials {
     fn from_origin(service_type: &str, parameters: &serde_json::Value) -> Option<Self> {
         let postgres = service_type == "postgres";
         Some(Self {
-            password: parameters.get("password")?.as_str()?.to_string(),
+            password: Some(parameters.get("password")?.as_str()?.to_string()),
             root_password: parameters
                 .get("root_password")
                 .and_then(|v| v.as_str())
@@ -3258,11 +3260,27 @@ impl RestoredServiceCredentials {
         })
     }
 
+    /// What a logical PostgreSQL restore by a job leaves to reconcile: the
+    /// database the origin's data was restored into. The job keeps the
+    /// target's login and its password through the dump (the dump's own role
+    /// passwords are those of backup time, which Temps does not know), so
+    /// neither changes. `None` when the origin names no database.
+    fn into_database_only(self) -> Option<Self> {
+        Some(Self {
+            password: None,
+            root_password: None,
+            username: None,
+            database: Some(self.database?),
+        })
+    }
+
     fn apply(&self, parameters: &mut serde_json::Map<String, serde_json::Value>) {
-        parameters.insert(
-            "password".to_string(),
-            serde_json::Value::String(self.password.clone()),
-        );
+        if let Some(password) = &self.password {
+            parameters.insert(
+                "password".to_string(),
+                serde_json::Value::String(password.clone()),
+            );
+        }
         if parameters.contains_key("root_password") {
             if let Some(password) = &self.root_password {
                 parameters.insert(
@@ -3997,20 +4015,12 @@ async fn run_job_restore(
     let parameters: serde_json::Value =
         serde_json::from_str(&config_json).unwrap_or_else(|_| serde_json::json!({}));
     let (job_target, password) = workload_job::pg_target(target, node_id, &parameters);
-    // The dump runs `ALTER ROLE` for every role of its origin. When the
-    // target logs in as one of them, its password changes to the origin's
-    // midway, and the dump's next `\connect` would fail with the target's:
-    // the job switches the login to the origin's password first (on the
-    // control plane the dump is applied over the container's local socket,
-    // where the password is never asked again).
-    let restored_login = origin_credentials.as_ref().and_then(|origin| {
-        (origin
-            .username
-            .as_deref()
-            .unwrap_or(workload_job::DEFAULT_PG_USERNAME)
-            == job_target.username)
-            .then(|| origin.password.clone())
-    });
+    // The dump runs `ALTER ROLE` for every role it holds, with the password
+    // each had when the backup was taken. The job keeps its login on the
+    // target's own password through it (`restore_script`), so the target's
+    // stored password stays the one that works, and only the database the
+    // restored data lives in is reconciled below.
+    let restored_database = origin_credentials.and_then(|origin| origin.into_database_only());
     let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
         .await
         .map_err(|e| RestoreError::ExternalService {
@@ -4069,8 +4079,8 @@ async fn run_job_restore(
         workload_job::JobPurpose::Restore {
             restore_run_id: run_id,
         },
-        workload_job::restore_script(&job_target, &object_key, restored_login.is_some()),
-        workload_job::restore_env(&password, &s3, restored_login.as_deref()),
+        workload_job::restore_script(&job_target, &object_key),
+        workload_job::restore_env(&password, &s3),
         // Past the safe point: nothing may interrupt the apply.
         &tokio_util::sync::CancellationToken::new(),
     )
@@ -4078,7 +4088,7 @@ async fn run_job_restore(
     .map_err(|e| RestoreError::ExternalService {
         reason: format!("restore run {run_id}: {e}"),
     })?;
-    reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
+    reconcile_restored_credentials(db, enc, target.id, restored_database.as_ref()).await;
     if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
     }
@@ -5218,7 +5228,10 @@ mod tests {
             })
             .unwrap();
         let parameters: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
-        assert_eq!(parameters["password"], credentials.password);
+        assert_eq!(
+            parameters["password"].as_str(),
+            credentials.password.as_deref()
+        );
         assert_eq!(parameters["username"], "origin_role");
         assert_eq!(parameters["database"], "origin_db");
         assert_eq!(parameters["container_name"], "operator-owned-target");
@@ -5251,6 +5264,41 @@ mod tests {
             assert_eq!(target["username"], "target_role");
             assert_eq!(target["database"], "target_db");
         }
+    }
+
+    /// A logical PostgreSQL restore by a job keeps the target's login and
+    /// password (the dump's are those of backup time, which may no longer be
+    /// the origin's): only the database the origin's data lives in is
+    /// reconciled, so the stored password keeps working.
+    #[test]
+    fn a_job_restore_reconciles_only_the_restored_database() {
+        let origin = serde_json::json!({
+            "password": "synthetic-origin-current-password",
+            "username": "origin_role",
+            "database": "origin_db"
+        });
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "username": "target_role",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin("postgres", &origin)
+            .and_then(RestoredServiceCredentials::into_database_only)
+            .expect("the origin names its database")
+            .apply(&mut target);
+        assert_eq!(target["password"], "synthetic-target-password");
+        assert_eq!(target["username"], "target_role");
+        assert_eq!(target["database"], "origin_db");
+
+        assert!(RestoredServiceCredentials::from_origin(
+            "postgres",
+            &serde_json::json!({ "password": "p" })
+        )
+        .and_then(RestoredServiceCredentials::into_database_only)
+        .is_none());
     }
 
     #[test]
@@ -7639,7 +7687,7 @@ mod tests {
         )
         .await
         .expect("a Postgres dump carries its origin's roles");
-        assert_eq!(postgres.password, "origin-pw");
+        assert_eq!(postgres.password.as_deref(), Some("origin-pw"));
         assert_eq!(postgres.username.as_deref(), Some("app"));
         assert_eq!(postgres.database.as_deref(), Some("shop"));
 
@@ -7651,7 +7699,7 @@ mod tests {
         )
         .await
         .expect("a mongodump carries admin.system.users");
-        assert_eq!(mongo.password, "origin-pw");
+        assert_eq!(mongo.password.as_deref(), Some("origin-pw"));
         assert_eq!(mongo.username, None, "only Postgres moves the login name");
     }
 

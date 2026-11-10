@@ -91,18 +91,16 @@ pub mod exit {
     /// truncated). Found by a verification pass before anything is applied;
     /// see [`super::restore_script`].
     pub const CORRUPT_DUMP: i64 = 7;
-    /// Switching the login to the password the dump restores failed; nothing
-    /// was applied. See [`super::restore_script`].
-    pub const LOGIN_SWITCH_FAILED: i64 = 8;
+    /// Keeping the job's login on its own password through the dump failed
+    /// (the filter that drops the dump's password for that login exited
+    /// non-zero); `psql` may have applied part of the dump. See
+    /// [`super::restore_script`].
+    pub const KEEP_LOGIN_FAILED: i64 = 8;
 }
 
 /// The login of a PostgreSQL service whose config names none, as the
 /// provider creates it.
 pub const DEFAULT_PG_USERNAME: &str = "postgres";
-
-/// The variable through which a restore job receives the password the dump
-/// it applies gives the job's login ([`restore_script`]).
-pub const RESTORED_PASSWORD_ENV: &str = "TEMPS_RESTORED_PASSWORD";
 
 /// Whether a backup (and an in-place restore) of `service` runs as a job on
 /// its node. See the module docs for why this is the gate.
@@ -367,20 +365,32 @@ pub fn backup_script(target: &PgJobTarget, object_key: &str) -> String {
     )
 }
 
-/// The variables of a restore job: those of [`job_env`], and, when the dump
-/// gives the job's login another password ([`restore_script`] with
-/// `switch_login`), that password in [`RESTORED_PASSWORD_ENV`].
-pub fn restore_env(
-    password: &str,
-    s3: &S3JobTarget,
-    restored_password: Option<&str>,
-) -> Vec<(String, String)> {
-    let mut env = job_env(password, s3);
-    if let Some(restored) = restored_password {
-        env.push((RESTORED_PASSWORD_ENV.to_string(), restored.to_string()));
-    }
-    env
+/// The variables of a restore job: those of [`job_env`]. The job applies the
+/// dump as the target's own login, with the target's own password, whatever
+/// the dump's roles say ([`restore_script`]).
+pub fn restore_env(password: &str, s3: &S3JobTarget) -> Vec<(String, String)> {
+    job_env(password, s3)
 }
+
+/// The `ALTER ROLE` line prefixes `pg_dumpall` writes for `role`, bare and
+/// quoted (it quotes a name that is not a plain lower-case identifier, or is
+/// a keyword): the lines whose password [`restore_script`] drops.
+fn alter_role_prefixes(role: &str) -> (String, String) {
+    (
+        format!("ALTER ROLE {role} WITH "),
+        format!("ALTER ROLE \"{}\" WITH ", role.replace('"', "\"\"")),
+    )
+}
+
+/// Drops `PASSWORD '...'` from the dump's `ALTER ROLE <login> WITH ...`
+/// lines, and only before the dump's first `\connect`: the cluster-wide
+/// globals (roles) come first, and no table data is written before it, so
+/// no row is ever rewritten. Role password hashes (SCRAM, md5) hold no
+/// quote. The prefixes arrive in the environment, never in the program.
+const KEEP_LOGIN_AWK: &str = "!done && /^\\\\connect / { done = 1 } \
+     !done && (index($0, ENVIRON[\"TEMPS_KEEP_BARE\"]) == 1 || \
+     index($0, ENVIRON[\"TEMPS_KEEP_QUOTED\"]) == 1) \
+     { sub(/ PASSWORD \\047[^\\047]*\\047/, \"\") } { print }";
 
 /// The restore script: the object streams through gunzip into `psql`, as
 /// the local pg_dump restore applies a `pg_dumpall --clean` dump (errors on
@@ -409,40 +419,21 @@ pub fn restore_env(
 /// (status 141: gunzip stopped reading first) is a corrupt object
 /// ([`exit::CORRUPT_DUMP`]); any other fetch failure is a download failure.
 ///
-/// A dump of another database runs `ALTER ROLE ... PASSWORD` for every role
-/// of its origin. When the job's login is one of them, its password changes
-/// midway, and the dump's next `\connect` would be refused with the old one.
-/// With `switch_login`, the job therefore gives its login the password the
-/// dump restores ([`RESTORED_PASSWORD_ENV`]) once the object is verified and
-/// before anything is applied, and applies the dump with it. The password
-/// reaches `psql` from the environment and is quoted by it (`:'...'`); it is
-/// never part of the script or of an argv. A failed switch exits with
-/// [`exit::LOGIN_SWITCH_FAILED`] and nothing applied.
-pub fn restore_script(target: &PgJobTarget, object_key: &str, switch_login: bool) -> String {
-    let switch = if switch_login {
-        // The quoted heredoc keeps the shell from expanding anything in the
-        // SQL; psql reads the password from the environment through a
-        // backtick builtin `printf`, so it never appears in an argv.
-        format!(
-            "[ -n \"${env}\" ] || {{ echo 'temps: the password the dump restores is missing; \
-             nothing was applied' >&2; exit {code}; }}\n\
-             psql -X -q -v ON_ERROR_STOP=1 --no-password --host={host} --port={port} \
-             --username={user} --dbname=postgres >/dev/null <<'TEMPS_SQL' \
-             || {{ echo 'temps: switching the login to the restored password failed; nothing \
-             was applied' >&2; exit {code}; }}\n\
-             \\set restored_password `printf %s \"${env}\"`\n\
-             ALTER ROLE CURRENT_USER PASSWORD :'restored_password';\n\
-             TEMPS_SQL\n\
-             PGPASSWORD=\"${env}\"; export PGPASSWORD\n",
-            env = RESTORED_PASSWORD_ENV,
-            host = q(&target.host),
-            port = target.port,
-            user = q(&target.username),
-            code = exit::LOGIN_SWITCH_FAILED,
-        )
-    } else {
-        String::new()
-    };
+/// The dump runs `ALTER ROLE ... PASSWORD` for every role it holds, with
+/// the password that role had when the backup was taken: of another
+/// database, or of this one before its password was changed. When the job's
+/// login is one of them, applying that would change the login's password
+/// midway, so the dump's next `\connect` (made with the target's password)
+/// would be refused with the dump half applied, and the target would be left
+/// with a password Temps does not know. The job therefore keeps its login on
+/// the target's own password: the dump streams through a filter
+/// ([`KEEP_LOGIN_AWK`]) that drops the `PASSWORD` clause of that login's
+/// `ALTER ROLE` line and changes nothing else. Nothing about the login is
+/// changed before the dump is applied, so a failed download or apply never
+/// leaves it with another password. The filter's own failure exits with
+/// [`exit::KEEP_LOGIN_FAILED`].
+pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
+    let (bare, quoted) = alter_role_prefixes(&target.username);
     format!(
         "{REQUIRE_WALG}\n\
          fetch_rc=\"${{TMPDIR:-/tmp}}/temps-restore-fetch.rc\"\n\
@@ -458,13 +449,19 @@ pub fn restore_script(target: &PgJobTarget, object_key: &str, switch_login: bool
          ${{fetch:-without a status}}$1\" >&2; exit 4; }}; \
          [ \"$unzip\" = 0 ] || {{ echo \"temps: decompressing the dump failed: gunzip exited \
          ${{unzip:-without a status}}$1\" >&2; exit 7; }}; }}\n\
+         keep_rc=\"${{TMPDIR:-/tmp}}/temps-restore-keep-login.rc\"\n\
          stream -t\n\
          check '; nothing was applied'\n\
-         {switch}\
-         stream | psql -X -q --no-password --host={host} --port={port} --username={user} \
+         rm -f \"$keep_rc\"\n\
+         stream | {{ TEMPS_KEEP_BARE={bare} TEMPS_KEEP_QUOTED={quoted} awk {awk}; \
+         echo $? > \"$keep_rc\"; }} \
+         | psql -X -q --no-password --host={host} --port={port} --username={user} \
          --dbname=postgres >/dev/null\n\
          psql_rc=$?\n\
          check '; psql may have applied part of it'\n\
+         keep=$(cat \"$keep_rc\" 2>/dev/null)\n\
+         [ \"$keep\" = 0 ] || {{ echo \"temps: keeping the login on its own password failed: awk \
+         exited ${{keep:-without a status}}; psql may have applied part of it\" >&2; exit {keep_code}; }}\n\
          [ \"$psql_rc\" = 0 ] || {{ echo \"temps: psql could not apply the dump: psql exited \
          $psql_rc\" >&2; exit 5; }}\n\
          echo 'temps: restore applied'",
@@ -472,6 +469,10 @@ pub fn restore_script(target: &PgJobTarget, object_key: &str, switch_login: bool
         port = target.port,
         user = q(&target.username),
         key = q(object_key),
+        bare = q(&bare),
+        quoted = q(&quoted),
+        awk = q(KEEP_LOGIN_AWK),
+        keep_code = exit::KEEP_LOGIN_FAILED,
     )
 }
 
@@ -913,8 +914,9 @@ fn failed(
             "the dump in S3 is corrupt or truncated (gunzip could not decompress it); \
              restore from another backup",
         ),
-        Some(exit::LOGIN_SWITCH_FAILED) => Some(
-            "switching the login to the password the dump restores failed; nothing was applied",
+        Some(exit::KEEP_LOGIN_FAILED) => Some(
+            "keeping the login on its own password through the dump failed; psql may have \
+             applied part of it",
         ),
         Some(exit::NO_WALG) => Some(
             "the database's image has no wal-g; backups of a database on a worker node need \
@@ -1733,15 +1735,16 @@ mod tests {
 
     #[test]
     fn the_restore_script_streams_the_object_into_psql() {
-        let script = restore_script(&target(), "p/dump.sql.gz", false);
+        let script = restore_script(&target(), "p/dump.sql.gz");
         assert!(script.contains("wal-g st cat 'p/dump.sql.gz'"), "{script}");
         assert!(script.contains("{ gunzip \"$@\"; echo $?"), "{script}");
         // Verified before anything is applied, then applied.
         assert!(script.contains("stream -t\n"), "{script}");
         assert!(
-            script.contains("stream | psql -X -q --no-password"),
+            script.contains("stream | { TEMPS_KEEP_BARE='ALTER ROLE app WITH '"),
             "{script}"
         );
+        assert!(script.contains("| psql -X -q --no-password"), "{script}");
         assert!(script.contains("--dbname=postgres"), "{script}");
         assert!(script.contains("exit 4") && script.contains("exit 5"));
         assert!(script.contains("exit 7"), "{script}");
@@ -1986,7 +1989,7 @@ mod tests {
         let object = tempfile::NamedTempFile::new().expect("object");
         std::fs::write(object.path(), b"SELECT 1;\n").expect("writing the object");
         let object_path = object.path().to_str().expect("utf-8 path");
-        let script = restore_script(&target(), "p/dump.sql.gz", false);
+        let script = restore_script(&target(), "p/dump.sql.gz");
         let run = |env: &[(&str, &str)]| {
             let mut all = vec![("STUB_OBJECT", object_path)];
             all.extend_from_slice(env);
@@ -2041,83 +2044,96 @@ mod tests {
         }
     }
 
-    /// A restore that switches the login runs `psql` twice: first the
-    /// `ALTER ROLE` with the target's password, then the dump with the
-    /// restored one. The password reaches neither the script nor an argv,
-    /// and a failed or impossible switch applies nothing.
+    /// A dump's `ALTER ROLE` for the job's own login keeps the attributes
+    /// it restores but never the password it had at backup time (another
+    /// database's, or this one's before its password changed): the login
+    /// stays on the target's password, so the dump's `\connect` keeps
+    /// working and Temps keeps handing out a password that works. Other
+    /// roles' passwords, and every line after the first `\connect` (table
+    /// data), are applied exactly as dumped. Runs the host's real `awk`.
     #[cfg(unix)]
     #[test]
-    fn a_switched_login_applies_the_dump_with_the_restored_password() {
+    fn the_dump_never_changes_the_password_of_the_jobs_login() {
         let stubs = Stubs::with_walg_and_psql();
         stubs.add("gunzip", "cat");
-        // Each call appends its password, argv and input to the log; a call
-        // whose input is the switch exits `$STUB_SWITCH_RC`.
-        stubs.add(
-            "psql",
-            "input=$(cat)\n\
-             printf 'call pw=%s argv=%s\\n%s\\n' \"$PGPASSWORD\" \"$*\" \"$input\" >> \"$STUB_PSQL_INPUT\"\n\
-             case \"$input\" in *'ALTER ROLE'*) exit \"${STUB_SWITCH_RC:-0}\";; esac\n\
-             exit 0",
-        );
+        let dump = "--\n-- Roles\n--\n\n\
+             CREATE ROLE app;\n\
+             ALTER ROLE app WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN PASSWORD 'SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy' VALID UNTIL 'infinity';\n\
+             CREATE ROLE application;\n\
+             ALTER ROLE application WITH LOGIN PASSWORD 'md5aaaa';\n\
+             CREATE ROLE \"App-Admin\";\n\
+             ALTER ROLE \"App-Admin\" WITH SUPERUSER LOGIN PASSWORD 'md5bbbb';\n\
+             \\connect orders\n\
+             COPY public.notes (body) FROM stdin;\n\
+             ALTER ROLE app WITH LOGIN PASSWORD 'a row, not a role';\n\
+             \\.\n";
         let object = tempfile::NamedTempFile::new().expect("object");
-        std::fs::write(object.path(), b"SELECT 1;\n").expect("writing the object");
+        std::fs::write(object.path(), dump).expect("writing the object");
         let object_path = object.path().to_str().expect("utf-8 path");
-        let script = restore_script(&target(), "p/dump.sql.gz", true);
-        assert!(
-            !script.contains("origin-secret"),
-            "the script never carries the password"
-        );
-        let run = |extra: &[(&str, &str)]| {
-            let mut env = vec![
-                ("STUB_OBJECT", object_path),
-                ("PGPASSWORD", "target-secret"),
-                (RESTORED_PASSWORD_ENV, "origin-secret"),
-            ];
-            env.extend_from_slice(extra);
-            stubs.run(&script, &env)
-        };
 
-        let (code, stderr, log) = run(&[]);
+        let (code, stderr, applied) = stubs.run(
+            &restore_script(&target(), "p/dump.sql.gz"),
+            &[("STUB_OBJECT", object_path)],
+        );
         assert_eq!(code, 0, "{stderr}");
-        let log = String::from_utf8(log.expect("psql ran")).expect("utf-8 log");
-        let calls: Vec<&str> = log.split("call ").filter(|c| !c.is_empty()).collect();
-        assert_eq!(calls.len(), 2, "{log}");
-        assert!(calls[0].starts_with("pw=target-secret "), "{log}");
+        let applied = String::from_utf8(applied.expect("psql ran")).expect("utf-8");
         assert!(
-            calls[0].contains("ALTER ROLE CURRENT_USER PASSWORD :'restored_password';"),
-            "{log}"
+            applied.contains(
+                "ALTER ROLE app WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN VALID UNTIL 'infinity';\n"
+            ),
+            "the login's attributes stay, its dumped password goes: {applied}"
+        );
+        assert!(!applied.contains("c2VydmVy"), "{applied}");
+        assert!(
+            applied.contains("ALTER ROLE application WITH LOGIN PASSWORD 'md5aaaa';"),
+            "another role whose name starts like the login's keeps its password: {applied}"
         );
         assert!(
-            calls[0].contains("\\set restored_password `printf %s \"$TEMPS_RESTORED_PASSWORD\"`"),
-            "psql reads the password itself, unexpanded by the shell: {log}"
+            applied.contains("ALTER ROLE \"App-Admin\" WITH SUPERUSER LOGIN PASSWORD 'md5bbbb';"),
+            "{applied}"
         );
-        assert!(calls[1].starts_with("pw=origin-secret "), "{log}");
-        assert!(calls[1].contains("SELECT 1;"), "{log}");
-        for call in &calls {
-            let first_line = call.lines().next().unwrap_or_default();
-            let argv = first_line.split(" argv=").nth(1).unwrap_or_default();
-            assert!(!argv.is_empty(), "{log}");
-            assert!(
-                !argv.contains("origin-secret"),
-                "the password is in an argv: {argv}"
-            );
-        }
+        assert!(
+            applied.contains("ALTER ROLE app WITH LOGIN PASSWORD 'a row, not a role';"),
+            "table data after the first \\connect is never rewritten: {applied}"
+        );
 
-        // The switch fails: nothing applied.
-        let (code, stderr, log) = run(&[("STUB_SWITCH_RC", "3")]);
-        assert_eq!(code, exit::LOGIN_SWITCH_FAILED as i32, "{stderr}");
-        assert!(stderr.contains("nothing was applied"), "{stderr}");
-        let log = String::from_utf8(log.unwrap_or_default()).expect("utf-8 log");
-        assert!(!log.contains("SELECT 1;"), "the dump ran: {log}");
-
-        // No restored password: refused before psql runs at all.
-        let (code, stderr, log) = run(&[(RESTORED_PASSWORD_ENV, "")]);
-        assert_eq!(code, exit::LOGIN_SWITCH_FAILED as i32, "{stderr}");
-        assert_eq!(log, None, "psql ran without a password to switch to");
+        // A login whose name pg_dumpall quotes.
+        let quoted = PgJobTarget {
+            username: "App-Admin".into(),
+            ..target()
+        };
+        let (code, stderr, applied) = stubs.run(
+            &restore_script(&quoted, "p/dump.sql.gz"),
+            &[("STUB_OBJECT", object_path)],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let applied = String::from_utf8(applied.expect("psql ran")).expect("utf-8");
+        assert!(
+            applied.contains("ALTER ROLE \"App-Admin\" WITH SUPERUSER LOGIN;\n"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("c2VydmVy"),
+            "the other login is left alone"
+        );
     }
 
+    /// Nothing about the login is changed before the dump is applied: a
+    /// download that fails after the verify pass (the object changed or the
+    /// connection dropped) leaves the login's password as it was, so the
+    /// stored one still works. A failing filter fails the job with its own
+    /// code.
+    #[cfg(unix)]
     #[test]
-    fn a_restore_env_carries_the_restored_password_only_when_switching() {
+    fn a_failed_restore_never_leaves_the_login_on_another_password() {
+        let script = restore_script(&target(), "p/dump.sql.gz");
+        assert_eq!(
+            script.matches("psql -X").count(),
+            1,
+            "psql runs once, only to apply the dump; the job itself never changes a role: \
+             {script}"
+        );
+        assert!(!script.contains("ALTER ROLE CURRENT_USER"), "{script}");
         let s3 = S3JobTarget {
             s3_source_id: 1,
             bucket: "b".into(),
@@ -2128,24 +2144,54 @@ mod tests {
             secret_access_key: "s".into(),
             session_token: None,
         };
-        let has = |env: &[(String, String)]| env.iter().any(|(k, _)| k == RESTORED_PASSWORD_ENV);
-        assert!(!has(&restore_env("t", &s3, None)));
-        assert_eq!(restore_env("t", &s3, None), job_env("t", &s3));
-        let env = restore_env("t", &s3, Some("o"));
-        assert!(env.contains(&(RESTORED_PASSWORD_ENV.to_string(), "o".to_string())));
-        assert!(env.contains(&("PGPASSWORD".to_string(), "t".to_string())));
-        assert!(!restore_script(&target(), "k", false).contains(RESTORED_PASSWORD_ENV));
+        assert_eq!(
+            restore_env("target-secret", &s3),
+            job_env("target-secret", &s3),
+            "the job carries no other password than the target's"
+        );
+
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        // The first fetch (the verify pass) succeeds, the second fails.
+        stubs.add(
+            "wal-g",
+            "count=\"$TMPDIR/fetches\"; n=$(cat \"$count\" 2>/dev/null || echo 0); \
+             echo $((n + 1)) > \"$count\"; cat \"$STUB_OBJECT\"; [ \"$n\" = 0 ] || exit 1",
+        );
+        let object = tempfile::NamedTempFile::new().expect("object");
+        std::fs::write(
+            object.path(),
+            b"ALTER ROLE app WITH LOGIN PASSWORD 'md5old';\n",
+        )
+        .expect("writing the object");
+        let object_path = object.path().to_str().expect("utf-8 path");
+        let (code, stderr, applied) = stubs.run(&script, &[("STUB_OBJECT", object_path)]);
+        assert_eq!(code, exit::DOWNLOAD_FAILED as i32, "{stderr}");
+        let applied = String::from_utf8(applied.unwrap_or_default()).expect("utf-8");
+        assert!(!applied.contains("md5old"), "{applied}");
+
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        stubs.add("awk", "cat >/dev/null; exit 2");
+        let (code, stderr, _) = stubs.run(&script, &[("STUB_OBJECT", object_path)]);
+        assert_eq!(code, exit::KEEP_LOGIN_FAILED as i32, "{stderr}");
+        assert!(stderr.contains("awk exited 2"), "{stderr}");
     }
 
     #[test]
-    fn a_failed_login_switch_names_its_step() {
+    fn a_failed_login_filter_names_its_step() {
         let status = temps_workload::WorkloadStatus {
             phase: WorkloadPhase::Failed,
-            exit_code: Some(exit::LOGIN_SWITCH_FAILED),
+            exit_code: Some(exit::KEEP_LOGIN_FAILED),
             ..Default::default()
         };
         let error = failed(&target(), "restore", 9, &status, None);
-        assert!(error.to_string().contains("nothing was applied"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("keeping the login on its own password"),
+            "{error}"
+        );
     }
 
     /// The reported failure itself, with the host's real `gunzip`: S3 serves
@@ -2162,7 +2208,7 @@ mod tests {
             return;
         }
         let stubs = Stubs::with_walg_and_psql();
-        let script = restore_script(&target(), "p/dump.sql.gz", false);
+        let script = restore_script(&target(), "p/dump.sql.gz");
         let sql = "CREATE TABLE proof(x int);\n".repeat(2_000);
         let whole = gzip(sql.as_bytes());
 
