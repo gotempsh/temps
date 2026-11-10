@@ -84,6 +84,14 @@ import {
 } from '@/lib/service-alert-comparator'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 import {
+  PG_CACHE_HIT_RATIO_METRIC,
+  formatPgCacheHitRatio,
+  pgCacheHitRatioDescription,
+  pgCacheHitRatioLabel,
+  pgCacheHitRatioScopedLabel,
+  type PgCacheHitScope,
+} from '@/lib/pg-cache-hit'
+import {
   serviceMetricsEngine,
   type ServiceMetricsEngine,
 } from '@/lib/service-metrics-engine'
@@ -488,6 +496,7 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
+  if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
   if (MARIADB_FLAG_METRICS.has(name)) {
     const flag = formatFlagValue(value)
     if (flag !== null) return flag
@@ -525,6 +534,7 @@ const METRIC_LABELS: Record<string, string> = {
   'pg.connections_idle': 'Idle',
   'pg.connections_idle_in_transaction': 'Idle in Transaction',
   'pg.connections_other': 'Other',
+  [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
   rustfs_cluster_buckets_total: 'Buckets',
   rustfs_cluster_objects_total: 'Objects',
   rustfs_cluster_capacity_usable_total_bytes: 'Usable Capacity',
@@ -623,17 +633,36 @@ type MetricTileProps = {
   onClick?: () => void
   alert?: 'warning' | 'critical'
   size?: 'hero' | 'group'
+  /** Databases the value covers, named in the label of a per-database
+   *  metric such as the cache hit ratio. */
+  scope?: PgCacheHitScope
 }
 
-function MetricTile({
+/** The label and tooltip of a tile, naming its scope where it matters. */
+function metricTileText(
+  name: string,
+  scope?: PgCacheHitScope
+): { label: string; hint?: string } {
+  if (name === PG_CACHE_HIT_RATIO_METRIC && scope) {
+    return {
+      label: pgCacheHitRatioScopedLabel(scope),
+      hint: pgCacheHitRatioDescription(scope),
+    }
+  }
+  return { label: labelForMetric(name) }
+}
+
+export function MetricTile({
   name,
   value,
   selected,
   onClick,
   alert,
   size = 'group',
+  scope,
 }: MetricTileProps) {
   const isHero = size === 'hero'
+  const { label, hint } = metricTileText(name, scope)
   const className = [
     'flex flex-col text-left transition-colors',
     isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
@@ -658,7 +687,9 @@ function MetricTile({
         {alert === 'warning' && (
           <span className="inline-block size-1.5 shrink-0 rounded-full bg-amber-400" />
         )}
-        <span className="truncate">{labelForMetric(name)}</span>
+        <span className="truncate" title={hint ?? label}>
+          {label}
+        </span>
       </dt>
       <dd
         className={[
@@ -1097,6 +1128,9 @@ function DatabasesSection({
                 name={name}
                 value={values.get(name)}
                 selected={false}
+                scope={
+                  selected === ALL_DATABASES ? 'all' : { database: selected }
+                }
               />
             ))}
           </dl>
@@ -1401,6 +1435,7 @@ function MonitoringDashboard({
               onClick={() => setSelectedMetric(name)}
               alert={firingBySeverity.get(name)}
               size="hero"
+              scope="all"
             />
           ))}
         </dl>

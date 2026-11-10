@@ -15,6 +15,13 @@ import {
   formatChartTooltipLabel,
 } from '@/lib/chart-tooltip'
 import { yAxisTickProps } from '@/lib/chart-axis-ticks'
+import {
+  PG_CACHE_HIT_RATIO_METRIC,
+  formatPgCacheHitRatio,
+  pgCacheHitRatioDescription,
+  pgCacheHitRatioLabel,
+  pgCacheHitRatioScopedLabel,
+} from '@/lib/pg-cache-hit'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -356,6 +363,7 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
+  if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
   if (MARIADB_FLAG_METRICS.has(name)) {
     const flag = formatFlagValue(value)
     if (flag !== null) return flag
@@ -385,7 +393,22 @@ const METRIC_LABELS: Record<string, string> = {
   'container.cpu_percent': 'CPU',
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
+  [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
   ...MARIADB_METRIC_LABELS,
+}
+
+// The stat tiles show the latest instance-wide value, so a per-database
+// metric names that scope.
+function statTileLabel(name: string): string {
+  if (name === PG_CACHE_HIT_RATIO_METRIC)
+    return pgCacheHitRatioScopedLabel('all')
+  return labelForMetric(name)
+}
+
+function statTileHint(name: string): string | undefined {
+  if (name === PG_CACHE_HIT_RATIO_METRIC)
+    return pgCacheHitRatioDescription('all')
+  return undefined
 }
 
 function labelForMetric(name: string): string {
@@ -938,8 +961,11 @@ function LiveMetrics({
                     : 'border-border bg-card'
                 }`}
               >
-                <span className="text-[11px] font-medium text-muted-foreground">
-                  {labelForMetric(name)}
+                <span
+                  className="text-[11px] font-medium text-muted-foreground"
+                  title={statTileHint(name)}
+                >
+                  {statTileLabel(name)}
                 </span>
                 <span className="text-base font-semibold tabular-nums text-foreground">
                   {latest != null ? formatMetricValue(name, latest.value) : '—'}

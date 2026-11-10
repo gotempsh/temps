@@ -1299,9 +1299,11 @@ pub const REDIS_FRAGMENTATION_MIN_USED_BYTES: f64 = 100.0 * 1024.0 * 1024.0;
 /// evaluated. One `GET` of a missing key on a new instance is a 0% hit ratio.
 pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 
-/// Lifetime shared-buffer block accesses (hits + reads) before the Postgres
-/// cache hit ratio is evaluated. A new server's first reads all come from
-/// disk, so its ratio starts low and only becomes meaningful with volume.
+/// Shared-buffer block accesses (hits + reads) in the cache hit ratio's
+/// trailing window (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`)
+/// before the Postgres cache hit ratio is evaluated. Both metrics cover the
+/// same window, so a nearly idle database, whose ratio rests on a handful of
+/// reads, never raises the alarm.
 pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 100_000.0;
 
 /// Lifetime InnoDB buffer pool read requests before the MariaDB buffer pool
@@ -2494,6 +2496,23 @@ mod tests {
     fn missing_volume_metric_fails_the_gate() {
         let values = latest(&[("pg.cache_hit_ratio", 0.4)]);
         assert!(!meets_volume_gate("pg.cache_hit_ratio", &values));
+    }
+
+    /// The Postgres ratio and its volume cover the same trailing window: a
+    /// low ratio from a window with little traffic is not evaluated.
+    #[test]
+    fn pg_cache_hit_ratio_needs_volume_in_its_window() {
+        let quiet = latest(&[
+            ("pg.cache_hit_ratio", 0.2),
+            ("pg.cache_blocks_accessed", 500.0),
+        ]);
+        assert!(!meets_volume_gate("pg.cache_hit_ratio", &quiet));
+
+        let busy = latest(&[
+            ("pg.cache_hit_ratio", 0.2),
+            ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
+        ]);
+        assert!(meets_volume_gate("pg.cache_hit_ratio", &busy));
     }
 
     #[test]
