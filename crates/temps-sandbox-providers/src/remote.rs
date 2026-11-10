@@ -38,6 +38,8 @@
 //! (control characters dropped, length capped) before it can reach an API
 //! client or a terminal. Transport errors never echo the node's internal URL.
 
+mod capacity;
+
 use async_trait::async_trait;
 use base64::Engine;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -1060,8 +1062,8 @@ impl RemoteSandboxProvider {
         response_cap: usize,
     ) -> Result<R, AgentError> {
         let url = format!("{}{}", self.agent_url, path);
-        let response = self
-            .with_body(
+        let send = || async {
+            self.with_body(
                 self.client
                     .post(&url)
                     .bearer_auth(&self.token)
@@ -1073,7 +1075,17 @@ impl RemoteSandboxProvider {
             .map_err(|error| self.failed(handle, operation, error.to_string()))?
             .send()
             .await
-            .map_err(|e| self.transport_unavailable(operation, e))?;
+            .map_err(|e| self.transport_unavailable(operation, e))
+        };
+        let response = if path == "/agent/sandboxes/service-access" {
+            tokio::time::timeout(timeout, capacity::send(send))
+                .await
+                .map_err(|_| {
+                    self.failed(handle, operation, "worker request deadline exceeded".into())
+                })??
+        } else {
+            send().await?
+        };
         if carries_values && response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             return Err(self.failed(
                 handle,
@@ -2166,6 +2178,7 @@ impl SandboxProvider for RemoteSandboxProvider {
 
 #[cfg(test)]
 mod tests {
+    mod service_access_capacity;
     use super::*;
 
     #[test]
