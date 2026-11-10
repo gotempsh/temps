@@ -358,7 +358,7 @@ async fn run_service_create(
 
     // The volumes this request creates, so a failed create removes those and
     // never a volume an earlier service left holding its data.
-    let created_volumes = create_service_volumes(docker, request.volumes.keys()).await;
+    let created_volumes = create_service_volumes(docker, request.volumes.keys(), &attempt).await;
 
     // Build port bindings
     let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
@@ -795,32 +795,41 @@ async fn abandon_create(
 
 /// Create the named volumes a service mounts, returning the ones this call
 /// created. A volume that already exists belongs to an earlier service (a
-/// re-create keeps its data on it), so it is never this request's to remove.
+/// re-create keeps its data on it) or to a create running at the same time,
+/// so it is never this request's to remove.
+///
+/// Ownership is decided by Docker, not by a check before the create: each
+/// volume is created with this attempt's [`CREATE_ATTEMPT_LABEL`], and
+/// Docker's create of a name that exists returns the existing volume with
+/// its own labels, unchanged. So whichever caller's create reaches Docker
+/// first owns the volume, and every other caller sees another attempt's
+/// label (or none) and leaves it alone, whatever the interleaving.
 async fn create_service_volumes<'a>(
     docker: &bollard::Docker,
     names: impl IntoIterator<Item = &'a String>,
+    attempt: &str,
 ) -> Vec<String> {
     let mut created = Vec::new();
     for name in names {
-        match docker.inspect_volume(name).await {
-            Ok(_) => continue,
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => {}
-            Err(e) => {
-                // Unknown: treat it as existing, so it is never removed.
-                tracing::warn!(volume = %name, error = %e, "Could not inspect service volume; leaving it to Docker");
-                continue;
-            }
-        }
         let create_opts = bollard::models::VolumeCreateRequest {
             name: Some(name.clone()),
+            labels: Some(HashMap::from([(
+                CREATE_ATTEMPT_LABEL.to_string(),
+                attempt.to_string(),
+            )])),
             ..Default::default()
         };
         match docker.create_volume(create_opts).await {
-            Ok(_) => created.push(name.clone()),
+            Ok(volume) => {
+                if volume.labels.get(CREATE_ATTEMPT_LABEL).map(String::as_str) == Some(attempt) {
+                    created.push(name.clone());
+                } else {
+                    tracing::debug!(volume = %name, "Service volume already existed; it is not this create's to remove");
+                }
+            }
             Err(e) => {
-                tracing::warn!(volume = %name, error = %e, "Volume creation returned an error");
+                // Unknown: treat it as existing, so it is never removed.
+                tracing::warn!(volume = %name, error = %e, "Volume creation returned an error; leaving it to Docker");
             }
         }
     }
@@ -3408,7 +3417,7 @@ mod failed_create_cleanup_tests {
             .await
             .expect("create the pre-existing volume");
 
-        let created = create_service_volumes(&docker, [&existing, &fresh]).await;
+        let created = create_service_volumes(&docker, [&existing, &fresh], "attempt-a").await;
 
         let image = "busybox:1.36";
         temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new(image))
@@ -3501,6 +3510,62 @@ mod failed_create_cleanup_tests {
         assert!(existing_kept, "a volume that existed before must be kept");
     }
 
+    /// Two creates race for one volume name: whichever reaches Docker first
+    /// owns it, and the other never claims it, so its failure cleanup can
+    /// never remove the winner's volume. Also the order the reviewer named:
+    /// another caller creates the volume after this one could have found
+    /// it missing, and before this one's create.
+    #[tokio::test]
+    async fn a_volume_created_concurrently_is_owned_by_exactly_one_create() {
+        let Some(docker) = docker().await else {
+            return;
+        };
+        for _ in 0..5 {
+            let raced = unique("temps-agent-create-it-raced");
+            let (a, b) = tokio::join!(
+                create_service_volumes(&docker, [&raced], "attempt-a"),
+                create_service_volumes(&docker, [&raced], "attempt-b"),
+            );
+            let owners = usize::from(a.contains(&raced)) + usize::from(b.contains(&raced));
+            // The loser's cleanup must leave the winner's volume.
+            let loser = if a.contains(&raced) { &b } else { &a };
+            let left_behind = remove_failed_service_create(&docker, None, loser).await;
+            let kept = volume_exists(&docker, &raced).await;
+            let _ = docker
+                .remove_volume(
+                    &raced,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await;
+            assert_eq!(owners, 1, "exactly one create owns the volume: {a:?} {b:?}");
+            assert_eq!(left_behind, None);
+            assert!(
+                kept,
+                "the losing create's cleanup removed the winner's volume"
+            );
+        }
+
+        let other = unique("temps-agent-create-it-other");
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(other.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("another caller creates the volume first");
+        let created = create_service_volumes(&docker, [&other], "attempt-c").await;
+        let _ = remove_failed_service_create(&docker, None, &created).await;
+        let kept = volume_exists(&docker, &other).await;
+        let _ = docker
+            .remove_volume(
+                &other,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+        assert!(created.is_empty(), "{created:?}");
+        assert!(kept, "another caller's volume must never be removed");
+    }
+
     /// Cleaning up after an attempt that never created its container, or
     /// whose volume is already gone, is not an error.
     #[tokio::test]
@@ -3556,7 +3621,9 @@ mod failed_create_cleanup_tests {
     }
 
     /// A stub Docker daemon for the create path. Every volume starts
-    /// missing, and every request is recorded in `events`.
+    /// missing (its create answers with the labels it was created with, as
+    /// Docker does for a new volume), and every request is recorded in
+    /// `events`.
     struct StubDaemon {
         pull: Pull,
         container_create: ContainerCreate,
@@ -3630,11 +3697,15 @@ mod failed_create_cleanup_tests {
         match (method, path) {
             (Method::POST, "volumes/create") => {
                 daemon.record("create volume".to_string());
+                let labels = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|request| request.get("Labels").cloned())
+                    .unwrap_or_else(|| serde_json::json!({}));
                 (
                     StatusCode::CREATED,
                     axum::Json(serde_json::json!({
                         "Name": "created", "Driver": "local", "Mountpoint": "/stub",
-                        "Labels": {}, "Scope": "local", "Options": {}
+                        "Labels": labels, "Scope": "local", "Options": {}
                     })),
                 )
                     .into_response()
@@ -3853,7 +3924,7 @@ mod failed_create_cleanup_tests {
         .expect("the second create is refused, not run")
         .expect("second create answers");
         assert_eq!(refused.status(), axum::http::StatusCode::CONFLICT);
-        assert_eq!(daemon.count("inspect volume"), 1, "{:?}", daemon.events());
+        assert_eq!(daemon.count("create volume"), 1, "{:?}", daemon.events());
 
         first.abort();
         let _ = first.await;
