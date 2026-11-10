@@ -406,6 +406,7 @@ function statTileLabel(name: string): string {
   return labelForMetric(name)
 }
 
+// The tooltip of a stat tile: what a per-database metric's value means.
 function statTileHint(name: string): string | undefined {
   if (name === PG_CACHE_HIT_RATIO_METRIC)
     return pgCacheHitRatioDescription('all')

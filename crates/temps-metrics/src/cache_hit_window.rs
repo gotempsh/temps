@@ -196,12 +196,14 @@ pub struct CacheHitWindows {
 }
 
 impl Default for CacheHitWindows {
+    /// Windows of [`CACHE_HIT_WINDOW`], the length the console labels.
     fn default() -> Self {
         Self::new(CACHE_HIT_WINDOW)
     }
 }
 
 impl CacheHitWindows {
+    /// Empty windows of length `window`; every series starts refilling.
     pub fn new(window: Duration) -> Self {
         Self {
             window,
@@ -364,6 +366,7 @@ impl CacheHitWindows {
     }
 }
 
+/// A gauge named `name` with the time, source and labels of `template`.
 fn gauge(template: &MetricPoint, name: &str, value: f64) -> MetricPoint {
     MetricPoint {
         name: name.to_string(),

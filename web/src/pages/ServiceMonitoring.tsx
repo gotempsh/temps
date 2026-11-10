@@ -653,6 +653,7 @@ function metricTileText(
   return { label: labelForMetric(name) }
 }
 
+/** One metric's latest value, clickable to chart it. */
 export function MetricTile({
   name,
   value,
