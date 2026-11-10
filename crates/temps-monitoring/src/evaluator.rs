@@ -927,8 +927,20 @@ impl AlertEvaluator {
         let value = match latest.get(&rule.metric_name) {
             Some(v) => *v,
             None => {
-                // No data yet — clear any breach state and return.
-                self.clear_breach(rule.id).await;
+                // A gated ratio can be absent because its volume metric shows
+                // too little traffic to compute one: an idle Postgres window
+                // writes `pg.cache_blocks_accessed = 0` and no ratio. That is
+                // the same healthy state as a present ratio below the gate,
+                // so resolve an alarm it fired. With no volume metric either,
+                // there is simply no data yet.
+                if default_volume_gate(rule)
+                    .is_some_and(|gate| latest.contains_key(gate.metric_name))
+                    && !meets_volume_gate(&rule.metric_name, latest)
+                {
+                    self.handle_recovery(rule, ctx).await;
+                } else {
+                    self.clear_breach(rule.id).await;
+                }
                 return Ok(());
             }
         };
@@ -2705,6 +2717,91 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            evaluator.firing_alarms.read().await.get(&rule.id),
+            Some(&99)
+        );
+    }
+
+    fn low_cache_hit_ratio_rule() -> monitoring_alert_rules::Model {
+        monitoring_alert_rules::Model {
+            name: "Low cache hit ratio".into(),
+            metric_name: "pg.cache_hit_ratio".into(),
+            threshold: 0.90,
+            comparator: "<".into(),
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        }
+    }
+
+    /// An idle window writes no ratio, only `pg.cache_blocks_accessed = 0`.
+    /// Once the last ratio has aged out of the latest values, that zero is
+    /// still proof the database is idle, so a fired alarm resolves.
+    #[tokio::test]
+    async fn idle_cache_hit_window_resolves_a_fired_alarm_without_a_ratio() {
+        use temps_entities::alarms;
+        let now = Utc::now();
+        let resolved = alarms::Model {
+            id: 99,
+            project_id: Some(1),
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(1),
+            alarm_type: "database_metric_threshold".into(),
+            severity: "warning".into(),
+            status: "resolved".into(),
+            title: "Low cache hit ratio".into(),
+            message: None,
+            metadata: None,
+            fired_at: now,
+            acknowledged_at: None,
+            acknowledged_by: None,
+            resolved_at: Some(now),
+            silenced_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let rule = low_cache_hit_ratio_rule();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![resolved]])
+            .into_connection();
+        let evaluator = evaluator_with_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("pg.cache_blocks_accessed", 0.0)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert!(
+            !evaluator.firing_alarms.read().await.contains_key(&rule.id),
+            "an idle window must resolve the low cache hit ratio alarm"
+        );
+    }
+
+    /// Without the volume metric there is no evidence either way: keep the
+    /// alarm until the collector reports again.
+    #[tokio::test]
+    async fn missing_cache_hit_ratio_and_volume_keeps_a_fired_alarm() {
+        let rule = low_cache_hit_ratio_rule();
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(&rule, &HashMap::new(), (Some(1), None, None, Some(1)))
+            .await
+            .expect("evaluation succeeds");
+
         assert_eq!(
             evaluator.firing_alarms.read().await.get(&rule.id),
             Some(&99)
