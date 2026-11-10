@@ -919,11 +919,12 @@ impl AlertEvaluator {
                 // too little traffic to compute one: an idle Postgres window
                 // writes `pg.cache_blocks_accessed = 0` and no ratio. That is
                 // the same healthy state as a present ratio below the gate,
-                // so resolve an alarm it fired. Zero volume resolves an
-                // edited rule too, which is never gated: a ratio over no
-                // traffic cannot be breaching, and nothing else would ever
-                // resolve its alarm while the source stays idle. With no
-                // volume metric either, there is simply no data yet.
+                // so resolve an alarm it fired. Zero volume over the ratio's
+                // own window resolves an edited rule too, which is never
+                // gated: a ratio over no traffic cannot be breaching, and
+                // nothing else would ever resolve its alarm while the source
+                // stays idle. With no volume metric either, there is simply
+                // no data yet.
                 let below_default_gate = default_volume_gate(rule)
                     .is_some_and(|gate| latest.contains_key(gate.metric_name))
                     && !meets_volume_gate(&rule.metric_name, latest);
@@ -963,9 +964,9 @@ impl AlertEvaluator {
         }
 
         // The store's latest values are picked per metric over the last 15
-        // minutes, so a window gone idle since pairs its zero volume with the
-        // last ratio written while it had traffic. That ratio no longer
-        // describes the source, gated rule or edited one.
+        // minutes, so a cache hit window gone idle since pairs its zero
+        // volume with the last ratio written while it had traffic. That ratio
+        // no longer describes the source, gated rule or edited one.
         if has_no_volume(&rule.metric_name, latest) {
             self.handle_recovery(rule, ctx).await;
             return Ok(());
@@ -1314,7 +1315,8 @@ pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 /// Shared-buffer block accesses (hits + reads) in the cache hit ratio's
 /// trailing 15-minute window (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`)
 /// before the Postgres cache hit ratio is evaluated. Both metrics cover the
-/// same window, so this is a rate: about 11 block accesses per second,
+/// same window, and the scraper scales the volume to the whole window at any
+/// scrape interval, so this is a rate: about 11 block accesses per second,
 /// sustained. A nearly idle database (health checks, autovacuum ticks), whose
 /// ratio rests on a handful of reads, never raises the alarm; a small
 /// application database doing tens of accesses per second is evaluated. The
@@ -1390,15 +1392,17 @@ fn default_volume_gate(rule: &monitoring_alert_rules::Model) -> Option<VolumeGat
 }
 
 /// The deduplicated metric names a source group's rules read, fetched in one
-/// `query_latest` call. A rule over a metric with a volume gate also needs
-/// the gating metric, edited rules included: they are not gated, but zero
-/// volume is what resolves their alarm once the ratio is gone.
+/// `query_latest` call. A rule with its default volume gate also needs the
+/// gating metric, and a rule over a windowed ratio needs that window's
+/// volume, edited rules included: they are not gated, but zero volume is what
+/// resolves their alarm once the ratio is gone.
 fn latest_metric_names(group: &[&monitoring_alert_rules::Model]) -> Vec<String> {
     group
         .iter()
         .flat_map(|r| {
             std::iter::once(r.metric_name.as_str())
-                .chain(volume_gate(&r.metric_name).map(|g| g.metric_name))
+                .chain(default_volume_gate(r).map(|g| g.metric_name))
+                .chain(window_volume_metric(&r.metric_name))
         })
         .map(str::to_string)
         .collect::<HashSet<_>>()
@@ -1406,12 +1410,20 @@ fn latest_metric_names(group: &[&monitoring_alert_rules::Model]) -> Vec<String> 
         .collect()
 }
 
-/// Whether the latest volume behind a gated `metric_name` is zero: the source
-/// saw no traffic, so no ratio over it can be breaching. False when the metric
-/// is ungated or its volume is missing.
+/// The volume over the same trailing window as `metric_name`, for a ratio
+/// the scraper writes only while that window saw traffic. Only the Postgres
+/// cache hit ratio: the proxy's request count, for one, covers a single
+/// sample, and an idle sample says nothing about the error rate before it.
+fn window_volume_metric(metric_name: &str) -> Option<&'static str> {
+    (metric_name == "pg.cache_hit_ratio").then_some("pg.cache_blocks_accessed")
+}
+
+/// Whether the window behind `metric_name` saw no traffic at all, so no ratio
+/// over it can be breaching. False for any other metric, or when the volume
+/// is missing.
 fn has_no_volume(metric_name: &str, latest: &HashMap<String, f64>) -> bool {
-    volume_gate(metric_name)
-        .and_then(|gate| latest.get(gate.metric_name))
+    window_volume_metric(metric_name)
+        .and_then(|name| latest.get(name))
         .is_some_and(|volume| *volume <= 0.0)
 }
 
@@ -2892,6 +2904,47 @@ mod tests {
         assert_eq!(
             latest_metric_names(&[&ungated, &ungated]),
             ["pg.connections_active"]
+        );
+    }
+
+    /// The proxy writes `proxy.requests = 0` on every idle sample and no error
+    /// rate, so the latest error rate is the last sample's with traffic. An
+    /// edited rule must keep judging it: resolving on each idle sample would
+    /// keep a sparse-traffic deployment failing every request from alerting.
+    #[tokio::test]
+    async fn an_idle_proxy_sample_does_not_reset_an_edited_error_rate_breach() {
+        let rule = monitoring_alert_rules::Model {
+            name: "High error rate (edited)".into(),
+            metric_name: "proxy.error_rate_percent".into(),
+            threshold: 10.0,
+            comparator: ">".into(),
+            for_duration_secs: 300,
+            ..make_rule(Some(1), None)
+        };
+        assert!(default_volume_gate(&rule).is_none(), "the edit opts out");
+        assert_eq!(latest_metric_names(&[&rule]), ["proxy.error_rate_percent"]);
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        let started_at = Utc::now();
+        evaluator
+            .breach_start
+            .write()
+            .await
+            .insert(rule.id, started_at);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("proxy.error_rate_percent", 100.0), ("proxy.requests", 0.0)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.breach_start.read().await.get(&rule.id).copied(),
+            Some(started_at),
+            "the breach window must keep counting"
         );
     }
 
