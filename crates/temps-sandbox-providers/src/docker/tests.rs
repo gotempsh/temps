@@ -5242,3 +5242,14 @@ async fn sandbox_step_output_is_capped_at_4k() {
         "{error}"
     );
 }
+
+#[test]
+fn test_all_runtimes_ship_vault_git_routing() {
+    for runtime in ["node", "bun", "python", "rust", "go", "full"] {
+        let dockerfile = dockerfile_for_runtime(runtime);
+        assert!(dockerfile.contains("COPY pty-agent/vault-git.sh /usr/local/bin/git"));
+        assert!(crate::pty_agent_bundle::BUNDLE
+            .iter()
+            .any(|file| file.path == "pty-agent/vault-git.sh" && file.mode == 0o755));
+    }
+}

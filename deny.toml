@@ -36,6 +36,8 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; only the pinned microsandbox SDK uses it" },
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26 is a shim re-exporting the fixed 1.0.10 roots" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only reached by aws-sigv4 SigV4A, which Temps does not use" },
+    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite, no patched libsqlite3-sys reachable; on-disk DBs (temps edge analytics.db, microsandbox catalog) are only writable by the Temps user" },
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar unmaintained; only the pinned microsandbox SDK and dev-only testcontainers use it, locked at the final hardened 0.6.4" },
 ]
 
 [licenses]
@@ -149,10 +151,12 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Every git dependency is pinned to a rev or tag in the root Cargo.toml.
+# Every git dependency is pinned to a rev or tag in its Cargo.toml.
 allow-git = [
     "https://github.com/getsentry/relay",
     "https://github.com/gotempsh/autopack",
     "https://github.com/cloudflare/cloudflare-rs",
     "https://github.com/gotempsh/agent-runtime-sdk.git",
+    # Embedded SDK, pinned by temps-service-access.
+    "https://github.com/gotempsh/tokenless",
 ]

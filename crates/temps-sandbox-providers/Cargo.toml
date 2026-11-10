@@ -19,6 +19,8 @@ test-support = []
 temps-agent-core = { path = "../temps-agent-core" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
+temps-service-access-runtime = { path = "../temps-service-access-runtime" }
+uuid.workspace = true
 temps-docker-util = { path = "../temps-docker-util" }
 temps-entities = { path = "../temps-entities" }
 temps-vm-agent = { path = "../temps-vm-agent" }
@@ -64,6 +66,8 @@ tempfile = { workspace = true }
 microsandbox = { workspace = true }
 
 [dev-dependencies]
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
+tokenless-control = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
 temps-test-utils = { path = "../temps-test-utils" }
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }

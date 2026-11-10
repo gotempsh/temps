@@ -46,8 +46,10 @@ actually shows:
    alerts) → `Ledger`. Columns + rows + optional toolbar/pagination.
 2. **One thing, in detail** (a single deployment, project, backup) →
    `Detail`, following the record recipe below.
-3. **Input the user submits** (settings, onboarding/setup wizard) →
-   `Settings`, built from `Field`/`FormErrors`.
+3. **A full settings form** → `Settings`, built from `Field`/`FormErrors`.
+   Reserve the left/right section layout for these pages. Small inline forms
+   on records use `Field`/`FormErrors` in the record layout, without settings
+   columns. Collections and operational panels never use Settings wrappers.
 4. **None of the above cleanly fits** (a dashboard, a custom visualization) —
    don't force a template. Compose primitives (`PageHeader`, `Status`,
    `TimeChart`, `Callout`) directly and say so in the PR description.

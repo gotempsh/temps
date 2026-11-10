@@ -59,7 +59,7 @@ commands, plus an alternative that does not need a shell on the host.
 - **New clusters get a random one** in `4096..=16777215` (never 42, never a
   small value another tool is likely to pick). The `network_config` row is
   seeded by the migration that creates it, so "new" is decided by a later
-  migration (`m20261109_000001_cluster_vxlan_network_id`): the seeded 42 is
+  migration (`m20261110_000003_cluster_vxlan_network_id`): the seeded 42 is
   replaced by a random VNI only on a brand-new database, one with no user, no
   node and no control-plane overlay allocation, which is the state right
   after a first boot's migrations (no migration creates a user).

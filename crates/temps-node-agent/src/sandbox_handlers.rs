@@ -34,6 +34,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+pub(crate) mod service_access;
 use base64::Engine;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -157,6 +158,7 @@ pub struct SandboxHostState {
     /// Upload slots, see [`MAX_CONCURRENT_UPLOADS`].
     upload_permits: Arc<Semaphore>,
     upload_permit_wait: Duration,
+    pub(crate) access_permits: Arc<Semaphore>,
 }
 
 impl SandboxHostState {
@@ -167,6 +169,7 @@ impl SandboxHostState {
             creating: std::sync::Mutex::new(HashSet::new()),
             upload_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)),
             upload_permit_wait: UPLOAD_PERMIT_WAIT,
+            access_permits: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -2121,6 +2124,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxProvider for FakeProvider {
+        async fn service_access(
+            &self,
+            handle: &SandboxHandle,
+            _: temps_sandbox_providers::service_access::ServiceAccessCommand,
+        ) -> Result<temps_sandbox_providers::service_access::ServiceAccessReply, AgentError>
+        {
+            self.saw(handle);
+            Ok(
+                temps_sandbox_providers::service_access::ServiceAccessReply::Retired {
+                    target: temps_sandbox_providers::service_access::ServiceAccessTarget {
+                        incarnation: "test-incarnation".into(),
+                        container_id: handle.sandbox_id.clone(),
+                    },
+                },
+            )
+        }
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             self.create_entered.notify_one();
             if let Some(gate) = &self.create_gate {
@@ -3311,6 +3330,7 @@ mod tests {
         for _ in 0..200 {
             if !n.provider.destroyed.lock().unwrap().is_empty()
                 && !n.state.work_root.join("orphan").exists()
+                && n.state.creating.lock().unwrap().is_empty()
             {
                 break;
             }
@@ -3584,5 +3604,52 @@ mod tests {
         let _ = started.acquire().await.unwrap();
         release.add_permits(1);
         assert_eq!(again.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn service_access_resolves_container_identity_but_retirement_keeps_exact_target() {
+        use temps_sandbox_providers::{
+            remote::RemoteServiceAccessRequest,
+            service_access::{ServiceAccessCommand, ServiceAccessTarget},
+        };
+        let node = node();
+        let request = |command| {
+            Json(RemoteServiceAccessRequest {
+                handle: sandbox_handle("temps-sandbox-abc", "stale-id"),
+                command,
+            })
+        };
+        let _receipt = service_access::command(
+            State(node.state.clone()),
+            request(ServiceAccessCommand::Inspect),
+        )
+        .await
+        .unwrap();
+        let _receipt = service_access::command(
+            State(node.state.clone()),
+            request(ServiceAccessCommand::Retire {
+                expected: ServiceAccessTarget {
+                    incarnation: "test-incarnation".into(),
+                    container_id: "stale-id".into(),
+                },
+                boot_id: uuid::Uuid::new_v4(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *node.provider.seen_ids.lock().unwrap(),
+            ["real-id", "stale-id"]
+        );
+        let rejected = service_access::command(
+            State(node.state),
+            Json(RemoteServiceAccessRequest {
+                handle: sandbox_handle("project-container", "real-id"),
+                command: ServiceAccessCommand::Inspect,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(node.provider.seen_ids.lock().unwrap().len(), 2);
     }
 }

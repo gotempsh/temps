@@ -130,6 +130,19 @@ const StatusPageDetailPage = lazy(() =>
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
 const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
+const AccessSessionCreatePage = lazy(
+  () => import('./pages/AccessSessionCreatePage')
+)
+const AccessSessionDetailPage = lazy(
+  () => import('./pages/AccessSessionDetailPage')
+)
+const AccessBundleDetailPage = lazy(
+  () => import('./pages/AccessBundleDetailPage')
+)
+const AccessBundlePage = lazy(() => import('./pages/AccessBundlePage'))
+const VaultDetailPage = lazy(() => import('./pages/VaultDetailPage'))
+const VaultPage = lazy(() => import('./pages/VaultPage'))
+const AccessServicePage = lazy(() => import('./pages/AccessServicePage'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
 )
@@ -776,6 +789,43 @@ const FullAppRoutes = () => {
                         <Route
                           path="/status-pages/:statusPageId"
                           element={<StatusPageDetailPage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route path="/vault" element={<VaultPage />} />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId"
+                          element={<VaultPage />}
                         />
                         <Route path="/sandboxes" element={<Sandboxes />} />
                         <Route

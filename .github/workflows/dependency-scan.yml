@@ -121,14 +121,35 @@ jobs:
       #   `bincode ^2.0.1` non-optionally, so no upgrade drops it. No
       #   vulnerability is reported against bincode 2.0.1. A temps-core
       #   Cargo.lock guard test fails if anything else starts depending on it.
+      # - RUSTSEC-2026-0440 (astral-tokio-tar): Astral ended maintenance on
+      #   2026-11-03; no patched version exists. No workspace crate uses it.
+      #   Dependents:
+      #   * microsandbox-image (and microsandbox's `local` feature, enabled by
+      #     temps-sandbox-providers): parses OCI image layer tarballs pulled
+      #     from registries when a microsandbox sandbox boots, so
+      #     registry-supplied archives do reach this parser. Not linked on musl
+      #     (the container image) or Intel macOS, same as bincode above.
+      #   * testcontainers: writes tar archives for copy-to-container and
+      #     reads copy-from-container output, against containers the tests
+      #     start themselves. Test-only: it is a dependency of the dev-only
+      #     temps-test-utils crate and of dev-dependencies, and no crate
+      #     depends on temps-test-utils outside dev-dependencies.
+      #   Checked 2026-11-09: the latest releases (microsandbox and
+      #   microsandbox-image 0.7.14, testcontainers 0.28.0) still require
+      #   `astral-tokio-tar ^0.6`, so no upgrade drops it. Cargo.lock is held
+      #   at 0.6.4, the last 0.6 release, which carries 0.6.3's parser
+      #   hardening (rejects ambiguous PAX/GNU metadata, truncated payloads and
+      #   partial sparse maps). A temps-core guard test fails if anything else
+      #   starts depending on it or if the lock drops below 0.6.4. Replace once
+      #   microsandbox and testcontainers move to a maintained tar crate.
       #
-      # The five below are vulnerability/unsoundness advisories (not "unmaintained"
+      # The six below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices). A version bump here cannot clear any of them: either no fix is
       # released, or an upstream crate still requires the affected copy.
       # Reachability analysis for RUSTSEC-2023-0071, RUSTSEC-2026-0235 and
       # RUSTSEC-2026-0253 lives in the root Cargo.toml under "Dependency
-      # Overrides - Security Fixes"; for RUSTSEC-2026-0381 and RUSTSEC-2026-0387
-      # it is the note on the entry itself. Re-verify that analysis before
+      # Overrides - Security Fixes"; for RUSTSEC-2026-0381, RUSTSEC-2026-0387
+      # and RUSTSEC-2026-0459 it is the note on the entry itself. Re-verify that analysis before
       # removing/renewing these on advisory-db updates:
       # - RUSTSEC-2023-0071 (rsa, Marvin Attack). Locked paths and how each
       #   uses RSA:
@@ -205,13 +226,44 @@ jobs:
       #   this repository makes are signed with plain SigV4 (HMAC-SHA256),
       #   which does not touch it. Drop this entry once aws-sigv4 moves to
       #   crypto-bigint >= 0.7.6.
+      # - RUSTSEC-2026-0459 (libsqlite3-sys: bundled SQLite < 3.54.0 can
+      #   return uninitialized page-cache memory when it opens a database
+      #   together with a crafted sibling `-wal` file of a different page
+      #   size; fixed in >= 0.39.0). Cargo.lock has one copy, 0.30.1, shared
+      #   by sqlx-sqlite 0.8 (sea-orm 1.1's `sqlx-sqlite` feature; sqlx 0.8
+      #   requires libsqlite3-sys 0.30, which has no patched release) and
+      #   sqlx-sqlite 0.9 (microsandbox-db in the exactly pinned microsandbox
+      #   SDK; capped at libsqlite3-sys < 0.38). The crate is
+      #   `links = "sqlite3"`, so no second, patched copy can coexist.
+      #   It is reachable. Two code paths open an on-disk database in WAL
+      #   mode:
+      #   * `temps edge` opens `<cache_dir>/analytics.db` through sea-orm and
+      #     sets `journal_mode = WAL` (temps-edge analytics.rs
+      #     AnalyticsStore::open). The cache dir defaults to
+      #     `~/.temps/edge-cache` and is created with the default umask.
+      #   * the experimental microsandbox backend (not linked on musl or
+      #     Intel macOS) opens the SDK's catalog under
+      #     `<data_dir>/microsandbox/db/` in WAL mode in the server process;
+      #     the `msb` VMM process writes the same catalog. The SDK home is
+      #     0700 and Temps-owned.
+      #   The main server database is never SQLite: temps-database only
+      #   accepts postgres:// URLs, and the other SQLite uses are
+      #   `sqlite::memory:` connections and mocks in tests.
+      #   Planting a crafted `-wal` next to either file takes write access to
+      #   a directory the Temps user owns: the Temps user itself (or root), an
+      #   operator who pointed `--cache-dir` at a shared writable path, or,
+      #   for the catalog, a guest that has already escaped into the VMM,
+      #   which ADR-050 treats as holding whatever the VMM can reach. That
+      #   residual risk is accepted until a patched copy is reachable.
+      #   Drop this entry once both sea-orm's sqlx and microsandbox-db allow
+      #   libsqlite3-sys >= 0.39.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
       # dependency graph, which can fail independently of this repository's
       # Cargo.lock (for example, when an upstream build-only crate is broken).
       - name: Install cargo-audit
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
           tool: cargo-audit@0.22.2
           fallback: none
@@ -220,7 +272,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440
 
   cargo-deny:
     name: Rust Licences, Sources & Bans (cargo-deny)
@@ -240,7 +292,7 @@ jobs:
           toolchain: 1.99.1
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
           tool: cargo-deny@0.20.2
           fallback: none
@@ -343,7 +395,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -382,7 +434,7 @@ jobs:
       - name: Upload Trivy results to GitHub code scanning
         if: ${{ !cancelled() && hashFiles('trivy-results.sarif') != '' }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7 # v4
+        uses: github/codeql-action/upload-sarif@0911ee96d2d6c8def97122c36c5cadd93829a4b4 # v4
         with:
           sarif_file: trivy-results.sarif
           category: ${{ matrix.sarif-category }}

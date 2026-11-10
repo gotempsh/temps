@@ -1,0 +1,415 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+import { useEffect, useState } from 'react'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import { useQuery } from '@tanstack/react-query'
+import { serviceProviderName } from '@/components/service-access/service-provider-registry'
+import {
+  Clock3,
+  Plus,
+  PlugZap,
+  Layers,
+  LockKeyhole,
+  MoreHorizontal,
+} from 'lucide-react'
+import { Button, Skeleton } from '@temps-sdk/ui'
+import {
+  Callout,
+  PageContainer,
+  PageHeader,
+  DataTable,
+  RecordLink,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+  TabsContent,
+  PageState,
+  ResponsivePagination,
+} from '@temps-sdk/ds'
+import {
+  getAccessVaultOptions,
+  listAccessBundlesOptions,
+  accessCapabilityOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import type { AccessVaultResponse } from '@/api/client'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
+  ServiceProviderLogo,
+  ServiceLogoStrip,
+} from '@/components/service-access/service-providers'
+import { AccessSessionsList } from '@/components/service-access/AccessSessionsList'
+import { VaultEditor } from '@/components/service-access/VaultEditor'
+import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+
+export default function VaultDetailPage() {
+  const { projectId: rawId, vaultId = '' } = useParams()
+  const projectId = Number(rawId)
+  return (
+    <VaultDetail
+      key={`${projectId}:${vaultId}`}
+      projectId={projectId}
+      vaultId={vaultId}
+    />
+  )
+}
+function VaultDetail({
+  projectId,
+  vaultId,
+}: {
+  projectId: number
+  vaultId: string
+}) {
+  const navigate = useNavigate()
+  const [params, setParams] = useSearchParams()
+  const valid =
+    Number.isInteger(projectId) &&
+    projectId > 0 &&
+    projectId <= 2147483647 &&
+    !!vaultId
+  const tab =
+    params.get('tab') === 'sessions'
+      ? 'sessions'
+      : params.get('tab') === 'bundles'
+        ? 'bundles'
+        : 'services'
+  const page = Math.max(
+    1,
+    Math.min(1000000, Math.floor(Number(params.get('page')) || 1))
+  )
+  const path = { project_id: projectId, vault_id: vaultId }
+  const vault = useQuery({ ...getAccessVaultOptions({ path }), enabled: valid })
+  const capability = useQuery({
+    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    enabled: valid,
+  })
+  const bundles = useQuery({
+    ...listAccessBundlesOptions({
+      path,
+      query: {
+        page,
+        page_size: 20,
+      },
+    }),
+    enabled: valid && tab === 'bundles',
+  })
+  const { setBreadcrumbs } = useBreadcrumbs()
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Vault', href: '/vault' },
+      { label: 'Vaults', href: `/vault/projects/${projectId}` },
+      { label: vault.data?.vault.name ?? 'Vault' },
+    ])
+    return () => setBreadcrumbs([])
+  }, [projectId, vault.data?.vault.name, setBreadcrumbs])
+  const [editingVault, setEditingVault] = useState<AccessVaultResponse>()
+  const [editorOpen, setEditorOpen] = useState(false)
+  const rows = vault.data?.services ?? []
+  const canWrite =
+    capability.data?.can_manage_services === true && !capability.isError
+  const changeTab = (next: string) =>
+    setParams((current) => {
+      const p = new URLSearchParams(current)
+      p.set('tab', next)
+      p.delete('page')
+      return p
+    })
+  return (
+    <PageContainer width="full">
+      <PageHeader
+        title={vault.data?.vault.name ?? 'Vault'}
+        actions={
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" asChild>
+              <Link to="/audit-logs?range=all">Audit logs</Link>
+            </Button>
+            <Button
+              variant="outline"
+              disabled={
+                !canWrite || !vault.data || vault.isFetching || vault.isError
+              }
+              onClick={() => {
+                setEditingVault((selected) => selected ?? vault.data?.vault)
+                setEditorOpen(true)
+              }}
+            >
+              Edit vault
+            </Button>
+            <Button variant="outline" asChild>
+              <Link to={`/vault/projects/${projectId}`}>All vaults</Link>
+            </Button>
+          </div>
+        }
+      />
+      {editingVault && (
+        <VaultEditor
+          key={editingVault.id}
+          vault={editingVault}
+          open={editorOpen}
+          onClose={() => setEditorOpen(false)}
+          canWrite={canWrite}
+        />
+      )}
+      {vault.isError && (
+        <Callout tone="error" title="Could not load vault">
+          <Button onClick={() => void vault.refetch()}>Retry</Button>
+        </Callout>
+      )}
+      {!valid && (
+        <Callout tone="error" title="Invalid vault link">
+          Return to Vault to choose a project.
+        </Callout>
+      )}
+      {vault.isPending ? (
+        <Skeleton className="h-48" />
+      ) : (
+        <Tabs value={tab} onValueChange={changeTab}>
+          <TabsList>
+            <TabsTrigger
+              value="services"
+              icon={PlugZap}
+              count={vault.data?.vault.service_ids.length}
+            >
+              Services
+            </TabsTrigger>
+            <TabsTrigger value="bundles" icon={Layers}>
+              Access bundles
+            </TabsTrigger>
+            <TabsTrigger value="sessions" icon={Clock3}>
+              Sessions
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="services" className="space-y-4">
+            <div className="flex justify-end">
+              <Button disabled={!canWrite} asChild={canWrite}>
+                {canWrite ? (
+                  <Link
+                    to={`/projects/${projectId}/access-services/new?vault=${encodeURIComponent(vaultId)}`}
+                  >
+                    <Plus className="size-4" />
+                    Add service
+                  </Link>
+                ) : (
+                  <span title="Project write permission is required">
+                    Add service
+                  </span>
+                )}
+              </Button>
+            </div>
+            {rows.length === 0 && !vault.isError ? (
+              <PageState
+                variant="empty"
+                icon={PlugZap}
+                title="Add a service to this vault"
+                description="Choose a provider, save its credential, and define which requests are allowed."
+              />
+            ) : (
+              <DataTable
+                aria-label="Vault services"
+                rows={rows}
+                rowKey={(r) => r.id}
+                columns={[
+                  {
+                    key: 'name',
+                    header: 'Service',
+                    render: (r) => (
+                      <div className="flex min-w-0 items-center gap-3">
+                        <ServiceProviderLogo service={r} />
+                        <div className="min-w-0">
+                          <RecordLink
+                            className="font-medium break-words"
+                            to={`/projects/${projectId}/access-services/${encodeURIComponent(r.id)}/edit?vault=${encodeURIComponent(vaultId)}`}
+                          >
+                            {r.name}
+                          </RecordLink>
+                          <p className="text-xs text-muted-foreground">
+                            {serviceProviderName(r)} · v{r.version}
+                          </p>
+                          <p className="text-xs text-muted-foreground @xl:hidden break-all">
+                            {r.policy.origin}
+                          </p>
+                        </div>
+                      </div>
+                    ),
+                  },
+                  {
+                    key: 'type',
+                    header: 'Type',
+                    className: 'hidden @xl:table-cell',
+                    render: (r) =>
+                      r.policy.github_repository?.protocol === 'git'
+                        ? 'Git HTTPS'
+                        : 'HTTP API',
+                  },
+                  {
+                    key: 'target',
+                    header: 'Target',
+                    className: 'hidden @xl:table-cell',
+                    render: (r) => (
+                      <span className="break-all rounded bg-muted px-2 py-1 text-xs font-mono">
+                        {r.policy.origin.replace('https://', '')}
+                      </span>
+                    ),
+                  },
+                  {
+                    key: 'credential',
+                    header: 'Credential',
+                    className: 'hidden @xl:table-cell',
+                    render: (r) => (
+                      <span className="inline-flex items-center gap-2 text-muted-foreground">
+                        <LockKeyhole className="size-3" />
+                        {r.policy.github_repository
+                          ? 'Project connection'
+                          : r.has_credential
+                            ? 'Stored value'
+                            : 'Not configured'}
+                      </span>
+                    ),
+                  },
+                  {
+                    key: 'state',
+                    header: 'Requests',
+                    render: (r) => (
+                      <span className="text-sm text-muted-foreground">
+                        {r.enabled ? 'Allowed' : 'Disabled'}
+                      </span>
+                    ),
+                  },
+                ]}
+              />
+            )}
+          </TabsContent>
+          <TabsContent
+            value="sessions"
+            forceMount
+            hidden={tab !== 'sessions'}
+            className="space-y-4"
+          >
+            <div className="flex justify-end">
+              <Button variant="outline" onClick={() => changeTab('bundles')}>
+                Choose a bundle to create a session
+              </Button>
+            </div>
+            {valid && (
+              <AccessSessionsList
+                key={vaultId}
+                projectId={projectId}
+                vaultId={vaultId}
+                active={tab === 'sessions'}
+              />
+            )}
+          </TabsContent>
+          <TabsContent value="bundles" className="space-y-4">
+            <div className="flex justify-end">
+              <Button
+                disabled={!canWrite}
+                onClick={() => {
+                  navigate(
+                    `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}/bundles/new`
+                  )
+                }}
+              >
+                <Plus className="size-4" />
+                Create access bundle
+              </Button>
+            </div>
+            {bundles.isError && (
+              <Callout tone="error" title="Could not load access bundles">
+                <Button onClick={() => void bundles.refetch()}>Retry</Button>
+              </Callout>
+            )}
+            {bundles.isPending ? (
+              <Skeleton className="h-40" />
+            ) : bundles.data?.total === 0 ? (
+              <PageState
+                variant="empty"
+                icon={Layers}
+                title="No access bundles"
+                description="Choose services and a maximum lifetime for new sessions."
+              />
+            ) : (
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {bundles.data?.items.map((b) => (
+                  <div
+                    key={b.id}
+                    className="relative rounded-lg border transition-colors hover:border-foreground/30 focus-within:ring-2 focus-within:ring-ring"
+                  >
+                    <div className="space-y-3 p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <h2 className="min-w-0 break-words font-semibold">
+                          <Link
+                            to={`/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}/bundles/${encodeURIComponent(b.id)}`}
+                            className="after:absolute after:inset-0 focus:outline-none"
+                          >
+                            {b.name}
+                          </Link>
+                        </h2>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="relative z-10"
+                              aria-label={`Actions for ${b.name}`}
+                            >
+                              <MoreHorizontal className="size-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              disabled={
+                                !canWrite ||
+                                bundles.isFetching ||
+                                bundles.isError
+                              }
+                              onSelect={() => {
+                                navigate(
+                                  `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}/bundles/${encodeURIComponent(b.id)}/edit`
+                                )
+                              }}
+                            >
+                              Edit bundle
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                      <ServiceLogoStrip
+                        services={rows.filter((s) =>
+                          b.service_ids.includes(s.id)
+                        )}
+                        total={b.service_ids.length}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-2 border-t p-3">
+                      <span className="text-xs text-muted-foreground">
+                        Up to {b.ttl_seconds / 60} min
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        View bundle →
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {(bundles.data?.total ?? 0) > 20 && (
+              <ResponsivePagination
+                page={page}
+                pageSize={20}
+                total={bundles.data?.total ?? 0}
+                totalPages={Math.ceil((bundles.data?.total ?? 0) / 20)}
+                onPageChange={(p) =>
+                  setParams({ tab: 'bundles', page: String(p) })
+                }
+              />
+            )}
+          </TabsContent>
+        </Tabs>
+      )}
+    </PageContainer>
+  )
+}

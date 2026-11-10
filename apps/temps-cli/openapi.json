@@ -22,6 +22,151 @@
         ],
         "type": "object"
       },
+      "AccessBundleList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AccessBundleResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "AccessBundleResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ttl_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "vault_id": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "vault_id",
+          "name",
+          "service_ids",
+          "ttl_seconds",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "AccessCapability": {
+        "properties": {
+          "can_manage_requests": {
+            "description": "Caller has project and sandbox write permissions. Ownership is still\nchecked on each sandbox mutation.",
+            "type": "boolean"
+          },
+          "can_manage_services": {
+            "description": "Caller may edit service policies in this project. Set by the handler.",
+            "type": "boolean"
+          },
+          "can_save_requests": {
+            "type": "boolean"
+          },
+          "can_use_project_github": {
+            "description": "Caller may use the project-bound GitHub credential source.",
+            "type": "boolean"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/AccessCapabilityState"
+          }
+        },
+        "required": [
+          "state",
+          "configured",
+          "can_save_requests",
+          "can_manage_services",
+          "can_use_project_github",
+          "can_manage_requests",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "AccessCapabilityState": {
+        "enum": [
+          "available",
+          "integration_unavailable"
+        ],
+        "type": "string"
+      },
+      "AccessMethod": {
+        "enum": [
+          "GET",
+          "HEAD",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE"
+        ],
+        "type": "string"
+      },
       "AccessPermission": {
         "enum": [
           "apps_edit",
@@ -110,6 +255,258 @@
         ],
         "type": "object"
       },
+      "AccessServiceList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AccessServiceResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "type": "object"
+      },
+      "AccessServiceProvider": {
+        "enum": [
+          "github",
+          "gitlab",
+          "openai",
+          "anthropic",
+          "stripe",
+          "resend",
+          "sendgrid",
+          "vercel",
+          "netlify",
+          "mistral",
+          "groq"
+        ],
+        "type": "string"
+      },
+      "AccessServiceResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "has_credential": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_ttl_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SandboxAccessPolicy"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "policy",
+          "max_ttl_seconds",
+          "enabled",
+          "has_credential",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "AccessSessionConsumer": {
+        "description": "Extensible consumer identity. Only authenticated sandbox bindings are supported today.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "sandbox"
+                ],
+                "type": "string"
+              },
+              "sandbox_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "sandbox_id",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AccessSessionDetail": {
+        "properties": {
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceGrantResponse"
+            },
+            "type": "array"
+          },
+          "session": {
+            "$ref": "#/components/schemas/AccessSessionResponse"
+          }
+        },
+        "required": [
+          "session",
+          "grants"
+        ],
+        "type": "object"
+      },
+      "AccessSessionList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AccessSessionResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "AccessSessionResponse": {
+        "properties": {
+          "bundle_id": {
+            "type": "string"
+          },
+          "bundle_name": {
+            "type": "string"
+          },
+          "bundle_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/AccessSessionConsumer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AccessSessionStatus",
+            "description": "Authorization state only. Inspect grants for acknowledged worker enforcement."
+          },
+          "vault_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "vault_id",
+          "bundle_id",
+          "bundle_name",
+          "bundle_version",
+          "consumer",
+          "status",
+          "service_count",
+          "created_at",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "AccessSessionStatus": {
+        "enum": [
+          "issued",
+          "expired",
+          "revoked"
+        ],
+        "type": "string"
+      },
       "AccessTokenCheckRequest": {
         "properties": {
           "account_id": {
@@ -172,6 +569,118 @@
           "ready",
           "warning",
           "token_url"
+        ],
+        "type": "object"
+      },
+      "AccessVaultDetail": {
+        "properties": {
+          "services": {
+            "description": "Vaults are bounded to 100 services.",
+            "items": {
+              "$ref": "#/components/schemas/AccessServiceResponse"
+            },
+            "type": "array"
+          },
+          "vault": {
+            "$ref": "#/components/schemas/AccessVaultResponse"
+          }
+        },
+        "required": [
+          "vault",
+          "services"
+        ],
+        "type": "object"
+      },
+      "AccessVaultList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AccessVaultOverview"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "AccessVaultOverview": {
+        "properties": {
+          "services": {
+            "description": "Up to four services for the overview; service_ids gives the total.",
+            "items": {
+              "$ref": "#/components/schemas/AccessServiceResponse"
+            },
+            "type": "array"
+          },
+          "vault": {
+            "$ref": "#/components/schemas/AccessVaultResponse"
+          }
+        },
+        "required": [
+          "vault",
+          "services"
+        ],
+        "type": "object"
+      },
+      "AccessVaultResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "service_ids",
+          "version",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -5491,6 +6000,60 @@
         "required": [
           "plan_id",
           "option"
+        ],
+        "type": "object"
+      },
+      "ApproveSandboxService": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "expires_at": {
+            "description": "Omit for the sandbox lifetime. A fixed expiry never renews beyond this deadline.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version",
+          "service_version"
+        ],
+        "type": "object"
+      },
+      "ApproveServiceGrant": {
+        "additionalProperties": false,
+        "description": "Explicit operator approval, separate from a saved request. Reuse request_id\nonly when retrying this exact approval; it never extends an existing grant.",
+        "properties": {
+          "request_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "ttl_seconds": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_id",
+          "service_id",
+          "service_version",
+          "ttl_seconds"
         ],
         "type": "object"
       },
@@ -15326,6 +15889,46 @@
           "name",
           "account_id",
           "token"
+        ],
+        "type": "object"
+      },
+      "CreateAccessSession": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_id": {
+            "type": "string"
+          },
+          "bundle_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "consumer": {
+            "$ref": "#/components/schemas/AccessSessionConsumer"
+          },
+          "request_id": {
+            "description": "Stable for retries of this approval. A new session needs a new UUID.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "services": {
+            "description": "Exact policies the operator reviewed, one per bundle service (maximum 16).",
+            "items": {
+              "$ref": "#/components/schemas/SessionServiceVersion"
+            },
+            "type": "array"
+          },
+          "ttl_seconds": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "request_id",
+          "bundle_id",
+          "bundle_version",
+          "consumer",
+          "ttl_seconds",
+          "services"
         ],
         "type": "object"
       },
@@ -34255,6 +34858,13 @@
         ],
         "type": "object"
       },
+      "GithubAccessProtocol": {
+        "enum": [
+          "api",
+          "git"
+        ],
+        "type": "string"
+      },
       "GithubManifestStartResponse": {
         "description": "Response of [`start_github_manifest_flow`].",
         "properties": {
@@ -34265,6 +34875,32 @@
         },
         "required": [
           "state"
+        ],
+        "type": "object"
+      },
+      "GithubRepositoryAccess": {
+        "additionalProperties": false,
+        "description": "Immutable reference to an explicitly selected GitHub connection and synced repository.\nChanging the connection or repository requires a new policy and fresh consent.",
+        "properties": {
+          "connection_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/GithubAccessProtocol"
+          },
+          "repository": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connection_id",
+          "owner",
+          "repository",
+          "protocol"
         ],
         "type": "object"
       },
@@ -35320,6 +35956,17 @@
           "check_operation"
         ],
         "type": "object"
+      },
+      "GrantEnforcement": {
+        "description": "Observed worker enforcement, independent of the requested authorization.",
+        "enum": [
+          "not_requested",
+          "pending",
+          "active",
+          "stopping",
+          "stopped"
+        ],
+        "type": "string"
       },
       "GroupEnvVarResponse": {
         "description": "A group variable as returned by the API. `value` is `\"***\"` in lists,\nplaintext only in the create/update response of a non-secret variable,\nand always `null` for secrets.",
@@ -58910,6 +59557,46 @@
         ],
         "type": "object"
       },
+      "RequestSandboxService": {
+        "additionalProperties": false,
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_version"
+        ],
+        "type": "object"
+      },
+      "RequestServiceGrant": {
+        "additionalProperties": false,
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "ttl_seconds": {
+            "description": "Absolute expiry is calculated at creation, even if the broker is unavailable.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_version",
+          "ttl_seconds"
+        ],
+        "type": "object"
+      },
       "RequestTimeoutSettings": {
         "description": "Upstream request/connection timeouts for customer app traffic.\n\nBy default, no timeout is applied to customer app traffic at all — an\nexisting app that happens to have a slow endpoint, a long-polling\nrequest, or an unusually long response must keep working exactly as it\ndid before this setting existed. Timeouts here are opt-in: an operator\ncan set a global default, and/or a project/environment can set its own\noverride (`DeploymentConfig::request_timeout_seconds` /\n`sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until\none of those is explicitly configured, the proxy holds the connection\nopen indefinitely (bounded only by TCP/OS-level limits).\n\n`default_*_timeout_seconds` of `0` means \"no timeout\" — this is the\nout-of-the-box value for all three. `max_request_timeout_seconds` is a\nhard ceiling that only comes into play once a timeout is actually\nconfigured (globally or per project/environment): whatever value is\nresolved is always clamped to it, so lowering the ceiling here takes\neffect immediately without needing every environment row re-saved. It\nnever *creates* a timeout for traffic that has none.",
         "properties": {
@@ -60164,6 +60851,32 @@
           "ts",
           "provider",
           "event_type"
+        ],
+        "type": "object"
+      },
+      "RevokeSandboxService": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "type": "object"
+      },
+      "RevokeServiceGrant": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
         ],
         "type": "object"
       },
@@ -61789,6 +62502,57 @@
         ],
         "type": "object"
       },
+      "SandboxAccessPolicy": {
+        "additionalProperties": false,
+        "description": "Exact destination and request scope. The broker must validate this again\nagainst its supported protocols before installing a policy.",
+        "properties": {
+          "github_repository": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GithubRepositoryAccess",
+                "description": "Use the selected GitHub connection on the host. No provider token is returned."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "methods": {
+            "items": {
+              "$ref": "#/components/schemas/AccessMethod"
+            },
+            "type": "array"
+          },
+          "origin": {
+            "description": "HTTPS origin only; no path, userinfo, query, fragment or non-443 port.",
+            "type": "string"
+          },
+          "path_prefixes": {
+            "description": "Segment-boundary path prefixes, for example `/owner/private-repo`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "provider": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AccessServiceProvider",
+                "description": "Explicit provider identity selected by the operator; never inferred from a name."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "origin",
+          "path_prefixes",
+          "methods"
+        ],
+        "type": "object"
+      },
       "SandboxBackend": {
         "description": "Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker\ncontainers, Firecracker microVMs and microsandbox (libkrun) microVMs\ncoexist on the same host behind the same `SandboxProvider` seam;\n`routing::RoutingSandboxProvider` dispatches between them. `Local` is the\ndev-only fork-exec fallback.",
         "enum": [
@@ -62365,6 +63129,111 @@
         ],
         "type": "object"
       },
+      "SandboxServiceList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SandboxServiceResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "type": "object"
+      },
+      "SandboxServiceResponse": {
+        "properties": {
+          "connected": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "enforcement": {
+            "$ref": "#/components/schemas/GrantEnforcement"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SandboxAccessPolicy"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SandboxServiceStatus"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "service_id",
+          "service_name",
+          "service_version",
+          "policy",
+          "version",
+          "status",
+          "enforcement",
+          "connected",
+          "reason",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "SandboxServiceStatus": {
+        "enum": [
+          "pending_approval",
+          "approved",
+          "suspended",
+          "revoked",
+          "expired",
+          "policy_changed",
+          "service_disabled"
+        ],
+        "type": "string"
+      },
       "SandboxStatusResponse": {
         "properties": {
           "docker_available": {
@@ -62401,6 +63270,122 @@
           "firecracker_available",
           "microsandbox",
           "firecracker_terminal"
+        ],
+        "type": "object"
+      },
+      "SaveAccessBundle": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "service_ids": {
+            "description": "A selection of this vault's services, not an authorization grant.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ttl_seconds": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "service_ids",
+          "ttl_seconds"
+        ],
+        "type": "object"
+      },
+      "SaveAccessService": {
+        "additionalProperties": false,
+        "properties": {
+          "clear_credential": {
+            "type": "boolean"
+          },
+          "credential": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Write-only bearer credential; omitted on update keeps the existing one.\nEmpty strings are rejected. Use clear_credential to remove it."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "writeOnly": true
+          },
+          "enabled": {
+            "description": "Allows requests to be saved; does not enable a network connection.",
+            "type": "boolean"
+          },
+          "expected_version": {
+            "description": "Required for updates; omit for creation.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_ttl_seconds": {
+            "description": "Maximum lifetime of a request, between 60 and 86400 seconds.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SandboxAccessPolicy"
+          },
+          "vault_id": {
+            "description": "Add a newly created service to this vault in the same transaction.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "policy",
+          "max_ttl_seconds",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "SaveAccessVault": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "service_ids": {
+            "description": "Existing services in this project. At most 100, without duplicates.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "service_ids"
         ],
         "type": "object"
       },
@@ -64588,6 +65573,142 @@
         ],
         "type": "object"
       },
+      "ServiceGrantApproval": {
+        "description": "Durable approval receipt. HTTP 202 does not mean the worker is connected.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "grant_id": {
+            "type": "string"
+          },
+          "sandbox_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "sandbox_id",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "ServiceGrantList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceGrantResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "type": "object"
+      },
+      "ServiceGrantResponse": {
+        "properties": {
+          "connected": {
+            "description": "True only for a current, live acknowledgment of this exact grant.",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "enforcement": {
+            "$ref": "#/components/schemas/GrantEnforcement"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SandboxAccessPolicy"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "type": "string"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ServiceGrantStatus"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "service_id",
+          "service_name",
+          "sandbox_id",
+          "service_version",
+          "policy",
+          "status",
+          "reason",
+          "enforcement",
+          "connected",
+          "version",
+          "created_at",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "ServiceGrantStatus": {
+        "enum": [
+          "pending_approval",
+          "approved",
+          "integration_unavailable",
+          "expired",
+          "revoked",
+          "service_disabled",
+          "policy_changed"
+        ],
+        "type": "string"
+      },
       "ServiceHealthResponse": {
         "properties": {
           "consecutive_failures": {
@@ -66183,6 +67304,23 @@
           "path",
           "status_code",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "SessionServiceVersion": {
+        "additionalProperties": false,
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id",
+          "version"
         ],
         "type": "object"
       },
@@ -134075,6 +135213,1103 @@
         ]
       }
     },
+    "/projects/{project_id}/access-services": {
+      "get": {
+        "operationId": "list_access_services",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_service",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-services/{service_id}": {
+      "get": {
+        "operationId": "get_access_service",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Service ID",
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            },
+            "description": "Service policy without stored credential"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      },
+      "put": {
+        "operationId": "update_access_service",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Service ID",
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessServiceResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-sessions": {
+      "get": {
+        "operationId": "list_access_sessions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "vault_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Filter by the sandbox's public ID; ownership still applies.",
+            "in": "query",
+            "name": "sandbox_id",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionList"
+                }
+              }
+            },
+            "description": "Session authorizations"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-sessions/{session_id}": {
+      "get": {
+        "operationId": "get_access_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionDetail"
+                }
+              }
+            },
+            "description": "Session policies and worker receipts"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-sessions/{session_id}/revoke": {
+      "post": {
+        "operationId": "revoke_access_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionResponse"
+                }
+              }
+            },
+            "description": "Revocation requested; inspect worker receipts"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-vaults": {
+      "get": {
+        "operationId": "list_access_vaults",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_vault",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessVault"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-vaults/{vault_id}": {
+      "get": {
+        "operationId": "get_access_vault",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultDetail"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "put": {
+        "operationId": "update_access_vault",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessVault"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessVaultResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-vaults/{vault_id}/bundles": {
+      "get": {
+        "operationId": "list_access_bundles",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessBundleList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_bundle",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessBundleResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-vaults/{vault_id}/bundles/{bundle_id}": {
+      "put": {
+        "operationId": "update_access_bundle",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "bundle_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveAccessBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessBundleResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid selection"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault"
+        ]
+      }
+    },
+    "/projects/{project_id}/access-vaults/{vault_id}/sessions": {
+      "post": {
+        "operationId": "create_access_session",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "vault_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccessSession"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSessionResponse"
+                }
+              }
+            },
+            "description": "Session issued; worker enforcement is asynchronous"
+          },
+          "400": {
+            "description": "Invalid session"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy changed"
+          },
+          "500": {
+            "description": "Session storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Vault sessions"
+        ]
+      }
+    },
     "/projects/{project_id}/access/{team_id}": {
       "delete": {
         "operationId": "revoke_project_access",
@@ -155421,6 +157656,646 @@
         ]
       }
     },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants": {
+      "get": {
+        "operationId": "list_service_grants",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque sandbox ID",
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceGrantList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      },
+      "post": {
+        "operationId": "request_service_grant",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque sandbox ID",
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestServiceGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceGrantResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      }
+    },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve": {
+      "post": {
+        "operationId": "approve_service_grant",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sandbox ID",
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveServiceGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceGrantApproval"
+                }
+              }
+            },
+            "description": "Fresh approval persisted; worker enforcement is asynchronous"
+          },
+          "400": {
+            "description": "Invalid consent"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy or sandbox changed"
+          },
+          "500": {
+            "description": "Approval storage failed"
+          },
+          "503": {
+            "description": "Worker unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      }
+    },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke": {
+      "post": {
+        "operationId": "revoke_service_grant",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Opaque sandbox ID",
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Grant request ID",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeServiceGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceGrantResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
+        ]
+      }
+    },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/services": {
+      "get": {
+        "operationId": "list_sandbox_services",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxServiceList"
+                }
+              }
+            },
+            "description": "Service access state; inspect enforcement for worker acknowledgment"
+          },
+          "400": {
+            "description": "Invalid access request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy or approval changed"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox services"
+        ]
+      },
+      "post": {
+        "operationId": "request_sandbox_service",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestSandboxService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxServiceResponse"
+                }
+              }
+            },
+            "description": "Service access state; inspect enforcement for worker acknowledgment"
+          },
+          "400": {
+            "description": "Invalid access request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy or approval changed"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox services"
+        ]
+      }
+    },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/approve": {
+      "post": {
+        "operationId": "approve_sandbox_service",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "access_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveSandboxService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxServiceResponse"
+                }
+              }
+            },
+            "description": "Service access state; inspect enforcement for worker acknowledgment"
+          },
+          "400": {
+            "description": "Invalid access request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy or approval changed"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox services"
+        ]
+      }
+    },
+    "/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/revoke": {
+      "post": {
+        "operationId": "revoke_sandbox_service",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "sandbox_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "access_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeSandboxService"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxServiceResponse"
+                }
+              }
+            },
+            "description": "Service access state; inspect enforcement for worker acknowledgment"
+          },
+          "400": {
+            "description": "Invalid access request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Scoped resource not found"
+          },
+          "409": {
+            "description": "Policy or approval changed"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox services"
+        ]
+      }
+    },
     "/projects/{project_id}/secrets": {
       "get": {
         "operationId": "listProjectSecrets",
@@ -155764,6 +158639,61 @@
         ],
         "tags": [
           "HTTP Checks"
+        ]
+      }
+    },
+    "/projects/{project_id}/service-access/capability": {
+      "get": {
+        "operationId": "access_capability",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessCapability"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "description": "Version conflict"
+          },
+          "500": {
+            "description": "Storage failure"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandbox service access"
         ]
       }
     },
@@ -172256,6 +175186,10 @@
     {
       "description": "Sandbox snapshot API (ADR-037): create, list, get, and delete snapshots.",
       "name": "Snapshots"
+    },
+    {
+      "description": "Saved service policies and time-limited access requests; runtime integration is not installed",
+      "name": "Sandbox service access"
     },
     {
       "description": "Log search, context, live tail, and retention management",

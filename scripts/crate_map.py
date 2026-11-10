@@ -77,6 +77,7 @@ LAYERS: dict[str, str] = {
     "temps-authz": "foundation",
     "temps-clickhouse": "foundation",
     # library
+    "libsqlite3-sys": "library",
     "temps-captcha-wasm": "library",
     "temps-cloud-protocol": "library",
     "temps-credential-checks": "library",
@@ -103,6 +104,7 @@ LAYERS: dict[str, str] = {
     "temps-preview-gateway": "runtime",
     "temps-pty-agent": "runtime",
     "temps-runtime-health": "runtime",
+    "temps-service-access-runtime": "runtime",
     "temps-vm-agent": "runtime",
     "temps-wireguard": "runtime",
     "temps-workload-activator": "runtime",
@@ -138,6 +140,7 @@ LAYERS: dict[str, str] = {
     "temps-environments": "domain",
     "temps-external-plugins": "domain",
     "temps-flags": "domain",
+    "temps-service-access": "domain",
     "temps-geo": "domain",
     "temps-git": "domain",
     "temps-infra": "domain",

@@ -95,6 +95,25 @@ impl RoutingSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for RoutingSandboxProvider {
+    async fn service_access(
+        &self,
+        handle: &SandboxHandle,
+        command: crate::service_access::ServiceAccessCommand,
+    ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+        // Credential authority must never follow the legacy default-backend
+        // fallback used by ordinary lifecycle operations.
+        let owner = self.backends.get(&handle.backend).ok_or_else(|| {
+            AgentError::SandboxProviderUnavailable {
+                provider: handle.backend.to_string(),
+                reason: format!(
+                    "cannot deliver service access for sandbox '{}': its backend is not registered",
+                    handle.sandbox_id
+                ),
+            }
+        })?;
+        owner.service_access(handle, command).await
+    }
+
     async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
         self.owner_of(handle)?.image_identity(handle).await
     }
@@ -486,6 +505,19 @@ mod tests {
 
     #[async_trait]
     impl SandboxProvider for RecordingProvider {
+        async fn service_access(
+            &self,
+            handle: &SandboxHandle,
+            _: crate::service_access::ServiceAccessCommand,
+        ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+            assert_eq!(handle.backend, self.backend);
+            Ok(crate::service_access::ServiceAccessReply::Retired {
+                target: crate::service_access::ServiceAccessTarget {
+                    incarnation: "test-incarnation".into(),
+                    container_id: handle.sandbox_id.clone(),
+                },
+            })
+        }
         async fn create(&self, _config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             Ok(self.handle())
         }
@@ -813,5 +845,28 @@ mod tests {
             }
             other => panic!("expected a validation error, got {other:?}"),
         }
+    }
+    #[tokio::test]
+    async fn service_access_uses_the_handle_backend_and_rejects_missing_backends() {
+        let docker = Arc::new(RecordingProvider::new(SandboxBackend::Docker));
+        let fc = Arc::new(RecordingProvider::new(SandboxBackend::Firecracker));
+        let router = router(docker.clone(), fc.clone());
+        for backend in [docker, fc] {
+            router
+                .service_access(
+                    &backend.handle(),
+                    crate::service_access::ServiceAccessCommand::Inspect,
+                )
+                .await
+                .unwrap();
+        }
+        let missing = RecordingProvider::new(SandboxBackend::Microsandbox);
+        assert!(router
+            .service_access(
+                &missing.handle(),
+                crate::service_access::ServiceAccessCommand::Inspect
+            )
+            .await
+            .is_err());
     }
 }

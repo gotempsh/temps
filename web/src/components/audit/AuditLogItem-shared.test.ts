@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from 'bun:test'
-import { CATEGORY_META } from './AuditLogItem-shared'
+import { CATEGORY_META, categorize } from './AuditLogItem-shared'
 
 // Colour -600 on a 10% tint of itself is below the 4.5:1 WCAG 1.4.3 minimum
 // for several hues (lime measured 2.85:1). Light-theme text must be -700 or
@@ -15,4 +15,16 @@ test('audit category badges use a text shade that meets contrast on the tint', (
     )
     .map(([category, meta]) => `${category}: ${meta.tone}`)
   expect(weak).toEqual([])
+})
+
+test('Vault management and grant operations have a dedicated audit category', () => {
+  for (const operation of [
+    'CREATE_ACCESS_VAULT',
+    'UPDATE_ACCESS_BUNDLE',
+    'CREATE_ACCESS_SESSION',
+    'REVOKE_ACCESS_SESSION',
+    'SANDBOX_SERVICE_GRANT_APPROVED',
+  ]) {
+    expect(categorize(operation)).toBe('vault')
+  }
 })

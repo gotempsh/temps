@@ -87,6 +87,7 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
           path.startsWith('/projects/') ||
           path.startsWith('/p/'),
       },
+      { title: 'Vault', url: '/vault', icon: ShieldAlert },
       { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       {

@@ -28,6 +28,7 @@ pub mod pty_agent_bundle;
 pub mod remote;
 pub mod routing;
 pub mod sandbox_registry;
+pub mod service_access;
 pub mod workload_vm;
 
 /// The Docker named volume holding `/home/temps` for a sandbox whose
@@ -889,6 +890,22 @@ pub fn is_linux_elf(header: &[u8]) -> bool {
 /// `Arc<dyn SandboxProvider>` stops compiling.
 #[async_trait]
 pub trait SandboxProvider: Send + Sync {
+    /// Host-only credential proxy control. Defaults closed for unsupported
+    /// backends; callers must never fall back to passing tokens into guests.
+    async fn service_access(
+        &self,
+        handle: &SandboxHandle,
+        _command: service_access::ServiceAccessCommand,
+    ) -> Result<service_access::ServiceAccessReply, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "service access is unavailable on provider '{}'",
+                self.name()
+            ),
+        })
+    }
     /// Create and start a new sandbox for a run.
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError>;
 

@@ -12,7 +12,7 @@
 //!    in favor of the daemon).
 //!    b. `printenv` does NOT show any `GITHUB_TOKEN` / `GH_TOKEN` /
 //!    `GITLAB_TOKEN` / `GL_TOKEN` env vars.
-//!    c. `/run/temps-git/` exists with mode 0750, owner
+//!    c. `/run/temps-git/` exists with mode 2750, owner
 //!    `temps-git:git-users`.
 //!    d. `/etc/temps/` exists with mode 0700, owner `temps-git:temps-git`.
 //!    e. As user `temps`: cannot read the env file (`cat
@@ -166,6 +166,71 @@ async fn exec_in_container(
     (stdout, stderr, exit_code)
 }
 
+/// Remove only this test's unique image, including on assertion failures.
+struct ImageGuard {
+    docker: Docker,
+    tag: String,
+}
+
+impl Drop for ImageGuard {
+    fn drop(&mut self) {
+        let docker = self.docker.clone();
+        let tag = self.tag.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async {
+                    let _ = docker
+                        .remove_image(
+                            &tag,
+                            None::<bollard::query_parameters::RemoveImageOptions>,
+                            None,
+                        )
+                        .await;
+                });
+            }
+        })
+        .join();
+    }
+}
+
+// RAII cleanup so the container is removed regardless of which
+// assertion or startup operation fails.
+struct ContainerGuard<'a> {
+    docker: &'a Docker,
+    id: &'a str,
+}
+impl<'a> Drop for ContainerGuard<'a> {
+    fn drop(&mut self) {
+        let docker = self.docker.clone();
+        let id = self.id.to_string();
+        // Best-effort cleanup. We're in Drop, so we spawn into the
+        // current runtime and let it run async cleanup.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                rt.block_on(async {
+                    let _ = docker
+                        .remove_container(
+                            &id,
+                            Some(bollard::query_parameters::RemoveContainerOptions {
+                                force: true,
+                                ..Default::default()
+                            }),
+                        )
+                        .await;
+                });
+            }
+        })
+        .join()
+        .ok();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sandbox_image_credential_pipeline_smoke() {
     let docker = match docker_or_skip().await {
@@ -175,8 +240,19 @@ async fn sandbox_image_credential_pipeline_smoke() {
 
     // Build the image. Use a unique tag so this test doesn't fight with
     // the production image cache.
-    let tag = "temps-sandbox-credential-smoke:test";
-    if !build_image(&docker, tag).await {
+    let tag = format!(
+        "temps-sandbox-credential-smoke:{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _image_guard = ImageGuard {
+        docker: docker.clone(),
+        tag: tag.clone(),
+    };
+    if !build_image(&docker, &tag).await {
         panic!("image build failed — see stderr above");
     }
 
@@ -188,11 +264,21 @@ async fn sandbox_image_credential_pipeline_smoke() {
             bollard::models::ContainerCreateBody {
                 image: Some(tag.to_string()),
                 cmd: Some(vec!["sleep".into(), "infinity".into()]),
+                host_config: Some(bollard::models::HostConfig {
+                    security_opt: Some(vec!["no-new-privileges:true".into()]),
+                    cap_drop: Some(vec!["ALL".into()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
         .await
         .expect("create container");
+
+    let _guard = ContainerGuard {
+        docker: &docker,
+        id: &container.id,
+    };
 
     docker
         .start_container(
@@ -206,45 +292,32 @@ async fn sandbox_image_credential_pipeline_smoke() {
     // before exec-ing sleep, no need to wait long.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // RAII cleanup so the container is removed regardless of which
-    // assertion fails. We don't bother with catch_unwind; tokio runs
-    // each test in its own process anyway.
-    struct ContainerGuard<'a> {
-        docker: &'a Docker,
-        id: &'a str,
-    }
-    impl<'a> Drop for ContainerGuard<'a> {
-        fn drop(&mut self) {
-            let docker = self.docker.clone();
-            let id = self.id.to_string();
-            // Best-effort cleanup. We're in Drop, so we spawn into the
-            // current runtime and let it run async cleanup.
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                if let Ok(rt) = rt {
-                    rt.block_on(async {
-                        let _ = docker
-                            .remove_container(
-                                &id,
-                                Some(bollard::query_parameters::RemoveContainerOptions {
-                                    force: true,
-                                    ..Default::default()
-                                }),
-                            )
-                            .await;
-                    });
-                }
-            })
-            .join()
-            .ok();
-        }
-    }
-    let _guard = ContainerGuard {
-        docker: &docker,
-        id: &container.id,
-    };
+    // A terminal stays open while Git asks for credentials. Reproduce that
+    // with a real PTY whose input stays open, without an external repository.
+    // `credential fill` exercises the same helper/prompt path as HTTPS clone.
+    let (_, _, socket_code) = exec_in_container(
+        &docker,
+        &container.id,
+        vec!["test", "-S", "/run/temps-git/git.sock"],
+        Some("temps"),
+    )
+    .await;
+    assert_ne!(socket_code, 0, "regression requires an absent daemon");
+    let (out, err, code) = exec_in_container(
+        &docker, &container.id,
+        vec!["sh", "-c", r#"sleep 4 | timeout 2 script -qec 'printf "protocol=https\nhost=github.com\npath=owner/private-repo\n\n" | git credential fill' /dev/null"#],
+        Some("temps"),
+    ).await;
+    assert_eq!(
+        code, 128,
+        "Git must fail, not wait for terminal input: {out} {err}"
+    );
+    assert!(
+        out.contains("credential daemon socket not found"),
+        "{out} {err}"
+    );
+    assert!(out.contains("terminal prompts disabled"), "{out} {err}");
+    assert!(!out.contains("\nUsername for"), "{out} {err}");
 
     // (a) ~/.git-credentials must not exist.
     {
@@ -286,7 +359,7 @@ async fn sandbox_image_credential_pipeline_smoke() {
         );
     }
 
-    // (c) /run/temps-git exists with mode 0750, owner temps-git:git-users.
+    // (c) /run/temps-git exists with mode 2750, owner temps-git:git-users.
     {
         let (out, _, _) = exec_in_container(
             &docker,
@@ -296,7 +369,7 @@ async fn sandbox_image_credential_pipeline_smoke() {
         )
         .await;
         assert!(
-            out.trim().starts_with("750 temps-git git-users"),
+            out.trim().starts_with("2750 temps-git git-users"),
             "/run/temps-git stat unexpected: {out:?}"
         );
     }
@@ -523,5 +596,39 @@ chmod 0600 /etc/temps/credential-daemon.env",
             out.contains("temps-git"),
             "credential daemon process not running, ps output: {out:?}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_container_is_removed_before_image_on_success_and_failure() {
+    use temps_docker_capture::{FakeDocker, Method};
+
+    for fail in [false, true] {
+        let fake = FakeDocker::start().await.expect("fake Docker");
+        fake.respond(Method::DELETE, "/containers/", 204, serde_json::Value::Null);
+        fake.respond(Method::DELETE, "/images/", 200, serde_json::json!([]));
+        let docker = fake.docker();
+        let result = tokio::task::spawn_blocking(move || {
+            let _image = ImageGuard {
+                docker: docker.clone(),
+                tag: "test-owned-image".into(),
+            };
+            let _container = ContainerGuard {
+                docker: &docker,
+                id: "test-owned-container",
+            };
+            assert!(!fail, "simulate failure after container creation");
+        })
+        .await;
+        assert_eq!(result.is_err(), fail);
+        let calls = fake.calls();
+        let deletes: Vec<_> = calls
+            .iter()
+            .filter(|call| call.method == "DELETE")
+            .collect();
+        assert_eq!(deletes.len(), 2, "{calls:?}");
+        assert_eq!(deletes[0].path, "/containers/test-owned-container");
+        assert_eq!(deletes[1].path, "/images/test-owned-image");
+        assert!(!deletes[1].query.contains("force=true"));
     }
 }

@@ -343,7 +343,9 @@ fn in_sandbox_agents_section() -> String {
 # the terminal handler.
 COPY --from=pty-agent-builder /build/target/release/temps-pty-agent /usr/local/bin/temps-pty-agent
 COPY pty-agent/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh
+COPY pty-agent/vault-git.sh /usr/local/bin/git
+RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh /usr/local/bin/git
+LABEL sh.temps.service-access.protocol="1"
 # In-sandbox git credential pipeline. Read-only mount the binaries to
 # `/usr/local/bin` (root:root, mode 0755 — they hold no secrets, the
 # whole point of the daemon split is that the helper has nothing
@@ -379,6 +381,8 @@ RUN chmod 0755 /usr/local/bin/temps-git-credential-helper /usr/local/bin/temps-g
 # being requested, so per-repo scoping degrades to refusal.
 RUN git config --system credential.helper /usr/local/bin/temps-git-credential-helper \
     && git config --system credential.useHttpPath true
+# Fail immediately when the credential daemon cannot supply credentials.
+ENV GIT_TERMINAL_PROMPT=0
 USER {user}
 WORKDIR {work_dir}
 # The container's CMD is whatever the caller passes (usually `sleep infinity`).

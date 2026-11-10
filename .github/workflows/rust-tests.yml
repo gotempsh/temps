@@ -1121,7 +1121,7 @@ jobs:
             # that crate.
             filter: >-
               ((package(temps-providers*) and not test(/^query::/)) or package(temps-presets) or
-              package(temps-auth) or package(temps-core) or
+              package(temps-auth) or package(temps-core) or package(libsqlite3-sys) or
               package(temps-monitoring) or package(temps-kv) or
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
@@ -1137,7 +1137,7 @@ jobs:
               package(temps-cloud-client) or package(temps-config-handlers) or
               package(temps-credential-checks) or package(temps-edge) or
               package(temps-edge-rules) or package(temps-email-tracking) or
-              package(temps-file-store) or package(temps-flags) or
+              package(temps-file-store) or package(temps-flags) or package(temps-service-access) or package(temps-service-access-runtime) or
               package(temps-log-aggregator) or package(temps-mcp-server) or
               package(temps-memory) or package(temps-observability) or
               package(temps-product-telemetry) or package(temps-project-groups) or
@@ -1221,7 +1221,7 @@ jobs:
               or (kind(=bin) and (package(temps-example-plugin) or
               package(temps-git-credential) or package(temps-google-indexing-plugin) or
               package(temps-indexnow-plugin) or package(temps-lighthouse-plugin) or
-              package(temps-preview-gateway) or package(temps-vm-agent)))
+              package(temps-preview-gateway) or package(temps-pty-agent) or package(temps-vm-agent)))
               or (kind(=example) and package(temps-plugin-sdk))
 
     steps:

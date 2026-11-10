@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-service-access"
+version.workspace = true
+edition.workspace = true
+description = "Project service policies and time-limited sandbox access requests with a fail-closed broker boundary"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+temps-git = { path = "../temps-git" }
+temps-core = { path = "../temps-core" }
+temps-authz = { path = "../temps-authz" }
+temps-entities = { path = "../temps-entities" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
+temps-agent-core = { path = "../temps-agent-core" }
+tokio.workspace = true
+temps-service-access-runtime = { path = "../temps-service-access-runtime" }
+base64.workspace = true
+rcgen.workspace = true
+zeroize.workspace = true
+ed25519-dalek = "2"
+rand08 = { package = "rand", version = "0.8" }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+utoipa.workspace = true
+sea-orm.workspace = true
+async-trait.workspace = true
+url.workspace = true
+# Pin the audited SDK contract while upstream enforcement work continues.
+tokenless-core = { git = "https://github.com/gotempsh/tokenless", rev = "03c94edcd6ec214164863540d7b372dac219b3ac" }
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

@@ -477,6 +477,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::resize_sandbox_disk,
         crate::sandbox_handlers::set_sandbox_egress_policy,
         crate::sandbox_handlers::sandbox_image_identity,
+        crate::sandbox_handlers::service_access::command,
         crate::sandbox_handlers::check_sandbox_agent_runtime,
         crate::sandbox_handlers::recover_sandbox_agent_harness,
         crate::sandbox_handlers::open_sandbox_byte_channel,

@@ -309,6 +309,9 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // control plane, and a create with no usable worker answers the
         // worker-node-required problem.
         || Box::new(SandboxPlugin::new()),
+        // Service grants consume the authenticated SandboxProvider registered
+        // by AgentsPlugin, and initialize delivery after sandbox recovery.
+        || Box::new(temps_service_access::ServiceAccessPlugin::new()),
     ]);
 
     // Structured log collection, storage, search, and streaming. Depends on
@@ -538,6 +541,7 @@ mod tests {
         "deployments",
         "mcp-server",
         "sandbox",
+        "service-access",
         "log-aggregator",
         "import",
         "status-page",
