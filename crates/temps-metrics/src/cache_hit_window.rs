@@ -31,6 +31,10 @@
 //!   not 100%.
 //! * [`PG_CACHE_BLOCKS_ACCESSED`]: `Σ(hit + read)` over the window, the
 //!   volume behind the ratio. The alarm evaluator gates the ratio rule on it.
+//!   An interval counts only while it lies entirely inside the window, so
+//!   the intervals cover the window short of up to one scrape at its start
+//!   (a third of it at the 5-minute maximum); the sum is scaled up to the
+//!   whole window, so the gate means the same rate at any scrape interval.
 //!
 //! Neither is written until the series has been tracked for a whole window.
 //! The windows live in memory: after a Temps restart, an HA failover or an
@@ -135,6 +139,9 @@ struct Series {
 struct WindowSum {
     hits: f64,
     accesses: f64,
+    /// Whole window over the time its intervals cover: `accesses` times this
+    /// is the volume of the whole window.
+    scale: f64,
     /// Whether the intervals cover the whole window, short of at most the
     /// scrape dropped at its start or a tenth of the window, rather than only
     /// the time since it started refilling or since a gap.
@@ -196,9 +203,16 @@ impl Series {
             .intervals
             .front()
             .map_or(window, |first| first.start - cutoff);
+        let covered = (window - uncovered).num_milliseconds();
+        let scale = if covered > 0 {
+            window.num_milliseconds() as f64 / covered as f64
+        } else {
+            1.0
+        };
         Some(WindowSum {
             hits,
             accesses,
+            scale,
             full: self
                 .tracked_since
                 .is_some_and(|since| interval.end - since >= window)
@@ -376,7 +390,11 @@ impl CacheHitWindows {
         if sum.accesses > 0.0 {
             out.push(gauge(template, PG_CACHE_HIT_RATIO, sum.hits / sum.accesses));
         }
-        out.push(gauge(template, PG_CACHE_BLOCKS_ACCESSED, sum.accesses));
+        out.push(gauge(
+            template,
+            PG_CACHE_BLOCKS_ACCESSED,
+            sum.accesses * sum.scale,
+        ));
     }
 
     /// Forget every window of `source_id`, e.g. after an HA failover, when the
@@ -701,11 +719,12 @@ mod tests {
             let out = windows.derive(1, deltas(900.0, 100.0, at(minute), "app"));
             assert!(out.is_empty(), "minute {minute}: {out:?}");
         }
-        // From minute 27 the window starts one scrape before minute 13.
+        // From minute 27 the window starts one scrape before minute 13: 14
+        // minutes of 1,000 accesses, reported for the whole 15.
         let out = windows.derive(1, deltas(900.0, 100.0, at(27), "app"));
         for db in [Some("app"), None] {
             assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), Some(0.9));
-            assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), Some(14_000.0));
+            assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), Some(15_000.0));
         }
     }
 
@@ -745,6 +764,29 @@ mod tests {
         // start is all the slack there is: jitter alone must not exceed it.
         for interval_ms in [120_000, 300_000] {
             assert_jittered_scrapes_keep_the_window_whole(interval_ms, 2_000);
+        }
+    }
+
+    #[test]
+    fn the_volume_covers_the_whole_window_at_any_scrape_interval() {
+        // 10 block accesses a second. At the 5-minute maximum (plus a cycle)
+        // the intervals inside the window cover 610 of its 900 seconds; the
+        // alarm's gate must still see the 15 minutes' 9,000 accesses.
+        for interval_secs in [30, 305] {
+            let mut windows = CacheHitWindows::default();
+            let mut last = Vec::new();
+            for scrape in 0..=(1_800 / interval_secs) {
+                let time = at(0) + Duration::seconds(scrape * interval_secs);
+                let blocks = 10.0 * interval_secs as f64;
+                last = windows.derive(1, deltas(blocks * 0.9, blocks * 0.1, time, "app"));
+            }
+            let volume = value(&last, PG_CACHE_BLOCKS_ACCESSED, None).unwrap();
+            assert!(
+                (volume - 9_000.0).abs() < 1e-6,
+                "{interval_secs} s: {volume}"
+            );
+            let ratio = value(&last, PG_CACHE_HIT_RATIO, None).unwrap();
+            assert!((ratio - 0.9).abs() < 1e-12, "{interval_secs} s: {ratio}");
         }
     }
 

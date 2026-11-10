@@ -1476,9 +1476,10 @@ mod tests {
         }
 
         // At minute 16 the window holds minutes 2 to 16. Minute 2's skewed
-        // 9,900 / 1,100 is left out; minutes 3 to 16 are 10,000 / 10,000 each.
+        // 9,900 / 1,100 is left out; minutes 3 to 16 are 10,000 / 10,000 each,
+        // 280,000 accesses over 14 minutes, reported for the whole 15.
         assert_eq!(served(&last, "pg.cache_hit_ratio"), Some(0.5));
-        assert_eq!(served(&last, "pg.cache_blocks_accessed"), Some(280_000.0));
+        assert_eq!(served(&last, "pg.cache_blocks_accessed"), Some(300_000.0));
         assert!(
             last.iter().all(|p| p.name != "pg.stats_reset"),
             "never persisted"
