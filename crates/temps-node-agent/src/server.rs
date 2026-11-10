@@ -338,8 +338,8 @@ fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState
             post(crate::service_data_handlers::postgres_walg_restore),
         )
         .route(
-            "/agent/services/postgres/walg-restore/outcome",
-            post(crate::service_data_handlers::postgres_walg_restore_outcome),
+            "/agent/services/restore/outcome",
+            post(crate::service_data_handlers::worker_restore_outcome),
         )
         .route(
             "/agent/services/postgres/walg-archive",
@@ -2102,7 +2102,7 @@ pub(crate) mod tests {
             "/agent/services/wal-health",
             "/agent/services/data-backup",
             "/agent/services/data-restore",
-            "/agent/services/postgres/walg-restore/outcome",
+            "/agent/services/restore/outcome",
             "/agent/services/mariadb/physical-backup",
             "/agent/services/mariadb/dump-backup",
             "/agent/services/mariadb/restore",
@@ -2142,18 +2142,18 @@ pub(crate) mod tests {
     /// restarted) is reported as unknown, not as running or failed: the
     /// control plane must not guess its outcome.
     #[tokio::test]
-    async fn a_walg_restore_outcome_the_node_never_recorded_is_unknown() {
+    async fn a_restore_outcome_the_node_never_recorded_is_unknown() {
         use axum::http::StatusCode;
         use temps_core::sealed_request::NodeSealing;
         use tower::ServiceExt;
         let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
         let token = test_agent_config(false).token;
-        let path = "/agent/services/postgres/walg-restore/outcome";
+        let path = "/agent/services/restore/outcome";
         let sealed = NodeSealing::Key(public)
             .seal(
                 "test-node",
                 path,
-                br#"{"service":"orders","operation_id":"restore-run-404"}"#,
+                br#"{"engine":"mongodb","service":"orders","operation_id":"restore-run-404"}"#,
             )
             .unwrap();
         let response = sealed_test_app(Some(private))

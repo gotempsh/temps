@@ -17,8 +17,8 @@
 //! recovery anywhere.
 
 use temps_providers::externalsvc::RestoreCapabilities;
-use temps_providers::remote_service_client::MongodbRestoreResult;
-use tracing::{info, warn};
+use temps_providers::remote_service_client::WorkerRestoreEngine;
+use tracing::info;
 
 use super::*;
 
@@ -150,7 +150,7 @@ pub(super) async fn run(
     // A node already running its maximum of backups and restores is waited
     // for, visibly and cancellably, instead of failing the run.
     // A try after a wait gets a credential minted after it.
-    let outcome = crate::node_busy::retry_while_node_busy_with_fresh_credential(
+    let answered = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
         destination,
         || super::worker_read_destination(db, scoper, run_id, backup, target.id, node_id, &[]),
@@ -160,32 +160,22 @@ pub(super) async fn run(
                 origin_password.clone(),
                 destination,
                 backup.s3_location.clone(),
+                Some(super::worker_outcome::operation_id(run_id)),
             )
         },
         |wait| super::wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
     )
-    .await?
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id} on node {node_id}: {e}"),
-    })?;
-    match outcome {
-        MongodbRestoreResult::Completed => {}
-        MongodbRestoreResult::Refused { reason } => {
-            return Err(RestoreError::Validation {
-                message: format!("restore run {run_id} on node {node_id} was refused: {reason}"),
-            })
-        }
-        MongodbRestoreResult::Failed { reason } => {
-            return Err(RestoreError::ExternalService {
-                reason: format!("restore run {run_id} on node {node_id}: {reason}"),
-            })
-        }
+    .await?;
+    super::worker_outcome::WorkerRestoreRun {
+        db,
+        run_id,
+        node_id,
+        target_id: target.id,
+        engine: WorkerRestoreEngine::Mongodb,
+        reconcile: origin_credentials.as_ref().map(|origin| (enc, origin)),
     }
-    reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
-    if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
-        warn!("Restore run {run_id}: recording the verify phase failed: {e}");
-    }
-    Ok(None)
+    .finish(mgr, answered)
+    .await
 }
 
 #[cfg(test)]

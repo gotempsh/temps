@@ -15,8 +15,8 @@
 use temps_providers::externalsvc::redis::{
     classify_redis_backup_location, RedisBackupLocationKind,
 };
-use temps_providers::remote_service_client::RedisRestoreResult;
-use tracing::{info, warn};
+use temps_providers::remote_service_client::WorkerRestoreEngine;
+use tracing::info;
 
 use super::*;
 
@@ -148,7 +148,7 @@ pub(super) async fn run(
     // A node already running its maximum of backups and restores is waited
     // for, visibly and cancellably, instead of failing the run.
     // A try after a wait gets a credential minted after it.
-    let outcome = crate::node_busy::retry_while_node_busy_with_fresh_credential(
+    let answered = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
         source,
         || super::worker_read_destination(db, scoper, run_id, backup, target.id, node_id, &[]),
@@ -158,31 +158,22 @@ pub(super) async fn run(
                 source,
                 backup.s3_location.clone(),
                 keep_bookkeeping,
+                Some(super::worker_outcome::operation_id(run_id)),
             )
         },
         |wait| super::wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
     )
-    .await?
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id} on node {node_id}: {e}"),
-    })?;
-    match outcome {
-        RedisRestoreResult::Completed => {}
-        RedisRestoreResult::Refused { reason } => {
-            return Err(RestoreError::Validation {
-                message: format!("restore run {run_id} on node {node_id} was refused: {reason}"),
-            })
-        }
-        RedisRestoreResult::Failed { reason } => {
-            return Err(RestoreError::ExternalService {
-                reason: format!("restore run {run_id} on node {node_id}: {reason}"),
-            })
-        }
+    .await?;
+    super::worker_outcome::WorkerRestoreRun {
+        db,
+        run_id,
+        node_id,
+        target_id: target.id,
+        engine: WorkerRestoreEngine::Redis,
+        reconcile: None,
     }
-    if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
-        warn!("Restore run {run_id}: recording the verify phase failed: {e}");
-    }
-    Ok(None)
+    .finish(mgr, answered)
+    .await
 }
 
 #[cfg(test)]

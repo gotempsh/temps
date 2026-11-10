@@ -162,6 +162,7 @@ pub enum RestoreError {
 
 mod worker_mariadb;
 mod worker_mongodb;
+mod worker_outcome;
 mod worker_redis;
 mod worker_walg;
 

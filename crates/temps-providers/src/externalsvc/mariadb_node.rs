@@ -737,6 +737,7 @@ pub async fn restore_on_node(
         location,
         recovery_target,
         target_user_data,
+        operation_id: _,
     } = request;
     let refused = |reason: String| MariadbRestoreResult::Refused {
         reason: format!(

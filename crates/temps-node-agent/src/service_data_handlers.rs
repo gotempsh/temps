@@ -24,11 +24,11 @@ use temps_service_protocol::{
     MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
     PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
-    PostgresWalgRestoreOutcomeRequest, PostgresWalgRestoreProgress, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult,
-    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
-    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
-    RemoteServiceRestoreResponse, TargetWriteBoundary,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest,
+    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
+    RedisWalgBackupResult, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, TargetWriteBoundary,
+    WorkerRestoreEngine, WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
 };
 use tokio::sync::Semaphore;
 
@@ -655,13 +655,12 @@ pub async fn postgres_walg_restore(
     let engine_writes = Arc::clone(&writes);
     // A restore named by its caller keeps its outcome after this request
     // ends: the caller asks for it when its request timed out or dropped.
-    let recorder = request.operation_id.as_deref().map(|operation_id| {
-        crate::restore_outcomes::POSTGRES_WALG_RESTORES.track(
-            &service,
-            operation_id,
-            Arc::clone(&writes),
-        )
-    });
+    let recorder = crate::restore_outcomes::WORKER_RESTORES.track_named(
+        WorkerRestoreEngine::PostgresWalg,
+        &service,
+        request.operation_id.as_deref(),
+        &writes,
+    );
     let engine_state = Arc::clone(&state);
     let engine_service = service.clone();
     let outcome = match run_detached(permit, Some(writes), async move {
@@ -684,16 +683,7 @@ pub async fn postgres_walg_restore(
             reroute_recreated_postgres(&engine_state, &engine_docker, &engine_service).await;
         }
         if let Some(recorder) = recorder {
-            let progress = match &result {
-                Ok(outcome) => PostgresWalgRestoreProgress::Finished {
-                    outcome: outcome.clone(),
-                },
-                Err(error) => PostgresWalgRestoreProgress::Ended {
-                    writes_began: recorder.writes_began(),
-                    reason: error.to_string(),
-                },
-            };
-            recorder.finish(progress);
+            recorder.finish_with(&result);
         }
         result
     })
@@ -734,32 +724,36 @@ pub async fn postgres_walg_restore(
     AgentResponse::ok(outcome).into_response()
 }
 
-/// `POST /agent/services/postgres/walg-restore/outcome`: where the WAL-G
-/// restore of a service started with an `operation_id` is: still running
-/// (and whether it began writing), its outcome, or that it ended without
-/// one. `unknown` when this node has no such restore (it never received it,
-/// or the agent restarted since). Read-only.
+/// `POST /agent/services/restore/outcome`: where the worker restore (WAL-G,
+/// MongoDB, Redis or MariaDB) of a service started with an `operation_id`
+/// is: still running (and whether it began writing), its outcome, or that it
+/// ended without one. `unknown` when this node has no such restore (it never
+/// received it, or the agent restarted since). Read-only.
 #[utoipa::path(
     tag = "Services",
     post,
-    path = "/agent/services/postgres/walg-restore/outcome",
-    request_body = PostgresWalgRestoreOutcomeRequest,
+    path = "/agent/services/restore/outcome",
+    request_body = WorkerRestoreOutcomeRequest,
     responses(
-        (status = 200, description = "Where the restore is", body = AgentResponse<PostgresWalgRestoreProgress>),
+        (status = 200, description = "Where the restore is", body = AgentResponse<WorkerRestoreProgress>),
         (status = 401, description = "Unauthorized")
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn postgres_walg_restore_outcome(
-    Json(request): Json<PostgresWalgRestoreOutcomeRequest>,
+pub async fn worker_restore_outcome(
+    Json(request): Json<WorkerRestoreOutcomeRequest>,
 ) -> axum::response::Response {
-    let progress = crate::restore_outcomes::POSTGRES_WALG_RESTORES
-        .progress(&request.service, &request.operation_id);
+    let progress = crate::restore_outcomes::WORKER_RESTORES.progress(
+        request.engine,
+        &request.service,
+        &request.operation_id,
+    );
     tracing::debug!(
+        engine = ?request.engine,
         service = %request.service,
         operation_id = %request.operation_id,
         ?progress,
-        "WAL-G restore outcome asked for"
+        "Worker restore outcome asked for"
     );
     AgentResponse::ok(progress).into_response()
 }
@@ -896,10 +890,22 @@ pub async fn mongodb_restore(
     let engine_docker = Arc::new(docker.clone());
     let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
     let engine_writes = Arc::clone(&writes);
+    // A restore named by its caller keeps its outcome after this request
+    // ends: the caller asks for it when its request timed out or dropped.
+    let recorder = crate::restore_outcomes::WORKER_RESTORES.track_named(
+        WorkerRestoreEngine::Mongodb,
+        &service,
+        request.operation_id.as_deref(),
+        &writes,
+    );
     let outcome = match run_detached(permit, Some(writes), async move {
-        runtime
+        let result = runtime
             .mongodb_restore(request, engine_docker, published_address, engine_writes)
-            .await
+            .await;
+        if let Some(recorder) = recorder {
+            recorder.finish_with(&result);
+        }
+        result
     })
     .await
     {
@@ -1152,16 +1158,30 @@ pub async fn redis_restore(
     // let finish or put the original back, whatever the deadline.
     let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
     let engine_writes = Arc::clone(&writes);
+    let engine_service = service.clone();
     let outcome = match run_redis_operation(
         &state,
         &service,
         "restore",
         LABEL,
         Some(writes),
-        |runtime, docker| async move {
-            runtime
-                .redis_restore(request, docker, engine_writes)
-                .await
+        |runtime, docker| {
+            // Called once admitted: a restore named by its caller keeps its
+            // outcome after this request ends, for a caller whose request
+            // timed out or dropped.
+            let recorder = crate::restore_outcomes::WORKER_RESTORES.track_named(
+                WorkerRestoreEngine::Redis,
+                &engine_service,
+                request.operation_id.as_deref(),
+                &engine_writes,
+            );
+            async move {
+                let result = runtime.redis_restore(request, docker, engine_writes).await;
+                if let Some(recorder) = recorder {
+                    recorder.finish_with(&result);
+                }
+                result
+            }
         },
     )
     .await

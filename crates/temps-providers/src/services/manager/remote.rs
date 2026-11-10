@@ -995,65 +995,74 @@ impl ExternalServiceManager {
                 operation_id,
             })
             .await?;
-        self.republish_after_walg_restore(service_id, node_id, &result)
-            .await;
+        self.republish_after_worker_restore(
+            service_id,
+            node_id,
+            crate::remote_service_client::WorkerRestoreEngine::PostgresWalg,
+            &result.clone().into(),
+        )
+        .await;
         Ok(result)
     }
 
-    /// Where the WAL-G restore of worker PostgreSQL `service_id` started
+    /// Where the `engine` restore of worker service `service_id` started
     /// with `operation_id` is on its node, for a restore whose own request
-    /// went unanswered. A finished restore that recreated the container
-    /// republishes its DNS record, as an answered one does.
-    pub async fn walg_restore_worker_postgres_outcome(
+    /// went unanswered. A finished restore that recreated or restarted the
+    /// container republishes its DNS record, as an answered one does.
+    pub async fn worker_restore_outcome(
         &self,
         service_id: i32,
+        engine: crate::remote_service_client::WorkerRestoreEngine,
         operation_id: &str,
-    ) -> Result<crate::remote_service_client::PostgresWalgRestoreProgress, ExternalServiceError>
-    {
+    ) -> Result<crate::remote_service_client::WorkerRestoreProgress, ExternalServiceError> {
         let (node_id, live_service_config) = self
-            .worker_service_target(service_id, "WAL-G restore outcome")
+            .worker_service_target(service_id, "restore outcome")
             .await?;
         let progress = self
             .get_remote_client(node_id)
             .await?
-            .postgres_walg_restore_outcome(
-                &crate::remote_service_client::PostgresWalgRestoreOutcomeRequest {
-                    service: live_service_config.name,
-                    operation_id: operation_id.to_string(),
-                },
-            )
+            .worker_restore_outcome(&crate::remote_service_client::WorkerRestoreOutcomeRequest {
+                engine,
+                service: live_service_config.name,
+                operation_id: operation_id.to_string(),
+            })
             .await?;
-        if let crate::remote_service_client::PostgresWalgRestoreProgress::Finished { outcome } =
-            &progress
+        if let crate::remote_service_client::WorkerRestoreProgress::Finished { outcome } = &progress
         {
-            self.republish_after_walg_restore(service_id, node_id, outcome)
+            self.republish_after_worker_restore(service_id, node_id, engine, outcome)
                 .await;
         }
         Ok(progress)
     }
 
-    /// The restored server, or the original put back, runs in a recreated
-    /// container with a new address on the node's networks; a refused
-    /// restore changed nothing.
-    async fn republish_after_walg_restore(
+    /// A WAL-G restore runs the restored server (or the original put back)
+    /// in a recreated container, and a MariaDB restore stops and starts its
+    /// container; either may come back with a new address on the node's
+    /// networks. A refused restore changed nothing; MongoDB and Redis
+    /// restores keep their container.
+    async fn republish_after_worker_restore(
         &self,
         service_id: i32,
         node_id: i32,
-        result: &crate::remote_service_client::PostgresWalgRestoreResult,
+        engine: crate::remote_service_client::WorkerRestoreEngine,
+        result: &crate::remote_service_client::WorkerRestoreResult,
     ) {
-        if matches!(
-            result,
-            crate::remote_service_client::PostgresWalgRestoreResult::Refused { .. }
-        ) {
+        use crate::remote_service_client::{WorkerRestoreEngine, WorkerRestoreResult};
+        if matches!(result, WorkerRestoreResult::Refused { .. }) {
             return;
         }
+        let engine = match engine {
+            WorkerRestoreEngine::PostgresWalg => "PostgreSQL WAL-G",
+            WorkerRestoreEngine::Mariadb => "MariaDB",
+            WorkerRestoreEngine::Mongodb | WorkerRestoreEngine::Redis => return,
+        };
         if let Err(error) = self.register_standalone_service_dns(service_id).await {
             warn!(
                 service_id,
                 node_id,
                 error = %error,
-                "PostgreSQL was recreated on its node by a WAL-G restore, but its internal \
-                 DNS record could not be republished"
+                "{engine} restore recreated or restarted the service's container on its node, \
+                 but its internal DNS record could not be republished"
             );
         }
     }
@@ -1091,13 +1100,15 @@ impl ExternalServiceManager {
     /// place from `location` in `source`, with the control plane's own
     /// restore run by the node's agent. `origin_password` is the backup
     /// origin's password for another service's backup, the provider's
-    /// fallback login as on the control plane.
+    /// fallback login as on the control plane. With `operation_id` the node
+    /// keeps the outcome for [`Self::worker_restore_outcome`].
     pub async fn mongodb_restore_worker(
         &self,
         service_id: i32,
         origin_password: Option<String>,
         source: crate::remote_service_client::WorkerS3Destination,
         location: String,
+        operation_id: Option<String>,
     ) -> Result<crate::remote_service_client::MongodbRestoreResult, ExternalServiceError> {
         let (node_id, service_config) = self
             .worker_service_target(service_id, "MongoDB restore")
@@ -1111,6 +1122,7 @@ impl ExternalServiceManager {
                 origin_password,
                 source,
                 location,
+                operation_id,
             })
             .await
     }
@@ -1168,13 +1180,16 @@ impl ExternalServiceManager {
     /// Restore Redis service `service_id`, which runs on a worker node, in
     /// place from `location` in `source`, with the provider's own restore run
     /// by the node's agent. `keep_target_bookkeeping` keeps the service's own
-    /// `_temps:*` keys over the backup's (a backup of another service).
+    /// `_temps:*` keys over the backup's (a backup of another service). With
+    /// `operation_id` the node keeps the outcome for
+    /// [`Self::worker_restore_outcome`].
     pub async fn restore_worker_redis(
         &self,
         service_id: i32,
         source: crate::remote_service_client::WorkerS3Destination,
         location: String,
         keep_target_bookkeeping: bool,
+        operation_id: Option<String>,
     ) -> Result<crate::remote_service_client::RedisRestoreResult, ExternalServiceError> {
         let (node_id, service_config) = self
             .worker_service_target(service_id, "Redis restore")
@@ -1188,6 +1203,7 @@ impl ExternalServiceManager {
                 source,
                 location,
                 keep_target_bookkeeping,
+                operation_id,
             })
             .await
     }
@@ -1277,7 +1293,8 @@ impl ExternalServiceManager {
     /// place or to `recovery_target`, from `location` in `source`, with the
     /// control plane's own restore run by the node's agent. `restored_login`
     /// is the login the restored data answers to (the backup origin's, for a
-    /// physical backup of another service).
+    /// physical backup of another service). With `operation_id` the node
+    /// keeps the outcome for [`Self::worker_restore_outcome`].
     #[allow(
         clippy::too_many_arguments,
         reason = "the restore's inputs, as the agent request"
@@ -1291,6 +1308,7 @@ impl ExternalServiceManager {
         location: String,
         recovery_target: Option<crate::remote_service_client::RecoveryTarget>,
         target_user_data: Option<String>,
+        operation_id: Option<String>,
     ) -> Result<crate::remote_service_client::MariadbRestoreResult, ExternalServiceError> {
         let (node_id, mut service_config) = self
             .worker_mariadb_target(service_id, "restore", source.endpoint.as_deref())
@@ -1314,24 +1332,16 @@ impl ExternalServiceManager {
                 location,
                 recovery_target,
                 target_user_data,
+                operation_id,
             })
             .await?;
-        // The restore stops and starts the container, which may come back
-        // with another address on the node's networks.
-        if !matches!(
-            result,
-            crate::remote_service_client::MariadbRestoreResult::Refused { .. }
-        ) {
-            if let Err(error) = self.register_standalone_service_dns(service_id).await {
-                warn!(
-                    service_id,
-                    node_id,
-                    error = %error,
-                    "MariaDB was restarted on its node by a restore, but its internal DNS \
-                     record could not be republished"
-                );
-            }
-        }
+        self.republish_after_worker_restore(
+            service_id,
+            node_id,
+            crate::remote_service_client::WorkerRestoreEngine::Mariadb,
+            &result.clone().into(),
+        )
+        .await;
         Ok(result)
     }
 

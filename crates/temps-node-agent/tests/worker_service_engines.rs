@@ -2953,6 +2953,7 @@ async fn mongo_restore(
         origin_password,
         source: held_by.destination(),
         location: location.to_string(),
+        operation_id: Some("restore-run-9".to_string()),
     };
     match path {
         MongoPath::Agent => {
@@ -2987,7 +2988,22 @@ async fn mongo_restore(
             })
             .await;
             assert_eq!(status, 200, "the agent did not run the restore: {body}");
-            match serde_json::from_value(body["data"].clone()).expect("a MongoDB restore result") {
+            let outcome: MongodbRestoreResult =
+                serde_json::from_value(body["data"].clone()).expect("a MongoDB restore result");
+            // The node kept the outcome, for a control plane whose request
+            // went unanswered.
+            assert_eq!(
+                recorded_restore_outcome(
+                    temps_service_protocol::WorkerRestoreEngine::Mongodb,
+                    &request.service_config.name,
+                    "restore-run-9",
+                )
+                .await,
+                temps_service_protocol::WorkerRestoreProgress::Finished {
+                    outcome: outcome.clone().into()
+                }
+            );
+            match outcome {
                 MongodbRestoreResult::Completed => Ok(()),
                 MongodbRestoreResult::Failed { reason } => Err(reason),
                 MongodbRestoreResult::Refused { reason } => {
@@ -3683,6 +3699,7 @@ async fn a_worker_redis_is_backed_up_and_restored_by_the_control_plane_engine_th
         source,
         location,
         keep_target_bookkeeping: keep,
+        operation_id: Some("restore-run-9".to_string()),
     };
     for (location, reached_at) in [
         (repository.clone(), in_network.clone()),
@@ -3699,6 +3716,20 @@ async fn a_worker_redis_is_backed_up_and_restored_by_the_control_plane_engine_th
         )
         .await;
         assert_eq!(outcome, RedisRestoreResult::Completed, "{location}");
+        // The node kept the outcome, for a control plane whose request went
+        // unanswered.
+        assert_eq!(
+            recorded_restore_outcome(
+                temps_service_protocol::WorkerRestoreEngine::Redis,
+                &config.name,
+                "restore-run-9",
+            )
+            .await,
+            temps_service_protocol::WorkerRestoreProgress::Finished {
+                outcome: temps_service_protocol::WorkerRestoreResult::Completed
+            },
+            "{location}"
+        );
         wait_redis(&docker, &container, &password).await;
         assert_eq!(cli(&["GET", "proof"]).await, "before-backup", "{location}");
         assert_eq!(cli(&["EXISTS", "added-after"]).await, "0", "{location}");
@@ -4039,6 +4070,28 @@ async fn mariadb_now(
 /// running its two data operations answers 429; the control plane waits for
 /// a slot and asks again, and so does this, since the other proofs in this
 /// process share the node's slots.
+/// What the agent's outcome route reports for the `engine` restore of
+/// `service` started as `operation_id`.
+async fn recorded_restore_outcome(
+    engine: temps_service_protocol::WorkerRestoreEngine,
+    service: &str,
+    operation_id: &str,
+) -> temps_service_protocol::WorkerRestoreProgress {
+    let response = temps_node_agent::service_data_handlers::worker_restore_outcome(Json(
+        temps_service_protocol::WorkerRestoreOutcomeRequest {
+            engine,
+            service: service.to_string(),
+            operation_id: operation_id.to_string(),
+        },
+    ))
+    .await;
+    let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .expect("the outcome body");
+    let body: Value = serde_json::from_slice(&body).expect("a JSON outcome");
+    serde_json::from_value(body["data"].clone()).expect("a restore progress")
+}
+
 async fn mariadb_outcome<T, F, Fut>(call: F, what: &str) -> T
 where
     T: serde::de::DeserializeOwned,
@@ -4469,6 +4522,7 @@ async fn a_worker_mariadb_is_backed_up_restored_and_recovered_by_the_control_pla
                 location,
                 recovery_target,
                 target_user_data: None,
+                operation_id: Some("restore-run-8".to_string()),
             }
         }
     };
@@ -4487,6 +4541,19 @@ async fn a_worker_mariadb_is_backed_up_restored_and_recovered_by_the_control_pla
     assert_eq!(
         run_restore(restore(&repository, None).await).await,
         MariadbRestoreResult::Completed
+    );
+    // The node kept the outcome, for a control plane whose request went
+    // unanswered.
+    assert_eq!(
+        recorded_restore_outcome(
+            temps_service_protocol::WorkerRestoreEngine::Mariadb,
+            &fixture.config.name,
+            "restore-run-8",
+        )
+        .await,
+        temps_service_protocol::WorkerRestoreProgress::Finished {
+            outcome: temps_service_protocol::WorkerRestoreResult::Completed
+        }
     );
     assert_eq!(mariadb_rows(docker, container, root).await, "base");
     assert!(

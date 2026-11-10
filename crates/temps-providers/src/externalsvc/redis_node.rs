@@ -567,6 +567,7 @@ pub async fn restore_on_node(
         source,
         location,
         keep_target_bookkeeping: keep,
+        operation_id: _,
     } = request;
     let service = service_config.name.clone();
     let refused = |reason: String| RedisRestoreResult::Refused {
@@ -863,6 +864,7 @@ mod tests {
                     source: destination(),
                     location: location.to_string(),
                     keep_target_bookkeeping: false,
+                    operation_id: None,
                 },
                 docker(),
                 Arc::clone(&writes),

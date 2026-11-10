@@ -972,6 +972,7 @@ mod tests {
                 origin_password: None,
                 source: destination,
                 location: "s3://elsewhere/walg".to_string(),
+                operation_id: None,
             },
             docker,
             None,
@@ -1003,6 +1004,7 @@ mod tests {
                 session_token: None,
             },
             location: "k".to_string(),
+            operation_id: None,
         };
         let engine = request.engine_config();
         assert_eq!(engine.parameters["password"], "target");

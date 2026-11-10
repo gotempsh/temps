@@ -26,7 +26,7 @@ use temps_service_protocol::{
     MariadbBinlogArchiveRequest, MariadbBinlogArchiveResult, MariadbDumpBackupRequest,
     MariadbDumpBackupResult, MariadbPhysicalBackupRequest, MariadbPhysicalBackupResult,
     MariadbRestoreRequest, MariadbRestoreResult, NodeServiceError, NodeServiceRuntime,
-    TargetWriteBoundary,
+    TargetWriteBoundary, WorkerRestoreEngine,
 };
 
 use crate::handlers::{error_response, AgentResponse, AgentState};
@@ -252,15 +252,41 @@ pub async fn mariadb_restore(
     );
     let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
     let engine_writes = Arc::clone(&writes);
+    let engine_state = Arc::clone(&state);
+    let engine_service = service.clone();
     let outcome = match run_on_node(
         &state,
         "restore",
         &service,
         Some(writes),
-        move |runtime, docker, published| async move {
-            runtime
-                .mariadb_restore(request, docker, published, engine_writes)
-                .await
+        move |runtime, docker, published| {
+            // Called once admitted: a restore named by its caller keeps its
+            // outcome after this request ends, for a caller whose request
+            // timed out or dropped.
+            let recorder = crate::restore_outcomes::WORKER_RESTORES.track_named(
+                WorkerRestoreEngine::Mariadb,
+                &engine_service,
+                request.operation_id.as_deref(),
+                &engine_writes,
+            );
+            async move {
+                let result = runtime
+                    .mariadb_restore(request, docker, published, engine_writes)
+                    .await;
+                // Here, not after the request: a restarted container (the
+                // restored one, or the original started again) is routed
+                // even when nobody waits for the answer any more.
+                if matches!(
+                    result,
+                    Ok(MariadbRestoreResult::Completed | MariadbRestoreResult::Failed { .. })
+                ) {
+                    reroute_restarted_mariadb(&engine_state, &engine_service).await;
+                }
+                if let Some(recorder) = recorder {
+                    recorder.finish_with(&result);
+                }
+                result
+            }
         },
     )
     .await
@@ -268,9 +294,9 @@ pub async fn mariadb_restore(
         Ok(outcome) => outcome,
         Err(response) => return *response,
     };
+    // The engine's task routed a restarted container before it returned.
     match &outcome {
         MariadbRestoreResult::Completed => {
-            reroute_restarted_mariadb(&state, &service).await;
             tracing::info!(service = %service, "MariaDB restore completed");
         }
         MariadbRestoreResult::Refused { reason } => {
@@ -278,7 +304,6 @@ pub async fn mariadb_restore(
         }
         MariadbRestoreResult::Failed { reason } => {
             // The original was started again, or the reason says otherwise.
-            reroute_restarted_mariadb(&state, &service).await;
             tracing::error!(service = %service, %reason, "MariaDB restore failed");
         }
     }

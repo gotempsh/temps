@@ -23,13 +23,14 @@ pub use temps_service_protocol::{
     MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
     PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
-    PostgresWalgRestoreOutcomeRequest, PostgresWalgRestoreProgress, PostgresWalgRestoreRequest,
-    PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest, RedisRdbBackupResult,
-    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
-    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
-    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
-    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest,
+    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
+    RedisWalgBackupResult, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
+    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, RemoteServiceBackupRequest,
+    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteWalHealthRequest, RemoteWalHealthResponse, ServiceContainerRuntime,
+    ServiceContainerStats, WorkerRestoreEngine, WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
+    WorkerRestoreResult, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -584,16 +585,17 @@ impl RemoteServiceClient {
         .await
     }
 
-    /// Where a WAL-G restore started with an `operation_id` is on its node:
-    /// still running, finished with an outcome, or ended without one. Asked
-    /// when the restore's own request went unanswered, so the run it belongs
-    /// to is completed from what the node actually did.
-    pub async fn postgres_walg_restore_outcome(
+    /// Where a worker restore (WAL-G, MongoDB, Redis or MariaDB) started
+    /// with an `operation_id` is on its node: still running, finished with
+    /// an outcome, or ended without one. Asked when the restore's own
+    /// request went unanswered, so the run it belongs to is completed from
+    /// what the node actually did.
+    pub async fn worker_restore_outcome(
         &self,
-        request: &PostgresWalgRestoreOutcomeRequest,
-    ) -> Result<PostgresWalgRestoreProgress, ExternalServiceError> {
+        request: &WorkerRestoreOutcomeRequest,
+    ) -> Result<WorkerRestoreProgress, ExternalServiceError> {
         self.agent_post_with_timeout(
-            "/agent/services/postgres/walg-restore/outcome",
+            "/agent/services/restore/outcome",
             request,
             RESTORE_OUTCOME_TIMEOUT,
         )
@@ -2293,6 +2295,7 @@ mod tests {
             origin_password: Some("origin-password".to_string()),
             source: worker_destination(),
             location: "s3://backups/walg".to_string(),
+            operation_id: None,
         };
         assert_eq!(
             client(address)
@@ -2425,6 +2428,7 @@ mod tests {
             source: worker_destination(),
             location: "s3://bucket/external_services/redis/other/walg".to_string(),
             keep_target_bookkeeping: true,
+            operation_id: None,
         };
         assert_eq!(
             client(address)
@@ -2606,6 +2610,7 @@ mod tests {
                     time: "2026-11-08T10:00:00Z".parse().unwrap(),
                 }),
                 target_user_data: None,
+                operation_id: None,
             })
             .await
             .unwrap();
@@ -2895,11 +2900,9 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_walg_restore_is_told_apart_and_its_outcome_asked_for() {
         async fn outcome(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
-            let request: PostgresWalgRestoreOutcomeRequest = open_for_test(
-                &headers,
-                "/agent/services/postgres/walg-restore/outcome",
-                &sealed,
-            );
+            let request: WorkerRestoreOutcomeRequest =
+                open_for_test(&headers, "/agent/services/restore/outcome", &sealed);
+            assert_eq!(request.engine, WorkerRestoreEngine::PostgresWalg);
             assert_eq!(request.service, "orders");
             assert_eq!(request.operation_id, "restore-run-5");
             Json(serde_json::json!({
@@ -2923,10 +2926,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route(
-                    "/agent/services/postgres/walg-restore/outcome",
-                    post(outcome),
-                ),
+                Router::new().route("/agent/services/restore/outcome", post(outcome)),
             )
             .await
             .unwrap();
@@ -2974,7 +2974,8 @@ mod tests {
             listener.local_addr().unwrap()
         };
         let error = client(closed)
-            .postgres_walg_restore_outcome(&PostgresWalgRestoreOutcomeRequest {
+            .worker_restore_outcome(&WorkerRestoreOutcomeRequest {
+                engine: WorkerRestoreEngine::PostgresWalg,
                 service: "orders".to_string(),
                 operation_id: "restore-run-5".to_string(),
             })
@@ -2985,7 +2986,8 @@ mod tests {
             "{error:?}"
         );
         let progress = client(answering)
-            .postgres_walg_restore_outcome(&PostgresWalgRestoreOutcomeRequest {
+            .worker_restore_outcome(&WorkerRestoreOutcomeRequest {
+                engine: WorkerRestoreEngine::PostgresWalg,
                 service: "orders".to_string(),
                 operation_id: "restore-run-5".to_string(),
             })
@@ -2994,7 +2996,7 @@ mod tests {
         server.abort();
         assert_eq!(
             progress,
-            PostgresWalgRestoreProgress::Running { writes_began: true }
+            WorkerRestoreProgress::Running { writes_began: true }
         );
     }
 

@@ -123,6 +123,14 @@ pub struct MariadbRestoreRequest {
     /// the latest.
     #[serde(default)]
     pub target_user_data: Option<String>,
+    /// The caller's name for this restore (the control plane's restore run).
+    /// With one, the node keeps the restore's outcome after the request
+    /// ends, so a caller whose request timed out or lost its connection can
+    /// ask for it ([`crate::WorkerRestoreOutcomeRequest`]) instead of guessing: a
+    /// restore that began writing outlives its deadline until it has
+    /// started the restored data or put the original back.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// What a [`MariadbRestoreRequest`] did.

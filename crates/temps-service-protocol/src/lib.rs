@@ -653,9 +653,9 @@ pub struct PostgresWalgRestoreRequest {
     /// The caller's name for this restore (the control plane's restore run).
     /// With one, the node keeps the restore's outcome after the request
     /// ends, so a caller whose request timed out or lost its connection can
-    /// ask for it ([`PostgresWalgRestoreOutcomeRequest`]) instead of
-    /// guessing: a restore that began writing outlives its deadline until it
-    /// has started the restored data or put the original back.
+    /// ask for it ([`WorkerRestoreOutcomeRequest`]) instead of guessing: a
+    /// restore that began writing outlives its deadline until it has
+    /// started the restored data or put the original back.
     #[serde(default)]
     pub operation_id: Option<String>,
 }
@@ -674,30 +674,91 @@ pub enum PostgresWalgRestoreResult {
     Failed { reason: String },
 }
 
-/// `POST /agent/services/postgres/walg-restore/outcome`: what became of the
-/// WAL-G restore of service `service` started with `operation_id`.
+/// The engine a worker restore ran, which names its outcome record on the
+/// node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRestoreEngine {
+    PostgresWalg,
+    Mongodb,
+    Redis,
+    Mariadb,
+}
+
+impl WorkerRestoreEngine {
+    /// The engine's name in messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PostgresWalg => "PostgreSQL WAL-G restore",
+            Self::Mongodb => "MongoDB restore",
+            Self::Redis => "Redis restore",
+            Self::Mariadb => "MariaDB restore",
+        }
+    }
+}
+
+/// `POST /agent/services/restore/outcome`: what became of the `engine`
+/// restore of service `service` started with `operation_id`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PostgresWalgRestoreOutcomeRequest {
-    /// The service's name on the node (its live configuration's `name`).
+pub struct WorkerRestoreOutcomeRequest {
+    pub engine: WorkerRestoreEngine,
+    /// The service's name on the node (its configuration's `name`).
     pub service: String,
-    /// The [`PostgresWalgRestoreRequest::operation_id`] it was started with.
+    /// The `operation_id` the restore request was started with.
     pub operation_id: String,
 }
 
-/// Where a WAL-G restore started with an `operation_id` is.
+/// What a worker restore did, whatever its engine: each engine's result
+/// ([`PostgresWalgRestoreResult`], [`MongodbRestoreResult`],
+/// [`RedisRestoreResult`], [`MariadbRestoreResult`]) has these three
+/// outcomes and converts into it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkerRestoreResult {
+    /// The restored data is live.
+    Completed,
+    /// Nothing was changed: the request cannot run on this service.
+    Refused { reason: String },
+    /// The restore failed. The original is running again unless the reason
+    /// says otherwise.
+    Failed { reason: String },
+}
+
+macro_rules! into_worker_restore_result {
+    ($($result:ident),* $(,)?) => {$(
+        impl From<$result> for WorkerRestoreResult {
+            fn from(result: $result) -> Self {
+                match result {
+                    $result::Completed => Self::Completed,
+                    $result::Refused { reason } => Self::Refused { reason },
+                    $result::Failed { reason } => Self::Failed { reason },
+                }
+            }
+        }
+    )*};
+}
+
+into_worker_restore_result!(
+    PostgresWalgRestoreResult,
+    MongodbRestoreResult,
+    RedisRestoreResult,
+    MariadbRestoreResult,
+);
+
+/// Where a worker restore started with an `operation_id` is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub enum PostgresWalgRestoreProgress {
-    /// Still running. Once `writes_began`, the server was stopped and its
-    /// data moved aside: the restore runs until it has started the restored
+pub enum WorkerRestoreProgress {
+    /// Still running. Once `writes_began`, the service was stopped or is
+    /// being written: the restore runs until it has started the restored
     /// data or put the original back, whatever the deadline.
     Running { writes_began: bool },
     /// The engine ended with this outcome.
-    Finished { outcome: PostgresWalgRestoreResult },
+    Finished { outcome: WorkerRestoreResult },
     /// The engine ended without an outcome (it could not run, passed its
     /// deadline, or stopped unexpectedly). With `writes_began` false the
-    /// service was never stopped and nothing was changed.
+    /// service was never changed.
     Ended { writes_began: bool, reason: String },
     /// The node has no restore of this service under this id: it never
     /// received it, or its agent restarted since.
@@ -794,6 +855,14 @@ pub struct MongodbRestoreRequest {
     /// The backup: a WAL-G repository `s3://<source's bucket>/…`, or a
     /// mongodump archive's key in the source's bucket.
     pub location: String,
+    /// The caller's name for this restore (the control plane's restore run).
+    /// With one, the node keeps the restore's outcome after the request
+    /// ends, so a caller whose request timed out or lost its connection can
+    /// ask for it ([`WorkerRestoreOutcomeRequest`]) instead of guessing: a
+    /// restore that began writing outlives its deadline until it has
+    /// started the restored data or put the original back.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 impl std::fmt::Debug for MongodbRestoreRequest {
@@ -808,6 +877,7 @@ impl std::fmt::Debug for MongodbRestoreRequest {
             )
             .field("source", &self.source)
             .field("location", &self.location)
+            .field("operation_id", &self.operation_id)
             .finish()
     }
 }
@@ -927,6 +997,14 @@ pub struct RedisRestoreRequest {
     /// project owns which logical database) are put back to the target's
     /// after the restore instead of taking the backup's.
     pub keep_target_bookkeeping: bool,
+    /// The caller's name for this restore (the control plane's restore run).
+    /// With one, the node keeps the restore's outcome after the request
+    /// ends, so a caller whose request timed out or lost its connection can
+    /// ask for it ([`WorkerRestoreOutcomeRequest`]) instead of guessing: a
+    /// restore that began writing outlives its deadline until it has
+    /// started the restored data or put the original back.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// What a [`RedisRestoreRequest`] did.
@@ -1413,6 +1491,7 @@ mod tests {
                 session_token: Some("token-secret".to_string()),
             },
             location: "fleet/external_services/mongodb/orders/walg".to_string(),
+            operation_id: Some("restore-run-3".to_string()),
         };
         let printed = format!("{request:?}");
         for secret in [
