@@ -56,7 +56,11 @@
 //! scrape leaves the counter baselines alone, so the first delta after an
 //! outage covers the whole outage. When that is longer than the window, the
 //! delta cannot honestly be called "the last 15 minutes": the series reports
-//! nothing until the window holds intervals again. A configured scrape
+//! nothing until the window holds intervals again. A shorter gap's delta
+//! counts while it lies inside the window; once it leaves, the rest covers
+//! only the minutes since the gap, and the series reports nothing until the
+//! window is whole again (minutes, not 15, would read as a nearly idle
+//! database to the alarm's volume gate). A configured scrape
 //! interval could cause the same on every scrape, so it is capped at
 //! `temps_config::MAX_SCRAPE_INTERVAL_SECS` (5 minutes): rejected above that
 //! when the settings are saved, and clamped with a warning by the scraper for
@@ -128,8 +132,9 @@ struct Series {
 struct WindowSum {
     hits: f64,
     accesses: f64,
-    /// Whether the intervals cover the whole window, rather than only the
-    /// time since it started refilling.
+    /// Whether the intervals cover the whole window, short of at most one
+    /// scrape interval at its start, rather than only the time since it
+    /// started refilling or since a gap.
     full: bool,
 }
 
@@ -168,12 +173,22 @@ impl Series {
         let (hits, accesses) = self.intervals.iter().fold((0.0, 0.0), |(hits, total), i| {
             (hits + i.hit, total + i.hit + i.read)
         });
+        // The interval that straddled the cutoff was dropped, so the window
+        // normally begins up to one scrape after its start. After a gap
+        // shorter than the window, the dropped one is the gap's long interval
+        // and the rest may cover only the minutes since: whole again once the
+        // uncovered start is no longer than the current scrape interval.
+        let uncovered = self
+            .intervals
+            .front()
+            .map_or(window, |first| first.start - cutoff);
         Some(WindowSum {
             hits,
             accesses,
             full: self
                 .tracked_since
-                .is_some_and(|since| interval.end - since >= window),
+                .is_some_and(|since| interval.end - since >= window)
+                && uncovered <= interval.end - interval.start,
         })
     }
 }
@@ -644,9 +659,40 @@ mod tests {
         let out = windows.derive(1, deltas(1_000.0, 0.0, at(15), "app"));
         assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.5));
         // At minute 16 the window starts after minute 0, so the long interval
-        // is no longer entirely inside it.
+        // is no longer entirely inside it, and what is left covers minutes 10
+        // to 16: not the window.
         let out = windows.derive(1, deltas(1_000.0, 0.0, at(16), "app"));
-        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(1.0));
+        assert!(
+            out.is_empty(),
+            "minutes 10 to 16 are not the window: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_left_with_only_the_minutes_after_a_gap_is_not_whole() {
+        // A database doing 1,000 block accesses a minute, then unreachable
+        // for 13 minutes: the first scrape after it carries the whole gap.
+        let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
+        windows.derive(1, deltas(900.0, 100.0, at(0), "app"));
+        windows.derive(1, deltas(11_700.0, 1_300.0, at(13), "app"));
+        windows.derive(1, deltas(900.0, 100.0, at(14), "app"));
+        // The gap's interval still lies inside the window: whole.
+        let out = windows.derive(1, deltas(900.0, 100.0, at(15), "app"));
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(15_000.0));
+
+        // Once it leaves, the window holds minutes 13 to 16, then 13 to 26:
+        // a fraction of the volume, which the alarm would read as idle.
+        for minute in 16..27 {
+            let out = windows.derive(1, deltas(900.0, 100.0, at(minute), "app"));
+            assert!(out.is_empty(), "minute {minute}: {out:?}");
+        }
+        // From minute 27 the window starts one scrape before minute 13.
+        let out = windows.derive(1, deltas(900.0, 100.0, at(27), "app"));
+        for db in [Some("app"), None] {
+            assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), Some(0.9));
+            assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), Some(14_000.0));
+        }
     }
 
     #[test]
