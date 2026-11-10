@@ -156,6 +156,20 @@ pub async fn create_access_session_general(
                     .detail("GitHub service has no credential source project")
                     .build()
             })?;
+            // GitHub grants retain the source project's worker authorization,
+            // including when coverage comes from a direct sandbox link.
+            project_permission_guard!(
+                auth,
+                ProjectsWrite,
+                source_project,
+                &state.project_access_checker
+            );
+            project_permission_guard!(
+                auth,
+                SandboxesWrite,
+                source_project,
+                &state.project_access_checker
+            );
             project_permission_guard!(
                 auth,
                 GitRepositoriesRead,

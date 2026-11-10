@@ -63,7 +63,11 @@ the vault, service, source project and proposed consumer. Apply the same checks
 when adding a service to an already linked vault or changing its GitHub source;
 otherwise editing a service would bypass link-time validation. Recheck the Git
 permissions against the source project at approval and during reconciliation,
-along with connection validity and repository scope. A moved sandbox loses
+along with connection validity and repository scope. Both approval and worker
+enforcement require source-project `ProjectsWrite`, `SandboxesWrite` and
+`GitRepositoriesRead`, even for a direct sandbox link; approval also requires
+instance `GitConnectionsRead`. A narrowed project role is rejected before any
+consent is issued, instead of accepting access that the worker cannot enforce. A moved sandbox loses
 eligibility. Projectless sandboxes can use ordinary credentials but cannot use
 these project-scoped GitHub credentials.
 
