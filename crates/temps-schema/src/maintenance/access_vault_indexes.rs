@@ -143,7 +143,7 @@ pub(crate) async fn prepare_consumer_constraints(
                     reason: error.to_string(),
                 })?;
         connection.close_on_drop();
-        for setting in ["SET lock_timeout='5s'", "SET statement_timeout='600s'"] {
+        for setting in ["SET lock_timeout=0", "SET statement_timeout='600s'"] {
             sqlx::query(setting)
                 .execute(&mut *connection)
                 .await
@@ -156,6 +156,14 @@ pub(crate) async fn prepare_consumer_constraints(
         sqlx::query("SELECT pg_advisory_lock(hashtext(current_database()),hashtext(current_schema() || ':vault_consumer_indexes'))").execute(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
             index: "sandbox_consumer_constraints", operation: "lock preparation of", reason: error.to_string(),
         })?;
+        sqlx::query("SET lock_timeout='5s'")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| SchemaError::VaultIndex {
+                index: "sandbox_consumer_constraints",
+                operation: "bound table lock wait for",
+                reason: error.to_string(),
+            })?;
         for &(name, table) in temps_migrations::GENERAL_VAULT_CONSUMER_INDEXES {
             let exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident($1)) IS NOT NULL")
                 .bind(table).fetch_one(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
@@ -189,6 +197,48 @@ pub(crate) async fn prepare_consumer_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_waits_for_another_upgrader_beyond_table_lock_timeout() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping preparation lock test: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::new().await.unwrap();
+        let db = test.connection_arc();
+        let mut holder = db.get_postgres_connection_pool().acquire().await.unwrap();
+        let lock_sql = "SELECT pg_advisory_lock(hashtext(current_database()),hashtext(current_schema() || ':vault_consumer_indexes'))";
+        sqlx::query(lock_sql).execute(&mut *holder).await.unwrap();
+        let waiting_db = db.clone();
+        let waiter = tokio::spawn(async move { prepare_consumer_constraints(&waiting_db).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
+                    .fetch_one(&mut *holder).await.unwrap();
+                if waiting { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        let was_waiting = !waiter.is_finished();
+        sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(holder);
+        test.cleanup().await;
+        assert!(
+            was_waiting,
+            "a healthy concurrent upgrade must not fail after five seconds"
+        );
+        result.unwrap();
+    }
 
     #[tokio::test]
     async fn retained_history_indexes_build_after_migration_and_are_idempotent() {
