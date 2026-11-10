@@ -840,19 +840,7 @@ impl AlertEvaluator {
                 }
             };
 
-            // Deduplicate metric names for this source. A rule whose metric
-            // has a volume gate also needs the gating metric, fetched in the
-            // same query so gating costs no extra round trip.
-            let names: Vec<String> = group
-                .iter()
-                .flat_map(|r| {
-                    std::iter::once(r.metric_name.as_str())
-                        .chain(default_volume_gate(r).map(|g| g.metric_name))
-                })
-                .map(str::to_string)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
+            let names = latest_metric_names(group);
 
             let source_key = (source_kind_str.clone(), *source_id);
             let latest = match self
@@ -1393,6 +1381,23 @@ fn default_volume_gate(rule: &monitoring_alert_rules::Model) -> Option<VolumeGat
                 && seed.comparator == rule.comparator
         })
         .then_some(gate)
+}
+
+/// The deduplicated metric names a source group's rules read, fetched in one
+/// `query_latest` call. A rule over a metric with a volume gate also needs
+/// the gating metric, edited rules included: they are not gated, but zero
+/// volume is what resolves their alarm once the ratio is gone.
+fn latest_metric_names(group: &[&monitoring_alert_rules::Model]) -> Vec<String> {
+    group
+        .iter()
+        .flat_map(|r| {
+            std::iter::once(r.metric_name.as_str())
+                .chain(volume_gate(&r.metric_name).map(|g| g.metric_name))
+        })
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Whether `latest` carries enough volume for a rule over `metric_name` to be
@@ -2816,6 +2821,35 @@ mod tests {
         assert!(
             idle_cache_hit_window_resolves(rule).await,
             "an idle window must resolve an edited cache hit ratio alarm"
+        );
+    }
+
+    /// The idle resolution above needs the volume in `latest`, which holds
+    /// only the names the cycle asks the store for.
+    #[test]
+    fn an_edited_cache_hit_rule_fetches_its_volume_metric() {
+        let seeded = low_cache_hit_ratio_rule();
+        let edited = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        for rule in [&seeded, &edited] {
+            let mut names = latest_metric_names(&[rule]);
+            names.sort();
+            assert_eq!(
+                names,
+                ["pg.cache_blocks_accessed", "pg.cache_hit_ratio"],
+                "threshold {}",
+                rule.threshold
+            );
+        }
+        let ungated = monitoring_alert_rules::Model {
+            metric_name: "pg.connections_active".into(),
+            ..make_rule(Some(1), None)
+        };
+        assert_eq!(
+            latest_metric_names(&[&ungated, &ungated]),
+            ["pg.connections_active"]
         );
     }
 
