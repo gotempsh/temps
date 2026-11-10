@@ -9,6 +9,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
+  canRedeployAnyInPlace,
   environmentsToRedeploy,
   redeployCurrentDeployments,
   redeploySummary,
@@ -16,7 +17,7 @@ import {
   type ServiceLinkChange,
 } from '@/lib/service-link-redeploy'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Info, Loader2, RefreshCw, X } from 'lucide-react'
+import { Info, Loader2, RefreshCw, Upload, X } from 'lucide-react'
 import { Link } from 'react-router'
 import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
 import { useProjectDeploy } from './project-deploy-context'
@@ -86,9 +87,31 @@ export function ServiceLinkRedeployPrompt({
   const targets = environmentsToRedeploy(environments.data).filter(
     (environment) => !startedIds.includes(environment.id)
   )
+  // Whether the running deployments can be redeployed by the console, from
+  // each one's own source. Unknown until read, and treated as yes if it cannot
+  // be read, so the action is never withheld on a failed lookup.
+  const running = environmentsToRedeploy(environments.data)
+  const redeployability = useQuery({
+    queryKey: [
+      'service-link-redeployability',
+      project.id,
+      project.source_type,
+      running.map((e) => `${e.id}:${e.current_deployment_id}`),
+    ],
+    queryFn: () =>
+      canRedeployAnyInPlace(project.id, project.source_type, running),
+    enabled: change != null && environments.isSuccess && running.length > 0,
+  })
   if (!change || (environments.isSuccess && targets.length === 0)) return null
 
-  const { title, description } = serviceLinkRedeployMessage(change, targets)
+  // An uploaded archive cannot be rebuilt by the console, so the action opens
+  // the upload instead of promising a redeploy that would be declined.
+  const redeployable = redeployability.data ?? true
+  const { title, description } = serviceLinkRedeployMessage(
+    change,
+    targets,
+    redeployable
+  )
   const firstTarget = defaultDeployEnvironment(targets)
   const reviewRedeploy = (environmentId: number | undefined) => {
     deployDialog?.openDeploy({
@@ -139,13 +162,20 @@ export function ServiceLinkRedeployPrompt({
                 key={environment.id}
                 size="sm"
                 variant={environment === firstTarget ? 'default' : 'outline'}
+                disabled={redeployability.isPending}
                 onClick={() => reviewRedeploy(environment.id)}
               >
-                <RefreshCw className="size-3.5" />
-                Redeploy {environment.name}
+                {redeployable ? (
+                  <RefreshCw className="size-3.5" />
+                ) : (
+                  <Upload className="size-3.5" />
+                )}
+                {redeployable
+                  ? `Redeploy ${environment.name}`
+                  : `Upload source again for ${environment.name}`}
               </Button>
             ))
-          ) : (
+          ) : redeployable || deployDialog ? (
             <Button
               size="sm"
               onClick={() =>
@@ -153,16 +183,22 @@ export function ServiceLinkRedeployPrompt({
                   ? reviewRedeploy(firstTarget?.id)
                   : redeploy.mutate()
               }
-              disabled={redeploy.isPending || !environments.isSuccess}
+              disabled={
+                redeploy.isPending ||
+                !environments.isSuccess ||
+                redeployability.isPending
+              }
             >
               {redeploy.isPending ? (
                 <Loader2 className="size-3.5 animate-spin" />
-              ) : (
+              ) : redeployable ? (
                 <RefreshCw className="size-3.5" />
+              ) : (
+                <Upload className="size-3.5" />
               )}
-              Redeploy now
+              {redeployable ? 'Redeploy now' : 'Upload source again'}
             </Button>
-          )}
+          ) : null}
           <Button size="sm" variant="outline" asChild>
             <Link to={`/projects/${project.slug}/deployments`}>
               View deployments

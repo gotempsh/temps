@@ -3,13 +3,19 @@
 
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse, EnvironmentResponse } from '@/api/client'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { installBrowserWindow } from '@/test/dom'
 import {
+  canRedeployAnyInPlace,
   environmentsToRedeploy,
   redeployCurrentDeployments,
   redeploySummary,
   serviceLinkRedeployMessage,
+  toastRedeployAfterLinkChange,
   type RedeployApi,
 } from './service-link-redeploy'
+
+installBrowserWindow()
 
 const env = (
   id: number,
@@ -205,5 +211,174 @@ describe('redeploySummary', () => {
       ]).message
     ).toBe('Redeploying 2 environments')
     expect(redeploySummary([]).message).toBe('Nothing to redeploy')
+  })
+})
+
+describe('canRedeployAnyInPlace', () => {
+  const apiFor = (
+    deployments: Record<number, DeploymentResponse | 'fail'>
+  ): Pick<RedeployApi, 'getDeployment'> =>
+    ({
+      getDeployment: async ({ path }: { path: { deployment_id: number } }) => {
+        const found = deployments[path.deployment_id]
+        if (found === 'fail' || found === undefined) throw new Error('boom')
+        return { data: found }
+      },
+    }) as unknown as Pick<RedeployApi, 'getDeployment'>
+
+  test('a manual project running an image can still be redeployed', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, { metadata: { externalImageRef: 'app:1' } }),
+    })
+    expect(
+      await canRedeployAnyInPlace(7, 'manual', [env(3, 'production', 31)], api)
+    ).toBe(true)
+  })
+
+  test('a manual project running a Git ref can still be redeployed', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, { branch: 'main', commit_hash: 'abc123' }),
+    })
+    expect(
+      await canRedeployAnyInPlace(7, 'manual', [env(3, 'production', 31)], api)
+    ).toBe(true)
+  })
+
+  test('an uploaded archive cannot be redeployed in place', async () => {
+    const api = apiFor({ 31: deployment(31, 3, {}) })
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31)],
+        api
+      )
+    ).toBe(false)
+  })
+
+  test('a Git project whose live deployment is an uploaded archive cannot', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, {
+        metadata: { deploymentSourceType: 'uploaded_source' },
+      }),
+    })
+    expect(
+      await canRedeployAnyInPlace(7, 'git', [env(3, 'production', 31)], api)
+    ).toBe(false)
+  })
+
+  test('one redeployable environment is enough to offer the action', async () => {
+    const api = apiFor({
+      31: deployment(31, 3, {}),
+      41: deployment(41, 4, { metadata: { externalImageRef: 'app:2' } }),
+    })
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31), env(4, 'staging', 41)],
+        api
+      )
+    ).toBe(true)
+  })
+
+  test('a deployment that cannot be read does not withhold the action', async () => {
+    const api = apiFor({ 31: 'fail' })
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31)],
+        api
+      )
+    ).toBe(true)
+  })
+
+  test('nothing to decide is not a reason to withhold it', async () => {
+    expect(
+      await canRedeployAnyInPlace(7, 'uploaded_source', [], apiFor({}))
+    ).toBe(true)
+  })
+})
+
+describe('serviceLinkRedeployMessage for a source that cannot be redeployed', () => {
+  test('says to upload the source again instead of offering a redeploy', () => {
+    const { description } = serviceLinkRedeployMessage(
+      { kind: 'linked', serviceName: 'synthetic-db' },
+      [{ name: 'production' }],
+      false
+    )
+    expect(description).toContain('Upload the source again')
+    expect(description).not.toContain('Redeploy production')
+  })
+})
+
+describe('toastRedeployAfterLinkChange', () => {
+  const change = { kind: 'linked', serviceName: 'synthetic-db' } as const
+  const notifier = () => {
+    const info: { title: string; options: Record<string, unknown> }[] = []
+    return {
+      info,
+      notify: {
+        info: (title: string, options: Record<string, unknown>) =>
+          info.push({ title, options }),
+        success: () => {},
+        warning: () => {},
+        error: () => {},
+      },
+    }
+  }
+
+  test('an uploaded source gets a notice without a Redeploy action', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(deployment(31, 3, {})),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      { id: 7, name: 'synthetic-api', source_type: 'uploaded_source' },
+      change,
+      notify as never
+    )
+    expect(info).toHaveLength(1)
+    expect(info[0].options.action).toBeUndefined()
+    expect(info[0].options.description).toContain('Upload the source again')
+    api.restore()
+  })
+
+  test('a Git project still gets the Redeploy now action', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      { id: 7, name: 'synthetic-api', source_type: 'git' },
+      change,
+      notify as never
+    )
+    expect(info[0].options.action).toMatchObject({ label: 'Redeploy now' })
+    api.restore()
+  })
+
+  test('a manual project running an image still gets the Redeploy now action', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(
+          deployment(31, 3, { metadata: { externalImageRef: 'app:1' } })
+        ),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      { id: 7, name: 'synthetic-api', source_type: 'manual' },
+      change,
+      notify as never
+    )
+    expect(info[0].options.action).toMatchObject({ label: 'Redeploy now' })
+    api.restore()
   })
 })

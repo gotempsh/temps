@@ -79,5 +79,14 @@ describe('variableChangeRedeployMessage', () => {
 
   test('still says when it applies when nothing is running', () => {
     expect(variableChangeRedeployMessage([])).toBe('Applies on next deploy.')
+    expect(variableChangeRedeployMessage([], false)).toBe(
+      'Applies on next deploy.'
+    )
+  })
+
+  test('says to upload the source again when it cannot be redeployed in place', () => {
+    expect(variableChangeRedeployMessage([{ name: 'production' }], false)).toBe(
+      'Applies on next deploy. Upload the source again to apply it now.'
+    )
   })
 })

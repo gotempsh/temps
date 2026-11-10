@@ -45,10 +45,15 @@ export function environmentsToRedeploy(
   )
 }
 
-/** The prompt shown after a link change, e.g. "Postgres was linked. …". */
+/**
+ * The prompt shown after a link change, e.g. "Postgres was linked. …". When
+ * the project cannot be redeployed in place, it says to upload the source
+ * again instead of offering a redeploy that would be declined.
+ */
 export function serviceLinkRedeployMessage(
   change: ServiceLinkChange,
-  environments: Pick<EnvironmentResponse, 'name'>[]
+  environments: Pick<EnvironmentResponse, 'name'>[],
+  redeployable = true
 ): { title: string; description: string } {
   const verb = change.kind === 'linked' ? 'linked' : 'unlinked'
   const effect =
@@ -59,9 +64,11 @@ export function serviceLinkRedeployMessage(
   const where =
     names.length === 0
       ? ''
-      : names.length === 1
-        ? ` Redeploy ${names[0]} to apply the change now.`
-        : ` Redeploy ${names.length} environments (${names.join(', ')}) to apply the change now.`
+      : !redeployable
+        ? ' Upload the source again to apply the change now.'
+        : names.length === 1
+          ? ` Redeploy ${names[0]} to apply the change now.`
+          : ` Redeploy ${names.length} environments (${names.join(', ')}) to apply the change now.`
   return {
     title: `${change.serviceName} was ${verb}`,
     description: `${effect}${where}`,
@@ -144,6 +151,50 @@ export async function redeployDeployment(
         ? 'it was deployed from an uploaded archive; upload it again'
         : 'it has no reusable source to rebuild from'
   }
+}
+
+/**
+ * Whether the console can start a redeploy for at least one of `environments`.
+ *
+ * Decided from each environment's current deployment, the way the redeploy
+ * itself decides ({@link deploymentRedeployPlan}), not from the project's
+ * source type: a project's type is its primary source, not a restriction, so a
+ * manual project can run an image or a Git ref, and a Git project can hold an
+ * uploaded archive. Only a deployment whose own source is an uploaded archive
+ * (or a manual or external one with nothing to rebuild from) has to be
+ * uploaded again.
+ *
+ * When a deployment cannot be read, or there is nothing to decide, this says
+ * yes: the redeploy itself reports why an environment was skipped, and
+ * withholding the action on a failed read would regress working projects.
+ */
+export async function canRedeployAnyInPlace(
+  projectId: number,
+  projectSourceType: SourceType,
+  environments: EnvironmentResponse[],
+  api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi
+): Promise<boolean> {
+  if (environments.length === 0) return true
+  const verdicts = await Promise.all(
+    environments.map(async (environment) => {
+      try {
+        const { data: deployment } = await api.getDeployment({
+          path: {
+            project_id: projectId,
+            deployment_id: environment.current_deployment_id as number,
+          },
+          throwOnError: true,
+        })
+        return (
+          deploymentRedeployPlan(deployment, projectSourceType).kind !==
+          'unsupported'
+        )
+      } catch {
+        return true
+      }
+    })
+  )
+  return verdicts.some(Boolean)
 }
 
 /**
@@ -247,7 +298,7 @@ export async function toastRedeployAfterLinkChange(
       options: {
         description: string
         duration: number
-        action: { label: string; onClick: () => void }
+        action?: { label: string; onClick: () => void }
       }
     ) => void
     success: (message: string) => void
@@ -266,7 +317,25 @@ export async function toastRedeployAfterLinkChange(
   }
   const targets = environmentsToRedeploy(environments)
   if (targets.length === 0) return
-  const { description } = serviceLinkRedeployMessage(change, targets)
+  const redeployable = await canRedeployAnyInPlace(
+    project.id,
+    project.source_type,
+    targets
+  )
+  const { description } = serviceLinkRedeployMessage(
+    change,
+    targets,
+    redeployable
+  )
+  if (!redeployable) {
+    // Nothing the toast could start: the source has to be uploaded again from
+    // the project, so it only says so.
+    notify.info(`${project.name}: upload the source to apply`, {
+      description,
+      duration: 20_000,
+    })
+    return
+  }
   const completed = new Set<number>()
   notify.info(`${project.name}: redeploy to apply`, {
     description,

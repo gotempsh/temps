@@ -33,20 +33,44 @@ const environment = (id: number, slug: string, deployment: number) => ({
   branch: slug === 'production' ? 'main' : slug,
 })
 
+/** What each environment's live deployment was made from. */
+type Made = 'git' | 'image' | 'archive'
+const deploymentOf = (id: number, made: Made) => ({
+  id,
+  ...(made === 'git' ? { branch: 'main', commit_hash: 'abc123' } : {}),
+  ...(made === 'image' ? { metadata: { externalImageRef: 'app:1' } } : {}),
+})
+
 /** Two deployed environments; records every request the prompt sends. */
-function serveEnvironments() {
+function serveEnvironments(made: Made = 'git') {
   return mockApi({
     'GET /projects/7/environments': () =>
       jsonResponse([
         environment(4, 'staging', 41),
         environment(3, 'production', 31),
       ]),
+    'GET /projects/7/deployments/41': () =>
+      jsonResponse(deploymentOf(41, made)),
+    'GET /projects/7/deployments/31': () =>
+      jsonResponse(deploymentOf(31, made)),
   })
+}
+
+/** Resolves once the named button exists and is no longer held back. */
+async function enabledButton(
+  view: ReturnType<typeof renderPrompt>,
+  name: RegExp
+) {
+  const button = (await view.findByRole('button', {
+    name,
+  })) as HTMLButtonElement
+  await waitFor(() => expect(button.disabled).toBe(false))
+  return button
 }
 
 function renderPrompt(
   wrap: (children: ReactNode) => ReactNode = (c) => c,
-  sourceType: 'git' | 'uploaded_source' = project.source_type
+  sourceType: 'git' | 'uploaded_source' | 'manual' = project.source_type
 ) {
   return render(
     <QueryClientProvider
@@ -83,15 +107,10 @@ test('on a project page, each environment gets its own deploy dialog, in turn', 
     </ProjectDeployContext.Provider>
   ))
 
-  fireEvent.click(
-    await view.findByRole('button', { name: /Redeploy production/ })
-  )
+  fireEvent.click(await enabledButton(view, /Redeploy production/))
   expect(opened[0].environmentId).toBe(3)
   // Nothing is deployed until the user confirms in the dialog.
   expect(api.calls.filter((call) => call.method !== 'GET')).toEqual([])
-  expect(api.calls.map((call) => call.path)).not.toContain(
-    '/projects/7/deployments/31'
-  )
 
   // Confirming stays here, because staging still needs its redeploy.
   act(() => opened[0].onStarted?.(3))
@@ -105,7 +124,7 @@ test('on a project page, each environment gets its own deploy dialog, in turn', 
 })
 
 test('every environment waiting goes with the deploy, so an upload can carry on with them', async () => {
-  serveEnvironments()
+  serveEnvironments('archive')
   const opened: OpenDeployOptions[] = []
   const view = renderPrompt(
     (children) => (
@@ -118,14 +137,29 @@ test('every environment waiting goes with the deploy, so an upload can carry on 
     'uploaded_source'
   )
 
-  fireEvent.click(await view.findByRole('button', { name: /Redeploy staging/ }))
+  // An uploaded archive cannot be rebuilt, so the action says it is an upload.
+  fireEvent.click(await enabledButton(view, /Upload source again for staging/))
+  expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
   expect(opened[0].environmentId).toBe(4)
   expect(opened[0].pendingEnvironmentIds).toEqual([4, 3])
 
   // Only the last environment left: nothing to carry on with.
   act(() => opened[0].onStarted?.(4))
-  fireEvent.click(view.getByRole('button', { name: /Redeploy now/ }))
+  fireEvent.click(view.getByRole('button', { name: /Upload source again/ }))
   expect(opened[1].pendingEnvironmentIds).toBeUndefined()
+})
+
+test('outside a project page, an uploaded source gets no redeploy that would be declined', async () => {
+  const api = serveEnvironments('archive')
+  const view = renderPrompt(undefined, 'uploaded_source')
+
+  await view.findByText(/Upload the source again to apply the change now/)
+  expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
+  expect(view.queryByRole('button', { name: /Upload source again/ })).toBeNull()
+  // The links that remain still work.
+  expect(view.getByRole('link', { name: 'View deployments' })).toBeTruthy()
+  // Reading the live deployments decided this; nothing was started.
+  expect(api.calls.filter((call) => call.method !== 'GET')).toEqual([])
 })
 
 test('outside a project page, Redeploy now still redeploys what is running', async () => {
@@ -144,4 +178,14 @@ test('outside a project page, Redeploy now still redeploys what is running', asy
       '/projects/7/deployments/31'
     )
   )
+})
+
+test('a manual project running an image keeps its Redeploy action', async () => {
+  serveEnvironments('image')
+  const view = renderPrompt(undefined, 'manual')
+
+  const button = await enabledButton(view, /Redeploy now/)
+  expect(button).toBeTruthy()
+  expect(view.queryByText(/Upload the source again/)).toBeNull()
+  expect(view.queryByRole('button', { name: /Upload source again/ })).toBeNull()
 })

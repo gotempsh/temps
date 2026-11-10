@@ -38,9 +38,13 @@ export function combinedScope(
 
 /** Toast body after a change, e.g. "Applies on next deploy. Redeploy production to apply it now." */
 export function variableChangeRedeployMessage(
-  targets: Pick<EnvironmentResponse, 'name'>[]
+  targets: Pick<EnvironmentResponse, 'name'>[],
+  redeployable = true
 ): string {
   const names = targets.map((environment) => environment.name)
+  if (!redeployable && names.length > 0) {
+    return 'Applies on next deploy. Upload the source again to apply it now.'
+  }
   const where =
     names.length === 1
       ? ` Redeploy ${names[0]} to apply it now.`

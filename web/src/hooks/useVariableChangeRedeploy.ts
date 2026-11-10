@@ -8,6 +8,7 @@ import {
   getProjectDeploymentsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
+  canRedeployAnyInPlace,
   redeployCurrentDeployments,
   redeploySummary,
 } from '@/lib/service-link-redeploy'
@@ -51,6 +52,18 @@ export function useVariableChangeRedeploy(
       if (targets.length === 0) {
         // Nothing running uses it yet; the first deployment picks it up.
         toast.success(title)
+        return
+      }
+      if (
+        !(await canRedeployAnyInPlace(project.id, project.source_type, targets))
+      ) {
+        // Every running deployment was uploaded as an archive, which the
+        // console cannot rebuild: offering "Redeploy" would end in a refusal,
+        // so say what to do instead.
+        toast.success(title, {
+          description: variableChangeRedeployMessage(targets, false),
+          duration: PROMPT_DURATION_MS,
+        })
         return
       }
       const completed = new Set<number>()
