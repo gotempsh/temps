@@ -1575,49 +1575,14 @@ mod tests {
     }
 }
 
-/// The worker path end to end against real containers: a service on the
-/// shared network, a RustFS bucket as the destination. Skips without Docker.
+/// The worker dump path against a real Docker daemon. Skips without Docker.
 #[cfg(test)]
 #[cfg(feature = "docker-tests")]
 mod docker_tests {
     use super::*;
-    use bollard::models::{NetworkCreateRequest, PortBinding};
-    use bollard::query_parameters::{CreateImageOptionsBuilder, InspectNetworkOptions};
-    use std::collections::HashMap;
-    use std::io::Read;
+    use bollard::query_parameters::CreateImageOptionsBuilder;
 
-    const RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0";
-    const RUSTFS_KEY: &str = "rustfsadmin";
-    const BUCKET: &str = "worker-backups";
-
-    /// Everything a test created, removed at the end; nothing else is touched.
-    struct Created {
-        docker: Arc<Docker>,
-        containers: Vec<String>,
-        network: Option<String>,
-    }
-
-    impl Created {
-        async fn cleanup(self) {
-            for container in &self.containers {
-                let _ = self
-                    .docker
-                    .remove_container(
-                        container,
-                        Some(
-                            RemoveContainerOptionsBuilder::new()
-                                .force(true)
-                                .v(true)
-                                .build(),
-                        ),
-                    )
-                    .await;
-            }
-            if let Some(network) = &self.network {
-                let _ = self.docker.remove_network(network).await;
-            }
-        }
-    }
+    const MONGO_IMAGE: &str = "mongo:7.0";
 
     async fn docker_or_skip() -> Option<Arc<Docker>> {
         let docker = Docker::connect_with_local_defaults().ok()?;
@@ -1643,175 +1608,21 @@ mod docker_tests {
         true
     }
 
-    async fn ensure_network(docker: &Docker, created: &mut Created) {
-        let name = temps_core::NETWORK_NAME.as_str();
-        if docker
-            .inspect_network(name, None::<InspectNetworkOptions>)
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        docker
-            .create_network(NetworkCreateRequest {
-                name: name.to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        created.network = Some(name.to_string());
-    }
-
-    async fn run(
-        docker: &Docker,
-        created: &mut Created,
-        name: &str,
-        body: ContainerCreateBody,
-    ) -> String {
-        docker
-            .create_container(
-                Some(CreateContainerOptionsBuilder::new().name(name).build()),
-                body,
-            )
-            .await
-            .unwrap();
-        created.containers.push(name.to_string());
-        docker
-            .start_container(name, None::<StartContainerOptions>)
-            .await
-            .unwrap();
-        name.to_string()
-    }
-
-    async fn exec(docker: &Docker, container: &str, env: Vec<String>, command: &[&str]) -> String {
-        use bollard::exec::{CreateExecOptions, StartExecResults};
-        let exec = docker
-            .create_exec(
-                container,
-                CreateExecOptions {
-                    cmd: Some(command.iter().map(|s| s.to_string()).collect()),
-                    env: Some(env),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let mut out = String::new();
-        if let StartExecResults::Attached { mut output, .. } =
-            docker.start_exec(&exec.id, None).await.unwrap()
-        {
-            while let Some(Ok(chunk)) = output.next().await {
-                out.push_str(&chunk.to_string());
-            }
-        }
-        out
-    }
-
-    /// A RustFS server on a random loopback port, with `BUCKET` created.
-    async fn destination(docker: &Docker, created: &mut Created, id: &str) -> WorkerS3Destination {
-        let name = format!("temps-test-worker-data-s3-{id}");
-        run(
-            docker,
-            created,
-            &name,
-            ContainerCreateBody {
-                image: Some(RUSTFS_IMAGE.to_string()),
-                env: Some(vec![
-                    format!("RUSTFS_ACCESS_KEY={RUSTFS_KEY}"),
-                    format!("RUSTFS_SECRET_KEY={RUSTFS_KEY}"),
-                ]),
-                host_config: Some(HostConfig {
-                    port_bindings: Some(HashMap::from([(
-                        "9000/tcp".to_string(),
-                        Some(vec![PortBinding {
-                            host_ip: Some("127.0.0.1".to_string()),
-                            host_port: Some(String::new()),
-                        }]),
-                    )])),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .await;
-        let inspect = docker
-            .inspect_container(&name, None::<InspectContainerOptions>)
-            .await
-            .unwrap();
-        let port = inspect
-            .network_settings
-            .and_then(|settings| settings.ports)
-            .and_then(|ports| ports.get("9000/tcp").cloned().flatten())
-            .and_then(|bindings| bindings.first().and_then(|b| b.host_port.clone()))
-            .unwrap();
-        let destination = WorkerS3Destination {
-            bucket: BUCKET.to_string(),
-            region: "us-east-1".to_string(),
-            endpoint: Some(format!("http://127.0.0.1:{port}")),
-            force_path_style: true,
-            access_key_id: RUSTFS_KEY.to_string(),
-            secret_access_key: RUSTFS_KEY.to_string(),
-            session_token: None,
-        };
-        let client = s3_credentials(&destination).build_s3_client().await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            match client.create_bucket().bucket(BUCKET).send().await {
-                Ok(_) => break,
-                Err(error) if tokio::time::Instant::now() > deadline => {
-                    panic!("RustFS never accepted the bucket: {error:?}")
-                }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
-            }
-        }
-        destination
-    }
-
-    async fn object(destination: &WorkerS3Destination, key: &str) -> Vec<u8> {
-        let client = s3_credentials(destination).build_s3_client().await;
-        let body = client
-            .get_object()
-            .bucket(&destination.bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap()
-            .body
-            .collect()
-            .await
-            .unwrap()
-            .into_bytes();
-        body.to_vec()
-    }
-
-    fn gunzip(bytes: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(bytes)
-            .read_to_end(&mut out)
-            .unwrap();
-        out
-    }
-
-    /// A stopped service is refused before any helper or upload starts.
+    /// A stopped service is refused before any helper or upload starts: the
+    /// dump a worker's MongoDB backup streams (`mongodb_backup`) checks its
+    /// container first.
     #[tokio::test]
     async fn a_stopped_service_is_not_backed_up() {
         let Some(docker) = docker_or_skip().await else {
             return;
         };
-        if !pull(&docker, "mariadb:11.4").await {
+        if !pull(&docker, MONGO_IMAGE).await {
             return;
         }
         let id = format!("{:08x}", rand::random::<u32>());
-        let mut created = Created {
-            docker: Arc::clone(&docker),
-            containers: vec![],
-            network: None,
-        };
         let service = format!("wdtest{id}");
         let container =
-            MariaDbService::new(service.clone(), Arc::clone(&docker)).get_docker_container_name();
+            MongodbService::new(service.clone(), Arc::clone(&docker)).get_docker_container_name();
         docker
             .create_container(
                 Some(
@@ -1820,37 +1631,49 @@ mod docker_tests {
                         .build(),
                 ),
                 ContainerCreateBody {
-                    image: Some("mariadb:11.4".to_string()),
+                    image: Some(MONGO_IMAGE.to_string()),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        created.containers.push(container.clone());
-        let result = backup_service_on_node(
-            RemoteServiceBackupRequest {
-                service_config: ServiceConfig {
-                    name: service,
-                    service_type: ServiceType::Mariadb,
-                    version: None,
-                    parameters: serde_json::json!({}),
-                },
-                destination: WorkerS3Destination {
-                    bucket: BUCKET.to_string(),
-                    region: "us-east-1".to_string(),
-                    endpoint: Some("http://127.0.0.1:1".to_string()),
-                    force_path_style: true,
-                    access_key_id: "a".to_string(),
-                    secret_access_key: "s".to_string(),
-                    session_token: None,
-                },
-                key: "mariadb/x/1/dump.sql.gz".to_string(),
-            },
+        let config = ServiceConfig {
+            name: service,
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({}),
+        };
+        // An endpoint nothing listens on: reaching it would fail differently.
+        let destination = WorkerS3Destination {
+            bucket: "worker-backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            force_path_style: true,
+            access_key_id: "a".to_string(),
+            secret_access_key: "s".to_string(),
+            session_token: None,
+        };
+        let result = dump_to_s3(
             Arc::clone(&docker),
+            DumpEngine::Mongodb,
+            &config,
+            &container,
+            &destination,
+            "mongodb/x/1/dump.archive",
             None,
         )
         .await;
-        created.cleanup().await;
+        let _ = docker
+            .remove_container(
+                &container,
+                Some(
+                    RemoveContainerOptionsBuilder::new()
+                        .force(true)
+                        .v(true)
+                        .build(),
+                ),
+            )
+            .await;
         assert!(
             matches!(result, Err(WorkerDataError::ContainerStopped { .. })),
             "{result:?}"
