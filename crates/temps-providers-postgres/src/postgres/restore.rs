@@ -317,6 +317,7 @@ impl PostgresService {
             })?;
 
         let output = docker.start_exec(&exec.id, None).await?;
+        let mut stderr_tail = String::new();
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
             while let Some(Ok(output)) = output.next().await {
                 match output {
@@ -324,14 +325,26 @@ impl PostgresService {
                         info!("stdout: {}", String::from_utf8_lossy(&message));
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        error!("stderr: {}", String::from_utf8_lossy(&message));
+                        let stderr = String::from_utf8_lossy(&message);
+                        error!("stderr: {}", stderr);
+                        crate::externalsvc::exec_util::keep_tail(
+                            &mut stderr_tail,
+                            &stderr,
+                            crate::externalsvc::exec_util::RESTORE_ERROR_TAIL,
+                        );
                     }
                     _ => {}
                 }
             }
         }
-
-        Ok(())
+        let inspect = docker.inspect_exec(&exec.id).await?;
+        crate::externalsvc::exec_util::restore_tool_outcome(
+            &self.name,
+            "psql",
+            container_name,
+            inspect.exit_code,
+            &stderr_tail,
+        )
     }
 
     /// Restore a custom-format pg_dump backup via pg_restore inside the container.
@@ -396,6 +409,7 @@ impl PostgresService {
             })?;
 
         let output = docker.start_exec(&exec.id, None).await?;
+        let mut stderr_tail = String::new();
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
             while let Some(Ok(output)) = output.next().await {
                 match output {
@@ -404,14 +418,27 @@ impl PostgresService {
                     }
                     bollard::container::LogOutput::StdErr { message } => {
                         // pg_restore emits progress info on stderr, log at debug level
-                        debug!("pg_restore stderr: {}", String::from_utf8_lossy(&message));
+                        let stderr = String::from_utf8_lossy(&message);
+                        debug!("pg_restore stderr: {}", stderr);
+                        crate::externalsvc::exec_util::keep_tail(
+                            &mut stderr_tail,
+                            &stderr,
+                            crate::externalsvc::exec_util::RESTORE_ERROR_TAIL,
+                        );
                     }
                     _ => {}
                 }
             }
         }
-
-        Ok(())
+        // pg_restore exits non-zero when any object failed to restore.
+        let inspect = docker.inspect_exec(&exec.id).await?;
+        crate::externalsvc::exec_util::restore_tool_outcome(
+            &self.name,
+            "pg_restore",
+            container_name,
+            inspect.exit_code,
+            &stderr_tail,
+        )
     }
 
     /// The WAL-G restore a worker's agent runs for the control plane: the

@@ -1495,27 +1495,68 @@ impl MongodbService {
             ..Default::default()
         };
 
-        let exec = self
+        let restored = self
+            .run_legacy_mongorestore(&container_name, exec_config)
+            .await;
+
+        // Remove the staged archive whether or not mongorestore succeeded.
+        match self
             .docker
-            .create_exec(&container_name, exec_config)
-            .await?;
+            .create_exec(
+                &container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["rm", "-f", "/tmp/backup.gz"]),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(cleanup) => {
+                if let Err(e) = self.docker.start_exec(&cleanup.id, None).await {
+                    warn!(
+                        "Could not remove the staged archive of legacy restore {} from '{}': {}",
+                        backup_location, container_name, e
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Could not remove the staged archive of legacy restore {} from '{}': {}",
+                backup_location, container_name, e
+            ),
+        }
+        restored?;
 
+        info!("MongoDB legacy restore completed successfully");
+        Ok(())
+    }
+
+    /// Run the legacy restore's `mongorestore` exec, logging its output as
+    /// it streams, and fail unless it exited 0: a corrupt archive, a refused
+    /// login or a failed insert must not read as a restored database.
+    async fn run_legacy_mongorestore(
+        &self,
+        container_name: &str,
+        exec_config: CreateExecOptions<&str>,
+    ) -> Result<()> {
+        let exec = self.docker.create_exec(container_name, exec_config).await?;
         let output = self.docker.start_exec(&exec.id, None).await?;
-
+        let mut stderr_tail = String::new();
         if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
             while let Some(result) = output.next().await {
                 match result {
-                    Ok(log_output) => match log_output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            let stdout_str = String::from_utf8_lossy(&message);
-                            info!("mongorestore stdout: {}", stdout_str);
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let stderr_str = String::from_utf8_lossy(&message);
-                            info!("mongorestore stderr: {}", stderr_str);
-                        }
-                        _ => {}
-                    },
+                    Ok(bollard::container::LogOutput::StdOut { message }) => {
+                        info!("mongorestore stdout: {}", String::from_utf8_lossy(&message));
+                    }
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        let stderr = String::from_utf8_lossy(&message);
+                        info!("mongorestore stderr: {}", stderr);
+                        super::exec_util::keep_tail(
+                            &mut stderr_tail,
+                            &stderr,
+                            super::exec_util::RESTORE_ERROR_TAIL,
+                        );
+                    }
+                    Ok(_) => {}
                     Err(e) => {
                         error!("Error reading exec output: {}", e);
                         return Err(EngineError::failed(
@@ -1526,23 +1567,14 @@ impl MongodbService {
                 }
             }
         }
-
-        // Clean up temporary file in container
-        let cleanup_exec = self
-            .docker
-            .create_exec(
-                &container_name,
-                CreateExecOptions {
-                    cmd: Some(vec!["rm", "/tmp/backup.gz"]),
-                    ..Default::default()
-                },
-            )
-            .await?;
-
-        self.docker.start_exec(&cleanup_exec.id, None).await?;
-
-        info!("MongoDB legacy restore completed successfully");
-        Ok(())
+        let inspect = self.docker.inspect_exec(&exec.id).await?;
+        super::exec_util::restore_tool_outcome(
+            &self.name,
+            "mongorestore",
+            container_name,
+            inspect.exit_code,
+            &stderr_tail,
+        )
     }
 
     /// Check if the WAL-G binary is available inside a container: what a
@@ -5245,7 +5277,7 @@ mod tests {
                 &s3_creds,
                 legacy_key,
                 &minio.s3_source,
-                legacy_service_config,
+                legacy_service_config.clone(),
             )
             .await
             .expect("legacy archive restore");
@@ -5258,6 +5290,33 @@ mod tests {
             "legacy restore must bring back 3 documents"
         );
         println!("✓ Legacy archive restore verified");
+
+        // Step 8c: a legacy archive mongorestore cannot read is a failed
+        // restore, not a completed one.
+        let corrupt_key = "legacy/corrupt.archive.gz";
+        minio
+            .s3_client
+            .put_object()
+            .bucket(&minio.s3_source.bucket_name)
+            .key(corrupt_key)
+            .body(b"not a mongodump archive".to_vec().into())
+            .send()
+            .await
+            .expect("upload corrupt archive");
+        let corrupt = service
+            .restore_from_s3(
+                &minio.s3_client,
+                &s3_creds,
+                corrupt_key,
+                &minio.s3_source,
+                legacy_service_config,
+            )
+            .await;
+        assert!(
+            corrupt.is_err(),
+            "a corrupt legacy archive must fail the restore: {corrupt:?}"
+        );
+        println!("✓ Corrupt legacy archive restore failed as it must");
 
         // Step 9: Cleanup
         println!("Step 9: Cleaning up...");
