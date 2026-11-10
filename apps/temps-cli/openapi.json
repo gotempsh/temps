@@ -40367,6 +40367,13 @@
               "null"
             ]
           },
+          "resource_id": {
+            "description": "Exact resource ID recorded in the audit payload (omit for all resources).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "to": {
             "description": "End timestamp, ISO 8601 (e.g. \"2024-01-15T14:30:00Z\")",
             "format": "date-time",
@@ -97370,6 +97377,15 @@
       "get": {
         "operationId": "list_audit_logs",
         "parameters": [
+          {
+            "description": "Exact resource ID recorded in the audit payload (omit for all resources).",
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Filter logs by operation type (omit for all)",
             "example": "user.login",

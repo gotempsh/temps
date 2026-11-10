@@ -15,10 +15,12 @@ import {
   BreadcrumbProvider,
   useBreadcrumbs,
 } from '@/contexts/BreadcrumbContext'
+import { AuthProvider } from '@/contexts/AuthContext'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
   generalAccessCapabilityOptions,
+  getCurrentUserOptions,
   getAccessVaultGeneralOptions,
   listAccessBundlesGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -76,6 +78,14 @@ function mount(tab = 'services', write = true, entry?: string) {
       mutations: { retry: false },
     },
   })
+  client.setQueryData(getCurrentUserOptions({}).queryKey, {
+    id: 1,
+    name: 'Fixture',
+    username: 'fixture',
+    avatar_url: '',
+    mfa_enabled: false,
+    role: write ? 'admin' : 'user',
+  })
   client.setQueryData(generalAccessCapabilityOptions().queryKey, {
     can_manage_services: write,
     can_manage_requests: write,
@@ -101,31 +111,33 @@ function mount(tab = 'services', write = true, entry?: string) {
       <MemoryRouter
         initialEntries={[entry ?? `/vault/vaults/vault_test?tab=${tab}`]}
       >
-        <BreadcrumbProvider>
-          <BreadcrumbProbe />
-          <Routes>
-            <Route
-              path="/access-services/:serviceId/edit"
-              element={<h1>Service details destination</h1>}
-            />
-            <Route
-              path="/vault/vaults/:vaultId/bundles/:bundleId"
-              element={<AccessBundleDetailPage />}
-            />
-            <Route
-              path="/vault/vaults/:vaultId/bundles/new"
-              element={<AccessBundlePage />}
-            />
-            <Route
-              path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
-              element={<AccessBundlePage />}
-            />
-            <Route
-              path="/vault/vaults/:vaultId"
-              element={<VaultDetailPage />}
-            />
-          </Routes>
-        </BreadcrumbProvider>
+        <AuthProvider>
+          <BreadcrumbProvider>
+            <BreadcrumbProbe />
+            <Routes>
+              <Route
+                path="/access-services/:serviceId/edit"
+                element={<h1>Service details destination</h1>}
+              />
+              <Route
+                path="/vault/vaults/:vaultId/bundles/:bundleId"
+                element={<AccessBundleDetailPage />}
+              />
+              <Route
+                path="/vault/vaults/:vaultId/bundles/new"
+                element={<AccessBundlePage />}
+              />
+              <Route
+                path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
+                element={<AccessBundlePage />}
+              />
+              <Route
+                path="/vault/vaults/:vaultId"
+                element={<VaultDetailPage />}
+              />
+            </Routes>
+          </BreadcrumbProvider>
+        </AuthProvider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -698,7 +710,7 @@ test('bundle pagination retains the authorized sandbox consumer', async () => {
   }
 })
 
-test('compact vault header has one ancestor, adjacent edit icon and external audit link', () => {
+test('compact vault header has one ancestor and only the name and edit icon', () => {
   const client = mount()
   try {
     const ui = within(document.body)
@@ -712,13 +724,105 @@ test('compact vault header has one ancestor, adjacent edit icon and external aud
       'Vaults → Development'
     )
     expect(ui.queryByRole('link', { name: 'All vaults' })).toBeNull()
-    const audit = ui.getByRole('link', {
-      name: 'Audit logs (opens in a new tab)',
+    expect(ui.queryByRole('link', { name: /Audit logs/ })).toBeNull()
+    expect(
+      ui.queryByRole('button', { name: 'Link project or sandbox' })
+    ).toBeNull()
+    for (const name of ['Linked to', 'Audit logs']) {
+      expect(ui.getByRole('tab', { name }).querySelector('svg')).toBeTruthy()
+    }
+  } finally {
+    client.clear()
+  }
+})
+
+test('vault tabs render links and resource-filtered audit rows without changing the header', async () => {
+  const requests: string[] = []
+  const api = mockApi({
+    'GET /users': () => jsonResponse([]),
+    'GET /access-vaults/vault_test/links': () => {
+      requests.push('links')
+      return jsonResponse({ items: [], total: 0, page: 1, page_size: 20 })
+    },
+    'GET /audit/logs': (request) => {
+      const url = new URL(request.url)
+      requests.push(
+        `audit:${url.searchParams.get('resource_id')}:${url.searchParams.get('offset')}`
+      )
+      return jsonResponse(
+        Array.from({ length: 20 }, (_, i) => ({
+          id: i + 1,
+          operation_type: 'CREATE_ACCESS_VAULT',
+          audit_date: Date.parse(date),
+          user: null,
+          ip_address: null,
+          data: { resource_id: vault.id },
+        }))
+      )
+    },
+  })
+  const client = mount()
+  const ui = within(document.body)
+  const selectTab = async (name: string) => {
+    fireEvent.mouseDown(ui.getByRole('tab', { name }), {
+      button: 0,
+      ctrlKey: false,
     })
-    expect(audit.getAttribute('href')).toBe('/audit-logs?range=all')
-    expect(audit.getAttribute('target')).toBe('_blank')
-    expect(audit.getAttribute('rel')).toContain('noopener')
-    expect(audit.querySelector('svg')).toBeTruthy()
+    await waitFor(() =>
+      expect(ui.getByRole('tab', { name }).getAttribute('aria-selected')).toBe(
+        'true'
+      )
+    )
+  }
+  try {
+    expect(requests).toEqual([])
+    await selectTab('Linked to')
+    await waitFor(() => expect(requests).toContain('links'))
+    expect(
+      ui.getByRole('button', { name: 'Link project or sandbox' })
+    ).toBeTruthy()
+    await selectTab('Audit logs')
+    await waitFor(() =>
+      expect(ui.getByRole('table', { name: 'Audit logs' })).toBeTruthy()
+    )
+    expect(requests).toContain('audit:vault_test:0')
+    expect(ui.queryByRole('button', { name: 'Show all resources' })).toBeNull()
+    fireEvent.click(ui.getByRole('button', { name: 'Next' }))
+    await waitFor(() => expect(requests).toContain('audit:vault_test:20'))
+    fireEvent.click(ui.getByRole('button', { name: 'Choose time range' }))
+    await waitFor(() =>
+      expect(ui.getByRole('button', { name: 'Reset filters' })).toBeTruthy()
+    )
+    fireEvent.click(ui.getByRole('button', { name: 'Reset filters' }))
+    await waitFor(() =>
+      expect(
+        ui
+          .getByRole('button', { name: 'All time' })
+          .getAttribute('aria-pressed')
+      ).toBe('true')
+    )
+    expect(
+      requests
+        .filter((r) => r.startsWith('audit:'))
+        .every((r) => r.startsWith('audit:vault_test:'))
+    ).toBe(true)
+    expect(ui.getByLabelText('Breadcrumb trail').textContent).toBe(
+      'Vaults → Development'
+    )
+    expect(ui.getAllByRole('heading', { level: 1 })).toHaveLength(1)
+  } finally {
+    cleanup()
+    api.restore()
+    client.clear()
+  }
+})
+
+test('non-admin vault readers do not see management or audit tabs', () => {
+  const client = mount('services', false)
+  try {
+    const ui = within(document.body)
+    expect(ui.queryByRole('tab', { name: 'Linked to' })).toBeNull()
+    expect(ui.queryByRole('tab', { name: 'Audit logs' })).toBeNull()
   } finally {
     client.clear()
   }

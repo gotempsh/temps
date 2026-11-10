@@ -7,7 +7,8 @@ import { serviceProviderName } from '@/components/service-access/service-provide
 import {
   Clock3,
   Pencil,
-  ExternalLink,
+  ScrollText,
+  Link2,
   Plus,
   PlugZap,
   Layers,
@@ -47,6 +48,8 @@ import {
 import { AccessSessionsList } from '@/components/service-access/AccessSessionsList'
 import { VaultLinks } from '@/components/service-access/VaultLinks'
 import { VaultEditor } from '@/components/service-access/VaultEditor'
+import { AuditLogView } from './AuditLogs-components'
+import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 
 export default function VaultDetailPage() {
@@ -57,12 +60,8 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const valid = !!vaultId
-  const tab =
-    params.get('tab') === 'sessions'
-      ? 'sessions'
-      : params.get('tab') === 'bundles'
-        ? 'bundles'
-        : 'services'
+  const requestedTab = params.get('tab') ?? 'services'
+  const canViewAuditLogs = useCanViewAuditLogs()
   const page = Math.max(
     1,
     Math.min(1000000, Math.floor(Number(params.get('page')) || 1))
@@ -92,7 +91,7 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
         sandbox_id: sandboxId,
       },
     }),
-    enabled: valid && tab === 'bundles',
+    enabled: valid && requestedTab === 'bundles',
   })
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
@@ -107,6 +106,13 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
   const rows = vault.data?.services ?? []
   const canWrite =
     capability.data?.can_manage_services === true && !capability.isError
+  const tab =
+    requestedTab === 'bundles' ||
+    requestedTab === 'sessions' ||
+    (requestedTab === 'links' && canWrite) ||
+    (requestedTab === 'audit' && canViewAuditLogs)
+      ? requestedTab
+      : 'services'
   const changeTab = (next: string) =>
     setParams((current) => {
       const p = new URLSearchParams(current)
@@ -140,21 +146,7 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
             )}
           </span>
         }
-        actions={
-          <Button variant="ghost" size="sm" asChild>
-            <Link
-              to="/audit-logs?range=all"
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label="Audit logs (opens in a new tab)"
-            >
-              Audit logs
-              <ExternalLink className="size-4" />
-            </Link>
-          </Button>
-        }
       />
-      {canWrite && <VaultLinks vaultId={vaultId} />}
       {editingVault && (
         <VaultEditor
           key={editingVault.id}
@@ -192,7 +184,27 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
             <TabsTrigger value="sessions" icon={Clock3}>
               Sessions
             </TabsTrigger>
+            {canWrite && (
+              <TabsTrigger value="links" icon={Link2}>
+                Linked to
+              </TabsTrigger>
+            )}
+            {canViewAuditLogs && (
+              <TabsTrigger value="audit" icon={ScrollText}>
+                Audit logs
+              </TabsTrigger>
+            )}
           </TabsList>
+          {canWrite && (
+            <TabsContent value="links" forceMount hidden={tab !== 'links'}>
+              <VaultLinks vaultId={vaultId} active={tab === 'links'} />
+            </TabsContent>
+          )}
+          {canViewAuditLogs && (
+            <TabsContent value="audit" forceMount hidden={tab !== 'audit'}>
+              <AuditLogView resourceId={vaultId} active={tab === 'audit'} />
+            </TabsContent>
+          )}
           <TabsContent value="services" className="space-y-4">
             <div className="flex justify-end">
               <Button disabled={!canWrite} asChild={canWrite}>

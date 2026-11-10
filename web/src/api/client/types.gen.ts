@@ -18859,6 +18859,10 @@ export type ListAuditLogsQuery = {
      */
     operation_type?: string | null;
     /**
+     * Exact resource ID recorded in the audit payload (omit for all resources).
+     */
+    resource_id?: string | null;
+    /**
      * End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
      */
     to?: string | null;
@@ -47064,6 +47068,10 @@ export type ListAuditLogsData = {
     body?: never;
     path?: never;
     query?: {
+        /**
+         * Exact resource ID recorded in the audit payload (omit for all resources).
+         */
+        resource_id?: string;
         /**
          * Filter logs by operation type (omit for all)
          */

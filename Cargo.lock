@@ -12875,6 +12875,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-geo",
+ "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

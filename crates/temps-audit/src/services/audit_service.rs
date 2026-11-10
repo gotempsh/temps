@@ -14,6 +14,30 @@ use temps_entities::{audit_logs, ip_geolocations, users};
 use temps_geo::IpAddressService;
 use tracing::warn;
 
+pub struct AuditLogFilter<'a> {
+    pub action: Option<&'a str>,
+    pub resource_id: Option<&'a str>,
+    pub user_id: Option<i32>,
+    pub from: Option<UtcDateTime>,
+    pub to: Option<UtcDateTime>,
+    pub limit: i32,
+    pub offset: i32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuditQueryError {
+    #[error("Failed to list audit logs for resource {resource_id:?}, operation {operation:?}, user {user_id:?}, limit {limit}, offset {offset}: {source}")]
+    Read {
+        resource_id: Option<String>,
+        operation: Option<String>,
+        user_id: Option<i32>,
+        limit: i32,
+        offset: i32,
+        #[source]
+        source: DbErr,
+    },
+}
+
 pub const PERMISSION_DENIED_RETENTION_DAYS: i64 = 90;
 pub const PERMISSION_DENIED_PRUNE_BATCH_SIZE: u64 = 2_048;
 pub const PERMISSION_DENIED_PRUNE_INTERVAL: std::time::Duration =
@@ -186,15 +210,25 @@ WHERE id IN (SELECT id FROM expired)
     }
     pub async fn filter_audit_logs(
         &self,
-        action: Option<&str>,
-        user_id_p: Option<i32>,
-        from: Option<UtcDateTime>,
-        to: Option<UtcDateTime>,
-        limit: i32,
-        offset: i32,
-    ) -> anyhow::Result<Vec<AuditLogWithDetails>> {
+        filter: AuditLogFilter<'_>,
+    ) -> Result<Vec<AuditLogWithDetails>, AuditQueryError> {
+        let AuditLogFilter {
+            action,
+            resource_id,
+            user_id: user_id_p,
+            from,
+            to,
+            limit,
+            offset,
+        } = filter;
         let mut query = temps_entities::audit_logs::Entity::find();
 
+        if let Some(resource_id) = resource_id {
+            query = query.filter(Expr::cust_with_values(
+                "CASE WHEN audit_logs.data IS JSON OBJECT THEN audit_logs.data::jsonb->>'resource_id' END = $1",
+                [resource_id],
+            ));
+        }
         // Apply filters
         if let Some(action_filter) = action {
             query = query
@@ -210,45 +244,31 @@ WHERE id IN (SELECT id FROM expired)
             query = query.filter(temps_entities::audit_logs::Column::AuditDate.lte(to_date));
         }
 
-        // Apply pagination and ordering, then fetch basic audit logs
         let logs = query
-            .order_by_desc(temps_entities::audit_logs::Column::AuditDate)
+            .order_by_desc(audit_logs::Column::AuditDate)
+            .order_by_desc(audit_logs::Column::Id)
             .limit(audit_page_limit(limit))
             .offset(audit_page_offset(offset))
+            .find_also_related(users::Entity)
+            .find_also_related(ip_geolocations::Entity)
             .all(self.db.as_ref())
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to load filtered audit logs: {}", e))?;
-
-        // Fetch related user and IP geolocation data for each log
-        let mut audit_details = Vec::new();
-        for log in logs {
-            // Fetch related user (user_id is None once the account is deleted)
-            let user = match log.user_id {
-                Some(uid) => {
-                    temps_entities::users::Entity::find_by_id(uid)
-                        .one(self.db.as_ref())
-                        .await?
-                }
-                None => None,
-            };
-
-            // Fetch related IP geolocation if present
-            let ip_address = if let Some(ip_address_id) = log.ip_address_id {
-                temps_entities::ip_geolocations::Entity::find_by_id(ip_address_id)
-                    .one(self.db.as_ref())
-                    .await?
-            } else {
-                None
-            };
-
-            audit_details.push(AuditLogWithDetails {
+            .map_err(|source| AuditQueryError::Read {
+                resource_id: resource_id.map(str::to_owned),
+                operation: action.map(str::to_owned),
+                user_id: user_id_p,
+                limit,
+                offset,
+                source,
+            })?;
+        Ok(logs
+            .into_iter()
+            .map(|(log, user, ip_address)| AuditLogWithDetails {
                 log,
                 user,
                 ip_address,
-            });
-        }
-
-        Ok(audit_details)
+            })
+            .collect())
     }
 
     pub async fn get_log_by_id(&self, log_id: i32) -> anyhow::Result<Option<AuditLogWithDetails>> {
@@ -337,6 +357,128 @@ mod tests {
         let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
         let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip));
         AuditService::new(db, ip_service)
+    }
+
+    #[tokio::test]
+    async fn resource_filter_is_bound_before_pagination_and_details_use_joins() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<std::collections::BTreeMap<String, Value>>::new()])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let service = AuditService::new(
+            db.clone(),
+            Arc::new(IpAddressService::new(db.clone(), geoip)),
+        );
+        assert!(service
+            .filter_audit_logs(AuditLogFilter {
+                action: None,
+                resource_id: Some("vault_fixture"),
+                user_id: None,
+                from: None,
+                to: None,
+                limit: 20,
+                offset: 20
+            })
+            .await
+            .unwrap()
+            .is_empty());
+        drop(service);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert_eq!(transactions.len(), 1);
+        let statement = &transactions[0].statements()[0];
+        assert!(statement.sql.contains("IS JSON OBJECT"));
+        assert!(statement.sql.contains("->>'resource_id'"));
+        assert!(statement.sql.contains("LEFT JOIN \"users\""));
+        assert!(statement.sql.contains("LEFT JOIN \"ip_geolocations\""));
+        assert!(statement.sql.contains("LIMIT"));
+        assert!(statement.sql.contains("OFFSET"));
+        assert!(statement
+            .values
+            .as_ref()
+            .unwrap()
+            .0
+            .contains(&Value::from("vault_fixture")));
+        assert!(!statement.sql.contains("vault_fixture"));
+    }
+
+    #[tokio::test]
+    async fn resource_filter_excludes_other_resources_and_malformed_payloads_before_paging() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping resource audit filter: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        db.execute_unprepared(
+            r#"INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) VALUES
+        ('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_fixture"}',now(),now()),
+        ('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_fixture"}',now(),now()),
+        ('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_other"}',now(),now()),
+        ('fixture','UPDATE_ACCESS_VAULT','not JSON',now(),now())"#,
+        )
+        .await
+        .unwrap();
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let service = AuditService::new(
+            db.clone(),
+            Arc::new(IpAddressService::new(db.clone(), geoip)),
+        );
+        let mut ids = Vec::new();
+        for offset in 0..3 {
+            let page = service
+                .filter_audit_logs(AuditLogFilter {
+                    action: None,
+                    resource_id: Some("vault_fixture"),
+                    user_id: None,
+                    from: None,
+                    to: None,
+                    limit: 1,
+                    offset,
+                })
+                .await
+                .unwrap();
+            if offset < 2 {
+                assert_eq!(page.len(), 1);
+                assert!(page[0].log.data.contains("vault_fixture"));
+                ids.push(page[0].log.id);
+            } else {
+                assert!(page.is_empty());
+            }
+        }
+        assert_ne!(ids[0], ids[1]);
+        drop(service);
+        drop(db);
+        test.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn resource_query_failure_preserves_requested_id() {
+        let service = service_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([DbErr::Custom("fixture failure".into())])
+                .into_connection(),
+        );
+        let error = service
+            .filter_audit_logs(AuditLogFilter {
+                action: None,
+                resource_id: Some("vault_missing"),
+                user_id: None,
+                from: None,
+                to: None,
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AuditQueryError::Read { resource_id: Some(ref id), .. } if id == "vault_missing")
+        );
     }
 
     fn log_row(user_id: Option<i32>) -> audit_logs::Model {

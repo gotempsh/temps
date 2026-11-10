@@ -38,7 +38,13 @@ const consumerSchema = z.discriminatedUnion('kind', [
   }),
 ])
 
-export function VaultLinks({ vaultId }: { vaultId: string }) {
+export function VaultLinks({
+  vaultId,
+  active = true,
+}: {
+  vaultId: string
+  active?: boolean
+}) {
   const client = useQueryClient()
   const [page, setPage] = useState(1)
   const form = useForm<z.infer<typeof consumerSchema>>({
@@ -49,12 +55,13 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
   const selected = useWatch({ control: form.control, name: 'selected' })
   const [open, setOpen] = useState(false)
   const [removing, setRemoving] = useState<VaultLinkResponse>()
-  const links = useQuery(
-    listVaultLinksOptions({
+  const links = useQuery({
+    ...listVaultLinksOptions({
       path: { vault_id: vaultId },
       query: { page, page_size: 20 },
-    })
-  )
+    }),
+    enabled: active,
+  })
   const refresh = () => {
     void client.invalidateQueries({ queryKey: [{ _id: 'listVaultLinks' }] })
     void client.invalidateQueries({
