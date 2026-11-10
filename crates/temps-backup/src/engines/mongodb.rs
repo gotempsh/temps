@@ -236,43 +236,45 @@ async fn backup_on_worker(
     );
     // Refuses an endpoint on this host's loopback, which the node cannot
     // reach.
-    let destination = super::worker_agent::scoped_destination(
-        &deps.worker_credentials,
-        deps.db.as_ref(),
-        s3_source_id,
-        WorkerS3Grant::job(
-            service.id,
-            node_id,
-            prefix,
-            temps_core::ScopedS3Access::Write,
+    let mint = || {
+        super::worker_agent::scoped_destination(
+            &deps.worker_credentials,
+            deps.db.as_ref(),
+            s3_source_id,
+            WorkerS3Grant::job(
+                service.id,
+                node_id,
+                prefix.clone(),
+                temps_core::ScopedS3Access::Write,
+                "backup",
+            ),
             "backup",
-        ),
-        "backup",
-    )
-    .await?;
+        )
+    };
+    let destination = mint().await?;
     // A node already running its maximum of backups and restores is waited
     // for (bounded, within this backup's own runtime limit) instead of
-    // failing the backup.
-    let request = crate::node_busy::retry_while_node_busy(
+    // failing the backup; a try after a wait gets a credential minted after
+    // it.
+    let request = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
-        || {
+        destination,
+        mint,
+        |destination| {
             deps.manager.mongodb_backup_worker(
                 service.id,
-                destination.clone(),
+                destination,
                 bucket_path.to_string(),
                 backup_uuid.to_string(),
                 mode.clone(),
             )
         },
-        |wait| super::worker_agent::wait_for_node_slot(ctx.backup_id, service.id, wait),
+        |wait| super::worker_agent::wait_for_node_slot_minting(ctx.backup_id, service.id, wait),
     );
     let result = tokio::select! {
         // Dropping the request ends it on the node too.
         _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-        result = request => match result {
-            Ok(result) => result,
-            Err(never) => match never {},
-        },
+        result = request => result?,
     }
     .map_err(|e| BackupError::Failed {
         reason: format!(

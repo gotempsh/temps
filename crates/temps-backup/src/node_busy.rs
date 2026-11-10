@@ -86,7 +86,7 @@ impl NodeWait {
 pub async fn retry_while_node_busy<T, E, Call, CallFut, Wait, WaitFut>(
     policy: &NodeBusyPolicy,
     mut call: Call,
-    mut wait: Wait,
+    wait: Wait,
 ) -> Result<Result<T, ExternalServiceError>, E>
 where
     Call: FnMut() -> CallFut,
@@ -94,10 +94,56 @@ where
     Wait: FnMut(NodeWait) -> WaitFut,
     WaitFut: Future<Output = Result<(), E>>,
 {
+    retry_while_node_busy_with_fresh_credential(
+        policy,
+        (),
+        || async { Ok(()) },
+        move |()| call(),
+        wait,
+    )
+    .await
+}
+
+/// [`retry_while_node_busy`] for a call that hands the node a credential
+/// with a lifetime (a scoped S3 credential lives a few hours at most, and the
+/// wait for a slot may last as long). `first` is sent with the first try,
+/// and `mint` derives a fresh credential before every later one, so a try
+/// never carries a credential minted before the run waited. A failure to
+/// mint ends the run with the outer `Err`, as the hook's own error does.
+pub async fn retry_while_node_busy_with_fresh_credential<
+    C,
+    T,
+    E,
+    Mint,
+    MintFut,
+    Call,
+    CallFut,
+    Wait,
+    WaitFut,
+>(
+    policy: &NodeBusyPolicy,
+    first: C,
+    mut mint: Mint,
+    mut call: Call,
+    mut wait: Wait,
+) -> Result<Result<T, ExternalServiceError>, E>
+where
+    Mint: FnMut() -> MintFut,
+    MintFut: Future<Output = Result<C, E>>,
+    Call: FnMut(C) -> CallFut,
+    CallFut: Future<Output = Result<T, ExternalServiceError>>,
+    Wait: FnMut(NodeWait) -> WaitFut,
+    WaitFut: Future<Output = Result<(), E>>,
+{
     let mut waited = Duration::ZERO;
     let mut attempt = 1u32;
+    let mut credential = Some(first);
     loop {
-        match call().await {
+        let this_try = match credential.take() {
+            Some(credential) => credential,
+            None => mint().await?,
+        };
+        match call(this_try).await {
             Err(ExternalServiceError::NodeBusy {
                 node,
                 route,
@@ -226,6 +272,102 @@ mod tests {
             }
             other => panic!("expected NodeBusy, got {other:?}"),
         }
+    }
+
+    /// A try after a wait never reuses the credential minted before it:
+    /// each later try is sent a freshly minted one, minted after the wait.
+    #[tokio::test]
+    async fn every_try_after_a_wait_is_sent_a_freshly_minted_credential() {
+        let minted = Arc::new(AtomicU32::new(0));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let policy = NodeBusyPolicy {
+            first: Duration::from_secs(1),
+            max_delay: Duration::from_secs(1),
+            budget: Duration::from_secs(60),
+        };
+        let outcome = retry_while_node_busy_with_fresh_credential(
+            &policy,
+            "credential-0".to_string(),
+            || {
+                let minted = minted.clone();
+                let events = events.clone();
+                async move {
+                    let n = minted.fetch_add(1, Ordering::SeqCst) + 1;
+                    events.lock().unwrap().push(format!("mint {n}"));
+                    Ok::<_, std::convert::Infallible>(format!("credential-{n}"))
+                }
+            },
+            |credential: String| {
+                let sent = sent.clone();
+                let events = events.clone();
+                async move {
+                    events.lock().unwrap().push(format!("send {credential}"));
+                    let mut sent = sent.lock().unwrap();
+                    sent.push(credential);
+                    if sent.len() < 3 {
+                        Err(busy())
+                    } else {
+                        Ok("restored")
+                    }
+                }
+            },
+            |_| {
+                let events = events.clone();
+                async move {
+                    events.lock().unwrap().push("wait".to_string());
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.unwrap(), "restored");
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec!["credential-0", "credential-1", "credential-2"],
+            "a later try reused an earlier credential"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "send credential-0",
+                "wait",
+                "mint 1",
+                "send credential-1",
+                "wait",
+                "mint 2",
+                "send credential-2",
+            ],
+            "each credential must be minted after the wait it follows"
+        );
+    }
+
+    /// A credential that cannot be minted after a wait ends the run with
+    /// that error; nothing is sent with a stale one instead.
+    #[tokio::test]
+    async fn a_failed_mint_after_a_wait_ends_the_run() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let outcome = retry_while_node_busy_with_fresh_credential(
+            &NodeBusyPolicy {
+                first: Duration::from_secs(1),
+                max_delay: Duration::from_secs(1),
+                budget: Duration::from_secs(60),
+            },
+            "credential-0",
+            || async { Err::<&str, _>("the STS refused") },
+            |_| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(busy())
+                }
+            },
+            |_| async { Ok(()) },
+        )
+        .await;
+        assert_eq!(outcome.unwrap_err(), "the STS refused");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Any other answer is returned at once, and the hook can stop the wait.

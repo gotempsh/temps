@@ -245,13 +245,16 @@ pub(super) async fn run(
     );
     // A node already running its maximum of backups and restores is waited
     // for, visibly and cancellably, instead of failing the run.
-    let outcome = crate::node_busy::retry_while_node_busy(
+    // A try after a wait gets a credential minted after it.
+    let outcome = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
-        || {
+        s3,
+        || super::worker_read_destination(db, scoper, run_id, backup, target.id, node_id, &binlogs),
+        |s3| {
             mgr.mariadb_restore_worker(
                 target.id,
                 restored_login.as_ref(),
-                s3.clone(),
+                s3,
                 bucket_path.clone(),
                 backup.s3_location.clone(),
                 recovery_target.clone(),

@@ -188,21 +188,31 @@ impl BackupEngine for RedisEngine {
             }
             Node::Worker(node_id) => {
                 // Write access to this snapshot's own directory, nothing else.
-                let destination = worker_destination(
-                    &deps,
-                    s3_source_id,
+                let mint = || {
+                    worker_destination(
+                        &deps,
+                        s3_source_id,
+                        &service,
+                        *node_id,
+                        temps_providers::worker_s3_scope::key_directory(&s3_key),
+                    )
+                };
+                let destination = mint().await?;
+                let result = on_worker(
+                    ctx,
                     &service,
                     *node_id,
-                    temps_providers::worker_s3_scope::key_directory(&s3_key),
+                    "RDB backup",
+                    destination,
+                    mint,
+                    |destination| {
+                        deps.manager.rdb_backup_worker_redis(
+                            service.id,
+                            destination,
+                            s3_key.clone(),
+                        )
+                    },
                 )
-                .await?;
-                let result = on_worker(ctx, &service, *node_id, "RDB backup", || {
-                    deps.manager.rdb_backup_worker_redis(
-                        service.id,
-                        destination.clone(),
-                        s3_key.clone(),
-                    )
-                })
                 .await?;
                 match result {
                     RedisRdbBackupResult::Completed { size_bytes } => size_bytes,
@@ -299,17 +309,25 @@ async fn run_walg_backup(
         Node::Worker(node_id) => {
             // Write access to the service's own WAL-G repository, nothing
             // else: `backup-push` writes and reads its sentinels there.
-            let destination =
-                worker_destination(deps, s3_source.id, service, *node_id, list_prefix.clone())
-                    .await?;
-            let result = on_worker(ctx, service, *node_id, "WAL-G backup", || {
-                deps.manager.walg_backup_worker_redis(
-                    service.id,
-                    destination.clone(),
-                    s3_source.bucket_path.clone(),
-                    backup_uuid.to_string(),
-                )
-            })
+            let mint =
+                || worker_destination(deps, s3_source.id, service, *node_id, list_prefix.clone());
+            let destination = mint().await?;
+            let result = on_worker(
+                ctx,
+                service,
+                *node_id,
+                "WAL-G backup",
+                destination,
+                mint,
+                |destination| {
+                    deps.manager.walg_backup_worker_redis(
+                        service.id,
+                        destination,
+                        s3_source.bucket_path.clone(),
+                        backup_uuid.to_string(),
+                    )
+                },
+            )
             .await?;
             match result {
                 RedisWalgBackupResult::Completed => {}
@@ -447,34 +465,38 @@ async fn worker_destination(
 
 /// Ask worker `node_id`'s agent to run a node half: a node already running
 /// its maximum of backups and restores is waited for (bounded) instead of
-/// failing the backup, and a cancelled backup stops waiting.
-async fn on_worker<T, Call, CallFut>(
+/// failing the backup, and a cancelled backup stops waiting. The first try
+/// is sent `first`; a try after a wait, a credential `mint` derives after it.
+async fn on_worker<C, T, Mint, MintFut, Call, CallFut>(
     ctx: &BackupContext,
     service: &temps_entities::external_services::Model,
     node_id: i32,
     operation: &str,
+    first: C,
+    mint: Mint,
     call: Call,
 ) -> Result<T, BackupError>
 where
-    Call: FnMut() -> CallFut,
+    Mint: FnMut() -> MintFut,
+    MintFut: std::future::Future<Output = Result<C, BackupError>>,
+    Call: FnMut(C) -> CallFut,
     CallFut: std::future::Future<Output = Result<T, temps_providers::ExternalServiceError>>,
 {
-    let request = crate::node_busy::retry_while_node_busy(
+    let request = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        first,
+        mint,
         call,
-        |wait| super::worker_agent::wait_for_node_slot(ctx.backup_id, service.id, wait),
+        |wait| super::worker_agent::wait_for_node_slot_minting(ctx.backup_id, service.id, wait),
     );
     tokio::select! {
         _ = ctx.cancel.cancelled() => Err(BackupError::Cancelled),
-        result = request => match result {
-            Ok(result) => result.map_err(|e| BackupError::Failed {
-                reason: format!(
-                    "Redis {operation} of service {} ('{}') on node {node_id}: {e}",
-                    service.id, service.name
-                ),
-            }),
-            Err(never) => match never {},
-        },
+        result = request => result?.map_err(|e| BackupError::Failed {
+            reason: format!(
+                "Redis {operation} of service {} ('{}') on node {node_id}: {e}",
+                service.id, service.name
+            ),
+        }),
     }
 }
 

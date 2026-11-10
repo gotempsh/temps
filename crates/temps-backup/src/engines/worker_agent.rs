@@ -245,6 +245,19 @@ pub(crate) async fn wait_for_node_slot(
     Ok(())
 }
 
+/// [`wait_for_node_slot`] for a retry whose own error is a [`BackupError`]:
+/// one that mints a fresh credential after each wait, which can fail.
+pub(crate) async fn wait_for_node_slot_minting(
+    backup_id: i32,
+    service_id: i32,
+    wait: crate::node_busy::NodeWait,
+) -> Result<(), BackupError> {
+    match wait_for_node_slot(backup_id, service_id, wait).await {
+        Ok(()) => Ok(()),
+        Err(never) => match never {},
+    }
+}
+
 #[async_trait]
 impl BackupEngine for WorkerAgentEngine {
     fn engine(&self) -> &'static str {
@@ -305,20 +318,22 @@ impl BackupEngine for WorkerAgentEngine {
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let key = backup_key(&s3_source.bucket_path, &service, &backup_uuid, kind);
         // The worker can write this backup's own directory and nothing else.
-        let destination = scoped_destination(
-            &deps.worker_credentials,
-            deps.db.as_ref(),
-            s3_source_id,
-            WorkerS3Grant::job(
-                service_id,
-                node_id,
-                backup_scope_prefix(&key, kind),
-                ScopedS3Access::Write,
+        let mint = || {
+            scoped_destination(
+                &deps.worker_credentials,
+                deps.db.as_ref(),
+                s3_source_id,
+                WorkerS3Grant::job(
+                    service_id,
+                    node_id,
+                    backup_scope_prefix(&key, kind),
+                    ScopedS3Access::Write,
+                    "backup",
+                ),
                 "backup",
-            ),
-            "backup",
-        )
-        .await?;
+            )
+        };
+        let destination = mint().await?;
         info!(
             backup_id,
             service_id,
@@ -330,23 +345,23 @@ impl BackupEngine for WorkerAgentEngine {
 
         // A node already running its maximum of backups and restores is
         // waited for (bounded, within this backup's own runtime limit)
-        // instead of failing the backup.
-        let request = crate::node_busy::retry_while_node_busy(
+        // instead of failing the backup; a try after a wait gets a credential
+        // minted after it.
+        let request = crate::node_busy::retry_while_node_busy_with_fresh_credential(
             &crate::node_busy::NodeBusyPolicy::DEFAULT,
-            || {
+            destination,
+            mint,
+            |destination| {
                 deps.manager
-                    .backup_worker_service(service_id, destination.clone(), key.clone())
+                    .backup_worker_service(service_id, destination, key.clone())
             },
-            |wait| wait_for_node_slot(backup_id, service_id, wait),
+            |wait| wait_for_node_slot_minting(backup_id, service_id, wait),
         );
         let response = tokio::select! {
             // Dropping the request ends it on the node too: the agent removes
             // its helper and aborts the upload.
             _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-            response = request => match response {
-                Ok(response) => response,
-                Err(never) => match never {},
-            },
+            response = request => response?,
         }
         .map_err(|e| BackupError::Failed {
             reason: format!(

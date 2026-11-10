@@ -335,23 +335,26 @@ pub(super) async fn run(
             ),
         });
     };
-    let destination = worker_agent::scoped_destination(
-        scoper,
-        db.as_ref(),
-        backup.s3_source_id,
-        temps_providers::worker_s3_scope::WorkerS3Grant::job(
-            target.id,
-            node_id,
-            repository,
-            temps_core::ScopedS3Access::Read,
+    let mint = || async {
+        worker_agent::scoped_destination(
+            scoper,
+            db.as_ref(),
+            backup.s3_source_id,
+            temps_providers::worker_s3_scope::WorkerS3Grant::job(
+                target.id,
+                node_id,
+                repository.clone(),
+                temps_core::ScopedS3Access::Read,
+                "restore",
+            ),
             "restore",
-        ),
-        "restore",
-    )
-    .await
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id}: {e}"),
-    })?;
+        )
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })
+    };
+    let destination = mint().await?;
 
     // The last safe point: once the node stops the server, the run can no
     // longer be cancelled.
@@ -372,13 +375,16 @@ pub(super) async fn run(
     );
     // A node already running its maximum of backups and restores is waited
     // for, visibly and cancellably, instead of failing the run.
-    let outcome = crate::node_busy::retry_while_node_busy(
+    // A try after a wait gets a credential minted after it.
+    let outcome = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
-        || {
+        destination,
+        mint,
+        |destination| {
             mgr.walg_restore_worker_postgres(
                 target.id,
                 restored_login.as_ref(),
-                destination.clone(),
+                destination,
                 backup.s3_location.clone(),
                 recovery_target.clone(),
                 target_user_data.clone(),

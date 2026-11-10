@@ -336,39 +336,41 @@ async fn physical_backup_on_worker(
 ) -> Result<Option<MariadbBinlogCoordinate>, BackupError> {
     // A credential for the service's WAL-G repository only (ADR-093), the
     // one prefix `wal-g backup-push` writes.
-    let target = super::worker_agent::scoped_destination(
-        &deps.worker_credentials,
-        deps.db.as_ref(),
-        s3_source_id,
-        temps_providers::worker_s3_scope::WorkerS3Grant::job(
-            service.id,
-            node_id,
-            node_half::walg_key_prefix(bucket_path, &service.name),
-            temps_core::ScopedS3Access::Write,
+    let mint = || {
+        super::worker_agent::scoped_destination(
+            &deps.worker_credentials,
+            deps.db.as_ref(),
+            s3_source_id,
+            temps_providers::worker_s3_scope::WorkerS3Grant::job(
+                service.id,
+                node_id,
+                node_half::walg_key_prefix(bucket_path, &service.name),
+                temps_core::ScopedS3Access::Write,
+                "backup",
+            ),
             "backup",
-        ),
-        "backup",
-    )
-    .await?;
-    let request = crate::node_busy::retry_while_node_busy(
+        )
+    };
+    let target = mint().await?;
+    // A try after a wait for a slot gets a credential minted after it.
+    let request = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
-        || {
+        target,
+        mint,
+        |target| {
             deps.manager.mariadb_physical_backup_worker(
                 service.id,
-                target.clone(),
+                target,
                 bucket_path.to_string(),
                 backup_uuid.to_string(),
             )
         },
-        |wait| super::worker_agent::wait_for_node_slot(ctx.backup_id, service.id, wait),
+        |wait| super::worker_agent::wait_for_node_slot_minting(ctx.backup_id, service.id, wait),
     );
     let result = tokio::select! {
         // Dropping the request ends it on the node too.
         _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
-        result = request => match result {
-            Ok(result) => result,
-            Err(never) => match never {},
-        },
+        result = request => result?,
     }
     .map_err(|e| BackupError::Failed {
         reason: format!(
