@@ -316,6 +316,19 @@ impl MigrateCommand {
                     println!("{} {}", "✓".green(), message.green());
                 }
                 if !self.dry_run {
+                    // The schema ledger can be current while a committed-batch
+                    // authorization backfill is unfinished. Resume it before
+                    // reporting maintenance success, preserving Ctrl+C cancellation.
+                    tokio::select! {
+                        result = temps_schema::run_migrations(&db) => {
+                            result.map_err(|error| anyhow::anyhow!("{error}"))?;
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            return Err(interrupted_maintenance_error(
+                                &self.database_url, backend_pid, "legacy vault-link backfill",
+                            ).await);
+                        }
+                    }
                     // Non-transactional maintenance must remain retryable even
                     // after every schema migration is already recorded.
                     run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json)
@@ -954,6 +967,39 @@ fn format_elapsed(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{race_maintenance, MaintenanceRace};
+
+    #[tokio::test]
+    async fn migrate_command_resumes_links_with_no_pending_schema_and_dry_run_does_not_write() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping migrate command retry: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection();
+        db.execute_unprepared("INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9951,'Fixture','repo','owner','/','main','nodejs','cli-backfill-fixture',now(),now()); INSERT INTO access_vaults(id,project_id,name,service_ids) VALUES('vault_cli_retry',9951,'Fixture',ARRAY[]::text[])").await.unwrap();
+        assert!(temps_schema::get_pending_migration_names(db)
+            .await
+            .unwrap()
+            .is_empty());
+        for dry_run in [true, false] {
+            let mut command = parse(&["--yes"]).unwrap();
+            command.database_url = test.database_url.clone();
+            command.dry_run = dry_run;
+            tokio::task::spawn_blocking(move || command.execute())
+                .await
+                .unwrap()
+                .unwrap();
+            let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+                "SELECT EXISTS(SELECT 1 FROM access_vault_links WHERE id='link_legacy_vault_cli_retry') AS linked")).await.unwrap().unwrap();
+            assert_eq!(row.try_get::<bool>("", "linked").unwrap(), !dry_run);
+        }
+        test.cleanup().await;
+    }
 
     #[test]
     fn data_dir_prefers_the_configured_directory() {
