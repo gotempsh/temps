@@ -1211,6 +1211,8 @@ mod tests {
             "temps-git",
             "temps-kv",
             "temps-log-aggregator",
+            // MCP regression routers exercise the same project guard as REST replay.
+            "temps-mcp-server",
             "temps-monitoring",
             "temps-observability",
             "temps-otel",
