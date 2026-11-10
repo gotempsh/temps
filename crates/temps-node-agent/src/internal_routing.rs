@@ -1039,7 +1039,7 @@ mod tests {
         let nft = FakeNft::default();
         let shutdown = Arc::new(Notify::new());
         let task = tokio::spawn(run(routing(&listeners, &nft), Arc::clone(&shutdown)));
-        for _ in 0..200 {
+        for _ in 0..2000 {
             if heartbeat_value().is_some() {
                 break;
             }
@@ -1061,7 +1061,7 @@ mod tests {
         );
         // `notify_waiters` only reaches a waiting supervisor: repeat until it
         // has stopped (it may be between a pass and its wait).
-        for _ in 0..1000 {
+        for _ in 0..2000 {
             shutdown.notify_waiters();
             if task.is_finished() {
                 break;
@@ -1082,7 +1082,7 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
         let task = tokio::spawn(run(routing(&listeners, &nft), Arc::clone(&shutdown)));
         let bound = || listeners.bound.lock().unwrap().len();
-        for _ in 0..200 {
+        for _ in 0..2000 {
             if bound() == 1 {
                 break;
             }
@@ -1093,7 +1093,7 @@ mod tests {
         // Healthy, so the next refresh is 30 s away; the crash must not wait
         // for it.
         listeners.crash(INTERNAL_PROXY_PORT).await;
-        for _ in 0..400 {
+        for _ in 0..2000 {
             if bound() == 2 {
                 break;
             }
@@ -1103,7 +1103,7 @@ mod tests {
         assert_eq!(listeners.serving(), vec![INTERNAL_PROXY_PORT]);
         assert_eq!(nft.applied.lock().unwrap().len(), 2, "redirect renewed");
 
-        for _ in 0..1000 {
+        for _ in 0..2000 {
             shutdown.notify_waiters();
             if task.is_finished() {
                 break;

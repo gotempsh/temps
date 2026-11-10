@@ -145,6 +145,26 @@ async fn envelope(response: axum::response::Response) -> (u16, Value) {
     )
 }
 
+/// The envelope of an agent backup or restore, asked again while the node
+/// answers 429. A node runs two data operations at a time; the control
+/// plane waits for a slot and asks again, and so does this, since every
+/// proof in this process shares the node's slots.
+async fn admitted<F, Fut>(call: F) -> (u16, Value)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = axum::response::Response>,
+{
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let (status, body) = envelope(call().await).await;
+        if status == 429 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        return (status, body);
+    }
+}
+
 async fn container_id(docker: &Docker, name: &str) -> Option<String> {
     docker
         .inspect_container(
@@ -244,11 +264,29 @@ fn control_plane_parameters(engine: &Engine) -> HashMap<String, Value> {
     parameters
 }
 
+/// A local port nothing listens on, for a container to publish.
+///
+/// Not one the kernel picks for port 0: that comes from the ephemeral range
+/// (32768+ on Linux, 49152+ on macOS), which is also where the outgoing
+/// connections the other proofs in this process open get their source
+/// ports, so one of them can take it before Docker binds it. These come
+/// from 20000-31999, start at an offset of this process's ID (so parallel
+/// test processes start apart), and are never handed out twice in a
+/// process.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .expect("a free local port")
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let start = std::process::id().wrapping_mul(97) % SPAN;
+    for _ in 0..SPAN {
+        let offset = (start + NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN;
+        let port = u16::try_from(FIRST + offset).expect("below 32000");
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free local port in {FIRST}-{}", FIRST + SPAN - 1);
 }
 
 fn as_strings(parameters: &HashMap<String, Value>) -> HashMap<String, String> {
@@ -565,6 +603,12 @@ async fn every_engine_on_a_worker_is_created_probed_provisioned_and_controlled_b
 
 /// `sh -c`-free exec in `container`: exit code and stdout.
 async fn exec(docker: &Docker, container: &str, cmd: &[&str]) -> (i64, String) {
+    let (code, stdout, _stderr) = exec_output(docker, container, cmd).await;
+    (code, stdout)
+}
+
+/// [`exec`], with what the command wrote to stderr.
+async fn exec_output(docker: &Docker, container: &str, cmd: &[&str]) -> (i64, String, String) {
     let output = temps_docker_util::exec_capture(
         docker,
         container,
@@ -585,6 +629,7 @@ async fn exec(docker: &Docker, container: &str, cmd: &[&str]) -> (i64, String) {
     (
         output.exit_code.unwrap_or(-1),
         output.stdout.trim().to_string(),
+        output.stderr.trim().to_string(),
     )
 }
 
@@ -626,14 +671,17 @@ async fn walg_backup(
     agent: &Arc<AgentState>,
     request: &temps_service_protocol::PostgresWalgBackupRequest,
 ) -> temps_service_protocol::PostgresWalgBackupResult {
-    let (status, body) = envelope(
-        temps_node_agent::service_data_handlers::postgres_walg_backup(
-            State(agent.clone()),
-            Json(request.clone()),
-        )
-        .await
-        .into_response(),
-    )
+    let (status, body) = admitted(|| {
+        let (agent, request) = (agent.clone(), request.clone());
+        async move {
+            temps_node_agent::service_data_handlers::postgres_walg_backup(
+                State(agent),
+                Json(request),
+            )
+            .await
+            .into_response()
+        }
+    })
     .await;
     assert_eq!(status, 200, "the WAL-G backup did not run: {body}");
     serde_json::from_value(body["data"].clone()).expect("a WAL-G backup result")
@@ -654,14 +702,17 @@ async fn walg_restore(
     agent: &Arc<AgentState>,
     request: &temps_service_protocol::PostgresWalgRestoreRequest,
 ) -> temps_service_protocol::PostgresWalgRestoreResult {
-    let (status, body) = envelope(
-        temps_node_agent::service_data_handlers::postgres_walg_restore(
-            State(agent.clone()),
-            Json(request.clone()),
-        )
-        .await
-        .into_response(),
-    )
+    let (status, body) = admitted(|| {
+        let (agent, request) = (agent.clone(), request.clone());
+        async move {
+            temps_node_agent::service_data_handlers::postgres_walg_restore(
+                State(agent),
+                Json(request),
+            )
+            .await
+            .into_response()
+        }
+    })
     .await;
     assert_eq!(status, 200, "the WAL-G restore did not run: {body}");
     serde_json::from_value(body["data"].clone()).expect("a WAL-G restore result")
@@ -1223,14 +1274,17 @@ async fn a_worker_postgres_archive_is_turned_on_and_repointed_through_its_agent(
         bucket_path: bucket_path.to_string(),
     };
     let repoint = |request: PostgresWalgArchiveRequest| async move {
-        let (status, body) = envelope(
-            temps_node_agent::service_data_handlers::postgres_walg_archive(
-                State(fixture.agent.clone()),
-                Json(request),
-            )
-            .await
-            .into_response(),
-        )
+        let (status, body) = admitted(|| {
+            let (agent, request) = (fixture.agent.clone(), request.clone());
+            async move {
+                temps_node_agent::service_data_handlers::postgres_walg_archive(
+                    State(agent),
+                    Json(request),
+                )
+                .await
+                .into_response()
+            }
+        })
         .await;
         assert_eq!(status, 200, "the re-point did not run: {body}");
         serde_json::from_value::<PostgresWalgArchiveResult>(body["data"].clone())
@@ -2347,18 +2401,19 @@ async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
         session_token: None,
     };
     let prefix = "external_services/s3/proof/backup-1";
-    let (status, body) = envelope(
-        data_backup(
-            State(agent.clone()),
-            Json(RemoteServiceBackupRequest {
-                service_config: config.clone(),
-                destination: destination.clone(),
-                key: prefix.to_string(),
-            }),
-        )
-        .await
-        .into_response(),
-    )
+    let (status, body) = admitted(|| {
+        let request = RemoteServiceBackupRequest {
+            service_config: config.clone(),
+            destination: destination.clone(),
+            key: prefix.to_string(),
+        };
+        let agent = agent.clone();
+        async move {
+            data_backup(State(agent), Json(request))
+                .await
+                .into_response()
+        }
+    })
     .await;
     assert_eq!(status, 200, "the backup failed: {body}");
 
@@ -2369,18 +2424,19 @@ async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
     put("docs/00.txt".to_string(), "changed after the backup").await;
     assert_eq!(objects().await.len(), 45);
 
-    let (status, body) = envelope(
-        data_restore(
-            State(agent.clone()),
-            Json(RemoteServiceRestoreRequest {
-                service_config: config.clone(),
-                source: destination,
-                location: prefix.to_string(),
-            }),
-        )
-        .await
-        .into_response(),
-    )
+    let (status, body) = admitted(|| {
+        let request = RemoteServiceRestoreRequest {
+            service_config: config.clone(),
+            source: destination.clone(),
+            location: prefix.to_string(),
+        };
+        let agent = agent.clone();
+        async move {
+            data_restore(State(agent), Json(request))
+                .await
+                .into_response()
+        }
+    })
     .await;
     assert_eq!(status, 200, "the restore failed: {body}");
     let restored = objects().await;
@@ -2453,6 +2509,15 @@ impl MongoFixture {
             parameters: json!({ "docker_image": image, "database": "admin", "username": "admin" }),
             expected_env: &[],
         });
+        // The generated password may start with `-`, which a tool given it
+        // as a separate argument takes for an option; make every proof's
+        // password do so, so that case is always exercised.
+        let generated = parameters
+            .get("password")
+            .and_then(Value::as_str)
+            .expect("a generated password")
+            .to_string();
+        parameters.insert("password".into(), json!(format!("-{generated}")));
         parameters.insert("port".into(), json!(free_port().to_string()));
         let params = ExternalServiceManager::remote_create_params(
             9,
@@ -2614,14 +2679,30 @@ impl MongoFixture {
         // root login; wait until it does, for a bounded time.
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let (code, out) = fixture.mongosh(&fixture.password(), "print('ready')").await;
+            let (code, out, err) = fixture
+                .mongosh_output(&fixture.password(), "print('ready')")
+                .await;
             if code == 0 && out.ends_with("ready") {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "mongod never accepted the root login: {code} {out}"
-            );
+            if Instant::now() >= deadline {
+                let state = fixture
+                    .docker
+                    .inspect_container(
+                        &fixture.container,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                    .map(|inspect| {
+                        format!("{:?}, restarts {:?}", inspect.state, inspect.restart_count)
+                    })
+                    .unwrap_or_else(|e| format!("not inspectable: {e}"));
+                let err: String = err.chars().take(2000).collect();
+                panic!(
+                    "mongod never accepted the root login within 120 s: mongosh exited {code}, \
+                     stdout {out:?}, stderr {err:?}; container {state}"
+                );
+            }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         Some(fixture)
@@ -2637,7 +2718,19 @@ impl MongoFixture {
     /// `script` against database `shop`, logged in as the root user with
     /// `password`: exit code and output.
     async fn mongosh(&self, password: &str, script: &str) -> (i64, String) {
-        exec(
+        let (code, stdout, _stderr) = self.mongosh_output(password, script).await;
+        (code, stdout)
+    }
+
+    /// [`Self::mongosh`], with what it wrote to stderr, the password
+    /// masked.
+    ///
+    /// The password is passed attached (`--password=...`): a generated one
+    /// may start with `-`, and given as the next argument mongosh would take
+    /// it for an unknown option, never log in, and echo it in its error.
+    async fn mongosh_output(&self, password: &str, script: &str) -> (i64, String, String) {
+        let password_arg = format!("--password={password}");
+        let (code, stdout, stderr) = exec_output(
             &self.docker,
             &self.container,
             &[
@@ -2645,8 +2738,7 @@ impl MongoFixture {
                 "--quiet",
                 "--username",
                 "admin",
-                "--password",
-                password,
+                &password_arg,
                 "--authenticationDatabase",
                 "admin",
                 "shop",
@@ -2654,7 +2746,13 @@ impl MongoFixture {
                 script,
             ],
         )
-        .await
+        .await;
+        let stderr = if password.is_empty() {
+            stderr
+        } else {
+            stderr.replace(password, "***")
+        };
+        (code, stdout, stderr)
     }
 
     /// The `x` of every document in `shop.proof`, in `_id` order.
@@ -2767,22 +2865,26 @@ async fn mongo_backup(fixture: &MongoFixture, path: MongoPath, uuid: &str) -> Mo
                 temps_core::ScopedS3Access::Write,
             )
             .await;
-            let (status, body) = envelope(
-                temps_node_agent::service_data_handlers::mongodb_backup(
-                    State(fixture.agent.clone()),
-                    Json(MongodbBackupRequest {
-                        service_id: 9,
-                        node_id: 2,
-                        service_config: fixture.config.clone(),
-                        destination,
-                        bucket_path: MONGO_BUCKET_PATH.to_string(),
-                        backup_uuid: uuid.to_string(),
-                        mode,
-                    }),
-                )
-                .await
-                .into_response(),
-            )
+            let (status, body) = admitted(|| {
+                let request = MongodbBackupRequest {
+                    service_id: 9,
+                    node_id: 2,
+                    service_config: fixture.config.clone(),
+                    destination: destination.clone(),
+                    bucket_path: MONGO_BUCKET_PATH.to_string(),
+                    backup_uuid: uuid.to_string(),
+                    mode: mode.clone(),
+                };
+                let agent = fixture.agent.clone();
+                async move {
+                    temps_node_agent::service_data_handlers::mongodb_backup(
+                        State(agent),
+                        Json(request),
+                    )
+                    .await
+                    .into_response()
+                }
+            })
             .await;
             assert_eq!(status, 200, "the agent did not run the backup: {body}");
             let result: MongodbBackupResult =
@@ -2870,14 +2972,17 @@ async fn mongo_restore(
                 .await,
                 ..request
             };
-            let (status, body) = envelope(
-                temps_node_agent::service_data_handlers::mongodb_restore(
-                    State(fixture.agent.clone()),
-                    Json(request),
-                )
-                .await
-                .into_response(),
-            )
+            let (status, body) = admitted(|| {
+                let (agent, request) = (fixture.agent.clone(), request.clone());
+                async move {
+                    temps_node_agent::service_data_handlers::mongodb_restore(
+                        State(agent),
+                        Json(request),
+                    )
+                    .await
+                    .into_response()
+                }
+            })
             .await;
             assert_eq!(status, 200, "the agent did not run the restore: {body}");
             match serde_json::from_value(body["data"].clone()).expect("a MongoDB restore result") {
@@ -3340,11 +3445,12 @@ async fn redis_route<Request, Outcome, Handler, Fut>(
     request: Request,
 ) -> Outcome
 where
-    Handler: FnOnce(State<Arc<AgentState>>, Json<Request>) -> Fut,
+    Request: Clone,
+    Handler: Fn(State<Arc<AgentState>>, Json<Request>) -> Fut,
     Fut: std::future::Future<Output = axum::response::Response>,
     Outcome: serde::de::DeserializeOwned,
 {
-    let (status, body) = envelope(handler(State(agent.clone()), Json(request)).await).await;
+    let (status, body) = admitted(|| handler(State(agent.clone()), Json(request.clone()))).await;
     assert_eq!(status, 200, "the Redis operation did not run: {body}");
     serde_json::from_value(body["data"].clone())
         .unwrap_or_else(|e| panic!("a Redis outcome ({e}): {body}"))
@@ -3937,17 +4043,10 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = axum::response::Response>,
 {
-    let deadline = Instant::now() + Duration::from_secs(600);
-    loop {
-        let (status, body) = envelope(call().await).await;
-        if status == 429 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        assert_eq!(status, 200, "the MariaDB {what} did not run: {body}");
-        return serde_json::from_value(body["data"].clone())
-            .unwrap_or_else(|e| panic!("a MariaDB {what} result: {e}: {body}"));
-    }
+    let (status, body) = admitted(call).await;
+    assert_eq!(status, 200, "the MariaDB {what} did not run: {body}");
+    serde_json::from_value(body["data"].clone())
+        .unwrap_or_else(|e| panic!("a MariaDB {what} result: {e}: {body}"))
 }
 
 /// Whether the data directory still holds the original kept aside by a

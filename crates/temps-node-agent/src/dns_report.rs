@@ -407,7 +407,15 @@ mod tests {
             answers: 0,
             source: "10.237.1.20".parse().expect("ip"),
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The observer's own task moves a logged query into the ring; wait
+        // for it rather than for a fixed time a loaded runner can outlast.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while dns.observer().snapshot(None, None).queries.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observer logged the query within 10 s");
 
         let router = app(dns.clone());
         let response = call(

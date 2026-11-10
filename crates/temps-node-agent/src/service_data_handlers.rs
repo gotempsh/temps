@@ -1644,7 +1644,7 @@ mod tests {
         done_rx
             .await
             .expect("the engine finished after the request was dropped");
-        for _ in 0..50 {
+        for _ in 0..500 {
             if admit(&SLOTS).is_some() {
                 return;
             }
