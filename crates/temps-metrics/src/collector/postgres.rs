@@ -10,8 +10,10 @@
 //! 1. `pg_stat_activity` — client-backend connection counts by state
 //!    (active/idle/idle-in-txn/other + total), long-running and blocked query
 //!    counts. Engine background processes are excluded.
-//! 2. `pg_stat_database` — cache-hit ratio, commits, rollbacks, deadlocks,
-//!    temp file usage, tuple DML rates, tuple fetch vs. return ratio
+//! 2. `pg_stat_database` — shared-buffer block counters (the scraper turns
+//!    them into the windowed cache hit ratio, see
+//!    [`crate::cache_hit_window`]), commits, rollbacks, deadlocks, temp file
+//!    usage, tuple DML rates, tuple fetch vs. return ratio
 //! 3. `pg_stat_replication` — per-replica write and replay lag (seconds)
 //! 4. `pg_stat_checkpointer` / `pg_stat_bgwriter` — checkpoint rates
 //! 5. `pg_stat_wal` (PG 15+) — WAL bytes, records, full-page images, buffer
@@ -32,6 +34,7 @@ use tokio_postgres::NoTls;
 use tracing::{debug, warn};
 
 use super::{Collector, CollectorConfig};
+use crate::cache_hit_window::{PG_BLKS_HIT, PG_BLKS_READ, PG_STATS_RESET};
 use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint};
 
@@ -383,7 +386,7 @@ async fn collect_metrics(
     }
 
     // -------------------------------------------------------------------------
-    // 2. pg_stat_database — cache hit ratio, commits, rollbacks, deadlocks,
+    // 2. pg_stat_database — block counters, commits, rollbacks, deadlocks,
     //    temp file usage, tuple DML counters, tuple fetch/return ratio.
     //
     //    Each metric is emitted twice:
@@ -391,9 +394,20 @@ async fn collect_metrics(
     //      * once UNLABELLED as an instance-wide aggregate.
     //    The stat tiles read the unlabelled row so they show the whole
     //    instance, not one arbitrary database (the store's latest-value query
-    //    can only pick one row per metric name). Sums are plain SUM; the two
-    //    ratios are recomputed from summed numerators/denominators so they stay
+    //    can only pick one row per metric name). Sums are plain SUM; the fetch
+    //    ratio is recomputed from summed numerators/denominators so it stays
     //    mathematically correct (you cannot average per-db ratios).
+    //
+    //    `blks_hit` / `blks_read` are reported raw, never as a ratio: they are
+    //    lifetime counters (PostgreSQL 15+ keeps them across a clean restart),
+    //    so a ratio of them reflects history, not the current workload. The
+    //    scraper derives `pg.cache_hit_ratio` from their deltas over a
+    //    trailing window (`crate::cache_hit_window`). They are reported per
+    //    database only: the scraper builds the instance-wide window from the
+    //    per-database deltas, because a summed counter goes backwards when a
+    //    database is dropped and would read as a reset. Each database's
+    //    `stats_reset` time goes with them so the window can drop the
+    //    interval spanning a `pg_stat_reset()`.
     //    Internal Postgres databases (template0, template1) are excluded.
     // -------------------------------------------------------------------------
     {
@@ -403,7 +417,8 @@ async fn collect_metrics(
                         xact_commit, xact_rollback, deadlocks, \
                         temp_files, temp_bytes, \
                         tup_inserted, tup_updated, tup_deleted, \
-                        tup_returned, tup_fetched \
+                        tup_returned, tup_fetched, \
+                        EXTRACT(EPOCH FROM stats_reset)::float8 \
                  FROM pg_stat_database \
                  WHERE datname NOT IN ('template0', 'template1') \
                    AND datname IS NOT NULL",
@@ -412,8 +427,6 @@ async fn collect_metrics(
             .await?;
 
         // Instance-wide accumulators for the unlabelled aggregate points.
-        let mut sum_blks_hit: i64 = 0;
-        let mut sum_blks_read: i64 = 0;
         let mut sum_commit: i64 = 0;
         let mut sum_rollback: i64 = 0;
         let mut sum_deadlocks: i64 = 0;
@@ -439,9 +452,8 @@ async fn collect_metrics(
             let tup_deleted: i64 = row.get(10);
             let tup_returned: i64 = row.get(11);
             let tup_fetched: i64 = row.get(12);
+            let stats_reset: Option<f64> = row.get(13);
 
-            sum_blks_hit += blks_hit;
-            sum_blks_read += blks_read;
             sum_commit += xact_commit;
             sum_rollback += xact_rollback;
             sum_deadlocks += deadlocks;
@@ -456,22 +468,28 @@ async fn collect_metrics(
             let mut db_labels = HashMap::new();
             db_labels.insert("datname".into(), datname.to_owned());
 
-            let total_blks = blks_hit + blks_read;
-            let cache_hit_ratio = if total_blks > 0 {
-                blks_hit as f64 / total_blks as f64
-            } else {
-                1.0 // No blocks read yet — treat as 100 % cache hit.
-            };
-
+            // Counters: callers receive raw cumulative values; the scraper
+            // computes deltas before writing to the store.
             points.push(make_point(
-                "pg.cache_hit_ratio",
-                cache_hit_ratio,
+                PG_BLKS_HIT,
+                blks_hit as f64,
+                MetricKind::Counter,
+                db_labels.clone(),
+            ));
+            points.push(make_point(
+                PG_BLKS_READ,
+                blks_read as f64,
+                MetricKind::Counter,
+                db_labels.clone(),
+            ));
+            // Lets the cache hit window drop the interval spanning a
+            // `pg_stat_reset()`, which the per-counter delta step can miss.
+            points.push(make_point(
+                PG_STATS_RESET,
+                stats_reset.unwrap_or(0.0),
                 MetricKind::Gauge,
                 db_labels.clone(),
             ));
-
-            // Counters: callers receive raw cumulative values; the scraper
-            // computes deltas before writing to the store.
             points.push(make_point(
                 "pg.commits_total",
                 xact_commit as f64,
@@ -544,34 +562,12 @@ async fn collect_metrics(
 
         // Instance-wide aggregates (no `datname` label). The stat tiles read
         // these so they reflect the whole instance rather than one database.
-        let total_blks = sum_blks_hit + sum_blks_read;
-        let instance_cache_hit_ratio = if total_blks > 0 {
-            sum_blks_hit as f64 / total_blks as f64
-        } else {
-            1.0
-        };
         let instance_fetch_ratio = if sum_returned > 0 {
             sum_fetched as f64 / sum_returned as f64
         } else {
             1.0
         };
 
-        points.push(make_point(
-            "pg.cache_hit_ratio",
-            instance_cache_hit_ratio,
-            MetricKind::Gauge,
-            HashMap::new(),
-        ));
-        // Lifetime block accesses behind the ratio. A new server's first
-        // reads all miss the cache, so alert rules on the ratio are only
-        // evaluated once this is large enough to mean something. A gauge (not
-        // a `_total` counter) because the evaluator needs the absolute volume.
-        points.push(make_point(
-            "pg.cache_blocks_accessed",
-            total_blks as f64,
-            MetricKind::Gauge,
-            HashMap::new(),
-        ));
         points.push(make_point(
             "pg.tuple_fetch_ratio",
             instance_fetch_ratio,

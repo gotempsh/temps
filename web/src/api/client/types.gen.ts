@@ -20454,7 +20454,11 @@ export type MonitoringSettings = {
     retention_raw_days?: number;
     /**
      * How often the MetricsScraper collects data from all sources, in seconds.
-     * Minimum effective value is 10 s; values below that are clamped at runtime.
+     * Saving accepts 15 to 300 s: windowed metrics such as the Postgres
+     * cache hit ratio need several scrapes in their 15 minutes. A value
+     * above 300 s stored before that limit is kept
+     * when a save leaves it unchanged, and the MetricsScraper clamps it to
+     * 300 s at runtime, as it clamps anything below 10 s to 10 s.
      */
     scrape_interval_secs?: number;
     /**
