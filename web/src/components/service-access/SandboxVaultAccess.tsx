@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { Button } from '@temps-sdk/ui'
+import { Button, Skeleton } from '@temps-sdk/ui'
 import { Callout, ResponsivePagination } from '@temps-sdk/ds'
 import { sandboxAccessVaultsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { SandboxServices } from './SandboxServices'
@@ -31,7 +31,20 @@ export function SandboxVaultAccess({
           <Button onClick={() => void vaults.refetch()}>Retry</Button>
         </Callout>
       ) : vaults.isPending ? (
-        <p role="status">Loading available vaults…</p>
+        <div
+          role="status"
+          aria-label="Loading available vaults"
+          className="space-y-3"
+        >
+          {[0, 1, 2].map((row) => (
+            <div key={row}>
+              <div className="flex items-center justify-between rounded-lg border p-3">
+                <Skeleton className="h-5 w-40" />
+                <Skeleton className="h-9 w-28" />
+              </div>
+            </div>
+          ))}
+        </div>
       ) : vaults.data?.total === 0 ? (
         <Callout title="Grant access">
           No vault is linked to this sandbox. An instance administrator can link

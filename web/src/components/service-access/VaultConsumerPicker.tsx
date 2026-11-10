@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Button } from '@temps-sdk/ui'
+import { Button, Skeleton } from '@temps-sdk/ui'
 import { Callout, ResponsivePagination } from '@temps-sdk/ds'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
@@ -47,7 +47,13 @@ export function VaultConsumerPicker({
           </Button>
         </Callout>
       ) : query.isPending ? (
-        <p role="status">Loading {kind}s…</p>
+        <div role="status" aria-label="Loading consumers" className="space-y-3">
+          {[0, 1, 2].map((row) => (
+            <div key={row}>
+              <Skeleton className="h-9 w-32 rounded-md" />
+            </div>
+          ))}
+        </div>
       ) : !rows?.length ? (
         <p>No {kind}s on this page.</p>
       ) : (

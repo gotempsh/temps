@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
-import { Button } from '@temps-sdk/ui'
+import { Button, Skeleton } from '@temps-sdk/ui'
 import { Callout, ResponsivePagination } from '@temps-sdk/ds'
 import { projectAccessVaultsOptions } from '@/api/client/@tanstack/react-query.gen'
 
@@ -23,7 +23,20 @@ export function ProjectVaultAccess({ projectId }: { projectId: number }) {
           <Button onClick={() => void vaults.refetch()}>Retry</Button>
         </Callout>
       ) : vaults.isPending ? (
-        <p role="status">Loading linked vaults…</p>
+        <div
+          role="status"
+          aria-label="Loading linked vaults"
+          className="space-y-3"
+        >
+          {[0, 1, 2].map((row) => (
+            <div key={row}>
+              <div className="space-y-2 rounded-lg border p-3">
+                <Skeleton className="h-5 w-40" />
+                <Skeleton className="h-4 w-64 max-w-full" />
+              </div>
+            </div>
+          ))}
+        </div>
       ) : vaults.data?.total === 0 ? (
         <Callout title="No vaults linked">
           An administrator can link a vault to this project. Sandbox owners can

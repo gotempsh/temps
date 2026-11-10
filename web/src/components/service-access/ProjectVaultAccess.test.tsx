@@ -47,3 +47,22 @@ test('project linked vaults are read-only and point to sandbox consent', () => {
   expect(html).not.toContain('Unlink')
   expect(html).not.toContain('Edit')
 })
+
+test('loading displays skeleton rows before consumer data arrives', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ProjectVaultAccess projectId={7} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('aria-label="Loading linked vaults"')
+    expect(html).toContain('animate-pulse')
+  } finally {
+    client.clear()
+  }
+})

@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { MemoryRouter } from 'react-router'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { expect, test } from 'bun:test'
 import {
   cleanup,
@@ -56,5 +58,24 @@ test('project consumers show the shared project icon and preserve selection', as
     cleanup()
     client.clear()
     api.restore()
+  }
+})
+
+test('loading displays skeleton rows before consumer data arrives', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <VaultConsumerPicker kind="project" onSelect={() => {}} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('aria-label="Loading consumers"')
+    expect(html).toContain('animate-pulse')
+  } finally {
+    client.clear()
   }
 })

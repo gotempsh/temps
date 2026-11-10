@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { MemoryRouter } from 'react-router'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, expect, test } from 'bun:test'
 import {
   cleanup,
@@ -48,7 +50,7 @@ test('unlink requires a revocation confirmation and preserves failures', async (
     const ui = within(document.body)
     await waitFor(() => expect(ui.getByText('Fixture project')).toBeTruthy())
     fireEvent.click(ui.getByRole('button', { name: 'Unlink' }))
-    const dialog = within(ui.getByRole('dialog'))
+    const dialog = within(ui.getByRole('alertdialog'))
     expect(dialog.getByText(/Live sessions and grants/)).toBeTruthy()
     expect(
       api.called('DELETE', '/access-vaults/vault_fixture/links/link_fixture')
@@ -59,10 +61,33 @@ test('unlink requires a revocation confirmation and preserves failures', async (
     await waitFor(() =>
       expect(dialog.getByText('Storage temporarily unavailable')).toBeTruthy()
     )
-    expect(ui.getByText('Fixture project')).toBeTruthy()
+    expect(
+      within(ui.getByRole('table', { hidden: true })).getByText(
+        'Fixture project'
+      )
+    ).toBeTruthy()
   } finally {
     cleanup()
     client.clear()
     api.restore()
+  }
+})
+
+test('loading displays skeleton rows before consumer data arrives', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('aria-label="Loading links"')
+    expect(html).toContain('animate-pulse')
+  } finally {
+    client.clear()
   }
 })

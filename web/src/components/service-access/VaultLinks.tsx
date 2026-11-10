@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Button,
+  Skeleton,
   Dialog,
   DialogContent,
   DialogHeader,
@@ -17,6 +18,7 @@ import {
 } from '@/api/client'
 import { listVaultLinksOptions } from '@/api/client/@tanstack/react-query.gen'
 import { VaultConsumerPicker } from './VaultConsumerPicker'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { problemDetail } from '@/lib/api-problem'
 
 export function VaultLinks({ vaultId }: { vaultId: string }) {
@@ -77,7 +79,16 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
         </Callout>
       )}
       {links.isPending ? (
-        <p role="status">Loading links…</p>
+        <div role="status" aria-label="Loading links" className="space-y-3">
+          {[0, 1, 2].map((row) => (
+            <div key={row}>
+              <div className="flex items-center justify-between border-b p-3">
+                <Skeleton className="h-5 w-40" />
+                <Skeleton className="h-9 w-16" />
+              </div>
+            </div>
+          ))}
+        </div>
       ) : links.data?.items.length === 0 ? (
         <p>
           No consumers linked. Link a project or sandbox before approving
@@ -166,36 +177,33 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
           </Button>
         </DialogContent>
       </Dialog>
-      <Dialog
+      <ConfirmDeleteDialog
         open={!!removing}
         onOpenChange={(next) => {
-          if (!next && !remove.isPending) setRemoving(undefined)
+          if (!next) setRemoving(undefined)
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Unlink consumer?</DialogTitle>
-          </DialogHeader>
-          <p>
-            Live sessions and grants approved through this link will be revoked.
-          </p>
-          {remove.isError && (
-            <Callout tone="error" title="Could not unlink consumer">
-              {problemDetail(remove.error, 'Retry unlinking.')}
-            </Callout>
-          )}
-          <Button
-            variant="destructive"
-            disabled={remove.isPending}
-            aria-busy={remove.isPending}
-            onClick={() => {
-              if (removing) remove.mutate(removing)
-            }}
-          >
-            Unlink and revoke access
-          </Button>
-        </DialogContent>
-      </Dialog>
+        resourceType="consumer"
+        resourceName={removing?.consumer_name ?? removing?.id ?? ''}
+        verb="Unlink"
+        confirmLabel="Unlink and revoke access"
+        isPending={remove.isPending}
+        consequences={
+          <>
+            <p>
+              Live sessions and grants approved through this link will be
+              revoked.
+            </p>
+            {remove.isError && (
+              <Callout tone="error" title="Could not unlink consumer">
+                {problemDetail(remove.error, 'Retry unlinking.')}
+              </Callout>
+            )}
+          </>
+        }
+        onConfirm={() => {
+          if (removing) remove.mutate(removing)
+        }}
+      />
     </section>
   )
 }

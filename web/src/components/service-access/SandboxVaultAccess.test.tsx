@@ -74,3 +74,22 @@ test('unlinked sandboxes keep the grant-access onboarding visible', () => {
   expect(html).toContain('AI chat')
   expect(html).toContain('href="/vault"')
 })
+
+test('loading displays skeleton rows before consumer data arrives', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SandboxVaultAccess sandboxId="sbx_fixture" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('aria-label="Loading available vaults"')
+    expect(html).toContain('animate-pulse')
+  } finally {
+    client.clear()
+  }
+})
