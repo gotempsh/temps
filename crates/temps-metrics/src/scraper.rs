@@ -91,6 +91,16 @@ type ClusterPrimaries = Arc<StdMutex<HashMap<i32, String>>>;
 /// Minimum scrape interval enforced at runtime regardless of configuration.
 const MIN_INTERVAL_SECS: u64 = 10;
 
+/// The scrape interval the loop actually uses for a configured value, and
+/// whether it differs from it. Settings saved through the API are already
+/// within bounds; a value stored before the maximum existed is capped at
+/// [`temps_config::MAX_SCRAPE_INTERVAL_SECS`] so windowed metrics (the
+/// Postgres cache hit ratio) keep whole scrape intervals inside their window.
+fn effective_interval_secs(configured: u64) -> (u64, bool) {
+    let effective = configured.clamp(MIN_INTERVAL_SECS, temps_config::MAX_SCRAPE_INTERVAL_SECS);
+    (effective, effective != configured)
+}
+
 /// Timeout given to each per-service collector task.
 const COLLECTOR_TIMEOUT_SECS: u64 = 5;
 
@@ -186,10 +196,22 @@ impl MetricsScraper {
             // Re-read interval each cycle — live settings changes take effect
             // without a binary restart.
             let interval_secs = match self.config_service.get_settings().await {
-                Ok(settings) => settings
-                    .monitoring
-                    .scrape_interval_secs
-                    .max(MIN_INTERVAL_SECS),
+                Ok(settings) => {
+                    let configured = settings.monitoring.scrape_interval_secs;
+                    let (effective, adjusted) = effective_interval_secs(configured);
+                    if adjusted && configured > effective {
+                        warn!(
+                            configured_secs = configured,
+                            effective_secs = effective,
+                            "MetricsScraper: monitoring.scrape_interval_secs is above the \
+                             maximum; scraping every {effective}s so the Postgres cache hit \
+                             ratio (last 15 minutes) keeps whole scrapes in its window. Save \
+                             the monitoring settings with an interval of at most {effective}s \
+                             to clear this warning"
+                        );
+                    }
+                    effective
+                }
                 Err(e) => {
                     warn!("MetricsScraper: failed to read settings, using default 30s: {e}");
                     30
@@ -1187,6 +1209,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effective_interval_keeps_the_configured_value_within_bounds() {
+        assert_eq!(effective_interval_secs(30), (30, false));
+        assert_eq!(effective_interval_secs(1), (MIN_INTERVAL_SECS, true));
+        assert_eq!(
+            effective_interval_secs(900),
+            (temps_config::MAX_SCRAPE_INTERVAL_SECS, true)
+        );
+        assert_eq!(
+            effective_interval_secs(temps_config::MAX_SCRAPE_INTERVAL_SECS),
+            (temps_config::MAX_SCRAPE_INTERVAL_SECS, false)
+        );
+    }
+
+    /// Scraping at the maximum interval, plus a slow cycle on top, must still
+    /// leave whole intervals in the cache hit window: a ratio is served.
+    #[tokio::test]
+    async fn the_maximum_scrape_interval_still_serves_a_cache_hit_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // The loop sleeps the interval after each cycle, so scrapes are the
+        // interval plus the cycle's duration apart.
+        let gap_secs = temps_config::MAX_SCRAPE_INTERVAL_SECS as i64 + 30;
+        let start = chrono::DateTime::<chrono::Utc>::from_timestamp(1_760_000_000, 0).unwrap();
+        let mut counters = (0.0, 0.0);
+        let mut last = Vec::new();
+        for scrape in 0..6 {
+            counters.0 += 9_900.0;
+            counters.1 += 100.0;
+            let mut points = pg_blocks(0, counters.0, counters.1);
+            for p in &mut points {
+                p.time = start + chrono::Duration::seconds(scrape * gap_secs);
+            }
+            last = finish_points(&baselines, &windows, 7, points).await;
+        }
+        let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+        assert!(served(&last, "pg.cache_blocks_accessed").unwrap() >= 20_000.0);
+    }
+
+    // ── windowed Postgres cache hit ratio ──────────────────────────────────
     // ── windowed Postgres cache hit ratio ──────────────────────────────────
 
     /// One Postgres scrape's raw, lifetime `blks_hit` / `blks_read` counters

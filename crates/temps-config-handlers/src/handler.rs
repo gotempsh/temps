@@ -3177,6 +3177,17 @@ fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), P
             .detail("monitoring.scrape_interval_secs must be >= 15")
             .build());
     }
+    if monitoring.scrape_interval_secs > temps_config::MAX_SCRAPE_INTERVAL_SECS {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "monitoring.scrape_interval_secs is {}, above the maximum of {} \
+                 seconds: windowed metrics such as the Postgres cache hit ratio \
+                 (last 15 minutes) need at least two scrapes inside their window",
+                monitoring.scrape_interval_secs,
+                temps_config::MAX_SCRAPE_INTERVAL_SECS
+            ))
+            .build());
+    }
     if !(1..=30).contains(&monitoring.retention_raw_days) {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail("monitoring.retention_raw_days must be between 1 and 30")
@@ -6511,6 +6522,33 @@ mod tests {
             error.body.get("detail").and_then(|value| value.as_str()),
             Some("monitoring.clickhouse_url is not a valid URL")
         );
+    }
+
+    #[test]
+    fn monitoring_validation_bounds_the_scrape_interval() {
+        for secs in [15, temps_config::MAX_SCRAPE_INTERVAL_SECS] {
+            let monitoring = MonitoringSettings {
+                scrape_interval_secs: secs,
+                ..Default::default()
+            };
+            assert!(validate_monitoring_settings(&monitoring).is_ok(), "{secs}");
+        }
+
+        // 15 minutes would leave the cache hit ratio's window empty forever.
+        let monitoring = MonitoringSettings {
+            scrape_interval_secs: 900,
+            ..Default::default()
+        };
+        let error = validate_monitoring_settings(&monitoring)
+            .expect_err("a scrape interval above the maximum must be rejected");
+        let detail = error
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("is 900"), "{detail}");
+        assert!(detail.contains("maximum of 300 seconds"), "{detail}");
+        assert!(detail.contains("cache hit ratio"), "{detail}");
     }
 
     #[test]

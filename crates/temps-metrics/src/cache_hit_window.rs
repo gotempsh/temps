@@ -41,8 +41,11 @@
 //! scrape leaves the counter baselines alone, so the first delta after an
 //! outage covers the whole outage. When that is longer than the window, the
 //! delta cannot honestly be called "the last 15 minutes": the series reports
-//! nothing until the window holds intervals again. (So does a configured
-//! scrape interval longer than the window.)
+//! nothing until the window holds intervals again. A configured scrape
+//! interval could cause the same on every scrape, so it is capped at
+//! `temps_config::MAX_SCRAPE_INTERVAL_SECS` (5 minutes): rejected above that
+//! when the settings are saved, and clamped with a warning by the scraper for
+//! a value stored before the cap existed.
 //!
 //! Memory is bounded: one entry per scrape per series, and at the minimum
 //! 10 s scrape interval a 15-minute window holds 90 entries of 32 bytes.

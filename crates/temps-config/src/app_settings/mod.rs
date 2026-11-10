@@ -1881,6 +1881,17 @@ pub enum MetricsStoreKind {
 
 /// Global metrics observability configuration.
 ///
+/// Longest accepted `monitoring.scrape_interval_secs`.
+///
+/// Windowed metrics are computed from the deltas between scrapes: the
+/// Postgres cache hit ratio covers the last 15 minutes
+/// (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`) and only counts
+/// scrape intervals that lie entirely inside that window. Five minutes keeps
+/// at least two whole intervals in it. A longer interval would leave the
+/// window empty on every scrape, so the ratio and its alarm would silently
+/// stop.
+pub const MAX_SCRAPE_INTERVAL_SECS: u64 = 300;
+
 /// Controls whether the MetricsScraper and AlertEvaluator background tasks
 /// are active, which storage backend they write to, and how long data is kept
 /// at each retention tier.
