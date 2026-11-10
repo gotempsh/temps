@@ -223,8 +223,8 @@ pub enum ApiToolError {
     },
 
     #[error(
-        "Operation '{operation_id}' was given a secret reference for '{field}', but no \
-         secrets are available in this context. Nothing was sent."
+        "Operation '{operation_id}' requires secret input for '{field}', but no \
+         secret-input flow is available in this context. Use the console or REST API for this operation. Nothing was sent."
     )]
     SecretsUnavailable { operation_id: String, field: String },
 

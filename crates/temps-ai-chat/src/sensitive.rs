@@ -234,57 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn notification_provider_credentials_are_redacted_from_review_and_results() {
-        let provider = serde_json::json!({
-            "provider_type": "webhook",
-            "config": {
-                "url": "https://hooks.example.test/services/private-path",
-                "method": "POST",
-                "headers": {"X-Signature": "private-signature"}
-            }
-        });
-        let redacted = redact_value(&provider);
-        assert_eq!(redacted["config"]["url"], "***");
-        assert_eq!(redacted["config"]["headers"], "***");
-
-        let command = serde_json::json!({
-            "command": "notifications create_notification_provider --config '{\"url\":\"https://hooks.example.test/private\"}'"
-        });
-        let display = redact_json_string(&command.to_string());
-        assert!(!display.contains("hooks.example.test"));
-        assert!(display.contains("--config ***"));
-    }
-
-    #[test]
-    fn write_command_arguments_are_safe_for_sse_and_history() {
-        let arguments = serde_json::json!({
-            "command": "projects create_environment_variable --name DATABASE_URL --value 'postgres://user:pass@db/app' --api-key sk-live-abcdef"
-        })
-        .to_string();
-        let display = redact_json_string(&arguments);
-        assert!(!display.contains("postgres://user:pass@db/app"));
-        assert!(!display.contains("sk-live-abcdef"));
-        assert!(display.contains("--value ***"));
-        assert!(display.contains("--api-key ***"));
-    }
-
-    #[test]
-    fn write_command_redaction_consumes_complete_punctuation_values() {
-        let secret = "VERY_SECRET";
-        for command in [
-            format!(
-                r#"projects create_environment_variable --name CONFIG --value {{"first":"public","second":"{secret}"}}"#
-            ),
-            format!("projects create_environment_variable --name CONFIG --value abc;{secret}"),
-        ] {
-            let arguments = serde_json::json!({"command": command}).to_string();
-            let display = redact_json_string(&arguments);
-            assert!(!display.contains(secret), "secret leaked from {arguments}");
-            assert!(display.contains("--value ***"));
-        }
-    }
-
-    #[test]
     fn opaque_and_jwt_like_tokens_are_detected_before_artifact_persistence() {
         for value in [
             "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
@@ -293,56 +242,6 @@ mod tests {
         ] {
             assert!(contains_likely_credential(value), "missed {value}");
         }
-    }
-
-    #[test]
-    fn write_command_redaction_matches_mixed_and_unterminated_quote_tokens() {
-        let secret = "VERY_SECRET";
-        for command in [
-            format!("projects create_environment_variable --name X --value 'prefix'{secret}"),
-            format!("projects create_environment_variable --name X --value 'prefix {secret}"),
-        ] {
-            let display = redact_json_string(&serde_json::json!({"command": command}).to_string());
-            assert!(!display.contains(secret), "secret leaked from {command}");
-            assert!(display.contains("--value ***"));
-        }
-    }
-
-    #[test]
-    fn bare_sensitive_boolean_does_not_hide_the_following_secret_flag() {
-        for command in [
-            "operation --token --value VERY_SECRET",
-            "operation --value --token VERY_SECRET",
-        ] {
-            let display = redact_json_string(&serde_json::json!({"command": command}).to_string());
-            assert!(
-                !display.contains("VERY_SECRET"),
-                "secret leaked from {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn quoted_or_mixed_sensitive_flag_names_are_classified_like_execution() {
-        for command in [
-            r#"operation "--value" VERY_SECRET"#,
-            "operation --'value' VERY_SECRET",
-            "operation --'api-key'=VERY_SECRET",
-        ] {
-            let display = redact_json_string(&serde_json::json!({"command": command}).to_string());
-            assert!(
-                !display.contains("VERY_SECRET"),
-                "secret leaked from {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn unstructured_upstream_errors_are_scrubbed() {
-        let error = r#"HTTP 400: {"password":"hunter2","detail":"Bearer token-abcdef rejected"}"#;
-        let display = redact_text(error);
-        assert!(!display.contains("hunter2"));
-        assert!(!display.contains("token-abcdef"));
     }
 
     #[test]

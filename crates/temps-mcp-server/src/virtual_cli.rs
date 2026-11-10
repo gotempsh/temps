@@ -312,7 +312,7 @@ mod tests {
         }));
         let api: utoipa::openapi::OpenApi = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},"paths":{"/projects":{
             "get":{"operationId":"read_fixture","tags":["Projects"],"responses":{"200":{"description":"ok"}}},
-            "post":{"operationId":"write_fixture","tags":["Projects"],"responses":{"200":{"description":"ok"}}}
+            "post":{"operationId":"write_fixture","tags":["Projects"],"requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"secret_key":{"type":"string","x-temps-secret":true}}}}}},"responses":{"200":{"description":"ok"}}}
         }}})).unwrap();
         let read = Arc::new(temps_ai_api_tools::ApiToolsHandle::new());
         read.set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
@@ -378,6 +378,41 @@ mod tests {
         assert_eq!(error.rpc_code(), crate::protocol::INVALID_PARAMS);
         assert!(error.to_string().contains("--help"));
     }
+    #[tokio::test]
+    async fn credential_input_is_rejected_before_proposing_without_a_secret_flow() {
+        let (state, writes, audit) = fixture();
+        for value in [
+            "fixture-private-value",
+            "secret_ref:v1:0123456789abcdef0123456789abcdef",
+        ] {
+            let error = execute(
+                &state,
+                &auth(3, true),
+                "temps_write",
+                &json!({"command":format!("write_fixture --secret_key {value}")}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.rpc_code(), crate::protocol::INVALID_PARAMS);
+            let message = error.to_string();
+            assert!(message.contains("write_fixture"));
+            assert!(message.contains("console or REST API"));
+            assert!(!message.contains(value));
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(audit.0.lock().unwrap().is_empty());
+        // An omitted optional credential still permits an ordinary proposal.
+        let proposal = execute(
+            &state,
+            &auth(3, true),
+            "temps_write",
+            &json!({"command":"write_fixture"}),
+        )
+        .await
+        .unwrap();
+        assert!(proposal.proposal_token.is_some());
+    }
+
     #[tokio::test]
     async fn proposal_requires_same_key_expires_and_executes_once_with_audit() {
         let (state, writes, audit) = fixture();

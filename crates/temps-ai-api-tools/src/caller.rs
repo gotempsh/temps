@@ -965,8 +965,19 @@ impl InternalApiCaller {
                     self.default_limit,
                     self.max_limit,
                 )
-                .and_then(|built| self.validate_plugin_route(op, &built))
-                {
+                .and_then(|built| {
+                    self.validate_plugin_route(op, &built)?;
+                    if scope.secrets.is_none() {
+                        if let Some(body) = &built.body {
+                            crate::secrets::validate_without_resolver(
+                                &op.operation_id,
+                                body,
+                                self.index.secret_fields(&op.operation_id),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                }) {
                     Err(e) => WritePrepareOutcome::Invalid(format!(
                         "{e}\nRun `{} --help` to check its flags.",
                         op.operation_id
