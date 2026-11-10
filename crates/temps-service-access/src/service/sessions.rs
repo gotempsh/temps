@@ -239,6 +239,7 @@ impl ServiceAccessService {
             project_id: Set(project_id),
             vault_id: Set(vault_id.into()),
             link_id: Set(Some(link.id)),
+            legacy_project_link: Set(false),
             bundle_id: Set(bundle.id),
             bundle_name: Set(bundle.name),
             bundle_version: Set(bundle.version),

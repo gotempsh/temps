@@ -425,9 +425,11 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
     db.execute_unprepared("UPDATE sandboxes SET status='running' WHERE id BETWEEN 10001 AND 10128")
         .await
         .unwrap();
+    // Leave clock-skew headroom below the 60-second cap: this tests capacity,
+    // not equality between the database clock and the signing host's clock.
     db.execute_unprepared(&format!(r#"
 INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at)
-SELECT 'grant_'||replace(gen_random_uuid()::text,'-',''),9601,g.service_id,r.sandbox_id,g.service_version,g.policy_snapshot,9601,now()+interval '60 seconds'
+SELECT 'grant_'||replace(gen_random_uuid()::text,'-',''),9601,g.service_id,r.sandbox_id,g.service_version,g.policy_snapshot,9601,now()+interval '50 seconds'
 FROM sandbox_access_runtimes r CROSS JOIN sandbox_service_grants g
 WHERE r.sandbox_id BETWEEN 10001 AND 10128 AND g.id='{}';
 INSERT INTO sandbox_access_authorizations(grant_id,request_id,requested_ttl,runtime_id,project_id,sandbox_id,approved_by)

@@ -1272,8 +1272,11 @@ mod tests {
         let ordinary = caller
             .execute_write("create_access_session_general", json!({}), &scope)
             .await
-            .unwrap();
-        assert_eq!(ordinary.status, 403);
+            .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            crate::ApiToolError::Upstream { status: 403, .. }
+        ));
         let confirmed = caller
             .execute_approved_write("create_access_session_general", json!({}), &scope, None)
             .await

@@ -11,7 +11,10 @@ import {
 } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
+import {
+  BreadcrumbProvider,
+  useBreadcrumbs,
+} from '@/contexts/BreadcrumbContext'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import AccessSessionCreatePage from './AccessSessionCreatePage'
@@ -23,6 +26,20 @@ afterEach(async () => {
   })
 })
 const date = '2026-01-01T00:00:00Z'
+function BreadcrumbLinks() {
+  const { breadcrumbs } = useBreadcrumbs()
+  return (
+    <nav aria-label="Breadcrumbs">
+      {breadcrumbs
+        .filter((item) => item.href)
+        .map((item, index) => (
+          <a key={index} href={item.href}>
+            {item.label}
+          </a>
+        ))}
+    </nav>
+  )
+}
 const service = {
   id: 'svc_test',
   name: 'Example API',
@@ -125,10 +142,11 @@ test('session approval binds reviewed policies and preserves consent identity on
       <QueryClientProvider client={client}>
         <MemoryRouter
           initialEntries={[
-            '/vault/vaults/vault_test/bundles/bundle_test/sessions/new',
+            '/vault/vaults/vault_test/bundles/bundle_test/sessions/new?sandbox=sbx_ready',
           ]}
         >
           <BreadcrumbProvider>
+            <BreadcrumbLinks />
             <Routes>
               <Route
                 path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
@@ -141,6 +159,13 @@ test('session approval binds reviewed policies and preserves consent identity on
     )
     const ui = within(document.body)
     await waitFor(() => expect(ui.getByLabelText(/Ready sandbox/)).toBeTruthy())
+    await waitFor(() =>
+      expect(
+        within(ui.getByRole('navigation', { name: 'Breadcrumbs' }))
+          .getByRole('link', { name: 'Work' })
+          .getAttribute('href')
+      ).toBe('/vault/vaults/vault_test?sandbox=sbx_ready')
+    )
     expect(
       (ui.getByLabelText(/Stopped sandbox/) as HTMLInputElement).disabled
     ).toBe(true)

@@ -101,8 +101,9 @@ still enforce grant/runtime/sandbox identity when project is absent.
 ## Migration and rollback
 
 Use a new migration; do not edit shipped migrations. Create a link for each
-existing vault's former project before removing ownership semantics. Backfill
-existing sessions to that link without changing IDs, consent payloads, TTLs,
+existing vault's former project before removing ownership semantics. Resolve existing sessions to that link using a constant-default legacy marker
+and the deterministic legacy link ID, without rewriting historical session rows
+under the schema lock or changing IDs, consent payloads, TTLs,
 revocation timestamps, grants or worker incarnations. Preserve existing service
 and bundle membership. Existing standalone services and direct grants retain
 their restricted legacy authorization until explicitly adopted by an admin;
@@ -114,7 +115,9 @@ original renewal scope.
 
 Retain former-project columns as nullable historical metadata during transition,
 remove cascading ownership semantics, and introduce independent vault foreign
-keys. Backfill large tables in bounded batches. Refuse a downgrade that cannot
+keys. PostgreSQL's constant default preserves legacy provenance without a table
+rewrite; newly issued sessions store an explicit link and never use the legacy
+fallback. Removing the legacy link still revokes its sessions transactionally. Refuse a downgrade that cannot
 represent the links, projectless consumers or retained authorization history.
 Empty databases may roll back; any credential or authorization data makes the
 downgrade refuse. Never silently discard general resources to restore the old

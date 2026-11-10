@@ -608,7 +608,7 @@ async fn grant_routes_honor_project_permission_narrowing_and_checker_failures() 
     ] {
         for (method, path, body) in routes()
             .into_iter()
-            .filter(|(_, path, _)| path.contains("/sandboxes/"))
+            .filter(|(_, path, _)| path.starts_with("/projects/") && path.contains("/sandboxes/"))
         {
             let audit = Arc::new(Audit::default());
             let mut state = state(

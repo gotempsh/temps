@@ -12,7 +12,7 @@ complete access approval in this chat. A sandbox does not need a project.
 1. Identify the sandbox the person selected or linked to this chat; never pick
    another user's sandbox. Read `general_access_capability` and
    the sandbox_access_vaults operation for that sandbox, then `list_access_bundles_general`
-   and `get_access_vault_general` with its `sandbox_id` to inspect masked policy
+   and `get_access_vault_general` with its sandbox ID query parameter to inspect masked policy
    versions. Follow pagination; do not assume the first page is the whole list.
 2. Explain the bundle's services, origins, methods, paths, target sandbox and
    fixed lifetime. Secrets stay in the vault and are never copied into chat,

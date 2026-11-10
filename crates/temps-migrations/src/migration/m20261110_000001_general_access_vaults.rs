@@ -33,18 +33,12 @@ INSERT INTO access_vault_links(id, vault_id, project_id, created_at)
  SELECT 'link_legacy_' || id, id, project_id, created_at FROM access_vaults WHERE project_id IS NOT NULL
  ON CONFLICT DO NOTHING;
 ALTER TABLE access_sessions ADD COLUMN IF NOT EXISTS link_id text REFERENCES access_vault_links(id) ON DELETE SET NULL;
-DO $$ DECLARE affected integer; BEGIN
- LOOP
-  WITH batch AS (
-   SELECT s.id,l.id AS link_id FROM access_sessions s JOIN access_vault_links l
-     ON l.vault_id=s.vault_id AND l.project_id=s.project_id
-   WHERE s.link_id IS NULL ORDER BY s.id LIMIT 1000
-  ) UPDATE access_sessions s SET link_id=batch.link_id FROM batch WHERE s.id=batch.id;
-  GET DIAGNOSTICS affected=ROW_COUNT;
-  EXIT WHEN affected=0;
- END LOOP;
-END $$;
-CREATE INDEX IF NOT EXISTS access_sessions_link ON access_sessions(link_id);
+-- PostgreSQL's constant default records legacy provenance without rewriting
+-- historical sessions under the ALTER TABLE lock. New approvals use explicit links.
+ALTER TABLE access_sessions ADD COLUMN IF NOT EXISTS legacy_project_link boolean NOT NULL DEFAULT true;
+ALTER TABLE access_sessions ALTER COLUMN legacy_project_link SET DEFAULT false;
+CREATE INDEX IF NOT EXISTS access_sessions_link ON access_sessions((COALESCE(link_id, CASE WHEN legacy_project_link THEN 'link_legacy_' || vault_id END)));
+CREATE INDEX IF NOT EXISTS sandbox_service_grants_service ON sandbox_service_grants(service_id);
 CREATE INDEX IF NOT EXISTS access_sessions_grants ON access_sessions USING gin(grant_ids);
 CREATE INDEX IF NOT EXISTS access_vaults_page ON access_vaults(created_at DESC,id DESC) WHERE retired_at IS NULL;
 CREATE INDEX IF NOT EXISTS access_vaults_services ON access_vaults USING gin(service_ids);
@@ -77,15 +71,15 @@ CREATE OR REPLACE FUNCTION access_vault_link_revoked() RETURNS trigger AS $$
 BEGIN
  IF TG_OP='DELETE' THEN
   UPDATE sandbox_service_grants g SET revoked_at=now(), version=g.version+1
-   WHERE g.revoked_at IS NULL AND EXISTS (SELECT 1 FROM access_sessions s WHERE s.link_id=OLD.id AND s.grant_ids @> ARRAY[g.id]);
-  UPDATE access_sessions SET revoked_at=now() WHERE link_id=OLD.id AND revoked_at IS NULL;
+   WHERE g.revoked_at IS NULL AND EXISTS (SELECT 1 FROM access_sessions s WHERE COALESCE(s.link_id, CASE WHEN s.legacy_project_link THEN 'link_legacy_' || s.vault_id END)=OLD.id AND s.grant_ids @> ARRAY[g.id]);
+  UPDATE access_sessions SET revoked_at=now() WHERE COALESCE(link_id, CASE WHEN legacy_project_link THEN 'link_legacy_' || vault_id END)=OLD.id AND revoked_at IS NULL;
   RETURN OLD;
  END IF;
  IF OLD.revoked_at IS NULL AND NEW.revoked_at IS NOT NULL THEN
   UPDATE sandbox_service_grants g SET revoked_at=NEW.revoked_at, version=g.version+1
    WHERE g.revoked_at IS NULL AND EXISTS (
-    SELECT 1 FROM access_sessions s WHERE s.link_id=OLD.id AND s.grant_ids @> ARRAY[g.id]);
-  UPDATE access_sessions SET revoked_at=NEW.revoked_at WHERE link_id=OLD.id AND revoked_at IS NULL;
+    SELECT 1 FROM access_sessions s WHERE COALESCE(s.link_id, CASE WHEN s.legacy_project_link THEN 'link_legacy_' || s.vault_id END)=OLD.id AND s.grant_ids @> ARRAY[g.id]);
+  UPDATE access_sessions SET revoked_at=NEW.revoked_at WHERE COALESCE(link_id, CASE WHEN legacy_project_link THEN 'link_legacy_' || vault_id END)=OLD.id AND revoked_at IS NULL;
  END IF;
  RETURN NULL;
 END;
@@ -112,6 +106,8 @@ DO $$ BEGIN
  END IF;
 END $$;
 ALTER TABLE access_sessions DROP COLUMN link_id;
+ALTER TABLE access_sessions DROP COLUMN legacy_project_link;
+DROP INDEX sandbox_service_grants_service;
 DROP TABLE access_vault_links;
 DROP FUNCTION access_vault_link_revoked();
 DROP INDEX access_sessions_grants;
@@ -189,7 +185,7 @@ INSERT INTO access_sessions(id,project_id,vault_id,bundle_id,bundle_name,bundle_
 "#).await.unwrap();
         crate::Migrator::up(db, None).await.unwrap();
         let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,
-            "SELECT s.link_id,s.revoked_at IS NULL AND g.revoked_at IS NULL AS live, s.consent->>'immutable' AS consent, s.expires_at=g.expires_at AS lifetime,l.project_id FROM access_sessions s JOIN access_vault_links l ON l.id=s.link_id JOIN sandbox_service_grants g ON g.id='grant_migration' WHERE s.id='session_migration'".to_owned())).await.unwrap().unwrap();
+            "SELECT l.id AS link_id,s.legacy_project_link AND s.link_id IS NULL AS migrated_without_rewrite,s.revoked_at IS NULL AND g.revoked_at IS NULL AS live, s.consent->>'immutable' AS consent, s.expires_at=g.expires_at AS lifetime,l.project_id FROM access_sessions s JOIN access_vault_links l ON l.id=COALESCE(s.link_id,CASE WHEN s.legacy_project_link THEN 'link_legacy_' || s.vault_id END) JOIN sandbox_service_grants g ON g.id='grant_migration' WHERE s.id='session_migration'".to_owned())).await.unwrap().unwrap();
         assert_eq!(
             row.try_get::<String>("", "link_id").unwrap(),
             "link_legacy_vault_migration"
@@ -197,6 +193,7 @@ INSERT INTO access_sessions(id,project_id,vault_id,bundle_id,bundle_name,bundle_
         assert_eq!(row.try_get::<i32>("", "project_id").unwrap(), 9921);
         assert_eq!(row.try_get::<String>("", "consent").unwrap(), "consent");
         assert!(row.try_get::<bool>("", "live").unwrap());
+        assert!(row.try_get::<bool>("", "migrated_without_rewrite").unwrap());
         assert!(row.try_get::<bool>("", "lifetime").unwrap());
         assert!(Migration
             .down(&SchemaManager::new(db))

@@ -49,12 +49,22 @@ export default function AccessBundleDetailPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Vault', href: '/vault' },
-      { label: vault.data?.vault.name ?? 'Vault', href: base },
+      {
+        label: vault.data?.vault.name ?? 'Vault',
+        href: `${base}${consumerQuery}`,
+      },
       { label: 'Access bundles', href: back },
       { label: bundle.data?.name ?? 'Access bundle' },
     ])
     return () => setBreadcrumbs([])
-  }, [setBreadcrumbs, vault.data?.vault.name, bundle.data?.name, base, back])
+  }, [
+    setBreadcrumbs,
+    vault.data?.vault.name,
+    bundle.data?.name,
+    base,
+    back,
+    consumerQuery,
+  ])
   const error = bundle.error || vault.error
   const services =
     vault.data?.services.filter((service) =>

@@ -14,7 +14,7 @@ impl ServiceAccessService {
         let row = db
             .query_one(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT id FROM access_vaults WHERE service_ids @> ARRAY[$1] ORDER BY id LIMIT 1",
+                "SELECT id FROM access_vaults WHERE retired_at IS NULL AND service_ids @> ARRAY[$1] ORDER BY id LIMIT 1",
                 [service_id.into()],
             ))
             .await
@@ -71,8 +71,8 @@ impl ServiceAccessService {
             .map_err(|e| AccessError::resource_database("read retiring service", service_id, e))?
             .ok_or_else(|| not_found("service", service_id.into(), None))?;
         for sql in [
-            "UPDATE sandbox_service_grants g SET revoked_at=now(),version=version+1 WHERE revoked_at IS NULL AND (service_id=$1 OR EXISTS (SELECT 1 FROM access_sessions s JOIN access_bundles b ON b.id=s.bundle_id WHERE b.service_ids @> ARRAY[$1] AND s.grant_ids @> ARRAY[g.id]))",
-            "UPDATE access_sessions s SET revoked_at=now() FROM access_bundles b WHERE b.id=s.bundle_id AND b.service_ids @> ARRAY[$1] AND s.revoked_at IS NULL",
+            "UPDATE sandbox_service_grants g SET revoked_at=now(),version=version+1 WHERE revoked_at IS NULL AND (service_id=$1 OR EXISTS (SELECT 1 FROM access_sessions s JOIN sandbox_service_grants affected ON s.grant_ids @> ARRAY[affected.id] WHERE affected.service_id=$1 AND s.grant_ids @> ARRAY[g.id]))",
+            "UPDATE access_sessions s SET revoked_at=now() WHERE s.revoked_at IS NULL AND EXISTS (SELECT 1 FROM sandbox_service_grants g WHERE s.grant_ids @> ARRAY[g.id] AND g.service_id=$1)",
             "UPDATE access_bundles SET retired_at=now() WHERE service_ids @> ARRAY[$1] AND retired_at IS NULL",
             "UPDATE access_vaults SET service_ids=array_remove(service_ids,$1),version=version+1,updated_at=now() WHERE service_ids @> ARRAY[$1]",
             "UPDATE sandbox_access_services SET retired_at=now(),enabled=false,credential_encrypted=NULL,version=version+1,updated_at=now() WHERE id=$1 AND retired_at IS NULL",
@@ -490,6 +490,26 @@ mod tests {
             matches!(service.require_standalone_service(db.as_ref(), "svc_fixture").await,
             Err(AccessError::VaultSessionRequired { service_id, vault_id }) if service_id == "svc_fixture" && vault_id == vault.id)
         );
+        // Editing a bundle cannot rewrite the dependencies of issued consent.
+        db.execute_unprepared("INSERT INTO sandbox_access_services(id,name,policy,max_ttl_seconds,enabled) VALUES('svc_changed','Changed','{}',60,true); UPDATE access_bundles SET service_ids=ARRAY['svc_changed'],version=version+1 WHERE id='bundle_fixture'").await.unwrap();
+        service.retire_service("svc_changed").await.unwrap();
+        let unaffected = grants::Entity::find_by_id("grant_fixture")
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            unaffected.revoked_at.is_none(),
+            "the session never consented to the replacement service"
+        );
+        let unaffected_session =
+            temps_entities::access_sessions::Entity::find_by_id("session_fixture")
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(unaffected_session.revoked_at.is_none());
+        db.execute_unprepared("UPDATE access_bundles SET retired_at=NULL,service_ids=ARRAY['svc_fixture'] WHERE id='bundle_fixture'").await.unwrap();
         service.unlink_vault(&vault.id, &link.id).await.unwrap();
         let grant = grants::Entity::find_by_id("grant_fixture")
             .one(db.as_ref())
@@ -508,11 +528,41 @@ mod tests {
             .covering_vault_link(&vault.id, 9911, None)
             .await
             .is_err());
+        // Removing A from today's bundle must still revoke the whole older A+C session.
+        db.execute_unprepared("INSERT INTO sandbox_access_services(id,name,policy,max_ttl_seconds,enabled) VALUES('svc_retained','Retained','{}',60,true); INSERT INTO sandbox_service_grants(id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at) VALUES('grant_old_a','svc_fixture',9911,1,'{}',9911,now()+interval '60 seconds'),('grant_old_c','svc_retained',9911,1,'{}',9911,now()+interval '60 seconds'); INSERT INTO access_sessions(id,vault_id,link_id,bundle_id,bundle_name,bundle_version,consumer_kind,consumer_id,sandbox_id,created_by,consent,grant_ids,created_at,expires_at) SELECT 'session_old',vault_id,link_id,bundle_id,bundle_name,bundle_version,consumer_kind,consumer_id,sandbox_id,created_by,consent,ARRAY['grant_old_a','grant_old_c'],now(),now()+interval '60 seconds' FROM access_sessions WHERE id='session_fixture'; UPDATE access_bundles SET service_ids=ARRAY['svc_retained'] WHERE id='bundle_fixture'").await.unwrap();
+        db.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE access_vaults SET service_ids=ARRAY['svc_fixture','svc_retained'] WHERE id=$1",
+            [vault.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        service.retire_service("svc_fixture").await.unwrap();
+        assert!(
+            temps_entities::access_sessions::Entity::find_by_id("session_old")
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .revoked_at
+                .is_some()
+        );
+        assert!(grants::Entity::find_by_id("grant_old_c")
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_some());
         service
             .retire_vault_resource(&vault.id, None)
             .await
             .unwrap();
         assert!(service.get_vault(None, &vault.id).await.is_err());
+        service
+            .require_standalone_service(db.as_ref(), "svc_retained")
+            .await
+            .unwrap();
         // Connection-backed credentials cannot widen their source project's audience.
         let git_vault = service
             .save_vault(

@@ -10,6 +10,8 @@ pub struct Model {
     pub project_id: Option<i32>,
     pub vault_id: String,
     pub link_id: Option<String>,
+    /// Metadata-only migration marker; new approvals always store an explicit link.
+    pub legacy_project_link: bool,
     pub bundle_id: String,
     pub bundle_name: String,
     pub bundle_version: i32,

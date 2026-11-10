@@ -102,12 +102,22 @@ function SessionCreate({
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Vault', href: '/vault' },
-      { label: vault.data?.vault.name ?? 'Vault', href: base },
+      {
+        label: vault.data?.vault.name ?? 'Vault',
+        href: `${base}${consumerQuery}`,
+      },
       { label: bundle.data?.name ?? 'Access bundle', href: back },
       { label: 'Create session' },
     ])
     return () => setBreadcrumbs([])
-  }, [setBreadcrumbs, base, back, bundle.data?.name, vault.data?.vault.name])
+  }, [
+    setBreadcrumbs,
+    base,
+    back,
+    consumerQuery,
+    bundle.data?.name,
+    vault.data?.vault.name,
+  ])
   const error = bundle.error || vault.error || capability.error
   const canIssue =
     !error &&

@@ -52,7 +52,7 @@ impl PolicyPlanner {
         let grants = Candidate::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             r#"SELECT r.id AS runtime_id,
                CASE WHEN s.policy->'github_repository' IS NULL AND EXISTS (
-                   SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=session.link_id
+                   SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
                    WHERE session.grant_ids @> ARRAY[g.id] AND link.sandbox_id=b.id
                      AND link.revoked_at IS NULL AND session.revoked_at IS NULL
                ) THEN NULL ELSE a.project_id END AS project_id, a.approved_by,
@@ -98,7 +98,7 @@ impl PolicyPlanner {
                   AND d.revoked_at IS NULL AND (d.expires_at IS NULL OR d.expires_at>now()+interval '1 second')
                   AND d.grant_id=g.id))
               AND (NOT EXISTS (SELECT 1 FROM access_sessions session WHERE session.grant_ids @> ARRAY[g.id]) OR EXISTS (
-                SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=session.link_id
+                SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
                 WHERE session.grant_ids @> ARRAY[g.id] AND session.revoked_at IS NULL AND session.expires_at>now()
                   AND link.revoked_at IS NULL AND link.vault_id=session.vault_id
                   AND (link.sandbox_id=b.id OR link.project_id=b.project_id)))
