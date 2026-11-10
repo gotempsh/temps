@@ -43,8 +43,10 @@ pub enum WalProbeOutcome {
 /// What the service page gets for a service's WAL health.
 #[derive(Debug, Clone)]
 pub enum WalHealthReading {
+    /// The last check produced this snapshot.
     Snapshot(PostgresWalHealth),
-    /// No snapshot, and the last check said why.
+    /// The last check could not run and said why, whether or not an older
+    /// snapshot exists: that one no longer describes the database.
     Unchecked(WalHealthUnchecked),
     /// No snapshot and no recorded reason: not probed yet, or not Postgres.
     Missing,
@@ -52,7 +54,9 @@ pub enum WalHealthReading {
 
 /// `existing` health metadata with `outcome` recorded: a snapshot replaces
 /// the previous one and clears any recorded reason; a reason is recorded and
-/// the previous snapshot kept (its `probed_at` dates it).
+/// the previous snapshot kept (its `probed_at` dates it). A recorded reason
+/// is therefore always newer than the snapshot beside it, and is what
+/// [`wal_health_reading`] reads.
 pub(crate) fn record_wal_outcome(
     existing: Option<&serde_json::Value>,
     outcome: &WalProbeOutcome,
@@ -81,6 +85,37 @@ pub(crate) fn record_wal_outcome(
         }
     }
     Ok(serde_json::Value::Object(map))
+}
+
+/// The WAL health a service's `health_metadata` says: the reason the last
+/// check could not run when one is recorded (it is newer than any snapshot
+/// beside it, see [`record_wal_outcome`]), else the last snapshot. A value
+/// that does not parse is logged and skipped.
+pub(crate) fn wal_health_reading(
+    service_id: i32,
+    metadata: &serde_json::Value,
+) -> WalHealthReading {
+    if let Some(unchecked) = metadata.get(POSTGRES_WAL_UNCHECKED_KEY) {
+        match serde_json::from_value(unchecked.clone()) {
+            Ok(parsed) => return WalHealthReading::Unchecked(parsed),
+            Err(error) => tracing::warn!(
+                service_id,
+                error = %error,
+                "health_metadata.postgres_wal_unchecked did not parse"
+            ),
+        }
+    }
+    if let Some(snapshot) = metadata.get(POSTGRES_WAL_KEY) {
+        match serde_json::from_value(snapshot.clone()) {
+            Ok(parsed) => return WalHealthReading::Snapshot(parsed),
+            Err(error) => tracing::warn!(
+                service_id,
+                error = %error,
+                "health_metadata.postgres_wal did not parse"
+            ),
+        }
+    }
+    WalHealthReading::Missing
 }
 
 impl ExternalServiceManager {
@@ -141,8 +176,8 @@ impl ExternalServiceManager {
         }
     }
 
-    /// The WAL health the service page shows: the last snapshot, else why
-    /// the last check produced none.
+    /// The WAL health the service page shows: why the last check could not
+    /// run, when it could not, else the last snapshot.
     ///
     /// `ServiceNotFound` only when the row doesn't exist at all.
     pub async fn get_postgres_wal_health_reading(
@@ -150,30 +185,10 @@ impl ExternalServiceManager {
         service_id: i32,
     ) -> Result<WalHealthReading, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
-        let Some(metadata) = service.health_metadata else {
-            return Ok(WalHealthReading::Missing);
-        };
-        if let Some(snapshot) = metadata.get(POSTGRES_WAL_KEY) {
-            match serde_json::from_value(snapshot.clone()) {
-                Ok(parsed) => return Ok(WalHealthReading::Snapshot(parsed)),
-                Err(error) => tracing::warn!(
-                    service_id,
-                    error = %error,
-                    "health_metadata.postgres_wal did not parse"
-                ),
-            }
-        }
-        if let Some(unchecked) = metadata.get(POSTGRES_WAL_UNCHECKED_KEY) {
-            match serde_json::from_value(unchecked.clone()) {
-                Ok(parsed) => return Ok(WalHealthReading::Unchecked(parsed)),
-                Err(error) => tracing::warn!(
-                    service_id,
-                    error = %error,
-                    "health_metadata.postgres_wal_unchecked did not parse"
-                ),
-            }
-        }
-        Ok(WalHealthReading::Missing)
+        Ok(match service.health_metadata {
+            Some(metadata) => wal_health_reading(service_id, &metadata),
+            None => WalHealthReading::Missing,
+        })
     }
 }
 
@@ -220,6 +235,60 @@ mod tests {
             updated[POSTGRES_WAL_UNCHECKED_KEY]["reason"],
             "agent too old"
         );
+    }
+
+    /// A worker produced a snapshot, then its probe started failing: the
+    /// page must get the failure, not the old snapshot with HTTP 200, or its
+    /// "WAL health is not being checked" warning never shows.
+    #[test]
+    fn a_later_failure_is_read_instead_of_the_older_snapshot() {
+        let first = Utc::now();
+        let with_snapshot = record_wal_outcome(None, &WalProbeOutcome::Snapshot(snapshot()), first)
+            .expect("record");
+        assert!(matches!(
+            wal_health_reading(1, &with_snapshot),
+            WalHealthReading::Snapshot(_)
+        ));
+        let failed = record_wal_outcome(
+            Some(&with_snapshot),
+            &WalProbeOutcome::Unchecked("cannot reach the agent on node 2".to_string()),
+            first + chrono::Duration::minutes(5),
+        )
+        .expect("record");
+        match wal_health_reading(1, &failed) {
+            WalHealthReading::Unchecked(unchecked) => {
+                assert_eq!(unchecked.reason, "cannot reach the agent on node 2")
+            }
+            other => panic!("the newer failure must be read, got {other:?}"),
+        }
+        // The next snapshot clears it again.
+        let recovered = record_wal_outcome(
+            Some(&failed),
+            &WalProbeOutcome::Snapshot(snapshot()),
+            first + chrono::Duration::minutes(10),
+        )
+        .expect("record");
+        assert!(matches!(
+            wal_health_reading(1, &recovered),
+            WalHealthReading::Snapshot(_)
+        ));
+        assert!(matches!(
+            wal_health_reading(1, &serde_json::json!({})),
+            WalHealthReading::Missing
+        ));
+    }
+
+    /// A recorded reason that does not parse does not hide the snapshot.
+    #[test]
+    fn an_unreadable_reason_falls_back_to_the_snapshot() {
+        let metadata = serde_json::json!({
+            "postgres_wal": serde_json::to_value(snapshot()).unwrap(),
+            "postgres_wal_unchecked": "not an object",
+        });
+        assert!(matches!(
+            wal_health_reading(1, &metadata),
+            WalHealthReading::Snapshot(_)
+        ));
     }
 
     #[test]
