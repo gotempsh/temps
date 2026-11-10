@@ -71,7 +71,7 @@
 //! a value stored before the cap existed.
 //!
 //! Memory is bounded: one entry per scrape per series, and at the minimum
-//! 10 s scrape interval a 15-minute window holds 90 entries of 32 bytes.
+//! 10 s scrape interval a 15-minute window holds 90 entries of 40 bytes.
 //! There is one series per database of each monitored service, and a
 //! database that disappears from `pg_stat_database` is dropped on that
 //! source's next scrape. Nothing here does I/O.
@@ -492,6 +492,12 @@ mod tests {
                 .collect();
             windows.derive(1, batch);
         }
+    }
+
+    #[test]
+    fn an_interval_entry_is_the_size_the_memory_bound_documents() {
+        // The module docs bound a window at 90 entries of 40 bytes.
+        assert_eq!(std::mem::size_of::<Interval>(), 40);
     }
 
     #[test]
