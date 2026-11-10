@@ -931,12 +931,18 @@ impl AlertEvaluator {
                 // too little traffic to compute one: an idle Postgres window
                 // writes `pg.cache_blocks_accessed = 0` and no ratio. That is
                 // the same healthy state as a present ratio below the gate,
-                // so resolve an alarm it fired. With no volume metric either,
-                // there is simply no data yet.
-                if default_volume_gate(rule)
+                // so resolve an alarm it fired. Zero volume resolves an
+                // edited rule too, which is never gated: a ratio over no
+                // traffic cannot be breaching, and nothing else would ever
+                // resolve its alarm while the source stays idle. With no
+                // volume metric either, there is simply no data yet.
+                let below_default_gate = default_volume_gate(rule)
                     .is_some_and(|gate| latest.contains_key(gate.metric_name))
-                    && !meets_volume_gate(&rule.metric_name, latest)
-                {
+                    && !meets_volume_gate(&rule.metric_name, latest);
+                let no_volume = volume_gate(&rule.metric_name)
+                    .and_then(|gate| latest.get(gate.metric_name))
+                    .is_some_and(|volume| *volume <= 0.0);
+                if below_default_gate || no_volume {
                     self.handle_recovery(rule, ctx).await;
                 } else {
                     self.clear_breach(rule.id).await;
@@ -1319,7 +1325,7 @@ pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 /// ratio rests on a handful of reads, never raises the alarm; a small
 /// application database doing tens of accesses per second is evaluated. The
 /// scraper writes the ratio and the volume only for a whole window, never for
-/// one still refilling after a restart or failover, so the latest pair always
+/// one still refilling after a restart, a failover or a scrape gap, so the latest pair always
 /// describes the same 15 minutes.
 pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 10_000.0;
 
@@ -2737,11 +2743,9 @@ mod tests {
         }
     }
 
-    /// An idle window writes no ratio, only `pg.cache_blocks_accessed = 0`.
-    /// Once the last ratio has aged out of the latest values, that zero is
-    /// still proof the database is idle, so a fired alarm resolves.
-    #[tokio::test]
-    async fn idle_cache_hit_window_resolves_a_fired_alarm_without_a_ratio() {
+    /// Evaluate `rule`, whose alarm 99 is firing, against an idle window:
+    /// `pg.cache_blocks_accessed = 0` and no ratio. Whether the alarm resolved.
+    async fn idle_cache_hit_window_resolves(rule: monitoring_alert_rules::Model) -> bool {
         use temps_entities::alarms;
         let now = Utc::now();
         let resolved = alarms::Model {
@@ -2765,7 +2769,6 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let rule = low_cache_hit_ratio_rule();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
@@ -2785,9 +2788,61 @@ mod tests {
             .await
             .expect("evaluation succeeds");
 
+        let still_firing = evaluator.firing_alarms.read().await.contains_key(&rule.id);
+        !still_firing
+    }
+
+    /// An idle window writes no ratio, only `pg.cache_blocks_accessed = 0`.
+    /// Once the last ratio has aged out of the latest values, that zero is
+    /// still proof the database is idle, so a fired alarm resolves.
+    #[tokio::test]
+    async fn idle_cache_hit_window_resolves_a_fired_alarm_without_a_ratio() {
         assert!(
-            !evaluator.firing_alarms.read().await.contains_key(&rule.id),
+            idle_cache_hit_window_resolves(low_cache_hit_ratio_rule()).await,
             "an idle window must resolve the low cache hit ratio alarm"
+        );
+    }
+
+    /// An edited rule has no volume gate, so a near-idle window can fire it.
+    /// Fully idle, the window has no ratio at all: without resolving on zero
+    /// volume, that alarm would stay open for as long as the database idles.
+    #[tokio::test]
+    async fn idle_cache_hit_window_resolves_an_edited_rule_without_a_ratio() {
+        let rule = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        assert!(default_volume_gate(&rule).is_none(), "the edit opts out");
+        assert!(
+            idle_cache_hit_window_resolves(rule).await,
+            "an idle window must resolve an edited cache hit ratio alarm"
+        );
+    }
+
+    /// Below the default gate is not idle: an edited rule keeps its alarm
+    /// while the ratio is missing and some traffic remains.
+    #[tokio::test]
+    async fn missing_ratio_with_some_volume_keeps_an_edited_rule_alarm() {
+        let rule = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let evaluator = evaluator_with_shared_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("pg.cache_blocks_accessed", 500.0)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.firing_alarms.read().await.get(&rule.id),
+            Some(&99)
         );
     }
 
