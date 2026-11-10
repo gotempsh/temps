@@ -27,7 +27,7 @@ use temps_service_protocol::{
     PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest,
     RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
     RedisWalgBackupResult, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, TargetWriteBoundary,
 };
 use tokio::sync::Semaphore;
 
@@ -246,7 +246,7 @@ pub async fn postgres_walg_backup(
         crate::service_handlers::published_probe_address(&state.host_bind_address());
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
-    let outcome = match run_detached(permit, async move {
+    let outcome = match run_detached(permit, None, async move {
         runtime
             .postgres_walg_backup(
                 request,
@@ -302,14 +302,52 @@ pub(crate) enum Detached<T> {
     Panicked(String),
 }
 
+/// How long a restore still only staging its backup is given, after the
+/// deadline expired it, to stop its fetch and remove what it staged.
+pub(crate) const DATA_OPERATION_UNWIND_GRACE: Duration = Duration::from_secs(120);
+
 /// Run `engine` in its own task, holding `permit` until it ends, bounded by
 /// [`DATA_OPERATION_DEADLINE`]. A control plane that stops waiting drops
 /// this request, and with it any future it awaits: a WAL-G engine stopped
 /// between moving the data directory aside and starting the server again
 /// would leave the service down. Detached, it finishes, putting the
 /// original back if it must.
+///
+/// The deadline stops a restore only while it is still reading. A restore
+/// passes `writes` at its last safe point; when the deadline fires first,
+/// the restore is refused the write phase and given
+/// [`DATA_OPERATION_UNWIND_GRACE`] to remove what it staged. When the
+/// restore is already writing, it is awaited until it has started the
+/// restored data or put the original back. An operation with no `writes`
+/// (a backup, or an engine with no write boundary) is dropped at the
+/// deadline.
 pub(crate) async fn run_detached<T, F>(
     permit: tokio::sync::SemaphorePermit<'static>,
+    writes: Option<Arc<TargetWriteBoundary>>,
+    engine: F,
+) -> Detached<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, temps_service_protocol::NodeServiceError>>
+        + Send
+        + 'static,
+{
+    run_detached_within(
+        permit,
+        DATA_OPERATION_DEADLINE,
+        DATA_OPERATION_UNWIND_GRACE,
+        writes,
+        engine,
+    )
+    .await
+}
+
+/// [`run_detached`] with its deadline and grace as arguments.
+async fn run_detached_within<T, F>(
+    permit: tokio::sync::SemaphorePermit<'static>,
+    deadline: Duration,
+    grace: Duration,
+    writes: Option<Arc<TargetWriteBoundary>>,
     engine: F,
 ) -> Detached<T>
 where
@@ -320,11 +358,34 @@ where
 {
     let task = tokio::spawn(async move {
         let _permit = permit;
-        tokio::time::timeout(DATA_OPERATION_DEADLINE, engine).await
+        let mut engine = std::pin::pin!(engine);
+        if let Ok(outcome) = tokio::time::timeout(deadline, engine.as_mut()).await {
+            return Some(outcome);
+        }
+        let writes = writes?;
+        if writes.expire() {
+            // Still only reading: the engine sees the expiry at its next
+            // check, stops its fetch and removes what it staged.
+            if tokio::time::timeout(grace, engine.as_mut()).await.is_err() {
+                tracing::warn!(
+                    target = %writes.target(),
+                    grace_secs = grace.as_secs(),
+                    "A restore past its deadline did not unwind within its grace; stopped"
+                );
+            }
+            return None;
+        }
+        tracing::warn!(
+            target = %writes.target(),
+            deadline_hours = deadline.as_secs() / 3600,
+            "A restore passed its deadline while writing to its target; waiting for it to \
+             start the restored data or put the original back"
+        );
+        Some(engine.await)
     });
     match task.await {
-        Ok(Ok(outcome)) => Detached::Done(outcome),
-        Ok(Err(_)) => Detached::DeadlineExceeded,
+        Ok(Some(outcome)) => Detached::Done(outcome),
+        Ok(None) => Detached::DeadlineExceeded,
         Err(error) => Detached::Panicked(error.to_string()),
     }
 }
@@ -419,7 +480,7 @@ pub async fn postgres_walg_archive(
         crate::service_handlers::published_probe_address(&state.host_bind_address());
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
-    let outcome = match run_detached(permit, async move {
+    let outcome = match run_detached(permit, None, async move {
         runtime
             .postgres_walg_archive(
                 request,
@@ -589,7 +650,9 @@ pub async fn postgres_walg_restore(
         crate::service_handlers::published_probe_address(&state.host_bind_address());
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
-    let outcome = match run_detached(permit, async move {
+    let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
+    let engine_writes = Arc::clone(&writes);
+    let outcome = match run_detached(permit, Some(writes), async move {
         runtime
             .postgres_walg_restore(
                 request,
@@ -597,6 +660,7 @@ pub async fn postgres_walg_restore(
                 node,
                 after_create,
                 published_address,
+                engine_writes,
             )
             .await
     })
@@ -681,7 +745,7 @@ pub async fn mongodb_backup(
         crate::service_handlers::published_probe_address(&state.host_bind_address());
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
-    let outcome = match run_detached(permit, async move {
+    let outcome = match run_detached(permit, None, async move {
         runtime
             .mongodb_backup(request, engine_docker, published_address)
             .await
@@ -768,9 +832,11 @@ pub async fn mongodb_restore(
         crate::service_handlers::published_probe_address(&state.host_bind_address());
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
-    let outcome = match run_detached(permit, async move {
+    let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
+    let engine_writes = Arc::clone(&writes);
+    let outcome = match run_detached(permit, Some(writes), async move {
         runtime
-            .mongodb_restore(request, engine_docker, published_address)
+            .mongodb_restore(request, engine_docker, published_address, engine_writes)
             .await
     })
     .await
@@ -832,7 +898,7 @@ where
         return Err(Box::new(docker_missing(verb, service)));
     };
     let future = engine(state.service_runtime.clone(), Arc::new(docker.clone()));
-    match run_detached(permit, future).await {
+    match run_detached(permit, None, future).await {
         Detached::Done(Ok(outcome)) => Ok(outcome),
         Detached::Done(Err(error)) => {
             tracing::error!(service = %service, %error, "{label} could not run");
@@ -1552,7 +1618,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let permit = admit(&SLOTS).expect("a free slot");
-        let request = tokio::spawn(run_detached(permit, async move {
+        let request = tokio::spawn(run_detached(permit, None, async move {
             let _ = started_tx.send(());
             let _ = release_rx.await;
             let _ = done_tx.send(());
@@ -1573,6 +1639,91 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("the engine's slot was not released when it finished");
+    }
+
+    /// A restore that passed its write boundary (the server stopped, its
+    /// data moved aside) is not dropped at the deadline: it is awaited until
+    /// it put the original back, and its own outcome is returned.
+    #[tokio::test]
+    async fn a_restore_writing_at_its_deadline_is_let_roll_back() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let writes = Arc::new(TargetWriteBoundary::new("orders"));
+        let engine_writes = Arc::clone(&writes);
+        let (rolled_back_tx, rolled_back_rx) = tokio::sync::oneshot::channel();
+        let permit = admit(&SLOTS).expect("a free slot");
+        let outcome = run_detached_within(
+            permit,
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Some(writes),
+            async move {
+                assert!(engine_writes.begin_target_writes());
+                // The swap and the rollback outlast the deadline and grace.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = rolled_back_tx.send(());
+                Ok::<_, temps_service_protocol::NodeServiceError>("rolled back")
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, Detached::Done(Ok("rolled back"))),
+            "the restore was dropped mid-swap"
+        );
+        rolled_back_rx.await.expect("the rollback ran to its end");
+        assert!(admit(&SLOTS).is_some(), "the slot is released at the end");
+    }
+
+    /// A restore still staging its backup at the deadline is refused the
+    /// write phase, so it never stops the server, and is reported as past
+    /// its deadline once it unwound.
+    #[tokio::test]
+    async fn a_restore_still_reading_at_its_deadline_never_starts_writing() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let writes = Arc::new(TargetWriteBoundary::new("orders"));
+        let engine_writes = Arc::clone(&writes);
+        let (unwound_tx, unwound_rx) = tokio::sync::oneshot::channel();
+        let permit = admit(&SLOTS).expect("a free slot");
+        let outcome = run_detached_within(
+            permit,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            Some(Arc::clone(&writes)),
+            async move {
+                while !engine_writes.is_expired() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let _ = unwound_tx.send(engine_writes.begin_target_writes());
+                Ok::<_, temps_service_protocol::NodeServiceError>(())
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Detached::DeadlineExceeded));
+        assert!(
+            !unwound_rx.await.expect("the engine saw the expiry"),
+            "an expired restore must be refused the write phase"
+        );
+        assert!(!writes.writes_began());
+    }
+
+    /// An operation with no write boundary (a backup) is still stopped at
+    /// the deadline.
+    #[tokio::test]
+    async fn an_operation_without_a_write_boundary_is_stopped_at_its_deadline() {
+        static SLOTS: Semaphore = Semaphore::const_new(1);
+        let permit = admit(&SLOTS).expect("a free slot");
+        let outcome = run_detached_within(
+            permit,
+            Duration::from_millis(20),
+            Duration::from_secs(60),
+            None,
+            async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<_, temps_service_protocol::NodeServiceError>(())
+            },
+        )
+        .await;
+        assert!(matches!(outcome, Detached::DeadlineExceeded));
+        assert!(admit(&SLOTS).is_some());
     }
 
     /// A node runs a bounded number of backups and restores at once; one

@@ -60,7 +60,7 @@ where
         Arc::new(docker.clone()),
         published_address,
     );
-    match run_detached(permit, future).await {
+    match run_detached(permit, None, future).await {
         Detached::Done(Ok(outcome)) => Ok(outcome),
         Detached::Done(Err(error)) => {
             tracing::error!(service, operation, %error, "MariaDB operation could not run");

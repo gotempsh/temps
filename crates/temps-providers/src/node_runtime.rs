@@ -22,7 +22,7 @@ use temps_service_protocol::{
     RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult, RedisRestoreRequest,
     RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult, RemoteServiceBackupRequest,
     RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
-    RemoteWalHealthResponse, ServiceConfig, ServiceType,
+    RemoteWalHealthResponse, ServiceConfig, ServiceType, TargetWriteBoundary,
 };
 
 use crate::externalsvc;
@@ -245,6 +245,7 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         node: NodeAttachment,
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<PostgresWalgRestoreResult, NodeServiceError> {
         let recreate = externalsvc::postgres::NodeRecreate {
             service_id: request.service_id,
@@ -257,6 +258,7 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
             docker,
             recreate,
             published_address,
+            writes,
         )
         .await)
     }
@@ -278,15 +280,15 @@ impl NodeServiceRuntime for ProvidersNodeRuntime {
         request: MongodbRestoreRequest,
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<MongodbRestoreResult, NodeServiceError> {
-        Ok(
-            externalsvc::mongodb_backup::mongodb_restore_on_node(
-                request,
-                docker,
-                published_address,
-            )
-            .await,
+        Ok(externalsvc::mongodb_backup::mongodb_restore_on_node(
+            request,
+            docker,
+            published_address,
+            writes,
         )
+        .await)
     }
 
     async fn redis_walg_backup(

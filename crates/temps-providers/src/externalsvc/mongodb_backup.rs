@@ -48,9 +48,7 @@ use super::mongodb::MongodbService;
 use super::naming::mongodb_container_name;
 use super::postgres_walg_backup::{run_walg_exec, WalgBaseBackupError};
 use super::worker_data::{dump_credentials, dump_to_s3, DumpEngine, WorkerDataError};
-use super::{
-    ExternalService, NoopRestoreGate, RestoreContext, S3Credentials, ServiceConfig, ServiceType,
-};
+use super::{ExternalService, RestoreContext, S3Credentials, ServiceConfig, ServiceType};
 
 /// The `mongodump` image of an archive backup (an image without WAL-G):
 /// release- and digest-pinned, so the dump tool is the same on every node
@@ -684,11 +682,15 @@ fn service_row(service_id: i32, name: &str) -> temps_entities::external_services
 /// The agent's side of `POST /agent/services/mongodb/restore`: the
 /// provider's own in-place restore, as the control plane runs it for a local
 /// service, against this node's Docker. The control plane has already
-/// passed its last cancellable point when it sends this.
+/// passed its last cancellable point when it sends this; what is left to
+/// stop it is the node's deadline, `writes`, which the restore passes before
+/// `mongorestore` runs (a WAL-G stream restore writes as it fetches, so it
+/// passes it before it starts).
 pub async fn mongodb_restore_on_node(
     request: MongodbRestoreRequest,
     docker: Arc<Docker>,
     published_address: Option<IpAddr>,
+    writes: Arc<temps_service_protocol::TargetWriteBoundary>,
 ) -> MongodbRestoreResult {
     let service_id = request.service_id;
     let name = request.service_config.name.clone();
@@ -720,6 +722,14 @@ pub async fn mongodb_restore_on_node(
         "Restoring a MongoDB service in place with the provider's restore"
     );
     let instance = MongodbService::new(name.clone(), docker);
+    if !instance.defers_target_writes(&location) && !writes.begin_target_writes() {
+        return MongodbRestoreResult::Failed {
+            reason: format!(
+                "MongoDB restore of service {service_id} ('{name}') from '{location}' reached \
+                 this node's deadline before it started; nothing was restored"
+            ),
+        };
+    }
     let result = instance
         .restore_in_place(RestoreContext {
             s3_client: &client,
@@ -731,7 +741,7 @@ pub async fn mongodb_restore_on_node(
             source_config: engine_config,
             live_target_config: request.service_config,
             pool: &pool,
-            gate: &NoopRestoreGate,
+            gate: writes.as_ref(),
         })
         .await;
     match result {
@@ -965,6 +975,7 @@ mod tests {
             },
             docker,
             None,
+            Arc::new(temps_service_protocol::TargetWriteBoundary::new("orders")),
         )
         .await;
         assert!(

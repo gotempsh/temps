@@ -415,8 +415,9 @@ impl PostgresService {
     }
 
     /// The WAL-G restore a worker's agent runs for the control plane: the
-    /// same [`Self::restore_from_walg`] as on the control plane, in place,
-    /// with nothing to cancel it but the request that started it.
+    /// same [`Self::restore_from_walg`] as on the control plane, in place.
+    /// `gate` is the node's deadline: it stops the fetch while only staged
+    /// files exist, and never once the server was stopped for the swap.
     #[allow(
         clippy::too_many_arguments,
         reason = "the restore's inputs, as restore_from_walg"
@@ -429,6 +430,7 @@ impl PostgresService {
         live_target_config: &ServiceConfig,
         recovery_target: Option<&crate::externalsvc::RecoveryTarget>,
         target_user_data: Option<&str>,
+        gate: &dyn crate::externalsvc::RestoreGate,
     ) -> Result<()> {
         self.restore_from_walg(
             s3_credentials,
@@ -437,7 +439,7 @@ impl PostgresService {
             Some(live_target_config),
             recovery_target,
             target_user_data,
-            &crate::externalsvc::NoopRestoreGate,
+            gate,
         )
         .await
     }

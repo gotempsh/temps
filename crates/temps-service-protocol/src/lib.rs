@@ -904,6 +904,83 @@ pub enum RedisRestoreResult {
     Failed { reason: String },
 }
 
+/// The point after which a restore on a node owns its target until it ends.
+///
+/// The node bounds every data operation by a deadline, but stopping a
+/// restore after it began writing to its target (a PostgreSQL restore that
+/// stopped the server and moved its data aside, a `mongorestore --drop`)
+/// would leave the service down or half restored. The engine calls
+/// [`begin_target_writes`](Self::begin_target_writes) once, at its last
+/// safe point; the runner calls [`expire`](Self::expire) when the deadline
+/// fires. Exactly one of them wins: an expired restore is refused the write
+/// phase and unwinds what it staged, and a restore that is writing is left
+/// to start its restored data or put the original back.
+#[derive(Debug)]
+pub struct TargetWriteBoundary {
+    target: String,
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl TargetWriteBoundary {
+    const READING: u8 = 0;
+    const WRITING: u8 = 1;
+    const EXPIRED: u8 = 2;
+
+    /// A boundary for a restore of `target` (a service or container name)
+    /// that has not written to it yet.
+    pub fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            state: std::sync::atomic::AtomicU8::new(Self::READING),
+        }
+    }
+
+    /// The service or container this restore writes to.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Engine side: enter the write phase. `false` when the deadline expired
+    /// first, in which case nothing may be written to the target.
+    pub fn begin_target_writes(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.state.compare_exchange(
+            Self::READING,
+            Self::WRITING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(current) => current == Self::WRITING,
+        }
+    }
+
+    /// Whether the deadline expired before the write phase began.
+    pub fn is_expired(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == Self::EXPIRED
+    }
+
+    /// Whether the engine entered the write phase.
+    pub fn writes_began(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == Self::WRITING
+    }
+
+    /// Runner side: the deadline fired. `true` when the restore was still
+    /// only reading, and is now refused the write phase; `false` when it is
+    /// already writing and must be let finish.
+    pub fn expire(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.state
+            .compare_exchange(
+                Self::READING,
+                Self::EXPIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 /// Runs once between creating a replacement container and starting it, with
 /// its id (the agent joins it to the overlay there). Shared, unlike
 /// [`AfterCreate`], because an engine may recreate more than once.
@@ -1152,7 +1229,8 @@ pub trait NodeServiceRuntime: Send + Sync {
     /// Run the control plane's WAL-G restore on this node (see
     /// [`PostgresWalgRestoreRequest`]). The restored and, on failure, the
     /// original container are rebuilt from the running container's own
-    /// specification, attached as `node` says.
+    /// specification, attached as `node` says. The engine passes `writes`
+    /// before it stops the server, so a deadline cannot stop it mid-swap.
     async fn postgres_walg_restore(
         &self,
         request: PostgresWalgRestoreRequest,
@@ -1160,6 +1238,7 @@ pub trait NodeServiceRuntime: Send + Sync {
         node: NodeAttachment,
         after_create: RecreateHook,
         published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<PostgresWalgRestoreResult, NodeServiceError>;
 
     /// Run the control plane's MongoDB backup on this node (see
@@ -1173,11 +1252,13 @@ pub trait NodeServiceRuntime: Send + Sync {
 
     /// Run the control plane's in-place MongoDB restore on this node (see
     /// [`MongodbRestoreRequest`]).
+    /// The engine passes `writes` before `mongorestore` runs.
     async fn mongodb_restore(
         &self,
         request: MongodbRestoreRequest,
         docker: Arc<Docker>,
         published_address: Option<IpAddr>,
+        writes: Arc<TargetWriteBoundary>,
     ) -> Result<MongodbRestoreResult, NodeServiceError>;
 
     /// Run the control plane's Redis WAL-G stream backup on this node (see
@@ -1243,6 +1324,26 @@ pub trait NodeServiceRuntime: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    /// The engine entering writes and the deadline expiring race; exactly
+    /// one wins, and the loser sees it.
+    #[test]
+    fn a_write_boundary_lets_either_the_writes_or_the_deadline_win() {
+        let writing = super::TargetWriteBoundary::new("orders");
+        assert!(writing.begin_target_writes());
+        assert!(!writing.expire(), "a restore that is writing is let finish");
+        assert!(writing.writes_began() && !writing.is_expired());
+        assert!(writing.begin_target_writes(), "entering twice is harmless");
+
+        let expired = super::TargetWriteBoundary::new("orders");
+        assert!(expired.expire());
+        assert!(
+            !expired.begin_target_writes(),
+            "an expired restore must not start writing"
+        );
+        assert!(expired.is_expired() && !expired.writes_began());
+        assert_eq!(expired.target(), "orders");
+    }
+
     use super::*;
 
     /// A MongoDB restore request printed for a log or an error shows which

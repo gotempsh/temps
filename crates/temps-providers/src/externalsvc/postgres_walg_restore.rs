@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use bollard::Docker;
 use temps_service_protocol::{
-    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget,
+    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget, TargetWriteBoundary,
 };
 use tracing::info;
 
@@ -129,6 +129,7 @@ pub async fn walg_restore_on_node(
     docker: Arc<Docker>,
     node: NodeRecreate,
     published_address: Option<IpAddr>,
+    writes: Arc<TargetWriteBoundary>,
 ) -> PostgresWalgRestoreResult {
     let PostgresWalgRestoreRequest {
         service_id,
@@ -204,6 +205,7 @@ pub async fn walg_restore_on_node(
             &live_service_config,
             recovery_target.as_ref(),
             target_user_data.as_deref(),
+            writes.as_ref(),
         )
         .await
     {
@@ -370,7 +372,14 @@ mod tests {
             ),
         ];
         for (request, expected) in cases {
-            let result = walg_restore_on_node(request, docker.clone(), node.clone(), None).await;
+            let result = walg_restore_on_node(
+                request,
+                docker.clone(),
+                node.clone(),
+                None,
+                Arc::new(TargetWriteBoundary::new("orders")),
+            )
+            .await;
             assert!(
                 matches!(&result, PostgresWalgRestoreResult::Refused { reason } if reason.contains(expected)),
                 "{expected}: {result:?}"

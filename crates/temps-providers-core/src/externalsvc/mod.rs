@@ -857,6 +857,27 @@ impl RestoreGate for NoopRestoreGate {
     }
 }
 
+/// A restore on a node is gated by its deadline: once the deadline expired
+/// it counts as cancelled, so an engine still staging unwinds and is refused
+/// the write phase; once it entered the write phase the deadline no longer
+/// stops it (see [`temps_service_protocol::TargetWriteBoundary`]).
+#[async_trait]
+impl RestoreGate for temps_service_protocol::TargetWriteBoundary {
+    fn is_cancelled(&self) -> bool {
+        self.is_expired()
+    }
+
+    async fn begin_target_writes(&self) -> std::result::Result<(), RestoreCancelled> {
+        if temps_service_protocol::TargetWriteBoundary::begin_target_writes(self) {
+            Ok(())
+        } else {
+            Err(RestoreCancelled {
+                target: self.target().to_string(),
+            })
+        }
+    }
+}
+
 /// Outcome of a restore-to-new-service operation.
 ///
 /// The orchestrator uses these to create the new `external_services` row

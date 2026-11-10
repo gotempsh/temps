@@ -1984,6 +1984,7 @@ async fn a_control_plane_postgres_is_restored_and_recovered_by_the_same_walg_res
                     &config,
                     target.as_ref(),
                     user_data.as_deref(),
+                    &temps_providers::externalsvc::NoopRestoreGate,
                 )
                 .await
         }

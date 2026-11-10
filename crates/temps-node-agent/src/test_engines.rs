@@ -247,6 +247,7 @@ impl NodeServiceRuntime for StubRuntime {
         node: temps_service_protocol::NodeAttachment,
         _after_create: temps_service_protocol::RecreateHook,
         published_address: Option<std::net::IpAddr>,
+        _writes: Arc<temps_service_protocol::TargetWriteBoundary>,
     ) -> Result<temps_service_protocol::PostgresWalgRestoreResult, NodeServiceError> {
         self.walg_restores
             .lock()
@@ -273,6 +274,7 @@ impl NodeServiceRuntime for StubRuntime {
         request: temps_service_protocol::MongodbRestoreRequest,
         _docker: Arc<Docker>,
         published_address: Option<std::net::IpAddr>,
+        _writes: Arc<temps_service_protocol::TargetWriteBoundary>,
     ) -> Result<temps_service_protocol::MongodbRestoreResult, NodeServiceError> {
         self.mongodb_restores
             .lock()
