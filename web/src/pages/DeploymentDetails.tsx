@@ -9,7 +9,6 @@ import {
   getDeploymentOptions,
   getFailureReportPreviewOptions,
   getDeploymentJobsOptions,
-  getSettingsOptions,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
   rollbackToDeploymentMutation,
@@ -71,6 +70,7 @@ import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useScreenshotsEnabled } from '@/hooks/useScreenshotsEnabled'
 import { writeToClipboard } from '@/lib/clipboard'
 import { formatMicrocores } from '@/lib/cpu-format'
 import {
@@ -1130,13 +1130,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
-  // Fetch platform settings to check if screenshots are enabled
-  const { data: settings } = useQuery({
-    ...getSettingsOptions(),
-    retry: false,
-  })
-
-  const screenshotsEnabled = settings?.screenshots?.enabled ?? false
+  // Whether the platform captures screenshots; off for roles that can't read it
+  const screenshotsEnabled = useScreenshotsEnabled()
 
   const createDeployment = useMutation({
     ...triggerProjectPipelineMutation(),

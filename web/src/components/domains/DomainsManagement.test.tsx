@@ -8,7 +8,8 @@ import { MemoryRouter, Route, Routes, useParams } from 'react-router'
 import type { DomainResponse } from '@/api/client/types.gen'
 import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import { installBrowserWindow } from '@/test/dom'
-import { mockApi } from '@/test/fetch-mock'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { DomainsManagement } from './DomainsManagement'
 
 installBrowserWindow()
@@ -29,15 +30,14 @@ function DomainPage() {
   return <p>Opened domain {useParams().id}</p>
 }
 
-function renderTable() {
+function renderTable(
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  routes: Parameters<typeof mockApi>[0] = {}
+) {
   // Tunnels and capabilities answer 404: the table still lists certificates.
-  mockApi({})
+  mockApi(routes)
   return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={['/domains']}>
         <PlatformAccessContext.Provider
           value={{
@@ -94,4 +94,26 @@ test('the domain name links to the domain, and a click on the row follows it', a
   expect(link.className).not.toContain('after:')
   fireEvent.click(link.closest('td') as HTMLElement)
   await waitFor(() => view.getByText('Opened domain 12'))
+})
+
+test('a role refused the tunnel reads still lists certificates, with no page failure', async () => {
+  const denied = () =>
+    jsonResponse({ title: 'Access denied', detail: 'settings:read' }, 403)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = renderTable(client, {
+    'GET /ingress/connectors': denied,
+    'GET /ingress/hostnames': denied,
+  })
+
+  expect(view.getByRole('link', { name: 'app.example.com' })).toBeTruthy()
+  await waitFor(() => {
+    const errored = client
+      .getQueryCache()
+      .findAll()
+      .filter((q) => q.state.status === 'error')
+    expect(errored.length).toBe(2)
+  })
+  expect(collectRouteQueryFailures(client)).toEqual([])
 })
