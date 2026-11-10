@@ -13,7 +13,7 @@ import {
   ResponsivePagination,
   Status,
 } from '@temps-sdk/ds'
-import { listAccessSessionsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { listAccessSessionsGeneralOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { AccessSessionResponse } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 
@@ -27,20 +27,18 @@ export function SessionStatus({ session }: { session: AccessSessionResponse }) {
   return <Status tone={label === 'Issued' ? 'idle' : 'warn'} label={label} />
 }
 export function AccessSessionsList({
-  projectId,
   vaultId,
   sandboxId,
   active = true,
 }: {
-  projectId: number
+  projectId?: number
   vaultId?: string
   sandboxId?: string
   active?: boolean
 }) {
   const [page, setPage] = useState(1)
   const query = useQuery({
-    ...listAccessSessionsOptions({
-      path: { project_id: projectId },
+    ...listAccessSessionsGeneralOptions({
       query: { vault_id: vaultId, sandbox_id: sandboxId, page, page_size: 20 },
     }),
     enabled: active,

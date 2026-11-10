@@ -17,11 +17,11 @@ import {
 } from '@temps-sdk/ui'
 import { Callout, Field, ResponsivePagination } from '@temps-sdk/ds'
 import {
-  getAccessVault,
-  updateAccessVault,
+  getAccessVaultGeneral,
+  updateAccessVaultGeneral,
   type AccessVaultResponse,
 } from '@/api/client'
-import { listAccessServicesOptions } from '@/api/client/@tanstack/react-query.gen'
+import { listAccessServicesGeneralOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ServiceProviderLogo } from './service-providers'
 import { problemDetail } from '@/lib/api-problem'
 
@@ -51,24 +51,24 @@ export function VaultEditor({
   })
   const selected = useWatch({ control: form.control, name: 'service_ids' })
   const services = useQuery({
-    ...listAccessServicesOptions({
-      path: { project_id: snapshot.project_id },
+    ...listAccessServicesGeneralOptions({
       query: { page, page_size: 20 },
     }),
     enabled: open,
   })
   const latest = useMutation({
     mutationFn: () =>
-      getAccessVault({
-        path: { project_id: snapshot.project_id, vault_id: snapshot.id },
+      getAccessVaultGeneral({
+        path: { vault_id: snapshot.id },
         throwOnError: true,
       }),
   })
   const save = useMutation({
     mutationFn: (values: z.infer<typeof schema>) => {
-      if (!canWrite) throw new Error('Project write permission is required')
-      return updateAccessVault({
-        path: { project_id: snapshot.project_id, vault_id: snapshot.id },
+      if (!canWrite)
+        throw new Error('Instance administrator permission is required')
+      return updateAccessVaultGeneral({
+        path: { vault_id: snapshot.id },
         body: { ...values, expected_version: snapshot.version },
         throwOnError: true,
       })
@@ -79,8 +79,12 @@ export function VaultEditor({
       latest.reset()
       setSnapshot(saved)
       form.reset({ name: saved.name, service_ids: saved.service_ids })
-      void client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
-      void client.invalidateQueries({ queryKey: [{ _id: 'listAccessVaults' }] })
+      void client.invalidateQueries({
+        queryKey: [{ _id: 'getAccessVaultGeneral' }],
+      })
+      void client.invalidateQueries({
+        queryKey: [{ _id: 'listAccessVaultsGeneral' }],
+      })
       onClose()
     },
   })

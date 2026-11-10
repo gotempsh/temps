@@ -15,9 +15,9 @@ import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
-  accessCapabilityOptions,
-  getAccessVaultOptions,
-  listAccessBundlesOptions,
+  generalAccessCapabilityOptions,
+  getAccessVaultGeneralOptions,
+  listAccessBundlesGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AccessServiceResponse, AccessVaultResponse } from '@/api/client'
 import VaultDetailPage from './VaultDetailPage'
@@ -65,26 +65,22 @@ function mount(tab = 'services', write = true, entry?: string) {
       mutations: { retry: false },
     },
   })
+  client.setQueryData(generalAccessCapabilityOptions().queryKey, {
+    can_manage_services: write,
+    can_manage_requests: write,
+    can_save_requests: true,
+    can_use_project_github: false,
+    reason: 'Available',
+    state: 'available',
+    configured: true,
+  })
   client.setQueryData(
-    accessCapabilityOptions({ path: { project_id: 7 } }).queryKey,
-    {
-      can_manage_services: write,
-      can_manage_requests: write,
-      can_save_requests: true,
-      can_use_project_github: false,
-      reason: 'Available',
-      state: 'available',
-      configured: true,
-    }
-  )
-  client.setQueryData(
-    getAccessVaultOptions({ path: { project_id: 7, vault_id: vault.id } })
-      .queryKey,
+    getAccessVaultGeneralOptions({ path: { vault_id: vault.id } }).queryKey,
     { vault, services: [service] }
   )
   client.setQueryData(
-    listAccessBundlesOptions({
-      path: { project_id: 7, vault_id: vault.id },
+    listAccessBundlesGeneralOptions({
+      path: { vault_id: vault.id },
       query: { page: 1, page_size: 20 },
     }).queryKey,
     { items: [], total: 0, page: 1, page_size: 20 }
@@ -92,30 +88,28 @@ function mount(tab = 'services', write = true, entry?: string) {
   render(
     <QueryClientProvider client={client}>
       <MemoryRouter
-        initialEntries={[
-          entry ?? `/vault/projects/7/vaults/vault_test?tab=${tab}`,
-        ]}
+        initialEntries={[entry ?? `/vault/vaults/vault_test?tab=${tab}`]}
       >
         <BreadcrumbProvider>
           <Routes>
             <Route
-              path="/projects/:projectId/access-services/:serviceId/edit"
+              path="/access-services/:serviceId/edit"
               element={<h1>Service details destination</h1>}
             />
             <Route
-              path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+              path="/vault/vaults/:vaultId/bundles/:bundleId"
               element={<AccessBundleDetailPage />}
             />
             <Route
-              path="/vault/projects/:projectId/vaults/:vaultId/bundles/new"
+              path="/vault/vaults/:vaultId/bundles/new"
               element={<AccessBundlePage />}
             />
             <Route
-              path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/edit"
+              path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
               element={<AccessBundlePage />}
             />
             <Route
-              path="/vault/projects/:projectId/vaults/:vaultId"
+              path="/vault/vaults/:vaultId"
               element={<VaultDetailPage />}
             />
           </Routes>
@@ -128,7 +122,7 @@ function mount(tab = 'services', write = true, entry?: string) {
 test('session pagination survives switching vault tabs without fetching hidden sessions', async () => {
   const pages: number[] = []
   const api = mockApi({
-    'GET /projects/7/access-sessions': (request) => {
+    'GET /access-sessions': (request) => {
       const page = Number(new URL(request.url).searchParams.get('page'))
       pages.push(page)
       return jsonResponse({
@@ -192,7 +186,7 @@ test('session pagination survives switching vault tabs without fetching hidden s
       const before = pages.length
       await act(async () => {
         await client.invalidateQueries({
-          queryKey: [{ _id: 'listAccessSessions' }],
+          queryKey: [{ _id: 'listAccessSessionsGeneral' }],
         })
       })
       expect(pages.length).toBe(before)
@@ -233,13 +227,13 @@ test('vault services show provider logos and readers have no add-service navigat
 test('bundle save selects services and lifetime without creating a grant', async () => {
   let submitted: unknown
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault, services: [service] }),
-    'POST /projects/7/access-vaults/vault_test/bundles': async (request) => {
+    'POST /access-vaults/vault_test/bundles': async (request) => {
       submitted = await request.json()
       return jsonResponse({ id: 'bundle_test' })
     },
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
   })
   try {
@@ -292,9 +286,9 @@ test('bundle save selects services and lifetime without creating a grant', async
 })
 test('failed bundle save and a vault refetch retain the draft', async () => {
   const api = mockApi({
-    'POST /projects/7/access-vaults/vault_test/bundles': () =>
+    'POST /access-vaults/vault_test/bundles': () =>
       jsonResponse({ detail: 'Lifetime exceeds the service limit' }, 400),
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault: { ...vault, version: 4 }, services: [service] }),
   })
   try {
@@ -334,7 +328,9 @@ test('failed bundle save and a vault refetch retain the draft', async () => {
       ).toBeTruthy()
     )
     await act(async () => {
-      await client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
+      await client.invalidateQueries({
+        queryKey: [{ _id: 'getAccessVaultGeneral' }],
+      })
       await new Promise((resolve) => setTimeout(resolve, 20))
     })
     expect(
@@ -351,15 +347,15 @@ test('failed bundle save and a vault refetch retain the draft', async () => {
 
 test('a failed bundle refresh cannot pin an obsolete cached edit', async () => {
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ detail: 'Temporarily unavailable' }, 503),
   })
   try {
     const client = mount('bundles')
     await act(async () => {
       client.setQueryData(
-        listAccessBundlesOptions({
-          path: { project_id: 7, vault_id: vault.id },
+        listAccessBundlesGeneralOptions({
+          path: { vault_id: vault.id },
           query: { page: 1, page_size: 20 },
         }).queryKey,
         {
@@ -382,7 +378,7 @@ test('a failed bundle refresh cannot pin an obsolete cached edit', async () => {
         }
       )
       await client.invalidateQueries({
-        queryKey: [{ _id: 'listAccessBundles' }],
+        queryKey: [{ _id: 'listAccessBundlesGeneral' }],
       })
       await new Promise((resolve) => setTimeout(resolve, 20))
     })
@@ -420,23 +416,17 @@ test('direct bundle edit loads a fresh version and saves back to the list', asyn
     updated_at: date,
   }
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault, services: [service] }),
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ items: [existing], total: 1, page: 1, page_size: 100 }),
-    'PUT /projects/7/access-vaults/vault_test/bundles/bundle_test': async (
-      request
-    ) => {
+    'PUT /access-vaults/vault_test/bundles/bundle_test': async (request) => {
       submitted = await request.json()
       return jsonResponse({ ...existing, version: 6 })
     },
   })
   try {
-    mount(
-      'bundles',
-      true,
-      '/vault/projects/7/vaults/vault_test/bundles/bundle_test/edit'
-    )
+    mount('bundles', true, '/vault/vaults/vault_test/bundles/bundle_test/edit')
     await waitFor(() =>
       expect(
         within(document.body).getByRole('heading', {
@@ -489,15 +479,15 @@ test('bundle card opens read-only details and vault has no sandbox grant tab', a
     updated_at: date,
   }
   const api = mockApi({
-    'GET /projects/7/access-vaults/vault_test/bundles': () =>
+    'GET /access-vaults/vault_test/bundles': () =>
       jsonResponse({ items: [existing], total: 1, page: 1, page_size: 100 }),
   })
   try {
     const client = mount('bundles', false)
     await act(async () => {
       client.setQueryData(
-        listAccessBundlesOptions({
-          path: { project_id: 7, vault_id: vault.id },
+        listAccessBundlesGeneralOptions({
+          path: { vault_id: vault.id },
           query: { page: 1, page_size: 20 },
         }).queryKey,
         { items: [existing], total: 1, page: 1, page_size: 20 }
@@ -511,7 +501,7 @@ test('bundle card opens read-only details and vault has no sandbox grant tab', a
       name: 'Repository access',
     })
     expect(card.getAttribute('href')).toBe(
-      '/vault/projects/7/vaults/vault_test/bundles/bundle_test'
+      '/vault/vaults/vault_test/bundles/bundle_test'
     )
     await act(async () => fireEvent.click(card))
     await waitFor(() =>
@@ -546,11 +536,11 @@ test('vault draft survives dismissal and refetch, and successful saves advance i
     expected_version: number
   }> = []
   const api = mockApi({
-    'GET /projects/7/access-services': () =>
+    'GET /access-services': () =>
       jsonResponse({ items: [service], total: 1, page: 1, page_size: 20 }),
-    'GET /projects/7/access-vaults/vault_test': () =>
+    'GET /access-vaults/vault_test': () =>
       jsonResponse({ vault: saved, services: [service] }),
-    'PUT /projects/7/access-vaults/vault_test': async (request) => {
+    'PUT /access-vaults/vault_test': async (request) => {
       const body = (await request.json()) as (typeof submissions)[number]
       submissions.push(body)
       saved = {
@@ -594,8 +584,7 @@ test('vault draft survives dismissal and refetch, and successful saves advance i
     )
     await act(async () => {
       client!.setQueryData(
-        getAccessVaultOptions({ path: { project_id: 7, vault_id: vault.id } })
-          .queryKey,
+        getAccessVaultGeneralOptions({ path: { vault_id: vault.id } }).queryKey,
         {
           vault: { ...vault, name: 'Refetched name', version: 9 },
           services: [service],
@@ -650,7 +639,7 @@ test('clicking service row outside its name opens the service', async () => {
     })
     const link = within(table).getByRole('link', { name: 'Repository API' })
     expect(link.getAttribute('href')).toBe(
-      '/projects/7/access-services/svc_test/edit?vault=vault_test'
+      '/access-services/svc_test/edit?vault=vault_test'
     )
     await act(async () => fireEvent.click(within(table).getByText('Allowed')))
     await waitFor(() =>
@@ -662,6 +651,41 @@ test('clicking service row outside its name opens the service', async () => {
     )
   } finally {
     await act(async () => cleanup())
+    client.clear()
+  }
+})
+
+test('bundle pagination retains the authorized sandbox consumer', async () => {
+  const seen: string[] = []
+  const api = mockApi({
+    'GET /access-vaults/vault_test': () =>
+      jsonResponse({ vault, services: [service] }),
+    'GET /access-vaults/vault_test/bundles': (request) => {
+      const params = new URL(request.url).searchParams
+      seen.push(`${params.get('page')}:${params.get('sandbox_id')}`)
+      return jsonResponse({
+        items: [],
+        total: 21,
+        page: Number(params.get('page')),
+        page_size: 20,
+      })
+    },
+  })
+  const client = mount(
+    'bundles',
+    false,
+    '/vault/vaults/vault_test?tab=bundles&sandbox=sbx_fixture'
+  )
+  try {
+    await waitFor(() => expect(seen).toContain('1:sbx_fixture'))
+    await act(async () =>
+      fireEvent.click(
+        within(document.body).getByRole('button', { name: 'Go to next page' })
+      )
+    )
+    await waitFor(() => expect(seen).toContain('2:sbx_fixture'))
+  } finally {
+    api.restore()
     client.clear()
   }
 })

@@ -79,7 +79,7 @@ test('saving an edit sends the pinned version without resending a stored credent
   let submitted: CreateAccessServiceData['body'] | undefined
   let saved = 0
   const api = mockApi({
-    'PUT /projects/7/access-services/svc_test': async (request) => {
+    'PUT /access-services/svc_test': async (request) => {
       submitted = (await request.json()) as CreateAccessServiceData['body']
       return jsonResponse({ ...service, name: 'Updated API', version: 5 })
     },
@@ -107,7 +107,7 @@ test('saving an edit sends the pinned version without resending a stored credent
 test('a version conflict stays visible and does not report a successful save', async () => {
   let saved = 0
   const api = mockApi({
-    'PUT /projects/7/access-services/svc_test': () =>
+    'PUT /access-services/svc_test': () =>
       jsonResponse(
         { detail: 'The service changed; reload before saving.' },
         409
@@ -211,7 +211,7 @@ test.each(['service', 'grant'] as const)(
     })
     const route =
       kind === 'service'
-        ? 'PUT /projects/7/access-services/svc_test'
+        ? 'PUT /access-services/svc_test'
         : 'POST /projects/7/sandboxes/sbx_test/service-grants'
     const api = mockApi({ [route]: () => pendingResponse })
     let closed = false
@@ -327,7 +327,7 @@ test('a save finishing after leaving refreshes data without navigating', async (
     resolve = done
   })
   const api = mockApi({
-    'PUT /projects/7/access-services/svc_test': () => response,
+    'PUT /access-services/svc_test': () => response,
   })
   let saved = 0
   let closed = 0
@@ -362,7 +362,7 @@ test('a save finishing after leaving refreshes data without navigating', async (
 
 test('invalid path prefixes stay beside the field and block the request until corrected', async () => {
   const api = mockApi({
-    'PUT /projects/7/access-services/svc_test': () => jsonResponse(service),
+    'PUT /access-services/svc_test': () => jsonResponse(service),
   })
   let saved = false
   try {
@@ -385,9 +385,7 @@ test('invalid path prefixes stay beside the field and block the request until co
       )
     })
     await click('Save service')
-    expect(api.called('PUT', '/projects/7/access-services/svc_test')).toBe(
-      false
-    )
+    expect(api.called('PUT', '/access-services/svc_test')).toBe(false)
     expect(document.body.textContent).toContain(
       'without encoding, traversal, query strings or wildcards'
     )
@@ -445,7 +443,7 @@ test('GitHub clone/fetch requires an explicit repository and saves no bearer cre
         per_page: 15,
         total_count: 1,
       }),
-    'POST /projects/7/access-services': async (request) => {
+    'POST /access-services': async (request) => {
       submitted = (await request.json()) as CreateAccessServiceData['body']
       return jsonResponse(service, 201)
     },
@@ -475,17 +473,17 @@ test('GitHub clone/fetch requires an explicit repository and saves no bearer cre
   await act(async () => {
     fireEvent.keyDown(connection, { key: 'ArrowDown' })
   })
-  await act(async () => {
-    fireEvent.click(
-      await within(document.body).findByRole('option', {
-        name: /Example account/,
-      })
-    )
+  const account = await within(document.body).findByRole('option', {
+    name: /Example account/,
   })
   await act(async () => {
-    fireEvent.click(
-      await within(document.body).findByRole('button', { name: /repo owner/ })
-    )
+    fireEvent.click(account)
+  })
+  const repository = await within(document.body).findByRole('button', {
+    name: /repo owner/,
+  })
+  await act(async () => {
+    fireEvent.click(repository)
   })
   await waitFor(() =>
     expect(
@@ -522,7 +520,7 @@ test('editing a GitHub service preserves its connection reference', async () => 
   }
   let submitted: CreateAccessServiceData['body'] | undefined
   const api = mockApi({
-    'PUT /projects/7/access-services/svc_test': async (request) => {
+    'PUT /access-services/svc_test': async (request) => {
       submitted = (await request.json()) as CreateAccessServiceData['body']
       return jsonResponse(service)
     },
@@ -587,9 +585,7 @@ test('missing GitHub configuration preserves the draft and explains how to conne
       (within(document.body).getByLabelText('HTTPS origin') as HTMLInputElement)
         .value
     ).toBe(service.policy.origin)
-    expect(api.called('PUT', '/projects/7/access-services/svc_test')).toBe(
-      false
-    )
+    expect(api.called('PUT', '/access-services/svc_test')).toBe(false)
   } finally {
     api.restore()
   }

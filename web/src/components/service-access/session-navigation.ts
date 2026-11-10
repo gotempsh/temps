@@ -5,7 +5,7 @@ import type { AccessSessionResponse } from '@/api/client'
 export function sessionHref(
   session: Pick<AccessSessionResponse, 'project_id' | 'vault_id' | 'id'>
 ) {
-  return `/vault/projects/${session.project_id}/vaults/${encodeURIComponent(session.vault_id)}/sessions/${encodeURIComponent(session.id)}`
+  return `/vault/vaults/${encodeURIComponent(session.vault_id)}/sessions/${encodeURIComponent(session.id)}`
 }
 export function useSessionClock() {
   const [now, setNow] = useState(() => Date.now())

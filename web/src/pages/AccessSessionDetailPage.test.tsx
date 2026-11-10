@@ -37,11 +37,11 @@ test('session revocation requires named confirmation, holds pending, and lets a 
   let calls = 0
   let finish: ((response: Response) => void) | undefined
   const api = mockApi({
-    'GET /projects/7/service-access/capability': () =>
+    'GET /service-access/capability': () =>
       jsonResponse({ configured: true, can_manage_requests: true }),
-    'GET /projects/7/access-sessions/session_example': () =>
+    'GET /access-sessions/session_example': () =>
       jsonResponse({ session, grants: [] }),
-    'POST /projects/7/access-sessions/session_example/revoke': () => {
+    'POST /access-sessions/session_example/revoke': () => {
       calls += 1
       return new Promise<Response>((resolve) => {
         finish = resolve
@@ -56,13 +56,13 @@ test('session revocation requires named confirmation, holds pending, and lets a 
       <QueryClientProvider client={client}>
         <MemoryRouter
           initialEntries={[
-            '/vault/projects/7/vaults/vault_example/sessions/session_example',
+            '/vault/vaults/vault_example/sessions/session_example',
           ]}
         >
           <BreadcrumbProvider>
             <Routes>
               <Route
-                path="/vault/projects/:projectId/vaults/:vaultId/sessions/:sessionId"
+                path="/vault/vaults/:vaultId/sessions/:sessionId"
                 element={<AccessSessionDetailPage />}
               />
             </Routes>
@@ -82,6 +82,13 @@ test('session revocation requires named confirmation, holds pending, and lets a 
       })
       return within(document.body).getByRole('alertdialog')
     }
+    await waitFor(() =>
+      expect(
+        within(view.container)
+          .getByRole('link', { name: 'All sessions' })
+          .getAttribute('href')
+      ).toBe('/vault/vaults/vault_example?tab=sessions&sandbox=sbx_example')
+    )
     let dialog = await open()
     expect(dialog.textContent).toContain('Read APIs')
     expect(dialog.textContent).toContain('session_example')

@@ -56,6 +56,14 @@ test('session approval binds reviewed policies and preserves consent identity on
   const handler = async (request: Request) => {
     const url = new URL(request.url)
     const method = request.method
+    if (url.pathname.includes('/consumers/'))
+      return jsonResponse({
+        id: 'link_fixture',
+        vault_id: 'vault_test',
+        sandbox_id: 42,
+        project_id: null,
+        created_at: date,
+      })
     if (method === 'POST') {
       bodies.push(await request.json())
       return jsonResponse({ detail: 'Policy changed. Review again.' }, 409)
@@ -94,13 +102,18 @@ test('session approval binds reviewed policies and preserves consent identity on
       })
     return jsonResponse({ detail: 'Unexpected request' }, 500)
   }
-  const api = mockApi(Object.fromEntries([
-    'POST /projects/7/access-vaults/vault_test/sessions',
-    'GET /projects/7/service-access/capability',
-    'GET /projects/7/access-vaults/vault_test/bundles',
-    'GET /projects/7/access-vaults/vault_test',
-    'GET /v1/sandboxes',
-  ].map(path => [path, handler])))
+  const api = mockApi(
+    Object.fromEntries(
+      [
+        'POST /access-vaults/vault_test/sessions',
+        'GET /service-access/capability',
+        'GET /access-vaults/vault_test/bundles',
+        'GET /access-vaults/vault_test',
+        'GET /v1/sandboxes',
+        'GET /access-vaults/vault_test/consumers/sbx_ready',
+      ].map((path) => [path, handler])
+    )
+  )
   try {
     const client = new QueryClient({
       defaultOptions: {
@@ -112,13 +125,13 @@ test('session approval binds reviewed policies and preserves consent identity on
       <QueryClientProvider client={client}>
         <MemoryRouter
           initialEntries={[
-            '/vault/projects/7/vaults/vault_test/bundles/bundle_test/sessions/new',
+            '/vault/vaults/vault_test/bundles/bundle_test/sessions/new',
           ]}
         >
           <BreadcrumbProvider>
             <Routes>
               <Route
-                path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
                 element={<AccessSessionCreatePage />}
               />
             </Routes>
@@ -135,6 +148,13 @@ test('session approval binds reviewed policies and preserves consent identity on
     fireEvent.change(ui.getByLabelText('Session lifetime (seconds)'), {
       target: { value: '120' },
     })
+    await waitFor(() =>
+      expect(
+        ui
+          .getByRole('button', { name: 'Approve session' })
+          .getAttribute('aria-disabled')
+      ).toBe('false')
+    )
     fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
     await waitFor(() => expect(bodies.length).toBe(1))
     expect(bodies[0]).toMatchObject({

@@ -28,7 +28,7 @@ export type AccessBundleResponse = {
     created_at: string;
     id: string;
     name: string;
-    project_id: number;
+    project_id?: number | null;
     service_ids: Array<string>;
     ttl_seconds: number;
     updated_at: string;
@@ -120,7 +120,7 @@ export type AccessServiceResponse = {
     max_ttl_seconds: number;
     name: string;
     policy: SandboxAccessPolicy;
-    project_id: number;
+    project_id?: number | null;
     updated_at: string;
     version: number;
 };
@@ -154,7 +154,7 @@ export type AccessSessionResponse = {
     created_by?: number | null;
     expires_at: string;
     id: string;
-    project_id: number;
+    project_id?: number | null;
     revoked_at?: string | null;
     service_count: number;
     /**
@@ -233,7 +233,7 @@ export type AccessVaultResponse = {
     created_at: string;
     id: string;
     name: string;
-    project_id: number;
+    project_id?: number | null;
     service_ids: Array<string>;
     updated_at: string;
     version: number;
@@ -9176,6 +9176,11 @@ export type CreateUserRequest = {
     password?: string | null;
     roles: Array<string>;
     username: string;
+};
+
+export type CreateVaultLink = {
+    project_id?: number | null;
+    sandbox_id?: string | null;
 };
 
 export type CreateWebhookProviderRequest = {
@@ -37019,6 +37024,23 @@ export type VariableHistoryList = {
     total: number;
 };
 
+export type VaultLinkList = {
+    items: Array<VaultLinkResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type VaultLinkResponse = {
+    consumer_name?: string | null;
+    created_at: string;
+    id: string;
+    project_id?: number | null;
+    revoked_at?: string | null;
+    sandbox_id?: number | null;
+    vault_id: string;
+};
+
 /**
  * How ownership of a hostname is proven.
  */
@@ -39100,6 +39122,783 @@ export type UpdateSpeedMetricsResponses = {
 };
 
 export type UpdateSpeedMetricsResponse = UpdateSpeedMetricsResponses[keyof UpdateSpeedMetricsResponses];
+
+export type ListAccessServicesGeneralData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/access-services';
+};
+
+export type ListAccessServicesGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type ListAccessServicesGeneralResponses = {
+    200: AccessServiceList;
+};
+
+export type ListAccessServicesGeneralResponse = ListAccessServicesGeneralResponses[keyof ListAccessServicesGeneralResponses];
+
+export type CreateAccessServiceGeneralData = {
+    body: SaveAccessServiceWritable;
+    path?: never;
+    query?: {
+        source_project_id?: number | null;
+    };
+    url: '/access-services';
+};
+
+export type CreateAccessServiceGeneralErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type CreateAccessServiceGeneralResponses = {
+    201: AccessServiceResponse;
+};
+
+export type CreateAccessServiceGeneralResponse = CreateAccessServiceGeneralResponses[keyof CreateAccessServiceGeneralResponses];
+
+export type DeleteAccessServiceGeneralData = {
+    body?: never;
+    path: {
+        service_id: string;
+    };
+    query?: never;
+    url: '/access-services/{service_id}';
+};
+
+export type DeleteAccessServiceGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteAccessServiceGeneralResponses = {
+    204: void;
+};
+
+export type DeleteAccessServiceGeneralResponse = DeleteAccessServiceGeneralResponses[keyof DeleteAccessServiceGeneralResponses];
+
+export type GetAccessServiceGeneralData = {
+    body?: never;
+    path: {
+        service_id: string;
+    };
+    query?: never;
+    url: '/access-services/{service_id}';
+};
+
+export type GetAccessServiceGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetAccessServiceGeneralResponses = {
+    200: AccessServiceResponse;
+};
+
+export type GetAccessServiceGeneralResponse = GetAccessServiceGeneralResponses[keyof GetAccessServiceGeneralResponses];
+
+export type UpdateAccessServiceGeneralData = {
+    body: SaveAccessServiceWritable;
+    path: {
+        service_id: string;
+    };
+    query?: never;
+    url: '/access-services/{service_id}';
+};
+
+export type UpdateAccessServiceGeneralErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type UpdateAccessServiceGeneralResponses = {
+    200: AccessServiceResponse;
+};
+
+export type UpdateAccessServiceGeneralResponse = UpdateAccessServiceGeneralResponses[keyof UpdateAccessServiceGeneralResponses];
+
+export type ListAccessSessionsGeneralData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        vault_id?: string | null;
+        /**
+         * Filter by the sandbox's public ID; ownership still applies.
+         */
+        sandbox_id?: string | null;
+    };
+    url: '/access-sessions';
+};
+
+export type ListAccessSessionsGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type ListAccessSessionsGeneralResponses = {
+    /**
+     * Session authorizations
+     */
+    200: AccessSessionList;
+};
+
+export type ListAccessSessionsGeneralResponse = ListAccessSessionsGeneralResponses[keyof ListAccessSessionsGeneralResponses];
+
+export type GetAccessSessionGeneralData = {
+    body?: never;
+    path: {
+        session_id: string;
+    };
+    query?: never;
+    url: '/access-sessions/{session_id}';
+};
+
+export type GetAccessSessionGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type GetAccessSessionGeneralResponses = {
+    /**
+     * Session policies and worker receipts
+     */
+    200: AccessSessionDetail;
+};
+
+export type GetAccessSessionGeneralResponse = GetAccessSessionGeneralResponses[keyof GetAccessSessionGeneralResponses];
+
+export type RevokeAccessSessionGeneralData = {
+    body?: never;
+    path: {
+        session_id: string;
+    };
+    query?: never;
+    url: '/access-sessions/{session_id}/revoke';
+};
+
+export type RevokeAccessSessionGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type RevokeAccessSessionGeneralResponses = {
+    /**
+     * Revocation requested; inspect worker receipts
+     */
+    202: AccessSessionResponse;
+};
+
+export type RevokeAccessSessionGeneralResponse = RevokeAccessSessionGeneralResponses[keyof RevokeAccessSessionGeneralResponses];
+
+export type ListAccessVaultsGeneralData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/access-vaults';
+};
+
+export type ListAccessVaultsGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessVaultsGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultList;
+};
+
+export type ListAccessVaultsGeneralResponse = ListAccessVaultsGeneralResponses[keyof ListAccessVaultsGeneralResponses];
+
+export type CreateAccessVaultGeneralData = {
+    body: SaveAccessVault;
+    path?: never;
+    query?: never;
+    url: '/access-vaults';
+};
+
+export type CreateAccessVaultGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessVaultGeneralResponses = {
+    /**
+     * Success
+     */
+    201: AccessVaultResponse;
+};
+
+export type CreateAccessVaultGeneralResponse = CreateAccessVaultGeneralResponses[keyof CreateAccessVaultGeneralResponses];
+
+export type DeleteAccessVaultGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}';
+};
+
+export type DeleteAccessVaultGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteAccessVaultGeneralResponses = {
+    204: void;
+};
+
+export type DeleteAccessVaultGeneralResponse = DeleteAccessVaultGeneralResponses[keyof DeleteAccessVaultGeneralResponses];
+
+export type GetAccessVaultGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: {
+        sandbox_id?: string | null;
+    };
+    url: '/access-vaults/{vault_id}';
+};
+
+export type GetAccessVaultGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type GetAccessVaultGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultDetail;
+};
+
+export type GetAccessVaultGeneralResponse = GetAccessVaultGeneralResponses[keyof GetAccessVaultGeneralResponses];
+
+export type UpdateAccessVaultGeneralData = {
+    body: SaveAccessVault;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}';
+};
+
+export type UpdateAccessVaultGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessVaultGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultResponse;
+};
+
+export type UpdateAccessVaultGeneralResponse = UpdateAccessVaultGeneralResponses[keyof UpdateAccessVaultGeneralResponses];
+
+export type ListAccessBundlesGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        sandbox_id?: string | null;
+    };
+    url: '/access-vaults/{vault_id}/bundles';
+};
+
+export type ListAccessBundlesGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessBundlesGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessBundleList;
+};
+
+export type ListAccessBundlesGeneralResponse = ListAccessBundlesGeneralResponses[keyof ListAccessBundlesGeneralResponses];
+
+export type CreateAccessBundleGeneralData = {
+    body: SaveAccessBundle;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/bundles';
+};
+
+export type CreateAccessBundleGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessBundleGeneralResponses = {
+    /**
+     * Success
+     */
+    201: AccessBundleResponse;
+};
+
+export type CreateAccessBundleGeneralResponse = CreateAccessBundleGeneralResponses[keyof CreateAccessBundleGeneralResponses];
+
+export type DeleteAccessBundleGeneralData = {
+    body?: never;
+    path: {
+        vault_id: string;
+        bundle_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/bundles/{bundle_id}';
+};
+
+export type DeleteAccessBundleGeneralErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteAccessBundleGeneralResponses = {
+    204: void;
+};
+
+export type DeleteAccessBundleGeneralResponse = DeleteAccessBundleGeneralResponses[keyof DeleteAccessBundleGeneralResponses];
+
+export type UpdateAccessBundleGeneralData = {
+    body: SaveAccessBundle;
+    path: {
+        vault_id: string;
+        bundle_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/bundles/{bundle_id}';
+};
+
+export type UpdateAccessBundleGeneralErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessBundleGeneralResponses = {
+    /**
+     * Success
+     */
+    200: AccessBundleResponse;
+};
+
+export type UpdateAccessBundleGeneralResponse = UpdateAccessBundleGeneralResponses[keyof UpdateAccessBundleGeneralResponses];
+
+export type GetVaultEligibilityData = {
+    body?: never;
+    path: {
+        vault_id: string;
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/consumers/{sandbox_id}';
+};
+
+export type GetVaultEligibilityErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type GetVaultEligibilityResponses = {
+    200: VaultLinkResponse;
+};
+
+export type GetVaultEligibilityResponse = GetVaultEligibilityResponses[keyof GetVaultEligibilityResponses];
+
+export type ListVaultLinksData = {
+    body?: never;
+    path: {
+        vault_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/access-vaults/{vault_id}/links';
+};
+
+export type ListVaultLinksErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type ListVaultLinksResponses = {
+    200: VaultLinkList;
+};
+
+export type ListVaultLinksResponse = ListVaultLinksResponses[keyof ListVaultLinksResponses];
+
+export type CreateVaultLinkData = {
+    body: CreateVaultLink;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/links';
+};
+
+export type CreateVaultLinkErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    500: unknown;
+};
+
+export type CreateVaultLinkResponses = {
+    201: VaultLinkResponse;
+};
+
+export type CreateVaultLinkResponse = CreateVaultLinkResponses[keyof CreateVaultLinkResponses];
+
+export type DeleteVaultLinkData = {
+    body?: never;
+    path: {
+        vault_id: string;
+        link_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/links/{link_id}';
+};
+
+export type DeleteVaultLinkErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type DeleteVaultLinkResponses = {
+    204: void;
+};
+
+export type DeleteVaultLinkResponse = DeleteVaultLinkResponses[keyof DeleteVaultLinkResponses];
+
+export type CreateAccessSessionGeneralData = {
+    body: CreateAccessSession;
+    path: {
+        vault_id: string;
+    };
+    query?: never;
+    url: '/access-vaults/{vault_id}/sessions';
+};
+
+export type CreateAccessSessionGeneralErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type CreateAccessSessionGeneralResponses = {
+    /**
+     * Session issued; worker enforcement is asynchronous
+     */
+    202: AccessSessionResponse;
+};
+
+export type CreateAccessSessionGeneralResponse = CreateAccessSessionGeneralResponses[keyof CreateAccessSessionGeneralResponses];
 
 export type GetAdminGateData = {
     body?: never;
@@ -81918,6 +82717,31 @@ export type TestProjectIpAccessResponses = {
 
 export type TestProjectIpAccessResponse2 = TestProjectIpAccessResponses[keyof TestProjectIpAccessResponses];
 
+export type ProjectAccessVaultsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/linked-vaults';
+};
+
+export type ProjectAccessVaultsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type ProjectAccessVaultsResponses = {
+    200: AccessVaultList;
+};
+
+export type ProjectAccessVaultsResponse = ProjectAccessVaultsResponses[keyof ProjectAccessVaultsResponses];
+
 export type PurgeProjectLogsData = {
     body: PurgeLogsRequest;
     path: {
@@ -86982,6 +87806,49 @@ export type RevenueListProvidersResponses = {
 };
 
 export type RevenueListProvidersResponse = RevenueListProvidersResponses[keyof RevenueListProvidersResponses];
+
+export type SandboxAccessVaultsData = {
+    body?: never;
+    path: {
+        sandbox_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/sandboxes/{sandbox_id}/access-vaults';
+};
+
+export type SandboxAccessVaultsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    500: unknown;
+};
+
+export type SandboxAccessVaultsResponses = {
+    200: AccessVaultList;
+};
+
+export type SandboxAccessVaultsResponse = SandboxAccessVaultsResponses[keyof SandboxAccessVaultsResponses];
+
+export type GeneralAccessCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/service-access/capability';
+};
+
+export type GeneralAccessCapabilityErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type GeneralAccessCapabilityResponses = {
+    200: AccessCapability;
+};
+
+export type GeneralAccessCapabilityResponse = GeneralAccessCapabilityResponses[keyof GeneralAccessCapabilityResponses];
 
 export type GetProjectSessionReplaysData = {
     body?: never;

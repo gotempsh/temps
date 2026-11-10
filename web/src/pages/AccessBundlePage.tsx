@@ -7,8 +7,8 @@ import { Button, Skeleton } from '@temps-sdk/ui'
 import { Callout, PageContainer } from '@temps-sdk/ds'
 import { type AccessBundleResponse } from '@/api/client'
 import {
-  accessCapabilityOptions,
-  getAccessVaultOptions,
+  generalAccessCapabilityOptions,
+  getAccessVaultGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
 import { AccessBundleEditor } from '@/components/service-access/AccessBundleEditor'
@@ -16,47 +16,40 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 export default function AccessBundlePage() {
-  const { projectId = '', vaultId = '', bundleId } = useParams()
+  const { vaultId = '', bundleId } = useParams()
   return (
     <BundlePage
-      key={`${projectId}:${vaultId}:${bundleId ?? 'new'}`}
-      projectId={Number(projectId)}
+      key={`${vaultId}:${bundleId ?? 'new'}`}
       vaultId={vaultId}
       bundleId={bundleId}
     />
   )
 }
 function BundlePage({
-  projectId,
   vaultId,
   bundleId,
 }: {
-  projectId: number
   vaultId: string
   bundleId?: string
 }) {
   const navigate = useNavigate()
-  const backPath = `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}?tab=bundles`
-  const valid =
-    Number.isInteger(projectId) &&
-    projectId > 0 &&
-    projectId <= 2147483647 &&
-    !!vaultId
+  const backPath = `/vault/vaults/${encodeURIComponent(vaultId)}?tab=bundles`
+  const valid = !!vaultId
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    ...generalAccessCapabilityOptions(),
     enabled: valid,
     retry: false,
   })
   const vault = useQuery({
-    ...getAccessVaultOptions({
-      path: { project_id: projectId, vault_id: vaultId },
+    ...getAccessVaultGeneralOptions({
+      path: { vault_id: vaultId },
     }),
     enabled: valid,
     retry: false,
     refetchOnMount: 'always',
   })
   const bundle = useQuery({
-    ...accessBundleOptions(projectId, vaultId, bundleId ?? ''),
+    ...accessBundleOptions(vaultId, bundleId ?? ''),
     enabled: valid && !!bundleId,
   })
   const [snapshot, setSnapshot] = useState<{ bundle?: AccessBundleResponse }>()
@@ -115,12 +108,12 @@ function BundlePage({
             <>
               {!canWrite && !capability.isError && (
                 <Callout title="Access bundles are read-only">
-                  Project write permission is required to save a bundle.
+                  Instance administrator permission is required to save a
+                  bundle.
                 </Callout>
               )}
               <fieldset disabled={!canWrite || !!error} className="min-w-0">
                 <AccessBundleEditor
-                  projectId={projectId}
                   vaultId={vaultId}
                   initialBundle={snapshot.bundle}
                   services={vault.data?.services ?? []}

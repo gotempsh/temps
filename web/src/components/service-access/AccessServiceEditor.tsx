@@ -9,10 +9,11 @@ import { Callout, Field, Settings, CredentialProviderMark } from '@temps-sdk/ds'
 import { Input, Textarea, Checkbox, Button } from '@temps-sdk/ui'
 import { toast } from 'sonner'
 import {
-  createAccessService,
-  updateAccessService,
+  createAccessServiceGeneral,
+  updateAccessServiceGeneral,
   type AccessServiceResponse,
 } from '@/api/client'
+import { VaultConsumerPicker } from './VaultConsumerPicker'
 import { VaultRepositoryPicker } from './VaultRepositoryPicker'
 import { serviceProviders } from './service-provider-registry'
 import { problemDetail } from '@/lib/api-problem'
@@ -45,6 +46,9 @@ export function AccessServiceEditor({
       mounted.current = false
     }
   }, [])
+  const [sourceProjectId, setSourceProjectId] = useState<number | undefined>(
+    service?.project_id ?? (projectId || undefined)
+  )
   const [sourceMode, setSourceMode] = useState<'bearer' | 'api' | 'git'>(
     service?.policy.github_repository?.protocol ?? 'bearer'
   )
@@ -98,20 +102,24 @@ export function AccessServiceEditor({
   }
   const save = useMutation({
     mutationFn: async (values: AccessServiceValues) => {
-      if (!projectId)
-        throw new Error('Select a project before saving a service')
+      if (values.githubRepository && !sourceProjectId)
+        throw new Error('Choose the project that owns the GitHub connection')
       const body = {
         ...serviceBody(values, service?.version),
         vault_id: service ? undefined : vaultId,
       }
       if (service)
-        return updateAccessService({
-          path: { project_id: projectId, service_id: service.id },
+        return updateAccessServiceGeneral({
+          path: { service_id: service.id },
           body,
           throwOnError: true,
         })
-      return createAccessService({
-        path: { project_id: projectId },
+      return createAccessServiceGeneral({
+        query: {
+          source_project_id: values.githubRepository
+            ? sourceProjectId
+            : undefined,
+        },
         body,
         throwOnError: true,
       })
@@ -141,7 +149,7 @@ export function AccessServiceEditor({
       })}
       dirty={
         form.formState.isDirty &&
-        !!projectId &&
+        (!github || !!sourceProjectId) &&
         (!github || canUseProjectGithub)
       }
       saving={save.isPending}
@@ -164,6 +172,28 @@ export function AccessServiceEditor({
               'Check your permissions and reload the service before trying again.'
             )}
           </Callout>
+        )}
+        {sourceMode !== 'bearer' && (
+          <Field
+            label="GitHub source project"
+            description="Only consumers in this project can use a vault containing this connection."
+          >
+            {() =>
+              service ? (
+                <p>
+                  {sourceProjectId
+                    ? `Project ${sourceProjectId}`
+                    : 'Create a new service to select a GitHub source project.'}
+                </p>
+              ) : (
+                <VaultConsumerPicker
+                  kind="project"
+                  selected={sourceProjectId}
+                  onSelect={(id) => setSourceProjectId(Number(id))}
+                />
+              )
+            }
+          </Field>
         )}
         <Field label="Service provider">
           {(props) => (

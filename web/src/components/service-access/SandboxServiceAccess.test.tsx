@@ -387,7 +387,7 @@ test('the secondary service action opens the routed editor from its menu', async
     )
   })
   expect(within(document.body).getByLabelText('Location').textContent).toBe(
-    '/projects/7/access-services/svc_test/edit?sandbox=sbx_test'
+    '/access-services/svc_test/edit?sandbox=sbx_test'
   )
   c.clear()
 })

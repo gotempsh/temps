@@ -9,22 +9,20 @@ import { Button, Skeleton } from '@temps-sdk/ui'
 import { PlugZap } from 'lucide-react'
 import type { AccessServiceResponse } from '@/api/client'
 import {
-  accessCapabilityOptions,
-  getAccessServiceOptions,
+  generalAccessCapabilityOptions,
+  getAccessServiceGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AccessServiceEditor } from '@/components/service-access/AccessServiceEditor'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 function Editor({
-  projectId,
   vaultId,
   service,
   canUseProjectGithub,
   onClose,
   onSaved,
 }: {
-  projectId: number
   vaultId?: string
   service?: AccessServiceResponse
   canUseProjectGithub: boolean
@@ -36,7 +34,6 @@ function Editor({
   const [initialService] = useState(service)
   return (
     <AccessServiceEditor
-      projectId={projectId}
       vaultId={vaultId}
       service={initialService}
       canUseProjectGithub={canUseProjectGithub}
@@ -47,28 +44,24 @@ function Editor({
 }
 
 export default function AccessServicePage() {
-  const { projectId: rawProjectId, serviceId } = useParams()
+  const { serviceId } = useParams()
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const client = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const projectId = Number(rawProjectId)
-  const valid =
-    Number.isInteger(projectId) && projectId > 0 && projectId <= 2147483647
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
-    enabled: valid,
+    ...generalAccessCapabilityOptions(),
     retry: false,
   })
   const service = useQuery({
-    ...getAccessServiceOptions({
-      path: { project_id: projectId, service_id: serviceId ?? '' },
+    ...getAccessServiceGeneralOptions({
+      path: { service_id: serviceId ?? '' },
     }),
-    enabled: valid && !!serviceId,
+    enabled: !!serviceId,
     retry: false,
     refetchOnMount: 'always',
   })
-  const editorKey = `${projectId}:${serviceId ?? 'new'}`
+  const editorKey = `${serviceId ?? 'new'}`
   const [loadedEditorKey, setLoadedEditorKey] = useState<string>()
   const hasLoadedService = loadedEditorKey === editorKey
   // Latch the first successful read for this route. Later refetch failures must
@@ -84,14 +77,6 @@ export default function AccessServicePage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Vault', href: '/vault' },
-      ...(valid
-        ? [
-            {
-              label: `Project ${projectId}`,
-              href: `/vault/projects/${projectId}`,
-            },
-          ]
-        : []),
       {
         label: serviceId
           ? (service.data?.name ?? 'Edit service')
@@ -99,46 +84,46 @@ export default function AccessServicePage() {
       },
     ])
     return () => setBreadcrumbs([])
-  }, [projectId, valid, serviceId, service.data?.name, setBreadcrumbs])
+  }, [serviceId, service.data?.name, setBreadcrumbs])
   const back = () => {
     const vault = params.get('vault')
     const sandbox = params.get('sandbox')
     navigate(
-      valid
-        ? `/vault/projects/${projectId}${vault ? `/vaults/${encodeURIComponent(vault)}` : ''}${sandbox ? `?sandbox=${encodeURIComponent(sandbox)}` : ''}`
-        : '/vault'
+      `/vault${vault ? `/vaults/${encodeURIComponent(vault)}` : ''}${sandbox ? `?sandbox=${encodeURIComponent(sandbox)}` : ''}`
     )
   }
   const saved = () => {
-    void client.invalidateQueries({ queryKey: [{ _id: 'listAccessVaults' }] })
-    void client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
-    void client.invalidateQueries({ queryKey: [{ _id: 'listAccessServices' }] })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'listAccessVaultsGeneral' }],
+    })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'getAccessVaultGeneral' }],
+    })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'listAccessServicesGeneral' }],
+    })
     void client.invalidateQueries({ queryKey: [{ _id: 'listServiceGrants' }] })
-    void client.invalidateQueries({ queryKey: [{ _id: 'getAccessService' }] })
+    void client.invalidateQueries({
+      queryKey: [{ _id: 'getAccessServiceGeneral' }],
+    })
   }
   return (
     <PageContainer width="form">
-      {!valid || (serviceId && service.isError && !hasLoadedService) ? (
+      {serviceId && service.isError && !hasLoadedService ? (
         <PageState
           variant="failed"
           icon={PlugZap}
           title="Could not load service"
-          description={
-            !valid
-              ? 'The project ID in this link is invalid.'
-              : problemDetail(
-                  service.error,
-                  'Check project access or return to Vault to select a service.'
-                )
-          }
+          description={problemDetail(
+            service.error,
+            'Check access or return to Vault to select a service.'
+          )}
           action={
             <div className="flex gap-2">
               <Button variant="outline" onClick={back}>
                 Back to Vault
               </Button>
-              {valid && (
-                <Button onClick={() => void service.refetch()}>Retry</Button>
-              )}
+              <Button onClick={() => void service.refetch()}>Retry</Button>
             </div>
           }
         />
@@ -147,7 +132,7 @@ export default function AccessServicePage() {
           variant="failed"
           icon={PlugZap}
           title="Could not check service permissions"
-          description="Retry to verify project write permission before editing."
+          description="Retry to verify administrator permission before editing."
           action={
             <Button onClick={() => void capability.refetch()}>Retry</Button>
           }
@@ -163,7 +148,7 @@ export default function AccessServicePage() {
           variant="failed"
           icon={PlugZap}
           title="Service policies are read-only"
-          description="Editing services requires project write permission. Ask a project administrator for access."
+          description="Editing services requires an instance administrator."
           action={
             <Button variant="outline" onClick={back}>
               Back to Vault
@@ -186,7 +171,6 @@ export default function AccessServicePage() {
           <fieldset disabled={capability.isError} className="min-w-0">
             <Editor
               key={editorKey}
-              projectId={projectId}
               vaultId={params.get('vault') ?? undefined}
               service={service.data}
               canUseProjectGithub={

@@ -785,6 +785,34 @@ const FullAppRoutes = () => {
                           element={<StatusPageDetailPage />}
                         />
                         <Route
+                          path="/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
                           path="/projects/:projectId/access-services/new"
                           element={<AccessServicePage />}
                         />
@@ -812,9 +840,13 @@ const FullAppRoutes = () => {
                           path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
                           element={<AccessBundleDetailPage />}
                         />
-                        <Route path="/vault" element={<VaultPage />} />
                         <Route
                           path="/vault/projects/:projectId/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route path="/vault" element={<VaultPage />} />
+                        <Route
+                          path="/vault/vaults/:vaultId"
                           element={<VaultDetailPage />}
                         />
                         <Route

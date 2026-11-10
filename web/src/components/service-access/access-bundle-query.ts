@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { listAccessBundles } from '@/api/client'
+import { listAccessBundlesGeneral } from '@/api/client'
 export function accessBundleOptions(
-  projectId: number,
   vaultId: string,
-  bundleId: string
+  bundleId: string,
+  sandboxId?: string
 ) {
   return {
-    queryKey: ['accessBundle', projectId, vaultId, bundleId],
+    queryKey: ['accessBundle', vaultId, bundleId, sandboxId],
     retry: false,
     refetchOnMount: 'always' as const,
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
@@ -19,9 +19,9 @@ export function accessBundleOptions(
       ])
       let pages = 1
       for (let page = 1; page <= pages; page++) {
-        const { data } = await listAccessBundles({
-          path: { project_id: projectId, vault_id: vaultId },
-          query: { page, page_size: 100 },
+        const { data } = await listAccessBundlesGeneral({
+          path: { vault_id: vaultId },
+          query: { page, page_size: 100, sandbox_id: sandboxId },
           signal: boundedSignal,
           throwOnError: true,
         })

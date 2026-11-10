@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { useEffect } from 'react'
-import { Link, useParams } from 'react-router'
+import { Link, useParams, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import { Button, Skeleton } from '@temps-sdk/ui'
 import {
@@ -12,8 +12,8 @@ import {
   Status,
 } from '@temps-sdk/ds'
 import {
-  accessCapabilityOptions,
-  getAccessVaultOptions,
+  generalAccessCapabilityOptions,
+  getAccessVaultGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
 import { ServiceProviderLogo } from '@/components/service-access/service-providers'
@@ -21,28 +21,28 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 export default function AccessBundleDetailPage() {
-  const { projectId: rawId, vaultId = '', bundleId = '' } = useParams()
-  const projectId = Number(rawId)
-  const valid =
-    Number.isInteger(projectId) &&
-    projectId > 0 &&
-    projectId <= 2147483647 &&
-    !!vaultId &&
-    !!bundleId
-  const base = `/vault/projects/${projectId}/vaults/${encodeURIComponent(vaultId)}`
-  const back = `${base}?tab=bundles`
+  const { vaultId = '', bundleId = '' } = useParams()
+  const [search] = useSearchParams()
+  const sandboxId = search.get('sandbox') ?? undefined
+  const consumerQuery = sandboxId
+    ? `?sandbox=${encodeURIComponent(sandboxId)}`
+    : ''
+  const valid = !!vaultId && !!bundleId
+  const base = `/vault/vaults/${encodeURIComponent(vaultId)}`
+  const back = `${base}?tab=bundles${sandboxId ? `&sandbox=${encodeURIComponent(sandboxId)}` : ''}`
   const bundle = useQuery({
-    ...accessBundleOptions(projectId, vaultId, bundleId),
+    ...accessBundleOptions(vaultId, bundleId, sandboxId),
     enabled: valid,
   })
   const vault = useQuery({
-    ...getAccessVaultOptions({
-      path: { project_id: projectId, vault_id: vaultId },
+    ...getAccessVaultGeneralOptions({
+      path: { vault_id: vaultId },
+      query: sandboxId ? { sandbox_id: sandboxId } : undefined,
     }),
     enabled: valid,
   })
   const capability = useQuery({
-    ...accessCapabilityOptions({ path: { project_id: projectId } }),
+    ...generalAccessCapabilityOptions(),
     enabled: valid,
   })
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -100,7 +100,7 @@ export default function AccessBundleDetailPage() {
               {capability.data?.can_manage_requests && !capability.isError && (
                 <Button asChild>
                   <Link
-                    to={`${base}/bundles/${encodeURIComponent(bundleId)}/sessions/new`}
+                    to={`${base}/bundles/${encodeURIComponent(bundleId)}/sessions/new${consumerQuery}`}
                   >
                     Create session
                   </Link>
@@ -115,7 +115,10 @@ export default function AccessBundleDetailPage() {
                   </Link>
                 </Button>
               ) : (
-                <Button disabled title="Project write permission is required">
+                <Button
+                  disabled
+                  title="Instance administrator permission is required"
+                >
                   Edit bundle
                 </Button>
               )}
