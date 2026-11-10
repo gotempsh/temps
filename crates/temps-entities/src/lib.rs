@@ -325,5 +325,6 @@ pub mod environment_workload_isolation;
 pub mod access_bundles;
 pub mod access_sessions;
 pub mod access_vault_links;
+pub mod access_vault_service_history;
 pub mod access_vaults;
 pub mod external_plugin_actors;

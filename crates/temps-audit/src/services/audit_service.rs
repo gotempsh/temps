@@ -237,6 +237,8 @@ WHERE id IN (SELECT id FROM expired)
                         UNION ALL SELECT id FROM access_vault_links WHERE vault_id = $1
                         UNION ALL SELECT unnest(service_ids)
                             FROM access_vaults WHERE id = $1
+                        UNION ALL SELECT service_id
+                            FROM access_vault_service_history WHERE vault_id = $1
                      ))
                 )"#,
                 [resource_id],
@@ -444,13 +446,23 @@ mod tests {
         )
         .await
         .unwrap();
+        // Retirement removes membership before emitting its audit event. Both
+        // that deletion and the earlier write must remain in the vault history.
+        db.execute_unprepared(
+            r#"UPDATE access_vaults SET service_ids='{}' WHERE id='vault_fixture';
+        INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) VALUES
+        ('fixture','DELETE_ACCESS_SERVICE','{"resource_id":"service_legacy"}',now(),now()),
+        ('fixture','DELETE_ACCESS_SERVICE','{"resource_id":"service_other"}',now(),now())"#,
+        )
+        .await
+        .unwrap();
         let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
         let service = AuditService::new(
             db.clone(),
             Arc::new(IpAddressService::new(db.clone(), geoip)),
         );
         let mut ids = Vec::new();
-        for offset in 0..7 {
+        for offset in 0..8 {
             let page = service
                 .filter_audit_logs(AuditLogFilter {
                     action: None,
@@ -463,9 +475,10 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            if offset < 6 {
+            if offset < 7 {
                 assert_eq!(page.len(), 1);
                 assert!(!page[0].log.data.contains("vault_other"));
+                assert!(!page[0].log.data.contains("service_other"));
                 ids.push(page[0].log.id);
             } else {
                 assert!(page.is_empty());
@@ -473,7 +486,7 @@ mod tests {
         }
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 7);
         drop(service);
         drop(db);
         test.cleanup().await;
