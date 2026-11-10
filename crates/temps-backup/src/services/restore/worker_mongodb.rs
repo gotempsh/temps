@@ -10,7 +10,8 @@
 //! cross-service confirmation as a local restore (in `start_restore`), and
 //! the same credential handling: the origin's password is handed to the
 //! engine as its fallback login, and the target's stored configuration is
-//! patched to it once the restored `admin.system.users` answers to it. Only
+//! patched to the origin's username and password once the restored
+//! `admin.system.users` answers to them. Only
 //! the transport differs. Restoring into a new service is not available on a
 //! worker yet and is refused at admission; MongoDB has no point-in-time
 //! recovery anywhere.

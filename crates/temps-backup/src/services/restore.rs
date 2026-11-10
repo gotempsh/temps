@@ -3039,7 +3039,8 @@ async fn run_restore_inner(
         Some(new_id)
     } else {
         // In-place / PITR-in-place: the restored auth catalog carries the
-        // origin's credentials. PostgreSQL also inherits its role/database.
+        // origin's credentials. PostgreSQL also inherits its role/database,
+        // MongoDB its root username.
         // Reconcile the encrypted login while retaining the target's endpoint
         // and physical ownership so UI/env vars/CLI match restored data.
         reconcile_restored_credentials(
@@ -3221,8 +3222,12 @@ async fn cancel_new_service(
 }
 
 /// Credentials inherited from a restored authentication catalog. PostgreSQL
-/// physical backups also carry the origin's role and database; other engines
-/// retain their existing login-identity behavior.
+/// physical backups also carry the origin's role and database. A MongoDB
+/// dump carries the origin's users (`admin.system.users`, which
+/// `mongorestore --drop` puts in place of the target's), so the target then
+/// answers to the origin's root username as well as its password; its
+/// database is the target's own. Other engines retain their existing
+/// login-identity behavior.
 struct RestoredServiceCredentials {
     /// `None` when the restore keeps the target's own password (a logical
     /// PostgreSQL restore by a job, [`Self::into_database_only`]).
@@ -3235,13 +3240,14 @@ struct RestoredServiceCredentials {
 impl RestoredServiceCredentials {
     fn from_origin(service_type: &str, parameters: &serde_json::Value) -> Option<Self> {
         let postgres = service_type == "postgres";
+        let restores_username = postgres || service_type == "mongodb";
         Some(Self {
             password: Some(parameters.get("password")?.as_str()?.to_string()),
             root_password: parameters
                 .get("root_password")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            username: postgres
+            username: restores_username
                 .then(|| {
                     parameters
                         .get("username")
@@ -5246,24 +5252,63 @@ mod tests {
             "username": "origin_role",
             "database": "origin_db"
         });
-        for engine in ["mongodb", "mariadb"] {
-            let mut target = serde_json::json!({
-                "password": "synthetic-target-password",
-                "root_password": "synthetic-target-root-password",
-                "username": "target_role",
-                "database": "target_db"
-            })
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "root_password": "synthetic-target-root-password",
+            "username": "target_role",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin("mariadb", &origin)
+            .unwrap()
+            .apply(&mut target);
+        assert_eq!(target["password"], origin["password"]);
+        assert_eq!(target["root_password"], origin["root_password"]);
+        assert_eq!(target["username"], "target_role");
+        assert_eq!(target["database"], "target_db");
+    }
+
+    /// A cross-service MongoDB restore puts the origin's users in place of
+    /// the target's, so the target's stored login takes the origin's root
+    /// username with its password: the origin's password under the target's
+    /// old username authenticates as nobody. The database stays the
+    /// target's.
+    #[test]
+    fn a_mongodb_restore_takes_the_origins_username_with_its_password() {
+        let origin = serde_json::json!({
+            "password": "synthetic-origin-password",
+            "username": "origin_admin",
+            "database": "origin_db"
+        });
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "username": "target_admin",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin("mongodb", &origin)
+            .unwrap()
+            .apply(&mut target);
+        assert_eq!(target["password"], "synthetic-origin-password");
+        assert_eq!(target["username"], "origin_admin");
+        assert_eq!(target["database"], "target_db");
+
+        // An origin whose config names no username leaves the target's.
+        let mut target = serde_json::json!({ "username": "target_admin" })
             .as_object()
             .unwrap()
             .clone();
-            RestoredServiceCredentials::from_origin(engine, &origin)
-                .unwrap()
-                .apply(&mut target);
-            assert_eq!(target["password"], origin["password"]);
-            assert_eq!(target["root_password"], origin["root_password"]);
-            assert_eq!(target["username"], "target_role");
-            assert_eq!(target["database"], "target_db");
-        }
+        RestoredServiceCredentials::from_origin(
+            "mongodb",
+            &serde_json::json!({ "password": "synthetic-origin-password" }),
+        )
+        .unwrap()
+        .apply(&mut target);
+        assert_eq!(target["username"], "target_admin");
     }
 
     /// A logical PostgreSQL restore by a job keeps the target's login and
@@ -7700,7 +7745,12 @@ mod tests {
         .await
         .expect("a mongodump carries admin.system.users");
         assert_eq!(mongo.password.as_deref(), Some("origin-pw"));
-        assert_eq!(mongo.username, None, "only Postgres moves the login name");
+        assert_eq!(
+            mongo.username.as_deref(),
+            Some("admin"),
+            "the restored users answer to the origin's root username"
+        );
+        assert_eq!(mongo.database, None, "the database stays the target's");
     }
 
     /// What carries no credentials, or is the target's own, changes none;
