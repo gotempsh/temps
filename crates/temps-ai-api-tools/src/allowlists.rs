@@ -829,6 +829,10 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "admin_get_node_resources",
     "admin_list_environment_volumes",
     "get_effective_policy",
+    // Which projects may call a project's internal addresses (ADR 101):
+    // project and environment ids, names and a description, no credential.
+    // ProjectsRead on the project, narrowed to it.
+    "list_internal_access_grants",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",
