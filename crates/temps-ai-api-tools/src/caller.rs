@@ -896,8 +896,16 @@ impl InternalApiCaller {
         scope: &ApiCallScope,
     ) -> Result<String, ApiToolError> {
         let permit = |op: &ApiOperation| self.permitted(op, &scope.auth);
-        let action =
-            crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::ReadOnly);
+        let action = crate::cli::resolve_with_project_context(
+            &self.index,
+            command,
+            &permit,
+            crate::cli::CliMode::ReadOnly,
+            scope
+                .project_scope
+                .allowed_ids()
+                .is_some_and(|ids| ids.len() == 1),
+        );
         let action = if matches!(action, crate::cli::CliAction::Invalid(_)) {
             match crate::cli::resolve(
                 &self.index,
@@ -973,7 +981,16 @@ impl InternalApiCaller {
         reject_secret_input: bool,
     ) -> WritePrepareOutcome {
         let permit = |op: &ApiOperation| self.permitted_write(op, &scope.auth);
-        match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
+        match crate::cli::resolve_with_project_context(
+            &self.index,
+            command,
+            &permit,
+            crate::cli::CliMode::Write,
+            scope
+                .project_scope
+                .allowed_ids()
+                .is_some_and(|ids| ids.len() == 1),
+        ) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
             crate::cli::CliAction::Invalid(text) => WritePrepareOutcome::Invalid(text),
             crate::cli::CliAction::Execute(op, params) => {
@@ -1331,16 +1348,11 @@ impl InternalApiCaller {
         // Step 5: collect body with size cap.
         let (mut body_value, truncated) =
             collect_body(response.into_body(), self.max_response_bytes, operation_id).await?;
-        // A byte cap can cut through a credential (including its JSON-escaped
-        // representation). Full-value replacement cannot safely mask that prefix.
-        // Keep bounded output, but withhold truncated credential-bearing responses.
-        if truncated
-            && (!substituted.is_empty()
-                || plugin_guard
-                    .as_ref()
-                    .is_some_and(|guard| guard.has_response_credentials()))
-        {
-            body_value = Value::String("Truncated response omitted to protect credentials".into());
+        // A byte cap destroys the JSON structure needed for field/label
+        // redaction and can split credentials. Never return that raw prefix,
+        // including for native reads and non-success responses.
+        if truncated {
+            body_value = Value::String("Truncated response omitted to protect credentials; narrow the query or reduce the page size".into());
         }
         crate::secrets::scrub(&mut body_value, &substituted);
         if let Some(guard) = &plugin_guard {

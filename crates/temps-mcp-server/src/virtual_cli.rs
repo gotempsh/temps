@@ -574,6 +574,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_help_matches_unselected_and_selected_contexts() {
+        for selector in ["id", "project_id"] {
+            let path = format!("/projects/{{{selector}}}/deployments");
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{path.clone():{
+                    "get":{"operationId":"get_project_deployments","parameters":[{"name":selector,"in":"path","required":true,"schema":{"type":"integer"}}],"responses":{"200":{"description":"ok"}}},
+                    "post":{"operationId":"write_project_fixture","parameters":[{"name":selector,"in":"path","required":true,"schema":{"type":"integer"}}],"responses":{"200":{"description":"ok"}}}
+                }}})).unwrap();
+            let router = axum::Router::new().route(
+                &path,
+                axum::routing::get(
+                    |axum::extract::Path(id): axum::extract::Path<i32>| async move {
+                        axum::Json(json!({"project":id}))
+                    },
+                ),
+            );
+            let (state, _, _) = fixture();
+            state
+                .api_tools
+                .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                    router.clone(),
+                    &api,
+                    vec!["get_project_deployments".into()],
+                ));
+            state.write_api_tools.set(
+                temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                    router,
+                    &api,
+                    vec!["write_project_fixture".into()],
+                ),
+            );
+            for (tool, operation) in [
+                ("temps", "get_project_deployments"),
+                ("temps_write", "write_project_fixture"),
+            ] {
+                let help = execute(
+                    &state,
+                    &auth(3, true),
+                    tool,
+                    &json!({"command":format!("{operation} --help")}),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    help.content[0]
+                        .text
+                        .contains(&format!("--{selector} <integer> (required)")),
+                    "{}",
+                    help.content[0].text
+                );
+                assert!(!help.content[0]
+                    .text
+                    .contains("supplied by the selected tool context"));
+                let result = execute(
+                    &state,
+                    &auth(3, true),
+                    tool,
+                    &json!({"command":format!("{operation} --{selector} 17")}),
+                )
+                .await
+                .unwrap();
+                if tool == "temps" {
+                    let result: Value = serde_json::from_str(&result.content[0].text).unwrap();
+                    assert_eq!(result["data"]["project"], 17);
+                } else {
+                    assert!(result.proposal_token.is_some());
+                }
+            }
+            // Chat's single selected project still supplies the selector, but
+            // multi-project chats must discover and provide it explicitly.
+            for ids in [vec![17], vec![17, 18]] {
+                let mut selected = scope(&auth(3, true), &metadata());
+                selected.project_scope = ProjectSelectorScope::Allowed(ids.clone());
+                let help = state
+                    .api_tools
+                    .get()
+                    .unwrap()
+                    .run_cli_result("get_project_deployments --help", &selected)
+                    .await
+                    .unwrap();
+                assert_eq!(help.contains(&format!("--{selector}")), ids.len() != 1);
+                let WritePrepareOutcome::Help(help) = state
+                    .write_api_tools
+                    .get()
+                    .unwrap()
+                    .prepare_write_cli("write_project_fixture --help", &selected)
+                else {
+                    panic!("expected help")
+                };
+                assert_eq!(help.contains(&format!("--{selector}")), ids.len() != 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_metric_responses_are_withheld_before_text_fallback() {
+        let bucket = json!({"value":1.0,"series_key":[["authorization","fixture-private-credential"],["region","x".repeat(2000)]]});
+        let payload = json!({"data":vec![bucket; 100],"count":100});
+        assert!(payload.to_string().len() > 128 * 1024);
+        for status in [
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let body = payload.clone();
+            let router = axum::Router::new().route(
+                "/metrics",
+                axum::routing::get(move || async move { (status, axum::Json(body)) }),
+            );
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/metrics":{"get":{"operationId":"query_metrics","responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let (state, _, _) = fixture();
+            state
+                .api_tools
+                .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                    router,
+                    &api,
+                    vec!["query_metrics".into()],
+                ));
+            let output = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":"query_metrics"}),
+            )
+            .await;
+            let text = if status.is_success() {
+                let output = output.unwrap();
+                assert!(!output.content[0]
+                    .text
+                    .contains("fixture-private-credential"));
+                let envelope: Value = serde_json::from_str(&output.content[0].text).unwrap();
+                assert_eq!(envelope["truncated"], true);
+                output.content[0].text.clone()
+            } else {
+                let error = output.unwrap_err();
+                assert_eq!(error.rpc_code(), crate::protocol::INTERNAL_ERROR);
+                error.to_string()
+            };
+            assert!(text.contains("Truncated response omitted"));
+            assert!(!text.contains("fixture-private-credential"));
+            assert!(text.len() < 16 * 1024);
+        }
+    }
+
+    #[tokio::test]
     async fn credential_label_discovery_is_rejected_before_replay() {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();

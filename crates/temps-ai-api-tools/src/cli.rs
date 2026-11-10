@@ -71,6 +71,17 @@ pub(crate) fn resolve<'a>(
     permit: &dyn Fn(&ApiOperation) -> bool,
     mode: CliMode,
 ) -> CliAction<'a> {
+    resolve_with_project_context(index, command, permit, mode, true)
+}
+
+/// Render selectors explicitly unless a single selected project supplies them.
+pub(crate) fn resolve_with_project_context<'a>(
+    index: &'a ReadOnlyApiIndex,
+    command: &str,
+    permit: &dyn Fn(&ApiOperation) -> bool,
+    mode: CliMode,
+    project_selected: bool,
+) -> CliAction<'a> {
     let tokens = tokenize(command);
     // Tolerate a leading program name — the model may write `temps deploy …`.
     let tokens: &[String] = if tokens
@@ -107,7 +118,7 @@ pub(crate) fn resolve<'a>(
             .iter()
             .find(|o| o.operation_id.eq_ignore_ascii_case(op_name))
         {
-            Some(op) => resolve_operation(op, &tokens[2..]),
+            Some(op) => resolve_operation(op, &tokens[2..], project_selected),
             None => CliAction::Invalid(format!(
                 "Unknown operation '{op_name}' in section '{}'.{}\n\n{}",
                 sec.slug,
@@ -126,7 +137,7 @@ pub(crate) fn resolve<'a>(
     // should never have been.
     if let Some(op) = index.get(first) {
         if permit(op) {
-            return resolve_operation(op, &tokens[1..]);
+            return resolve_operation(op, &tokens[1..], project_selected);
         }
     }
 
@@ -237,9 +248,13 @@ fn mutation_redirect(op_name: &str) -> String {
 }
 
 /// Resolve the tail of `… <operation_id> [tail]` — either help or execution.
-fn resolve_operation<'a>(op: &'a ApiOperation, tail: &[String]) -> CliAction<'a> {
+fn resolve_operation<'a>(
+    op: &'a ApiOperation,
+    tail: &[String],
+    project_selected: bool,
+) -> CliAction<'a> {
     if tail.first().map(|t| is_help(t)).unwrap_or(false) {
-        return CliAction::Terminal(render_operation_help(op));
+        return CliAction::Terminal(render_operation_help_with_context(op, project_selected));
     }
     match parse_flags(tail, Some(op)) {
         Ok(params) => CliAction::Execute(op, params),
@@ -320,7 +335,12 @@ fn render_section_help(sec: &Section) -> String {
     out
 }
 
+#[cfg(test)]
 fn render_operation_help(op: &ApiOperation) -> String {
+    render_operation_help_with_context(op, true)
+}
+
+fn render_operation_help_with_context(op: &ApiOperation, project_selected: bool) -> String {
     let mut out = format!("{} — {} {}\n", op.operation_id, op.method, op.path);
     if let Some(s) = &op.summary {
         out.push_str(s);
@@ -337,12 +357,11 @@ fn render_operation_help(op: &ApiOperation) -> String {
         .params
         .iter()
         .find(|param| is_project_scope_param(op, param));
-    // Hide the context-supplied project selector — the model must not put it
-    // inside the virtual command.
+    // Only hide a selector when the request builder can auto-fill it.
     let flags: Vec<&_> = op
         .params
         .iter()
-        .filter(|p| !is_project_scope_param(op, p))
+        .filter(|p| !project_selected || !is_project_scope_param(op, p))
         .collect();
     if flags.is_empty() {
         out.push_str("Flags: none\n");
@@ -385,7 +404,7 @@ fn render_operation_help(op: &ApiOperation) -> String {
              `--ids 1,2`, `--ids '[1,2]'`, `--ids 1 --ids 2`.)\n",
         );
     }
-    if let Some(selector) = project_selector {
+    if let Some(selector) = project_selector.filter(|_| project_selected) {
         if matches!(selector.location, ParamLocation::Body) && !selector.required {
             out.push_str(
                 "(project_id is optional: it is supplied by the selected tool context when one exists; otherwise the resource remains unlinked.)\n",
