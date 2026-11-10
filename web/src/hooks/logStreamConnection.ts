@@ -8,8 +8,8 @@ type Status = 'connecting' | 'connected' | 'complete' | 'error'
 //
 // Every socket asks for the same bounded tail, so a replacement socket
 // starts by replaying lines the caller already holds. `message` is told,
-// on the first frame of a replacement socket, that the frames from there
-// on replace what it buffered rather than continue it.
+// on the first frame of a replacement socket, that the socket was replaced;
+// the caller decides which frame starts the replay (an error frame does not).
 export function connectLogStream(
   create: () => WebSocket,
   status: (state: Status, message?: string) => void,

@@ -58,6 +58,68 @@ export function mergeLogLines<T>(
   return next.length <= maxLogs ? next : next.slice(-maxLogs)
 }
 
+// One frame of the log stream: a log line, or the server saying the stream
+// failed (`{"error": ..., "detail" | "stack": ...}`, sent when Docker or the
+// worker cannot be reached). Both are shown as rows; only a log line can start
+// a reconnected socket's replay of the tail.
+export interface LogFrame {
+  kind: 'line' | 'error'
+  text: string
+}
+
+const ERROR_FRAME_KEYS = new Set(['error', 'detail', 'stack'])
+
+function isErrorFrame(parsed: unknown): boolean {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return false
+  }
+  const frame = parsed as Record<string, unknown>
+  return (
+    typeof frame.error === 'string' &&
+    Object.keys(frame).every((key) => ERROR_FRAME_KEYS.has(key))
+  )
+}
+
+// The row a frame shows, and whether it is a log line or an error. `null`
+// for a blank frame.
+export function parseLogFrame(data: string): LogFrame | null {
+  try {
+    const parsed = JSON.parse(data)
+    const kind = isErrorFrame(parsed) ? 'error' : 'line'
+    if (parsed.error && parsed.stack) {
+      return { kind, text: `ERROR: ${parsed.error}\n${parsed.stack}` }
+    }
+    if (parsed.message) return { kind, text: parsed.message }
+    if (parsed.log) return { kind, text: parsed.log }
+    return { kind, text: JSON.stringify(parsed, null, 2) }
+  } catch {
+    const line = data.trim()
+    return line ? { kind: 'line', text: line } : null
+  }
+}
+
+// Decides which frame replaces the buffer after a reconnect. A replacement
+// socket replays the tail the buffer already holds, so its first log line
+// replaces the buffer. An error sent before that line (the reconnect failed)
+// is appended and leaves the lines on screen alone; the replace stays armed
+// for the replay that follows, on this socket or the next.
+export function createReplayGate() {
+  let armed = false
+  return {
+    socketReplaced() {
+      armed = true
+    },
+    replacesBuffer(frame: LogFrame): boolean {
+      if (!armed || frame.kind !== 'line') return false
+      armed = false
+      return true
+    },
+    reset() {
+      armed = false
+    },
+  }
+}
+
 export interface UseLogStreamReturn {
   logs: LiveLogLine[]
   filteredLogs: LiveLogLine[]
@@ -167,6 +229,7 @@ export function useLogStream({
   // Set when a reconnected socket starts replaying the tail: the next commit
   // replaces the visible lines instead of appending to them.
   const replaceOnFlushRef = useRef(false)
+  const replayGateRef = useRef(createReplayGate())
 
   const filteredLogs = useMemo(() => {
     if (selectedLevels.length === 0 && !searchTerm) return logs
@@ -201,6 +264,7 @@ export function useLogStream({
     setConnectionStatus('connecting')
     pendingLogsRef.current = []
     replaceOnFlushRef.current = false
+    replayGateRef.current.reset()
 
     const scheduleFlush = () => {
       if (flushHandleRef.current != null) return
@@ -246,31 +310,18 @@ export function useLogStream({
         setErrorMessage(message)
         if (message) onError?.(message)
       },
-      (event, replacesBuffer) => {
-        if (replacesBuffer) {
+      (event, socketReplaced) => {
+        const gate = replayGateRef.current
+        if (socketReplaced) gate.socketReplaced()
+        const frame = parseLogFrame(event.data)
+        if (!frame) return
+        if (gate.replacesBuffer(frame)) {
           // Lines queued from the dropped socket are in the replay too.
           pendingLogsRef.current = []
           replaceOnFlushRef.current = true
           if (pausedRef.current) setBufferedCount(0)
         }
-        try {
-          const parsed = JSON.parse(event.data)
-
-          if (parsed.error && parsed.stack) {
-            enqueue(`ERROR: ${parsed.error}\n${parsed.stack}`)
-          } else if (parsed.message) {
-            enqueue(parsed.message)
-          } else if (parsed.log) {
-            enqueue(parsed.log)
-          } else {
-            enqueue(JSON.stringify(parsed, null, 2))
-          }
-        } catch {
-          const line = event.data.trim()
-          if (line) {
-            enqueue(line)
-          }
-        }
+        enqueue(frame.text)
       }
     )
 
@@ -282,6 +333,7 @@ export function useLogStream({
       }
       pendingLogsRef.current = []
       replaceOnFlushRef.current = false
+      replayGateRef.current.reset()
     }
   }, [wsUrl, onError, showTimestamps, maxLogs, retryGeneration])
 

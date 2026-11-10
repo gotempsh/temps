@@ -3,7 +3,12 @@
 
 import { describe, expect, test } from 'bun:test'
 import { connectLogStream } from './logStreamConnection'
-import { buildLogStreamUrl, mergeLogLines } from './useLogStream'
+import {
+  buildLogStreamUrl,
+  createReplayGate,
+  mergeLogLines,
+  parseLogFrame,
+} from './useLogStream'
 
 describe('buildLogStreamUrl', () => {
   test('requests a bounded Docker backlog for restart-heavy containers', () => {
@@ -37,11 +42,13 @@ describe('buildLogStreamUrl', () => {
 })
 
 // A log view wired the way `useLogStream` wires it: every socket asks for
-// the same tail, and each frame is merged into a bounded buffer.
+// the same tail, each frame is parsed, the replay gate decides whether it
+// replaces the buffer, and it is merged into a bounded buffer.
 function logView(maxLogs: number) {
   const sockets: WebSocket[] = []
   let retry: (() => void) | undefined
   let buffer: string[] = []
+  const gate = createReplayGate()
   const dispose = connectLogStream(
     () => {
       const ws = { close() {} } as WebSocket
@@ -49,12 +56,15 @@ function logView(maxLogs: number) {
       return ws
     },
     () => {},
-    (event, replacesBuffer) => {
+    (event, socketReplaced) => {
+      if (socketReplaced) gate.socketReplaced()
+      const frame = parseLogFrame(event.data as string)
+      if (!frame) return
       buffer = mergeLogLines(
         buffer,
-        [event.data as string],
+        [frame.text],
         maxLogs,
-        replacesBuffer
+        gate.replacesBuffer(frame)
       )
     },
     ((fn: () => void) => {
@@ -116,6 +126,93 @@ describe('reconnecting the live log stream', () => {
     view.send('a', 'b', 'c')
     expect(view.lines()).toEqual(['a', 'b', 'c'])
     view.dispose()
+  })
+
+  // What the server sends when Docker or the worker cannot be reached.
+  const unavailable = JSON.stringify({
+    error: 'Failed to get container logs',
+    detail: 'worker node 2 is unreachable',
+  })
+
+  test('an error before the replay is appended, and the replay still replaces the lines', () => {
+    const view = logView(1000)
+    view.send('booting', 'listening on :8080')
+    view.drop()
+    view.send(unavailable)
+    const shown = view.lines()
+    expect(shown.slice(0, 2)).toEqual(['booting', 'listening on :8080'])
+    expect(shown).toHaveLength(3)
+    expect(shown[2]).toContain('worker node 2 is unreachable')
+    // The replay that follows takes the buffer's place: no line twice.
+    view.send('booting', 'listening on :8080', 'GET /health 200')
+    expect(view.lines()).toEqual([
+      'booting',
+      'listening on :8080',
+      'GET /health 200',
+    ])
+    view.dispose()
+  })
+
+  test('a reconnect that only sends an error keeps the lines on screen', () => {
+    const view = logView(1000)
+    view.send('booting', 'listening on :8080')
+    view.drop()
+    view.send(unavailable)
+    expect(view.lines()).toHaveLength(3)
+    expect(view.lines().slice(0, 2)).toEqual(['booting', 'listening on :8080'])
+    // The next socket fails the same way: the lines are still there.
+    view.drop()
+    view.send(unavailable)
+    expect(view.lines()).toHaveLength(4)
+    expect(view.lines().slice(0, 2)).toEqual(['booting', 'listening on :8080'])
+    // Once a socket replays, the replay replaces everything.
+    view.drop()
+    view.send('booting', 'listening on :8080')
+    expect(view.lines()).toEqual(['booting', 'listening on :8080'])
+    view.dispose()
+  })
+})
+
+describe('parseLogFrame', () => {
+  test("tells the server's error frames from log lines", () => {
+    expect(
+      parseLogFrame('{"error":"Failed to get container logs","detail":"x"}')
+        ?.kind
+    ).toBe('error')
+    expect(parseLogFrame('{"error":"boom","stack":"at main"}')).toEqual({
+      kind: 'error',
+      text: 'ERROR: boom\nat main',
+    })
+    // A container's own JSON line that mentions an error is a log line.
+    expect(
+      parseLogFrame('{"level":"error","error":"timeout","msg":"retrying"}')
+        ?.kind
+    ).toBe('line')
+    expect(parseLogFrame('{"message":"ready"}')).toEqual({
+      kind: 'line',
+      text: 'ready',
+    })
+    expect(parseLogFrame('plain text line ')).toEqual({
+      kind: 'line',
+      text: 'plain text line',
+    })
+    expect(parseLogFrame('   ')).toBeNull()
+  })
+})
+
+describe('createReplayGate', () => {
+  test('only the first log line after a replaced socket replaces the buffer', () => {
+    const gate = createReplayGate()
+    const line = { kind: 'line', text: 'a' } as const
+    const error = { kind: 'error', text: 'e' } as const
+    expect(gate.replacesBuffer(line)).toBe(false)
+    gate.socketReplaced()
+    expect(gate.replacesBuffer(error)).toBe(false)
+    expect(gate.replacesBuffer(line)).toBe(true)
+    expect(gate.replacesBuffer(line)).toBe(false)
+    gate.socketReplaced()
+    gate.reset()
+    expect(gate.replacesBuffer(line)).toBe(false)
   })
 })
 
