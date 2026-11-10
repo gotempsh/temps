@@ -225,7 +225,20 @@ WHERE id IN (SELECT id FROM expired)
 
         if let Some(resource_id) = resource_id {
             query = query.filter(Expr::cust_with_values(
-                "CASE WHEN audit_logs.data IS JSON OBJECT THEN audit_logs.data::jsonb->>'resource_id' END = $1",
+                r#"EXISTS (
+                    SELECT 1 FROM (SELECT temps_audit_json(audit_logs.data) AS payload OFFSET 0) parsed
+                    WHERE
+                    parsed.payload->>'resource_id' = $1 OR
+                    parsed.payload->>'vault_id' = $1 OR
+                    (NOT (parsed.payload ? 'vault_id') AND
+                     parsed.payload->>'resource_id' IN (
+                        SELECT id FROM access_bundles WHERE vault_id = $1
+                        UNION ALL SELECT id FROM access_sessions WHERE vault_id = $1
+                        UNION ALL SELECT id FROM access_vault_links WHERE vault_id = $1
+                        UNION ALL SELECT unnest(service_ids)
+                            FROM access_vaults WHERE id = $1
+                     ))
+                )"#,
                 [resource_id],
             ));
         }
@@ -388,7 +401,7 @@ mod tests {
         let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
         assert_eq!(transactions.len(), 1);
         let statement = &transactions[0].statements()[0];
-        assert!(statement.sql.contains("IS JSON OBJECT"));
+        assert!(statement.sql.contains("temps_audit_json(audit_logs.data)"));
         assert!(statement.sql.contains("->>'resource_id'"));
         assert!(statement.sql.contains("LEFT JOIN \"users\""));
         assert!(statement.sql.contains("LEFT JOIN \"ip_geolocations\""));
@@ -416,11 +429,18 @@ mod tests {
             .unwrap();
         let db = test.connection_arc();
         db.execute_unprepared(
-            r#"INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) VALUES
+            r#"INSERT INTO access_vaults(id,name,service_ids) VALUES ('vault_fixture','Fixture',ARRAY['service_legacy']);
+        INSERT INTO access_bundles(id,vault_id,name,service_ids,ttl_seconds) VALUES ('bundle_legacy','vault_fixture','Fixture',ARRAY['service_legacy'],60);
+        INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) VALUES
         ('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_fixture"}',now(),now()),
         ('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_fixture"}',now(),now()),
         ('fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_other"}',now(),now()),
-        ('fixture','UPDATE_ACCESS_VAULT','not JSON',now(),now())"#,
+        ('fixture','UPDATE_ACCESS_VAULT','not JSON',now(),now()),
+        ('fixture','CREATE_ACCESS_BUNDLE','{"resource_id":"bundle_legacy"}',now(),now()),
+        ('fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"service_legacy"}',now(),now()),
+        ('fixture','REVOKE_ACCESS_VAULT_LINK','{"resource_id":"link_deleted","vault_id":"vault_fixture"}',now(),now()),
+        ('fixture','REVOKE_ACCESS_SESSION','{"resource_id":"session_deleted","vault_id":"vault_fixture"}',now(),now()),
+        ('fixture','UPDATE_ACCESS_BUNDLE','{"resource_id":"bundle_legacy","vault_id":"vault_other"}',now(),now())"#,
         )
         .await
         .unwrap();
@@ -430,7 +450,7 @@ mod tests {
             Arc::new(IpAddressService::new(db.clone(), geoip)),
         );
         let mut ids = Vec::new();
-        for offset in 0..3 {
+        for offset in 0..7 {
             let page = service
                 .filter_audit_logs(AuditLogFilter {
                     action: None,
@@ -443,15 +463,17 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            if offset < 2 {
+            if offset < 6 {
                 assert_eq!(page.len(), 1);
-                assert!(page[0].log.data.contains("vault_fixture"));
+                assert!(!page[0].log.data.contains("vault_other"));
                 ids.push(page[0].log.id);
             } else {
                 assert!(page.is_empty());
             }
         }
-        assert_ne!(ids[0], ids[1]);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 6);
         drop(service);
         drop(db);
         test.cleanup().await;

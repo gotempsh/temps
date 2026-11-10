@@ -233,16 +233,18 @@ impl From<AccessError> for Problem {
     }
 }
 
-pub(super) async fn audit(
+pub(super) async fn audit<'a>(
     state: &AccessAppState,
     auth: &temps_authz::AuthContext,
     metadata: RequestMetadata,
     project_id: impl Into<Option<i32>>,
-    resource_id: &str,
+    resource: impl Into<super::audit::AuditResource<'a>>,
     version: i32,
     operation: &'static str,
 ) {
     let project_id = project_id.into();
+    let resource = resource.into();
+    let resource_id = resource.id;
     let event = AccessAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -251,6 +253,7 @@ pub(super) async fn audit(
         },
         project_id,
         resource_id: resource_id.into(),
+        vault_id: resource.vault_id.map(str::to_owned),
         version,
         operation,
     };

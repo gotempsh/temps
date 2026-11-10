@@ -198,7 +198,7 @@ pub async fn create_access_session_general(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        (&response.id, &response.vault_id),
         1,
         "CREATE_ACCESS_SESSION",
     )
@@ -246,7 +246,7 @@ pub async fn revoke_access_session_general(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        (&response.id, &response.vault_id),
         1,
         "REVOKE_ACCESS_SESSION",
     )

@@ -75,6 +75,7 @@ async fn session_route(projectless: bool, removal: &str) {
             .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
             .any(|event| event["operation"] == "CREATE_ACCESS_VAULT_LINK"
                 && event["resource_id"] == linked.id
+                && event["vault_id"] == vault.id
                 && event["context"]["user_id"] == 9801));
     }
     let mut selections = Vec::new();
@@ -235,6 +236,7 @@ async fn session_route(projectless: bool, removal: &str) {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["project_id"], serde_json::json!(context));
         assert_eq!(sessions[0]["resource_id"], received.id);
+        assert_eq!(sessions[0]["vault_id"], vault.id);
         assert_eq!(sessions[0]["context"]["user_id"], 9801);
         assert!(events
             .iter()
@@ -334,6 +336,7 @@ async fn session_route(projectless: bool, removal: &str) {
                 .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
                 .any(|event| event["operation"] == "REVOKE_ACCESS_VAULT_LINK"
                     && event["resource_id"] == link_id
+                    && event["vault_id"] == vault.id
                     && event["context"]["user_id"] == 9801));
         }
         "service" | "bundle" | "vault" => {

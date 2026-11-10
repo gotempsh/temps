@@ -18833,7 +18833,7 @@ export type ListAuditLogsQuery = {
      */
     operation_type?: string | null;
     /**
-     * Exact resource ID recorded in the audit payload (omit for all resources).
+     * Resource ID, including child events for a vault (omit for all resources).
      */
     resource_id?: string | null;
     /**
@@ -46685,7 +46685,7 @@ export type ListAuditLogsData = {
     path?: never;
     query?: {
         /**
-         * Exact resource ID recorded in the audit payload (omit for all resources).
+         * Resource ID, including child events for a vault (omit for all resources).
          */
         resource_id?: string;
         /**

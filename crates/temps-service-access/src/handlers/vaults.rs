@@ -186,7 +186,7 @@ pub async fn create_access_bundle(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        (&response.id, &vault_id),
         response.version,
         "CREATE_ACCESS_BUNDLE",
     )
@@ -226,7 +226,7 @@ pub async fn update_access_bundle(
         &auth,
         metadata,
         project_id,
-        &response.id,
+        (&response.id, &vault_id),
         response.version,
         "UPDATE_ACCESS_BUNDLE",
     )

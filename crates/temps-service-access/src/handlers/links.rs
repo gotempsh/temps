@@ -59,7 +59,7 @@ pub async fn create_vault_link(
         &auth,
         metadata,
         row.project_id,
-        &row.id,
+        (&row.id, &vault_id),
         1,
         "CREATE_ACCESS_VAULT_LINK",
     )
@@ -82,7 +82,7 @@ pub async fn delete_vault_link(
         &auth,
         metadata,
         None,
-        &link_id,
+        (&link_id, &vault_id),
         1,
         "REVOKE_ACCESS_VAULT_LINK",
     )
@@ -194,7 +194,7 @@ pub async fn delete_access_bundle_general(
         &auth,
         metadata,
         None,
-        &bundle_id,
+        (&bundle_id, &vault_id),
         1,
         "DELETE_ACCESS_BUNDLE_GENERAL",
     )

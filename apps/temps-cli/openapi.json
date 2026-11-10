@@ -40368,7 +40368,7 @@
             ]
           },
           "resource_id": {
-            "description": "Exact resource ID recorded in the audit payload (omit for all resources).",
+            "description": "Resource ID, including child events for a vault (omit for all resources).",
             "type": [
               "string",
               "null"
@@ -97378,7 +97378,7 @@
         "operationId": "list_audit_logs",
         "parameters": [
           {
-            "description": "Exact resource ID recorded in the audit payload (omit for all resources).",
+            "description": "Resource ID, including child events for a vault (omit for all resources).",
             "in": "query",
             "name": "resource_id",
             "required": false,
