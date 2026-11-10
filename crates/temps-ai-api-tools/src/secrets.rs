@@ -358,6 +358,23 @@ pub(crate) fn reject_references_in_url(
     Ok(())
 }
 
+/// Fail before requesting approval when a credential cannot be supplied safely.
+pub(crate) fn validate_without_resolver(
+    operation_id: &str,
+    body: &Value,
+    paths: &[SecretPath],
+) -> Result<(), ApiToolError> {
+    for pointer in credential_pointers(body, paths) {
+        if matches!(body.pointer(&pointer), Some(Value::String(text)) if !text.is_empty()) {
+            return Err(ApiToolError::SecretsUnavailable {
+                operation_id: operation_id.into(),
+                field: pointer,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Replace every handle at a credential path with the user's value.
 ///
 /// Returns the values that were substituted, so the caller can scrub them from
@@ -470,6 +487,36 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn unavailable_secret_input_checks_nested_slots_without_echoing_values() {
+        let paths = collect_secret_paths(
+            &json!({"type":"object","properties":{"items":{"type":"array","items":{
+                "type":"object","properties":{"password":{"type":"string","x-temps-secret":true}}
+            }}}}),
+            &json!({}),
+        );
+        for value in [
+            "fixture-private-value",
+            "secret_ref:v1:0123456789abcdef0123456789abcdef",
+        ] {
+            let error = validate_without_resolver(
+                "fixture_write",
+                &json!({"items":[{"password":value}]}),
+                &paths,
+            )
+            .unwrap_err();
+            assert!(matches!(error, ApiToolError::SecretsUnavailable { .. }));
+            assert!(!error.to_string().contains(value));
+        }
+        for body in [
+            json!({}),
+            json!({"items":[{}]}),
+            json!({"items":[{"password":""}]}),
+        ] {
+            assert!(validate_without_resolver("fixture_write", &body, &paths).is_ok());
+        }
+    }
 
     const VALUE: &str = "wJalr-example-not-a-real-secret";
     const HANDLE: &str = "secret_ref:v1:0123456789abcdef0123456789abcdef";

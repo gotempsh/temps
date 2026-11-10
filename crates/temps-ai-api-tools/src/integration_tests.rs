@@ -764,7 +764,7 @@ mod tests {
 
         assert!(error.contains("--environment_ids"), "{error}");
         assert!(error.contains("item 2"), "{error}");
-        assert!(error.contains("\"prod\""), "{error}");
+        assert!(!error.contains("prod"), "{error}");
     }
 
     #[tokio::test]

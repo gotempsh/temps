@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+regex = { workspace = true }
 arc-swap = { workspace = true }
 uuid = { workspace = true }
 # Internal crates

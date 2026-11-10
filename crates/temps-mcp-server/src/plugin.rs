@@ -7,9 +7,6 @@ use std::sync::Arc;
 
 use temps_config::ConfigService;
 use temps_core::plugin::{PluginError, ServiceRegistrationContext, TempsPlugin};
-use temps_core::project_access::ProjectAccessChecker;
-use temps_deployments::DeploymentService;
-use temps_projects::ProjectService;
 
 use crate::proposal::ProposalStore;
 use crate::McpHandlerState;
@@ -43,22 +40,13 @@ impl TempsPlugin for McpServerPlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            let project_service = context.require_service::<ProjectService>();
-            let deployment_service = context.require_service::<DeploymentService>();
             let config_service = context.require_service::<ConfigService>();
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
-            // Optional — not all instances have team-based project access configured.
-            // `get_service` (not `require_service`) so startup succeeds on plain OSS.
-            let project_access_checker = context.get_service::<dyn ProjectAccessChecker>();
-
             let state = Arc::new(McpHandlerState {
-                project_service,
-                deployment_service,
+                virtual_cli: std::sync::OnceLock::new(),
                 config_service,
                 proposals: Arc::new(ProposalStore::new()),
                 audit_service,
-                project_access_checker,
-                edge_rule_service: std::sync::OnceLock::new(),
             });
 
             // Register as Arc<McpHandlerState> so console.rs can retrieve it
@@ -76,10 +64,15 @@ impl TempsPlugin for McpServerPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let state = context.require_service::<McpHandlerState>();
-            let service = context
-                .require_service::<temps_proxy::service::edge_rule_service::EdgeRuleService>();
-            // Set once; a second initialisation keeps the first service.
-            let _ = state.edge_rule_service.set(service);
+            let _ = state
+                .virtual_cli
+                .set(Arc::new(crate::virtual_cli::VirtualCli {
+                    api_tools: context.require_service::<temps_ai_api_tools::ApiToolsHandle>(),
+                    write_api_tools: context
+                        .require_service::<temps_ai_api_tools::WriteApiToolsHandle>(),
+                    proposals: state.proposals.clone(),
+                    audit_service: state.audit_service.clone(),
+                }));
             Ok(())
         })
     }

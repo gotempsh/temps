@@ -119,8 +119,8 @@ The request path: reverse proxy, edge cache, route table and bot protection.
 | Crate | Description | Consumers | Binaries |
 |---|---|---|---|
 | [`temps-edge`](../../crates/temps-edge) | Database-free edge CDN node that caches static assets locally and proxies dynamic requests to a Temps control plane | **1**: cli |  |
-| [`temps-edge-rules`](../../crates/temps-edge-rules) | Edge rule model, validation and evaluation engine (ADR-089). Pure: no I/O. | **2**: mcp-server, proxy |  |
-| [`temps-proxy`](../../crates/temps-proxy) | Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield | **3**: cli, mcp-server, observability |  |
+| [`temps-edge-rules`](../../crates/temps-edge-rules) | Edge rule model, validation and evaluation engine (ADR-089). Pure: no I/O. | **1**: proxy |  |
+| [`temps-proxy`](../../crates/temps-proxy) | Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield | **2**: cli, observability |  |
 | [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **8**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, ingress, network-policy, proxy |  |
 | [`temps-shield`](../../crates/temps-shield) | Shield: proof-of-work challenges, clearance cookies and reputation lists (ADR 066) | **5**: environments, node-agent, projects, proxy, routes |  |
 
@@ -137,7 +137,7 @@ Control-plane features: a service layer plus HTTP handlers for one product area.
 | [`temps-ci-tokens`](../../crates/temps-ci-tokens) | Deployment tokens and one-build CI runner dispatch: token issuing and rotation, runner identity checks and their HTTP handlers | **1**: deployments |  |
 | [`temps-cloud`](../../crates/temps-cloud) | Host integration for the optional Temps managed control plane. | **2**: cli, notifications |  |
 | [`temps-cloud-client`](../../crates/temps-cloud-client) | Optional client that links a self-hosted Temps instance to a managed backend. | **5**: ai-gateway, cli, cloud, log-aggregator, otel |  |
-| [`temps-deployments`](../../crates/temps-deployments) | Deployment pipeline: workflow jobs that build and roll out a project's containers, node scheduling and placement, and their HTTP handlers | **4**: ai-agents, cli, import, mcp-server |  |
+| [`temps-deployments`](../../crates/temps-deployments) | Deployment pipeline: workflow jobs that build and roll out a project's containers, node scheduling and placement, and their HTTP handlers | **3**: ai-agents, cli, import |  |
 | [`temps-dns`](../../crates/temps-dns) | DNS provider management (Cloudflare, Route 53, DigitalOcean and others) for automatic record setup, with manual instructions as fallback | **7**: cli, deployments, domains, email, ingress, nodes, providers |  |
 | [`temps-docker-housekeeping`](../../crates/temps-docker-housekeeping) | Docker housekeeping on hosts Temps manages: scheduled image, build cache and asset cleanup, and the Docker disk usage report | **1**: deployments |  |
 | [`temps-domains`](../../crates/temps-domains) | Custom domains and TLS: ACME certificate issuance and renewal, DNS-01 and HTTP-01 challenges, and the domain HTTP handlers | **3**: cli, ingress, status-page |  |
@@ -156,7 +156,7 @@ Control-plane features: a service layer plus HTTP handlers for one product area.
 | [`temps-notifications`](../../crates/temps-notifications) | Notification providers (email, Slack, webhook), alert routing, weekly digests and vulnerability notifications | **4**: ai-agents, cli, domains, error-tracking |  |
 | [`temps-product-telemetry`](../../crates/temps-product-telemetry) | Anonymous product usage telemetry reporter (not OpenTelemetry), with its admin on/off setting and HTTP handlers | **1**: cli |  |
 | [`temps-project-groups`](../../crates/temps-project-groups) | Project groups: an optional parent that gathers several projects into one unit | **1**: cli |  |
-| [`temps-projects`](../../crates/temps-projects) | Projects: project CRUD, environment variables, custom domains, template-based creation, data purge and their HTTP handlers | **13**: ai-chat, cli, import, import-caprover, import-coolify, import-docker, import-dokploy, import-kamal, import-kubernetes, import-portainer, ingress, mcp-server, project-groups |  |
+| [`temps-projects`](../../crates/temps-projects) | Projects: project CRUD, environment variables, custom domains, template-based creation, data purge and their HTTP handlers | **12**: ai-chat, cli, import, import-caprover, import-coolify, import-docker, import-dokploy, import-kamal, import-kubernetes, import-portainer, ingress, project-groups |  |
 | [`temps-providers`](../../crates/temps-providers) | Managed services (Postgres, MariaDB, MongoDB, Redis, S3): container lifecycle, upgrades, data import, health and query APIs | **8**: backup, blob, cli, deployments, import, kv, project-groups, projects |  |
 | [`temps-providers-core`](../../crates/temps-providers-core) | What every managed-service engine builds on: the ExternalService trait and its types, EngineError, and shared container, restore, data import and workload machinery | **6**: providers, providers-mariadb, providers-mongodb, providers-postgres, providers-redis, providers-s3 |  |
 | [`temps-providers-mariadb`](../../crates/temps-providers-mariadb) | The MariaDB managed-service engine: container lifecycle, backup and point-in-time restore, data import, binlog health | **1**: providers |  |
@@ -204,7 +204,7 @@ AI foundation, agents, chat, gateway and the MCP surfaces.
 | [`temps-ai`](../../crates/temps-ai) | Temps AI foundation: a governed, provider-agnostic seam for text and typed/structured output, plus reusable schemas (ADR-022) | **8**: ai-agent-cli, ai-agents, ai-chat, ai-cli, ai-gateway, analytics, external-plugins, otel |  |
 | [`temps-ai-agent-cli`](../../crates/temps-ai-agent-cli) | Bridge between AiService and AiCliProvider for subscription-backed AI workloads (ADR-037) | **2**: ai-chat, ai-gateway |  |
 | [`temps-ai-agents`](../../crates/temps-ai-agents) | AI agent runs: agent definitions, workflows and triggers, AI CLI provider logins, the autofixer, and the sandbox providers they run in | **1**: cli |  |
-| [`temps-ai-api-tools`](../../crates/temps-ai-api-tools) | Turns the REST API into a searchable, callable tool index for AI, replaying calls through the router with propose-then-confirm writes | **3**: ai-chat, cli, external-plugins |  |
+| [`temps-ai-api-tools`](../../crates/temps-ai-api-tools) | Turns the REST API into a searchable, callable tool index for AI, replaying calls through the router with propose-then-confirm writes | **4**: ai-chat, cli, external-plugins, mcp-server |  |
 | [`temps-ai-chat`](../../crates/temps-ai-chat) | Persistent, resumable AI debugging conversations attached to any entity (ADR-023) | **1**: cli |  |
 | [`temps-ai-cli`](../../crates/temps-ai-cli) | AI coding CLI providers: Claude, Codex, OpenCode and OpenAI-compatible runs, their catalog, logins and credential snapshots | **4**: ai-agent-cli, ai-agents, ai-chat, ai-gateway |  |
 | [`temps-ai-gateway`](../../crates/temps-ai-gateway) | AI gateway: OpenAI-compatible and native endpoints proxied to configured providers, with provider keys, models, pricing, usage and limits | **1**: cli |  |

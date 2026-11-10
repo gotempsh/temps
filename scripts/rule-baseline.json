@@ -220,7 +220,7 @@
       "functions_over_300_lines": 1
     },
     "temps-mcp-server": {
-      "lazy_error_variants": 3
+      "lazy_error_variants": 1
     },
     "temps-metrics": {
       "functions_over_300_lines": 1
