@@ -35,50 +35,10 @@ pub const ALL_GROUP_INFOS: &[ToolGroupInfo] = &[
     },
 ];
 
-/// Collect the MCP tools that match the requested groups.
-///
-/// `requested_groups` is the parsed `?groups=` value (empty = all groups).
-/// `write_enabled` gates write tools in each group.
-pub fn collect_tools(requested_groups: &[String], write_enabled: bool) -> Vec<McpTool> {
-    let all = requested_groups.is_empty();
-    let wants = |key: &str| all || requested_groups.iter().any(|g| g == key);
-
-    let mut tools = Vec::new();
-
-    if wants("deployments") {
-        tools.extend(crate::tools::deployments::tools(write_enabled));
-    }
-    if wants("infrastructure") {
-        // TODO(mcp): implement infrastructure tools (services, containers, load-balancer, scans)
-    }
-    if wants("networking") {
-        tools.extend(crate::tools::edge_rules::tools(write_enabled));
-        // TODO(mcp): implement networking tools (domains, custom-domains, dns-providers, ip-access)
-    }
-    if wants("data") {
-        // TODO(mcp): implement data tools (backups, dsn)
-    }
-    if wants("observability") {
-        // TODO(mcp): implement observability tools (monitors, incidents, errors, proxy-logs, funnels, analytics)
-    }
-    if wants("notifications") {
-        // TODO(mcp): implement notifications tools (notifications, notification-prefs, webhooks, email-domains, email-providers)
-    }
-    if wants("platform") {
-        tools.extend(crate::tools::platform::tools());
-    }
-
-    // Every group's write tools only propose; `confirm_action` executes the
-    // proposal, so it is listed once whenever a write tool is.
-    let proposes = tools.iter().any(|t| {
-        t.name == "trigger_deployment"
-            || crate::tools::edge_rules::WRITE_TOOLS.contains(&t.name.as_str())
-    });
-    if proposes && !tools.iter().any(|t| t.name == "confirm_action") {
-        tools.push(crate::tools::deployments::confirm_action_tool());
-    }
-
-    tools
+/// The virtual CLI is independent of legacy `?groups=` filters. Keep accepting
+/// them so existing connection URLs can migrate without reconfiguration.
+pub fn collect_tools(_requested_groups: &[String], write_enabled: bool) -> Vec<McpTool> {
+    crate::virtual_cli::tools(write_enabled)
 }
 
 #[cfg(test)]
@@ -86,56 +46,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_groups_constant_has_seven_entries() {
-        assert_eq!(ALL_GROUP_INFOS.len(), 7);
-        let keys: Vec<&str> = ALL_GROUP_INFOS.iter().map(|g| g.key).collect();
-        assert!(keys.contains(&"deployments"));
-        assert!(keys.contains(&"platform"));
+    fn only_virtual_cli_tools_are_listed_regardless_of_legacy_filter() {
+        for groups in [
+            vec![],
+            vec!["platform".into()],
+            vec!["networking".into()],
+            vec!["unknown".into()],
+        ] {
+            let read = collect_tools(&groups, false);
+            assert_eq!(
+                read.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                ["temps"]
+            );
+            let write = collect_tools(&groups, true);
+            assert_eq!(
+                write.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                ["temps", "temps_write", "confirm_action"]
+            );
+        }
     }
-
     #[test]
-    fn empty_requested_groups_returns_all() {
-        let tools = collect_tools(&[], false);
-        // At minimum platform + deployments read tools are present.
-        assert!(!tools.is_empty());
-    }
-
-    #[test]
-    fn single_group_filter() {
-        let platform_only = collect_tools(&["platform".to_string()], false);
-        let names: Vec<&str> = platform_only.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"list_projects"));
-        assert!(!names.contains(&"list_deployments"));
-    }
-
-    #[test]
-    fn networking_lists_edge_rule_tools_and_confirm_in_write_mode() {
-        let read = collect_tools(&["networking".to_string()], false);
-        let names: Vec<&str> = read.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"list_edge_rules"));
-        assert!(names.contains(&"evaluate_edge_rules"));
-        assert!(!names.contains(&"create_edge_rule"));
-        assert!(!names.contains(&"confirm_action"));
-
-        let write = collect_tools(&["networking".to_string()], true);
-        let names: Vec<&str> = write.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"create_edge_rule"));
-        assert_eq!(names.iter().filter(|n| **n == "confirm_action").count(), 1);
-
-        let everything = collect_tools(&[], true);
-        let confirms = everything
-            .iter()
-            .filter(|t| t.name == "confirm_action")
-            .count();
-        assert_eq!(confirms, 1, "listed once across groups");
-    }
-
-    #[test]
-    fn write_mode_adds_write_tools() {
-        let with_write = collect_tools(&["deployments".to_string()], true);
-        let without_write = collect_tools(&["deployments".to_string()], false);
-        assert!(with_write.len() > without_write.len());
-        let names_write: Vec<&str> = with_write.iter().map(|t| t.name.as_str()).collect();
-        assert!(names_write.contains(&"trigger_deployment"));
+    fn migrated_operations_use_shared_chat_allowlists() {
+        let reads = temps_ai_api_tools::allowlists::ai_read_allowlist();
+        for operation in ["get_projects", "get_project", "get_project_deployments"] {
+            assert!(
+                reads.iter().any(|id| id == operation),
+                "missing {operation}"
+            );
+        }
+        let writes = temps_ai_api_tools::allowlists::ai_write_allowlist();
+        assert!(writes.iter().any(|id| id == "trigger_project_pipeline"));
+        // Edge-rule match values can contain secrets. Removal must not silently
+        // widen the shared policy merely to retain the legacy tool surface.
+        for operation in ["list_edge_rules", "get_edge_rule"] {
+            assert!(!reads.iter().any(|id| id == operation));
+        }
     }
 }

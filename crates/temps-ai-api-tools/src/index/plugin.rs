@@ -1154,7 +1154,7 @@ mod tests {
                 let command = format!("plugin.reports.create --value '{value}'");
                 let (op, params) = match resolve(&index, &command, &|_| true, CliMode::Write) {
                     CliAction::Execute(op, params) => (op, params),
-                    CliAction::Terminal(error) => panic!("{error}"),
+                    CliAction::Terminal(error) | CliAction::Invalid(error) => panic!("{error}"),
                 };
                 let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
                 assert_eq!(request.body, Some(json!({"value": value})), "{command}");
@@ -1166,7 +1166,7 @@ mod tests {
                     &|_| true,
                     CliMode::Write
                 ),
-                CliAction::Terminal(_)
+                CliAction::Terminal(_) | CliAction::Invalid(_)
             ));
             let op = plugin
                 .callable("plugin.reports.create", PluginToolAccess::Write)
@@ -1225,7 +1225,7 @@ mod tests {
                 CliMode::ReadOnly,
             ) {
                 CliAction::Execute(op, params) => (op, params),
-                CliAction::Terminal(error) => panic!("{error}"),
+                CliAction::Terminal(error) | CliAction::Invalid(error) => panic!("{error}"),
             };
             assert_eq!(params, json!({"ids":["123","true"]}));
             let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
@@ -1257,7 +1257,7 @@ mod tests {
                 let command = format!("plugin.reports.filter --choice '{value}'");
                 let (op, params) = match resolve(&index, &command, &|_| true, CliMode::ReadOnly) {
                     CliAction::Execute(op, params) => (op, params),
-                    CliAction::Terminal(error) => panic!("{error}"),
+                    CliAction::Terminal(error) | CliAction::Invalid(error) => panic!("{error}"),
                 };
                 let request = crate::build_request_parts(op, &params, &[], 20, 100).unwrap();
                 assert_eq!(

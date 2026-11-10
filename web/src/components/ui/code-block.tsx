@@ -157,9 +157,6 @@ export function CodeBlock({
   const [wrapLines, setWrapLines] = useState(defaultWrap)
   const [showLineNumbers, setShowLineNumbers] = useState(defaultShowLineNumbers)
 
-  const visibleButtonCount =
-    1 + (disableWrapToggle ? 0 : 1) + (showCopy ? 1 : 0)
-
   // Long unwrapped lines scroll horizontally; make that scroller a tab stop
   // (only while it overflows) so keyboard users can reach the rest of the line.
   const { ref: scrollerRef, scrollable } = useScrollableRegion<HTMLDivElement>()
@@ -192,36 +189,8 @@ export function CodeBlock({
       {/* The white/2.5 wash over zinc-900 is what gives the dark panel its
           slightly-lifted tone in the docs; without it the block reads as a
           flat hole in the page. */}
-      <div className="relative min-w-0 dark:bg-white/[0.025]">
-        <div
-          ref={scrollerRef}
-          {...scrollerProps}
-          className={cn(
-            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
-            // w-0 min-w-full max-w-full is the trick: forces this element to
-            // parent width while letting its children overflow horizontally.
-            'w-0 min-w-full max-w-full py-4 pl-4',
-            visibleButtonCount === 3 && 'pr-28',
-            visibleButtonCount === 2 && 'pr-20',
-            visibleButtonCount === 1 && 'pr-12',
-            visibleButtonCount === 0 && 'pr-4',
-            wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
-          )}
-        >
-          <pre
-            className={cn(
-              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
-              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
-            )}
-          >
-            <HighlightedCode
-              code={code}
-              language={language}
-              showLineNumbers={showLineNumbers}
-            />
-          </pre>
-        </div>
-        <div className="absolute top-2 right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+      <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
+        <div className="mt-2 mr-2 flex shrink-0 self-end items-center gap-0.5 opacity-100">
           <Button
             size="icon"
             variant="ghost"
@@ -284,6 +253,29 @@ export function CodeBlock({
               )}
             </Button>
           )}
+        </div>
+        <div
+          ref={scrollerRef}
+          {...scrollerProps}
+          className={cn(
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+            // Keep the toolbar above the full-width code scroller.
+            'min-w-0 w-full px-4 pt-2 pb-4',
+            wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
+          )}
+        >
+          <pre
+            className={cn(
+              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
+              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
+            )}
+          >
+            <HighlightedCode
+              code={code}
+              language={language}
+              showLineNumbers={showLineNumbers}
+            />
+          </pre>
         </div>
       </div>
     </div>

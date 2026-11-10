@@ -11,6 +11,8 @@ use thiserror::Error;
 /// All errors that can arise when searching, describing, or calling an API tool.
 #[derive(Error, Debug, Clone)]
 pub enum ApiToolError {
+    #[error("Invalid CLI command: {detail}")]
+    InvalidCommand { detail: String },
     #[error("Plugin '{plugin}' operation '{operation_id}' failed: {reason}")]
     PluginOperation {
         plugin: String,
@@ -116,7 +118,7 @@ pub enum ApiToolError {
 
     /// A parameter value is not one of the declared enum members.
     #[error(
-        "Parameter '{name}' has value '{value}' which is not one of the allowed values: \
+        "Parameter '{name}' must be one of the allowed values: \
          [{allowed}] for operation '{operation_id}'."
     )]
     BadEnum {
@@ -221,8 +223,8 @@ pub enum ApiToolError {
     },
 
     #[error(
-        "Operation '{operation_id}' was given a secret reference for '{field}', but no \
-         secrets are available in this context. Nothing was sent."
+        "Operation '{operation_id}' requires secret input for '{field}', but no \
+         secret-input flow is available in this context. Use the console or REST API for this operation. Nothing was sent."
     )]
     SecretsUnavailable { operation_id: String, field: String },
 

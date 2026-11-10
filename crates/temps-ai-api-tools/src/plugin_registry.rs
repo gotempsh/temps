@@ -156,10 +156,6 @@ impl PluginDispatchGuard {
         crate::secrets::scrub(response, &self.response_credentials.load());
     }
 
-    pub(crate) fn has_response_credentials(&self) -> bool {
-        !self.response_credentials.load().is_empty()
-    }
-
     pub fn is_current(&self) -> bool {
         self.binding.registry.upgrade().is_some_and(|registry| {
             Arc::ptr_eq(&registry.snapshot(), &self.binding.snapshot)
