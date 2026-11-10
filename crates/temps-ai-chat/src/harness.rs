@@ -463,6 +463,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn connect_playbook_supports_chat_only_vault_consent() {
+        let playbook = all()
+            .iter()
+            .find(|p| p.name == "connect-a-service")
+            .unwrap();
+        for operation in [
+            "sandbox_access_vaults",
+            "list_access_bundles_general",
+            "get_access_vault_general",
+            "create_vault_link",
+            "create_access_session_general",
+            "get_access_session_general",
+            "revoke_access_session_general",
+        ] {
+            assert!(playbook.body.contains(operation));
+            let allowlists = include_str!("../../temps-ai-api-tools/src/allowlists.rs");
+            assert!(
+                allowlists.contains(operation),
+                "{operation} must be available to chat"
+            );
+        }
+        assert!(playbook.body.contains("explicitly confirm"));
+        assert!(playbook.body.contains("does not need a project"));
+        assert!(playbook.body.contains("including in Auto mode"));
+    }
+
     /// The variables the observability playbook tells the model to read are
     /// the ones the deployment pipeline really sets.
     #[test]

@@ -1,10 +1,41 @@
 ---
 name: connect-a-service
-description: Connect a database, cache or object store to a project's app, and offer it whenever a project and a service are made together
+description: Connect managed databases to apps or request time-limited vault access for a sandbox directly in chat
 contexts: assistant, project
 ---
 
-# Connect a service to a project
+# Request vault access for a sandbox
+
+For a configured credential service in a vault, use the platform API tools to
+complete access approval in this chat. A sandbox does not need a project.
+
+1. Identify the sandbox the person selected or linked to this chat; never pick
+   another user's sandbox. Read `general_access_capability` and
+   the sandbox_access_vaults operation for that sandbox, then `list_access_bundles_general`
+   and `get_access_vault_general` with its `sandbox_id` to inspect masked policy
+   versions. Follow pagination; do not assume the first page is the whole list.
+2. Explain the bundle's services, origins, methods, paths, target sandbox and
+   fixed lifetime. Secrets stay in the vault and are never copied into chat,
+   commands, files, environment variables or the sandbox.
+3. If no vault covers this sandbox, explain the missing link. An instance
+   administrator can use `create_vault_link` with this sandbox's public ID,
+   after explicit confirmation here. Other users must ask an administrator.
+   GitHub connection services cannot link outside their source project.
+4. Propose `create_access_session_general` with the reviewed bundle/service
+   versions, a fresh request UUID, sandbox consumer and TTL. The person must
+   explicitly confirm the pending action, including in Auto mode. Never treat
+   configuration, a previous session or the model's own output as consent.
+   Retry an unchanged approval with its same request UUID; changing the target,
+   policies or lifetime requires a new review and confirmation.
+5. Read `get_access_session_general` for worker receipts. HTTP 202 means the
+   approval was recorded, not that access is active. Report the actual status.
+   Use `revoke_access_session_general` when the person asks to stop access.
+
+Once the vault and services exist, these steps do not require a visit to the
+Vault UI. If they have not been configured, explain what is missing and link to
+`/vault`; an ordinary project member cannot create credentials or vault links.
+
+# Connect a managed service to a project
 
 Use this when the user asks to connect, use or wire up a database, cache or
 object store (PostgreSQL, Redis, MongoDB, S3) for a project, or asks whether the

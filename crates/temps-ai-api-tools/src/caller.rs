@@ -1026,6 +1026,12 @@ impl InternalApiCaller {
                 return Err(ApiToolError::PluginOperation {plugin:plugin.into(),operation_id:operation_id.into(),reason:"Plugin declaration changed since approval was requested; propose the operation again".into()});
             }
         }
+        if matches!(
+            operation_id,
+            "create_access_session_general" | "create_vault_link"
+        ) {
+            return self.call_inner(operation_id, params, scope, true).await;
+        }
         self.execute_write(operation_id, params, scope).await
     }
 
@@ -1104,7 +1110,7 @@ impl InternalApiCaller {
             }
             let result = match tokio::time::timeout_at(
                 deadline,
-                self.call_inner(operation_id, params, scope),
+                self.call_inner(operation_id, params, scope, false),
             )
             .await
             {
@@ -1126,7 +1132,7 @@ impl InternalApiCaller {
             }
             return result;
         }
-        self.call_inner(operation_id, params, scope).await
+        self.call_inner(operation_id, params, scope, false).await
     }
 
     fn validate_plugin_route(
@@ -1159,6 +1165,7 @@ impl InternalApiCaller {
         operation_id: &str,
         params: Value,
         scope: &ApiCallScope,
+        human_confirmed: bool,
     ) -> Result<ApiToolResponse, ApiToolError> {
         // Step 1: look up the operation.
         let op = self
@@ -1244,6 +1251,10 @@ impl InternalApiCaller {
         // rows it read, since those reach a third-party AI provider.
         req.extensions_mut()
             .insert(temps_core::ai_tool_call::AiToolCall);
+        if human_confirmed {
+            req.extensions_mut()
+                .insert(temps_core::ai_tool_call::ConfirmedAiWrite);
+        }
         if let Some(origin) = &scope.origin {
             req.extensions_mut().insert(origin.clone());
         }

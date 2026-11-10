@@ -528,6 +528,18 @@ impl PendingActionService {
         let user_id = auth.user_id();
         let action = self.get(project_id, user_id, public_id).await?;
 
+        if matches!(
+            action.operation_id.as_str(),
+            "create_access_session_general" | "create_vault_link"
+        ) && confirmed_by != Some(user_id)
+        {
+            return Err(PendingActionError::PermissionDenied {
+                public_id: public_id.to_owned(),
+                permission: "explicit human confirmation".into(),
+                decision: "confirm",
+            });
+        }
+
         // 2. Status pre-check. Project-level feature toggles do not participate
         // in authorization: the native harness approval and the confirming
         // user's current RBAC/project scope are the authoritative controls.

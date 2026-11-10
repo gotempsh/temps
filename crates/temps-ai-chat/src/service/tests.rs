@@ -7108,3 +7108,22 @@ fn sandbox_access_approval_requires_a_human_in_writes_and_plans() {
         assert!(automatic_platform_decision(&request).is_none());
     }
 }
+
+#[test]
+fn vault_sessions_always_require_human_consent_in_chat() {
+    for input in [
+        serde_json::json!({"operation":"create_access_session_general","method":"POST"}),
+        serde_json::json!({"operation":"create_vault_link","method":"POST"}),
+        serde_json::json!({"steps":[{"operation":"create_access_session_general","method":"POST"}]}),
+    ] {
+        for kind in [PermissionKind::ToolApproval, PermissionKind::PlanApproval] {
+            let request = PermissionRequest {
+                id: "fixture".into(),
+                kind,
+                tool_name: "temps_write".into(),
+                input: input.clone(),
+            };
+            assert!(automatic_platform_decision(&request).is_none());
+        }
+    }
+}

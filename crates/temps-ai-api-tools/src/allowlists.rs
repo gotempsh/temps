@@ -35,6 +35,18 @@
 /// operation_id without duplicating the list — see `ai_tool_allowlist_tests`
 /// in the console (`temps-cli`), which checks it against the real API.
 pub const AI_READ_ALLOWLIST: &[&str] = &[
+    "get_vault_eligibility",
+    "sandbox_access_vaults",
+    "project_access_vaults",
+    "general_access_capability",
+    "list_access_services_general",
+    "get_access_service_general",
+    "list_access_vaults_general",
+    "get_access_vault_general",
+    "list_access_bundles_general",
+    "list_access_sessions_general",
+    "get_access_session_general",
+    "list_vault_links",
     // Vault metadata is masked; grants never return upstream credentials.
     "list_access_services",
     "get_access_service",
@@ -850,6 +862,10 @@ pub fn ai_read_allowlist() -> Vec<String> {
 /// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
 /// which is the one rule holding up the read-only-POST mechanism.
 pub const AI_WRITE_ALLOWLIST: &[&str] = &[
+    "create_vault_link",
+    "delete_vault_link",
+    "create_access_session_general",
+    "revoke_access_session_general",
     // Same scoped user authorization as the console, through the existing
     // assistant write policy. This does not let the agent change that policy.
     "request_sandbox_service",

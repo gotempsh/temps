@@ -674,12 +674,13 @@ fn params_carry_secret_handle(value: &serde_json::Value) -> bool {
 fn platform_request_requires_human(request: &PermissionRequest) -> bool {
     let flagged = |value: &serde_json::Value| {
         // Durable access spends an existing credential even without a secret handle.
-        value.get("operation").and_then(serde_json::Value::as_str)
-            == Some("approve_sandbox_service")
-            || value
-                .get("carries_handle")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
+        matches!(
+            value.get("operation").and_then(serde_json::Value::as_str),
+            Some("approve_sandbox_service" | "create_access_session_general" | "create_vault_link")
+        ) || value
+            .get("carries_handle")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     };
     flagged(&request.input)
         || request
