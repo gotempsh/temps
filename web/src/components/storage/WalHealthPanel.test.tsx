@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { cleanup, render, waitFor } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { getExternalServiceBackupCapabilityQueryKey } from '@/api/client/@tanstack/react-query.gen'
@@ -9,7 +10,12 @@ import type {
   ExternalServiceBackupCapabilityResponse,
   PostgresWalHealth,
 } from '@/api/client/types.gen'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { WalHealthPanel } from './WalHealthPanel'
+
+installBrowserWindow()
 
 function renderPanel(settings: Partial<PostgresWalHealth>, isImported = false) {
   const client = new QueryClient({
@@ -87,5 +93,66 @@ describe('post-restore WAL archiving guidance', () => {
     expect(markup).toContain('archive_command is empty')
     expect(markup).toContain('can fill disk')
     expect(markup).not.toContain('discards WAL')
+  })
+})
+
+describe('backup compatibility check that cannot be answered', () => {
+  function renderUnanswered(status: number) {
+    const api = mockApi({
+      'GET /backups/external-services/7/capability': () =>
+        jsonResponse(
+          status === 403
+            ? {
+                type: 'about:blank',
+                title: 'Forbidden',
+                status,
+                detail:
+                  'You do not have access to the external service (7) involved in this backup',
+              }
+            : { title: 'Internal Server Error', status, detail: 'boom' },
+          status
+        ),
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel serviceId={7} serviceType="postgres" />
+      </QueryClientProvider>
+    )
+    return { api, client, view }
+  }
+
+  afterEach(cleanup)
+
+  test('a refusal shows nothing: no error alert, no internal id, no retry', async () => {
+    const { api, client, view } = renderUnanswered(403)
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryCache()
+          .findAll()
+          .some((q) => q.state.status === 'error')
+      ).toBe(true)
+    )
+    expect(view.container.textContent).not.toContain(
+      'Backup compatibility unavailable'
+    )
+    expect(view.container.textContent).not.toContain('external service (7)')
+    expect(view.queryByRole('button', { name: 'Check again' })).toBeNull()
+    expect(collectRouteQueryFailures(client)).toEqual([])
+    api.restore()
+  })
+
+  test('a real failure of the check is still reported, with a retry', async () => {
+    const { api, client, view } = renderUnanswered(500)
+    expect(
+      await view.findByText('Backup compatibility unavailable')
+    ).toBeTruthy()
+    expect(view.getByRole('button', { name: 'Check again' })).toBeTruthy()
+    // The panel explains it itself; the shell does not repeat it.
+    expect(collectRouteQueryFailures(client)).toEqual([])
+    api.restore()
   })
 })
