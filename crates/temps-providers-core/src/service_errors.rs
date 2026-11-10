@@ -312,6 +312,18 @@ pub enum ExternalServiceError {
         detail: String,
     },
 
+    /// The node's agent never answered `route`: the request timed out, or
+    /// its connection dropped or could not be made. Unlike an error the
+    /// agent returned, the operation may have started and may still be
+    /// running there, so a caller that must know its outcome asks the node
+    /// again instead of assuming it failed.
+    #[error("Node '{node}' did not answer {route}: {detail}")]
+    AgentUnanswered {
+        node: String,
+        route: String,
+        detail: String,
+    },
+
     /// The local Docker daemon is structurally unavailable in this process —
     /// the process was started without a socket (e.g. a containerised
     /// control plane). Use [`Self::LocalWorkloadsDisabled`] when the daemon
@@ -521,6 +533,7 @@ pub fn worker_node_required(error: &ExternalServiceError) -> Option<Problem> {
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
         | E::NodeBusy { .. }
         | E::ControlPlaneAddressRequired { .. }
         | E::ControlPlaneMemberUnreachable { .. }

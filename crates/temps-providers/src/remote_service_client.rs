@@ -23,13 +23,13 @@ pub use temps_service_protocol::{
     MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
     PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
     PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
-    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest,
-    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
-    RedisWalgBackupResult, RemoteHealthProbeRequest, RemoteHealthProbeResponse,
-    RemoteRuntimeEnvRequest, RemoteRuntimeEnvResponse, RemoteServiceBackupRequest,
-    RemoteServiceBackupResponse, RemoteServiceRestoreRequest, RemoteServiceRestoreResponse,
-    RemoteWalHealthRequest, RemoteWalHealthResponse, ServiceContainerRuntime,
-    ServiceContainerStats, WorkerS3Destination,
+    PostgresWalgRestoreOutcomeRequest, PostgresWalgRestoreProgress, PostgresWalgRestoreRequest,
+    PostgresWalgRestoreResult, RecoveryTarget, RedisRdbBackupRequest, RedisRdbBackupResult,
+    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
+    RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
+    RemoteRuntimeEnvResponse, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
+    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, RemoteWalHealthRequest,
+    RemoteWalHealthResponse, ServiceContainerRuntime, ServiceContainerStats, WorkerS3Destination,
 };
 
 /// Whether a node's agent has a route this release added. An agent that
@@ -61,6 +61,11 @@ const WAL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A worker backup or restore streams the whole dataset; the agent bounds
 /// its own work by the same deadline.
 pub const DATA_OPERATION_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+
+/// How long the agent has to say where a restore is: it reads an in-memory
+/// record, so a slow answer means the node is unreachable, and the caller
+/// asks again later.
+const RESTORE_OUTCOME_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Lightweight client for the agent's service endpoints.
 pub struct RemoteServiceClient {
@@ -575,6 +580,22 @@ impl RemoteServiceClient {
             "/agent/services/postgres/walg-restore",
             request,
             DATA_OPERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Where a WAL-G restore started with an `operation_id` is on its node:
+    /// still running, finished with an outcome, or ended without one. Asked
+    /// when the restore's own request went unanswered, so the run it belongs
+    /// to is completed from what the node actually did.
+    pub async fn postgres_walg_restore_outcome(
+        &self,
+        request: &PostgresWalgRestoreOutcomeRequest,
+    ) -> Result<PostgresWalgRestoreProgress, ExternalServiceError> {
+        self.agent_post_with_timeout(
+            "/agent/services/postgres/walg-restore/outcome",
+            request,
+            RESTORE_OUTCOME_TIMEOUT,
         )
         .await
     }
@@ -1148,11 +1169,23 @@ impl RemoteServiceClient {
             })?
             .send()
             .await
-            .map_err(|error| ExternalServiceError::InternalError {
-                reason: format!(
-                    "Failed to reach agent on node {} at {}: {}",
-                    self.node_name, url, error
-                ),
+            .map_err(|error| {
+                // Not connected: the request never reached the agent.
+                if error.is_connect() {
+                    return ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to reach agent on node {} at {}: {}",
+                            self.node_name, url, error
+                        ),
+                    };
+                }
+                // Sent, then a timeout or a dropped connection: the agent may
+                // have started the operation, and may still be running it.
+                ExternalServiceError::AgentUnanswered {
+                    node: self.node_name.clone(),
+                    route: path.to_string(),
+                    detail: format!("{url}: {error}"),
+                }
             })?;
         if response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             return Err(self.older_agent_error());
@@ -2779,6 +2812,7 @@ mod tests {
                 request.recovery_target,
                 Some(RecoveryTarget::Lsn { ref lsn }) if lsn == "0/3000060"
             ));
+            assert_eq!(request.operation_id.as_deref(), Some("restore-run-5"));
             Json(serde_json::json!({
                 "success": true,
                 "data": {"status": "failed", "reason": "the original database was put back unchanged"},
@@ -2821,6 +2855,7 @@ mod tests {
                 lsn: "0/3000060".to_string(),
             }),
             target_user_data: None,
+            operation_id: Some("restore-run-5".to_string()),
         };
         let outcome = client(address)
             .postgres_walg_restore(&request)
@@ -2850,6 +2885,117 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("Update the node's agent"), "{message}");
+    }
+
+    /// A restore's request that the agent never answers (a timeout, or a
+    /// connection dropped before the response) is `AgentUnanswered`, not an
+    /// error the agent returned: the restore may still be running there.
+    /// Its outcome is then asked for by its operation id, sealed like every
+    /// worker service request.
+    #[tokio::test]
+    async fn an_unanswered_walg_restore_is_told_apart_and_its_outcome_asked_for() {
+        async fn outcome(headers: HeaderMap, sealed: axum::body::Bytes) -> Json<serde_json::Value> {
+            let request: PostgresWalgRestoreOutcomeRequest = open_for_test(
+                &headers,
+                "/agent/services/postgres/walg-restore/outcome",
+                &sealed,
+            );
+            assert_eq!(request.service, "orders");
+            assert_eq!(request.operation_id, "restore-run-5");
+            Json(serde_json::json!({
+                "success": true,
+                "data": {"state": "running", "writes_began": true},
+                "error": null
+            }))
+        }
+        // Accepts the restore's connection and closes it without answering.
+        let dropping = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dropped = dropping.local_addr().unwrap();
+        let closer = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = dropping.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await;
+                drop(socket);
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let answering = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/agent/services/postgres/walg-restore/outcome",
+                    post(outcome),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client = |address: std::net::SocketAddr| {
+            RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing())
+        };
+        let config = ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({"host": "localhost"}),
+        };
+        let error = client(dropped)
+            .postgres_walg_restore(&PostgresWalgRestoreRequest {
+                service_id: 8,
+                node_id: 2,
+                service_config: config.clone(),
+                live_service_config: config,
+                source: worker_destination(),
+                walg_prefix: "s3://backups/external_services/postgres/orders/walg".to_string(),
+                recovery_target: None,
+                target_user_data: None,
+                operation_id: Some("restore-run-5".to_string()),
+            })
+            .await
+            .expect_err("a dropped connection has no outcome");
+        closer.abort();
+        match error {
+            ExternalServiceError::AgentUnanswered { node, route, .. } => {
+                assert_eq!(node, "worker-1");
+                assert_eq!(route, "/agent/services/postgres/walg-restore");
+            }
+            other => panic!("expected AgentUnanswered, got {other:?}"),
+        }
+        // Nothing listens: the request was never delivered, and nothing ran.
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let error = client(closed)
+            .postgres_walg_restore_outcome(&PostgresWalgRestoreOutcomeRequest {
+                service: "orders".to_string(),
+                operation_id: "restore-run-5".to_string(),
+            })
+            .await
+            .expect_err("nothing listens");
+        assert!(
+            matches!(error, ExternalServiceError::InternalError { .. }),
+            "{error:?}"
+        );
+        let progress = client(answering)
+            .postgres_walg_restore_outcome(&PostgresWalgRestoreOutcomeRequest {
+                service: "orders".to_string(),
+                operation_id: "restore-run-5".to_string(),
+            })
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            progress,
+            PostgresWalgRestoreProgress::Running { writes_began: true }
+        );
     }
 
     /// A node without a sealing key never receives a backup's credentials.

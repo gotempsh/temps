@@ -967,6 +967,7 @@ impl ExternalServiceManager {
         walg_prefix: String,
         recovery_target: Option<crate::remote_service_client::RecoveryTarget>,
         target_user_data: Option<String>,
+        operation_id: Option<String>,
     ) -> Result<crate::remote_service_client::PostgresWalgRestoreResult, ExternalServiceError> {
         let (node_id, live_service_config) = self
             .worker_service_target(service_id, "WAL-G restore")
@@ -991,25 +992,70 @@ impl ExternalServiceManager {
                 walg_prefix,
                 recovery_target,
                 target_user_data,
+                operation_id,
             })
             .await?;
-        // The restored server, or the original put back, runs in a recreated
-        // container with a new address on the node's networks.
-        if !matches!(
+        self.republish_after_walg_restore(service_id, node_id, &result)
+            .await;
+        Ok(result)
+    }
+
+    /// Where the WAL-G restore of worker PostgreSQL `service_id` started
+    /// with `operation_id` is on its node, for a restore whose own request
+    /// went unanswered. A finished restore that recreated the container
+    /// republishes its DNS record, as an answered one does.
+    pub async fn walg_restore_worker_postgres_outcome(
+        &self,
+        service_id: i32,
+        operation_id: &str,
+    ) -> Result<crate::remote_service_client::PostgresWalgRestoreProgress, ExternalServiceError>
+    {
+        let (node_id, live_service_config) = self
+            .worker_service_target(service_id, "WAL-G restore outcome")
+            .await?;
+        let progress = self
+            .get_remote_client(node_id)
+            .await?
+            .postgres_walg_restore_outcome(
+                &crate::remote_service_client::PostgresWalgRestoreOutcomeRequest {
+                    service: live_service_config.name,
+                    operation_id: operation_id.to_string(),
+                },
+            )
+            .await?;
+        if let crate::remote_service_client::PostgresWalgRestoreProgress::Finished { outcome } =
+            &progress
+        {
+            self.republish_after_walg_restore(service_id, node_id, outcome)
+                .await;
+        }
+        Ok(progress)
+    }
+
+    /// The restored server, or the original put back, runs in a recreated
+    /// container with a new address on the node's networks; a refused
+    /// restore changed nothing.
+    async fn republish_after_walg_restore(
+        &self,
+        service_id: i32,
+        node_id: i32,
+        result: &crate::remote_service_client::PostgresWalgRestoreResult,
+    ) {
+        if matches!(
             result,
             crate::remote_service_client::PostgresWalgRestoreResult::Refused { .. }
         ) {
-            if let Err(error) = self.register_standalone_service_dns(service_id).await {
-                warn!(
-                    service_id,
-                    node_id,
-                    error = %error,
-                    "PostgreSQL was recreated on its node by a WAL-G restore, but its internal \
-                     DNS record could not be republished"
-                );
-            }
+            return;
         }
-        Ok(result)
+        if let Err(error) = self.register_standalone_service_dns(service_id).await {
+            warn!(
+                service_id,
+                node_id,
+                error = %error,
+                "PostgreSQL was recreated on its node by a WAL-G restore, but its internal \
+                 DNS record could not be republished"
+            );
+        }
     }
 
     /// Back up MongoDB service `service_id`, which runs on a worker node, with

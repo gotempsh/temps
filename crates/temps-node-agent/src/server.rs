@@ -338,6 +338,10 @@ fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState
             post(crate::service_data_handlers::postgres_walg_restore),
         )
         .route(
+            "/agent/services/postgres/walg-restore/outcome",
+            post(crate::service_data_handlers::postgres_walg_restore_outcome),
+        )
+        .route(
             "/agent/services/postgres/walg-archive",
             post(crate::service_data_handlers::postgres_walg_archive),
         )
@@ -2098,6 +2102,7 @@ pub(crate) mod tests {
             "/agent/services/wal-health",
             "/agent/services/data-backup",
             "/agent/services/data-restore",
+            "/agent/services/postgres/walg-restore/outcome",
             "/agent/services/mariadb/physical-backup",
             "/agent/services/mariadb/dump-backup",
             "/agent/services/mariadb/restore",
@@ -2131,6 +2136,41 @@ pub(crate) mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// A restore this node never received (or ran before its agent
+    /// restarted) is reported as unknown, not as running or failed: the
+    /// control plane must not guess its outcome.
+    #[tokio::test]
+    async fn a_walg_restore_outcome_the_node_never_recorded_is_unknown() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let path = "/agent/services/postgres/walg-restore/outcome";
+        let sealed = NodeSealing::Key(public)
+            .seal(
+                "test-node",
+                path,
+                br#"{"service":"orders","operation_id":"restore-run-404"}"#,
+            )
+            .unwrap();
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(path, Some(&token), sealed))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(
+            body["data"],
+            serde_json::json!({"state": "unknown"}),
+            "{body}"
+        );
     }
 
     /// The service page's read-only routes take the node token like every

@@ -140,6 +140,7 @@ pub async fn walg_restore_on_node(
         walg_prefix,
         recovery_target,
         target_user_data,
+        operation_id: _,
     } = request;
     let service = live_service_config.name.clone();
     if live_service_config.service_type != ServiceType::Postgres
@@ -336,6 +337,7 @@ mod tests {
             walg_prefix: "s3://backups/external_services/postgres/orders/walg".to_string(),
             recovery_target: None,
             target_user_data: None,
+            operation_id: None,
         };
         let pg = |host: &str| config("orders", ServiceType::Postgres, host);
         let cases = [

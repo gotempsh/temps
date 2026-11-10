@@ -1451,6 +1451,7 @@ async fn a_worker_postgres_is_restored_and_recovered_to_a_point_in_time_through_
         recovery_target: target,
         target_user_data: uuid
             .map(|uuid| serde_json::json!({ "temps_backup_id": uuid }).to_string()),
+        operation_id: None,
     };
     let inspect = || async {
         docker
@@ -1765,6 +1766,7 @@ async fn another_services_walg_backup_is_restored_into_a_worker_postgres_through
             walg_prefix: walg_prefix(&origin.bucket, WALG_BUCKET_PATH, &origin.name),
             recovery_target: Some(RecoveryTarget::Time { time: t }),
             target_user_data: Some(serde_json::json!({ "temps_backup_id": "cross-1" }).to_string()),
+            operation_id: None,
         },
     )
     .await;

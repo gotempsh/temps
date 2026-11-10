@@ -12,12 +12,16 @@
 //! patched to afterwards). Only the transport differs. Restoring into a new
 //! service is not available on a worker yet and is refused at admission.
 
+use std::future::Future;
 use std::time::Duration;
 
 use sea_orm::{DatabaseConnection, EntityTrait};
 use temps_providers::externalsvc::postgres_walg_backup::walg_key_prefix;
 use temps_providers::externalsvc::RestoreCapabilities;
-use temps_providers::remote_service_client::PostgresWalgRestoreResult;
+use temps_providers::remote_service_client::{
+    PostgresWalgRestoreProgress, PostgresWalgRestoreResult,
+};
+use temps_providers::services::ExternalServiceError;
 use tracing::{info, warn};
 
 use super::*;
@@ -29,6 +33,29 @@ const WINDOW_DEADLINE: Duration = Duration::from_secs(10);
 /// At most this many listing pages (1,000 keys each) are read for the
 /// window: a bigger archive reports its latest point as unknown.
 const WINDOW_MAX_PAGES: usize = 100;
+
+/// How a restore whose request went unanswered is waited for: its node is
+/// asked every `interval` where the restore is. The wait gives up when the
+/// node stays unreachable for `unreachable_for`, or after `max_wait` (the
+/// node keeps an outcome for a day).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OutcomeWait {
+    pub(super) interval: Duration,
+    pub(super) unreachable_for: Duration,
+    pub(super) max_wait: Duration,
+}
+
+const OUTCOME_WAIT: OutcomeWait = OutcomeWait {
+    interval: Duration::from_secs(15),
+    unreachable_for: Duration::from_secs(2 * 3600),
+    max_wait: Duration::from_secs(24 * 3600),
+};
+
+/// The name a restore run's WAL-G restore is started under on its node, to
+/// ask for its outcome by.
+fn operation_id(run_id: i32) -> String {
+    format!("restore-run-{run_id}")
+}
 
 /// Whether `location` is a WAL-G repository, which a WAL-G restore fetches,
 /// rather than a `pg_dumpall` dump, which a job applies.
@@ -376,7 +403,7 @@ pub(super) async fn run(
     // A node already running its maximum of backups and restores is waited
     // for, visibly and cancellably, instead of failing the run.
     // A try after a wait gets a credential minted after it.
-    let outcome = crate::node_busy::retry_while_node_busy_with_fresh_credential(
+    let answered = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
         destination,
         mint,
@@ -388,14 +415,62 @@ pub(super) async fn run(
                 backup.s3_location.clone(),
                 recovery_target.clone(),
                 target_user_data.clone(),
+                Some(operation_id(run_id)),
             )
         },
         |wait| super::wait_for_node_slot(db.as_ref(), run_id, phase, wait),
     )
-    .await?
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id} on node {node_id}: {e}"),
-    })?;
+    .await?;
+    let outcome = match answered {
+        Ok(outcome) => outcome,
+        // The request timed out or its connection dropped: the node may
+        // still be restoring, past its deadline once it began writing. The
+        // run stays active (and keeps other restores of the service out)
+        // until the node says how it ended.
+        Err(ExternalServiceError::AgentUnanswered { detail, .. }) => {
+            warn!(
+                run_id,
+                service_id = target.id,
+                node_id,
+                %detail,
+                "the node did not answer a WAL-G restore; waiting for its outcome there"
+            );
+            let operation_id = operation_id(run_id);
+            await_unanswered_restore(&OUTCOME_WAIT, run_id, node_id, || {
+                mgr.walg_restore_worker_postgres_outcome(target.id, &operation_id)
+            })
+            .await?
+        }
+        Err(e) => {
+            return Err(RestoreError::ExternalService {
+                reason: format!("restore run {run_id} on node {node_id}: {e}"),
+            })
+        }
+    };
+    settle(
+        db,
+        enc,
+        run_id,
+        node_id,
+        target.id,
+        origin_credentials.as_ref(),
+        outcome,
+    )
+    .await
+}
+
+/// What a run makes of its node's restore outcome: a completed restore
+/// patches the target's stored login to the restored one and enters
+/// verification; a refused or failed one fails the run.
+async fn settle(
+    db: &Arc<DatabaseConnection>,
+    enc: &Arc<temps_core::EncryptionService>,
+    run_id: i32,
+    node_id: i32,
+    target_id: i32,
+    origin_credentials: Option<&RestoredServiceCredentials>,
+    outcome: PostgresWalgRestoreResult,
+) -> Result<Option<i32>, RestoreError> {
     match outcome {
         PostgresWalgRestoreResult::Completed => {}
         PostgresWalgRestoreResult::Refused { reason } => {
@@ -409,11 +484,126 @@ pub(super) async fn run(
             })
         }
     }
-    reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
+    reconcile_restored_credentials(db, enc, target_id, origin_credentials).await;
     if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
         warn!("Restore run {run_id}: recording the verify phase failed: {e}");
     }
     Ok(None)
+}
+
+/// Wait for the outcome of a restore whose request went unanswered, asking
+/// its node with `ask` as `wait` says. Nothing is written meanwhile: the run
+/// stays `running`, so no other destructive restore of the service starts
+/// while the node may still be swapping data.
+///
+/// A restore that ended before it changed the database fails cleanly; one
+/// that ended without an outcome after it began writing, that the node no
+/// longer knows, or whose node stays unreachable, fails saying the database
+/// must be checked before it is restored again.
+pub(super) async fn await_unanswered_restore<Ask, AskFut>(
+    wait: &OutcomeWait,
+    run_id: i32,
+    node_id: i32,
+    mut ask: Ask,
+) -> Result<PostgresWalgRestoreResult, RestoreError>
+where
+    Ask: FnMut() -> AskFut,
+    AskFut: Future<Output = Result<PostgresWalgRestoreProgress, ExternalServiceError>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut unreachable_since: Option<tokio::time::Instant> = None;
+    let mut last_error = String::new();
+    loop {
+        match ask().await {
+            Ok(PostgresWalgRestoreProgress::Finished { outcome }) => {
+                info!(
+                    run_id,
+                    node_id,
+                    ?outcome,
+                    "the node reported the outcome of an unanswered WAL-G restore"
+                );
+                return Ok(outcome);
+            }
+            Ok(PostgresWalgRestoreProgress::Ended {
+                writes_began: false,
+                reason,
+            }) => {
+                return Err(RestoreError::ExternalService {
+                    reason: format!(
+                        "restore run {run_id} on node {node_id} stopped before it changed the \
+                         database, which is unchanged: {reason}"
+                    ),
+                })
+            }
+            Ok(PostgresWalgRestoreProgress::Ended {
+                writes_began: true,
+                reason,
+            }) => {
+                return Err(RestoreError::ExternalService {
+                    reason: format!(
+                        "restore run {run_id} on node {node_id} stopped after it began writing to \
+                         the database, without an outcome: {reason}. The database may be \
+                         partially restored; check it before restoring again"
+                    ),
+                })
+            }
+            Ok(PostgresWalgRestoreProgress::Unknown) => {
+                return Err(RestoreError::ExternalService {
+                    reason: format!(
+                        "restore run {run_id}: node {node_id} did not answer the restore and has \
+                         no record of it (its agent may have restarted). The database may have \
+                         been changed; check it before restoring again"
+                    ),
+                })
+            }
+            Ok(PostgresWalgRestoreProgress::Running { writes_began }) => {
+                unreachable_since = None;
+                tracing::debug!(
+                    run_id,
+                    node_id,
+                    writes_began,
+                    "an unanswered WAL-G restore is still running"
+                );
+            }
+            Err(error) => {
+                let since = *unreachable_since.get_or_insert_with(tokio::time::Instant::now);
+                last_error = error.to_string();
+                warn!(
+                    run_id,
+                    node_id,
+                    error = %last_error,
+                    "could not ask node for the outcome of an unanswered WAL-G restore; retrying"
+                );
+                if since.elapsed() >= wait.unreachable_for {
+                    return Err(RestoreError::ExternalService {
+                        reason: format!(
+                            "restore run {run_id}: node {node_id} did not answer the restore, and \
+                             could not be asked for its outcome for {}s ({last_error}). The \
+                             restore may still be running there and the database may be \
+                             partially restored; check it before restoring again",
+                            wait.unreachable_for.as_secs()
+                        ),
+                    });
+                }
+            }
+        }
+        if started.elapsed() >= wait.max_wait {
+            return Err(RestoreError::ExternalService {
+                reason: format!(
+                    "restore run {run_id}: node {node_id} reported no outcome for the restore \
+                     within {}s{}. The restore may still be running there; check the database \
+                     before restoring again",
+                    wait.max_wait.as_secs(),
+                    if last_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (last error: {last_error})")
+                    }
+                ),
+            });
+        }
+        tokio::time::sleep(wait.interval).await;
+    }
 }
 
 #[cfg(test)]
@@ -542,5 +732,471 @@ mod tests {
         assert!(!capabilities.restore_to_new_service);
         assert_eq!(capabilities.earliest_pitr_time, None);
         assert_eq!(capabilities.latest_pitr_time, None);
+    }
+
+    // ---- A restore whose request went unanswered
+
+    const FAST: OutcomeWait = OutcomeWait {
+        interval: Duration::from_millis(5),
+        unreachable_for: Duration::from_millis(60),
+        max_wait: Duration::from_secs(30),
+    };
+
+    /// The node's answers to the outcome asks, in order; the last repeats.
+    fn answers(
+        answers: Vec<Result<PostgresWalgRestoreProgress, ExternalServiceError>>,
+    ) -> impl FnMut() -> std::future::Ready<Result<PostgresWalgRestoreProgress, ExternalServiceError>>
+    {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        move || {
+            let mut answers = answers.lock().unwrap();
+            let answer = if answers.len() > 1 {
+                answers.pop_front().unwrap()
+            } else {
+                match answers.front().unwrap() {
+                    Ok(progress) => Ok(progress.clone()),
+                    Err(_) => Err(unreachable()),
+                }
+            };
+            std::future::ready(answer)
+        }
+    }
+
+    fn unreachable() -> ExternalServiceError {
+        ExternalServiceError::AgentUnanswered {
+            node: "worker-2".to_string(),
+            route: "/agent/services/postgres/walg-restore/outcome".to_string(),
+            detail: "operation timed out".to_string(),
+        }
+    }
+
+    /// The restore's own request went unanswered before it began writing:
+    /// the node's agent stopped it at its deadline, and the run fails at
+    /// once, saying the database is unchanged.
+    #[tokio::test]
+    async fn an_unanswered_restore_that_never_wrote_fails_cleanly() {
+        let error = await_unanswered_restore(
+            &FAST,
+            41,
+            2,
+            answers(vec![Ok(PostgresWalgRestoreProgress::Ended {
+                writes_began: false,
+                reason: "WAL-G restore of 'orders' passed its deadline".to_string(),
+            })]),
+        )
+        .await
+        .expect_err("ended without an outcome");
+        let message = error.to_string();
+        assert!(message.contains("restore run 41 on node 2"), "{message}");
+        assert!(message.contains("which is unchanged"), "{message}");
+        assert!(message.contains("passed its deadline"), "{message}");
+    }
+
+    /// Running answers are waited through, an unreachable node in between
+    /// is retried, and the node's final outcome is what the run gets.
+    #[tokio::test]
+    async fn an_unanswered_restore_is_waited_for_until_the_node_reports_it() {
+        let outcome = await_unanswered_restore(
+            &FAST,
+            41,
+            2,
+            answers(vec![
+                Ok(PostgresWalgRestoreProgress::Running { writes_began: true }),
+                Err(unreachable()),
+                Ok(PostgresWalgRestoreProgress::Running { writes_began: true }),
+                Ok(PostgresWalgRestoreProgress::Finished {
+                    outcome: PostgresWalgRestoreResult::Failed {
+                        reason: "the original database was put back unchanged".to_string(),
+                    },
+                }),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PostgresWalgRestoreResult::Failed {
+                reason: "the original database was put back unchanged".to_string()
+            }
+        );
+    }
+
+    /// Ended after writing, unknown to the node, or a node unreachable past
+    /// the limit: each fails, saying the database must be checked.
+    #[tokio::test]
+    async fn an_unanswered_restore_without_a_known_outcome_says_to_check_the_database() {
+        let cases = [
+            (
+                vec![Ok(PostgresWalgRestoreProgress::Ended {
+                    writes_began: true,
+                    reason: "the engine stopped".to_string(),
+                })],
+                "may be partially restored",
+            ),
+            (
+                vec![Ok(PostgresWalgRestoreProgress::Unknown)],
+                "has no record of it",
+            ),
+            (
+                vec![
+                    Ok(PostgresWalgRestoreProgress::Running { writes_began: true }),
+                    Err(unreachable()),
+                ],
+                "could not be asked for its outcome",
+            ),
+        ];
+        for (answered, expected) in cases {
+            let message = await_unanswered_restore(&FAST, 41, 2, answers(answered))
+                .await
+                .expect_err("no known outcome")
+                .to_string();
+            assert!(message.contains(expected), "{expected}: {message}");
+            assert!(message.contains("before restoring again"), "{message}");
+        }
+    }
+
+    /// A node that keeps reporting the restore as running is given up on
+    /// after the wait's limit, not waited for forever.
+    #[tokio::test]
+    async fn an_unanswered_restore_is_not_waited_for_past_the_limit() {
+        let wait = OutcomeWait {
+            max_wait: Duration::from_millis(40),
+            ..FAST
+        };
+        let message = await_unanswered_restore(
+            &wait,
+            41,
+            2,
+            answers(vec![Ok(PostgresWalgRestoreProgress::Running {
+                writes_began: true,
+            })]),
+        )
+        .await
+        .expect_err("past the limit")
+        .to_string();
+        assert!(message.contains("reported no outcome"), "{message}");
+    }
+
+    struct RunFixture {
+        _test_db: temps_test_utils::TestDatabase,
+        db: Arc<DatabaseConnection>,
+        enc: Arc<temps_core::EncryptionService>,
+        user_id: i32,
+        service_id: i32,
+        backup_id: i32,
+    }
+
+    /// A PostgreSQL with its stored login, a backup of another service and
+    /// the user who restores it, in a real database (settling a run reads
+    /// neither the node nor the backup's data). `None` without one.
+    async fn run_fixture() -> Option<RunFixture> {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, NotSet};
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping");
+            return None;
+        }
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return None;
+            }
+        };
+        let db = test_db.db.clone();
+        let enc = Arc::new(temps_core::EncryptionService::new_from_password(
+            "synthetic-restore-test-key",
+        ));
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Restore Tester".to_string()),
+            email: Set("restore-tester@example.com".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert user");
+        let source = temps_entities::s3_sources::ActiveModel {
+            name: Set("restore-source".to_string()),
+            bucket_name: Set("backups".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            region: Set("us-east-1".to_string()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert S3 source");
+        let config = serde_json::json!({
+            "host": "localhost",
+            "port": "5432",
+            "username": "orders_owner",
+            "password": "target-password",
+        })
+        .to_string();
+        let service = temps_entities::external_services::ActiveModel {
+            name: Set("orders".to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set("standalone".to_string()),
+            config: Set(Some(enc.encrypt_string(&config).unwrap())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert service");
+        let backup = temps_entities::backups::ActiveModel {
+            id: NotSet,
+            name: Set("nightly".to_string()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            schedule_run_id: Set(None),
+            backup_type: Set("full".to_string()),
+            state: Set("completed".to_string()),
+            started_at: Set(Utc::now()),
+            finished_at: Set(Some(Utc::now())),
+            s3_source_id: Set(source.id),
+            s3_location: Set("s3://backups/external_services/postgres/billing/walg".to_string()),
+            compression_type: Set("none".to_string()),
+            created_by: Set(user.id),
+            tags: Set("[]".to_string()),
+            size_bytes: Set(None),
+            file_count: Set(None),
+            error_message: Set(None),
+            expires_at: Set(None),
+            checksum: Set(None),
+            metadata: Set("{}".to_string()),
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert backup");
+        Some(RunFixture {
+            _test_db: test_db,
+            db,
+            enc,
+            user_id: user.id,
+            service_id: service.id,
+            backup_id: backup.id,
+        })
+    }
+
+    impl RunFixture {
+        async fn start_in_place(
+            &self,
+        ) -> Result<temps_entities::restore_runs::Model, RestoreError> {
+            use sea_orm::{ActiveValue::Set, NotSet};
+            insert_restore_run(
+                self.db.as_ref(),
+                temps_entities::restore_runs::ActiveModel {
+                    id: NotSet,
+                    source_backup_id: Set(self.backup_id),
+                    source_service_id: Set(self.service_id),
+                    target_service_id: Set(None),
+                    target_service_name: Set(None),
+                    mode: Set("in_place".to_string()),
+                    status: Set("running".to_string()),
+                    phase: Set("restore".to_string()),
+                    recovery_target: Set(None),
+                    parameter_overrides: Set(serde_json::json!({})),
+                    resume_token: Set(None),
+                    log_id: Set(uuid::Uuid::new_v4().to_string()),
+                    error_message: Set(None),
+                    attempt: Set(1),
+                    started_at: Set(Some(Utc::now())),
+                    finished_at: Set(None),
+                    created_by: Set(self.user_id),
+                    created_at: NotSet,
+                    updated_at: NotSet,
+                    cancel_requested_at: Set(None),
+                    cancel_requested_by: Set(None),
+                },
+                Some(self.backup_id),
+                self.service_id,
+                true,
+            )
+            .await
+        }
+
+        async fn run_status(&self, run_id: i32) -> String {
+            temps_entities::restore_runs::Entity::find_by_id(run_id)
+                .one(self.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        }
+
+        async fn stored_login(&self) -> serde_json::Value {
+            let service = temps_entities::external_services::Entity::find_by_id(self.service_id)
+                .one(self.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            let config = self.enc.decrypt_string(&service.config.unwrap()).unwrap();
+            let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+            serde_json::json!({
+                "username": config["username"],
+                "password": config["password"],
+            })
+        }
+
+        /// Settle `run_id` from the node's answers, as `run` does after an
+        /// unanswered request, in its own task like the restore's.
+        fn settle_unanswered(
+            &self,
+            run_id: i32,
+            progress: tokio::sync::watch::Receiver<PostgresWalgRestoreProgress>,
+        ) -> tokio::task::JoinHandle<Result<Option<i32>, RestoreError>> {
+            let db = Arc::clone(&self.db);
+            let enc = Arc::clone(&self.enc);
+            let service_id = self.service_id;
+            tokio::spawn(async move {
+                // The backup is another service's: the restored data answers
+                // to its origin's login.
+                let origin = RestoredServiceCredentials::from_origin(
+                    "postgres",
+                    &serde_json::json!({"username": "billing_owner", "password": "origin-password"}),
+                );
+                let outcome = await_unanswered_restore(&FAST, run_id, 2, || {
+                    std::future::ready(Ok(progress.borrow().clone()))
+                })
+                .await?;
+                settle(&db, &enc, run_id, 2, service_id, origin.as_ref(), outcome).await
+            })
+        }
+    }
+
+    /// While the node still restores (past its write boundary) after the
+    /// request went unanswered, the run stays `running` and a second
+    /// destructive restore of the service is refused. The node's later
+    /// success completes the run and patches the stored login to the
+    /// restored one; the service is free again after.
+    #[tokio::test]
+    async fn an_unanswered_restore_that_wrote_holds_the_service_until_it_succeeds() {
+        let Some(fixture) = run_fixture().await else {
+            return;
+        };
+        let run = fixture.start_in_place().await.expect("first restore");
+        let (report, progress) =
+            tokio::sync::watch::channel(PostgresWalgRestoreProgress::Running {
+                writes_began: true,
+            });
+        let settling = fixture.settle_unanswered(run.id, progress);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!settling.is_finished(), "waits for the node's outcome");
+        assert_eq!(fixture.run_status(run.id).await, "running");
+        match fixture.start_in_place().await {
+            Err(RestoreError::RestoreAlreadyActive {
+                service_id,
+                restore_run_id,
+            }) => {
+                assert_eq!(service_id, fixture.service_id);
+                assert_eq!(restore_run_id, run.id);
+            }
+            other => panic!("expected RestoreAlreadyActive, got {other:?}"),
+        }
+        assert_eq!(
+            fixture.stored_login().await,
+            serde_json::json!({"username": "orders_owner", "password": "target-password"}),
+            "the login is not changed while the outcome is unknown"
+        );
+
+        report
+            .send(PostgresWalgRestoreProgress::Finished {
+                outcome: PostgresWalgRestoreResult::Completed,
+            })
+            .unwrap();
+        let result = settling.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        persist_terminal_state(fixture.db.as_ref(), run.id, &result, TERMINAL_WRITE_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(fixture.run_status(run.id).await, "completed");
+        assert_eq!(
+            fixture.stored_login().await,
+            serde_json::json!({"username": "billing_owner", "password": "origin-password"})
+        );
+        fixture
+            .start_in_place()
+            .await
+            .expect("the service is free once the run completed");
+    }
+
+    /// The node's later failure (the original put back) fails the run and
+    /// leaves the stored login as it was.
+    #[tokio::test]
+    async fn an_unanswered_restore_that_wrote_fails_when_the_node_reports_failure() {
+        let Some(fixture) = run_fixture().await else {
+            return;
+        };
+        let run = fixture.start_in_place().await.expect("first restore");
+        let (report, progress) =
+            tokio::sync::watch::channel(PostgresWalgRestoreProgress::Running {
+                writes_began: true,
+            });
+        let settling = fixture.settle_unanswered(run.id, progress);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!settling.is_finished(), "waits for the node's outcome");
+        assert!(matches!(
+            fixture.start_in_place().await,
+            Err(RestoreError::RestoreAlreadyActive { .. })
+        ));
+
+        report
+            .send(PostgresWalgRestoreProgress::Finished {
+                outcome: PostgresWalgRestoreResult::Failed {
+                    reason: "recovery did not finish; the original database was put back"
+                        .to_string(),
+                },
+            })
+            .unwrap();
+        let result = settling.await.unwrap();
+        let message = result.as_ref().expect_err("the node failed").to_string();
+        assert!(
+            message.contains("the original database was put back"),
+            "{message}"
+        );
+        persist_terminal_state(fixture.db.as_ref(), run.id, &result, TERMINAL_WRITE_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(fixture.run_status(run.id).await, "failed");
+        assert_eq!(
+            fixture.stored_login().await,
+            serde_json::json!({"username": "orders_owner", "password": "target-password"})
+        );
+    }
+
+    /// Unanswered before it began writing: the node stopped it at its
+    /// deadline, the run fails at once with the database unchanged, and the
+    /// service is free for another restore.
+    #[tokio::test]
+    async fn an_unanswered_restore_before_writes_fails_and_frees_the_service() {
+        let Some(fixture) = run_fixture().await else {
+            return;
+        };
+        let run = fixture.start_in_place().await.expect("first restore");
+        let (_report, progress) = tokio::sync::watch::channel(PostgresWalgRestoreProgress::Ended {
+            writes_began: false,
+            reason: "WAL-G restore of 'orders' passed its deadline".to_string(),
+        });
+        let result = fixture.settle_unanswered(run.id, progress).await.unwrap();
+        let message = result.as_ref().expect_err("ended early").to_string();
+        assert!(message.contains("which is unchanged"), "{message}");
+        persist_terminal_state(fixture.db.as_ref(), run.id, &result, TERMINAL_WRITE_RETRY)
+            .await
+            .unwrap();
+        assert_eq!(fixture.run_status(run.id).await, "failed");
+        assert_eq!(
+            fixture.stored_login().await,
+            serde_json::json!({"username": "orders_owner", "password": "target-password"})
+        );
+        fixture
+            .start_in_place()
+            .await
+            .expect("the service is free once the run failed");
     }
 }

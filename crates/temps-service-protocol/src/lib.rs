@@ -650,6 +650,14 @@ pub struct PostgresWalgRestoreRequest {
     /// the latest.
     #[serde(default)]
     pub target_user_data: Option<String>,
+    /// The caller's name for this restore (the control plane's restore run).
+    /// With one, the node keeps the restore's outcome after the request
+    /// ends, so a caller whose request timed out or lost its connection can
+    /// ask for it ([`PostgresWalgRestoreOutcomeRequest`]) instead of
+    /// guessing: a restore that began writing outlives its deadline until it
+    /// has started the restored data or put the original back.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// What a [`PostgresWalgRestoreRequest`] did.
@@ -664,6 +672,36 @@ pub enum PostgresWalgRestoreResult {
     /// The restore failed. The original is running again unless the reason
     /// says otherwise.
     Failed { reason: String },
+}
+
+/// `POST /agent/services/postgres/walg-restore/outcome`: what became of the
+/// WAL-G restore of service `service` started with `operation_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresWalgRestoreOutcomeRequest {
+    /// The service's name on the node (its live configuration's `name`).
+    pub service: String,
+    /// The [`PostgresWalgRestoreRequest::operation_id`] it was started with.
+    pub operation_id: String,
+}
+
+/// Where a WAL-G restore started with an `operation_id` is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PostgresWalgRestoreProgress {
+    /// Still running. Once `writes_began`, the server was stopped and its
+    /// data moved aside: the restore runs until it has started the restored
+    /// data or put the original back, whatever the deadline.
+    Running { writes_began: bool },
+    /// The engine ended with this outcome.
+    Finished { outcome: PostgresWalgRestoreResult },
+    /// The engine ended without an outcome (it could not run, passed its
+    /// deadline, or stopped unexpectedly). With `writes_began` false the
+    /// service was never stopped and nothing was changed.
+    Ended { writes_began: bool, reason: String },
+    /// The node has no restore of this service under this id: it never
+    /// received it, or its agent restarted since.
+    Unknown,
 }
 
 /// `POST /agent/services/mongodb/backup`: a backup of a MongoDB service on

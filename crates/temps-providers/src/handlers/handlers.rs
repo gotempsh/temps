@@ -198,6 +198,7 @@ fn data_safety_problem(error: &crate::services::ExternalServiceError) -> Option<
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
         | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
@@ -260,6 +261,7 @@ fn service_name_problem(error: &crate::services::ExternalServiceError) -> Option
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
         | E::NodeBusy { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
@@ -351,6 +353,7 @@ fn cluster_placement_problem(error: &crate::services::ExternalServiceError) -> O
         | E::DockerError { .. }
         | E::DuplicateServiceType { .. }
         | E::InternalError { .. }
+        | E::AgentUnanswered { .. }
         | E::DockerUnavailable(_)
         | E::LocalWorkloadsDisabled { .. }
         | E::Engine { .. } => return None,
