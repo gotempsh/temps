@@ -165,6 +165,19 @@ pub(crate) async fn prepare_consumer_constraints(
                 reason: error.to_string(),
             })?;
         for &(name, table) in temps_migrations::GENERAL_VAULT_CONSUMER_INDEXES {
+            let table = if table == "sandbox_access_runtimes" {
+                let renamed: bool = sqlx::query_scalar("SELECT to_regclass(quote_ident(current_schema()) || '.sandbox_access_runtime_records') IS NOT NULL")
+                    .fetch_one(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
+                        index: name, operation: "resolve runtime storage for", reason: error.to_string(),
+                    })?;
+                if renamed {
+                    "sandbox_access_runtime_records"
+                } else {
+                    table
+                }
+            } else {
+                table
+            };
             let exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident($1)) IS NOT NULL")
                 .bind(table).fetch_one(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
                     index: name, operation: "check source table for", reason: error.to_string(),

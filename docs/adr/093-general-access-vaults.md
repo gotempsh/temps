@@ -189,3 +189,15 @@ Cover frontend onboarding, read-only project views and manager controls with
 adjacent tests. Regenerate both OpenAPI clients against the changed server and
 run CLI spec checks, Rust checks/tests and web typechecking/tests before marking
 this ADR implemented.
+
+## Binary rollback compatibility
+
+Runtime storage uses `sandbox_access_runtime_records`. The previous table name
+remains a writable view exposing only records with a project ID, so an older
+binary's non-null runtime decoder cannot fail on a projectless record and block
+unrelated project bindings on the same worker. Existing rows, foreign keys and
+indexes are preserved by a metadata rename. Revision triggers and the new planner
+use the complete table. During binary rollback, projectless sessions are not
+renewed by the old server and their short worker leases expire; their consent
+history remains stored. Removing this compatibility layer refuses while any
+projectless runtime history exists.

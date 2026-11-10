@@ -139,7 +139,7 @@ async fn postgres_delivery_fences_claims_versions_and_survives_runtime_deletion(
         .await
         .unwrap();
     let db = test.connection_arc();
-    db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9401,'Delivery','repo','owner','/','main','nodejs','delivery',now(),now()); INSERT INTO sandboxes (id,public_id,name,project_id) VALUES (9401,'sbx_delivery','delivery',9401); INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000201',9401,9401,'container:generation')").await.unwrap();
+    db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9401,'Delivery','repo','owner','/','main','nodejs','delivery',now(),now()); INSERT INTO sandboxes (id,public_id,name,project_id) VALUES (9401,'sbx_delivery','delivery',9401); INSERT INTO sandbox_access_runtime_records (id,project_id,sandbox_id,provider_identity) VALUES ('00000000-0000-4000-8000-000000000201',9401,9401,'container:generation')").await.unwrap();
     let queue = DeliveryQueue::new(Arc::clone(&db));
     let runtime_id = Uuid::parse_str("00000000-0000-4000-8000-000000000201").unwrap();
     let txn = db.begin().await.unwrap();
@@ -264,7 +264,7 @@ async fn postgres_delivery_fences_claims_versions_and_survives_runtime_deletion(
     ));
     txn.rollback().await.unwrap();
     // Deletion leaves the claimed retirement intact; no duplicate or FK loss.
-    db.execute_unprepared("DELETE FROM sandbox_access_runtimes")
+    db.execute_unprepared("DELETE FROM sandbox_access_runtime_records")
         .await
         .unwrap();
     queue.complete(&cut).await.unwrap();
@@ -319,7 +319,7 @@ async fn worker_claim_excludes_other_sandboxes_until_release() {
     db.execute_unprepared("INSERT INTO projects (id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES (9401,'Claims','repo','owner','/','main','nodejs','claims',now(),now()); INSERT INTO sandboxes (id,public_id,name,project_id) VALUES (9401,'sbx_one','one',9401),(9402,'sbx_two','two',9401)").await.unwrap();
     for sandbox in [9401, 9402] {
         let id = Uuid::new_v4();
-        db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name) VALUES ('{id}',9401,{sandbox},'container-{sandbox}','{}','docker','sandbox-{sandbox}')",worker.identity().boot_id)).await.unwrap();
+        db.execute_unprepared(&format!("INSERT INTO sandbox_access_runtime_records (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name) VALUES ('{id}',9401,{sandbox},'container-{sandbox}','{}','docker','sandbox-{sandbox}')",worker.identity().boot_id)).await.unwrap();
         let tx = db.begin().await.unwrap();
         DeliveryQueue::advance(&tx, id, 0, DeliveryOperation::Reconcile)
             .await

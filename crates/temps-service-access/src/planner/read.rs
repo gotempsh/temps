@@ -63,7 +63,7 @@ impl PolicyPlanner {
             FROM sandbox_access_authorizations a
             JOIN sandbox_service_grants g ON g.id=a.grant_id AND g.project_id IS NOT DISTINCT FROM a.project_id AND g.sandbox_id=a.sandbox_id
             JOIN sandbox_access_services s ON s.id=g.service_id
-            JOIN sandbox_access_runtimes r ON r.id=a.runtime_id AND r.project_id IS NOT DISTINCT FROM a.project_id AND r.sandbox_id=a.sandbox_id
+            JOIN sandbox_access_runtime_records r ON r.id=a.runtime_id AND r.project_id IS NOT DISTINCT FROM a.project_id AND r.sandbox_id=a.sandbox_id
             JOIN sandboxes b ON b.id=r.sandbox_id AND b.project_id IS NOT DISTINCT FROM r.project_id
             LEFT JOIN projects p ON p.id=a.project_id
             JOIN users u ON u.id=a.approved_by

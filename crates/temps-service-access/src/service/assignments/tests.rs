@@ -525,7 +525,7 @@ async fn replacement_waits_for_runtime_before_touching_authority() {
     .unwrap();
     let lock = db.begin().await.unwrap();
     lock.execute_unprepared(&format!(
-        "SELECT id FROM sandbox_access_runtimes WHERE id='{}' FOR UPDATE",
+        "SELECT id FROM sandbox_access_runtime_records WHERE id='{}' FOR UPDATE",
         observed.incarnation
     ))
     .await

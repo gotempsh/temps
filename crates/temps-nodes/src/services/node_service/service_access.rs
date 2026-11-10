@@ -14,11 +14,11 @@ impl NodeService {
         node_id: i32,
     ) -> Result<(), NodeError> {
         for sql in [
-            "SELECT id FROM sandbox_access_runtimes WHERE node_id=$1 ORDER BY id FOR UPDATE",
+            "SELECT id FROM sandbox_access_runtime_records WHERE node_id=$1 ORDER BY id FOR UPDATE",
             // Destroyed sandboxes can retain both open and closed incarnations.
             // Their authorizations cascade; the delete trigger emits retirement
             // tombstones and advances the authority before its keys are removed.
-            "DELETE FROM sandbox_access_runtimes WHERE node_id=$1",
+            "DELETE FROM sandbox_access_runtime_records WHERE node_id=$1",
             "DELETE FROM sandbox_access_authorities WHERE node_id=$1",
             // The node is no longer managed: retries cannot reach its worker.
             // Include tombstones left by earlier project deletion and invalidate

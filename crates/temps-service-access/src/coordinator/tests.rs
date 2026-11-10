@@ -527,7 +527,7 @@ async fn applied_delivery_with_lost_receipt_retries_with_a_new_binding_version()
         Some(DispatchOutcome::Applied)
     );
     // Simulate the worker's successful install surviving a lost receipt commit.
-    db.execute_unprepared("UPDATE sandbox_access_runtimes SET applied_version=0,lease_expires_at=NULL; UPDATE sandbox_access_delivery SET completed_at=NULL,available_at=now() WHERE operation='reconcile'").await.unwrap();
+    db.execute_unprepared("UPDATE sandbox_access_runtime_records SET applied_version=0,lease_expires_at=NULL; UPDATE sandbox_access_delivery SET completed_at=NULL,available_at=now() WHERE operation='reconcile'").await.unwrap();
     assert_eq!(
         coordinator.dispatch_one().await.unwrap(),
         Some(DispatchOutcome::Superseded)

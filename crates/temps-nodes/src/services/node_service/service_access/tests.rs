@@ -25,17 +25,17 @@ SELECT ('00000000-0000-4000-8000-' || lpad(i::text,12,'0'))::uuid,
        ('00000000-0000-4000-9000-' || lpad(i::text,12,'0'))::uuid,
        repeat('a',44),'encrypted-snapshot','encrypted-session','public-ca','encrypted-ca'
 FROM generate_series(1,3) i;
-INSERT INTO sandbox_access_runtimes (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name)
+INSERT INTO sandbox_access_runtime_records (id,project_id,sandbox_id,provider_identity,authority_id,provider_backend,provider_name)
 VALUES ('00000000-0000-4000-8000-000000000101',9901,9901,'remote-container','00000000-0000-4000-8000-000000000001','docker','remote'),
        ('00000000-0000-4000-8000-000000000102',9901,9902,'local-container','00000000-0000-4000-8000-000000000003','docker','local');
 UPDATE sandbox_access_authorities SET closed_at=now() WHERE id='00000000-0000-4000-8000-000000000002';
 INSERT INTO sandbox_access_delivery (runtime_id,desired_version,operation)
-SELECT id,desired_version,'reconcile' FROM sandbox_access_runtimes;
+SELECT id,desired_version,'reconcile' FROM sandbox_access_runtime_records;
 "#).await.unwrap();
     for sql in [
         "UPDATE sandboxes SET node_id=$1 WHERE id=9901",
         "UPDATE sandbox_access_authorities SET node_id=$1 WHERE id IN ('00000000-0000-4000-8000-000000000001','00000000-0000-4000-8000-000000000002')",
-        "UPDATE sandbox_access_runtimes SET node_id=$1 WHERE sandbox_id=9901",
+        "UPDATE sandbox_access_runtime_records SET node_id=$1 WHERE sandbox_id=9901",
         "UPDATE sandbox_access_delivery SET node_id=$1,claim_id='00000000-0000-4000-8000-000000000201',claimed_until=now()+interval '25 seconds' WHERE runtime_id='00000000-0000-4000-8000-000000000101'",
     ] {
         db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,sql,[node.id.into()])).await.unwrap();
@@ -69,7 +69,11 @@ async fn node_removal_releases_worker_authorities_and_destroyed_runtimes() {
         3
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS n FROM sandbox_access_runtimes").await,
+        count(
+            &db,
+            "SELECT count(*) AS n FROM sandbox_access_runtime_records"
+        )
+        .await,
         2
     );
 
@@ -92,7 +96,11 @@ async fn node_removal_releases_worker_authorities_and_destroyed_runtimes() {
         1
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS n FROM sandbox_access_runtimes").await,
+        count(
+            &db,
+            "SELECT count(*) AS n FROM sandbox_access_runtime_records"
+        )
+        .await,
         1
     );
     // Deletion creates a retirement tombstone. Both it and the previously
@@ -122,7 +130,11 @@ async fn node_removal_releases_authorities_after_project_deletion() {
     .await
     .unwrap();
     assert_eq!(
-        count(&db, "SELECT count(*) AS n FROM sandbox_access_runtimes").await,
+        count(
+            &db,
+            "SELECT count(*) AS n FROM sandbox_access_runtime_records"
+        )
+        .await,
         0
     );
     assert_eq!(
@@ -151,7 +163,7 @@ async fn node_removal_preserves_another_workers_live_access() {
     for sql in [
         "UPDATE sandboxes SET node_id=$1 WHERE id=9902",
         "UPDATE sandbox_access_authorities SET node_id=$1 WHERE id='00000000-0000-4000-8000-000000000003'",
-        "UPDATE sandbox_access_runtimes SET node_id=$1 WHERE sandbox_id=9902",
+        "UPDATE sandbox_access_runtime_records SET node_id=$1 WHERE sandbox_id=9902",
         "UPDATE sandbox_access_delivery SET node_id=$1 WHERE runtime_id='00000000-0000-4000-8000-000000000102'",
     ] {
         db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, [other.id.into()])).await.unwrap();
@@ -168,7 +180,7 @@ async fn node_removal_preserves_another_workers_live_access() {
         .await,
         1
     );
-    assert_eq!(count(&db, "SELECT count(*) AS n FROM sandbox_access_runtimes WHERE closed_at IS NULL AND sandbox_id=9902").await, 1);
+    assert_eq!(count(&db, "SELECT count(*) AS n FROM sandbox_access_runtime_records WHERE closed_at IS NULL AND sandbox_id=9902").await, 1);
     assert_eq!(count(&db, "SELECT count(*) AS n FROM sandbox_access_delivery WHERE completed_at IS NULL AND runtime_id='00000000-0000-4000-8000-000000000102'").await, 1);
     assert!(matches!(
         service.remove(other.id).await,
@@ -202,7 +214,11 @@ CREATE TRIGGER reject_node_delete BEFORE DELETE ON nodes FOR EACH ROW EXECUTE FU
         3
     );
     assert_eq!(
-        count(&db, "SELECT count(*) AS n FROM sandbox_access_runtimes").await,
+        count(
+            &db,
+            "SELECT count(*) AS n FROM sandbox_access_runtime_records"
+        )
+        .await,
         2
     );
     assert_eq!(

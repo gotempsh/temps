@@ -92,7 +92,7 @@ impl DeliveryQueue {
         }
         let retire = operation == DeliveryOperation::Retire;
         let row = txn.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "WITH changed AS (UPDATE sandbox_access_runtimes SET desired_version=desired_version+1, updated_at=now(), closed_at=CASE WHEN $3 THEN now() ELSE closed_at END WHERE id=$1 AND desired_version=$2 AND closed_at IS NULL RETURNING id,node_id,desired_version,authority_id,provider_identity,provider_backend,provider_name) INSERT INTO sandbox_access_delivery (runtime_id,node_id,desired_version,operation,worker_boot_id,provider_identity,provider_backend,provider_name) SELECT id,node_id,desired_version,CASE WHEN $3 THEN 'retire' ELSE 'reconcile' END,authority_id,CASE WHEN authority_id IS NOT NULL THEN provider_identity ELSE NULL END,provider_backend,provider_name FROM changed RETURNING desired_version",
+            "WITH changed AS (UPDATE sandbox_access_runtime_records SET desired_version=desired_version+1, updated_at=now(), closed_at=CASE WHEN $3 THEN now() ELSE closed_at END WHERE id=$1 AND desired_version=$2 AND closed_at IS NULL RETURNING id,node_id,desired_version,authority_id,provider_identity,provider_backend,provider_name) INSERT INTO sandbox_access_delivery (runtime_id,node_id,desired_version,operation,worker_boot_id,provider_identity,provider_backend,provider_name) SELECT id,node_id,desired_version,CASE WHEN $3 THEN 'retire' ELSE 'reconcile' END,authority_id,CASE WHEN authority_id IS NOT NULL THEN provider_identity ELSE NULL END,provider_backend,provider_name FROM changed RETURNING desired_version",
             [runtime_id.into(),expected_version.into(),retire.into()])).await
             .map_err(|e| database("advance runtime", runtime_id, e))?
             .ok_or(DeliveryError::RuntimeChanged { runtime_id, version: expected_version })?;
@@ -227,7 +227,7 @@ impl DeliveryQueue {
         // delivery, so absence does not make a retirement receipt invalid.
         txn.query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "SELECT id FROM sandbox_access_runtimes WHERE id=$1 FOR UPDATE",
+            "SELECT id FROM sandbox_access_runtime_records WHERE id=$1 FOR UPDATE",
             [command.runtime_id.into()],
         ))
         .await
@@ -242,7 +242,7 @@ impl DeliveryQueue {
             });
         }
         let applied = txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE sandbox_access_runtimes SET applied_version=$2,lease_expires_at=$5,applied_revision=$6,applied_grant_ids=$7,updated_at=now() WHERE id=$1 AND desired_version=$2 AND node_id IS NOT DISTINCT FROM $3 AND (($4 AND closed_at IS NOT NULL) OR (NOT $4 AND closed_at IS NULL)) AND ($6::bigint IS NULL OR ($5>clock_timestamp() AND EXISTS (SELECT 1 FROM sandbox_access_authorities a WHERE a.id=sandbox_access_runtimes.authority_id AND a.closed_at IS NULL AND a.desired_revision=$6)))",
+            "UPDATE sandbox_access_runtime_records SET applied_version=$2,lease_expires_at=$5,applied_revision=$6,applied_grant_ids=$7,updated_at=now() WHERE id=$1 AND desired_version=$2 AND node_id IS NOT DISTINCT FROM $3 AND (($4 AND closed_at IS NOT NULL) OR (NOT $4 AND closed_at IS NULL)) AND ($6::bigint IS NULL OR ($5>clock_timestamp() AND EXISTS (SELECT 1 FROM sandbox_access_authorities a WHERE a.id=sandbox_access_runtime_records.authority_id AND a.closed_at IS NULL AND a.desired_revision=$6)))",
             [command.runtime_id.into(),command.desired_version.into(),command.node_id.into(),(command.operation==DeliveryOperation::Retire).into(),lease_expires_at.into(),expected_revision.into(),grant_ids.to_vec().into()])).await
             .map_err(|e| database("record applied version", command.runtime_id, e))?;
         if expected_revision.is_some() && applied.rows_affected() != 1 {
@@ -274,7 +274,7 @@ impl DeliveryQueue {
             .await
             .map_err(|e| database("begin supersession", command.id, e))?;
         let row = tx.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "SELECT desired_version,closed_at FROM sandbox_access_runtimes WHERE id=$1 FOR UPDATE", [command.runtime_id.into()]))
+            "SELECT desired_version,closed_at FROM sandbox_access_runtime_records WHERE id=$1 FOR UPDATE", [command.runtime_id.into()]))
             .await.map_err(|e| database("lock superseded runtime", command.runtime_id, e))?;
         if let Some(row) = row {
             let version: i64 = row
