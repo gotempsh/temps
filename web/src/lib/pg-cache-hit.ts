@@ -10,8 +10,9 @@
 export const PG_CACHE_HIT_RATIO_METRIC = 'pg.cache_hit_ratio'
 
 /**
- * Block accesses in the same window. The scraper writes it on every scrape
- * once the window is whole, not while it refills after a restart.
+ * Block accesses in the same window. The scraper writes it with the ratio,
+ * on every scrape once the window is whole (not while it refills after a
+ * restart), including when the window saw no block access.
  */
 export const PG_CACHE_BLOCKS_ACCESSED_METRIC = 'pg.cache_blocks_accessed'
 
@@ -24,7 +25,7 @@ export const PG_CACHE_HIT_WINDOW_MINUTES = 15
  * so the latest stored ratio can be older than the window it is labelled
  * with. The block-access count keeps being written: when it says the
  * current window is empty, the ratio is "no data", whatever was stored
- * before. While it is missing (the window is refilling) the ratio is shown.
+ * before.
  */
 export function metricTileValue(
   name: string,

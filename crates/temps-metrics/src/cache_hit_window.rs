@@ -30,14 +30,16 @@
 //!   Omitted when the window saw no block access, because 0/0 is "no data",
 //!   not 100%.
 //! * [`PG_CACHE_BLOCKS_ACCESSED`]: `Σ(hit + read)` over the window, the
-//!   volume behind the ratio. The alarm evaluator gates the ratio rule on it
-//!   and treats a volume below the gate as recovered, so it is written only
-//!   once the series has been tracked for a whole window. The windows live in
-//!   memory: after a Temps restart, an HA failover or an outage longer than
-//!   the window they refill from empty, and a sum over the first scrapes
-//!   would read as a nearly idle database and resolve a real alarm. While it
-//!   refills the ratio is still written; the evaluator, missing the volume,
-//!   keeps the alarm's state as it is.
+//!   volume behind the ratio. The alarm evaluator gates the ratio rule on it.
+//!
+//! Neither is written until the series has been tracked for a whole window.
+//! The windows live in memory: after a Temps restart, an HA failover or an
+//! outage longer than the window they refill from empty, and the first
+//! scrapes' sums cover a minute, not 15. Written, such a ratio would be
+//! judged against the volume stored before the reset (the store's latest
+//! value looks back 15 minutes) and could resolve or open an alarm, and a
+//! partial volume would read as a nearly idle database. While a window
+//! refills, the latest values stay the last whole window's, then none.
 //!
 //! The collector reports the counters once per database (`datname` label).
 //! Each database is its own series, and the instance-wide series (no
@@ -337,12 +339,13 @@ impl CacheHitWindows {
         else {
             return;
         };
+        if !sum.full {
+            return;
+        }
         if sum.accesses > 0.0 {
             out.push(gauge(template, PG_CACHE_HIT_RATIO, sum.hits / sum.accesses));
         }
-        if sum.full {
-            out.push(gauge(template, PG_CACHE_BLOCKS_ACCESSED, sum.accesses));
-        }
+        out.push(gauge(template, PG_CACHE_BLOCKS_ACCESSED, sum.accesses));
     }
 
     /// Forget every window of `source_id`, e.g. after an HA failover, when the
@@ -442,21 +445,18 @@ mod tests {
     }
 
     #[test]
-    fn block_accesses_wait_for_a_whole_window() {
+    fn a_series_reports_nothing_until_its_window_is_whole() {
         // As after a restart, a failover or a long outage: the window refills
-        // from empty. Its first minutes are not "15 minutes of traffic", and
-        // the alarm's volume gate would read them as a nearly idle database.
+        // from empty. Its first minutes are not "the last 15 minutes".
         let mut windows = CacheHitWindows::default();
         windows.derive(1, deltas(90.0, 10.0, at(0), "app"));
         for minute in 1..15 {
             let out = windows.derive(1, deltas(90.0, 10.0, at(minute), "app"));
-            for db in [Some("app"), None] {
-                assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), Some(0.9), "{minute}");
-                assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), None, "{minute}");
-            }
+            assert!(out.is_empty(), "minute {minute}: {out:?}");
         }
         let out = windows.derive(1, deltas(90.0, 10.0, at(15), "app"));
         for db in [Some("app"), None] {
+            assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), Some(0.9));
             assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), Some(1_500.0));
         }
     }
@@ -464,6 +464,7 @@ mod tests {
     #[test]
     fn a_stats_reset_right_after_a_baseline_only_scrape_is_still_caught() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
         // The scrape that set the counter baselines: only the reset time
         // reaches the window.
         let mut reset = counter(PG_STATS_RESET, 0.0, at(0), Some("app"));
@@ -618,21 +619,21 @@ mod tests {
         let out = windows.derive(1, deltas(1_000.0, 39_000.0, at(41), "app"));
         assert!(out.is_empty(), "nothing is claimed for the window: {out:?}");
 
-        // The next interval is the window's only content again. The window
-        // refills from minute 41, so its volume waits until it is whole.
+        // The window refills from minute 41 and reports again once whole.
         let out = windows.derive(1, deltas(990.0, 10.0, at(42), "app"));
-        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.99));
-        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), None);
+        assert!(out.is_empty(), "the window is refilling: {out:?}");
         for minute in 43..56 {
             windows.derive(1, deltas(0.0, 0.0, at(minute), "app"));
         }
         let out = windows.derive(1, deltas(0.0, 0.0, at(56), "app"));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.99));
         assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(1000.0));
     }
 
     #[test]
     fn a_shorter_gap_counts_until_its_start_leaves_the_window() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
         windows.derive(1, deltas(0.0, 0.0, at(0), "app"));
         // Ten minutes without a scrape: the delta spans minutes 0 to 10.
         let out = windows.derive(1, deltas(0.0, 1_000.0, at(10), "app"));
@@ -649,7 +650,14 @@ mod tests {
     fn a_clock_step_backwards_restarts_the_window() {
         let mut windows = CacheHitWindows::default();
         windows.derive(1, deltas(0.0, 100.0, at(10), "app"));
-        let out = windows.derive(1, deltas(100.0, 0.0, at(5), "app"));
+        let out = windows.derive(1, deltas(0.0, 0.0, at(5), "app"));
+        assert!(out.is_empty(), "the window refills from minute 5: {out:?}");
+        windows.derive(1, deltas(100.0, 0.0, at(6), "app"));
+        for minute in 7..20 {
+            windows.derive(1, deltas(0.0, 0.0, at(minute), "app"));
+        }
+        // Only what came after the step: the 100 reads before it are gone.
+        let out = windows.derive(1, deltas(0.0, 0.0, at(20), "app"));
         assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(1.0));
     }
 }
