@@ -5,6 +5,7 @@ import {
   getRestoreCapabilitiesQueryKey,
   getRestoreRunQueryKey,
   getServiceQueryKey,
+  listExternalServiceBackupsQueryKey,
   listRestoreRunsForServiceQueryKey,
   listS3SourcesQueryKey,
   listSourceBackupsQueryKey,
@@ -13,6 +14,7 @@ import {
   getRestoreCapabilities,
   getRestoreRun,
   getService,
+  listExternalServiceBackups,
   listRestoreRunsForService,
   listS3Sources,
   listSourceBackups,
@@ -78,6 +80,26 @@ export function restoreSourceBackupsQuery(sourceId: number) {
     queryFn: ({ signal }) =>
       requireData(
         listSourceBackups({ ...options, signal, throwOnError: false })
+      ),
+    retry: (count, error) => shouldRetryRead(count, error),
+  })
+}
+
+/**
+ * The database's own backups, newest first, for a role that may not list
+ * storage sources. One page of the most recent backups (the server's maximum
+ * page size); the source-based list stays the way to reach older ones.
+ */
+export function restoreOwnBackupsQuery(serviceId: number) {
+  const options = {
+    path: { service_id: serviceId },
+    query: { page_size: 100 },
+  }
+  return queryOptions({
+    queryKey: listExternalServiceBackupsQueryKey(options),
+    queryFn: ({ signal }) =>
+      requireData(
+        listExternalServiceBackups({ ...options, signal, throwOnError: false })
       ),
     retry: (count, error) => shouldRetryRead(count, error),
   })

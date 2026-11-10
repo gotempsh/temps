@@ -28,6 +28,13 @@ export const DESTINATIONS_PERMISSION_EXPLANATION =
 export const DESTINATIONS_UNAVAILABLE_EXPLANATION =
   'The server could not be reached or is temporarily unavailable.'
 
+/**
+ * Shown when the caller may start a backup but not list the destinations: the
+ * server uses the default destination when none is named.
+ */
+export const DESTINATIONS_RESTRICTED_MESSAGE =
+  'Your role cannot choose a backup destination. The backup is saved to the default destination set by an administrator.'
+
 export const SELECTED_DESTINATION_MISSING_MESSAGE =
   'The selected destination is no longer available. Choose another destination.'
 
@@ -63,6 +70,12 @@ export type DestinationState<T extends DestinationLike> =
   | { kind: 'error'; failure: DestinationFailure }
   /** A refresh failed, but a previously loaded non-empty list is cached. */
   | { kind: 'stale'; destinations: T[]; failure: DestinationFailure }
+  /**
+   * The caller is refused the list (401/403) and nothing is cached. A refusal
+   * does not mean no destination exists, and a retry cannot change it, but the
+   * caller may still start a backup: left unnamed, the server uses the default.
+   */
+  | { kind: 'restricted'; failure: DestinationFailure }
   /** The server successfully reported that no destinations exist. */
   | { kind: 'empty' }
   /** The server successfully returned at least one destination. */
@@ -188,7 +201,9 @@ export function deriveDestinationState<T extends DestinationLike>(
       const failure = classifyDestinationError(error)
       return data.length > 0
         ? { kind: 'stale', destinations: data, failure }
-        : { kind: 'error', failure }
+        : failure.reason === 'permission'
+          ? { kind: 'restricted', failure }
+          : { kind: 'error', failure }
     }
     return data.length > 0
       ? { kind: 'ready', destinations: data }
@@ -196,7 +211,10 @@ export function deriveDestinationState<T extends DestinationLike>(
   }
 
   if (isError) {
-    return { kind: 'error', failure: classifyDestinationError(error) }
+    const failure = classifyDestinationError(error)
+    return failure.reason === 'permission'
+      ? { kind: 'restricted', failure }
+      : { kind: 'error', failure }
   }
 
   // `isPending` without data, or a disabled query that has not run yet:
@@ -240,6 +258,9 @@ export function canSubmitBackup<T extends DestinationLike>(
   state: DestinationState<T>,
   selectedId: number | undefined
 ): boolean {
+  // The list is refused, so no destination can be named; the server uses the
+  // default. Naming one anyway would be a guess at an id nobody can verify.
+  if (state.kind === 'restricted') return selectedId === undefined
   const destinations = knownDestinations(state)
   if (!destinations) return false
   return selectionStatus(destinations, selectedId) === 'valid'
