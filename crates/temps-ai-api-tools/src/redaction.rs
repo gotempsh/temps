@@ -51,11 +51,27 @@ pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Preserve known feature-flag configuration fields without weakening credential
+/// Preserve known configuration and metric-discovery fields without weakening credential
 /// masking for other operations or nested credentials in JSON flag values.
 pub fn redact_api_result(operation_id: &str, value: &serde_json::Value) -> serde_json::Value {
     let mut redacted = redact_value(value);
     match operation_id {
+        "list_metric_label_keys" | "list_metric_label_values" => {
+            let field = if operation_id == "list_metric_label_keys" {
+                "keys"
+            } else {
+                "values"
+            };
+            if let (Some(values), Some(object)) = (
+                value.get(field).and_then(serde_json::Value::as_array),
+                redacted.as_object_mut(),
+            ) {
+                object.insert(
+                    field.into(),
+                    redact_value(&serde_json::Value::Array(values.clone())),
+                );
+            }
+        }
         "list_flags" | "get_flag_snapshot" => {
             if let (Some(original), Some(masked)) = (
                 value.get("flags").and_then(serde_json::Value::as_array),
@@ -77,6 +93,19 @@ pub fn redact_api_result(operation_id: &str, value: &serde_json::Value) -> serde
         _ => {}
     }
     redacted
+}
+
+/// Write previews use an explicit operation policy, independently of response
+/// schemas, so configuration values remain distinguishable before approval.
+pub fn redact_api_proposal(operation_id: &str, params: &serde_json::Value) -> serde_json::Value {
+    match operation_id {
+        "create_flag"
+        | "update_flag"
+        | "restore_flag"
+        | "archive_flag"
+        | "set_flag_environment" => redact_api_result(operation_id, params),
+        _ => redact_value(params),
+    }
 }
 
 fn restore_flag_fields(original: &serde_json::Value, redacted: &mut serde_json::Value) {
@@ -244,6 +273,37 @@ fn cli_token_spans(input: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_lists_and_flag_proposals_preserve_only_known_configuration_fields() {
+        for (operation, field) in [
+            ("list_metric_label_keys", "keys"),
+            ("list_metric_label_values", "values"),
+        ] {
+            let data = serde_json::json!({field:["GET","Bearer fixture-private"],"token":"fixture-private"});
+            let result = redact_api_result(operation, &data);
+            assert_eq!(result[field][0], "GET");
+            assert_eq!(result[field][1], "Bearer ***");
+            assert_eq!(result["token"], "***");
+            assert_eq!(redact_api_result("other_operation", &data)[field], "***");
+        }
+        let params = serde_json::json!({"key":"checkout.v2","value":false,"default_value":{"password":"fixture-private","enabled":true}});
+        let result = redact_api_proposal("set_flag_environment", &params);
+        assert_eq!(result["key"], "checkout.v2");
+        assert_eq!(result["value"], false);
+        assert_eq!(
+            redact_api_proposal(
+                "set_flag_environment",
+                &serde_json::json!({"key":"checkout.v2","value":null})
+            )["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(result["default_value"]["password"], "***");
+        assert_eq!(
+            redact_api_proposal("create_secret", &params)["value"],
+            "***"
+        );
+    }
 
     #[test]
     fn flag_result_policy_preserves_configuration_but_masks_nested_credentials() {

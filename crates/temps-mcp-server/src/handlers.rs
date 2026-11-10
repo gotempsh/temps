@@ -289,6 +289,7 @@ async fn handle_tool_call(
         return crate::virtual_cli::execute(
             state.virtual_cli.get().ok_or(McpError::CliUnavailable)?,
             auth,
+            metadata,
             tool_name,
             args,
         )

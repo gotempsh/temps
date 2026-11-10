@@ -10,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use temps_ai_api_tools::{
-    redaction::{redact_api_result, redact_json_string, redact_value},
+    redaction::{redact_api_proposal, redact_api_result, redact_json_string, redact_value},
     ApiCallScope, ProjectSelectorScope, WritePrepareOutcome,
 };
 use temps_authz::AuthContext;
@@ -43,11 +43,14 @@ pub(crate) fn tools(write: bool) -> Vec<McpTool> {
     tools
 }
 
-fn scope(auth: &AuthContext) -> ApiCallScope {
+fn scope(auth: &AuthContext, metadata: &temps_core::RequestMetadata) -> ApiCallScope {
     ApiCallScope {
         auth: auth.clone(),
         project_scope: ProjectSelectorScope::Unrestricted,
-        origin: None,
+        origin: Some(temps_core::ai_tool_call::AiToolOrigin {
+            ip_address: metadata.ip_address.clone(),
+            user_agent: metadata.user_agent.clone(),
+        }),
         secrets: None,
     }
 }
@@ -126,6 +129,7 @@ fn key_id(auth: &AuthContext) -> Result<i32, McpError> {
 pub(crate) async fn execute(
     state: &VirtualCli,
     auth: &AuthContext,
+    metadata: &temps_core::RequestMetadata,
     name: &str,
     args: &Value,
 ) -> Result<McpToolResult, McpError> {
@@ -145,7 +149,7 @@ pub(crate) async fn execute(
     if name == "temps" {
         let caller = state.api_tools.get().ok_or(McpError::CliUnavailable)?;
         return caller
-            .run_cli_result(command, &scope(auth))
+            .run_cli_result(command, &scope(auth, metadata))
             .await
             .map(|text| McpToolResult::text(safe_read_result(&text)))
             .map_err(safe_error);
@@ -154,7 +158,7 @@ pub(crate) async fn execute(
         .write_api_tools
         .get()
         .ok_or(McpError::CliUnavailable)?;
-    match caller.prepare_write_cli(command, &scope(auth)) {
+    match caller.prepare_write_cli_without_secret_input(command, &scope(auth, metadata)) {
         WritePrepareOutcome::Help(text) => Ok(McpToolResult::text(safe(&text))),
         WritePrepareOutcome::Invalid(detail) => Err(McpError::Cli {
             source: temps_ai_api_tools::ApiToolError::InvalidCommand {
@@ -162,8 +166,8 @@ pub(crate) async fn execute(
             },
         }),
         WritePrepareOutcome::Prepared(prepared) => {
-            let review = json!({"operation": prepared.operation_id, "description": prepared.summary,
-                "parameters": redact_value(&prepared.params)});
+            let review = json!({"operation": prepared.operation_id, "description": safe(&prepared.summary),
+                "parameters": redact_api_proposal(&prepared.operation_id, &prepared.params)});
             let pending = PendingWrite {
                 user_id: auth.user_id(),
                 key_id: key_id(auth)?,
@@ -176,7 +180,7 @@ pub(crate) async fn execute(
             let token = state
                 .proposals
                 .create("temps_write".into(), serde_json::to_value(pending)?);
-            Ok(McpToolResult::text_with_proposal_token(format!("{}\nAsk the human to approve, then call confirm_action. Token expires in 5 minutes.", safe(&review.to_string())), token))
+            Ok(McpToolResult::text_with_proposal_token(format!("{}\nAsk the human to approve, then call confirm_action. Token expires in 5 minutes.", cap_output(review.to_string())), token))
         }
     }
 }
@@ -201,7 +205,7 @@ pub(crate) async fn confirm(
         .execute_approved_write(
             &pending.operation_id,
             pending.params,
-            &scope(auth),
+            &scope(auth, metadata),
             pending.plugin_revision.as_deref(),
         )
         .await;
@@ -225,6 +229,17 @@ pub(crate) async fn confirm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Most tests use the same fixture origin; origin-specific tests pass their
+    // own metadata directly through the production adapter.
+    async fn execute(
+        state: &VirtualCli,
+        auth: &AuthContext,
+        name: &str,
+        args: &Value,
+    ) -> Result<McpToolResult, McpError> {
+        super::execute(state, auth, &metadata(), name, args).await
+    }
+
     #[test]
     fn listing_keeps_virtual_tools_independent_of_legacy_groups() {
         for groups in [
@@ -358,6 +373,164 @@ mod tests {
             audit,
         )
     }
+    #[tokio::test]
+    async fn flag_proposals_show_the_actual_configuration_before_confirmation() {
+        for operation in ["set_flag_environment", "create_flag"] {
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/flags":{"post":{"operationId":operation,"tags":["Flags"],"requestBody":{"content":{"application/json":{
+                    "schema":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"boolean"},"value_type":{"type":"string"},"default_value":{"type":"boolean"},"token":{"type":"string"}}}
+                }}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let (state, writes, _) = fixture();
+            state.write_api_tools.set(
+                temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                    axum::Router::new(),
+                    &api,
+                    vec![operation.into()],
+                ),
+            );
+            for value in ["true", "false"] {
+                let command = if operation == "create_flag" {
+                    format!("{operation} --key checkout.v2 --value_type boolean --default_value {value} --token fixture-private")
+                } else {
+                    format!("{operation} --key checkout.v2 --value {value} --token fixture-private")
+                };
+                let proposal = execute(
+                    &state,
+                    &auth(3, true),
+                    "temps_write",
+                    &json!({"command":command}),
+                )
+                .await
+                .unwrap();
+                let preview: Value =
+                    serde_json::from_str(proposal.content[0].text.lines().next().unwrap()).unwrap();
+                let field = if operation == "create_flag" {
+                    "default_value"
+                } else {
+                    "value"
+                };
+                let expected: Value = serde_json::from_str(value).unwrap();
+                assert_eq!(preview["parameters"]["key"], "checkout.v2");
+                assert_eq!(preview["parameters"][field], expected);
+                assert_eq!(preview["parameters"]["token"], "***");
+                if operation == "create_flag" {
+                    assert_eq!(preview["parameters"]["value_type"], "boolean");
+                }
+                let stored = state
+                    .proposals
+                    .peek(proposal.proposal_token.as_deref().unwrap())
+                    .unwrap();
+                assert_eq!(stored.arguments["params"][field], expected);
+                assert!(!proposal.content[0].text.contains("fixture-private"));
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_label_discovery_survives_mcp_response_redaction() {
+        for (operation, field, values) in [
+            ("list_metric_label_keys", "keys", json!(["http.method"])),
+            ("list_metric_label_values", "values", json!(["GET", "POST"])),
+        ] {
+            let payload = json!({field: values.clone(), "token": "fixture-private"});
+            let router = axum::Router::new().route(
+                "/labels",
+                axum::routing::get(move || async move { axum::Json(payload) }),
+            );
+            let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+                "paths":{"/labels":{"get":{"operationId":operation,"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+            let (state, _, _) = fixture();
+            state
+                .api_tools
+                .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                    router,
+                    &api,
+                    vec![operation.into()],
+                ));
+            let result = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":operation}),
+            )
+            .await
+            .unwrap();
+            let result: Value = serde_json::from_str(&result.content[0].text).unwrap();
+            assert_eq!(result["data"][field], values);
+            assert_eq!(result["data"]["token"], "***");
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_read_origin_and_current_confirmation_origin() {
+        async fn echo(
+            axum::Extension(meta): axum::Extension<temps_core::RequestMetadata>,
+        ) -> axum::Json<Value> {
+            axum::Json(json!({"ip":meta.ip_address,"agent":meta.user_agent}))
+        }
+        let crypto = Arc::new(temps_core::CookieCrypto::from_bytes(&[7; 32]));
+        let router = axum::Router::new()
+            .route("/origin", axum::routing::get(echo).post(echo))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let crypto = crypto.clone();
+                async move { temps_core::request_metadata_middleware(crypto, req, next).await }
+            }));
+        let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/origin":{"get":{"operationId":"read_origin","responses":{"200":{"description":"ok"}}},
+            "post":{"operationId":"write_origin","responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let (state, _, audit) = fixture();
+        state
+            .api_tools
+            .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                router.clone(),
+                &api,
+                vec!["read_origin".into()],
+            ));
+        state.write_api_tools.set(
+            temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                router,
+                &api,
+                vec!["write_origin".into()],
+            ),
+        );
+        let mut origin = metadata();
+        origin.ip_address = "192.0.2.10".into();
+        origin.user_agent = "fixture-mcp-client".into();
+        let result = super::execute(
+            &state,
+            &auth(3, true),
+            &origin,
+            "temps",
+            &json!({"command":"read_origin"}),
+        )
+        .await
+        .unwrap();
+        assert!(result.content[0].text.contains("192.0.2.10"));
+        assert!(result.content[0].text.contains("fixture-mcp-client"));
+        let proposal = super::execute(
+            &state,
+            &auth(3, true),
+            &origin,
+            "temps_write",
+            &json!({"command":"write_origin"}),
+        )
+        .await
+        .unwrap();
+        let token = proposal.proposal_token.unwrap();
+        let args = state.proposals.peek(&token).unwrap().arguments;
+        origin.ip_address = "192.0.2.20".into();
+        origin.user_agent = "fixture-confirm-client".into();
+        let result = confirm(&state, &auth(3, true), &origin, &token, args)
+            .await
+            .unwrap();
+        assert!(result.content[0].text.contains("192.0.2.20"));
+        assert!(result.content[0].text.contains("fixture-confirm-client"));
+        assert!(result.content[0].text.contains("via Temps AI assistant"));
+        assert!(!result.content[0].text.contains("192.0.2.10"));
+        assert!(audit.0.lock().unwrap()[0].contains("192.0.2.20"));
+    }
+
     #[tokio::test]
     async fn feature_flag_reads_preserve_keys_types_and_values_through_router_replay() {
         for operation in ["list_flags", "get_flag", "get_flag_snapshot"] {

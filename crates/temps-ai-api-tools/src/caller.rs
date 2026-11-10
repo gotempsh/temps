@@ -939,6 +939,26 @@ impl InternalApiCaller {
     /// (in another crate) calls [`Self::execute_write`] with the `params` from
     /// the returned [`PreparedWrite`].
     pub fn prepare_write_cli(&self, command: &str, scope: &ApiCallScope) -> WritePrepareOutcome {
+        self.prepare_write_cli_with_secret_policy(command, scope, false)
+    }
+
+    /// Prepare for adapters with no secret-input flow, such as external MCP.
+    /// Chat may bind its secret resolver only at confirmation, so a missing
+    /// resolver during ordinary preparation does not imply missing capability.
+    pub fn prepare_write_cli_without_secret_input(
+        &self,
+        command: &str,
+        scope: &ApiCallScope,
+    ) -> WritePrepareOutcome {
+        self.prepare_write_cli_with_secret_policy(command, scope, true)
+    }
+
+    fn prepare_write_cli_with_secret_policy(
+        &self,
+        command: &str,
+        scope: &ApiCallScope,
+        reject_secret_input: bool,
+    ) -> WritePrepareOutcome {
         let permit = |op: &ApiOperation| self.permitted_write(op, &scope.auth);
         match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
@@ -967,7 +987,7 @@ impl InternalApiCaller {
                 )
                 .and_then(|built| {
                     self.validate_plugin_route(op, &built)?;
-                    if scope.secrets.is_none() {
+                    if reject_secret_input {
                         if let Some(body) = &built.body {
                             crate::secrets::validate_without_resolver(
                                 &op.operation_id,
@@ -3141,6 +3161,106 @@ mod tests {
                 "create_service".to_string(),
             ],
         )
+    }
+
+    #[tokio::test]
+    async fn chat_prepares_secret_handles_and_binds_resolver_only_at_confirmation() {
+        use chrono::Utc;
+        use temps_authz::{context::AuthContext, permissions::Role};
+        use temps_entities::users;
+
+        let now = Utc::now();
+        let user = users::Model {
+            id: 1,
+            name: "Test".into(),
+            email: "t@t.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let auth = AuthContext::new_session(user, Role::Admin);
+        let mut scope = ApiCallScope {
+            auth,
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+
+        #[derive(Debug)]
+        struct Resolver;
+        #[async_trait::async_trait]
+        impl crate::secrets::SecretResolver for Resolver {
+            async fn resolve(
+                &self,
+                handle: &str,
+                usage: &crate::secrets::SecretUse<'_>,
+            ) -> Result<temps_core::secret_string::SecretString, crate::secrets::SecretResolveError>
+            {
+                assert_eq!(handle, "secret_ref:v1:fixture-slot");
+                assert_eq!(usage.operation_id, "create_source");
+                assert_eq!(usage.field, "/secret_key");
+                Ok(temps_core::secret_string::SecretString::new(
+                    "fixture-credential",
+                ))
+            }
+        }
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = writes.clone();
+        let router = axum::Router::new().route(
+            "/sources",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert_eq!(body["secret_key"], "fixture-credential");
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"created":true}))
+                }
+            }),
+        );
+        let api = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/sources":{"post":{"operationId":"create_source","requestBody":{"content":{"application/json":{
+                "schema":{"type":"object","properties":{"secret_key":{"type":"string","x-temps-secret":true}}}
+            }}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let caller =
+            InternalApiCaller::new_write_allowlisted(router, &api, vec!["create_source".into()]);
+        let command = "create_source --secret_key secret_ref:v1:fixture-slot";
+        let WritePrepareOutcome::Prepared(prepared) = caller.prepare_write_cli(command, &scope)
+        else {
+            panic!("chat must be able to stage handles before binding its resolver");
+        };
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            caller.prepare_write_cli_without_secret_input(command, &scope),
+            WritePrepareOutcome::Invalid(_)
+        ));
+        assert!(caller
+            .execute_approved_write(
+                &prepared.operation_id,
+                prepared.params.clone(),
+                &scope,
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        scope.secrets = Some(std::sync::Arc::new(Resolver));
+        caller
+            .execute_approved_write(&prepared.operation_id, prepared.params, &scope, None)
+            .await
+            .unwrap();
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
