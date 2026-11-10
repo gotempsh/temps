@@ -5,6 +5,7 @@
 //! authenticated provider before this transaction; it is never an HTTP DTO.
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chrono::SubsecRound;
 use temps_entities::{
     sandbox_access_authorities as authorities, sandbox_access_authorizations as authorizations,
     sandbox_access_runtimes as runtimes,
@@ -351,7 +352,9 @@ impl ServiceAccessService {
                 "the sandbox would exceed 16 active grants; revoke grants before adding more",
             ));
         }
-        let now = issued_at;
+        // PostgreSQL retains microseconds. Use the same precision for the
+        // initial receipt and persisted grants so consent replays are exact.
+        let now = issued_at.trunc_subsecs(6);
         let mut grant_models = Vec::with_capacity(selections.len());
         let mut authorization_models = Vec::with_capacity(selections.len());
         let mut receipts = Vec::with_capacity(selections.len());

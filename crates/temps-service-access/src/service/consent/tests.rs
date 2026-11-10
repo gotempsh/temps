@@ -182,10 +182,24 @@ async fn postgres_fresh_consent_is_scoped_atomic_bounded_and_preserves_retiremen
     first_request.request_id = request_id;
     let mut retry_request = consent(&definition.id);
     retry_request.request_id = request_id;
-    let (first, retried) = tokio::join!(
-        service.authorize_grant(first_request, observation(&worker, incarnation)),
-        service.authorize_grant(retry_request, observation(&worker, incarnation)),
-    );
+    // Exercise precision that PostgreSQL cannot retain, regardless of the
+    // platform clock's native resolution. Both concurrent callers must return
+    // exactly the same persisted expiry, including the first issuance.
+    let issued_at = chrono::Timelike::with_nanosecond(&Utc::now(), 123_456_789).unwrap();
+    let authorize = |request| async {
+        let tx = db.begin().await.unwrap();
+        let result = service
+            .authorize_grant_in_transaction(
+                &tx,
+                request,
+                observation(&worker, incarnation),
+                issued_at,
+            )
+            .await;
+        tx.commit().await.unwrap();
+        result
+    };
+    let (first, retried) = tokio::join!(authorize(first_request), authorize(retry_request));
     let first = first.unwrap();
     let retried = retried.unwrap();
     assert_eq!(retried.grant_id, first.grant_id);
