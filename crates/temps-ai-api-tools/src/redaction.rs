@@ -51,11 +51,23 @@ pub fn redact_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Preserve known configuration and metric-discovery fields without weakening credential
+/// Preserve known configuration and metric fields without weakening credential
 /// masking for other operations or nested credentials in JSON flag values.
 pub fn redact_api_result(operation_id: &str, value: &serde_json::Value) -> serde_json::Value {
     let mut redacted = redact_value(value);
     match operation_id {
+        "query_metrics" => {
+            if let (Some(original), Some(masked)) = (
+                value.get("data").and_then(serde_json::Value::as_array),
+                redacted
+                    .get_mut("data")
+                    .and_then(serde_json::Value::as_array_mut),
+            ) {
+                for (original, masked) in original.iter().zip(masked) {
+                    restore_metric_bucket(original, masked);
+                }
+            }
+        }
         "list_metric_label_keys" | "list_metric_label_values" => {
             let field = if operation_id == "list_metric_label_keys" {
                 "keys"
@@ -105,6 +117,40 @@ pub fn redact_api_proposal(operation_id: &str, params: &serde_json::Value) -> se
         | "archive_flag"
         | "set_flag_environment" => redact_api_result(operation_id, params),
         _ => redact_value(params),
+    }
+}
+
+// OtelMetricsResponse.data contains MetricBucket values. Restore only the
+// declared measurement types; unexpected strings/objects stay masked.
+fn restore_metric_bucket(original: &serde_json::Value, redacted: &mut serde_json::Value) {
+    let Some(object) = redacted.as_object_mut() else {
+        return;
+    };
+    for field in ["avg_value", "min_value", "max_value", "value"] {
+        if let Some(value) = original.get(field).filter(|value| value.is_number()) {
+            object.insert(field.into(), value.clone());
+        }
+    }
+    let Some(series) = original.get("series_key") else {
+        return;
+    };
+    // MetricBucket uses ordered label pairs, not an object. Apply the same
+    // credential-name masking to each label's value before preserving the pairs.
+    if let Ok(labels) = serde_json::from_value::<Option<Vec<(String, String)>>>(series.clone()) {
+        let labels = labels
+            .map(|labels| {
+                serde_json::Value::Array(
+                    labels
+                        .into_iter()
+                        .map(|(name, value)| {
+                            let masked = redact_value(&serde_json::json!({name.as_str(): value}));
+                            serde_json::json!([redact_text(&name), masked[&name]])
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or(serde_json::Value::Null);
+        object.insert("series_key".into(), labels);
     }
 }
 
@@ -273,6 +319,61 @@ fn cli_token_spans(input: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_query_preserves_measurements_and_redacts_credentials() {
+        let bucket = serde_json::json!({
+            "bucket":"2026-01-01T00:00:00Z",
+            "avg_value":0.125, "min_value":-2.5, "max_value":8.75, "value":0.0,
+            "count":4, "quantiles":[[0.95,8.0]],
+            "histogram_summary":{"count":4,"sum":0.5,"bounds":[0.0,10.0],"bucket_counts":[1,3,0]},
+            "series_key":[["http.method","GET"],["authorization","fixture-private"],["service.name","Bearer fixture-private"]],
+            "token":"fixture-private"
+        });
+        let response = serde_json::json!({"data":[bucket],"count":1,"api_key":"fixture-private"});
+        let result = redact_api_result("query_metrics", &response);
+        for field in [
+            "bucket",
+            "avg_value",
+            "min_value",
+            "max_value",
+            "value",
+            "count",
+            "quantiles",
+            "histogram_summary",
+        ] {
+            assert_eq!(
+                result["data"][0][field], response["data"][0][field],
+                "{field}"
+            );
+        }
+        assert_eq!(
+            result["data"][0]["series_key"],
+            serde_json::json!([
+                ["http.method", "GET"],
+                ["authorization", "***"],
+                ["service.name", "Bearer ***"]
+            ])
+        );
+        assert_eq!(result["data"][0]["token"], "***");
+        assert_eq!(result["api_key"], "***");
+        assert_eq!(
+            redact_api_result("other_operation", &response)["data"][0]["value"],
+            "***"
+        );
+
+        let malformed = serde_json::json!({"data":[{"value":"fixture-private","avg_value":{"token":"fixture-private"},"series_key":{"password":"fixture-private"}}]});
+        let masked = redact_api_result("query_metrics", &malformed);
+        for field in ["value", "avg_value", "series_key"] {
+            assert_eq!(masked["data"][0][field], "***");
+        }
+        for series in [serde_json::Value::Null, serde_json::json!([])] {
+            let data = serde_json::json!({"data":[{"value":3.0,"series_key":series}]});
+            assert_eq!(redact_api_result("query_metrics", &data), data);
+        }
+        let empty = serde_json::json!({"data":[],"count":0});
+        assert_eq!(redact_api_result("query_metrics", &empty), empty);
+    }
 
     #[test]
     fn metric_lists_and_flag_proposals_preserve_only_known_configuration_fields() {

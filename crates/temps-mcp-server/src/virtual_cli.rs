@@ -428,6 +428,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metric_query_measurements_survive_mcp_router_replay() {
+        let data = json!({"data":[
+            {"bucket":"2026-01-01T00:00:00Z","avg_value":1.25,"min_value":-0.5,"max_value":2.5,"value":1.25,"count":2,"series_key":[["http.method","GET"]]},
+            {"bucket":"2026-01-01T00:00:00Z","avg_value":0.0,"min_value":0.0,"max_value":0.0,"value":0.0,"count":1,"series_key":[["http.method","POST"]]}
+        ],"count":2,"token":"fixture-private"});
+        let payload = data.clone();
+        let router = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || async move { axum::Json(payload) }),
+        );
+        let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/metrics":{"get":{"operationId":"query_metrics","responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let (state, _, _) = fixture();
+        state
+            .api_tools
+            .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                router,
+                &api,
+                vec!["query_metrics".into()],
+            ));
+        let result = execute(
+            &state,
+            &auth(3, false),
+            "temps",
+            &json!({"command":"query_metrics"}),
+        )
+        .await
+        .unwrap();
+        let result: Value = serde_json::from_str(&result.content[0].text).unwrap();
+        assert_eq!(result["data"]["data"], data["data"]);
+        assert_eq!(result["data"]["count"], 2);
+        assert_eq!(result["data"]["token"], "***");
+    }
+
+    #[tokio::test]
     async fn metric_label_discovery_survives_mcp_response_redaction() {
         for (operation, field, values) in [
             ("list_metric_label_keys", "keys", json!(["http.method"])),
