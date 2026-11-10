@@ -1373,6 +1373,49 @@ mod tests {
         );
     }
 
+    /// Failed scrapes keep the counter baselines, so the first good scrape
+    /// after an outage carries the whole outage's block accesses. They must
+    /// not be served as the last 15 minutes.
+    #[tokio::test]
+    async fn a_scrape_outage_is_not_served_as_the_last_15_minutes() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+        scrape_minutes(&baselines, &windows, &mut counters, 1..5, (9_900.0, 100.0)).await;
+
+        // Minutes 5..45: every scrape fails (nothing reaches finish_points)
+        // while a cold bulk load runs.
+        counters.0 += 40.0 * 300.0;
+        counters.1 += 40.0 * 700.0;
+        let after_outage = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(45, counters.0, counters.1),
+        )
+        .await;
+        assert_eq!(served(&after_outage, "pg.cache_hit_ratio"), None);
+        assert_eq!(served(&after_outage, "pg.cache_blocks_accessed"), None);
+
+        let next = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            46..47,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&next, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+    }
+
     /// PostgreSQL 15+ keeps its statistics across a clean restart, so the
     /// lifetime counters never reset and their ratio barely moves. The window
     /// must follow the workload anyway.

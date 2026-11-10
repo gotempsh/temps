@@ -36,8 +36,16 @@
 //! instead, a dropped database simply stops contributing, and a database
 //! whose own statistics were reset contributes what it did since the reset.
 //!
+//! An interval spans from the source's previous successful scrape to this
+//! one, and counts only while it lies entirely inside the window. A failed
+//! scrape leaves the counter baselines alone, so the first delta after an
+//! outage covers the whole outage. When that is longer than the window, the
+//! delta cannot honestly be called "the last 15 minutes": the series reports
+//! nothing until the window holds intervals again. (So does a configured
+//! scrape interval longer than the window.)
+//!
 //! Memory is bounded: one entry per scrape per series, and at the minimum
-//! 10 s scrape interval a 15-minute window holds 90 entries of 24 bytes.
+//! 10 s scrape interval a 15-minute window holds 90 entries of 32 bytes.
 //! There is one series per database of each monitored service, and a
 //! database that disappears from `pg_stat_database` is dropped on that
 //! source's next scrape. Nothing here does I/O.
@@ -73,8 +81,11 @@ pub const CACHE_HIT_WINDOW: Duration = Duration::minutes(15);
 /// One scrape interval's block accesses for a series.
 #[derive(Debug, Clone, Copy)]
 struct Interval {
+    /// When the source's previous successful scrape ran: the delta's
+    /// baseline. Equal to `end` when that is unknown.
+    start: DateTime<Utc>,
     /// When the scrape that closed this interval ran.
-    time: DateTime<Utc>,
+    end: DateTime<Utc>,
     hit: f64,
     read: f64,
 }
@@ -86,27 +97,36 @@ struct Series {
 }
 
 impl Series {
-    /// Record an interval and drop every interval that has left the window
-    /// ending at `interval.time`. Returns `(hits, accesses)` over the window.
-    fn push(&mut self, interval: Interval, window: Duration) -> (f64, f64) {
+    /// Record an interval and drop every interval no longer entirely inside
+    /// the window ending at `interval.end`. Returns `(hits, accesses)` over
+    /// the window, or `None` when nothing is left in it (the new interval
+    /// itself started before the window).
+    fn push(&mut self, interval: Interval, window: Duration) -> Option<(f64, f64)> {
         // Scrapes of one service never run concurrently, so time only goes
         // backwards if the clock was stepped. Restart the window rather than
         // keep intervals that may now be in the future.
         if self
             .intervals
             .back()
-            .is_some_and(|last| last.time > interval.time)
+            .is_some_and(|last| last.end > interval.end)
         {
             self.intervals.clear();
         }
         self.intervals.push_back(interval);
-        let cutoff = interval.time - window;
-        while self.intervals.front().is_some_and(|i| i.time <= cutoff) {
+        let cutoff = interval.end - window;
+        while self
+            .intervals
+            .front()
+            .is_some_and(|i| i.start < cutoff || i.end <= cutoff)
+        {
             self.intervals.pop_front();
         }
-        self.intervals.iter().fold((0.0, 0.0), |(hits, total), i| {
+        if self.intervals.is_empty() {
+            return None;
+        }
+        Some(self.intervals.iter().fold((0.0, 0.0), |(hits, total), i| {
             (hits + i.hit, total + i.hit + i.read)
-        })
+        }))
     }
 }
 
@@ -120,6 +140,9 @@ type SeriesKey = (i32, String);
 pub struct CacheHitWindows {
     window: Duration,
     series: HashMap<SeriesKey, Series>,
+    /// Time of each source's latest successful scrape: the start of its next
+    /// interval, since the scraper's counter baselines date from then.
+    last_scrape: HashMap<i32, DateTime<Utc>>,
 }
 
 impl Default for CacheHitWindows {
@@ -133,6 +156,7 @@ impl CacheHitWindows {
         Self {
             window,
             series: HashMap::new(),
+            last_scrape: HashMap::new(),
         }
     }
 
@@ -147,7 +171,14 @@ impl CacheHitWindows {
     /// recorded) contributes nothing yet, to its own series or to the
     /// instance-wide one. Counters without a [`PG_DATABASE_LABEL`] are
     /// dropped: the instance-wide series is always derived here.
+    ///
+    /// Call it for every successful scrape of the source, including one that
+    /// only recorded baselines, so the next interval's start is known.
     pub fn derive(&mut self, source_id: i32, points: Vec<MetricPoint>) -> Vec<MetricPoint> {
+        let previous = self.last_scrape.get(&source_id).copied();
+        if let Some(scraped_at) = points.iter().map(|p| p.time).max() {
+            self.last_scrape.insert(source_id, scraped_at);
+        }
         let mut out = Vec::with_capacity(points.len());
         // Per label key: the hit point (kept as the template for the gauges'
         // time, labels and source fields) and the read delta.
@@ -178,7 +209,8 @@ impl CacheHitWindows {
                 continue;
             }
             let interval = Interval {
-                time: template.time,
+                start: previous.map_or(template.time, |p| p.min(template.time)),
+                end: template.time,
                 // Deltas are non-negative by the scraper's contract; clamp so
                 // a violation can never yield a ratio outside 0..=1.
                 hit: template.value.max(0.0),
@@ -186,7 +218,8 @@ impl CacheHitWindows {
             };
             match &mut instance {
                 Some((_, sum)) => {
-                    sum.time = sum.time.max(interval.time);
+                    sum.start = sum.start.min(interval.start);
+                    sum.end = sum.end.max(interval.end);
                     sum.hit += interval.hit;
                     sum.read += interval.read;
                 }
@@ -220,11 +253,14 @@ impl CacheHitWindows {
         interval: Interval,
         out: &mut Vec<MetricPoint>,
     ) {
-        let (hits, accesses) = self
+        let Some((hits, accesses)) = self
             .series
             .entry((source_id, key))
             .or_default()
-            .push(interval, self.window);
+            .push(interval, self.window)
+        else {
+            return;
+        };
         if accesses > 0.0 {
             out.push(gauge(template, PG_CACHE_HIT_RATIO, hits / accesses));
         }
@@ -235,11 +271,13 @@ impl CacheHitWindows {
     /// new primary's counters belong to a different server.
     pub fn reset_source(&mut self, source_id: i32) {
         self.series.retain(|(sid, _), _| *sid != source_id);
+        self.last_scrape.remove(&source_id);
     }
 
     /// Keep only the windows of `active` sources.
     pub fn retain_sources(&mut self, active: &HashSet<i32>) {
         self.series.retain(|(sid, _), _| active.contains(sid));
+        self.last_scrape.retain(|sid, _| active.contains(sid));
     }
 }
 
@@ -397,6 +435,37 @@ mod tests {
         assert_eq!(windows.series.len(), 2);
         windows.retain_sources(&HashSet::new());
         assert!(windows.series.is_empty());
+    }
+
+    #[test]
+    fn a_delta_spanning_more_than_the_window_is_not_reported_as_the_window() {
+        let mut windows = CacheHitWindows::default();
+        windows.derive(1, deltas(990.0, 10.0, at(0), "app"));
+        windows.derive(1, deltas(990.0, 10.0, at(1), "app"));
+        // Scrapes fail for 40 minutes; the first good one carries the whole
+        // outage's accesses, which mostly missed the cache.
+        let out = windows.derive(1, deltas(1_000.0, 39_000.0, at(41), "app"));
+        assert!(out.is_empty(), "nothing is claimed for the window: {out:?}");
+
+        // The next interval is the window's only content again.
+        let out = windows.derive(1, deltas(990.0, 10.0, at(42), "app"));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.99));
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(1000.0));
+    }
+
+    #[test]
+    fn a_shorter_gap_counts_until_its_start_leaves_the_window() {
+        let mut windows = CacheHitWindows::default();
+        windows.derive(1, deltas(0.0, 0.0, at(0), "app"));
+        // Ten minutes without a scrape: the delta spans minutes 0 to 10.
+        let out = windows.derive(1, deltas(0.0, 1_000.0, at(10), "app"));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.0));
+        let out = windows.derive(1, deltas(1_000.0, 0.0, at(15), "app"));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.5));
+        // At minute 16 the window starts after minute 0, so the long interval
+        // is no longer entirely inside it.
+        let out = windows.derive(1, deltas(1_000.0, 0.0, at(16), "app"));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(1.0));
     }
 
     #[test]

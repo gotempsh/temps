@@ -47,9 +47,10 @@ describe('formatPgCacheHitRatio', () => {
     expect(formatPgCacheHitRatio(Number.NaN)).toBe('—')
   })
 
-  test('never shows a value outside 0–100%', () => {
-    expect(formatPgCacheHitRatio(1.2)).toBe('100.0%')
-    expect(formatPgCacheHitRatio(-0.1)).toBe('0.0%')
+  test('an out-of-range alert threshold is shown as configured', () => {
+    // A rule entered as 95 (meaning 95%) must not pass for "100.0%".
+    expect(formatPgCacheHitRatio(95)).toBe('9500.0%')
+    expect(formatPgCacheHitRatio(-0.1)).toBe('-10.0%')
   })
 })
 

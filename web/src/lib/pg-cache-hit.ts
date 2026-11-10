@@ -59,11 +59,16 @@ export function pgCacheHitRatioDescription(scope: PgCacheHitScope): string {
   )
 }
 
-/** A 0–1 ratio as a percentage, or an em dash when there is no value. */
+/**
+ * A 0–1 ratio as a percentage, or an em dash when there is no value.
+ *
+ * Not clamped: measured ratios are 0–1 by construction, and an alert-rule
+ * threshold rendered here must show what was configured, so a rule entered
+ * as `95` (meaning 95%) reads "9500.0%" instead of passing for "100.0%".
+ */
 export function formatPgCacheHitRatio(
   value: number | null | undefined
 ): string {
   if (value == null || !Number.isFinite(value)) return '—'
-  const clamped = Math.min(1, Math.max(0, value))
-  return `${(clamped * 100).toFixed(1)}%`
+  return `${(value * 100).toFixed(1)}%`
 }
