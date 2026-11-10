@@ -927,10 +927,7 @@ impl AlertEvaluator {
                 let below_default_gate = default_volume_gate(rule)
                     .is_some_and(|gate| latest.contains_key(gate.metric_name))
                     && !meets_volume_gate(&rule.metric_name, latest);
-                let no_volume = volume_gate(&rule.metric_name)
-                    .and_then(|gate| latest.get(gate.metric_name))
-                    .is_some_and(|volume| *volume <= 0.0);
-                if below_default_gate || no_volume {
+                if below_default_gate || has_no_volume(&rule.metric_name, latest) {
                     self.handle_recovery(rule, ctx).await;
                 } else {
                     self.clear_breach(rule.id).await;
@@ -961,6 +958,15 @@ impl AlertEvaluator {
             return Ok(());
         }
         if default_volume_gate(rule).is_some() && !meets_volume_gate(&rule.metric_name, latest) {
+            self.handle_recovery(rule, ctx).await;
+            return Ok(());
+        }
+
+        // The store's latest values are picked per metric over the last 15
+        // minutes, so a window gone idle since pairs its zero volume with the
+        // last ratio written while it had traffic. That ratio no longer
+        // describes the source, gated rule or edited one.
+        if has_no_volume(&rule.metric_name, latest) {
             self.handle_recovery(rule, ctx).await;
             return Ok(());
         }
@@ -1398,6 +1404,15 @@ fn latest_metric_names(group: &[&monitoring_alert_rules::Model]) -> Vec<String> 
         .collect::<HashSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Whether the latest volume behind a gated `metric_name` is zero: the source
+/// saw no traffic, so no ratio over it can be breaching. False when the metric
+/// is ungated or its volume is missing.
+fn has_no_volume(metric_name: &str, latest: &HashMap<String, f64>) -> bool {
+    volume_gate(metric_name)
+        .and_then(|gate| latest.get(gate.metric_name))
+        .is_some_and(|volume| *volume <= 0.0)
 }
 
 /// Whether `latest` carries enough volume for a rule over `metric_name` to be
@@ -2751,6 +2766,15 @@ mod tests {
     /// Evaluate `rule`, whose alarm 99 is firing, against an idle window:
     /// `pg.cache_blocks_accessed = 0` and no ratio. Whether the alarm resolved.
     async fn idle_cache_hit_window_resolves(rule: monitoring_alert_rules::Model) -> bool {
+        cache_hit_alarm_resolves(rule, &[("pg.cache_blocks_accessed", 0.0)]).await
+    }
+
+    /// Evaluate `rule`, whose alarm 99 is firing, against `values`. Whether
+    /// the alarm resolved.
+    async fn cache_hit_alarm_resolves(
+        rule: monitoring_alert_rules::Model,
+        values: &[(&str, f64)],
+    ) -> bool {
         use temps_entities::alarms;
         let now = Utc::now();
         let resolved = alarms::Model {
@@ -2785,11 +2809,7 @@ mod tests {
         evaluator.firing_alarms.write().await.insert(rule.id, 99);
 
         evaluator
-            .evaluate_rule(
-                &rule,
-                &latest(&[("pg.cache_blocks_accessed", 0.0)]),
-                (Some(1), None, None, Some(1)),
-            )
+            .evaluate_rule(&rule, &latest(values), (Some(1), None, None, Some(1)))
             .await
             .expect("evaluation succeeds");
 
@@ -2821,6 +2841,28 @@ mod tests {
         assert!(
             idle_cache_hit_window_resolves(rule).await,
             "an idle window must resolve an edited cache hit ratio alarm"
+        );
+    }
+
+    /// Up to 15 minutes after the window went idle, the store's latest values
+    /// still hold the last ratio written while it had traffic, next to the
+    /// zero volume. That ratio must not keep an edited rule's alarm open.
+    #[tokio::test]
+    async fn a_stale_ratio_next_to_zero_volume_resolves_an_edited_rule() {
+        let rule = monitoring_alert_rules::Model {
+            threshold: 0.95,
+            ..low_cache_hit_ratio_rule()
+        };
+        assert!(
+            cache_hit_alarm_resolves(
+                rule,
+                &[
+                    ("pg.cache_hit_ratio", 0.0),
+                    ("pg.cache_blocks_accessed", 0.0)
+                ],
+            )
+            .await,
+            "a ratio over no traffic must not keep the alarm open"
         );
     }
 
