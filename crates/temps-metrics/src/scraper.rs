@@ -1190,32 +1190,43 @@ mod tests {
     // ── windowed Postgres cache hit ratio ──────────────────────────────────
 
     /// One Postgres scrape's raw, lifetime `blks_hit` / `blks_read` counters
-    /// for the instance-wide aggregate, as the collector reports them.
-    fn pg_blocks(minute: i64, hit: f64, read: f64) -> Vec<MetricPoint> {
+    /// for each `(database, hit, read)`, as the collector reports them.
+    fn pg_scrape(minute: i64, databases: &[(&str, f64, f64)]) -> Vec<MetricPoint> {
         let time = chrono::DateTime::<chrono::Utc>::from_timestamp(1_760_000_000, 0).unwrap()
             + chrono::Duration::minutes(minute);
-        [
-            (crate::cache_hit_window::PG_BLKS_HIT, hit),
-            (crate::cache_hit_window::PG_BLKS_READ, read),
-        ]
-        .into_iter()
-        .map(|(name, value)| MetricPoint {
-            time,
-            source_kind: SourceKind::Database,
-            source_id: 7,
-            name: name.to_string(),
-            value,
-            kind: MetricKind::Counter,
-            engine: Some("postgres".to_string()),
-            environment: None,
-            node_id: None,
-            labels: HashMap::new(),
-        })
-        .collect()
+        let mut points = Vec::new();
+        for (db, hit, read) in databases {
+            for (name, value) in [
+                (crate::cache_hit_window::PG_BLKS_HIT, *hit),
+                (crate::cache_hit_window::PG_BLKS_READ, *read),
+            ] {
+                points.push(MetricPoint {
+                    time,
+                    source_kind: SourceKind::Database,
+                    source_id: 7,
+                    name: name.to_string(),
+                    value,
+                    kind: MetricKind::Counter,
+                    engine: Some("postgres".to_string()),
+                    environment: None,
+                    node_id: None,
+                    labels: HashMap::from([("datname".to_string(), db.to_string())]),
+                });
+            }
+        }
+        points
     }
 
+    fn pg_blocks(minute: i64, hit: f64, read: f64) -> Vec<MetricPoint> {
+        pg_scrape(minute, &[("app", hit, read)])
+    }
+
+    /// The instance-wide value of `name`, the one the tiles and alarm read.
     fn served(points: &[MetricPoint], name: &str) -> Option<f64> {
-        points.iter().find(|p| p.name == name).map(|p| p.value)
+        points
+            .iter()
+            .find(|p| p.name == name && p.labels.is_empty())
+            .map(|p| p.value)
     }
 
     /// The scrape-to-store pipeline over minutes `minutes`, each scrape adding
@@ -1308,9 +1319,57 @@ mod tests {
         );
         // Only the derived gauges are persisted, never the raw block counters.
         let names: HashSet<&str> = tuned.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(tuned.len(), 4, "per-database and instance-wide gauges");
         assert_eq!(
             names,
             HashSet::from(["pg.cache_hit_ratio", "pg.cache_blocks_accessed"])
+        );
+    }
+
+    /// Dropping a database takes its row out of `pg_stat_database`, so a
+    /// counter summed over databases goes backwards. The instance-wide window
+    /// must not read that as a reset and fill up with the remaining
+    /// databases' lifetime totals.
+    #[tokio::test]
+    async fn dropping_a_database_does_not_inject_lifetime_history() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // Lifetime: the app database 30M hits / 70M reads, a scratch
+        // database with a large history of reads.
+        let (mut app, mut scratch) = ((30_000_000.0, 70_000_000.0), (1_000.0, 5_000_000.0));
+        for minute in 0..16 {
+            app.0 += 9_900.0;
+            app.1 += 100.0;
+            scratch.1 += 10.0;
+            finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_scrape(
+                    minute,
+                    &[("app", app.0, app.1), ("scratch", scratch.0, scratch.1)],
+                ),
+            )
+            .await;
+        }
+
+        // The scratch database is dropped.
+        app.0 += 9_900.0;
+        app.1 += 100.0;
+        let after_drop = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_scrape(16, &[("app", app.0, app.1)]),
+        )
+        .await;
+
+        let ratio = served(&after_drop, "pg.cache_hit_ratio").unwrap();
+        assert!(ratio > 0.98, "the live workload still dominates: {ratio}");
+        let accessed = served(&after_drop, "pg.cache_blocks_accessed").unwrap();
+        assert!(
+            accessed < 200_000.0,
+            "no lifetime totals in the window: {accessed}"
         );
     }
 

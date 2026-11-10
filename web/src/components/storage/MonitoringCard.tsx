@@ -18,6 +18,7 @@ import { yAxisTickProps } from '@/lib/chart-axis-ticks'
 import {
   PG_CACHE_HIT_RATIO_METRIC,
   formatPgCacheHitRatio,
+  metricTileValue,
   pgCacheHitRatioDescription,
   pgCacheHitRatioLabel,
   pgCacheHitRatioScopedLabel,
@@ -948,7 +949,10 @@ function LiveMetrics({
       <div className="@container">
         <div className="grid grid-cols-2 gap-2 @lg:grid-cols-3 @3xl:grid-cols-6">
           {statMetrics.map((name) => {
-            const latest = latestByName.get(name)
+            const latest = metricTileValue(
+              name,
+              (m) => latestByName.get(m)?.value
+            )
             const isSelected = name === selectedMetric
             return (
               <button
@@ -968,7 +972,7 @@ function LiveMetrics({
                   {statTileLabel(name)}
                 </span>
                 <span className="text-base font-semibold tabular-nums text-foreground">
-                  {latest != null ? formatMetricValue(name, latest.value) : '—'}
+                  {latest != null ? formatMetricValue(name, latest) : '—'}
                 </span>
               </button>
             )

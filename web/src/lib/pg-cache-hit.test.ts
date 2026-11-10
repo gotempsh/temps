@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   formatPgCacheHitRatio,
+  metricTileValue,
   pgCacheHitRatioDescription,
   pgCacheHitRatioLabel,
   pgCacheHitRatioScopedLabel,
@@ -49,5 +50,40 @@ describe('formatPgCacheHitRatio', () => {
   test('never shows a value outside 0–100%', () => {
     expect(formatPgCacheHitRatio(1.2)).toBe('100.0%')
     expect(formatPgCacheHitRatio(-0.1)).toBe('0.0%')
+  })
+})
+
+describe('metricTileValue', () => {
+  const lookup = (values: Record<string, number>) => (metric: string) =>
+    values[metric]
+
+  test('an empty window hides a ratio stored before it', () => {
+    const values = lookup({
+      'pg.cache_hit_ratio': 0.3,
+      'pg.cache_blocks_accessed': 0,
+    })
+    expect(metricTileValue('pg.cache_hit_ratio', values)).toBeUndefined()
+  })
+
+  test('a window with traffic shows its ratio', () => {
+    const values = lookup({
+      'pg.cache_hit_ratio': 0.99,
+      'pg.cache_blocks_accessed': 150_000,
+    })
+    expect(metricTileValue('pg.cache_hit_ratio', values)).toBe(0.99)
+  })
+
+  test('without a volume reading the ratio is shown as stored', () => {
+    expect(
+      metricTileValue('pg.cache_hit_ratio', lookup({ 'pg.cache_hit_ratio': 1 }))
+    ).toBe(1)
+  })
+
+  test('other metrics are passed through', () => {
+    const values = lookup({
+      'pg.connections': 4,
+      'pg.cache_blocks_accessed': 0,
+    })
+    expect(metricTileValue('pg.connections', values)).toBe(4)
   })
 })

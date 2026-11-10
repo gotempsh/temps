@@ -9,7 +9,28 @@
  */
 export const PG_CACHE_HIT_RATIO_METRIC = 'pg.cache_hit_ratio'
 
+/** Block accesses in the same window; the scraper writes it every scrape. */
+export const PG_CACHE_BLOCKS_ACCESSED_METRIC = 'pg.cache_blocks_accessed'
+
 export const PG_CACHE_HIT_WINDOW_MINUTES = 15
+
+/**
+ * The value a tile should show for `name`, read through `lookup`.
+ *
+ * The scraper writes no cache hit ratio for a window without block access,
+ * so the latest stored ratio can be older than the window it is labelled
+ * with. The block-access count is written on every scrape: when it says the
+ * current window is empty, the ratio is "no data", whatever was stored
+ * before.
+ */
+export function metricTileValue(
+  name: string,
+  lookup: (metric: string) => number | undefined
+): number | undefined {
+  const value = lookup(name)
+  if (name !== PG_CACHE_HIT_RATIO_METRIC) return value
+  return lookup(PG_CACHE_BLOCKS_ACCESSED_METRIC) === 0 ? undefined : value
+}
 
 /** Which databases a value covers: the whole server, or one database. */
 export type PgCacheHitScope = { database: string } | 'all'

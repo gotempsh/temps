@@ -402,7 +402,10 @@ async fn collect_metrics(
     //    lifetime counters (PostgreSQL 15+ keeps them across a clean restart),
     //    so a ratio of them reflects history, not the current workload. The
     //    scraper derives `pg.cache_hit_ratio` from their deltas over a
-    //    trailing window (`crate::cache_hit_window`).
+    //    trailing window (`crate::cache_hit_window`). They are reported per
+    //    database only: the scraper builds the instance-wide window from the
+    //    per-database deltas, because a summed counter goes backwards when a
+    //    database is dropped and would read as a reset.
     //    Internal Postgres databases (template0, template1) are excluded.
     // -------------------------------------------------------------------------
     {
@@ -421,8 +424,6 @@ async fn collect_metrics(
             .await?;
 
         // Instance-wide accumulators for the unlabelled aggregate points.
-        let mut sum_blks_hit: i64 = 0;
-        let mut sum_blks_read: i64 = 0;
         let mut sum_commit: i64 = 0;
         let mut sum_rollback: i64 = 0;
         let mut sum_deadlocks: i64 = 0;
@@ -449,8 +450,6 @@ async fn collect_metrics(
             let tup_returned: i64 = row.get(11);
             let tup_fetched: i64 = row.get(12);
 
-            sum_blks_hit += blks_hit;
-            sum_blks_read += blks_read;
             sum_commit += xact_commit;
             sum_rollback += xact_rollback;
             sum_deadlocks += deadlocks;
@@ -557,18 +556,6 @@ async fn collect_metrics(
             1.0
         };
 
-        points.push(make_point(
-            PG_BLKS_HIT,
-            sum_blks_hit as f64,
-            MetricKind::Counter,
-            HashMap::new(),
-        ));
-        points.push(make_point(
-            PG_BLKS_READ,
-            sum_blks_read as f64,
-            MetricKind::Counter,
-            HashMap::new(),
-        ));
         points.push(make_point(
             "pg.tuple_fetch_ratio",
             instance_fetch_ratio,

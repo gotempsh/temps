@@ -86,6 +86,7 @@ import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 import {
   PG_CACHE_HIT_RATIO_METRIC,
   formatPgCacheHitRatio,
+  metricTileValue,
   pgCacheHitRatioDescription,
   pgCacheHitRatioLabel,
   pgCacheHitRatioScopedLabel,
@@ -1126,7 +1127,7 @@ function DatabasesSection({
               <MetricTile
                 key={name}
                 name={name}
-                value={values.get(name)}
+                value={metricTileValue(name, (m) => values.get(m))}
                 selected={false}
                 scope={
                   selected === ALL_DATABASES ? 'all' : { database: selected }
@@ -1430,7 +1431,7 @@ function MonitoringDashboard({
             <MetricTile
               key={name}
               name={name}
-              value={latestByName.get(name)}
+              value={metricTileValue(name, (m) => latestByName.get(m))}
               selected={selectedMetric === name}
               onClick={() => setSelectedMetric(name)}
               alert={firingBySeverity.get(name)}
@@ -1488,7 +1489,7 @@ function MonitoringDashboard({
               <MetricTile
                 key={name}
                 name={name}
-                value={latestByName.get(name)}
+                value={metricTileValue(name, (m) => latestByName.get(m))}
                 selected={selectedMetric === name}
                 onClick={() => setSelectedMetric(name)}
                 alert={firingBySeverity.get(name)}
