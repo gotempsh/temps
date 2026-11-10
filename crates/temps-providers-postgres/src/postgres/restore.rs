@@ -19,6 +19,39 @@ pub(super) const WALG_FETCH_PID_FILE: &str = "/tmp/walg_fetch.pid";
 /// Scratch directory on the data volume a WAL-G restore fetches into.
 pub(super) const WALG_RESTORE_TEMP: &str = "/var/lib/postgresql/restore_temp";
 
+/// Applies a staged `pg_dumpall` dump (`/backup.sql`) through the restore
+/// filter (`$TEMPS_RESTORE_FILTER`) as `$TEMPS_RESTORE_USER`, from the
+/// `postgres` database the dump expects to start in, stopping at the first
+/// failed statement. POSIX `sh` has no `pipefail`, so the filter's status is
+/// carried out of the pipeline in a file (removed first, so a filter that
+/// never wrote one reads as a failure); a failed filter exits 70. Names and
+/// the program arrive in the environment, never in the script.
+const CLUSTER_DUMP_RESTORE_SCRIPT: &str = "rc=/tmp/temps-restore-filter.rc; rm -f \"$rc\"; \
+     { awk \"$TEMPS_RESTORE_FILTER\" /backup.sql; echo $? > \"$rc\"; } \
+     | psql -X -v ON_ERROR_STOP=1 --no-password -U \"$TEMPS_RESTORE_USER\" -d postgres; \
+     psql_rc=$?; filter_rc=$(cat \"$rc\" 2>/dev/null); rm -f \"$rc\"; \
+     if [ \"$filter_rc\" != 0 ]; then echo \"temps: filtering the dump failed: awk exited \
+     ${filter_rc:-without a status}\" >&2; exit 70; fi; exit $psql_rc";
+
+/// Whether the staged plain-format dump at `path` is a `pg_dumpall` dump
+/// (read from its first lines only).
+async fn dump_starts_as_cluster_dump(path: &std::path::Path) -> std::io::Result<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut head = vec![0u8; 512];
+    let mut filled = 0;
+    while filled < head.len() {
+        let read = file.read(&mut head[filled..]).await?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(crate::dump_filter::is_cluster_dump(
+        &String::from_utf8_lossy(&head[..filled]),
+    ))
+}
+
 pub(super) fn postgres_startup_error_is_transient(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Io(error) => matches!(
@@ -298,14 +331,54 @@ impl PostgresService {
             )
         })?;
 
-        // Execute psql to restore the backup with actual credentials
+        // Apply it with ON_ERROR_STOP, so a failed statement fails the
+        // restore instead of psql exiting 0 with the dump half applied. A
+        // `pg_dumpall` dump goes through the filter that lets the statements
+        // a live server refuses by design succeed (see `dump_filter`), from
+        // the `postgres` database the dump expects to start in.
+        let cluster_dump = dump_starts_as_cluster_dump(backup_path)
+            .await
+            .map_err(|e| {
+                EngineError::failed(
+                    &self.name,
+                    format!(
+                        "Failed to read the staged backup '{}' to restore into container {}: {}",
+                        backup_path.display(),
+                        container_name,
+                        e
+                    ),
+                )
+            })?;
         let password_env = format!("PGPASSWORD={}", password);
+        let user_env = format!("TEMPS_RESTORE_USER={}", username);
+        let filter_env = format!(
+            "TEMPS_RESTORE_FILTER={}",
+            crate::dump_filter::PG_DUMPALL_RESTORE_FILTER_AWK
+        );
+        let cmd = if cluster_dump {
+            vec!["sh", "-c", CLUSTER_DUMP_RESTORE_SCRIPT]
+        } else {
+            vec![
+                "psql",
+                "-X",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-U",
+                username,
+                "-f",
+                "/backup.sql",
+            ]
+        };
         let exec = docker
             .create_exec(
                 container_name,
                 bollard::exec::CreateExecOptions {
-                    cmd: Some(vec!["psql", "-U", username, "-f", "/backup.sql"]),
-                    env: Some(vec![password_env.as_str()]),
+                    cmd: Some(cmd),
+                    env: Some(vec![
+                        password_env.as_str(),
+                        user_env.as_str(),
+                        filter_env.as_str(),
+                    ]),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -1481,6 +1554,99 @@ mod tests {
             let custom = run_exec(&docker, &container, psql("SELECT count(*) FROM custom_items"), None, timeout)
                 .await?
                 .output;
+
+            // ON_ERROR_STOP: a dump whose statement fails fails the restore,
+            // and nothing after that statement is applied.
+            let failing_path = staging.path().join("failing.dump");
+            std::fs::write(
+                &failing_path,
+                "CREATE TABLE before_failure (n int);\nSELECT 1/0;\nCREATE TABLE after_failure (n int);\n",
+            )?;
+            let refused = service
+                .restore_backup_file(&docker, &container, &failing_path, "postgres", password)
+                .await;
+            anyhow::ensure!(refused.is_err(), "a dump with a failing statement restored successfully");
+            let after = run_exec(&docker, &container, psql("SELECT to_regclass('after_failure') IS NULL"), None, timeout)
+                .await?
+                .output;
+            anyhow::ensure!(after.trim().ends_with('t'), "psql went on past the failed statement: {after}");
+
+            // A whole-cluster dump (`pg_dumpall --clean --if-exists`, the
+            // backup format) restores over the live server while an
+            // application holds the database open.
+            run_exec(&docker, &container, psql("CREATE DATABASE orders"), None, timeout).await?;
+            let orders = |sql: &str| {
+                vec!["psql".to_string(), "-U".to_string(), "postgres".to_string(), "-d".to_string(), "orders".to_string(), "-tAc".to_string(), sql.to_string()]
+            };
+            run_exec(&docker, &container, orders("CREATE TABLE t AS SELECT generate_series(1, 4) AS n"), None, timeout).await?;
+            run_exec(
+                &docker,
+                &container,
+                vec!["sh".into(), "-c".into(), "pg_dumpall -U postgres --clean --if-exists > /tmp/cluster.sql".into()],
+                None,
+                timeout,
+            )
+            .await?;
+            run_exec(&docker, &container, orders("INSERT INTO t VALUES (99)"), None, timeout).await?;
+            let mut tar_bytes = Vec::new();
+            let mut stream = docker.download_from_container(
+                &container,
+                Some(
+                    bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                        .path("/tmp/cluster.sql")
+                        .build(),
+                ),
+            );
+            while let Some(chunk) = stream.next().await {
+                tar_bytes.extend_from_slice(&chunk?);
+            }
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let mut entry = archive
+                .entries()?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty pg_dumpall download"))??;
+            let mut cluster = Vec::new();
+            entry.read_to_end(&mut cluster)?;
+            let cluster_path = staging.path().join("cluster.dump");
+            std::fs::write(&cluster_path, &cluster)?;
+            let session = docker
+                .create_exec(
+                    &container,
+                    bollard::exec::CreateExecOptions {
+                        cmd: Some(vec!["psql", "-U", "postgres", "-d", "orders", "-c", "SELECT pg_sleep(120)"]),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            docker
+                .start_exec(
+                    &session.id,
+                    Some(bollard::exec::StartExecOptions {
+                        detach: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            for _ in 0..30 {
+                let open = run_exec(&docker, &container, psql("SELECT count(*) FROM pg_stat_activity WHERE datname = 'orders'"), None, timeout)
+                    .await?
+                    .output;
+                if open.trim().ends_with('1') {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            service
+                .restore_backup_file(&docker, &container, &cluster_path, "postgres", password)
+                .await?;
+            let restored = run_exec(&docker, &container, orders("SELECT string_agg(n::text, ',' ORDER BY n) FROM t"), None, timeout)
+                .await?
+                .output;
+            anyhow::ensure!(restored.trim().ends_with("1,2,3,4"), "the cluster dump was not restored as dumped: {restored}");
+            let allowed = run_exec(&docker, &container, psql("SELECT bool_and(datallowconn) FROM pg_database WHERE datname <> 'template0'"), None, timeout)
+                .await?
+                .output;
+            anyhow::ensure!(allowed.trim().ends_with('t'), "a restored database refuses connections: {allowed}");
             Ok((plain, custom))
         }
         .await;

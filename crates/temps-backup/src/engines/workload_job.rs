@@ -61,6 +61,7 @@ use temps_workload_plane::{
 use temps_workload_volumes::VolumePin;
 
 use super::v2_common;
+use temps_providers::externalsvc::postgres_dump_filter;
 
 /// Engine key stored in `backup_jobs.engine` for a backup taken as a job.
 pub const ENGINE_KEY: &str = "postgres_workload_job";
@@ -372,26 +373,6 @@ pub fn restore_env(password: &str, s3: &S3JobTarget) -> Vec<(String, String)> {
     job_env(password, s3)
 }
 
-/// The `ALTER ROLE` line prefixes `pg_dumpall` writes for `role`, bare and
-/// quoted (it quotes a name that is not a plain lower-case identifier, or is
-/// a keyword): the lines whose password [`restore_script`] drops.
-fn alter_role_prefixes(role: &str) -> (String, String) {
-    (
-        format!("ALTER ROLE {role} WITH "),
-        format!("ALTER ROLE \"{}\" WITH ", role.replace('"', "\"\"")),
-    )
-}
-
-/// Drops `PASSWORD '...'` from the dump's `ALTER ROLE <login> WITH ...`
-/// lines, and only before the dump's first `\connect`: the cluster-wide
-/// globals (roles) come first, and no table data is written before it, so
-/// no row is ever rewritten. Role password hashes (SCRAM, md5) hold no
-/// quote. The prefixes arrive in the environment, never in the program.
-const KEEP_LOGIN_AWK: &str = "!done && /^\\\\connect / { done = 1 } \
-     !done && (index($0, ENVIRON[\"TEMPS_KEEP_BARE\"]) == 1 || \
-     index($0, ENVIRON[\"TEMPS_KEEP_QUOTED\"]) == 1) \
-     { sub(/ PASSWORD \\047[^\\047]*\\047/, \"\") } { print }";
-
 /// The restore script: the object streams through gunzip into `psql`, as
 /// the local pg_dump restore applies a `pg_dumpall --clean` dump (errors on
 /// objects that already exist are reported, not fatal).
@@ -409,11 +390,14 @@ const KEEP_LOGIN_AWK: &str = "!done && /^\\\\connect / { done = 1 } \
 /// database: a `--clean` dump drops every object first, and half of one
 /// would leave the database emptier than before. Applying it cannot be made
 /// atomic instead: `pg_dumpall` output runs `CREATE DATABASE` and
-/// `\connect`, which cannot run inside `--single-transaction`, and the local
-/// restore deliberately runs without `ON_ERROR_STOP` (TimescaleDB rejects
-/// the dump's `DROP ... ONLY` on hypertables, harmlessly), so this one
-/// matches it. The second pass checks every stage again, in case the object
-/// changed in between. Memory stays constant: both passes stream.
+/// `\connect`, which cannot run inside `--single-transaction`. It runs with
+/// `ON_ERROR_STOP`, so a failed statement fails the job instead of `psql`
+/// exiting 0 with the dump half applied; the statements a live server
+/// refuses by design (an existing role's `CREATE ROLE`, dropping the
+/// connected role, dropping a database an application holds open) are made
+/// to succeed by the dump filter (`postgres_dump_filter`). The second pass
+/// checks every stage again, in case the object changed in between. Memory
+/// stays constant: both passes stream.
 ///
 /// A `gunzip` failure whose fetch either succeeded or was killed by SIGPIPE
 /// (status 141: gunzip stopped reading first) is a corrupt object
@@ -426,14 +410,13 @@ const KEEP_LOGIN_AWK: &str = "!done && /^\\\\connect / { done = 1 } \
 /// midway, so the dump's next `\connect` (made with the target's password)
 /// would be refused with the dump half applied, and the target would be left
 /// with a password Temps does not know. The job therefore keeps its login on
-/// the target's own password: the dump streams through a filter
-/// ([`KEEP_LOGIN_AWK`]) that drops the `PASSWORD` clause of that login's
-/// `ALTER ROLE` line and changes nothing else. Nothing about the login is
+/// the target's own password: the dump filter drops the `PASSWORD` clause
+/// of that login's `ALTER ROLE` line (`TEMPS_KEEP_BARE`/`TEMPS_KEEP_QUOTED`). Nothing about the login is
 /// changed before the dump is applied, so a failed download or apply never
 /// leaves it with another password. The filter's own failure exits with
 /// [`exit::KEEP_LOGIN_FAILED`].
 pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
-    let (bare, quoted) = alter_role_prefixes(&target.username);
+    let (bare, quoted) = postgres_dump_filter::alter_role_prefixes(&target.username);
     format!(
         "{REQUIRE_WALG}\n\
          fetch_rc=\"${{TMPDIR:-/tmp}}/temps-restore-fetch.rc\"\n\
@@ -455,15 +438,16 @@ pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
          rm -f \"$keep_rc\"\n\
          stream | {{ TEMPS_KEEP_BARE={bare} TEMPS_KEEP_QUOTED={quoted} awk {awk}; \
          echo $? > \"$keep_rc\"; }} \
-         | psql -X -q --no-password --host={host} --port={port} --username={user} \
-         --dbname=postgres >/dev/null\n\
+         | psql -X -q -v ON_ERROR_STOP=1 --no-password --host={host} --port={port} \
+         --username={user} --dbname=postgres >/dev/null\n\
          psql_rc=$?\n\
          check '; psql may have applied part of it'\n\
          keep=$(cat \"$keep_rc\" 2>/dev/null)\n\
-         [ \"$keep\" = 0 ] || {{ echo \"temps: keeping the login on its own password failed: awk \
-         exited ${{keep:-without a status}}; psql may have applied part of it\" >&2; exit {keep_code}; }}\n\
+         [ \"$keep\" = 0 ] || {{ echo \"temps: filtering the dump (keeping the login on its own \
+         password) failed: awk exited ${{keep:-without a status}}; psql may have applied part of \
+         it\" >&2; exit {keep_code}; }}\n\
          [ \"$psql_rc\" = 0 ] || {{ echo \"temps: psql could not apply the dump: psql exited \
-         $psql_rc\" >&2; exit 5; }}\n\
+         $psql_rc at the first failed statement\" >&2; exit 5; }}\n\
          echo 'temps: restore applied'",
         host = q(&target.host),
         port = target.port,
@@ -471,7 +455,7 @@ pub fn restore_script(target: &PgJobTarget, object_key: &str) -> String {
         key = q(object_key),
         bare = q(&bare),
         quoted = q(&quoted),
-        awk = q(KEEP_LOGIN_AWK),
+        awk = q(postgres_dump_filter::PG_DUMPALL_RESTORE_FILTER_AWK),
         keep_code = exit::KEEP_LOGIN_FAILED,
     )
 }
@@ -909,13 +893,16 @@ fn failed(
         Some(exit::DUMP_FAILED) => Some("pg_dumpall failed"),
         Some(exit::UPLOAD_FAILED) => Some("uploading the dump to S3 failed"),
         Some(exit::DOWNLOAD_FAILED) => Some("downloading the dump from S3 failed"),
-        Some(exit::APPLY_FAILED) => Some("psql could not apply the dump"),
+        Some(exit::APPLY_FAILED) => Some(
+            "psql could not apply the dump: it stops at the first failed statement, which its \
+             output names",
+        ),
         Some(exit::CORRUPT_DUMP) => Some(
             "the dump in S3 is corrupt or truncated (gunzip could not decompress it); \
              restore from another backup",
         ),
         Some(exit::KEEP_LOGIN_FAILED) => Some(
-            "keeping the login on its own password through the dump failed; psql may have \
+            "filtering the dump (keeping the login on its own password) failed; psql may have \
              applied part of it",
         ),
         Some(exit::NO_WALG) => Some(
@@ -1744,7 +1731,10 @@ mod tests {
             script.contains("stream | { TEMPS_KEEP_BARE='ALTER ROLE app WITH '"),
             "{script}"
         );
-        assert!(script.contains("| psql -X -q --no-password"), "{script}");
+        assert!(
+            script.contains("| psql -X -q -v ON_ERROR_STOP=1 --no-password"),
+            "{script}"
+        );
         assert!(script.contains("--dbname=postgres"), "{script}");
         assert!(script.contains("exit 4") && script.contains("exit 5"));
         assert!(script.contains("exit 7"), "{script}");
@@ -2192,6 +2182,73 @@ mod tests {
                 .contains("keeping the login on its own password"),
             "{error}"
         );
+    }
+
+    /// `psql` applies the dump with `ON_ERROR_STOP`, so a failed statement
+    /// fails the job instead of exiting 0 half applied, and the statements a
+    /// live server refuses by design reach it in a form that succeeds: the
+    /// existing role's `CREATE ROLE`, dropping the connected role, dropping a
+    /// database an application holds open. Runs the host's real `awk`.
+    #[cfg(unix)]
+    #[test]
+    fn the_dump_is_applied_with_on_error_stop_through_the_live_server_filter() {
+        let script = restore_script(&target(), "p/dump.sql.gz");
+        assert!(
+            script.contains("| psql -X -q -v ON_ERROR_STOP=1 --no-password "),
+            "{script}"
+        );
+        let stubs = Stubs::with_walg_and_psql();
+        stubs.add("gunzip", "cat");
+        let dump = "--\n-- PostgreSQL database cluster dump\n--\n\n\
+             DROP DATABASE IF EXISTS orders;\n\
+             DROP ROLE IF EXISTS app;\n\
+             CREATE ROLE app;\n\
+             ALTER ROLE app WITH LOGIN PASSWORD 'md5old';\n\
+             \\connect orders\n\
+             COPY public.notes (body) FROM stdin;\n\
+             CREATE ROLE app;\n\
+             \\.\n";
+        let object = tempfile::NamedTempFile::new().expect("object");
+        std::fs::write(object.path(), dump).expect("writing the object");
+        let object_path = object.path().to_str().expect("utf-8 path");
+        let (code, stderr, applied) = stubs.run(&script, &[("STUB_OBJECT", object_path)]);
+        assert_eq!(code, 0, "{stderr}");
+        let applied = String::from_utf8(applied.expect("psql ran")).expect("utf-8");
+        assert!(
+            applied.contains(
+                "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity \
+                 WHERE datname = 'orders' AND pid <> pg_catalog.pg_backend_pid();\n\
+                 DROP DATABASE IF EXISTS orders;\n"
+            ),
+            "{applied}"
+        );
+        assert!(
+            applied
+                .contains("DO $temps$ BEGIN DROP ROLE IF EXISTS app; EXCEPTION WHEN object_in_use"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains(
+                "DO $temps$ BEGIN CREATE ROLE app; EXCEPTION WHEN duplicate_object THEN NULL; END $temps$;"
+            ),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("ALTER ROLE app WITH LOGIN;\n"),
+            "{applied}"
+        );
+        assert!(
+            applied.contains("FROM stdin;\nCREATE ROLE app;\n\\.\n"),
+            "table data is never rewritten: {applied}"
+        );
+
+        // psql stopping at a failed statement fails the job.
+        let (code, stderr, _) = stubs.run(
+            &script,
+            &[("STUB_OBJECT", object_path), ("STUB_PSQL_RC", "3")],
+        );
+        assert_eq!(code, exit::APPLY_FAILED as i32, "{stderr}");
+        assert!(stderr.contains("first failed statement"), "{stderr}");
     }
 
     /// The reported failure itself, with the host's real `gunzip`: S3 serves

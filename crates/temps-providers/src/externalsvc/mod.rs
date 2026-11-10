@@ -5,6 +5,7 @@ pub use temps_providers_core::externalsvc::*;
 pub use temps_providers_mariadb::mariadb;
 pub use temps_providers_mariadb::mariadb_binlog_health;
 pub use temps_providers_mongodb::mongodb;
+pub use temps_providers_postgres::dump_filter as postgres_dump_filter;
 pub use temps_providers_postgres::postgres;
 pub use temps_providers_postgres::postgres_cluster;
 pub use temps_providers_postgres::postgres_upgrade;
