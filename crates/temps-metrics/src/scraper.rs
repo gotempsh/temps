@@ -1283,6 +1283,18 @@ mod tests {
         pg_scrape(minute, &[("app", hit, read)])
     }
 
+    /// [`pg_blocks`] plus the database's `stats_reset` time, as the
+    /// collector reports it.
+    fn pg_blocks_since(minute: i64, hit: f64, read: f64, stats_reset: f64) -> Vec<MetricPoint> {
+        let mut points = pg_blocks(minute, hit, read);
+        let mut reset = points[0].clone();
+        reset.name = crate::cache_hit_window::PG_STATS_RESET.to_string();
+        reset.value = stats_reset;
+        reset.kind = MetricKind::Gauge;
+        points.push(reset);
+        points
+    }
+
     /// The instance-wide value of `name`, the one the tiles and alarm read.
     fn served(points: &[MetricPoint], name: &str) -> Option<f64> {
         points
@@ -1442,15 +1454,7 @@ mod tests {
     async fn a_stats_reset_that_only_one_counter_shows_does_not_skew_the_ratio() {
         let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
         let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
-        let with_reset = |minute: i64, hit: f64, read: f64, reset: f64| {
-            let mut points = pg_blocks(minute, hit, read);
-            let mut stats_reset = points[0].clone();
-            stats_reset.name = crate::cache_hit_window::PG_STATS_RESET.to_string();
-            stats_reset.value = reset;
-            stats_reset.kind = MetricKind::Gauge;
-            points.push(stats_reset);
-            points
-        };
+        let with_reset = pg_blocks_since;
         finish_points(
             &baselines,
             &windows,
@@ -1485,10 +1489,74 @@ mod tests {
         // the skewed 9,900 / 100 of minute 2 is left out.
         let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
         assert!((ratio - 1_010_000.0 / 1_030_000.0).abs() < 1e-12, "{ratio}");
-        assert_eq!(served(&last, "pg.cache_blocks_accessed"), Some(1_030_000.0));
         assert!(
             last.iter().all(|p| p.name != "pg.stats_reset"),
             "never persisted"
+        );
+    }
+
+    /// The same reset right after the scrape that set the baselines (a Temps
+    /// restart, a failover, a new database): that scrape only records the
+    /// reset time, and the next interval is still recognised as mixed.
+    #[tokio::test]
+    async fn a_stats_reset_right_after_the_baseline_scrape_does_not_skew_the_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let first = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks_since(0, 1_000_000.0, 10_000.0, 0.0),
+        )
+        .await;
+        assert!(first.is_empty(), "baselines only: {first:?}");
+        let mixed = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks_since(1, 9_900.0, 10_100.0, 600.0),
+        )
+        .await;
+        assert_eq!(served(&mixed, "pg.cache_hit_ratio"), None);
+        let clean = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks_since(2, 19_900.0, 20_100.0, 600.0),
+        )
+        .await;
+        assert_eq!(served(&clean, "pg.cache_hit_ratio"), Some(0.5));
+    }
+
+    /// After a Temps restart the windows refill from empty. Their first
+    /// minutes must not be served as 15 minutes of traffic: the alarm's
+    /// volume gate would read a busy database as idle and resolve its alarm.
+    #[tokio::test]
+    async fn a_restart_does_not_serve_a_partial_window_as_low_traffic() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // 200 block accesses per second at a 70% hit ratio.
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        let mut last = Vec::new();
+        for minute in 0..=15 {
+            counters.0 += 8_400.0;
+            counters.1 += 3_600.0;
+            last = finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, counters.0, counters.1, 0.0),
+            )
+            .await;
+            if (1..15).contains(&minute) {
+                let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+                assert!((ratio - 0.7).abs() < 1e-9, "{minute}: {ratio}");
+                assert_eq!(served(&last, "pg.cache_blocks_accessed"), None, "{minute}");
+            }
+        }
+        assert_eq!(
+            served(&last, "pg.cache_blocks_accessed"),
+            Some(15.0 * 12_000.0)
         );
     }
 

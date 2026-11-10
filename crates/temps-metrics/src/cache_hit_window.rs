@@ -30,7 +30,14 @@
 //!   Omitted when the window saw no block access, because 0/0 is "no data",
 //!   not 100%.
 //! * [`PG_CACHE_BLOCKS_ACCESSED`]: `Σ(hit + read)` over the window, the
-//!   volume behind the ratio. The alarm evaluator gates the ratio rule on it.
+//!   volume behind the ratio. The alarm evaluator gates the ratio rule on it
+//!   and treats a volume below the gate as recovered, so it is written only
+//!   once the series has been tracked for a whole window. The windows live in
+//!   memory: after a Temps restart, an HA failover or an outage longer than
+//!   the window they refill from empty, and a sum over the first scrapes
+//!   would read as a nearly idle database and resolve a real alarm. While it
+//!   refills the ratio is still written; the evaluator, missing the volume,
+//!   keeps the alarm's state as it is.
 //!
 //! The collector reports the counters once per database (`datname` label).
 //! Each database is its own series, and the instance-wide series (no
@@ -108,14 +115,28 @@ struct Interval {
 #[derive(Debug, Default)]
 struct Series {
     intervals: VecDeque<Interval>,
+    /// Start of the first interval since the window was last empty: from
+    /// then on every interval was recorded, so the window is whole once this
+    /// is a full window old.
+    tracked_since: Option<DateTime<Utc>>,
+}
+
+/// A series' window after recording an interval.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WindowSum {
+    hits: f64,
+    accesses: f64,
+    /// Whether the intervals cover the whole window, rather than only the
+    /// time since it started refilling.
+    full: bool,
 }
 
 impl Series {
     /// Record an interval and drop every interval no longer entirely inside
-    /// the window ending at `interval.end`. Returns `(hits, accesses)` over
-    /// the window, or `None` when nothing is left in it (the new interval
-    /// itself started before the window).
-    fn push(&mut self, interval: Interval, window: Duration) -> Option<(f64, f64)> {
+    /// the window ending at `interval.end`. Returns the sums over the window,
+    /// or `None` when nothing is left in it (the new interval itself started
+    /// before the window).
+    fn push(&mut self, interval: Interval, window: Duration) -> Option<WindowSum> {
         // Scrapes of one service never run concurrently, so time only goes
         // backwards if the clock was stepped. Restart the window rather than
         // keep intervals that may now be in the future.
@@ -125,6 +146,9 @@ impl Series {
             .is_some_and(|last| last.end > interval.end)
         {
             self.intervals.clear();
+        }
+        if self.intervals.is_empty() {
+            self.tracked_since = Some(interval.start);
         }
         self.intervals.push_back(interval);
         let cutoff = interval.end - window;
@@ -136,11 +160,19 @@ impl Series {
             self.intervals.pop_front();
         }
         if self.intervals.is_empty() {
+            self.tracked_since = None;
             return None;
         }
-        Some(self.intervals.iter().fold((0.0, 0.0), |(hits, total), i| {
+        let (hits, accesses) = self.intervals.iter().fold((0.0, 0.0), |(hits, total), i| {
             (hits + i.hit, total + i.hit + i.read)
-        }))
+        });
+        Some(WindowSum {
+            hits,
+            accesses,
+            full: self
+                .tracked_since
+                .is_some_and(|since| interval.end - since >= window),
+        })
     }
 }
 
@@ -215,6 +247,18 @@ impl CacheHitWindows {
                 out.push(pt);
             }
         }
+        // Record every database's reset time, also on a scrape that only set
+        // counter baselines (none of its counters reached here), so a reset
+        // right after it is still caught.
+        let mut reset_since_last_scrape: HashSet<String> = HashSet::new();
+        for (key, reset) in &resets {
+            let before = self.stats_reset.insert((source_id, key.clone()), *reset);
+            if before.is_some_and(|before| before != *reset) {
+                reset_since_last_scrape.insert(key.clone());
+            }
+        }
+        self.stats_reset
+            .retain(|(sid, key), _| *sid != source_id || resets.contains_key(key));
         if pairs.is_empty() {
             return out;
         }
@@ -224,11 +268,7 @@ impl CacheHitWindows {
         let mut instance: Option<(MetricPoint, Interval)> = None;
         for (key, pair) in pairs {
             seen.insert(key.clone());
-            let stats_were_reset = resets.remove(&key).is_some_and(|reset| {
-                self.stats_reset
-                    .insert((source_id, key.clone()), reset)
-                    .is_some_and(|before| before != reset)
-            });
+            let stats_were_reset = reset_since_last_scrape.contains(&key);
             let (Some(template), Some(read)) = pair else {
                 continue;
             };
@@ -277,8 +317,6 @@ impl CacheHitWindows {
         // counters: forget its window so the map tracks only live series.
         self.series
             .retain(|(sid, key), _| *sid != source_id || seen.contains(key));
-        self.stats_reset
-            .retain(|(sid, key), _| *sid != source_id || seen.contains(key));
         out
     }
 
@@ -291,7 +329,7 @@ impl CacheHitWindows {
         interval: Interval,
         out: &mut Vec<MetricPoint>,
     ) {
-        let Some((hits, accesses)) = self
+        let Some(sum) = self
             .series
             .entry((source_id, key))
             .or_default()
@@ -299,10 +337,12 @@ impl CacheHitWindows {
         else {
             return;
         };
-        if accesses > 0.0 {
-            out.push(gauge(template, PG_CACHE_HIT_RATIO, hits / accesses));
+        if sum.accesses > 0.0 {
+            out.push(gauge(template, PG_CACHE_HIT_RATIO, sum.hits / sum.accesses));
         }
-        out.push(gauge(template, PG_CACHE_BLOCKS_ACCESSED, accesses));
+        if sum.full {
+            out.push(gauge(template, PG_CACHE_BLOCKS_ACCESSED, sum.accesses));
+        }
     }
 
     /// Forget every window of `source_id`, e.g. after an HA failover, when the
@@ -389,9 +429,59 @@ mod tests {
         points
     }
 
+    /// Track `dbs` of source 1 for the 16 minutes before `at(0)`, without
+    /// block access, so their windows are whole from `at(0)` on.
+    fn warm_up(windows: &mut CacheHitWindows, dbs: &[&str]) {
+        for minute in -16..0 {
+            let batch = dbs
+                .iter()
+                .flat_map(|db| deltas(0.0, 0.0, at(minute), db))
+                .collect();
+            windows.derive(1, batch);
+        }
+    }
+
+    #[test]
+    fn block_accesses_wait_for_a_whole_window() {
+        // As after a restart, a failover or a long outage: the window refills
+        // from empty. Its first minutes are not "15 minutes of traffic", and
+        // the alarm's volume gate would read them as a nearly idle database.
+        let mut windows = CacheHitWindows::default();
+        windows.derive(1, deltas(90.0, 10.0, at(0), "app"));
+        for minute in 1..15 {
+            let out = windows.derive(1, deltas(90.0, 10.0, at(minute), "app"));
+            for db in [Some("app"), None] {
+                assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), Some(0.9), "{minute}");
+                assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), None, "{minute}");
+            }
+        }
+        let out = windows.derive(1, deltas(90.0, 10.0, at(15), "app"));
+        for db in [Some("app"), None] {
+            assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), Some(1_500.0));
+        }
+    }
+
+    #[test]
+    fn a_stats_reset_right_after_a_baseline_only_scrape_is_still_caught() {
+        let mut windows = CacheHitWindows::default();
+        // The scrape that set the counter baselines: only the reset time
+        // reaches the window.
+        let mut reset = counter(PG_STATS_RESET, 0.0, at(0), Some("app"));
+        reset.kind = MetricKind::Gauge;
+        assert!(windows.derive(1, vec![reset]).is_empty());
+
+        let out = windows.derive(1, deltas_since(9_900.0, 100.0, at(1), "app", 1_000.0));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, Some("app")), None);
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), None);
+
+        let out = windows.derive(1, deltas_since(10_000.0, 10_000.0, at(2), "app", 1_000.0));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, Some("app")), Some(0.5));
+    }
+
     #[test]
     fn the_interval_spanning_a_stats_reset_is_dropped() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
         let out = windows.derive(1, deltas_since(900.0, 100.0, at(0), "app", 0.0));
         assert_eq!(value(&out, PG_CACHE_HIT_RATIO, Some("app")), Some(0.9));
         assert_eq!(value(&out, PG_STATS_RESET, Some("app")), None);
@@ -414,6 +504,7 @@ mod tests {
     #[test]
     fn ratio_is_weighted_over_the_window_and_counters_are_not_persisted() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
         windows.derive(1, deltas(900.0, 100.0, at(0), "app"));
         let out = windows.derive(1, deltas(100.0, 900.0, at(1), "app"));
 
@@ -450,6 +541,7 @@ mod tests {
     #[test]
     fn an_idle_window_reports_no_ratio_instead_of_dividing_by_zero() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
         let out = windows.derive(1, deltas(0.0, 0.0, at(0), "app"));
         for db in [Some("app"), None] {
             assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), None);
@@ -460,6 +552,7 @@ mod tests {
     #[test]
     fn the_instance_series_is_the_traffic_weighted_sum_of_the_databases() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app", "bulk"]);
         let mut batch = deltas(70.0, 30.0, at(0), "app");
         batch.extend(deltas(0.0, 900.0, at(0), "bulk"));
         let out = windows.derive(1, batch);
@@ -479,6 +572,7 @@ mod tests {
     #[test]
     fn unlabelled_counters_never_become_a_second_instance_series() {
         let mut windows = CacheHitWindows::default();
+        warm_up(&mut windows, &["app"]);
         let mut batch = deltas(10.0, 0.0, at(0), "app");
         // A summed counter that "reset" would carry lifetime history.
         batch.push(counter(PG_BLKS_HIT, 0.0, at(0), None));
@@ -524,9 +618,15 @@ mod tests {
         let out = windows.derive(1, deltas(1_000.0, 39_000.0, at(41), "app"));
         assert!(out.is_empty(), "nothing is claimed for the window: {out:?}");
 
-        // The next interval is the window's only content again.
+        // The next interval is the window's only content again. The window
+        // refills from minute 41, so its volume waits until it is whole.
         let out = windows.derive(1, deltas(990.0, 10.0, at(42), "app"));
         assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), Some(0.99));
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), None);
+        for minute in 43..56 {
+            windows.derive(1, deltas(0.0, 0.0, at(minute), "app"));
+        }
+        let out = windows.derive(1, deltas(0.0, 0.0, at(56), "app"));
         assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(1000.0));
     }
 

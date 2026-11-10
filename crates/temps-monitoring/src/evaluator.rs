@@ -929,7 +929,8 @@ impl AlertEvaluator {
             None => {
                 // A gated ratio can be absent because its volume metric shows
                 // too little traffic to compute one: an idle Postgres window
-                // writes `pg.cache_blocks_accessed = 0` and no ratio. That is
+                // writes `pg.cache_blocks_accessed = 0` (only once the window
+                // is whole) and no ratio. That is
                 // the same healthy state as a present ratio below the gate,
                 // so resolve an alarm it fired. With no volume metric either,
                 // there is simply no data yet.
@@ -1317,7 +1318,10 @@ pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 /// same window, so this is a rate: about 11 block accesses per second,
 /// sustained. A nearly idle database (health checks, autovacuum ticks), whose
 /// ratio rests on a handful of reads, never raises the alarm; a small
-/// application database doing tens of accesses per second is evaluated.
+/// application database doing tens of accesses per second is evaluated. The
+/// scraper writes the volume only for a whole window, never for one still
+/// refilling after a restart or failover, so a partial sum cannot pass for
+/// an idle database and resolve the alarm.
 pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 10_000.0;
 
 /// Lifetime InnoDB buffer pool read requests before the MariaDB buffer pool
@@ -2785,6 +2789,38 @@ mod tests {
         assert!(
             !evaluator.firing_alarms.read().await.contains_key(&rule.id),
             "an idle window must resolve the low cache hit ratio alarm"
+        );
+    }
+
+    /// While the window refills after a restart or failover the scraper
+    /// writes the ratio but not the volume: the alarm is neither resolved nor
+    /// fired again.
+    #[tokio::test]
+    async fn a_refilling_cache_hit_window_keeps_a_fired_alarm() {
+        let rule = low_cache_hit_ratio_rule();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results(vec![sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db);
+        evaluator.firing_alarms.write().await.insert(rule.id, 99);
+
+        evaluator
+            .evaluate_rule(
+                &rule,
+                &latest(&[("pg.cache_hit_ratio", 0.7)]),
+                (Some(1), None, None, Some(1)),
+            )
+            .await
+            .expect("evaluation succeeds");
+
+        assert_eq!(
+            evaluator.firing_alarms.read().await.get(&rule.id),
+            Some(&99)
         );
     }
 
