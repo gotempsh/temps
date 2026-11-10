@@ -7,6 +7,204 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 mod credential_isolation;
 
+#[tokio::test]
+async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unlink() {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping linked session planner: database unavailable");
+        return;
+    }
+    use crate::{
+        authority::AuthorityStore,
+        broker::UnavailableTokenlessBroker,
+        service::{HostObservation, ServiceAccessService},
+        session_types::*,
+        types::*,
+        vault_types::*,
+    };
+    use temps_service_access_runtime::{HostAudit, WorkerControl};
+    for mode in ["direct", "projectless", "legacy"] {
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        db.execute_unprepared("INSERT INTO users(id,name,email) VALUES(9703,'Fixture','planner@example.com'); INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9703,'Fixture','repo','owner','/','main','nodejs','linked-planner',now(),now()); INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9703,'sbx_linked_planner','Fixture',9703,9703,'running','docker')").await.unwrap();
+        if mode == "projectless" {
+            db.execute_unprepared("UPDATE sandboxes SET project_id=NULL WHERE id=9703")
+                .await
+                .unwrap();
+        }
+        let service = ServiceAccessService::new(
+            db.clone(),
+            encryption(),
+            Arc::new(UnavailableTokenlessBroker),
+        );
+        let vault = service
+            .save_vault(
+                None,
+                None,
+                SaveAccessVault {
+                    name: "Fixture".into(),
+                    service_ids: vec![],
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        let definition = service
+            .save_service(
+                None,
+                None,
+                SaveAccessService {
+                    vault_id: Some(vault.id.clone()),
+                    name: "Fixture API".into(),
+                    policy: SandboxAccessPolicy {
+                        provider: None,
+                        github_repository: None,
+                        origin: "https://api.example.com".into(),
+                        path_prefixes: vec!["/v1".into()],
+                        methods: vec![AccessMethod::Get],
+                    },
+                    max_ttl_seconds: 300,
+                    enabled: true,
+                    credential: Some(SecretString::new("fixture-token")),
+                    clear_credential: false,
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        let bundle = service
+            .save_bundle(
+                None,
+                &vault.id,
+                None,
+                SaveAccessBundle {
+                    name: "Fixture bundle".into(),
+                    service_ids: vec![definition.id.clone()],
+                    ttl_seconds: 120,
+                    expected_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        let link = service
+            .link_vault(
+                &vault.id,
+                if mode == "legacy" { Some(9703) } else { None },
+                if mode == "legacy" { None } else { Some(9703) },
+            )
+            .await
+            .unwrap();
+        let link_id = if mode == "legacy" {
+            let id = format!("link_legacy_{}", vault.id);
+            db.execute(sea_orm::Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE access_vault_links SET id=$1 WHERE id=$2",
+                [id.clone().into(), link.id.into()],
+            ))
+            .await
+            .unwrap();
+            id
+        } else {
+            link.id
+        };
+        let worker = WorkerControl::new(Arc::new(HostAudit));
+        let identity = worker.identity();
+        AuthorityStore::new(
+            db.clone(),
+            encryption(),
+            Arc::new(temps_core::NoopAuditLogger),
+        )
+        .register(None, &identity)
+        .await
+        .unwrap();
+        let approved = service
+            .authorize_session(
+                None,
+                &vault.id,
+                9703,
+                false,
+                CreateAccessSession {
+                    authorized_link_id: Some(link_id.clone()),
+                    request_id: Uuid::new_v4(),
+                    bundle_id: bundle.id,
+                    bundle_version: bundle.version,
+                    consumer: AccessSessionConsumer::Sandbox {
+                        sandbox_id: "sbx_linked_planner".into(),
+                    },
+                    ttl_seconds: 120,
+                    services: vec![SessionServiceVersion {
+                        service_id: definition.id,
+                        version: definition.version,
+                    }],
+                },
+                HostObservation {
+                    worker: identity.clone(),
+                    incarnation: Uuid::new_v4(),
+                    node_id: None,
+                    container_id: "immutable-linked-container".into(),
+                    container_name: "temps-sandbox-linked_planner".into(),
+                    backend: "docker".into(),
+                },
+            )
+            .await
+            .unwrap();
+        if mode == "legacy" {
+            db.execute(sea_orm::Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE access_sessions SET link_id=NULL,legacy_project_link=true WHERE id=$1",
+                [approved.id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+        let checker = Checker::new(0);
+        checker.deny.store(mode != "legacy", Ordering::SeqCst);
+        let planner = PolicyPlanner::new(
+            db.clone(),
+            encryption(),
+            Some(checker.clone()),
+            Arc::new(crate::github::NoGithub),
+        );
+        let plan = planner.prepare(identity.boot_id).await.unwrap();
+        assert_eq!(
+            plan.bindings.len(),
+            1,
+            "{mode} must reach the worker planner"
+        );
+        assert!(plan.retire.is_empty());
+        if mode == "legacy" {
+            checker.deny.store(true, Ordering::SeqCst);
+            assert!(
+                planner
+                    .prepare(identity.boot_id)
+                    .await
+                    .unwrap()
+                    .bindings
+                    .is_empty(),
+                "legacy project links still require current project permission"
+            );
+            checker.deny.store(false, Ordering::SeqCst);
+        } else {
+            assert_eq!(
+                checker.batches.load(Ordering::SeqCst),
+                0,
+                "direct links do not require project membership"
+            );
+        }
+        service.unlink_vault(&vault.id, &link_id).await.unwrap();
+        let revoked = planner.prepare(identity.boot_id).await.unwrap();
+        assert!(
+            revoked.bindings.is_empty(),
+            "{mode} cannot retain revoked credentials"
+        );
+        assert_eq!(revoked.retire.len(), 1);
+        test.cleanup().await;
+    }
+}
+
 fn encryption() -> Arc<EncryptionService> {
     Arc::new(EncryptionService::new(&"ab".repeat(32)).unwrap())
 }

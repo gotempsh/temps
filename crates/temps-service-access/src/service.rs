@@ -81,7 +81,10 @@ impl ServiceAccessService {
         let model = services::Entity::find_by_id(service_id)
             .filter(services::Column::RetiredAt.is_null())
             .apply_if(project_id, |q, id| {
-                q.filter(services::Column::ProjectId.eq(id))
+                q.filter(services::Column::ProjectId.eq(id)).filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "(NOT EXISTS (SELECT 1 FROM access_vaults v WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id]) OR EXISTS (SELECT 1 FROM access_vaults v JOIN access_vault_links l ON l.vault_id=v.id WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id] AND l.project_id=$1 AND l.revoked_at IS NULL))",
+                    [id],
+                ))
             })
             .one(self.db.as_ref())
             .await
@@ -101,7 +104,10 @@ impl ServiceAccessService {
         let pages = services::Entity::find()
             .filter(services::Column::RetiredAt.is_null())
             .apply_if(project_id, |q, id| {
-                q.filter(services::Column::ProjectId.eq(id))
+                q.filter(services::Column::ProjectId.eq(id)).filter(sea_orm::sea_query::Expr::cust_with_values(
+                    "(NOT EXISTS (SELECT 1 FROM access_vaults v WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id]) OR EXISTS (SELECT 1 FROM access_vaults v JOIN access_vault_links l ON l.vault_id=v.id WHERE v.retired_at IS NULL AND v.service_ids @> ARRAY[sandbox_access_services.id] AND l.project_id=$1 AND l.revoked_at IS NULL))",
+                    [id],
+                ))
             })
             .order_by_desc(services::Column::CreatedAt)
             .order_by_desc(services::Column::Id)

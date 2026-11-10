@@ -71,6 +71,7 @@ impl ServiceAccessService {
             .map_err(|e| AccessError::resource_database("read retiring service", service_id, e))?
             .ok_or_else(|| not_found("service", service_id.into(), None))?;
         for sql in [
+            "UPDATE sandbox_service_assignments SET revoked_at=COALESCE(revoked_at,now()),next_reconcile_at=NULL,version=version+1,updated_at=now() WHERE service_id=$1 AND (revoked_at IS NULL OR next_reconcile_at IS NOT NULL)",
             "UPDATE sandbox_service_grants g SET revoked_at=now(),version=version+1 WHERE revoked_at IS NULL AND (service_id=$1 OR EXISTS (SELECT 1 FROM access_sessions s JOIN sandbox_service_grants affected ON s.grant_ids @> ARRAY[affected.id] WHERE affected.service_id=$1 AND s.grant_ids @> ARRAY[g.id]))",
             "UPDATE access_sessions s SET revoked_at=now() WHERE s.revoked_at IS NULL AND EXISTS (SELECT 1 FROM sandbox_service_grants g WHERE s.grant_ids @> ARRAY[g.id] AND g.service_id=$1)",
             "UPDATE access_bundles SET retired_at=now() WHERE service_ids @> ARRAY[$1] AND retired_at IS NULL",
@@ -537,7 +538,18 @@ mod tests {
         ))
         .await
         .unwrap();
+        db.execute_unprepared("INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,service_version,requested_by,approved_by,approved_at,next_reconcile_at) VALUES('assignment_retirement',9911,9912,'svc_fixture',1,9911,9911,now(),now())").await.unwrap();
         service.retire_service("svc_fixture").await.unwrap();
+        let assignment = temps_entities::sandbox_service_assignments::Entity::find_by_id(
+            "assignment_retirement",
+        )
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(assignment.revoked_at.is_some());
+        assert!(assignment.next_reconcile_at.is_none());
+        assert_eq!(assignment.version, 2);
         assert!(
             temps_entities::access_sessions::Entity::find_by_id("session_old")
                 .one(db.as_ref())

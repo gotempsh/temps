@@ -100,7 +100,7 @@ function VaultCollection() {
     },
   })
   const changePage = (page: number) => setParams({ page: String(page) })
-  const error = vaults.error
+  const error = capability.error || vaults.error
   const total = vaults.data?.total
   return (
     <PageContainer width="full">
@@ -129,7 +129,18 @@ function VaultCollection() {
       )}
       {error && (
         <Callout tone="error" title="Could not load vaults">
-          <Button variant="outline" onClick={() => void vaults.refetch()}>
+          {problemDetail(
+            error,
+            'The vault capability or list could not be loaded.'
+          )}
+          <Button
+            variant="outline"
+            onClick={() => {
+              void (capability.isError
+                ? capability.refetch()
+                : vaults.refetch())
+            }}
+          >
             Retry
           </Button>
         </Callout>

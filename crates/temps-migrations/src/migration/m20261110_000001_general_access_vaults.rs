@@ -37,15 +37,7 @@ ALTER TABLE access_sessions ADD COLUMN IF NOT EXISTS link_id text REFERENCES acc
 -- historical sessions under the ALTER TABLE lock. New approvals use explicit links.
 ALTER TABLE access_sessions ADD COLUMN IF NOT EXISTS legacy_project_link boolean NOT NULL DEFAULT true;
 ALTER TABLE access_sessions ALTER COLUMN legacy_project_link SET DEFAULT false;
-CREATE INDEX IF NOT EXISTS access_sessions_link ON access_sessions((COALESCE(link_id, CASE WHEN legacy_project_link THEN 'link_legacy_' || vault_id END)));
-CREATE INDEX IF NOT EXISTS sandbox_service_grants_service ON sandbox_service_grants(service_id);
-CREATE INDEX IF NOT EXISTS access_sessions_grants ON access_sessions USING gin(grant_ids);
-CREATE INDEX IF NOT EXISTS access_vaults_page ON access_vaults(created_at DESC,id DESC) WHERE retired_at IS NULL;
-CREATE INDEX IF NOT EXISTS access_vaults_services ON access_vaults USING gin(service_ids);
-CREATE INDEX IF NOT EXISTS access_bundles_page ON access_bundles(vault_id,created_at DESC,id DESC) WHERE retired_at IS NULL;
-CREATE INDEX IF NOT EXISTS access_sessions_page ON access_sessions(created_at DESC,id DESC);
-CREATE INDEX IF NOT EXISTS access_sessions_sandbox ON access_sessions(sandbox_id,created_at DESC,id DESC);
-CREATE INDEX IF NOT EXISTS sandbox_access_services_page ON sandbox_access_services(created_at DESC,id DESC);
+-- Non-constraint indexes are built CONCURRENTLY by post-migration maintenance.
 ALTER TABLE access_vaults ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE access_bundles ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE sandbox_access_services ALTER COLUMN project_id DROP NOT NULL;
@@ -107,16 +99,16 @@ DO $$ BEGIN
 END $$;
 ALTER TABLE access_sessions DROP COLUMN link_id;
 ALTER TABLE access_sessions DROP COLUMN legacy_project_link;
-DROP INDEX sandbox_service_grants_service;
+DROP INDEX IF EXISTS sandbox_service_grants_service;
 DROP TABLE access_vault_links;
 DROP FUNCTION access_vault_link_revoked();
-DROP INDEX access_sessions_grants;
-DROP INDEX access_vaults_page;
-DROP INDEX access_vaults_services;
-DROP INDEX access_bundles_page;
-DROP INDEX access_sessions_page;
-DROP INDEX access_sessions_sandbox;
-DROP INDEX sandbox_access_services_page;
+DROP INDEX IF EXISTS access_sessions_grants;
+DROP INDEX IF EXISTS access_vaults_page;
+DROP INDEX IF EXISTS access_vaults_services;
+DROP INDEX IF EXISTS access_bundles_page;
+DROP INDEX IF EXISTS access_sessions_page;
+DROP INDEX IF EXISTS access_sessions_sandbox;
+DROP INDEX IF EXISTS sandbox_access_services_page;
 ALTER TABLE sandbox_access_authorizations DROP CONSTRAINT sandbox_access_authorizations_grant_consumer;
 ALTER TABLE sandbox_access_authorizations DROP CONSTRAINT sandbox_access_authorizations_runtime_consumer;
 DROP INDEX sandbox_service_grant_consumer;

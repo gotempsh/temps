@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Button } from '@temps-sdk/ui'
 import { Callout, ResponsivePagination } from '@temps-sdk/ds'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   getProjectsOptions,
   listSandboxesOptions,
@@ -29,7 +30,12 @@ export function VaultConsumerPicker({
   })
   const query = kind === 'project' ? projects : sandboxes
   const rows =
-    kind === 'project' ? projects.data?.projects : sandboxes.data?.sandboxes
+    kind === 'project'
+      ? projects.data?.projects.map((project) => ({
+          ...project,
+          icon: <ServiceIcon service={project} size="xs" />,
+        }))
+      : sandboxes.data?.sandboxes.map((sandbox) => ({ ...sandbox, icon: null }))
   const total =
     kind === 'project' ? projects.data?.total : sandboxes.data?.pagination.count
   return (
@@ -53,6 +59,7 @@ export function VaultConsumerPicker({
             aria-pressed={selected === row.id}
             onClick={() => onSelect(row.id)}
           >
+            {row.icon}
             {row.name}
           </Button>
         ))

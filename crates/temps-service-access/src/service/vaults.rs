@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::vault_types::*;
+use sea_orm::sea_query::Expr;
 use std::collections::{BTreeMap, BTreeSet};
 use temps_entities::{access_bundles as bundles, access_vaults as vaults};
 
@@ -55,7 +56,10 @@ impl ServiceAccessService {
         let query = vaults::Entity::find_by_id(id)
             .filter(vaults::Column::RetiredAt.is_null())
             .apply_if(project_id, |q, id| {
-                q.filter(vaults::Column::ProjectId.eq(id))
+                q.filter(vaults::Column::ProjectId.eq(id)).filter(Expr::cust_with_values(
+                    "EXISTS (SELECT 1 FROM access_vault_links l WHERE l.vault_id=access_vaults.id AND l.project_id=$1 AND l.revoked_at IS NULL)",
+                    [id],
+                ))
             });
         let query = if lock { query.lock_exclusive() } else { query };
         query
@@ -101,7 +105,10 @@ impl ServiceAccessService {
         let pages = vaults::Entity::find()
             .filter(vaults::Column::RetiredAt.is_null())
             .apply_if(project_id, |q, id| {
-                q.filter(vaults::Column::ProjectId.eq(id))
+                q.filter(vaults::Column::ProjectId.eq(id)).filter(Expr::cust_with_values(
+                    "EXISTS (SELECT 1 FROM access_vault_links l WHERE l.vault_id=access_vaults.id AND l.project_id=$1 AND l.revoked_at IS NULL)",
+                    [id],
+                ))
             })
             .order_by_desc(vaults::Column::CreatedAt)
             .order_by_desc(vaults::Column::Id)
@@ -621,6 +628,71 @@ mod database_tests {
                 .unwrap(),
             0
         );
+        let links = service
+            .list_vault_links(
+                &vault.id,
+                AccessPageQuery {
+                    page: None,
+                    page_size: None,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .unlink_vault(&vault.id, &links.items[0].id)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .list_vaults(
+                    9602,
+                    AccessPageQuery {
+                        page: None,
+                        page_size: None
+                    }
+                )
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        for error in [
+            service.get_vault(9602, &vault.id).await.unwrap_err(),
+            service
+                .list_bundles(
+                    9602,
+                    &vault.id,
+                    AccessPageQuery {
+                        page: None,
+                        page_size: None,
+                    },
+                )
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, AccessError::NotFound { id, project_id: Some(9602), .. } if id == vault.id)
+            );
+        }
+        assert!(matches!(service.get_service(9602, &definition.id).await,
+            Err(AccessError::NotFound { id, project_id:Some(9602), .. }) if id == definition.id));
+        assert_eq!(
+            service
+                .list_services(
+                    9602,
+                    AccessPageQuery {
+                        page: None,
+                        page_size: None
+                    }
+                )
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        // The manager can still inspect the general resource; only the former
+        // project's read authority was removed.
+        assert!(service.get_vault(None, &vault.id).await.is_ok());
         test.cleanup().await;
     }
 }

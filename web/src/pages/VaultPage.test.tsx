@@ -23,6 +23,47 @@ import VaultPage from './VaultPage'
 import type { AccessVaultList } from '@/api/client'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 
+test('failed capability checks explain the error and retry before listing vaults', async () => {
+  let attempts = 0
+  const api = mockApi({
+    'GET /service-access/capability': () =>
+      ++attempts === 1
+        ? jsonResponse({ detail: 'Capability temporarily unavailable' }, 503)
+        : jsonResponse({ can_manage_services: true }),
+    'GET /access-vaults': () =>
+      jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    mount(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <BreadcrumbProvider>
+            <VaultPage />
+          </BreadcrumbProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    await waitFor(() =>
+      expect(ui.getByText('Capability temporarily unavailable')).toBeTruthy()
+    )
+    expect(api.called('GET', '/access-vaults')).toBe(false)
+    fireEvent.click(ui.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(api.called('GET', '/access-vaults')).toBe(true))
+    await waitFor(() =>
+      expect(ui.queryByText('Capability temporarily unavailable')).toBeNull()
+    )
+    expect(attempts).toBe(2)
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
 test('vault creation freezes the name while pending and preserves it after failure', async () => {
   const names: string[] = []
   let finish: ((response: Response) => void) | undefined

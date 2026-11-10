@@ -13,6 +13,12 @@ use thiserror::Error;
 /// PostgreSQL server (a setting and a restart), not in Temps or the data.
 #[derive(Debug, Error)]
 pub enum SchemaError {
+    #[error("Failed to {operation} access vault index '{index}': {reason}")]
+    VaultIndex {
+        index: &'static str,
+        operation: &'static str,
+        reason: String,
+    },
     #[error(transparent)]
     LockSlotsExhausted(Box<LockSlotsExhausted>),
 
@@ -32,6 +38,7 @@ impl From<SchemaError> for ServiceError {
     /// [`ServiceError::Configuration`] with the full advice as its message.
     fn from(error: SchemaError) -> Self {
         match error {
+            error @ SchemaError::VaultIndex { .. } => ServiceError::Database(error.to_string()),
             // A server setting the operator has to change.
             SchemaError::LockSlotsExhausted(error) => ServiceError::Configuration {
                 message: error.to_string(),
