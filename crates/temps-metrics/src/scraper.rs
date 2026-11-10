@@ -1250,7 +1250,6 @@ mod tests {
     }
 
     // ── windowed Postgres cache hit ratio ──────────────────────────────────
-    // ── windowed Postgres cache hit ratio ──────────────────────────────────
 
     /// One Postgres scrape's raw, lifetime `blks_hit` / `blks_read` counters
     /// for each `(database, hit, read)`, as the collector reports them.
@@ -1433,6 +1432,63 @@ mod tests {
         assert!(
             accessed < 200_000.0,
             "no lifetime totals in the window: {accessed}"
+        );
+    }
+
+    /// `pg_stat_reset()` between two scrapes: hits fall below their old
+    /// value but reads, already past theirs, look as if they kept growing.
+    /// The interval mixing both sides of the reset must not count.
+    #[tokio::test]
+    async fn a_stats_reset_that_only_one_counter_shows_does_not_skew_the_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let with_reset = |minute: i64, hit: f64, read: f64, reset: f64| {
+            let mut points = pg_blocks(minute, hit, read);
+            let mut stats_reset = points[0].clone();
+            stats_reset.name = crate::cache_hit_window::PG_STATS_RESET.to_string();
+            stats_reset.value = reset;
+            stats_reset.kind = MetricKind::Gauge;
+            points.push(stats_reset);
+            points
+        };
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            with_reset(0, 1_000_000.0, 10_000.0, 0.0),
+        )
+        .await;
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            with_reset(1, 2_000_000.0, 20_000.0, 0.0),
+        )
+        .await;
+        // Reset, then 9,900 hits and 10,100 reads before the next scrape.
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            with_reset(2, 9_900.0, 10_100.0, 600.0),
+        )
+        .await;
+        let last = finish_points(
+            &baselines,
+            &windows,
+            7,
+            with_reset(3, 19_900.0, 20_100.0, 600.0),
+        )
+        .await;
+
+        // Minute 1 (1,000,000 / 10,000) and minute 3 (10,000 / 10,000) only;
+        // the skewed 9,900 / 100 of minute 2 is left out.
+        let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 1_010_000.0 / 1_030_000.0).abs() < 1e-12, "{ratio}");
+        assert_eq!(served(&last, "pg.cache_blocks_accessed"), Some(1_030_000.0));
+        assert!(
+            last.iter().all(|p| p.name != "pg.stats_reset"),
+            "never persisted"
         );
     }
 

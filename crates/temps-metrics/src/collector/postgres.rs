@@ -34,7 +34,7 @@ use tokio_postgres::NoTls;
 use tracing::{debug, warn};
 
 use super::{Collector, CollectorConfig};
-use crate::cache_hit_window::{PG_BLKS_HIT, PG_BLKS_READ};
+use crate::cache_hit_window::{PG_BLKS_HIT, PG_BLKS_READ, PG_STATS_RESET};
 use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint};
 
@@ -405,7 +405,9 @@ async fn collect_metrics(
     //    trailing window (`crate::cache_hit_window`). They are reported per
     //    database only: the scraper builds the instance-wide window from the
     //    per-database deltas, because a summed counter goes backwards when a
-    //    database is dropped and would read as a reset.
+    //    database is dropped and would read as a reset. Each database's
+    //    `stats_reset` time goes with them so the window can drop the
+    //    interval spanning a `pg_stat_reset()`.
     //    Internal Postgres databases (template0, template1) are excluded.
     // -------------------------------------------------------------------------
     {
@@ -415,7 +417,8 @@ async fn collect_metrics(
                         xact_commit, xact_rollback, deadlocks, \
                         temp_files, temp_bytes, \
                         tup_inserted, tup_updated, tup_deleted, \
-                        tup_returned, tup_fetched \
+                        tup_returned, tup_fetched, \
+                        EXTRACT(EPOCH FROM stats_reset)::float8 \
                  FROM pg_stat_database \
                  WHERE datname NOT IN ('template0', 'template1') \
                    AND datname IS NOT NULL",
@@ -449,6 +452,7 @@ async fn collect_metrics(
             let tup_deleted: i64 = row.get(10);
             let tup_returned: i64 = row.get(11);
             let tup_fetched: i64 = row.get(12);
+            let stats_reset: Option<f64> = row.get(13);
 
             sum_commit += xact_commit;
             sum_rollback += xact_rollback;
@@ -476,6 +480,14 @@ async fn collect_metrics(
                 PG_BLKS_READ,
                 blks_read as f64,
                 MetricKind::Counter,
+                db_labels.clone(),
+            ));
+            // Lets the cache hit window drop the interval spanning a
+            // `pg_stat_reset()`, which the per-counter delta step can miss.
+            points.push(make_point(
+                PG_STATS_RESET,
+                stats_reset.unwrap_or(0.0),
+                MetricKind::Gauge,
                 db_labels.clone(),
             ));
             points.push(make_point(

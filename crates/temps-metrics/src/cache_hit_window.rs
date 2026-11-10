@@ -15,7 +15,13 @@
 //! ([`PG_BLKS_HIT`], [`PG_BLKS_READ`]) as [`MetricKind::Counter`] points.
 //! The scraper turns them into per-scrape deltas, and a counter that goes
 //! backwards (a stats reset or a crash restart) is treated as a reset, never as
-//! a negative delta. [`CacheHitWindows::derive`] then keeps each series' deltas
+//! a negative delta. That step sees each counter alone, so after
+//! `pg_stat_reset()` a counter whose count since the reset already exceeds its
+//! old value looks as if it kept growing, and the interval would mix both sides
+//! of the reset (9,900 hits since the reset next to 100 of the 10,100 reads
+//! reads as 99% instead of 49.5%). The collector therefore also reports each
+//! database's `stats_reset` time ([`PG_STATS_RESET`]), and the interval in
+//! which it changes is dropped. [`CacheHitWindows::derive`] then keeps each series' deltas
 //! for the last [`CACHE_HIT_WINDOW`] and replaces the counter points with two
 //! gauges, which are the only ones persisted:
 //!
@@ -67,6 +73,11 @@ pub const PG_BLKS_HIT: &str = "pg.blks_hit";
 /// Raw cumulative `pg_stat_database.blks_read`, emitted by the collector as a
 /// counter and consumed here. Never persisted.
 pub const PG_BLKS_READ: &str = "pg.blks_read";
+
+/// `pg_stat_database.stats_reset` of a database as Unix seconds, 0 while it
+/// was never reset, emitted by the collector as a gauge and consumed here.
+/// Never persisted.
+pub const PG_STATS_RESET: &str = "pg.stats_reset";
 
 /// Shared-buffer hit ratio over [`CACHE_HIT_WINDOW`], 0.0 to 1.0.
 pub const PG_CACHE_HIT_RATIO: &str = "pg.cache_hit_ratio";
@@ -146,6 +157,8 @@ pub struct CacheHitWindows {
     /// Time of each source's latest successful scrape: the start of its next
     /// interval, since the scraper's counter baselines date from then.
     last_scrape: HashMap<i32, DateTime<Utc>>,
+    /// Last [`PG_STATS_RESET`] seen for each database series.
+    stats_reset: HashMap<SeriesKey, f64>,
 }
 
 impl Default for CacheHitWindows {
@@ -160,6 +173,7 @@ impl CacheHitWindows {
             window,
             series: HashMap::new(),
             last_scrape: HashMap::new(),
+            stats_reset: HashMap::new(),
         }
     }
 
@@ -172,8 +186,10 @@ impl CacheHitWindows {
     /// the counters are non-negative per-interval deltas. A database whose
     /// hit or read delta is missing this scrape (its baseline was only just
     /// recorded) contributes nothing yet, to its own series or to the
-    /// instance-wide one. Counters without a [`PG_DATABASE_LABEL`] are
-    /// dropped: the instance-wide series is always derived here.
+    /// instance-wide one. Neither does a database whose [`PG_STATS_RESET`]
+    /// changed since the previous scrape, whose deltas straddle the reset.
+    /// Counters without a [`PG_DATABASE_LABEL`] are dropped: the
+    /// instance-wide series is always derived here.
     ///
     /// Call it for every successful scrape of the source, including one that
     /// only recorded baselines, so the next interval's start is known.
@@ -186,12 +202,15 @@ impl CacheHitWindows {
         // Per label key: the hit point (kept as the template for the gauges'
         // time, labels and source fields) and the read delta.
         let mut pairs: HashMap<String, (Option<MetricPoint>, Option<f64>)> = HashMap::new();
+        let mut resets: HashMap<String, f64> = HashMap::new();
         for pt in points {
             if pt.kind == MetricKind::Counter && pt.name == PG_BLKS_HIT {
                 let key = labels_key(&pt.labels);
                 pairs.entry(key).or_default().0 = Some(pt);
             } else if pt.kind == MetricKind::Counter && pt.name == PG_BLKS_READ {
                 pairs.entry(labels_key(&pt.labels)).or_default().1 = Some(pt.value);
+            } else if pt.name == PG_STATS_RESET {
+                resets.insert(labels_key(&pt.labels), pt.value);
             } else {
                 out.push(pt);
             }
@@ -205,10 +224,24 @@ impl CacheHitWindows {
         let mut instance: Option<(MetricPoint, Interval)> = None;
         for (key, pair) in pairs {
             seen.insert(key.clone());
+            let stats_were_reset = resets.remove(&key).is_some_and(|reset| {
+                self.stats_reset
+                    .insert((source_id, key.clone()), reset)
+                    .is_some_and(|before| before != reset)
+            });
             let (Some(template), Some(read)) = pair else {
                 continue;
             };
             if !template.labels.contains_key(PG_DATABASE_LABEL) {
+                continue;
+            }
+            if stats_were_reset {
+                // The intervals before the reset still count, in this
+                // database's window and in the instance-wide one, which this
+                // scrape may otherwise never reach: keep both.
+                let mut labels = template.labels.clone();
+                labels.remove(PG_DATABASE_LABEL);
+                seen.insert(labels_key(&labels));
                 continue;
             }
             let interval = Interval {
@@ -244,6 +277,8 @@ impl CacheHitWindows {
         // counters: forget its window so the map tracks only live series.
         self.series
             .retain(|(sid, key), _| *sid != source_id || seen.contains(key));
+        self.stats_reset
+            .retain(|(sid, key), _| *sid != source_id || seen.contains(key));
         out
     }
 
@@ -275,12 +310,14 @@ impl CacheHitWindows {
     pub fn reset_source(&mut self, source_id: i32) {
         self.series.retain(|(sid, _), _| *sid != source_id);
         self.last_scrape.remove(&source_id);
+        self.stats_reset.retain(|(sid, _), _| *sid != source_id);
     }
 
     /// Keep only the windows of `active` sources.
     pub fn retain_sources(&mut self, active: &HashSet<i32>) {
         self.series.retain(|(sid, _), _| active.contains(sid));
         self.last_scrape.retain(|sid, _| active.contains(sid));
+        self.stats_reset.retain(|(sid, _), _| active.contains(sid));
     }
 }
 
@@ -335,6 +372,43 @@ mod tests {
             .iter()
             .find(|p| p.name == name && p.labels.get(PG_DATABASE_LABEL).map(String::as_str) == db)
             .map(|p| p.value)
+    }
+
+    /// One database's deltas plus its `stats_reset` time.
+    fn deltas_since(
+        hit: f64,
+        read: f64,
+        time: DateTime<Utc>,
+        db: &str,
+        stats_reset: f64,
+    ) -> Vec<MetricPoint> {
+        let mut points = deltas(hit, read, time, db);
+        let mut reset = counter(PG_STATS_RESET, stats_reset, time, Some(db));
+        reset.kind = MetricKind::Gauge;
+        points.push(reset);
+        points
+    }
+
+    #[test]
+    fn the_interval_spanning_a_stats_reset_is_dropped() {
+        let mut windows = CacheHitWindows::default();
+        let out = windows.derive(1, deltas_since(900.0, 100.0, at(0), "app", 0.0));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, Some("app")), Some(0.9));
+        assert_eq!(value(&out, PG_STATS_RESET, Some("app")), None);
+
+        // `pg_stat_reset()` between the scrapes: the per-counter delta step
+        // saw hits go backwards but reads keep growing, so these deltas mix
+        // both sides of the reset.
+        let out = windows.derive(1, deltas_since(9_900.0, 100.0, at(1), "app", 1_000.0));
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, Some("app")), None);
+        assert_eq!(value(&out, PG_CACHE_HIT_RATIO, None), None);
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), None);
+
+        // After it, deltas are clean again and count with the earlier ones.
+        let out = windows.derive(1, deltas_since(50.0, 50.0, at(2), "app", 1_000.0));
+        let ratio = value(&out, PG_CACHE_HIT_RATIO, Some("app")).unwrap();
+        assert!((ratio - 950.0 / 1_100.0).abs() < 1e-12, "{ratio}");
+        assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, None), Some(1_100.0));
     }
 
     #[test]
