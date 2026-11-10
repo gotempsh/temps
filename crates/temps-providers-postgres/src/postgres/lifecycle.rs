@@ -289,10 +289,51 @@ impl PostgresService {
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
         let name_label_key = format!("{}service_name", temps_core::DOCKER_LABEL_PREFIX);
 
-        let container_labels = HashMap::from([
+        let mut container_labels = HashMap::from([
             (service_label_key, "postgres".to_string()),
             (name_label_key, self.name.to_string()),
         ]);
+
+        // ADR 093: install the server certificate before the server that
+        // reads it starts. A mode that asks for TLS without material comes
+        // from a lifecycle path that does not carry it; the container is then
+        // created without TLS (plaintext is accepted in every supported mode)
+        // and the service's TLS status reports it as not active.
+        let server_tls = config.effective_server_tls();
+        if let Some(material) = server_tls {
+            crate::externalsvc::server_tls::install_tls_directory(
+                docker,
+                crate::externalsvc::server_tls::TlsInstallTarget {
+                    service_name: &self.name,
+                    image: &config.docker_image,
+                    volume: &volume_name,
+                    mount_target: POSTGRES_VOLUME_MOUNT,
+                    dir: POSTGRES_TLS_DIR_NAME,
+                    owner_user: "postgres",
+                },
+                material,
+            )
+            .await
+            .map_err(|e| EngineError::failed(&self.name, e.to_string()))?;
+            container_labels.insert(
+                crate::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL.to_string(),
+                material.fingerprint_sha256.clone(),
+            );
+            info!(
+                service = %self.name,
+                fingerprint = %material.fingerprint_sha256,
+                "Installed server TLS certificate for PostgreSQL container {}",
+                container_name
+            );
+        } else if config.server_tls_mode.offers_tls() && config.container_name.is_none() {
+            warn!(
+                service = %self.name,
+                mode = %config.server_tls_mode,
+                "PostgreSQL service asks for server TLS but no certificate was supplied; \
+                 creating container {} without TLS",
+                container_name
+            );
+        }
 
         // Determine PGDATA path based on docker image
         let pgdata_path = Self::get_pgdata_path(&config.docker_image).map_err(|e| {
@@ -314,7 +355,7 @@ impl PostgresService {
             port_bindings: Some(crate::utils::local_port_binding("5432/tcp", &config.port)),
             mounts: Some(vec![bollard::models::Mount {
                 // Always mount at /var/lib/postgresql - PGDATA env var controls subdirectory
-                target: Some("/var/lib/postgresql".to_string()),
+                target: Some(POSTGRES_VOLUME_MOUNT.to_string()),
                 source: Some(volume_name),
                 typ: Some(bollard::models::MountType::VOLUME),
                 ..Default::default()
@@ -354,33 +395,7 @@ impl PostgresService {
             // the container if this value drifts. This makes the bad combo
             // (archive_mode=on, archive_command='') unrepresentable for any
             // service that's been Stop+Start'd at least once.
-            cmd: Some(vec![
-                "postgres".to_string(),
-                "-c".to_string(),
-                format!("max_connections={}", config.max_connections),
-                "-c".to_string(),
-                "wal_level=replica".to_string(),
-                "-c".to_string(),
-                format!(
-                    "archive_mode={}",
-                    if enable_archiving { "on" } else { "off" }
-                ),
-                "-c".to_string(),
-                "archive_timeout=60".to_string(),
-                // Enable pg_stat_statements at provision time so the extension
-                // can be created after startup. A restart (not just a reload)
-                // is required to change shared_preload_libraries, so this is
-                // set once at container-creation time. Existing services
-                // provisioned before this change need a container restart
-                // (via the restart endpoint) for the change to take effect.
-                // Merged with any library the image itself requires (e.g.
-                // `timescaledb`) — see `shared_preload_libraries_for_image`.
-                "-c".to_string(),
-                format!(
-                    "shared_preload_libraries={}",
-                    Self::shared_preload_libraries_for_image(&config.docker_image)
-                ),
-            ]),
+            cmd: Some(postgres_container_cmd(config, enable_archiving)),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -602,6 +617,38 @@ impl PostgresService {
                 .host_config
                 .as_ref()
                 .is_some_and(host_config_missing_init),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the container's TLS setup disagrees with `desired`: TLS is on
+    /// in its CMD but should be off, or should be on (with this certificate)
+    /// and is not. Returns false when it can't be determined, like the CMD
+    /// drift checks above.
+    pub(super) async fn container_server_tls_differs(
+        &self,
+        container: &bollard::models::ContainerSummary,
+        desired: &DesiredServerTls,
+    ) -> bool {
+        let Some(id) = container.id.as_deref() else {
+            return false;
+        };
+        match self
+            .docker
+            .inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => {
+                let config = info.config.unwrap_or_default();
+                server_tls_drift(
+                    config.cmd.as_deref().unwrap_or_default(),
+                    config.labels.as_ref(),
+                    desired,
+                )
+            }
             Err(_) => false,
         }
     }
@@ -919,6 +966,105 @@ impl PostgresService {
 
 /// Internal port used by PostgreSQL inside the container
 pub(super) const POSTGRES_INTERNAL_PORT: &str = "5432";
+
+/// Where a standalone PostgreSQL container mounts its data volume.
+pub(super) const POSTGRES_VOLUME_MOUNT: &str = "/var/lib/postgresql";
+
+/// Directory (under [`POSTGRES_VOLUME_MOUNT`], outside PGDATA) holding the
+/// server certificate and key. Outside PGDATA so base backups, restores and
+/// major upgrades never copy or replace it.
+pub(super) const POSTGRES_TLS_DIR_NAME: &str = "tls";
+
+/// `-c` settings that make the server offer TLS with the installed files.
+/// pg_hba is left alone: the image's `host all all all md5` rule matches TLS
+/// and plaintext connections alike, which is exactly `available`.
+pub(crate) fn server_tls_settings() -> [String; 3] {
+    let dir = format!("{POSTGRES_VOLUME_MOUNT}/{POSTGRES_TLS_DIR_NAME}");
+    [
+        "ssl=on".to_string(),
+        format!(
+            "ssl_cert_file={dir}/{}",
+            crate::externalsvc::server_tls::SERVER_CERT_FILE
+        ),
+        format!(
+            "ssl_key_file={dir}/{}",
+            crate::externalsvc::server_tls::SERVER_KEY_FILE
+        ),
+    ]
+}
+
+/// The CMD of a standalone PostgreSQL container built from `config`.
+///
+/// archive_mode is computed from on-disk truth, not stored state:
+/// `/var/lib/postgresql/walg.env` exists on the volume iff WAL-G archiving
+/// has been configured for this service. The reconcile-on-start path in
+/// `start()` recomputes and recreates the container if this value drifts.
+/// This makes the bad combo (archive_mode=on, archive_command='')
+/// unrepresentable for any service that's been Stop+Start'd at least once.
+///
+/// TLS settings are added only when [`PostgresConfig::effective_server_tls`]
+/// has material to serve (ADR 093).
+pub(crate) fn postgres_container_cmd(
+    config: &PostgresConfig,
+    enable_archiving: bool,
+) -> Vec<String> {
+    let mut cmd = vec![
+        "postgres".to_string(),
+        "-c".to_string(),
+        format!("max_connections={}", config.max_connections),
+        "-c".to_string(),
+        "wal_level=replica".to_string(),
+        "-c".to_string(),
+        format!(
+            "archive_mode={}",
+            if enable_archiving { "on" } else { "off" }
+        ),
+        "-c".to_string(),
+        "archive_timeout=60".to_string(),
+        // Enable pg_stat_statements at provision time so the extension
+        // can be created after startup. A restart (not just a reload)
+        // is required to change shared_preload_libraries, so this is
+        // set once at container-creation time. Existing services
+        // provisioned before this change need a container restart
+        // (via the restart endpoint) for the change to take effect.
+        // Merged with any library the image itself requires (e.g.
+        // `timescaledb`) — see `shared_preload_libraries_for_image`.
+        "-c".to_string(),
+        format!(
+            "shared_preload_libraries={}",
+            PostgresService::shared_preload_libraries_for_image(&config.docker_image)
+        ),
+    ];
+    if config.effective_server_tls().is_some() {
+        for setting in server_tls_settings() {
+            cmd.push("-c".to_string());
+            cmd.push(setting);
+        }
+    }
+    cmd
+}
+
+/// Whether a container with this CMD and these labels is out of step with
+/// `desired`. TLS counts as on when the CMD sets `ssl=on`; an "on" container
+/// is also stale when it was created with a different certificate (renewal).
+pub(crate) fn server_tls_drift(
+    cmd: &[String],
+    labels: Option<&HashMap<String, String>>,
+    desired: &DesiredServerTls,
+) -> bool {
+    let ssl_on = cmd
+        .iter()
+        .any(|token| token.trim().eq_ignore_ascii_case("ssl=on"));
+    match desired {
+        DesiredServerTls::Off => ssl_on,
+        DesiredServerTls::On { fingerprint_sha256 } => {
+            let actual = labels.and_then(|labels| {
+                labels.get(crate::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL)
+            });
+            !ssl_on || actual != Some(fingerprint_sha256)
+        }
+    }
+}
 
 /// Data volumes of a service named `name`, as `remove()` deletes them.
 pub fn postgres_volume_names(name: &str) -> [String; 1] {

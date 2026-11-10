@@ -233,6 +233,13 @@ impl ExternalServiceManager {
 
         let topology = request.topology.clone();
         let topology_for_txn = topology.clone();
+        // ADR 093: new PostgreSQL services (standalone local, and clusters) offer TLS.
+        let default_tls_mode = super::server_tls::default_tls_mode_for_new_service(
+            request.service_type,
+            &topology,
+            request.node_id,
+            &parameters,
+        );
 
         // Start transaction
         let service = self
@@ -265,6 +272,8 @@ impl ExternalServiceManager {
                     };
 
                     let service = new_service.insert(txn).await?;
+                    super::server_tls::record_initial_tls_mode(txn, service.id, default_tls_mode)
+                        .await?;
 
                     Ok(service)
                 })
@@ -494,12 +503,18 @@ impl ExternalServiceManager {
                 service_type: service.service_type.clone(),
             }
         })?;
-        let config = self.get_service_config(service_id).await?;
+        let mut config = self.get_service_config(service_id).await?;
         let instance = self.create_service_instance_for_parameter_value(
             service.name.clone(),
             service_type,
             &config.parameters,
         )?;
+        // ADR 093: a recreate keeps (or applies) the service's server TLS.
+        let parameters = self.get_service_parameters(service_id).await?;
+        let tls_parameters = self.server_tls_parameters(&service, &parameters).await?;
+        if let Some(object) = config.parameters.as_object_mut() {
+            object.extend(tls_parameters);
+        }
         instance.force_recreate(config).await.map_err(|error| {
             ExternalServiceError::from_engine(service_id, error, |e| {
                 ExternalServiceError::InternalError {

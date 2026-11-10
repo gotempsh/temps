@@ -13393,6 +13393,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tower",
  "tower-http 0.7.1",
@@ -13401,6 +13402,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "x25519-dalek 3.0.0",
+ "x509-parser",
  "yaml_serde",
 ]
 
@@ -15228,6 +15230,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-postgres",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "urlencoding",

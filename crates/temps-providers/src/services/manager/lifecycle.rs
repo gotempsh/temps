@@ -48,6 +48,14 @@ impl ExternalServiceManager {
             });
         }
 
+        // ADR 093: the engine installs the server certificate when it
+        // (re)creates the container. Transient: never stored with the
+        // parameters. Empty for services without managed TLS.
+        let mut parameters = parameters;
+        for (key, value) in self.server_tls_parameters(&service, &parameters).await? {
+            parameters.insert(key, value);
+        }
+
         // Local node — use existing Docker-based service logic
         let service_instance = self.create_service_instance_for_parameters(
             service.name.clone(),
@@ -478,6 +486,12 @@ impl ExternalServiceManager {
                 }
             }
             let start_result = if managed_postgres {
+                // ADR 093: start-time drift repair must know the TLS state
+                // (and have the certificate) or it cannot apply it.
+                let mut parameters = parameters.clone();
+                for (key, value) in self.server_tls_parameters(&service, &parameters).await? {
+                    parameters.insert(key, value);
+                }
                 let service_config = ServiceConfig {
                     name: service.name.clone(),
                     service_type: service_type_enum,

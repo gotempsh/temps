@@ -62,6 +62,9 @@ impl ExternalServiceManager {
                          roles; it keeps its previous authentication until the next start"
                     );
                 }
+                // Also renews a managed certificate nearing expiry.
+                self.reconcile_cluster_server_tls(svc.id, "control plane start")
+                    .await;
             }
         }
 
@@ -544,6 +547,16 @@ impl ExternalServiceManager {
         }
         self.release_cluster_claim(service_id, action, status, error_message)
             .await?;
+
+        // Data nodes keep their certificate across restarts; this applies a
+        // mode changed while the cluster was stopped, a renewal, or a member
+        // that missed an earlier change.
+        if matches!(action, ClusterLifecycleAction::Start)
+            && outcome.as_ref().is_ok_and(|report| !report.done.is_empty())
+        {
+            self.reconcile_cluster_server_tls(service_id, "cluster start")
+                .await;
+        }
 
         let report = outcome?;
         if report.failures.is_empty() {

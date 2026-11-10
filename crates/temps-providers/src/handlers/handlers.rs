@@ -1432,7 +1432,7 @@ fn require_reveal_audit(
 /// so the same condition can't map to different status codes across handlers
 /// (notably `UpgradeInProgress` must be 409 everywhere, not 500 on some).
 /// Returns `None` for variants each handler should classify itself.
-fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Problem> {
+pub(crate) fn upgrade_error_problem(e: &crate::services::ExternalServiceError) -> Option<Problem> {
     use crate::services::ExternalServiceError as E;
     match e {
         E::Engine { .. } => engine_problem(e),

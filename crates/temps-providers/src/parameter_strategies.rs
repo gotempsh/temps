@@ -374,7 +374,12 @@ pub struct PostgresParameterStrategy;
 
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
-        reject_internal_only_keys(params, &["container_name"])?;
+        // `server_tls_*` are injected by the control plane from the TLS record
+        // (ADR 093) and never stored with the parameters.
+        reject_internal_only_keys(
+            params,
+            &["container_name", "server_tls_mode", "server_tls_material"],
+        )?;
         reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
@@ -1690,6 +1695,25 @@ mod tests {
         assert!(strategy.updateable_keys().contains(&"port"));
         assert!(strategy.updateable_keys().contains(&"max_connections"));
         assert!(strategy.updateable_keys().contains(&"ssl_mode"));
+    }
+
+    /// ADR 093: the TLS mode and certificate are injected by the control
+    /// plane; a client can neither create nor update them as parameters, so
+    /// they can never land in the stored parameter blob.
+    #[test]
+    fn test_postgres_rejects_client_supplied_server_tls_parameters() {
+        let strategy = PostgresParameterStrategy;
+        for key in ["server_tls_mode", "server_tls_material"] {
+            let params = HashMap::from([
+                ("database".to_string(), JsonValue::String("app".into())),
+                ("username".to_string(), JsonValue::String("app".into())),
+                (key.to_string(), JsonValue::String("available".into())),
+            ]);
+            let err = strategy.validate_for_creation(&params).unwrap_err();
+            assert!(err.contains(key), "{err}");
+            let updates = HashMap::from([(key.to_string(), JsonValue::String("off".into()))]);
+            assert!(strategy.validate_for_update(&updates).is_err());
+        }
     }
 
     #[test]

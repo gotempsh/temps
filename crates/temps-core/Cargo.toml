@@ -55,6 +55,8 @@ arc-swap = { workspace = true }
 # workspace 0.14.8; node_pki.rs was migrated to the 0.14 `Issuer` API in #250
 # (merged from main), so the earlier 0.13.2 pin is no longer needed.
 rcgen = { workspace = true }
+# Validity windows for managed-service certificates (rcgen takes `time` types).
+time = { workspace = true }
 # TLS client config that verifies the control plane's node API by its
 # reserved server name rather than by the address it is reached at
 # (`node_pki::control_plane_client_config`).
@@ -65,6 +67,8 @@ rustls = { workspace = true }
 bollard = { workspace = true }
 
 [dev-dependencies]
+# Asserts SANs, key usages and signatures of issued certificates.
+x509-parser = { workspace = true }
 # Signs test Access JWTs.
 rsa = { workspace = true }
 tempfile = { workspace = true }
