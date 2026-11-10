@@ -117,8 +117,14 @@ Retain former-project columns as nullable historical metadata during transition,
 remove cascading ownership semantics, and introduce independent vault foreign
 keys. PostgreSQL's constant default preserves legacy provenance without a table
 rewrite; newly issued sessions store an explicit link and never use the legacy
-fallback. Non-constraint history indexes build concurrently through post-migration
-maintenance, outside the migration transaction. Removing the legacy link still
+fallback. The two consumer-identity constraint indexes are prepared concurrently
+before upgrade DDL; the migration refuses unprepared populated tables. Fresh,
+physically empty tables can create them transactionally. Non-constraint history
+indexes build concurrently through post-migration maintenance. Both paths keep
+retained-history index scans outside the migration transaction. Replacement
+foreign keys enforce new writes immediately with `NOT VALID`; post-migration
+maintenance validates the already constrained history under locks that allow
+writes, rather than rescanning it under the DDL transaction's exclusive locks. Removing the legacy link still
 revokes its sessions transactionally. Refuse a downgrade that cannot
 represent the links, projectless consumers or retained authorization history.
 Empty databases may roll back; any credential or authorization data makes the

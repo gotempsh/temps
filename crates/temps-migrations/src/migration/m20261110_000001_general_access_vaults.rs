@@ -6,12 +6,35 @@
 //! Downgrade refuses to discard links or authorization provenance.
 use sea_orm_migration::prelude::*;
 
+pub const GENERAL_VAULT_MIGRATION: &str = "m20261110_000001_general_access_vaults";
+pub const GENERAL_VAULT_CONSUMER_INDEXES: &[(&str, &str)] = &[
+    ("sandbox_service_grant_consumer", "sandbox_service_grants"),
+    ("sandbox_access_runtime_consumer", "sandbox_access_runtimes"),
+];
+
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Existing history must have its constraint indexes prepared concurrently
+        // by temps-schema. Only physically empty tables may build them here.
+        for &(index, table) in GENERAL_VAULT_CONSUMER_INDEXES {
+            manager.get_connection().execute_unprepared(&format!(r#"
+DO $$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname=current_schema() AND c.relname='{index}' AND i.indisvalid) THEN
+  LOCK TABLE {table} IN SHARE MODE;
+  IF pg_relation_size('{table}'::regclass) <> 0 THEN
+   RAISE EXCEPTION 'General vault migration requires concurrent preparation of index {index} on {table}; run temps migrate';
+  END IF;
+  CREATE UNIQUE INDEX {index} ON {table}(id,sandbox_id);
+ END IF;
+END $$;
+"#)).await?;
+        }
         manager.get_connection().execute_unprepared(r#"
 ALTER TABLE sandbox_access_services ADD COLUMN IF NOT EXISTS retired_at timestamptz;
 ALTER TABLE access_vaults ADD COLUMN IF NOT EXISTS retired_at timestamptz;
@@ -42,23 +65,21 @@ ALTER TABLE access_vaults ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE access_bundles ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE sandbox_access_services ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE access_vaults DROP CONSTRAINT IF EXISTS access_vaults_project_id_fkey;
-ALTER TABLE access_vaults ADD CONSTRAINT access_vaults_project_id_fkey FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE access_vaults ADD CONSTRAINT access_vaults_project_id_fkey FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL NOT VALID;
 ALTER TABLE sandbox_access_services DROP CONSTRAINT IF EXISTS sandbox_access_services_project_id_fkey;
-ALTER TABLE sandbox_access_services ADD CONSTRAINT sandbox_access_services_project_id_fkey FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE sandbox_access_services ADD CONSTRAINT sandbox_access_services_project_id_fkey FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL NOT VALID;
 ALTER TABLE access_bundles DROP CONSTRAINT IF EXISTS access_bundles_project_id_vault_id_fkey;
-ALTER TABLE access_bundles ADD CONSTRAINT access_bundles_vault_id_fkey FOREIGN KEY(vault_id) REFERENCES access_vaults(id) ON DELETE RESTRICT;
+ALTER TABLE access_bundles ADD CONSTRAINT access_bundles_vault_id_fkey FOREIGN KEY(vault_id) REFERENCES access_vaults(id) ON DELETE RESTRICT NOT VALID;
 ALTER TABLE access_sessions DROP CONSTRAINT IF EXISTS access_sessions_project_id_vault_id_fkey;
-ALTER TABLE access_sessions ADD CONSTRAINT access_sessions_vault_id_fkey FOREIGN KEY(vault_id) REFERENCES access_vaults(id) ON DELETE RESTRICT;
+ALTER TABLE access_sessions ADD CONSTRAINT access_sessions_vault_id_fkey FOREIGN KEY(vault_id) REFERENCES access_vaults(id) ON DELETE RESTRICT NOT VALID;
 ALTER TABLE sandbox_service_grants DROP CONSTRAINT IF EXISTS sandbox_service_grants_service_id_project_id_fkey;
-ALTER TABLE sandbox_service_grants ADD CONSTRAINT sandbox_service_grants_service_id_fkey FOREIGN KEY(service_id) REFERENCES sandbox_access_services(id) ON DELETE RESTRICT;
+ALTER TABLE sandbox_service_grants ADD CONSTRAINT sandbox_service_grants_service_id_fkey FOREIGN KEY(service_id) REFERENCES sandbox_access_services(id) ON DELETE RESTRICT NOT VALID;
 ALTER TABLE access_sessions ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE sandbox_service_grants ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE sandbox_access_runtimes ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE sandbox_access_authorizations ALTER COLUMN project_id DROP NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS sandbox_service_grant_consumer ON sandbox_service_grants(id,sandbox_id);
-CREATE UNIQUE INDEX IF NOT EXISTS sandbox_access_runtime_consumer ON sandbox_access_runtimes(id,sandbox_id);
-ALTER TABLE sandbox_access_authorizations ADD CONSTRAINT sandbox_access_authorizations_grant_consumer FOREIGN KEY(grant_id,sandbox_id) REFERENCES sandbox_service_grants(id,sandbox_id) ON DELETE CASCADE;
-ALTER TABLE sandbox_access_authorizations ADD CONSTRAINT sandbox_access_authorizations_runtime_consumer FOREIGN KEY(runtime_id,sandbox_id) REFERENCES sandbox_access_runtimes(id,sandbox_id) ON DELETE CASCADE;
+ALTER TABLE sandbox_access_authorizations ADD CONSTRAINT sandbox_access_authorizations_grant_consumer FOREIGN KEY(grant_id,sandbox_id) REFERENCES sandbox_service_grants(id,sandbox_id) ON DELETE CASCADE NOT VALID;
+ALTER TABLE sandbox_access_authorizations ADD CONSTRAINT sandbox_access_authorizations_runtime_consumer FOREIGN KEY(runtime_id,sandbox_id) REFERENCES sandbox_access_runtimes(id,sandbox_id) ON DELETE CASCADE NOT VALID;
 CREATE OR REPLACE FUNCTION access_vault_link_revoked() RETURNS trigger AS $$
 BEGIN
  IF TG_OP='DELETE' THEN
@@ -175,6 +196,12 @@ INSERT INTO access_bundles(id,project_id,vault_id,name,service_ids,ttl_seconds) 
 INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at) VALUES('grant_migration',9921,'svc_migration',9921,1,'{}',9921,now()+interval '1 hour');
 INSERT INTO access_sessions(id,project_id,vault_id,bundle_id,bundle_name,bundle_version,consumer_kind,consumer_id,sandbox_id,created_by,consent,grant_ids,created_at,expires_at) VALUES('session_migration',9921,'vault_migration','bundle_migration','Fixture',1,'sandbox','sbx_migration_fixture',9921,9921,'{"immutable":"consent"}',ARRAY['grant_migration'],now(),now()+interval '1 hour');
 "#).await.unwrap();
+        let unprepared = crate::Migrator::up(db, None).await.unwrap_err();
+        assert!(unprepared.to_string().contains("concurrent preparation of index sandbox_service_grant_consumer"));
+        // Upgrade preparation happens outside Migrator::up's transaction.
+        for &(index, table) in GENERAL_VAULT_CONSUMER_INDEXES {
+            db.execute_unprepared(&format!("CREATE UNIQUE INDEX CONCURRENTLY {index} ON {table}(id,sandbox_id)")).await.unwrap();
+        }
         crate::Migrator::up(db, None).await.unwrap();
         let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,
             "SELECT l.id AS link_id,s.legacy_project_link AND s.link_id IS NULL AS migrated_without_rewrite,s.revoked_at IS NULL AND g.revoked_at IS NULL AS live, s.consent->>'immutable' AS consent, s.expires_at=g.expires_at AS lifetime,l.project_id FROM access_sessions s JOIN access_vault_links l ON l.id=COALESCE(s.link_id,CASE WHEN s.legacy_project_link THEN 'link_legacy_' || s.vault_id END) JOIN sandbox_service_grants g ON g.id='grant_migration' WHERE s.id='session_migration'".to_owned())).await.unwrap().unwrap();

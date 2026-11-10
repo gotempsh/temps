@@ -3,6 +3,31 @@
 
 use super::{build_index_with_retry, MaintenanceProgress, SchemaError, SchemaResult};
 
+// NOT VALID enforces every new write immediately. Existing rows were already
+// protected by the former project-qualified foreign keys. Validate history
+// after DDL commits, under PostgreSQL's write-compatible validation locks.
+const CONSTRAINTS: &[(&str, &str)] = &[
+    ("access_vaults_project_id_fkey", "access_vaults"),
+    (
+        "sandbox_access_services_project_id_fkey",
+        "sandbox_access_services",
+    ),
+    ("access_bundles_vault_id_fkey", "access_bundles"),
+    ("access_sessions_vault_id_fkey", "access_sessions"),
+    (
+        "sandbox_service_grants_service_id_fkey",
+        "sandbox_service_grants",
+    ),
+    (
+        "sandbox_access_authorizations_grant_consumer",
+        "sandbox_access_authorizations",
+    ),
+    (
+        "sandbox_access_authorizations_runtime_consumer",
+        "sandbox_access_authorizations",
+    ),
+];
+
 // These are performance indexes, not constraints. Retained session and grant
 // history can be large, so build them after the migration transaction commits.
 const INDEXES: &[(&str, &str, &str)] = &[
@@ -87,7 +112,78 @@ where
             elapsed: started.elapsed(),
         });
     }
+    for &(constraint, table) in CONSTRAINTS {
+        sqlx::query(&format!(
+            "ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}"
+        ))
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| SchemaError::VaultConstraint {
+            constraint,
+            table,
+            reason: error.to_string(),
+        })?;
+    }
     Ok(())
+}
+
+/// Constraint-supporting indexes must exist before the general-vault DDL. Build
+/// retained history concurrently, with a disposable session for locks/timeouts.
+pub(crate) async fn prepare_consumer_constraints(
+    db: &sea_orm::DatabaseConnection,
+) -> SchemaResult<()> {
+    let prepare = async {
+        let mut connection =
+            db.get_postgres_connection_pool()
+                .acquire()
+                .await
+                .map_err(|error| SchemaError::VaultIndex {
+                    index: "sandbox_consumer_constraints",
+                    operation: "acquire preparation connection for",
+                    reason: error.to_string(),
+                })?;
+        connection.close_on_drop();
+        for setting in ["SET lock_timeout='5s'", "SET statement_timeout='600s'"] {
+            sqlx::query(setting)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| SchemaError::VaultIndex {
+                    index: "sandbox_consumer_constraints",
+                    operation: "bound preparation time for",
+                    reason: error.to_string(),
+                })?;
+        }
+        sqlx::query("SELECT pg_advisory_lock(hashtext(current_database()),hashtext(current_schema() || ':vault_consumer_indexes'))").execute(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
+            index: "sandbox_consumer_constraints", operation: "lock preparation of", reason: error.to_string(),
+        })?;
+        for &(name, table) in temps_migrations::GENERAL_VAULT_CONSUMER_INDEXES {
+            let exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident($1)) IS NOT NULL")
+                .bind(table).fetch_one(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
+                    index: name, operation: "check source table for", reason: error.to_string(),
+                })?;
+            if !exists {
+                continue;
+            }
+            tracing::info!(
+                index = name,
+                table,
+                "Preparing vault consumer constraint index concurrently"
+            );
+            build_index_with_retry(
+                &mut connection, name, table,
+                &format!("CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table}(id,sandbox_id)"),
+                &format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"),
+            ).await.map_err(|reason| SchemaError::VaultIndex { index: name, operation: "prepare", reason })?;
+        }
+        Ok(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(600), prepare)
+        .await
+        .map_err(|_| SchemaError::VaultIndex {
+            index: "sandbox_consumer_constraints",
+            operation: "prepare",
+            reason: "preparation exceeded 600 seconds; retry the migration".into(),
+        })?
 }
 
 #[cfg(test)]
@@ -113,12 +209,103 @@ mod tests {
             before, 0,
             "the migration must not scan retained history to build indexes"
         );
+        let constraints: Vec<&str> = CONSTRAINTS.iter().map(|c| c.0).collect();
+        let unvalidated: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname=current_schema() AND c.conname=ANY($1) AND NOT c.convalidated").bind(&constraints).fetch_one(&mut *connection).await.unwrap();
+        assert_eq!(unvalidated, CONSTRAINTS.len() as i64);
         build(&mut connection, &|_| {}).await.unwrap();
         build(&mut connection, &|_| {}).await.unwrap();
+        let validated: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname=current_schema() AND c.conname=ANY($1) AND c.convalidated").bind(&constraints).fetch_one(&mut *connection).await.unwrap();
+        assert_eq!(validated, CONSTRAINTS.len() as i64);
         let valid=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND i.indisvalid").bind(&names).fetch_one(&mut *connection).await.unwrap();
         assert_eq!(valid, INDEXES.len() as i64);
         drop(connection);
         drop(db);
         test.cleanup().await;
+    }
+    #[tokio::test]
+    async fn populated_upgrade_prepares_constraints_without_blocking_writes() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
+        use sea_orm_migration::MigratorTrait;
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping vault constraint preparation: database unavailable");
+            return;
+        }
+        for streaming in [false, true] {
+            let mut test = temps_test_utils::TestDatabase::new().await.unwrap();
+            let db = test.connection_arc();
+            let previous = temps_migrations::Migrator::migrations()
+                .iter()
+                .position(|m| m.name() == temps_migrations::GENERAL_VAULT_MIGRATION)
+                .unwrap();
+            temps_migrations::Migrator::up(db.as_ref(), Some(previous as u32))
+                .await
+                .unwrap();
+            db.execute_unprepared("INSERT INTO users(id,name,email) VALUES(9931,'Fixture','index-fixture@example.com'); INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9931,'Fixture','repo','owner','/','main','nodejs','index-fixture',now(),now()); INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9931,'sbx_index_fixture','Fixture',9931,9931,'running','docker'); INSERT INTO sandbox_access_services(id,project_id,name,policy,max_ttl_seconds,enabled) VALUES('svc_index',9931,'Fixture','{}',60,true); INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at) VALUES('grant_index',9931,'svc_index',9931,1,'{}',9931,now()+interval '1 hour')").await.unwrap();
+            let writer = db.begin().await.unwrap();
+            writer
+                .execute_unprepared(
+                    "UPDATE sandbox_service_grants SET version=version WHERE id='grant_index'",
+                )
+                .await
+                .unwrap();
+            let pid: i32 = writer
+                .query_one(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_backend_pid() AS pid",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "pid")
+                .unwrap();
+            let upgrading = db.clone();
+            let upgrade = tokio::spawn(async move {
+                if streaming {
+                    let report = crate::run_migrations_streaming(upgrading.as_ref(), |_| {})
+                        .await
+                        .unwrap();
+                    assert!(report.failed().is_none(), "{report:?}");
+                } else {
+                    crate::run_migrations(upgrading.as_ref()).await.unwrap();
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let waiting: bool = db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE 'CREATE UNIQUE INDEX CONCURRENTLY%') AS waiting", [pid.into()])).await.unwrap().unwrap().try_get("", "waiting").unwrap();
+                    if waiting { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            // A concurrent build may wait for an existing writer, but it must
+            // not prevent another writer from issuing access in the meantime.
+            let concurrent = db.begin().await.unwrap();
+            concurrent
+                .execute_unprepared("SET LOCAL lock_timeout='1s'")
+                .await
+                .unwrap();
+            let inserted = concurrent.execute_unprepared("INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at) VALUES('grant_during_index',9931,'svc_index',9931,1,'{}',9931,now()+interval '1 hour')").await;
+            concurrent.commit().await.unwrap();
+            writer.rollback().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(30), upgrade)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                inserted.is_ok(),
+                "access writes must continue while indexes are prepared: {inserted:?}"
+            );
+            prepare_consumer_constraints(db.as_ref()).await.unwrap();
+            let names: Vec<&str> = temps_migrations::GENERAL_VAULT_CONSUMER_INDEXES
+                .iter()
+                .map(|i| i.0)
+                .collect();
+            let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND i.indisvalid AND i.indisunique").bind(&names).fetch_one(db.get_postgres_connection_pool()).await.unwrap();
+            assert_eq!(valid, 2);
+            drop(db);
+            test.cleanup().await;
+        }
     }
 }

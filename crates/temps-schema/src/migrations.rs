@@ -201,6 +201,13 @@ pub async fn run_migrations(db: &DbConnection) -> SchemaResult<()> {
         };
     }
 
+    if status
+        .pending()
+        .iter()
+        .any(|name| name == temps_migrations::GENERAL_VAULT_MIGRATION)
+    {
+        crate::maintenance::prepare_consumer_constraints(db).await?;
+    }
     match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) if is_lock_exhaustion(&e) => {
@@ -368,6 +375,12 @@ where
             .map(|migration| migration.name().to_string())
             .collect()
     };
+    if pending_names
+        .iter()
+        .any(|name| name == temps_migrations::GENERAL_VAULT_MIGRATION)
+    {
+        crate::maintenance::prepare_consumer_constraints(db).await?;
+    }
     // Only the newer-schema path applies migrations itself, so only it needs
     // the migration objects; `Migrator::up(db, Some(1))` finds its own.
     let newer_schema_migrations = if newer_schema {

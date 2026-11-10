@@ -93,3 +93,7 @@ pub use migration::m20261105_000001_project_data_purges::DETACHED_PARENTS as PRO
 pub use migration::m20261105_000001_project_data_purges::{
     fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
 };
+
+pub use migration::m20261110_000001_general_access_vaults::{
+    GENERAL_VAULT_CONSUMER_INDEXES, GENERAL_VAULT_MIGRATION,
+};

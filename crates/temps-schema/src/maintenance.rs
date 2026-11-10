@@ -13,6 +13,7 @@ use temps_core::{ServiceError, ServiceResult};
 use tracing::debug;
 
 mod access_vault_indexes;
+pub(crate) use access_vault_indexes::prepare_consumer_constraints;
 
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
 
