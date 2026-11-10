@@ -387,7 +387,10 @@ mod tests {
             r#"{"protocol_version":1,"agent_version":"old","capabilities":["telemetry_shipping"]}"#,
         )
         .unwrap();
-        let ours = hello(&[Capability::TelemetryShipping, Capability::ConsoleSessionLogout]);
+        let ours = hello(&[
+            Capability::TelemetryShipping,
+            Capability::ConsoleSessionLogout,
+        ]);
         assert_eq!(
             ours.negotiate(&old_peer).unwrap(),
             vec![Capability::TelemetryShipping]

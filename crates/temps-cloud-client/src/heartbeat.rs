@@ -773,19 +773,21 @@ async fn apply_console_logout(
     sink: &Arc<dyn ConsoleLogoutSink>,
     logout: &ConsoleLogout,
 ) -> Result<(), HeartbeatError> {
-    let outcome =
-        match tokio::time::timeout(CONSOLE_LOGOUT_APPLY_TIMEOUT, sink.apply(&logout.logout_token))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                tracing::warn!(
-                    timeout_secs = CONSOLE_LOGOUT_APPLY_TIMEOUT.as_secs(),
-                    "applying a Cloud console logout timed out; Cloud will send it again"
-                );
-                return Ok(());
-            }
-        };
+    let outcome = match tokio::time::timeout(
+        CONSOLE_LOGOUT_APPLY_TIMEOUT,
+        sink.apply(&logout.logout_token),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CONSOLE_LOGOUT_APPLY_TIMEOUT.as_secs(),
+                "applying a Cloud console logout timed out; Cloud will send it again"
+            );
+            return Ok(());
+        }
+    };
     match outcome {
         ConsoleLogoutOutcome::Applied {
             jti,
@@ -1058,7 +1060,10 @@ mod tests {
                     }
                 }
             } else if let Some(ack) = envelope.decode::<ConsoleLogoutAck>(CONSOLE_LOGOUT_ACK_KIND) {
-                stub.console_logout_acks.lock().expect("acks lock").push(ack);
+                stub.console_logout_acks
+                    .lock()
+                    .expect("acks lock")
+                    .push(ack);
             } else if let Some(rejected) =
                 envelope.decode::<ConsoleLogoutRejected>(CONSOLE_LOGOUT_REJECTED_KIND)
             {
@@ -1936,7 +1941,10 @@ mod tests {
             ..Default::default()
         };
         if !run_console_logout_cycle(&stub, None, |stub| {
-            stub.client_advertised_console_logout.lock().unwrap().is_some()
+            stub.client_advertised_console_logout
+                .lock()
+                .unwrap()
+                .is_some()
                 && stub.heartbeats_received.load(Ordering::SeqCst) > 0
         })
         .await

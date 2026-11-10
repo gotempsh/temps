@@ -11,8 +11,8 @@ mod backup_mirror;
 /// console-access OIDC provider. See the module doc for the wiring point
 /// once `temps-cloud-client`'s console-proxy worker exists.
 pub mod console_oidc;
-pub mod console_sessions;
 mod console_oidc_bootstrap;
+pub mod console_sessions;
 mod handler;
 mod lifecycle_notify;
 mod plugin;

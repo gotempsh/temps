@@ -691,8 +691,9 @@ impl CloudService {
             // ADR-094: with an auth plugin, this instance applies Cloud's
             // signed console logouts and says so in its `Hello`.
             let console_logout = self.oidc_provisioner.get().map(|oidc| {
-                Arc::new(crate::console_sessions::ConsoleLogoutAdapter::new(oidc.clone()))
-                    as Arc<dyn temps_cloud_client::ConsoleLogoutSink>
+                Arc::new(crate::console_sessions::ConsoleLogoutAdapter::new(
+                    oidc.clone(),
+                )) as Arc<dyn temps_cloud_client::ConsoleLogoutSink>
             });
             *task = Some(tokio::spawn(async move {
                 temps_cloud_client::heartbeat::run_with_console_logout(

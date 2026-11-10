@@ -28,16 +28,16 @@ use tokio::sync::Mutex;
 use crate::oidc_errors::OidcError;
 
 mod cloud_sessions;
-pub use cloud_sessions::{
-    CloudLogoutApplied, CloudLogoutRefusal, CloudSessionCheck, CloudSessionStatus,
-    CLOUD_SESSION_CHECK_INTERVAL, CLOUD_SESSION_STALE_AFTER,
-};
 use crate::oidc_types::{
     derive_provider_slug, role_mapping_to_response, CreateOidcProviderRequest,
     CreateOidcRoleMappingRequest, OidcProviderSummary, OidcRoleMappingResponse,
     UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
+pub use cloud_sessions::{
+    CloudLogoutApplied, CloudLogoutRefusal, CloudSessionCheck, CloudSessionStatus,
+    CLOUD_SESSION_CHECK_INTERVAL, CLOUD_SESSION_STALE_AFTER,
+};
 use temps_core::EncryptionService;
 use temps_entities::oidc_login_states;
 use temps_entities::oidc_providers;

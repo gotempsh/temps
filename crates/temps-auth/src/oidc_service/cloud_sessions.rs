@@ -61,9 +61,15 @@ pub struct CloudLogoutApplied {
 pub enum CloudLogoutRefusal {
     /// Not even a request id could be read.
     Unreadable,
-    Rejected { jti: Uuid, reason: &'static str },
+    Rejected {
+        jti: Uuid,
+        reason: &'static str,
+    },
     /// Verified, but ending the sessions failed. Cloud sends it again.
-    Failed { jti: Uuid, reason: String },
+    Failed {
+        jti: Uuid,
+        reason: String,
+    },
 }
 
 /// Cloud's answer to a session re-check.
@@ -481,7 +487,8 @@ impl OidcService {
         let sessions_ended = if inactive.is_empty() {
             0
         } else {
-            self.end_cloud_sessions(provider.id, Some(&inactive)).await?
+            self.end_cloud_sessions(provider.id, Some(&inactive))
+                .await?
         };
         Ok(CloudSessionCheck::Checked {
             sessions_ended: sessions_ended + orphaned,
@@ -531,18 +538,33 @@ mod tests {
     fn every_back_channel_logout_claim_rule_is_enforced() {
         let now = 1_000_000;
         let cases: Vec<(&str, Mutation)> = vec![
-            ("issuer", Box::new(|c| c["iss"] = "https://evil.example/oidc".into())),
-            ("audience", Box::new(|c| c["aud"] = "another-instance".into())),
+            (
+                "issuer",
+                Box::new(|c| c["iss"] = "https://evil.example/oidc".into()),
+            ),
+            (
+                "audience",
+                Box::new(|c| c["aud"] = "another-instance".into()),
+            ),
             ("events", Box::new(|c| c["events"] = serde_json::json!({}))),
             ("nonce", Box::new(|c| c["nonce"] = "n".into())),
-            ("future iat", Box::new(move |c| c["iat"] = (now + 3600).into())),
+            (
+                "future iat",
+                Box::new(move |c| c["iat"] = (now + 3600).into()),
+            ),
             ("expired", Box::new(move |c| c["exp"] = (now - 1).into())),
-            ("no exp", Box::new(|c| {
-                c.as_object_mut().unwrap().remove("exp");
-            })),
-            ("no sub", Box::new(|c| {
-                c.as_object_mut().unwrap().remove("sub");
-            })),
+            (
+                "no exp",
+                Box::new(|c| {
+                    c.as_object_mut().unwrap().remove("exp");
+                }),
+            ),
+            (
+                "no sub",
+                Box::new(|c| {
+                    c.as_object_mut().unwrap().remove("sub");
+                }),
+            ),
             ("empty sub", Box::new(|c| c["sub"] = "".into())),
         ];
         for (name, mutate) in cases {
@@ -591,7 +613,11 @@ mod tests {
             .expect("signing key")
     }
 
-    fn jwt(key: &CoreRsaPrivateSigningKey, header: serde_json::Value, claims: &serde_json::Value) -> String {
+    fn jwt(
+        key: &CoreRsaPrivateSigningKey,
+        header: serde_json::Value,
+        claims: &serde_json::Value,
+    ) -> String {
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let input = format!(
             "{}.{}",
@@ -599,7 +625,10 @@ mod tests {
             engine.encode(serde_json::to_vec(claims).unwrap())
         );
         let signature = key
-            .sign(&CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256, input.as_bytes())
+            .sign(
+                &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+                input.as_bytes(),
+            )
             .expect("sign");
         format!("{input}.{}", engine.encode(signature))
     }
@@ -616,7 +645,11 @@ mod tests {
         })
     }
 
-    async fn user(db: &sea_orm::DatabaseConnection, name: &str, link: Option<(i32, &str)>) -> users::Model {
+    async fn user(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+        link: Option<(i32, &str)>,
+    ) -> users::Model {
         users::ActiveModel {
             name: Set(name.to_string()),
             email: Set(format!("{name}@example.com")),
@@ -630,7 +663,11 @@ mod tests {
         .expect("user must insert")
     }
 
-    async fn session(db: &sea_orm::DatabaseConnection, user_id: i32, origin: Option<String>) -> i32 {
+    async fn session(
+        db: &sea_orm::DatabaseConnection,
+        user_id: i32,
+        origin: Option<String>,
+    ) -> i32 {
         sessions::ActiveModel {
             user_id: Set(user_id),
             session_token: Set(Uuid::new_v4().to_string()),
@@ -722,7 +759,11 @@ mod tests {
             ),
             (
                 "a key Cloud never published",
-                jwt(&rsa_key(KID), logout_header(), &logout_claims("cloud-alice", jti)),
+                jwt(
+                    &rsa_key(KID),
+                    logout_header(),
+                    &logout_claims("cloud-alice", jti),
+                ),
             ),
             (
                 "a nonce",
@@ -735,7 +776,9 @@ mod tests {
         ];
         for (name, token) in refused {
             match service.apply_cloud_logout_token(&token).await {
-                Err(CloudLogoutRefusal::Rejected { jti: got, .. }) => assert_eq!(got, jti, "{name}"),
+                Err(CloudLogoutRefusal::Rejected { jti: got, .. }) => {
+                    assert_eq!(got, jti, "{name}")
+                }
                 other => panic!("{name} must be rejected, got {other:?}"),
             }
         }
@@ -748,12 +791,25 @@ mod tests {
         // Accepted: Alice's Cloud session and grant go; her password session
         // and Bob stay.
         let applied = service
-            .apply_cloud_logout_token(&jwt(&key, logout_header(), &logout_claims("cloud-alice", jti)))
+            .apply_cloud_logout_token(&jwt(
+                &key,
+                logout_header(),
+                &logout_claims("cloud-alice", jti),
+            ))
             .await
             .expect("a genuine logout token applies");
-        assert_eq!(applied, CloudLogoutApplied { jti, sessions_ended: 1 });
+        assert_eq!(
+            applied,
+            CloudLogoutApplied {
+                jti,
+                sessions_ended: 1
+            }
+        );
         assert!(!exists(conn, alice_cloud).await);
-        assert!(exists(conn, alice_local).await, "local logins are never touched");
+        assert!(
+            exists(conn, alice_local).await,
+            "local logins are never touched"
+        );
         assert!(crate::ingress_grants::test_support::is_revoked(&db.db, alice_grant).await);
         assert!(exists(conn, bob_cloud).await);
         assert!(!crate::ingress_grants::test_support::is_revoked(&db.db, bob_grant).await);
