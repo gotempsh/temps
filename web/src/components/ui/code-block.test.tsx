@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
 import githubDark from 'shiki/themes/github-dark.mjs'
 import { CodeBlock } from './code-block'
@@ -69,4 +69,38 @@ test('dark comments are lightened and other token colours are untouched', () => 
   before.forEach((colour, index) => {
     if (colour !== '#6a737d') expect(after[index]).toBe(colour)
   })
+})
+
+// The toolbar must occupy space outside the code scroller. Padding inside the
+// scroller does not stop an unwrapped line painting underneath an overlay.
+test.each([
+  { showCopy: true, disableWrapToggle: false },
+  { showCopy: false, disableWrapToggle: false },
+  { showCopy: false, disableWrapToggle: true },
+])('code and controls have separate layout space: %j', async (props) => {
+  const command = `bunx @temps-sdk/cli mcp add claude-code --url https://${'long-'.repeat(30)}example.test`
+  const view = render(<CodeBlock code={command} language="text" {...props} />)
+  await act(async () => {})
+  const pre = view.container.querySelector('pre')!
+  const scroller = pre.parentElement!
+  const controls = view.getByRole('button', {
+    name: 'Show line numbers',
+  }).parentElement!
+
+  expect(scroller.parentElement).toBe(controls.parentElement)
+  expect(scroller.parentElement!.classList.contains('flex')).toBe(true)
+  expect(scroller.classList.contains('min-w-0')).toBe(true)
+  expect(scroller.classList.contains('w-full')).toBe(true)
+  expect(scroller.parentElement!.classList.contains('flex-col')).toBe(true)
+  expect(controls.nextElementSibling).toBe(scroller)
+  expect(controls.classList.contains('self-end')).toBe(true)
+  expect(controls.classList.contains('shrink-0')).toBe(true)
+  expect(controls.classList.contains('absolute')).toBe(false)
+  expect(pre.textContent).toBe(command)
+
+  if (!props.disableWrapToggle) {
+    fireEvent.click(view.getByRole('button', { name: 'Enable line wrap' }))
+    expect(pre.classList.contains('whitespace-pre-wrap')).toBe(true)
+    expect(pre.textContent).toBe(command)
+  }
 })

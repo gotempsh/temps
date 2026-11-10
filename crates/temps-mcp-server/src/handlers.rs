@@ -10,11 +10,8 @@ use axum::{
 use std::sync::Arc;
 use tracing::{error, info};
 
-use temps_authz::permissions::Permission;
 use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
-
-use crate::tools::deployments::{AuditActor, DeploymentExecCtx};
 
 use crate::error::McpError;
 use crate::protocol::{
@@ -279,7 +276,7 @@ async fn handle_tool_call(
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Result<McpToolResult, McpError> {
-    // Verify the tool belongs to one of the requested (active) groups.
+    // Enforce the advertised surface and the write opt-in before dispatch.
     let available_tools = collect_tools(requested_groups, write_enabled);
     let tool_known = available_tools.iter().any(|t| t.name == tool_name);
     if !tool_known {
@@ -288,133 +285,41 @@ async fn handle_tool_call(
         });
     }
 
-    // Write tools additionally require write mode opt-in AND DeploymentsCreate
-    // permission.  These are two distinct, orthogonal checks:
-    // - `write_enabled`: operator/user explicitly passed `?write=1` in the MCP
-    //   URL — the session was opened with intent to mutate.
-    // - `DeploymentsCreate` permission: the token's role actually carries the
-    //   capability to trigger deployments (matches the REST endpoint check in
-    //   remote_deployments.rs).
-    // `confirm_action` carries a proposal of any group: an edge rule
-    // proposal is executed (and its permission checked) by the edge rule
-    // tools; everything else keeps the deployment checks below.
-    if tool_name == "confirm_action" {
-        if !write_enabled {
-            return Err(McpError::WriteNotEnabled);
-        }
-        let token = args
-            .get("token")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| McpError::MissingArgument {
-                arg: "token".to_string(),
-                tool: tool_name.to_string(),
-            })?;
-        let peeked = state.proposals.peek(token).map_err(McpError::from)?;
-        if crate::tools::edge_rules::handles(&peeked.tool_name) {
-            info!(
-                user_id = auth.user_id(),
-                proposal = %peeked.tool_name,
-                "MCP edge rule proposal confirmed"
-            );
-            let actor = AuditActor {
-                user_id: auth.user_id(),
-                ip_address: Some(metadata.ip_address.clone()),
-                user_agent: metadata.user_agent.clone(),
-            };
-            let ctx = edge_rule_ctx(state, auth, &actor)?;
-            return crate::tools::edge_rules::confirm(
-                token,
-                &peeked.tool_name,
-                &peeked.arguments,
-                &ctx,
-            )
-            .await;
-        }
-    }
-
-    // Edge rule tools check `edge_rules:read` / `edge_rules:write` themselves.
-    if crate::tools::edge_rules::handles(tool_name) {
-        let actor = AuditActor {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        };
-        let ctx = edge_rule_ctx(state, auth, &actor)?;
-        return crate::tools::edge_rules::execute(tool_name, args, write_enabled, &ctx).await;
-    }
-
-    let write_tools = ["trigger_deployment", "confirm_action"];
-    if write_tools.contains(&tool_name) {
-        if !write_enabled {
-            return Err(McpError::WriteNotEnabled);
-        }
-        if !auth.has_permission(&Permission::DeploymentsCreate) {
-            return Err(McpError::InsufficientPermission {
-                permission: Permission::DeploymentsCreate.to_string(),
-            });
-        }
-        info!(
-            user_id = auth.user_id(),
-            tool = tool_name,
-            "MCP write tool invoked (propose-then-confirm)"
-        );
-    }
-
-    // Route to the correct group handler.
-    // Platform tools.
-    if matches!(tool_name, "list_projects" | "get_project") {
-        return crate::tools::platform::execute(
+    if matches!(tool_name, "temps" | "temps_write") {
+        return crate::virtual_cli::execute(
+            state.virtual_cli.get().ok_or(McpError::CliUnavailable)?,
+            auth,
             tool_name,
             args,
-            auth,
-            &state.project_service,
-            state.project_access_checker.as_deref(),
         )
         .await;
     }
 
-    // Deployments tools.
-    if matches!(
-        tool_name,
-        "list_deployments" | "trigger_deployment" | "confirm_action"
-    ) {
-        let actor = AuditActor {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        };
-        let exec_ctx = DeploymentExecCtx {
-            deployment_service: &state.deployment_service,
-            proposals: &state.proposals,
-            audit_service: &state.audit_service,
-            actor: &actor,
+    if tool_name == "confirm_action" {
+        let token = args
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| McpError::MissingArgument {
+                arg: "token".into(),
+                tool: tool_name.into(),
+            })?;
+        let proposal = state.proposals.peek(token).map_err(McpError::from)?;
+        if proposal.tool_name != "temps_write" {
+            return Err(McpError::UnknownTool {
+                name: proposal.tool_name,
+            });
+        }
+        return crate::virtual_cli::confirm(
+            state.virtual_cli.get().ok_or(McpError::CliUnavailable)?,
             auth,
-            checker: state.project_access_checker.as_deref(),
-        };
-        return crate::tools::deployments::execute(tool_name, args, write_enabled, &exec_ctx).await;
+            metadata,
+            token,
+            proposal.arguments,
+        )
+        .await;
     }
-
     Err(McpError::UnknownTool {
-        name: tool_name.to_string(),
-    })
-}
-
-fn edge_rule_ctx<'a>(
-    state: &'a Arc<McpHandlerState>,
-    auth: &'a AuthContext,
-    actor: &'a AuditActor,
-) -> Result<crate::tools::edge_rules::EdgeRuleExecCtx<'a>, McpError> {
-    let service = state
-        .edge_rule_service
-        .get()
-        .ok_or(McpError::EdgeRulesUnavailable)?;
-    Ok(crate::tools::edge_rules::EdgeRuleExecCtx {
-        service,
-        proposals: &state.proposals,
-        audit_service: &state.audit_service,
-        actor,
-        auth,
-        checker: state.project_access_checker.as_deref(),
+        name: tool_name.into(),
     })
 }
 
@@ -459,7 +364,7 @@ mod tests {
         let result = handle_tools_list(&[], true).expect("tools/list must succeed");
         let tools = &result.tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"trigger_deployment"));
+        assert_eq!(names, ["temps", "temps_write", "confirm_action"]);
         assert!(names.contains(&"confirm_action"));
     }
 
@@ -469,7 +374,7 @@ mod tests {
             handle_tools_list(&["platform".to_string()], false).expect("tools/list must succeed");
         let tools = &result.tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"list_projects"));
+        assert_eq!(names, ["temps"]);
         assert!(!names.contains(&"list_deployments"));
     }
 

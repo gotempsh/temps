@@ -14,33 +14,28 @@ pub struct AuditContext {
     pub user_agent: String,
 }
 
-/// Recorded when an MCP client's `confirm_action` call executes a proposed
-/// `trigger_deployment` (ADR-039 propose-then-confirm write flow).
+/// A confirmed virtual CLI operation; never records executable parameters.
 #[derive(Debug, Clone, Serialize)]
-pub struct McpDeploymentTriggeredAudit {
+pub struct McpCliWriteAudit {
     pub context: AuditContext,
-    pub project_id: i32,
-    pub environment_id: i32,
-    pub branch: Option<String>,
+    pub operation_id: String,
+    pub method: String,
+    pub path: String,
+    pub succeeded: bool,
 }
-
-impl AuditOperation for McpDeploymentTriggeredAudit {
+impl AuditOperation for McpCliWriteAudit {
     fn operation_type(&self) -> String {
-        "MCP_DEPLOYMENT_TRIGGERED".to_string()
+        "MCP_CLI_WRITE".into()
     }
-
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
     }
-
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
     }
-
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-
     fn serialize(&self) -> temps_core::AuditResult<String> {
         temps_core::serialize_audit_operation(self)
     }

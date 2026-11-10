@@ -11,6 +11,8 @@ use thiserror::Error;
 /// All errors that can arise when searching, describing, or calling an API tool.
 #[derive(Error, Debug, Clone)]
 pub enum ApiToolError {
+    #[error("Invalid CLI command: {detail}")]
+    InvalidCommand { detail: String },
     #[error("Plugin '{plugin}' operation '{operation_id}' failed: {reason}")]
     PluginOperation {
         plugin: String,

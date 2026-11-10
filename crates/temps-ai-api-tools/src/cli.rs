@@ -45,6 +45,7 @@ pub(crate) enum CliMode {
 pub(crate) enum CliAction<'a> {
     /// Help or an error — already-rendered text to return to the model verbatim.
     Terminal(String),
+    Invalid(String),
     /// A resolved operation to execute with the given flat parameter object.
     Execute(&'a ApiOperation, Value),
 }
@@ -107,7 +108,7 @@ pub(crate) fn resolve<'a>(
             .find(|o| o.operation_id.eq_ignore_ascii_case(op_name))
         {
             Some(op) => resolve_operation(op, &tokens[2..]),
-            None => CliAction::Terminal(format!(
+            None => CliAction::Invalid(format!(
                 "Unknown operation '{op_name}' in section '{}'.{}\n\n{}",
                 sec.slug,
                 mutation_redirect_for(mode, op_name),
@@ -129,7 +130,7 @@ pub(crate) fn resolve<'a>(
         }
     }
 
-    CliAction::Terminal(format!(
+    CliAction::Invalid(format!(
         "Unknown command '{first}'. Run `--help` to list sections.{}{}",
         mutation_redirect_for(mode, first),
         suggest_operations(&secs, first),
@@ -242,7 +243,7 @@ fn resolve_operation<'a>(op: &'a ApiOperation, tail: &[String]) -> CliAction<'a>
     }
     match parse_flags(tail, Some(op)) {
         Ok(params) => CliAction::Execute(op, params),
-        Err(e) => CliAction::Terminal(e),
+        Err(e) => CliAction::Invalid(e),
     }
 }
 
@@ -1169,7 +1170,7 @@ mod tests {
             &|_| true,
             CliMode::ReadOnly,
         );
-        let CliAction::Terminal(message) = result else {
+        let CliAction::Invalid(message) = result else {
             panic!("unknown analytics operation unexpectedly resolved");
         };
 
@@ -1194,7 +1195,7 @@ mod tests {
             &|op| op.operation_id != "get_analytics_visitor_sessions",
             CliMode::ReadOnly,
         );
-        let CliAction::Terminal(message) = result else {
+        let CliAction::Invalid(message) = result else {
             panic!("unknown analytics operation unexpectedly resolved");
         };
 
@@ -1215,7 +1216,7 @@ mod tests {
             &|_| true,
             CliMode::ReadOnly,
         );
-        let CliAction::Terminal(message) = result else {
+        let CliAction::Invalid(message) = result else {
             panic!("unknown analytics mutation unexpectedly resolved");
         };
 
@@ -1489,7 +1490,7 @@ mod tests {
     fn write_mode_does_not_redirect_unknown_mutations_to_itself() {
         let index = analytics_discovery_index();
 
-        let CliAction::Terminal(message) = resolve(
+        let CliAction::Invalid(message) = resolve(
             &index,
             "analytics delete_analytics",
             &|_| true,

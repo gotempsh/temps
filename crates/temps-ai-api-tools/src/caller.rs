@@ -816,7 +816,7 @@ impl InternalApiCaller {
             &permit,
             crate::cli::CliMode::ReadOnly,
         ) {
-            crate::cli::CliAction::Terminal(text) => text,
+            crate::cli::CliAction::Terminal(text) | crate::cli::CliAction::Invalid(text) => text,
             // resolve("--help") is always Terminal; this arm is unreachable.
             crate::cli::CliAction::Execute(..) => String::new(),
         }
@@ -829,7 +829,7 @@ impl InternalApiCaller {
     pub fn cli_write_root_help(&self, auth: &AuthContext) -> String {
         let permit = |op: &ApiOperation| self.permitted_write(op, auth);
         match crate::cli::resolve(&self.index, "--help", &permit, crate::cli::CliMode::Write) {
-            crate::cli::CliAction::Terminal(text) => text,
+            crate::cli::CliAction::Terminal(text) | crate::cli::CliAction::Invalid(text) => text,
             crate::cli::CliAction::Execute(..) => String::new(),
         }
     }
@@ -883,33 +883,44 @@ impl InternalApiCaller {
     /// caller's scope (auth + `project_id` auto-fill + allowlist all apply).
     /// Always returns model-facing text — help, an error, or the response body.
     pub async fn run_cli(&self, command: &str, scope: &ApiCallScope) -> String {
+        self.run_cli_result(command, scope)
+            .await
+            .unwrap_or_else(|error| error.to_string())
+    }
+
+    /// Structured read CLI result for protocol adapters. Router failures retain
+    /// their operation and HTTP status instead of becoming successful tool text.
+    pub async fn run_cli_result(
+        &self,
+        command: &str,
+        scope: &ApiCallScope,
+    ) -> Result<String, ApiToolError> {
         let permit = |op: &ApiOperation| self.permitted(op, &scope.auth);
-        match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::ReadOnly) {
-            crate::cli::CliAction::Terminal(text) => text,
+        let action =
+            crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::ReadOnly);
+        let action = if matches!(action, crate::cli::CliAction::Invalid(_)) {
+            match crate::cli::resolve(
+                &self.index,
+                command,
+                &|_| true,
+                crate::cli::CliMode::ReadOnly,
+            ) {
+                execute @ crate::cli::CliAction::Execute(_, _) => execute,
+                _ => action,
+            }
+        } else {
+            action
+        };
+        match action {
+            crate::cli::CliAction::Terminal(text) => Ok(text),
+            crate::cli::CliAction::Invalid(detail) => Err(ApiToolError::InvalidCommand { detail }),
             crate::cli::CliAction::Execute(op, params) => {
-                let op_id = op.operation_id.clone();
-                match self.call(&op_id, params, scope).await {
-                    Ok(resp) => {
-                        // Structured result: a clean `{operation, status, data}`
-                        // object rather than a status-prefixed text blob. The model
-                        // gets `status` as a number and `data` as real JSON (not a
-                        // stringified body), and the UI can pretty-print it.
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("operation".to_string(), Value::String(op_id.clone()));
-                        obj.insert("status".to_string(), Value::from(resp.status));
-                        obj.insert("data".to_string(), resp.body);
-                        if resp.truncated {
-                            obj.insert("truncated".to_string(), Value::Bool(true));
-                        }
-                        serde_json::to_string(&Value::Object(obj)).unwrap_or_else(|_| {
-                            format!("{{\"operation\":\"{op_id}\",\"status\":{}}}", resp.status)
-                        })
-                    }
-                    Err(e) => format!(
-                        "`{op_id}` failed: {e}\nRun `{op_id} --help` to check its flags, or \
-                         `--help` to list sections."
-                    ),
-                }
+                let response = self.call(&op.operation_id, params, scope).await?;
+                Ok(
+                    serde_json::json!({"operation": op.operation_id, "status": response.status,
+                    "data": response.body, "truncated": response.truncated})
+                    .to_string(),
+                )
             }
         }
     }
@@ -931,6 +942,7 @@ impl InternalApiCaller {
         let permit = |op: &ApiOperation| self.permitted_write(op, &scope.auth);
         match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
+            crate::cli::CliAction::Invalid(text) => WritePrepareOutcome::Invalid(text),
             crate::cli::CliAction::Execute(op, params) => {
                 if op.operation_id.starts_with("plugin.")
                     && self.plugins.as_ref().is_none_or(|binding| {

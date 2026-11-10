@@ -44,7 +44,7 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-g, --groups <groups>` | Comma-separated tool groups to enable (default: all) | - | No |
+| `-g, --groups <groups>` | Legacy tool-group filter (optional; does not restrict temps/temps_write permissions) | - | No |
 | `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |

@@ -1,0 +1,514 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! External protocol adapter over the shared chat API callers.
+use crate::{
+    audit::{AuditContext, McpCliWriteAudit},
+    error::McpError,
+    protocol::{McpTool, McpToolResult},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use temps_ai_api_tools::{
+    redaction::{redact_json_string, redact_value},
+    ApiCallScope, ProjectSelectorScope, WritePrepareOutcome,
+};
+use temps_authz::AuthContext;
+
+pub(crate) struct VirtualCli {
+    pub api_tools: std::sync::Arc<temps_ai_api_tools::ApiToolsHandle>,
+    pub write_api_tools: std::sync::Arc<temps_ai_api_tools::WriteApiToolsHandle>,
+    pub proposals: std::sync::Arc<crate::proposal::ProposalStore>,
+    pub audit_service: std::sync::Arc<dyn temps_core::AuditLogger>,
+}
+
+pub(crate) fn tools(write: bool) -> Vec<McpTool> {
+    let mut tools = vec![McpTool {
+        name: "temps".into(),
+        description: "Read Temps APIs. Start with `temps --help`, then drill down with section and operation --help.".into(),
+        input_schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}),
+    }];
+    if write {
+        tools.push(McpTool {
+            name: "temps_write".into(),
+            description: "Propose a Temps write; show the proposal to the human before confirm_action. Start with `temps --help` and drill down. Never executes directly.".into(),
+            input_schema: tools[0].input_schema.clone(),
+        });
+        tools.push(McpTool {
+            name: "confirm_action".into(),
+            description: "Execute a proposed write only after human approval. Tokens expire after 5 minutes and are single-use.".into(),
+            input_schema: json!({"type":"object","properties":{"token":{"type":"string","description":"Proposal token returned by temps_write"}},"required":["token"],"additionalProperties":false}),
+        });
+    }
+    tools
+}
+
+fn scope(auth: &AuthContext) -> ApiCallScope {
+    ApiCallScope {
+        auth: auth.clone(),
+        project_scope: ProjectSelectorScope::Unrestricted,
+        origin: None,
+        secrets: None,
+    }
+}
+
+fn safe_error(error: impl Into<McpError>) -> McpError {
+    match error.into() {
+        McpError::Cli {
+            source:
+                temps_ai_api_tools::ApiToolError::Upstream {
+                    status,
+                    detail,
+                    operation_id,
+                },
+        } => McpError::Cli {
+            source: temps_ai_api_tools::ApiToolError::Upstream {
+                status,
+                detail: safe(&detail),
+                operation_id,
+            },
+        },
+        other => other,
+    }
+}
+
+fn safe(text: &str) -> String {
+    let mut text = redact_json_string(text);
+    const LIMIT: usize = 16 * 1024;
+    if text.len() > LIMIT {
+        let mut end = LIMIT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[truncated]");
+    }
+    text
+}
+
+/// Only server-created data enters the proposal store. The owner is checked
+/// before consuming the token; confirmation always uses freshly authenticated permissions.
+#[derive(Serialize, Deserialize)]
+struct PendingWrite {
+    user_id: i32,
+    key_id: i32,
+    operation_id: String,
+    method: String,
+    path: String,
+    params: Value,
+    plugin_revision: Option<String>,
+}
+
+fn key_id(auth: &AuthContext) -> Result<i32, McpError> {
+    auth.api_key_info()
+        .map(|(_, id)| id)
+        .ok_or(McpError::ProposalOwnerMismatch)
+}
+
+pub(crate) async fn execute(
+    state: &VirtualCli,
+    auth: &AuthContext,
+    name: &str,
+    args: &Value,
+) -> Result<McpToolResult, McpError> {
+    let command =
+        args.get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::MissingArgument {
+                arg: "command".into(),
+                tool: name.into(),
+            })?;
+    if command.len() > 16 * 1024 {
+        return Err(McpError::InvalidArgument {
+            arg: "command".into(),
+            reason: "command exceeds 16384 bytes; use temps --help".into(),
+        });
+    }
+    if name == "temps" {
+        let caller = state.api_tools.get().ok_or(McpError::CliUnavailable)?;
+        return caller
+            .run_cli_result(command, &scope(auth))
+            .await
+            .map(|text| McpToolResult::text(safe(&text)))
+            .map_err(safe_error);
+    }
+    let caller = state
+        .write_api_tools
+        .get()
+        .ok_or(McpError::CliUnavailable)?;
+    match caller.prepare_write_cli(command, &scope(auth)) {
+        WritePrepareOutcome::Help(text) => Ok(McpToolResult::text(safe(&text))),
+        WritePrepareOutcome::Invalid(detail) => Err(McpError::Cli {
+            source: temps_ai_api_tools::ApiToolError::InvalidCommand {
+                detail: safe(&detail),
+            },
+        }),
+        WritePrepareOutcome::Prepared(prepared) => {
+            let review = json!({"operation": prepared.operation_id, "description": prepared.summary,
+                "parameters": redact_value(&prepared.params)});
+            let pending = PendingWrite {
+                user_id: auth.user_id(),
+                key_id: key_id(auth)?,
+                operation_id: prepared.operation_id,
+                method: prepared.method,
+                path: prepared.path,
+                params: prepared.params,
+                plugin_revision: prepared.plugin_revision,
+            };
+            let token = state
+                .proposals
+                .create("temps_write".into(), serde_json::to_value(pending)?);
+            Ok(McpToolResult::text_with_proposal_token(format!("{}\nAsk the human to approve, then call confirm_action. Token expires in 5 minutes.", safe(&review.to_string())), token))
+        }
+    }
+}
+
+pub(crate) async fn confirm(
+    state: &VirtualCli,
+    auth: &AuthContext,
+    metadata: &temps_core::RequestMetadata,
+    token: &str,
+    arguments: Value,
+) -> Result<McpToolResult, McpError> {
+    let pending: PendingWrite = serde_json::from_value(arguments)?;
+    if pending.user_id != auth.user_id() || pending.key_id != key_id(auth)? {
+        return Err(McpError::ProposalOwnerMismatch);
+    }
+    let caller = state
+        .write_api_tools
+        .get()
+        .ok_or(McpError::CliUnavailable)?;
+    state.proposals.take(token).map_err(safe_error)?;
+    let result = caller
+        .execute_approved_write(
+            &pending.operation_id,
+            pending.params,
+            &scope(auth),
+            pending.plugin_revision.as_deref(),
+        )
+        .await;
+    let event = McpCliWriteAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        operation_id: pending.operation_id,
+        method: pending.method,
+        path: pending.path,
+        succeeded: result.is_ok(),
+    };
+    if let Err(error) = state.audit_service.create_audit_log(&event).await {
+        tracing::error!(operation_id = %event.operation_id, %error, "Failed to audit MCP CLI write");
+    }
+    result.map(|response| McpToolResult::text(safe(&json!({"status":response.status,"data":response.body,"truncated":response.truncated}).to_string()))).map_err(safe_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn listing_keeps_virtual_tools_independent_of_legacy_groups() {
+        for groups in [
+            vec![],
+            vec!["platform".into()],
+            vec!["networking".into()],
+            vec!["data".into()],
+        ] {
+            for write in [false, true] {
+                let tools = crate::registry::collect_tools(&groups, write);
+                assert!(tools.iter().any(|tool| tool.name == "temps"));
+                assert_eq!(tools.iter().any(|tool| tool.name == "temps_write"), write);
+                assert_eq!(
+                    tools
+                        .iter()
+                        .filter(|tool| tool.name == "confirm_action")
+                        .count(),
+                    usize::from(write)
+                );
+            }
+        }
+    }
+    #[test]
+    fn output_masks_credentials_and_caps_unicode() {
+        assert!(!safe(r#"{"password":"private-fixture"}"#).contains("private-fixture"));
+        assert!(safe(&"é".repeat(20000)).len() < 16500);
+    }
+    fn make_user(id: i32) -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+    use temps_authz::permissions::Permission;
+    #[derive(Default)]
+    struct Audit(Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for Audit {
+        async fn create_audit_log(
+            &self,
+            op: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            self.0.lock().unwrap().push(op.serialize()?);
+            Ok(())
+        }
+    }
+    fn auth(key: i32, write: bool) -> AuthContext {
+        let mut perms = vec![Permission::ProjectsRead];
+        if write {
+            perms.push(Permission::ProjectsWrite);
+        }
+        AuthContext::new_api_key(make_user(7), None, Some(perms), "fixture".into(), key)
+    }
+    fn metadata() -> temps_core::RequestMetadata {
+        temps_core::RequestMetadata {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "test".into(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".into(),
+            scheme: "http".into(),
+            host: "localhost".into(),
+            is_secure: false,
+        }
+    }
+    fn fixture() -> (VirtualCli, Arc<AtomicUsize>, Arc<Audit>) {
+        use axum::{routing::get, Json};
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counter = writes.clone();
+        let router = axum::Router::new().route("/projects", get(|temps_authz::RequireAuth(auth): temps_authz::RequireAuth| async move {
+            temps_authz::permission_guard!(auth, ProjectsRead);
+            Ok::<_, temps_core::problemdetails::Problem>(Json(json!({"user":auth.user_id(),"actor_id":auth.api_key_info().map(|(_,id)|id)})))
+        }).post(move |temps_authz::RequireAuth(auth): temps_authz::RequireAuth| {
+            let counter = counter.clone();
+            async move {
+                temps_authz::permission_guard!(auth, ProjectsWrite);
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, temps_core::problemdetails::Problem>(Json(json!({"done":true})))
+            }
+        }));
+        let api: utoipa::openapi::OpenApi = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},"paths":{"/projects":{
+            "get":{"operationId":"read_fixture","tags":["Projects"],"responses":{"200":{"description":"ok"}}},
+            "post":{"operationId":"write_fixture","tags":["Projects"],"responses":{"200":{"description":"ok"}}}
+        }}})).unwrap();
+        let read = Arc::new(temps_ai_api_tools::ApiToolsHandle::new());
+        read.set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+            router.clone(),
+            &api,
+            vec!["read_fixture".into()],
+        ));
+        let write = Arc::new(temps_ai_api_tools::WriteApiToolsHandle::new());
+        write.set(
+            temps_ai_api_tools::InternalApiCaller::new_write_allowlisted(
+                router,
+                &api,
+                vec!["write_fixture".into()],
+            ),
+        );
+        let audit = Arc::new(Audit::default());
+        (
+            VirtualCli {
+                api_tools: read,
+                write_api_tools: write,
+                proposals: Arc::new(crate::proposal::ProposalStore::new()),
+                audit_service: audit.clone(),
+            },
+            writes,
+            audit,
+        )
+    }
+    #[tokio::test]
+    async fn help_read_and_invalid_commands_use_shared_caller() {
+        let (state, _, _) = fixture();
+        for command in ["temps --help", "projects --help"] {
+            let result = execute(
+                &state,
+                &auth(3, false),
+                "temps",
+                &json!({"command":command}),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.content[0].text.contains("projects")
+                    || result.content[0].text.contains("read_fixture")
+            );
+        }
+        let result = execute(
+            &state,
+            &auth(3, false),
+            "temps",
+            &json!({"command":"read_fixture"}),
+        )
+        .await
+        .unwrap();
+        assert!(result.content[0].text.contains("7"));
+        assert!(result.content[0].text.contains("3") || result.content[0].text.contains("***"));
+        let error = execute(
+            &state,
+            &auth(3, false),
+            "temps",
+            &json!({"command":"unknown"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.rpc_code(), crate::protocol::INVALID_PARAMS);
+        assert!(error.to_string().contains("--help"));
+    }
+    #[tokio::test]
+    async fn proposal_requires_same_key_expires_and_executes_once_with_audit() {
+        let (state, writes, audit) = fixture();
+        let actor = auth(3, true);
+        let proposal = execute(
+            &state,
+            &actor,
+            "temps_write",
+            &json!({"command":"write_fixture"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        let token = proposal.proposal_token.unwrap();
+        let args = state.proposals.peek(&token).unwrap().arguments;
+        assert!(matches!(
+            confirm(&state, &auth(4, true), &metadata(), &token, args.clone()).await,
+            Err(McpError::ProposalOwnerMismatch)
+        ));
+        confirm(&state, &actor, &metadata(), &token, args.clone())
+            .await
+            .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            confirm(&state, &actor, &metadata(), &token, args).await,
+            Err(McpError::ProposalNotFound)
+        ));
+        {
+            let audit = audit.0.lock().unwrap();
+            assert_eq!(audit.len(), 1);
+            assert!(audit[0].contains("write_fixture"));
+            assert!(audit[0].contains("true"));
+        }
+        let proposal = execute(
+            &state,
+            &actor,
+            "temps_write",
+            &json!({"command":"write_fixture"}),
+        )
+        .await
+        .unwrap();
+        let token = proposal.proposal_token.unwrap();
+        let args = state.proposals.peek(&token).unwrap().arguments;
+        state.proposals.backdate(
+            &token,
+            crate::proposal::PROPOSAL_TTL + std::time::Duration::from_secs(1),
+        );
+        assert!(matches!(
+            confirm(&state, &actor, &metadata(), &token, args).await,
+            Err(McpError::ProposalExpired)
+        ));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn confirmation_replays_current_key_permissions_without_elevation() {
+        let (state, writes, audit) = fixture();
+        let proposal = execute(
+            &state,
+            &auth(3, true),
+            "temps_write",
+            &json!({"command":"write_fixture"}),
+        )
+        .await
+        .unwrap();
+        let token = proposal.proposal_token.unwrap();
+        let args = state.proposals.peek(&token).unwrap().arguments;
+        let denied = confirm(&state, &auth(3, false), &metadata(), &token, args)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.rpc_code(), -32006);
+        assert!(denied.to_string().contains("write_fixture"));
+        assert!(denied.to_string().contains("projects:write"));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(audit.0.lock().unwrap()[0].contains("false"));
+    }
+    #[tokio::test]
+    async fn api_key_project_access_is_enforced_by_replayed_rest_guard() {
+        struct Checker;
+        #[async_trait::async_trait]
+        impl temps_core::project_access::ProjectAccessChecker for Checker {
+            async fn user_can_access_project(
+                &self,
+                user_id: i32,
+                project_id: i32,
+            ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(user_id == 7 && project_id == 11)
+            }
+        }
+        let router = axum::Router::new().route(
+            "/projects/{project_id}",
+            axum::routing::get(
+                |temps_authz::RequireAuth(auth): temps_authz::RequireAuth,
+                 axum::extract::Path(project_id): axum::extract::Path<i32>| async move {
+                    temps_authz::permission_guard!(auth, ProjectsRead);
+                    let checker: Option<Arc<dyn temps_core::project_access::ProjectAccessChecker>> =
+                        Some(Arc::new(Checker));
+                    temps_authz::project_access_guard!(auth, project_id, checker);
+                    Ok::<_, temps_core::problemdetails::Problem>(axum::Json(
+                        json!({"project_id":project_id}),
+                    ))
+                },
+            ),
+        );
+        let api = serde_json::from_value(json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},"paths":{"/projects/{project_id}":{"get":{"operationId":"get_fixture","tags":["Projects"],"parameters":[{"name":"project_id","in":"path","required":true,"schema":{"type":"integer"}}],"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let (state, _, _) = fixture();
+        state
+            .api_tools
+            .set(temps_ai_api_tools::InternalApiCaller::new_allowlisted(
+                router,
+                &api,
+                vec!["get_fixture".into()],
+            ));
+        let result = execute(
+            &state,
+            &auth(3, false),
+            "temps",
+            &json!({"command":"get_fixture --project_id 11"}),
+        )
+        .await
+        .unwrap();
+        assert!(result.content[0].text.contains("11"));
+        let error = execute(
+            &state,
+            &auth(3, false),
+            "temps",
+            &json!({"command":"get_fixture --project_id 12"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.rpc_code(), -32006);
+        assert!(error.to_string().contains("get_fixture"));
+        assert!(error.to_string().contains("Project Access Denied"));
+    }
+}
