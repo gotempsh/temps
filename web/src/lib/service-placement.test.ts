@@ -18,14 +18,16 @@ describe('standalonePlacement', () => {
       offerControlPlane: false,
       value: '4',
       noTarget: false,
+      chosenUnavailable: false,
     })
     expect(placementNodeId(placement.value)).toBe(4)
   })
 
-  test('the control plane is never kept as a choice when it runs no containers', () => {
-    expect(
-      standalonePlacement(CONTROL_PLANE_PLACEMENT, false, [4]).value
-    ).toBe('4')
+  test('a picked control plane that turns out to run no containers is not swapped for a worker', () => {
+    // Picked while the capability was still loading.
+    const placement = standalonePlacement(CONTROL_PLANE_PLACEMENT, false, [4])
+    expect(placement.value).toBeNull()
+    expect(placement.chosenUnavailable).toBe(true)
   })
 
   test('a picked worker is kept', () => {
@@ -33,11 +35,25 @@ describe('standalonePlacement', () => {
     expect(standalonePlacement('7', true, [4, 7]).value).toBe('7')
   })
 
-  test('a worker that left the list falls back to the default', () => {
-    expect(standalonePlacement('9', false, [4]).value).toBe('4')
-    expect(standalonePlacement('9', true, [4]).value).toBe(
-      CONTROL_PLANE_PLACEMENT
-    )
+  // A worker the user picked went offline or started draining, and the
+  // list refreshed: submitting must not create the service on the control
+  // plane or on another worker instead.
+  test('a picked worker that left the list is not replaced by another machine', () => {
+    for (const local of [false, true, undefined]) {
+      const placement = standalonePlacement('9', local, [4])
+      expect(placement.value).toBeNull()
+      expect(placement.chosenUnavailable).toBe(true)
+      expect(placement.noTarget).toBe(false)
+    }
+  })
+
+  test('picking again after the choice left clears the warning', () => {
+    expect(standalonePlacement('4', false, [4])).toEqual({
+      offerControlPlane: false,
+      value: '4',
+      noTarget: false,
+      chosenUnavailable: false,
+    })
   })
 
   test('no local workloads and no worker: nothing can run it', () => {
@@ -45,6 +61,7 @@ describe('standalonePlacement', () => {
       offerControlPlane: false,
       value: null,
       noTarget: true,
+      chosenUnavailable: false,
     })
   })
 

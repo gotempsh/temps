@@ -457,6 +457,15 @@ export function CreateService() {
       toast.error('Select a supported service type')
       return
     }
+    if (topology === 'standalone' && standaloneNodeId === null) {
+      // Never fall back to another machine than the one chosen.
+      toast.error(
+        placement.chosenUnavailable
+          ? 'The machine you chose is no longer available. Choose another deployment node.'
+          : 'Choose the machine that will run this service.'
+      )
+      return
+    }
 
     // Keep numbers as numbers, convert null to empty strings
     const cleanedParameters: Record<string, any> = {}
@@ -775,12 +784,24 @@ export function CreateService() {
                 ))}
               </SelectContent>
             </Select>
+            {placement.chosenUnavailable && !placement.noTarget && (
+              <Alert variant="destructive">
+                <AlertTitle>
+                  The machine you chose is no longer available
+                </AlertTitle>
+                <AlertDescription>
+                  It went offline, started draining or can no longer run
+                  services. Choose another deployment node; the service is not
+                  moved to another machine without your choice.
+                </AlertDescription>
+              </Alert>
+            )}
             {placement.noTarget && (
               <Alert variant="destructive">
                 <AlertTitle>No machine can run this service</AlertTitle>
                 <AlertDescription>
-                  This control plane runs no services itself, and no worker
-                  node is active.{' '}
+                  This control plane runs no services itself, and no worker node
+                  is active.{' '}
                   <Link to="/settings/nodes" className="underline">
                     Join a worker node
                   </Link>{' '}
@@ -833,7 +854,11 @@ export function CreateService() {
               ? `Create ${serviceName.trim()}`
               : 'Create database'
           }
-          submitDisabled={!serviceName.trim() || !!preset.error}
+          submitDisabled={
+            !serviceName.trim() ||
+            !!preset.error ||
+            (topology === 'standalone' && standaloneNodeId === null)
+          }
           isSubmitting={createServiceMut.isPending}
           serviceType={serviceType}
           managedByTemps

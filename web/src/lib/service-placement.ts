@@ -9,6 +9,11 @@
  * target only produces a rejected create. There the form offers workers
  * only and starts on the first one; elsewhere it behaves as before (the
  * control plane, unless the user picks a worker).
+ *
+ * The default applies only until the user picks a target. A picked target
+ * that stops being offered (its worker went offline or started draining)
+ * is never swapped for another machine: the placement has no value until
+ * the user picks again.
  */
 
 /** Select value of the control plane. */
@@ -21,6 +26,11 @@ export interface StandalonePlacement {
   value: string | null
   /** No target can run the service (no local workloads, no worker). */
   noTarget: boolean
+  /**
+   * The target the user picked is no longer offered; `value` is `null`
+   * until they pick another.
+   */
+  chosenUnavailable: boolean
 }
 
 /**
@@ -37,23 +47,20 @@ export function standalonePlacement(
 ): StandalonePlacement {
   const offerControlPlane = localWorkloads !== false
   const workers = workerIds.map(String)
-  const valid =
-    chosen !== null &&
-    (chosen === CONTROL_PLANE_PLACEMENT
-      ? offerControlPlane
-      : workers.includes(chosen))
-  if (valid) {
-    return { offerControlPlane, value: chosen, noTarget: false }
+  const noTarget = !offerControlPlane && workers.length === 0
+  if (chosen !== null) {
+    const offered =
+      chosen === CONTROL_PLANE_PLACEMENT
+        ? offerControlPlane
+        : workers.includes(chosen)
+    return offered
+      ? { offerControlPlane, value: chosen, noTarget, chosenUnavailable: false }
+      : { offerControlPlane, value: null, noTarget, chosenUnavailable: true }
   }
-  if (offerControlPlane) {
-    return {
-      offerControlPlane,
-      value: CONTROL_PLANE_PLACEMENT,
-      noTarget: false,
-    }
-  }
-  const first = workers[0] ?? null
-  return { offerControlPlane, value: first, noTarget: first === null }
+  const value = offerControlPlane
+    ? CONTROL_PLANE_PLACEMENT
+    : (workers[0] ?? null)
+  return { offerControlPlane, value, noTarget, chosenUnavailable: false }
 }
 
 /** The `node_id` a placement value sends: `null` for the control plane. */
