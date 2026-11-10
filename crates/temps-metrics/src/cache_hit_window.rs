@@ -133,8 +133,8 @@ struct WindowSum {
     hits: f64,
     accesses: f64,
     /// Whether the intervals cover the whole window, short of at most one
-    /// scrape interval at its start, rather than only the time since it
-    /// started refilling or since a gap.
+    /// scrape interval or a tenth of the window at its start, rather than
+    /// only the time since it started refilling or since a gap.
     full: bool,
 }
 
@@ -174,21 +174,25 @@ impl Series {
             (hits + i.hit, total + i.hit + i.read)
         });
         // The interval that straddled the cutoff was dropped, so the window
-        // normally begins up to one scrape after its start. After a gap
-        // shorter than the window, the dropped one is the gap's long interval
-        // and the rest may cover only the minutes since: whole again once the
-        // uncovered start is no longer than the current scrape interval.
+        // normally begins up to one scrape after its start; scrapes are the
+        // configured interval plus a cycle that varies by seconds, so that
+        // dropped one can be a little longer than the current one. After a
+        // gap shorter than the window, the dropped one is the gap's long
+        // interval and the rest may cover only the minutes since. Tolerate
+        // one scrape interval or a tenth of the window, whichever is longer:
+        // jitter stays well inside it, a gap of minutes does not.
         let uncovered = self
             .intervals
             .front()
             .map_or(window, |first| first.start - cutoff);
+        let tolerated = (interval.end - interval.start).max(window / 10);
         Some(WindowSum {
             hits,
             accesses,
             full: self
                 .tracked_since
                 .is_some_and(|since| interval.end - since >= window)
-                && uncovered <= interval.end - interval.start,
+                && uncovered <= tolerated,
         })
     }
 }
@@ -692,6 +696,31 @@ mod tests {
         for db in [Some("app"), None] {
             assert_eq!(value(&out, PG_CACHE_HIT_RATIO, db), Some(0.9));
             assert_eq!(value(&out, PG_CACHE_BLOCKS_ACCESSED, db), Some(14_000.0));
+        }
+    }
+
+    #[test]
+    fn uneven_scrape_intervals_without_a_gap_keep_the_window_whole() {
+        // Scrapes are the configured 30 s plus the cycle's own duration,
+        // which varies by up to the 5 s collector timeout: no scrape fails.
+        let mut windows = CacheHitWindows::default();
+        let start = at(0);
+        let mut elapsed_ms: i64 = 0;
+        let mut seed: u64 = 0x5eed;
+        windows.derive(1, deltas(90.0, 10.0, start, "app"));
+        for _ in 0..1_000 {
+            // A fixed linear congruential sequence: reproducible jitter.
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            elapsed_ms += 30_000 + ((seed >> 33) % 5_000) as i64;
+            let time = start + Duration::milliseconds(elapsed_ms);
+            let out = windows.derive(1, deltas(90.0, 10.0, time, "app"));
+            if elapsed_ms >= 900_000 {
+                assert_eq!(
+                    value(&out, PG_CACHE_HIT_RATIO, None),
+                    Some(0.9),
+                    "{elapsed_ms} ms: {out:?}"
+                );
+            }
         }
     }
 
