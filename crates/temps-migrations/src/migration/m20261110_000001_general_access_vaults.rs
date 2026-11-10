@@ -52,9 +52,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS access_vault_links_project ON access_vault_lin
 CREATE UNIQUE INDEX IF NOT EXISTS access_vault_links_sandbox ON access_vault_links(vault_id, sandbox_id) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS access_vault_links_project_lookup ON access_vault_links(project_id, created_at DESC, id DESC) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS access_vault_links_sandbox_lookup ON access_vault_links(sandbox_id, created_at DESC, id DESC) WHERE revoked_at IS NULL;
-INSERT INTO access_vault_links(id, vault_id, project_id, created_at)
- SELECT 'link_legacy_' || id, id, project_id, created_at FROM access_vaults WHERE project_id IS NOT NULL
- ON CONFLICT DO NOTHING;
+-- Link data is populated in committed batches after this DDL transaction.
+CREATE TABLE IF NOT EXISTS access_vault_link_backfill (
+ singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+ cursor_id text
+);
+INSERT INTO access_vault_link_backfill(singleton) VALUES(true) ON CONFLICT DO NOTHING;
 ALTER TABLE access_sessions ADD COLUMN IF NOT EXISTS link_id text REFERENCES access_vault_links(id) ON DELETE SET NULL;
 -- PostgreSQL's constant default records legacy provenance without rewriting
 -- historical sessions under the ALTER TABLE lock. New approvals use explicit links.
@@ -121,6 +124,7 @@ END $$;
 ALTER TABLE access_sessions DROP COLUMN link_id;
 ALTER TABLE access_sessions DROP COLUMN legacy_project_link;
 DROP INDEX IF EXISTS sandbox_service_grants_service;
+DROP TABLE access_vault_link_backfill;
 DROP TABLE access_vault_links;
 DROP FUNCTION access_vault_link_revoked();
 DROP INDEX IF EXISTS access_sessions_grants;
@@ -203,6 +207,7 @@ INSERT INTO access_sessions(id,project_id,vault_id,bundle_id,bundle_name,bundle_
             db.execute_unprepared(&format!("CREATE UNIQUE INDEX CONCURRENTLY {index} ON {table}(id,sandbox_id)")).await.unwrap();
         }
         crate::Migrator::up(db, None).await.unwrap();
+        crate::backfill_legacy_vault_links(db).await.unwrap();
         let row=db.query_one(Statement::from_string(DatabaseBackend::Postgres,
             "SELECT l.id AS link_id,s.legacy_project_link AND s.link_id IS NULL AS migrated_without_rewrite,s.revoked_at IS NULL AND g.revoked_at IS NULL AS live, s.consent->>'immutable' AS consent, s.expires_at=g.expires_at AS lifetime,l.project_id FROM access_sessions s JOIN access_vault_links l ON l.id=COALESCE(s.link_id,CASE WHEN s.legacy_project_link THEN 'link_legacy_' || s.vault_id END) JOIN sandbox_service_grants g ON g.id='grant_migration' WHERE s.id='session_migration'".to_owned())).await.unwrap().unwrap();
         assert_eq!(

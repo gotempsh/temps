@@ -243,6 +243,7 @@ mod tests {
                 .await
                 .unwrap();
             db.execute_unprepared("INSERT INTO users(id,name,email) VALUES(9931,'Fixture','index-fixture@example.com'); INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9931,'Fixture','repo','owner','/','main','nodejs','index-fixture',now(),now()); INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9931,'sbx_index_fixture','Fixture',9931,9931,'running','docker'); INSERT INTO sandbox_access_services(id,project_id,name,policy,max_ttl_seconds,enabled) VALUES('svc_index',9931,'Fixture','{}',60,true); INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at) VALUES('grant_index',9931,'svc_index',9931,1,'{}',9931,now()+interval '1 hour')").await.unwrap();
+            db.execute_unprepared("INSERT INTO access_vaults(id,project_id,name,service_ids) VALUES('vault_backfill',9931,'Fixture',ARRAY['svc_index'])").await.unwrap();
             let writer = db.begin().await.unwrap();
             writer
                 .execute_unprepared(
@@ -304,6 +305,29 @@ mod tests {
                 .collect();
             let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=ANY($1) AND i.indisvalid AND i.indisunique").bind(&names).fetch_one(db.get_postgres_connection_pool()).await.unwrap();
             assert_eq!(valid, 2);
+            let links: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM access_vault_links WHERE id='link_legacy_vault_backfill'",
+            )
+            .fetch_one(db.get_postgres_connection_pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                links, 1,
+                "both migration runners finish the committed link backfill"
+            );
+            db.execute_unprepared(
+                "DELETE FROM access_vault_links WHERE id='link_legacy_vault_backfill'",
+            )
+            .await
+            .unwrap();
+            crate::run_migrations(db.as_ref()).await.unwrap();
+            let links: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM access_vault_links WHERE id='link_legacy_vault_backfill'",
+            )
+            .fetch_one(db.get_postgres_connection_pool())
+            .await
+            .unwrap();
+            assert_eq!(links, 0, "restarts do not reauthorize a removed consumer");
             drop(db);
             test.cleanup().await;
         }

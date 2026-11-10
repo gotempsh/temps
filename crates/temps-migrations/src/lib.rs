@@ -15,6 +15,8 @@
 )]
 pub use sea_orm_migration::prelude::*;
 
+mod general_vault_backfill;
+pub use general_vault_backfill::backfill_legacy_vault_links;
 mod migration;
 #[cfg(test)]
 mod migration_order;

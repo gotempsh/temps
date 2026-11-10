@@ -105,7 +105,13 @@ still enforce grant/runtime/sandbox identity when project is absent.
 ## Migration and rollback
 
 Use a new migration; do not edit shipped migrations. Create a link for each
-existing vault's former project before removing ownership semantics. Resolve existing sessions to that link using a constant-default legacy marker
+existing vault's former project before startup exposes the general model. The DDL
+transaction creates a durable backfill cursor, then commits. Both migration
+runners insert legacy links in batches of at most 1,000 vaults, committing links
+and cursor together outside the schema-locking transaction. Interrupted startup
+resumes from that cursor even when no DDL remains pending. Completion removes
+the cursor row permanently, so later starts cannot recreate deleted links.
+Resolve existing sessions to that link using a constant-default legacy marker
 and the deterministic legacy link ID, without rewriting historical session rows
 under the schema lock or changing IDs, consent payloads, TTLs,
 revocation timestamps, grants or worker incarnations. Preserve existing service
