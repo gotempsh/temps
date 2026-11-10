@@ -20,6 +20,7 @@ use temps_entities::{
 
 mod lookups;
 mod overlay_join;
+mod service_access;
 
 pub use lookups::NodeContainerRecord;
 
@@ -2679,6 +2680,7 @@ impl NodeService {
             .exec(&txn)
             .await?;
 
+        Self::remove_service_access_on(&txn, node_id).await?;
         nodes::Entity::delete_by_id(node_id).exec(&txn).await?;
         txn.commit().await?;
 
@@ -4232,7 +4234,7 @@ mod tests {
     }
 
     /// Build a register request with sensible defaults for tests.
-    fn register_req(name: &str, token_hash: &str, address: &str) -> RegisterNodeRequest {
+    pub(super) fn register_req(name: &str, token_hash: &str, address: &str) -> RegisterNodeRequest {
         RegisterNodeRequest {
             architecture: None,
             name: name.to_string(),
@@ -4345,6 +4347,14 @@ mod tests {
                 last_insert_id: 0,
                 rows_affected: 0,
             }])
+            // lock/remove stale runtimes, remove authorities, finish outbox work
+            .append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                };
+                4
+            ])
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
@@ -4484,7 +4494,7 @@ mod tests {
     /// nothing to run against: no `TEMPS_TEST_DATABASE_URL` and no reachable
     /// Docker daemon. Every other setup failure (schema creation, a broken
     /// migration) panics, so the tests never pass without running.
-    async fn migrated_test_db() -> Option<temps_test_utils::TestDatabase> {
+    pub(super) async fn migrated_test_db() -> Option<temps_test_utils::TestDatabase> {
         if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
             let docker_up = match bollard::Docker::connect_with_local_defaults() {
                 Ok(docker) => docker.ping().await.is_ok(),

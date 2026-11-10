@@ -79,14 +79,6 @@ const CHAT_TABS: ReadonlyArray<{
   { value: TERMINAL_TAB, label: 'Terminal', Icon: SquareTerminal },
 ]
 
-/**
- * A tab's label, hidden to an icon when the panel is narrow so the strip
- * fits without scrolling. The active tab and a wide panel keep it visible;
- * screen readers always get it.
- */
-const COLLAPSIBLE_LABEL =
-  'max-w-32 truncate sr-only group-data-[state=active]:not-sr-only @xl:not-sr-only'
-
 function projectKey(project: ProjectRef): string {
   return `project:${project.id}`
 }
@@ -479,14 +471,13 @@ export function DeploymentSidebar({
       >
         <div
           className={cn(
-            'flex items-center gap-1 border-b px-2 py-2',
+            'flex items-start gap-2 border-b px-2 py-2',
             inDrawer && 'pr-12'
           )}
         >
-          {/* A narrow panel shows the tabs as icons, keeping the selected
-              one's label, so the strip fits instead of scrolling. It still
-              scrolls when many projects are open. */}
-          <TabsList className="@container h-8 min-w-0 flex-1 justify-start overflow-x-auto">
+          {/* Let navigation grow vertically within the panel. A fixed height
+              clips the shared triggers and creates nested scrollbars. */}
+          <TabsList className="h-auto min-w-0 flex-1 flex-wrap justify-start gap-x-4 gap-y-0 overflow-visible border-b-0">
             {conversationPublicId &&
               CHAT_TABS.map(({ value, label, Icon }) => (
                 <TabsTrigger
@@ -494,9 +485,9 @@ export function DeploymentSidebar({
                   value={value}
                   title={label}
                   icon={Icon}
-                  className="group text-xs"
+                  className="min-w-0 max-w-full text-xs"
                 >
-                  <span className={COLLAPSIBLE_LABEL}>{label}</span>
+                  <span className="min-w-0 truncate">{label}</span>
                 </TabsTrigger>
               ))}
             {deployments.length > 0 && (
@@ -504,9 +495,9 @@ export function DeploymentSidebar({
                 value={DEPLOYMENTS_TAB}
                 title="Deployments"
                 icon={Rocket}
-                className="group text-xs"
+                className="min-w-0 max-w-full text-xs"
               >
-                <span className={COLLAPSIBLE_LABEL}>Deployments</span>
+                <span className="min-w-0 truncate">Deployments</span>
                 {deployments.length > 1 && (
                   <span className="text-[10px] tabular-nums text-muted-foreground">
                     {deployments.length}
@@ -520,9 +511,9 @@ export function DeploymentSidebar({
                 value={projectKey(project)}
                 title={project.name}
                 icon={FolderGit2}
-                className="group text-xs"
+                className="min-w-0 max-w-full text-xs"
               >
-                <span className={COLLAPSIBLE_LABEL}>{project.name}</span>
+                <span className="min-w-0 truncate">{project.name}</span>
               </TabsTrigger>
             ))}
           </TabsList>

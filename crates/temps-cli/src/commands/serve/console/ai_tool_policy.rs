@@ -21,6 +21,37 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
+        "vault, bundle and session administration is console-only; assistants use the scoped sandbox service operations",
+        &[
+            "create_access_bundle",
+            "create_access_session",
+            "create_access_vault",
+            "get_access_session",
+            "get_access_vault",
+            "list_access_bundles",
+            "list_access_sessions",
+            "list_access_vaults",
+            "revoke_access_session",
+            "update_access_bundle",
+            "update_access_vault",
+        ],
+    ),
+    (
+        "live sandbox service grants require direct operator consent; assistants cannot approve their own access",
+        &["approve_service_grant"],
+    ),
+    (
+        "pre-integration service access is console/API-only; credentials and fresh grant consent are managed directly until runtime enforcement is available",
+        &[
+            "access_capability",
+            "create_access_service",
+            "list_service_grants",
+            "request_service_grant",
+            "revoke_service_grant",
+            "update_access_service",
+        ],
+    ),
+    (
         "plugin AI consent is inspected in the operator console; assistant discovery already lists declared tools and disabled access",
         &["get_plugin_ai_tools"],
     ),

@@ -28,6 +28,25 @@ impl DockerSandboxProvider {
                 provider: "docker".to_string(),
                 reason: format!("list managed sandboxes for isolation validation: {source}"),
             })?;
+        if let Some(mounts) = &self.service_access {
+            let referenced = containers
+                .iter()
+                .filter_map(|container| {
+                    container
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get(super::service_access::MOUNT_LABEL))
+                        .cloned()
+                })
+                .collect();
+            let removed = mounts.reap_detached(&referenced)?;
+            if removed > 0 {
+                tracing::info!(
+                    mounts = removed,
+                    "Removed detached sandbox service proxy mounts"
+                );
+            }
+        }
         for summary in containers {
             let Some(id) = summary.id.as_deref() else {
                 continue;
@@ -86,6 +105,9 @@ impl DockerSandboxProvider {
             container = container_name,
             "Stopping sandbox because its network policy is stale or invalid"
         );
+        if let Some(mounts) = &self.service_access {
+            mounts.close(container_reference).await?;
+        }
         match self
             .docker
             .stop_container(
@@ -203,6 +225,16 @@ impl DockerSandboxProvider {
                         None,
                     )
                     .await?;
+                }
+                if running && super::service_access::mount_id(&info).is_some() {
+                    if let Some(mounts) = &self.service_access {
+                        let id = info.id.as_deref().unwrap_or(container_name);
+                        let _operation = mounts.operation(id)?;
+                        if mounts.target(&info).is_err() {
+                            mounts.close(id).await?;
+                            mounts.recover(&info)?;
+                        }
+                    }
                 }
                 let container_id = info.id.unwrap_or_default();
                 tracing::info!("Recovered sandbox {} (running={})", container_name, running);

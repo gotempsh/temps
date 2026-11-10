@@ -132,7 +132,13 @@ pub(crate) async fn open_sealed_requests(
     if SANDBOX_UPLOAD_PATHS.contains(&request.uri().path()) {
         return next.run(request).await;
     }
-    open_sealed(&state, MAX_SEALED_REQUEST_BYTES, request, next).await
+    let limit = if request.uri().path() == crate::sandbox_handlers::service_access::PATH {
+        // Eight MiB of JSON plus the base64 envelope, bounded before decoding.
+        12 * 1024 * 1024
+    } else {
+        MAX_SEALED_REQUEST_BYTES
+    };
+    open_sealed(&state, limit, request, next).await
 }
 
 /// [`open_sealed_requests`] for the sandbox upload routes: a route layer inside

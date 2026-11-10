@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { AuditLogIpInfo, AuditLogUserInfo } from '@/api/client'
+import { vaultAuditLabel } from '@/lib/vault-audit'
 import { TERMS } from '@/lib/terminology'
 import {
   Bell,
@@ -39,6 +40,7 @@ export interface AuditLogItemProps {
 }
 
 export type Category =
+  | 'vault'
   | 'plugin'
   | 'auth'
   | 'user'
@@ -75,6 +77,7 @@ export function humanize(op: string): string {
 }
 
 export function categorize(op: string): Category {
+  if (vaultAuditLabel(op)) return 'vault'
   if (op.startsWith('EXTERNAL_PLUGIN_')) return 'plugin'
   if (
     op.startsWith('LOGIN_') ||
@@ -199,6 +202,11 @@ export const CATEGORY_META: Record<
     label: 'MCP',
     icon: Workflow,
     tone: 'bg-teal-500/10 text-teal-700 dark:text-teal-400',
+  },
+  vault: {
+    label: 'Vault',
+    icon: KeyRound,
+    tone: 'bg-muted text-muted-foreground',
   },
   secret: {
     label: 'Secret',

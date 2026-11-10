@@ -72,3 +72,17 @@ describe('audit operation filters', () => {
     })
   })
 })
+
+test('Vault operations are selectable in the shared audit table', () => {
+  const operations = buildOperationOptions().filter(
+    (entry) => entry.group === 'Vault'
+  )
+  expect(operations).toHaveLength(17)
+  expect(
+    operations.find((entry) => entry.value === 'CREATE_ACCESS_SESSION')?.label
+  ).toBe('Vault session issued')
+  expect(
+    operations.find((entry) => entry.value === 'SANDBOX_SERVICE_GRANT_REVOKED')
+      ?.label
+  ).toBe('Service access revoked')
+})

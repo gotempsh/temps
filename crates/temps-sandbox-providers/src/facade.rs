@@ -296,6 +296,16 @@ fn stream_sink(cb: OnStreamEventCallback) -> temps_workload::ExecLineSink {
 
 #[async_trait]
 impl SandboxProvider for DriverSandboxProvider {
+    async fn service_access(
+        &self,
+        handle: &SandboxHandle,
+        command: crate::service_access::ServiceAccessCommand,
+    ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+        // Credential delivery belongs to the trusted provider, not the guest driver.
+        self.driver_for(handle)?;
+        self.product.service_access(handle, command).await
+    }
+
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         let plan = self.plan_create(&config)?;
         if !plan.passed_over.is_empty() {
@@ -854,6 +864,19 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl SandboxProvider for FakeBackend {
+        async fn service_access(
+            &self,
+            handle: &SandboxHandle,
+            _: crate::service_access::ServiceAccessCommand,
+        ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+            self.record(format!("service_access {}", handle.sandbox_id));
+            Ok(crate::service_access::ServiceAccessReply::Retired {
+                target: crate::service_access::ServiceAccessTarget {
+                    incarnation: "test-incarnation".into(),
+                    container_id: handle.sandbox_id.clone(),
+                },
+            })
+        }
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             let label = config
                 .container_name_override
@@ -1278,5 +1301,18 @@ pub(crate) mod tests {
         assert!(matches!(error, AgentError::Validation { .. }), "{error:?}");
         assert!(facade.supports_backend(SandboxBackend::Microsandbox));
         assert!(!facade.supports_backend(SandboxBackend::Local));
+    }
+    #[tokio::test]
+    async fn service_access_reaches_the_trusted_product_provider() {
+        let (facade, docker, _, _) = facade(SandboxBackend::Docker);
+        let handle = docker.handle("temps-sandbox-test");
+        facade
+            .service_access(
+                &handle,
+                crate::service_access::ServiceAccessCommand::Inspect,
+            )
+            .await
+            .unwrap();
+        assert_eq!(docker.calls(), ["service_access temps-sandbox-test-id"]);
     }
 }

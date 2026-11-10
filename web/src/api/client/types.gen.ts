@@ -17,6 +17,50 @@ export type AccessBinding = {
     provider_id: number;
 };
 
+export type AccessBundleList = {
+    items: Array<AccessBundleResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AccessBundleResponse = {
+    created_at: string;
+    id: string;
+    name: string;
+    project_id: number;
+    service_ids: Array<string>;
+    ttl_seconds: number;
+    updated_at: string;
+    vault_id: string;
+    version: number;
+};
+
+export type AccessCapability = {
+    /**
+     * Caller has project and sandbox write permissions. Ownership is still
+     * checked on each sandbox mutation.
+     */
+    can_manage_requests: boolean;
+    /**
+     * Caller may edit service policies in this project. Set by the handler.
+     */
+    can_manage_services: boolean;
+    can_save_requests: boolean;
+    /**
+     * Caller may use the project-bound GitHub credential source.
+     */
+    can_use_project_github: boolean;
+    configured: boolean;
+    reason: string;
+    setup_path?: string | null;
+    state: AccessCapabilityState;
+};
+
+export type AccessCapabilityState = 'available' | 'integration_unavailable';
+
+export type AccessMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
 export type AccessPermission = 'apps_edit' | 'organizations_read';
 
 export type AccessPermissionCheck = {
@@ -59,6 +103,69 @@ export type AccessProviderResponse = {
     team_domain: string;
 };
 
+export type AccessServiceList = {
+    items: Array<AccessServiceResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AccessServiceProvider = 'github' | 'gitlab' | 'openai' | 'anthropic' | 'stripe' | 'resend' | 'sendgrid' | 'vercel' | 'netlify' | 'mistral' | 'groq';
+
+export type AccessServiceResponse = {
+    created_at: string;
+    enabled: boolean;
+    has_credential: boolean;
+    id: string;
+    max_ttl_seconds: number;
+    name: string;
+    policy: SandboxAccessPolicy;
+    project_id: number;
+    updated_at: string;
+    version: number;
+};
+
+/**
+ * Extensible consumer identity. Only authenticated sandbox bindings are supported today.
+ */
+export type AccessSessionConsumer = {
+    kind: 'sandbox';
+    sandbox_id: string;
+};
+
+export type AccessSessionDetail = {
+    grants: Array<ServiceGrantResponse>;
+    session: AccessSessionResponse;
+};
+
+export type AccessSessionList = {
+    items: Array<AccessSessionResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AccessSessionResponse = {
+    bundle_id: string;
+    bundle_name: string;
+    bundle_version: number;
+    consumer: AccessSessionConsumer;
+    created_at: string;
+    created_by?: number | null;
+    expires_at: string;
+    id: string;
+    project_id: number;
+    revoked_at?: string | null;
+    service_count: number;
+    /**
+     * Authorization state only. Inspect grants for acknowledged worker enforcement.
+     */
+    status: AccessSessionStatus;
+    vault_id: string;
+};
+
+export type AccessSessionStatus = 'issued' | 'expired' | 'revoked';
+
 export type AccessTokenCheckRequest = {
     /**
      * The Cloudflare account the Access applications live in (32 hex
@@ -97,6 +204,39 @@ export type AccessTokenCheckResult = {
      * What the token can do beyond Temps' own apps.
      */
     warning: string;
+};
+
+export type AccessVaultDetail = {
+    /**
+     * Vaults are bounded to 100 services.
+     */
+    services: Array<AccessServiceResponse>;
+    vault: AccessVaultResponse;
+};
+
+export type AccessVaultList = {
+    items: Array<AccessVaultOverview>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type AccessVaultOverview = {
+    /**
+     * Up to four services for the overview; service_ids gives the total.
+     */
+    services: Array<AccessServiceResponse>;
+    vault: AccessVaultResponse;
+};
+
+export type AccessVaultResponse = {
+    created_at: string;
+    id: string;
+    name: string;
+    project_id: number;
+    service_ids: Array<string>;
+    updated_at: string;
+    version: number;
 };
 
 export type AcmeOrderResponse = {
@@ -2683,6 +2823,26 @@ export type ApplyRequest = {
      * The plan this acts on, from `POST …/reachability/plan`.
      */
     plan_id: string;
+};
+
+export type ApproveSandboxService = {
+    expected_version: number;
+    /**
+     * Omit for the sandbox lifetime. A fixed expiry never renews beyond this deadline.
+     */
+    expires_at?: string | null;
+    service_version: number;
+};
+
+/**
+ * Explicit operator approval, separate from a saved request. Reuse request_id
+ * only when retrying this exact approval; it never extends an existing grant.
+ */
+export type ApproveServiceGrant = {
+    request_id: string;
+    service_id: string;
+    service_version: number;
+    ttl_seconds: number;
 };
 
 export type ArchiveFlagResponse = {
@@ -7361,6 +7521,21 @@ export type CreateAccessProviderRequest = {
      * Checked, then sealed; never returned.
      */
     token: SecretString;
+};
+
+export type CreateAccessSession = {
+    bundle_id: string;
+    bundle_version: number;
+    consumer: AccessSessionConsumer;
+    /**
+     * Stable for retries of this approval. A new session needs a new UUID.
+     */
+    request_id: string;
+    /**
+     * Exact policies the operator reviewed, one per bundle service (maximum 16).
+     */
+    services: Array<SessionServiceVersion>;
+    ttl_seconds: number;
 };
 
 export type CreateAlertRuleRequest = {
@@ -15809,6 +15984,8 @@ export type GitSourcePlan = {
     repo: string;
 };
 
+export type GithubAccessProtocol = 'api' | 'git';
+
 /**
  * Response of [`start_github_manifest_flow`].
  */
@@ -15818,6 +15995,17 @@ export type GithubManifestStartResponse = {
      * to the callback, which accepts the manifest code only together with it.
      */
     state: string;
+};
+
+/**
+ * Immutable reference to an explicitly selected GitHub connection and synced repository.
+ * Changing the connection or repository requires a new policy and fresh consent.
+ */
+export type GithubRepositoryAccess = {
+    connection_id: number;
+    owner: string;
+    protocol: GithubAccessProtocol;
+    repository: string;
 };
 
 export type GlobalAnalyticsResponse = {
@@ -16207,6 +16395,11 @@ export type GoalResponse = {
     status: string;
     title: string;
 };
+
+/**
+ * Observed worker enforcement, independent of the requested authorization.
+ */
+export type GrantEnforcement = 'not_requested' | 'pending' | 'active' | 'stopping' | 'stopped';
 
 /**
  * A group variable as returned by the API. `value` is `"***"` in lists,
@@ -27348,6 +27541,20 @@ export type RequestRow = {
     user_agent?: string | null;
 };
 
+export type RequestSandboxService = {
+    service_id: string;
+    service_version: number;
+};
+
+export type RequestServiceGrant = {
+    service_id: string;
+    service_version: number;
+    /**
+     * Absolute expiry is calculated at creation, even if the broker is unavailable.
+     */
+    ttl_seconds: number;
+};
+
 /**
  * Upstream request/connection timeouts for customer app traffic.
  *
@@ -28003,6 +28210,14 @@ export type RevenueRow = {
     ts: string;
 };
 
+export type RevokeSandboxService = {
+    expected_version: number;
+};
+
+export type RevokeServiceGrant = {
+    expected_version: number;
+};
+
 /**
  * Risk level for a migration step
  */
@@ -28529,6 +28744,24 @@ export type S3SourceResponse = {
 };
 
 /**
+ * Exact destination and request scope. The broker must validate this again
+ * against its supported protocols before installing a policy.
+ */
+export type SandboxAccessPolicy = {
+    github_repository?: GithubRepositoryAccess | null;
+    methods: Array<AccessMethod>;
+    /**
+     * HTTPS origin only; no path, userinfo, query, fragment or non-443 port.
+     */
+    origin: string;
+    /**
+     * Segment-boundary path prefixes, for example `/owner/private-repo`.
+     */
+    path_prefixes: Array<string>;
+    provider?: AccessServiceProvider | null;
+};
+
+/**
  * Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker
  * containers, Firecracker microVMs and microsandbox (libkrun) microVMs
  * coexist on the same host behind the same `SandboxProvider` seam;
@@ -28871,6 +29104,30 @@ export type SandboxRuntimeEnvironmentResponse = {
     };
 };
 
+export type SandboxServiceList = {
+    items: Array<SandboxServiceResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type SandboxServiceResponse = {
+    connected: boolean;
+    created_at: string;
+    enforcement: GrantEnforcement;
+    expires_at?: string | null;
+    id: string;
+    policy: SandboxAccessPolicy;
+    reason: string;
+    service_id: string;
+    service_name: string;
+    service_version: number;
+    status: SandboxServiceStatus;
+    version: number;
+};
+
+export type SandboxServiceStatus = 'pending_approval' | 'approved' | 'suspended' | 'revoked' | 'expired' | 'policy_changed' | 'service_disabled';
+
 export type SandboxStatusResponse = {
     docker_available: boolean;
     error?: string | null;
@@ -28888,6 +29145,47 @@ export type SandboxStatusResponse = {
      * when not configured it carries the reason and where to set it up.
      */
     microsandbox: MicrosandboxCapability;
+};
+
+export type SaveAccessBundle = {
+    expected_version?: number | null;
+    name: string;
+    /**
+     * A selection of this vault's services, not an authorization grant.
+     */
+    service_ids: Array<string>;
+    ttl_seconds: number;
+};
+
+export type SaveAccessService = {
+    clear_credential?: boolean;
+    /**
+     * Allows requests to be saved; does not enable a network connection.
+     */
+    enabled: boolean;
+    /**
+     * Required for updates; omit for creation.
+     */
+    expected_version?: number | null;
+    /**
+     * Maximum lifetime of a request, between 60 and 86400 seconds.
+     */
+    max_ttl_seconds: number;
+    name: string;
+    policy: SandboxAccessPolicy;
+    /**
+     * Add a newly created service to this vault in the same transaction.
+     */
+    vault_id?: string | null;
+};
+
+export type SaveAccessVault = {
+    expected_version?: number | null;
+    name: string;
+    /**
+     * Existing services in this project. At most 100, without duplicates.
+     */
+    service_ids: Array<string>;
 };
 
 export type SaveAgentTokenRequest = {
@@ -30033,6 +30331,44 @@ export type ServiceDownAlertResponse = {
     silenced_until?: string | null;
 };
 
+/**
+ * Durable approval receipt. HTTP 202 does not mean the worker is connected.
+ */
+export type ServiceGrantApproval = {
+    expires_at: string;
+    grant_id: string;
+    sandbox_id: string;
+};
+
+export type ServiceGrantList = {
+    items: Array<ServiceGrantResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ServiceGrantResponse = {
+    /**
+     * True only for a current, live acknowledgment of this exact grant.
+     */
+    connected: boolean;
+    created_at: string;
+    enforcement: GrantEnforcement;
+    expires_at: string;
+    id: string;
+    policy: SandboxAccessPolicy;
+    reason: string;
+    revoked_at?: string | null;
+    sandbox_id: string;
+    service_id: string;
+    service_name: string;
+    service_version: number;
+    status: ServiceGrantStatus;
+    version: number;
+};
+
+export type ServiceGrantStatus = 'pending_approval' | 'approved' | 'integration_unavailable' | 'expired' | 'revoked' | 'service_disabled' | 'policy_changed';
+
 export type ServiceHealthResponse = {
     /**
      * Consecutive failed probes. Alert fires at 3.
@@ -30623,6 +30959,11 @@ export type SessionRequestLog = {
     response_time_ms?: number | null;
     status_code: number;
     user_agent?: string | null;
+};
+
+export type SessionServiceVersion = {
+    service_id: string;
+    version: number;
 };
 
 export type SessionSummary = {
@@ -38181,6 +38522,29 @@ export type S3SourceResponseWritable = {
     region: string;
     secret_key: string;
     updated_at: number;
+};
+
+export type SaveAccessServiceWritable = {
+    clear_credential?: boolean;
+    credential?: SecretString | null;
+    /**
+     * Allows requests to be saved; does not enable a network connection.
+     */
+    enabled: boolean;
+    /**
+     * Required for updates; omit for creation.
+     */
+    expected_version?: number | null;
+    /**
+     * Maximum lifetime of a request, between 60 and 86400 seconds.
+     */
+    max_ttl_seconds: number;
+    name: string;
+    policy: SandboxAccessPolicy;
+    /**
+     * Add a newly created service to this vault in the same transaction.
+     */
+    vault_id?: string | null;
 };
 
 export type GetPlatformInfoData = {
@@ -69049,6 +69413,735 @@ export type GrantProjectAccessResponses = {
 
 export type GrantProjectAccessResponse = GrantProjectAccessResponses[keyof GrantProjectAccessResponses];
 
+export type ListAccessServicesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/access-services';
+};
+
+export type ListAccessServicesErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessServicesResponses = {
+    /**
+     * Success
+     */
+    200: AccessServiceList;
+};
+
+export type ListAccessServicesResponse = ListAccessServicesResponses[keyof ListAccessServicesResponses];
+
+export type CreateAccessServiceData = {
+    body: SaveAccessServiceWritable;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-services';
+};
+
+export type CreateAccessServiceErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessServiceResponses = {
+    /**
+     * Success
+     */
+    201: AccessServiceResponse;
+};
+
+export type CreateAccessServiceResponse = CreateAccessServiceResponses[keyof CreateAccessServiceResponses];
+
+export type GetAccessServiceData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Service ID
+         */
+        service_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-services/{service_id}';
+};
+
+export type GetAccessServiceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type GetAccessServiceResponses = {
+    /**
+     * Service policy without stored credential
+     */
+    200: AccessServiceResponse;
+};
+
+export type GetAccessServiceResponse = GetAccessServiceResponses[keyof GetAccessServiceResponses];
+
+export type UpdateAccessServiceData = {
+    body: SaveAccessServiceWritable;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Service ID
+         */
+        service_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-services/{service_id}';
+};
+
+export type UpdateAccessServiceErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessServiceResponses = {
+    /**
+     * Success
+     */
+    200: AccessServiceResponse;
+};
+
+export type UpdateAccessServiceResponse = UpdateAccessServiceResponses[keyof UpdateAccessServiceResponses];
+
+export type ListAccessSessionsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        vault_id?: string | null;
+        /**
+         * Filter by the sandbox's public ID; ownership still applies.
+         */
+        sandbox_id?: string | null;
+    };
+    url: '/projects/{project_id}/access-sessions';
+};
+
+export type ListAccessSessionsErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type ListAccessSessionsResponses = {
+    /**
+     * Session authorizations
+     */
+    200: AccessSessionList;
+};
+
+export type ListAccessSessionsResponse = ListAccessSessionsResponses[keyof ListAccessSessionsResponses];
+
+export type GetAccessSessionData = {
+    body?: never;
+    path: {
+        project_id: number;
+        session_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-sessions/{session_id}';
+};
+
+export type GetAccessSessionErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type GetAccessSessionResponses = {
+    /**
+     * Session policies and worker receipts
+     */
+    200: AccessSessionDetail;
+};
+
+export type GetAccessSessionResponse = GetAccessSessionResponses[keyof GetAccessSessionResponses];
+
+export type RevokeAccessSessionData = {
+    body?: never;
+    path: {
+        project_id: number;
+        session_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-sessions/{session_id}/revoke';
+};
+
+export type RevokeAccessSessionErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type RevokeAccessSessionResponses = {
+    /**
+     * Revocation requested; inspect worker receipts
+     */
+    202: AccessSessionResponse;
+};
+
+export type RevokeAccessSessionResponse = RevokeAccessSessionResponses[keyof RevokeAccessSessionResponses];
+
+export type ListAccessVaultsData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/access-vaults';
+};
+
+export type ListAccessVaultsErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessVaultsResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultList;
+};
+
+export type ListAccessVaultsResponse = ListAccessVaultsResponses[keyof ListAccessVaultsResponses];
+
+export type CreateAccessVaultData = {
+    body: SaveAccessVault;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-vaults';
+};
+
+export type CreateAccessVaultErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessVaultResponses = {
+    /**
+     * Success
+     */
+    201: AccessVaultResponse;
+};
+
+export type CreateAccessVaultResponse = CreateAccessVaultResponses[keyof CreateAccessVaultResponses];
+
+export type GetAccessVaultData = {
+    body?: never;
+    path: {
+        project_id: number;
+        vault_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-vaults/{vault_id}';
+};
+
+export type GetAccessVaultErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type GetAccessVaultResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultDetail;
+};
+
+export type GetAccessVaultResponse = GetAccessVaultResponses[keyof GetAccessVaultResponses];
+
+export type UpdateAccessVaultData = {
+    body: SaveAccessVault;
+    path: {
+        project_id: number;
+        vault_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-vaults/{vault_id}';
+};
+
+export type UpdateAccessVaultErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessVaultResponses = {
+    /**
+     * Success
+     */
+    200: AccessVaultResponse;
+};
+
+export type UpdateAccessVaultResponse = UpdateAccessVaultResponses[keyof UpdateAccessVaultResponses];
+
+export type ListAccessBundlesData = {
+    body?: never;
+    path: {
+        project_id: number;
+        vault_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/access-vaults/{vault_id}/bundles';
+};
+
+export type ListAccessBundlesErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListAccessBundlesResponses = {
+    /**
+     * Success
+     */
+    200: AccessBundleList;
+};
+
+export type ListAccessBundlesResponse = ListAccessBundlesResponses[keyof ListAccessBundlesResponses];
+
+export type CreateAccessBundleData = {
+    body: SaveAccessBundle;
+    path: {
+        project_id: number;
+        vault_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-vaults/{vault_id}/bundles';
+};
+
+export type CreateAccessBundleErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type CreateAccessBundleResponses = {
+    /**
+     * Success
+     */
+    201: AccessBundleResponse;
+};
+
+export type CreateAccessBundleResponse = CreateAccessBundleResponses[keyof CreateAccessBundleResponses];
+
+export type UpdateAccessBundleData = {
+    body: SaveAccessBundle;
+    path: {
+        project_id: number;
+        vault_id: string;
+        bundle_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-vaults/{vault_id}/bundles/{bundle_id}';
+};
+
+export type UpdateAccessBundleErrors = {
+    /**
+     * Invalid selection
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type UpdateAccessBundleResponses = {
+    /**
+     * Success
+     */
+    200: AccessBundleResponse;
+};
+
+export type UpdateAccessBundleResponse = UpdateAccessBundleResponses[keyof UpdateAccessBundleResponses];
+
+export type CreateAccessSessionData = {
+    body: CreateAccessSession;
+    path: {
+        project_id: number;
+        vault_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access-vaults/{vault_id}/sessions';
+};
+
+export type CreateAccessSessionErrors = {
+    /**
+     * Invalid session
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy changed
+     */
+    409: unknown;
+    /**
+     * Session storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type CreateAccessSessionResponses = {
+    /**
+     * Session issued; worker enforcement is asynchronous
+     */
+    202: AccessSessionResponse;
+};
+
+export type CreateAccessSessionResponse = CreateAccessSessionResponses[keyof CreateAccessSessionResponses];
+
 export type RevokeProjectAccessData = {
     body?: never;
     path: {
@@ -81816,6 +82909,414 @@ export type GetProjectRuntimeHealthResponses = {
 
 export type GetProjectRuntimeHealthResponse = GetProjectRuntimeHealthResponses[keyof GetProjectRuntimeHealthResponses];
 
+export type ListServiceGrantsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Opaque sandbox ID
+         */
+        sandbox_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants';
+};
+
+export type ListServiceGrantsErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type ListServiceGrantsResponses = {
+    /**
+     * Success
+     */
+    200: ServiceGrantList;
+};
+
+export type ListServiceGrantsResponse = ListServiceGrantsResponses[keyof ListServiceGrantsResponses];
+
+export type RequestServiceGrantData = {
+    body: RequestServiceGrant;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Opaque sandbox ID
+         */
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants';
+};
+
+export type RequestServiceGrantErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type RequestServiceGrantResponses = {
+    /**
+     * Success
+     */
+    201: ServiceGrantResponse;
+};
+
+export type RequestServiceGrantResponse = RequestServiceGrantResponses[keyof RequestServiceGrantResponses];
+
+export type ApproveServiceGrantData = {
+    body: ApproveServiceGrant;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Sandbox ID
+         */
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve';
+};
+
+export type ApproveServiceGrantErrors = {
+    /**
+     * Invalid consent
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy or sandbox changed
+     */
+    409: unknown;
+    /**
+     * Approval storage failed
+     */
+    500: unknown;
+    /**
+     * Worker unavailable
+     */
+    503: unknown;
+};
+
+export type ApproveServiceGrantResponses = {
+    /**
+     * Fresh approval persisted; worker enforcement is asynchronous
+     */
+    202: ServiceGrantApproval;
+};
+
+export type ApproveServiceGrantResponse = ApproveServiceGrantResponses[keyof ApproveServiceGrantResponses];
+
+export type RevokeServiceGrantData = {
+    body: RevokeServiceGrant;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Opaque sandbox ID
+         */
+        sandbox_id: string;
+        /**
+         * Grant request ID
+         */
+        grant_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke';
+};
+
+export type RevokeServiceGrantErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type RevokeServiceGrantResponses = {
+    /**
+     * Success
+     */
+    200: ServiceGrantResponse;
+};
+
+export type RevokeServiceGrantResponse = RevokeServiceGrantResponses[keyof RevokeServiceGrantResponses];
+
+export type ListSandboxServicesData = {
+    body?: never;
+    path: {
+        project_id: number;
+        sandbox_id: string;
+    };
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/services';
+};
+
+export type ListSandboxServicesErrors = {
+    /**
+     * Invalid access request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy or approval changed
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type ListSandboxServicesResponses = {
+    /**
+     * Service access state; inspect enforcement for worker acknowledgment
+     */
+    200: SandboxServiceList;
+};
+
+export type ListSandboxServicesResponse = ListSandboxServicesResponses[keyof ListSandboxServicesResponses];
+
+export type RequestSandboxServiceData = {
+    body: RequestSandboxService;
+    path: {
+        project_id: number;
+        sandbox_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/services';
+};
+
+export type RequestSandboxServiceErrors = {
+    /**
+     * Invalid access request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy or approval changed
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type RequestSandboxServiceResponses = {
+    /**
+     * Service access state; inspect enforcement for worker acknowledgment
+     */
+    202: SandboxServiceResponse;
+};
+
+export type RequestSandboxServiceResponse = RequestSandboxServiceResponses[keyof RequestSandboxServiceResponses];
+
+export type ApproveSandboxServiceData = {
+    body: ApproveSandboxService;
+    path: {
+        project_id: number;
+        sandbox_id: string;
+        access_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/approve';
+};
+
+export type ApproveSandboxServiceErrors = {
+    /**
+     * Invalid access request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy or approval changed
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type ApproveSandboxServiceResponses = {
+    /**
+     * Service access state; inspect enforcement for worker acknowledgment
+     */
+    202: SandboxServiceResponse;
+};
+
+export type ApproveSandboxServiceResponse = ApproveSandboxServiceResponses[keyof ApproveSandboxServiceResponses];
+
+export type RevokeSandboxServiceData = {
+    body: RevokeSandboxService;
+    path: {
+        project_id: number;
+        sandbox_id: string;
+        access_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/revoke';
+};
+
+export type RevokeSandboxServiceErrors = {
+    /**
+     * Invalid access request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Scoped resource not found
+     */
+    404: unknown;
+    /**
+     * Policy or approval changed
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type RevokeSandboxServiceResponses = {
+    /**
+     * Service access state; inspect enforcement for worker acknowledgment
+     */
+    202: SandboxServiceResponse;
+};
+
+export type RevokeSandboxServiceResponse = RevokeSandboxServiceResponses[keyof RevokeSandboxServiceResponses];
+
 export type ListProjectSecretsData = {
     body?: never;
     path: {
@@ -82049,6 +83550,54 @@ export type ListSecretHistoryResponses = {
 };
 
 export type ListSecretHistoryResponse = ListSecretHistoryResponses[keyof ListSecretHistoryResponses];
+
+export type AccessCapabilityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/service-access/capability';
+};
+
+export type AccessCapabilityErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Resource not found
+     */
+    404: unknown;
+    /**
+     * Version conflict
+     */
+    409: unknown;
+    /**
+     * Storage failure
+     */
+    500: unknown;
+};
+
+export type AccessCapabilityResponses = {
+    /**
+     * Success
+     */
+    200: AccessCapability;
+};
+
+export type AccessCapabilityResponse = AccessCapabilityResponses[keyof AccessCapabilityResponses];
 
 export type UpdateServiceTemplateRuntimeData = {
     body: UpdateServiceTemplateRuntimeRequest;

@@ -264,7 +264,14 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_access_authorities;
+pub mod sandbox_access_authorizations;
+pub mod sandbox_access_delivery;
+pub mod sandbox_access_runtimes;
+pub mod sandbox_access_services;
 pub mod sandbox_events;
+pub mod sandbox_service_assignments;
+pub mod sandbox_service_grants;
 pub mod sandbox_services;
 pub mod sandbox_snapshots;
 pub mod sandboxes;
@@ -315,4 +322,7 @@ pub mod functions;
 // ADR-055 Phase 10: Firecracker for deployments
 pub mod environment_workload_isolation;
 
+pub mod access_bundles;
+pub mod access_sessions;
+pub mod access_vaults;
 pub mod external_plugin_actors;

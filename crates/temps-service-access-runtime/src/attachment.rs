@@ -1,0 +1,307 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Per-sandbox host attachment. Mount only `directory()` read-only into the
+//! owning sandbox; never mount the parent or use a shared TCP listener as an
+//! identity boundary. The caller must resolve the actual runtime incarnation.
+use crate::{MountDirectory, RuntimeError, SandboxBinding, MAX_SANDBOX_CONNECTIONS};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
+use tempfile::TempDir;
+use tokenless_dataplane::CutReport;
+use tokio::{
+    net::UnixListener,
+    task::{JoinHandle, JoinSet},
+};
+
+/// Owns its endpoint and all forwarding tasks. Drop cuts access even when the
+/// lifecycle operation creating it is cancelled or fails after attachment.
+pub struct UnixAttachment {
+    slot: Arc<AttachmentSlot>,
+    task: JoinHandle<()>,
+    directory: AttachmentDirectory,
+}
+
+enum AttachmentDirectory {
+    Temporary(TempDir),
+    Mounted(MountDirectory),
+}
+impl AttachmentDirectory {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(directory) => directory.path(),
+            Self::Mounted(directory) => directory.guest_path(),
+        }
+    }
+}
+
+struct AttachmentSlot {
+    id: String,
+    binding: OnceLock<Arc<SandboxBinding>>,
+    closed: AtomicBool,
+}
+
+impl AttachmentSlot {
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Some(binding) = self.binding.get() {
+            binding.revoke();
+        }
+    }
+}
+
+impl UnixAttachment {
+    /// Atomic public trust-bundle publication. The mount is read-only in the
+    /// guest; a failed write leaves the preceding certificate intact.
+    pub fn publish_certificate(
+        &self,
+        certificate: &crate::PublicCertificate,
+    ) -> Result<(), RuntimeError> {
+        use std::io::Write;
+        let failure = |source| RuntimeError::Attachment {
+            operation: "publish public CA certificate",
+            binding: self.slot.id.clone(),
+            source,
+        };
+        let mut file = tempfile::NamedTempFile::new_in(self.directory()).map_err(failure)?;
+        file.write_all(certificate.as_pem().as_bytes())
+            .map_err(failure)?;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .map_err(failure)?;
+        file.persist(self.directory().join("ca.pem"))
+            .map_err(|e| failure(e.error))?;
+        Ok(())
+    }
+    /// Sticky routing ownership: API-only deliveries never change Git routing.
+    /// Keep this marker after revocation so assigned Git traffic cannot silently
+    /// fall back to the independent project credential helper.
+    pub fn publish_github_git_route(&self) -> Result<(), RuntimeError> {
+        std::fs::write(self.directory().join("github-git"), b"vault\n").map_err(|source| {
+            RuntimeError::Attachment {
+                operation: "publish Git routing ownership",
+                binding: self.slot.id.clone(),
+                source,
+            }
+        })
+    }
+
+    /// `parent` is an operator-owned directory outside every sandbox mount.
+    /// It must not be writable by a sandbox user. A fresh, unpredictable child
+    /// is created on every invocation; existing paths are never replaced.
+    pub fn bind(parent: &Path, binding: Arc<SandboxBinding>) -> Result<Self, RuntimeError> {
+        let attachment = Self::reserve(parent, binding.id().into())?;
+        attachment.activate(binding)?;
+        Ok(attachment)
+    }
+
+    /// Reserve the mount before container creation. An ungranted attachment
+    /// closes connections immediately. `id` must come from the host's fresh
+    /// sandbox incarnation, never a guest request or a reusable display name.
+    pub fn reserve(parent: &Path, id: String) -> Result<Self, RuntimeError> {
+        let io_error = |source| RuntimeError::Attachment {
+            binding: id.clone(),
+            operation: "create Unix attachment directory",
+            source,
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("access-")
+            .tempdir_in(parent)
+            .map_err(io_error)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+            .map_err(io_error)?;
+        Self::listen(AttachmentDirectory::Temporary(directory), id)
+    }
+
+    /// The mount's inode survives a provider/worker restart once retained.
+    /// Reopening always starts denied; it never reloads a previous binding.
+    pub fn reserve_mounted(directory: MountDirectory, id: String) -> Result<Self, RuntimeError> {
+        Self::listen(AttachmentDirectory::Mounted(directory), id)
+    }
+
+    pub fn mount_id(&self) -> Option<&str> {
+        match &self.directory {
+            AttachmentDirectory::Temporary(_) => None,
+            AttachmentDirectory::Mounted(directory) => Some(directory.id()),
+        }
+    }
+
+    /// The provider calls this after creating the container, so dropping this
+    /// listener does not strand the container on an unlinked mount inode.
+    pub fn retain_mount(&mut self) {
+        if let AttachmentDirectory::Mounted(directory) = &mut self.directory {
+            directory.retain();
+        }
+    }
+
+    fn listen(directory: AttachmentDirectory, id: String) -> Result<Self, RuntimeError> {
+        if id.is_empty() || id.len() > 256 {
+            return Err(RuntimeError::Invalid {
+                operation: "reserve attachment",
+                binding: "unassigned".into(),
+                reason: "binding identity must contain 1 to 256 bytes",
+            });
+        }
+        let slot = Arc::new(AttachmentSlot {
+            id,
+            binding: OnceLock::new(),
+            closed: AtomicBool::new(false),
+        });
+        let io_error = |source| RuntimeError::Attachment {
+            binding: slot.id.clone(),
+            operation: "create Unix attachment",
+            source,
+        };
+        if let AttachmentDirectory::Mounted(directory) = &directory {
+            directory.clear_socket()?;
+        }
+        let path = directory.path().join("proxy.sock");
+        let listener = bind_listener(directory.path()).map_err(io_error)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .map_err(io_error)?;
+        let task_slot = Arc::clone(&slot);
+        let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = connections.join_next(), if !connections.is_empty() => {},
+                    accepted = listener.accept() => {
+                        let (stream, _) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(_) => {
+                                tracing::warn!(binding = task_slot.id, "Sandbox proxy attachment stopped accepting connections");
+                                task_slot.close();
+                                break;
+                            }
+                        };
+                        // Bound tasks before spawn; the SDK also enforces the
+                        // configured per-binding and aggregate worker limits.
+                        if connections.len() >= MAX_SANDBOX_CONNECTIONS {
+                            drop(stream);
+                            continue;
+                        }
+                        if task_slot.closed.load(Ordering::SeqCst) {
+                            drop(stream);
+                            continue;
+                        }
+                        let Some(serving) = task_slot.binding.get().cloned() else {
+                            drop(stream);
+                            continue;
+                        };
+                        connections.spawn(async move {
+                            if serving.serve(stream).await.is_err() {
+                                // Never format SDK sources: they can contain
+                                // request metadata controlled by the guest.
+                                tracing::debug!(binding = serving.id(), "Sandbox proxy connection refused or closed");
+                            }
+                        });
+                    }
+                }
+            }
+            // JoinSet aborts every owned connection when the listener exits.
+        });
+        Ok(Self {
+            slot,
+            task,
+            directory,
+        })
+    }
+
+    /// Activate once for the reserved identity. Changes to grants use the
+    /// worker's version-fenced binding updates, never replacement identities.
+    pub fn activate(&self, binding: Arc<SandboxBinding>) -> Result<(), RuntimeError> {
+        let invalid = |reason| RuntimeError::Invalid {
+            operation: "activate attachment",
+            binding: self.slot.id.clone(),
+            reason,
+        };
+        if self.slot.closed.load(Ordering::SeqCst) {
+            return Err(invalid("attachment is permanently closed"));
+        }
+        if binding.id() != self.slot.id {
+            return Err(invalid(
+                "binding does not match the reserved sandbox incarnation",
+            ));
+        }
+        if let Some(current) = self.slot.binding.get() {
+            return if Arc::ptr_eq(current, &binding) {
+                Ok(())
+            } else {
+                Err(invalid("attachment already has a different binding"))
+            };
+        }
+        self.slot
+            .binding
+            .set(Arc::clone(&binding))
+            .map_err(|_| invalid("attachment was activated concurrently"))?;
+        // Close and activation can race. A binding installed after close's
+        // lookup is revoked here; admission also checks closed before serving.
+        if self.slot.closed.load(Ordering::SeqCst) {
+            binding.revoke();
+            return Err(invalid("attachment closed during activation"));
+        }
+        Ok(())
+    }
+
+    pub fn directory(&self) -> &Path {
+        self.directory.path()
+    }
+
+    /// Stops admission, cuts all traffic, then returns the enforcement receipt.
+    /// A timeout is an error, never a successful revocation acknowledgement.
+    pub async fn revoke_and_wait(&self, timeout: Duration) -> Result<CutReport, RuntimeError> {
+        self.slot.close();
+        self.task.abort();
+        match self.slot.binding.get() {
+            Some(binding) => binding.revoke_and_wait(timeout).await,
+            None => Ok(CutReport {
+                snapshot_version: None,
+                connections_closed: 0,
+                waited: Duration::ZERO,
+            }),
+        }
+    }
+}
+
+// Linux workers may keep their private state under a long data-directory
+// prefix. Unix socket addresses are limited to roughly 100 bytes even when
+// the filesystem accepts that path. Bind through an owned directory fd;
+// Docker guests connect through their short, fixed mount path instead.
+#[cfg(target_os = "linux")]
+fn bind_listener(directory: &Path) -> std::io::Result<UnixListener> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory)?;
+    UnixListener::bind(format!(
+        "/proc/self/fd/{}/proxy.sock",
+        directory.as_raw_fd()
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_listener(directory: &Path) -> std::io::Result<UnixListener> {
+    UnixListener::bind(directory.join("proxy.sock"))
+}
+
+impl Drop for UnixAttachment {
+    fn drop(&mut self) {
+        self.slot.close();
+        self.task.abort();
+        if let AttachmentDirectory::Mounted(directory) = &self.directory {
+            if directory.clear_socket().is_err() {
+                tracing::warn!(binding=%self.slot.id,"Could not remove stopped sandbox proxy socket");
+            }
+        }
+        // Temporary directories are removed. Retained mount directories keep
+        // their inode until explicit container destruction removes them.
+    }
+}

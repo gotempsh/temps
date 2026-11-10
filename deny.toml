@@ -151,10 +151,12 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Every git dependency is pinned to a rev or tag in the root Cargo.toml.
+# Every git dependency is pinned to a rev or tag in its Cargo.toml.
 allow-git = [
     "https://github.com/getsentry/relay",
     "https://github.com/gotempsh/autopack",
     "https://github.com/cloudflare/cloudflare-rs",
     "https://github.com/gotempsh/agent-runtime-sdk.git",
+    # Embedded SDK, pinned by temps-service-access.
+    "https://github.com/gotempsh/tokenless",
 ]

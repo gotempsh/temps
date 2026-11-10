@@ -35,6 +35,10 @@
 /// operation_id without duplicating the list — see `ai_tool_allowlist_tests`
 /// in the console (`temps-cli`), which checks it against the real API.
 pub const AI_READ_ALLOWLIST: &[&str] = &[
+    // Vault metadata is masked; grants never return upstream credentials.
+    "list_access_services",
+    "get_access_service",
+    "list_sandbox_services",
     // ── OpenTelemetry: metrics / traces / logs / health ──
     "query_metrics",
     "list_metric_names",
@@ -846,6 +850,11 @@ pub fn ai_read_allowlist() -> Vec<String> {
 /// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
 /// which is the one rule holding up the read-only-POST mechanism.
 pub const AI_WRITE_ALLOWLIST: &[&str] = &[
+    // Same scoped user authorization as the console, through the existing
+    // assistant write policy. This does not let the agent change that policy.
+    "request_sandbox_service",
+    "approve_sandbox_service",
+    "revoke_sandbox_service",
     // ── Deployment lifecycle (reversible / safe) ──
     // Redeploy the project from its configured branch —
     // what a "redeploy main" request maps to
@@ -1495,5 +1504,29 @@ mod tests {
                 "duplicate allowlist entry: {entry}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_service_tests {
+    use super::*;
+    #[test]
+    fn chat_can_discover_and_manage_scoped_sandbox_access() {
+        for operation in [
+            "list_access_services",
+            "get_access_service",
+            "list_sandbox_services",
+        ] {
+            assert!(AI_READ_ALLOWLIST.contains(&operation));
+        }
+        for operation in [
+            "request_sandbox_service",
+            "approve_sandbox_service",
+            "revoke_sandbox_service",
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation));
+            assert!(!AI_READ_ALLOWLIST.contains(&operation));
+        }
+        assert!(!AI_WRITE_ALLOWLIST.contains(&"confirm_pending_action"));
     }
 }

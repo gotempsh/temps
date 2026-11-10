@@ -39,6 +39,8 @@ use super::{
 };
 
 mod create;
+mod service_access;
+pub use service_access::ServiceAccessTarget;
 mod egress;
 mod exec;
 mod files;
@@ -256,6 +258,7 @@ pub const DEFAULT_PIDS_LIMIT: i64 = 512;
 pub struct DockerSandboxProvider {
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
+    service_access: Option<service_access::AccessMounts>,
     network_lock: tokio::sync::Mutex<()>,
     /// Which sandboxes are being created and which are being reaped, so the
     /// two can never overlap. A creating sandbox's isolated network may be
@@ -353,9 +356,18 @@ impl DockerSandboxProvider {
         Self {
             docker,
             config,
+            service_access: None,
             network_lock: tokio::sync::Mutex::new(()),
             creates_in_flight: std::sync::Mutex::new(SandboxLifecycle::default()),
         }
+    }
+
+    /// Enable host-owned service proxy mounts. The directory is private worker
+    /// state derived from its bootstrap data root, never a guest-supplied path.
+    /// The Docker daemon must share this host's filesystem and Unix sockets.
+    pub fn with_service_access_root(mut self, root: PathBuf) -> Self {
+        self.service_access = Some(service_access::AccessMounts::new(root));
+        self
     }
 }
 

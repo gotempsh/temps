@@ -38,6 +38,8 @@
 //! (control characters dropped, length capped) before it can reach an API
 //! client or a terminal. Transport errors never echo the node's internal URL.
 
+mod capacity;
+
 use async_trait::async_trait;
 use base64::Engine;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -182,6 +184,13 @@ pub struct RemoteCreateRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemoteHandleRequest {
     pub handle: SandboxHandle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteServiceAccessRequest {
+    pub handle: SandboxHandle,
+    pub command: crate::service_access::ServiceAccessCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1053,8 +1062,8 @@ impl RemoteSandboxProvider {
         response_cap: usize,
     ) -> Result<R, AgentError> {
         let url = format!("{}{}", self.agent_url, path);
-        let response = self
-            .with_body(
+        let send = || async {
+            self.with_body(
                 self.client
                     .post(&url)
                     .bearer_auth(&self.token)
@@ -1066,7 +1075,17 @@ impl RemoteSandboxProvider {
             .map_err(|error| self.failed(handle, operation, error.to_string()))?
             .send()
             .await
-            .map_err(|e| self.transport_unavailable(operation, e))?;
+            .map_err(|e| self.transport_unavailable(operation, e))
+        };
+        let response = if path == "/agent/sandboxes/service-access" {
+            tokio::time::timeout(timeout, capacity::send(send))
+                .await
+                .map_err(|_| {
+                    self.failed(handle, operation, "worker request deadline exceeded".into())
+                })??
+        } else {
+            send().await?
+        };
         if carries_values && response.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
             return Err(self.failed(
                 handle,
@@ -1569,6 +1588,29 @@ impl RemoteSandboxProvider {
 
 #[async_trait]
 impl SandboxProvider for RemoteSandboxProvider {
+    async fn service_access(
+        &self,
+        handle: &SandboxHandle,
+        command: crate::service_access::ServiceAccessCommand,
+    ) -> Result<crate::service_access::ServiceAccessReply, AgentError> {
+        let carries_values = matches!(
+            command,
+            crate::service_access::ServiceAccessCommand::Apply { .. }
+        );
+        self.call_body(
+            "/agent/sandboxes/service-access",
+            &RemoteServiceAccessRequest {
+                handle: Self::local_handle(handle),
+                command,
+            },
+            carries_values,
+            Duration::from_secs(30),
+            Some(handle),
+            "service access",
+            SMALL_RESPONSE_CAP,
+        )
+        .await
+    }
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(SandboxBackend::Docker)?;
         let label = config
@@ -2136,6 +2178,7 @@ impl SandboxProvider for RemoteSandboxProvider {
 
 #[cfg(test)]
 mod tests {
+    mod service_access_capacity;
     use super::*;
 
     #[test]
@@ -3961,5 +4004,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("too old"), "{error}");
+    }
+    fn access_delivery() -> crate::service_access::ServiceAccessCommand {
+        use temps_service_access_runtime::{PolicyEnvelope, SessionDelivery, WorkerAuthority};
+        crate::service_access::ServiceAccessCommand::Apply {
+            expected: crate::service_access::ServiceAccessTarget {
+                incarnation: "test-incarnation".into(),
+                container_id: remote_handle().sandbox_id,
+            },
+            delivery: Box::new(SessionDelivery {
+                github_git: false,
+                authority: WorkerAuthority {
+                    boot_id: uuid::Uuid::new_v4(),
+                    node_id: uuid::Uuid::new_v4(),
+                    snapshot_verify_key: [1; 32],
+                },
+                policy: PolicyEnvelope {
+                    body: "sealed-policy".into(),
+                    signature: "signature".into(),
+                    key_id: "key".into(),
+                },
+                session: SANDBOX_SECRET.into(),
+                version: 1,
+            }),
+        }
+    }
+    #[tokio::test]
+    async fn service_access_delivery_is_sealed_and_never_falls_back_to_plaintext() {
+        use temps_core::sealed_request::NodeSealing;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let (url, seen) = recording_agent(500).await;
+        let _ = provider_at(&url)
+            .with_sealing(NodeSealing::Key(public))
+            .service_access(&remote_handle(), access_delivery())
+            .await;
+        assert_sealed_for(
+            &seen,
+            &private,
+            "/agent/sandboxes/service-access",
+            SANDBOX_SECRET,
+        )
+        .await;
+        for (sealing, expected) in [
+            (NodeSealing::NoKey, "no encryption key"),
+            (NodeSealing::PlainHttp, "plain http://"),
+        ] {
+            let error = provider_at("http://127.0.0.1:9")
+                .with_sealing(sealing)
+                .service_access(&remote_handle(), access_delivery())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains(SANDBOX_SECRET));
+        }
     }
 }

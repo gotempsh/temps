@@ -665,17 +665,21 @@ fn params_carry_secret_handle(value: &serde_json::Value) -> bool {
     }
 }
 
-/// A write that spends a user-provided credential. Permission modes that
+/// A write that spends a provided credential or grants durable sandbox access.
+/// Permission modes that
 /// approve non-destructive writes on their own must not approve these: the
 /// other fields of the same request (an endpoint, a base URL) are chosen by the
 /// model, and a prompt-injected model could point the user's key at a host it
 /// controls. The approval card shows those fields, so the user decides.
-fn platform_request_uses_secret(request: &PermissionRequest) -> bool {
+fn platform_request_requires_human(request: &PermissionRequest) -> bool {
     let flagged = |value: &serde_json::Value| {
-        value
-            .get("carries_handle")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+        // Durable access spends an existing credential even without a secret handle.
+        value.get("operation").and_then(serde_json::Value::as_str)
+            == Some("approve_sandbox_service")
+            || value
+                .get("carries_handle")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
     };
     flagged(&request.input)
         || request
@@ -686,7 +690,7 @@ fn platform_request_uses_secret(request: &PermissionRequest) -> bool {
 }
 
 fn automatic_platform_decision(request: &PermissionRequest) -> Option<PermissionDecision> {
-    if platform_request_is_destructive(request) || platform_request_uses_secret(request) {
+    if platform_request_is_destructive(request) || platform_request_requires_human(request) {
         return None;
     }
     match request.kind {
