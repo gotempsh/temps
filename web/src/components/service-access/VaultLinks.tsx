@@ -63,6 +63,7 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
         throwOnError: true,
       }),
     onSuccess: () => {
+      setPage(1)
       refresh()
       setRemoving(undefined)
     },

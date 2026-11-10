@@ -17,6 +17,72 @@ import { VaultLinks } from './VaultLinks'
 installBrowserWindow()
 afterEach(cleanup)
 
+test('unlinking the final row on page two returns to the remaining consumers', async () => {
+  let removed = false
+  const pages: number[] = []
+  const api = mockApi({
+    'GET /access-vaults/vault_fixture/links': (request) => {
+      const page = Number(new URL(request.url).searchParams.get('page'))
+      pages.push(page)
+      const ids =
+        page === 1
+          ? Array.from({ length: 20 }, (_, i) => i + 1)
+          : removed
+            ? []
+            : [21]
+      return jsonResponse({
+        items: ids.map((id) => ({
+          id: `link_${id}`,
+          vault_id: 'vault_fixture',
+          project_id: id,
+          sandbox_id: null,
+          consumer_name: `Project ${id}`,
+          created_at: '2026-01-01T00:00:00Z',
+        })),
+        total: removed ? 20 : 21,
+        page,
+        page_size: 20,
+      })
+    },
+    'DELETE /access-vaults/vault_fixture/links/link_21': () => {
+      removed = true
+      return new Response(null, { status: 204 })
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  try {
+    render(
+      <QueryClientProvider client={client}>
+        <VaultLinks vaultId="vault_fixture" />
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    await waitFor(() => expect(ui.getByText('Project 1')).toBeTruthy())
+    fireEvent.click(ui.getByRole('button', { name: 'Next page' }))
+    await waitFor(() => expect(ui.getByText('Project 21')).toBeTruthy())
+    fireEvent.click(ui.getByRole('button', { name: 'Unlink' }))
+    fireEvent.click(
+      within(ui.getByRole('alertdialog')).getByRole('button', {
+        name: 'Unlink and revoke access',
+      })
+    )
+    await waitFor(() => {
+      expect(ui.queryByRole('alertdialog')).toBeNull()
+      expect(ui.getByText('Project 1')).toBeTruthy()
+      expect(ui.getAllByRole('button', { name: 'Unlink' })).toHaveLength(20)
+    })
+    expect(removed).toBe(true)
+    expect(pages).toContain(2)
+    expect(ui.queryByText(/No consumers linked/)).toBeNull()
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
 test('unlink requires a revocation confirmation and preserves failures', async () => {
   const api = mockApi({
     'GET /access-vaults/vault_fixture/links': () =>
