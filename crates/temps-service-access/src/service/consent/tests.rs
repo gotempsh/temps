@@ -377,6 +377,14 @@ async fn worker_admission_rejects_overflow_and_legacy_rows_still_reconcile() {
         )
         .await
         .unwrap();
+    // Give the healthy binding explicit priority; application-created and
+    // database-created timestamps must not assume identical clocks.
+    db.execute_unprepared(&format!(
+        "UPDATE sandbox_access_runtimes SET created_at=now()-interval '1 minute' WHERE id='{}'",
+        healthy.runtime_id
+    ))
+    .await
+    .unwrap();
     // Seed historical open runtimes left behind by destroyed sandboxes.
     db.execute_unprepared("INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) SELECT n,'sbx_capacity_'||n,'capacity',9601,9601,'destroyed','docker' FROM generate_series(10001,10128) n").await.unwrap();
     let boot = worker.identity().boot_id;

@@ -346,6 +346,18 @@ async fn durable_approvals_renew_only_after_explicit_consent_and_revocation_wins
         )
         .await
         .unwrap();
+    let awakened = assignments::Entity::find_by_id(&fixed.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        awakened.next_reconcile_at.is_some(),
+        "reapproval must wake terminal work"
+    );
+    // Test scheduling separately from equality between the signing host and
+    // database clocks: the wakeup is persisted, then made explicitly due.
+    db.execute_unprepared(&format!("UPDATE sandbox_service_assignments SET next_reconcile_at=now()-interval '1 minute' WHERE id='{}'", fixed.id)).await.unwrap();
     assert_eq!(
         service.due_assignments().await.unwrap().assignments.len(),
         1

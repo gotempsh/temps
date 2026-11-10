@@ -7,7 +7,7 @@ use sea_orm::{ConnectionTrait, EntityTrait};
 #[tokio::test]
 async fn create_session_route_returns_accepted_session_and_audits_issuance() {
     session_route(false, "unlink").await;
-    for removal in ["unlink", "bundle", "vault", "sandbox"] {
+    for removal in ["unlink", "bundle", "vault", "service", "sandbox"] {
         session_route(true, removal).await;
     }
 }
@@ -333,16 +333,73 @@ async fn session_route(projectless: bool, removal: &str) {
                     && event["resource_id"] == link_id
                     && event["context"]["user_id"] == 9801));
         }
-        "bundle" => state
-            .service
-            .retire_vault_resource(&vault.id, Some(&bundle.id))
-            .await
-            .unwrap(),
-        "vault" => state
-            .service
-            .retire_vault_resource(&vault.id, None)
-            .await
-            .unwrap(),
+        "service" | "bundle" | "vault" => {
+            let (path, operation, id) = match removal {
+                "service" => {
+                    let id = bundle.service_ids[0].clone();
+                    (
+                        format!("/access-services/{id}"),
+                        "DELETE_ACCESS_SERVICE",
+                        id,
+                    )
+                }
+                "bundle" => (
+                    format!("/access-vaults/{}/bundles/{}", vault.id, bundle.id),
+                    "DELETE_ACCESS_BUNDLE_GENERAL",
+                    bundle.id.clone(),
+                ),
+                "vault" => (
+                    format!("/access-vaults/{}", vault.id),
+                    "DELETE_ACCESS_VAULT_GENERAL",
+                    vault.id.clone(),
+                ),
+                _ => unreachable!(),
+            };
+            let mut manager = test_user();
+            manager.id = 9801;
+            let response = send(
+                "DELETE",
+                &path,
+                "",
+                Some(AuthContext::new_session(manager.clone(), Role::Admin)),
+                state.clone(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap()
+                .is_empty());
+            {
+                let events = audit.0.lock().unwrap();
+                assert!(events
+                    .iter()
+                    .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                    .any(|event| event["operation"] == operation
+                        && event["resource_id"] == id
+                        && event["context"]["user_id"] == 9801));
+            }
+            let missing = send(
+                "DELETE",
+                &format!("{path}_missing"),
+                "",
+                Some(AuthContext::new_session(manager, Role::Admin)),
+                state.clone(),
+            )
+            .await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                missing.headers()["content-type"],
+                "application/problem+json"
+            );
+            let problem: serde_json::Value =
+                serde_json::from_slice(&to_bytes(missing.into_body(), 8192).await.unwrap())
+                    .unwrap();
+            assert!(problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{id}_missing")));
+        }
         "sandbox" => {
             db.execute_unprepared("DELETE FROM sandboxes WHERE id=9801")
                 .await

@@ -1298,3 +1298,177 @@ async fn project_members_cannot_manage_general_vaults_or_links() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
 }
+
+#[tokio::test]
+async fn general_management_http_contracts_mask_secrets_and_audit_resource_ids() {
+    use sea_orm::ConnectionTrait;
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping general management HTTP contracts: database unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared(
+        "INSERT INTO users(id,name,email) VALUES(1,'Fixture','management-fixture@example.com')",
+    )
+    .await
+    .unwrap();
+    let audit = Arc::new(Audit::default());
+    let state = state_with_db(db.clone(), audit.clone());
+    async fn call(
+        state: &Arc<AccessAppState>,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+        status: StatusCode,
+    ) -> serde_json::Value {
+        let response = send(
+            method,
+            path,
+            &body.to_string(),
+            Some(AuthContext::new_session(test_user(), Role::Admin)),
+            state.clone(),
+        )
+        .await;
+        let actual = response.status();
+        if status.is_client_error() {
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+        }
+        let raw = to_bytes(response.into_body(), 32768).await.unwrap();
+        assert_eq!(
+            actual,
+            status,
+            "{method} {path}: {}",
+            String::from_utf8_lossy(&raw)
+        );
+        assert!(!String::from_utf8_lossy(&raw).contains("fixture-bearer-secret"));
+        serde_json::from_slice(&raw).unwrap()
+    }
+    let vault = call(
+        &state,
+        "POST",
+        "/access-vaults",
+        serde_json::json!({"name":"Shared APIs","service_ids":[]}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let vault_path = format!("/access-vaults/{vault_id}");
+    assert!(vault["project_id"].is_null());
+    let mut definition = serde_json::json!({"vault_id":vault_id,"name":"API","policy":{"origin":"https://api.example.com","path_prefixes":["/"],"methods":["GET"]},"max_ttl_seconds":900,"enabled":true,"credential":"fixture-bearer-secret"});
+    let service = call(
+        &state,
+        "POST",
+        "/access-services",
+        definition.clone(),
+        StatusCode::CREATED,
+    )
+    .await;
+    let service_id = service["id"].as_str().unwrap();
+    let service_path = format!("/access-services/{service_id}");
+    assert!(service["project_id"].is_null());
+    assert_eq!(service["has_credential"], true);
+    definition.as_object_mut().unwrap().remove("vault_id");
+    definition["expected_version"] = serde_json::json!(1);
+    definition["name"] = serde_json::json!("Updated API");
+    let updated = call(&state, "PUT", &service_path, definition, StatusCode::OK).await;
+    assert_eq!(updated["version"], 2);
+    let detail = call(
+        &state,
+        "GET",
+        &vault_path,
+        serde_json::json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let updated_vault = call(&state, "PUT", &vault_path, serde_json::json!({"name":"Updated vault","service_ids":[service_id],"expected_version":detail["vault"]["version"]}), StatusCode::OK).await;
+    assert_eq!(updated_vault["name"], "Updated vault");
+    let bundle_path = format!("{vault_path}/bundles");
+    let bundle = call(
+        &state,
+        "POST",
+        &bundle_path,
+        serde_json::json!({"name":"Read APIs","service_ids":[service_id],"ttl_seconds":900}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let bundle_id = bundle["id"].as_str().unwrap();
+    let updated_bundle = call(&state, "PUT", &format!("{bundle_path}/{bundle_id}"), serde_json::json!({"name":"Updated bundle","service_ids":[service_id],"ttl_seconds":600,"expected_version":1}), StatusCode::OK).await;
+    assert_eq!(updated_bundle["version"], 2);
+    assert_eq!(updated_bundle["ttl_seconds"], 600);
+    for path in ["/access-vaults", "/access-services", &bundle_path] {
+        let list = call(&state, "GET", path, serde_json::json!({}), StatusCode::OK).await;
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["items"].as_array().unwrap().len(), 1);
+        assert_eq!(list["page_size"], 20);
+    }
+    let read = call(
+        &state,
+        "GET",
+        &service_path,
+        serde_json::json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(read["id"], service_id);
+    assert_eq!(read["has_credential"], true);
+    for path in [
+        "/access-services/svc_missing",
+        "/access-vaults/vault_missing",
+        "/access-vaults/vault_missing/bundles",
+    ] {
+        let problem = call(
+            &state,
+            "GET",
+            path,
+            serde_json::json!({}),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(problem["title"], "Service access resource not found");
+        assert!(problem["detail"].as_str().unwrap().contains("missing"));
+    }
+    let invalid = call(
+        &state,
+        "POST",
+        "/access-vaults",
+        serde_json::json!({"name":"","service_ids":[]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(invalid["title"], "Invalid service access request");
+    let stale = call(&state, "PUT", &format!("{bundle_path}/{bundle_id}"), serde_json::json!({"name":"Stale","service_ids":[service_id],"ttl_seconds":600,"expected_version":1}), StatusCode::CONFLICT).await;
+    assert!(stale["detail"].as_str().unwrap().contains(bundle_id));
+    {
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 6);
+        for (operation, id) in [
+            ("CREATE_ACCESS_VAULT", vault_id),
+            ("UPDATE_ACCESS_VAULT", vault_id),
+            ("CREATE_ACCESS_SERVICE", service_id),
+            ("UPDATE_ACCESS_SERVICE", service_id),
+            ("CREATE_ACCESS_BUNDLE", bundle_id),
+            ("UPDATE_ACCESS_BUNDLE", bundle_id),
+        ] {
+            assert!(events
+                .iter()
+                .map(|event| serde_json::from_str::<serde_json::Value>(event).unwrap())
+                .any(|event| event["operation"] == operation
+                    && event["resource_id"] == id
+                    && event["context"]["user_id"] == 1));
+        }
+        assert!(events
+            .iter()
+            .all(|event| !event.contains("fixture-bearer-secret")));
+    }
+    drop(state);
+    drop(db);
+    test.cleanup().await;
+}
