@@ -410,9 +410,9 @@ async fn run_service_create(
     // so it can resolve `*.temps.local` natively (ADR-011). Falls back to
     // Docker's default DNS when the overlay isn't bootstrapped yet
     // (single-host setups). Read from the agent's shared slot — published
-    // by `network_sync` once the bridge gateway is up. `dns_with_fallback`
-    // appends public resolvers so a crashed/unreachable Hickory resolver
-    // never takes down DNS for every managed-service container on the node.
+    // by `network_sync` once the bridge gateway is up. The resolver is the
+    // container's only nameserver: it forwards outside names itself, and a
+    // host or public one beside it would bypass internal policy (ADR-096).
     let dns_servers: Option<Vec<String>> = state
         .overlay_bridge_address
         .read()

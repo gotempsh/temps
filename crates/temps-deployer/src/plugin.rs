@@ -684,11 +684,10 @@ impl TempsPlugin for DeployerPlugin {
             // the resolver stops answering. Turning cluster DNS on or off thus
             // reaches new containers without a restart. While the slot is
             // empty, containers get no custom `HostConfig.Dns` and keep
-            // Docker's embedded DNS, as before ADR-024. When it is set they
-            // also get fallback nameservers (`dns_with_fallback`), which
-            // guards against the DNS-timeout-cascade incident: glibc cycling
-            // through nameservers at ~5 s x 2 attempts when the only injected
-            // resolver is slow, causing 22-27 s connect delays.
+            // Docker's embedded DNS, as before ADR-024. When it is set the
+            // resolver is their only nameserver (`dns_with_fallback` adds
+            // none): it forwards outside names itself, and another
+            // nameserver would bypass internal policy (ADR-096).
             if local_workloads_enabled {
                 if let Some(slot) =
                     context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
