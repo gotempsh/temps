@@ -3604,6 +3604,8 @@ mod failed_create_cleanup_tests {
         /// Never answers, as a long pull does.
         Hang,
         Succeed,
+        /// The registry refuses the image.
+        Fail,
     }
 
     /// How the stub daemon answers creating the container.
@@ -3622,14 +3624,21 @@ mod failed_create_cleanup_tests {
 
     /// A stub Docker daemon for the create path. Every volume starts
     /// missing (its create answers with the labels it was created with, as
-    /// Docker does for a new volume), and every request is recorded in
-    /// `events`.
+    /// Docker does for a new volume) unless it is in `existing_volumes`
+    /// (its create answers with the labels it already had, as Docker does),
+    /// and every request is recorded in `events`.
     struct StubDaemon {
         pull: Pull,
         container_create: ContainerCreate,
         /// Hold the container start until `release_start`.
         hang_start: bool,
         release_start: tokio::sync::Notify,
+        /// Fail listing networks, so ensuring the app network fails.
+        fail_networks: bool,
+        /// Fail starting the container after it was created.
+        fail_start: bool,
+        /// Volumes that exist before the create, made by nobody it knows.
+        existing_volumes: std::collections::HashSet<String>,
         events: std::sync::Mutex<Vec<String>>,
         /// Labels of the container under the requested name, once there is one.
         container_labels: std::sync::Mutex<Option<serde_json::Value>>,
@@ -3642,9 +3651,27 @@ mod failed_create_cleanup_tests {
                 container_create,
                 hang_start,
                 release_start: tokio::sync::Notify::new(),
+                fail_networks: false,
+                fail_start: false,
+                existing_volumes: Default::default(),
                 events: Default::default(),
                 container_labels: Default::default(),
             }
+        }
+
+        fn failing_networks(mut self) -> Self {
+            self.fail_networks = true;
+            self
+        }
+
+        fn failing_start(mut self) -> Self {
+            self.fail_start = true;
+            self
+        }
+
+        fn with_existing_volume(mut self, name: &str) -> Self {
+            self.existing_volumes.insert(name.to_string());
+            self
         }
 
         fn record(&self, event: String) {
@@ -3696,11 +3723,21 @@ mod failed_create_cleanup_tests {
         let message = |text: &str| axum::Json(serde_json::json!({ "message": text }));
         match (method, path) {
             (Method::POST, "volumes/create") => {
-                daemon.record("create volume".to_string());
-                let labels = serde_json::from_slice::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|request| request.get("Labels").cloned())
-                    .unwrap_or_else(|| serde_json::json!({}));
+                let request = serde_json::from_slice::<serde_json::Value>(&body).ok();
+                let name = request
+                    .as_ref()
+                    .and_then(|request| request.get("Name"))
+                    .and_then(|name| name.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                daemon.record(format!("create volume {name}"));
+                let labels = if daemon.existing_volumes.contains(&name) {
+                    serde_json::json!({})
+                } else {
+                    request
+                        .and_then(|request| request.get("Labels").cloned())
+                        .unwrap_or_else(|| serde_json::json!({}))
+                };
                 (
                     StatusCode::CREATED,
                     axum::Json(serde_json::json!({
@@ -3725,9 +3762,23 @@ mod failed_create_cleanup_tests {
                     Pull::Succeed => {
                         (StatusCode::OK, "{\"status\":\"Downloaded\"}\n").into_response()
                     }
+                    Pull::Fail => (
+                        StatusCode::NOT_FOUND,
+                        message("pull access denied for stub/postgres"),
+                    )
+                        .into_response(),
                 }
             }
+            (Method::GET, "networks") if daemon.fail_networks => {
+                daemon.record("list networks".to_string());
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    message("daemon is restarting"),
+                )
+                    .into_response()
+            }
             (Method::GET, "networks") => {
+                daemon.record("list networks".to_string());
                 (StatusCode::OK, axum::Json(serde_json::json!([]))).into_response()
             }
             (Method::POST, "containers/create") => {
@@ -3768,6 +3819,13 @@ mod failed_create_cleanup_tests {
                 if daemon.hang_start {
                     daemon.release_start.notified().await;
                 }
+                if daemon.fail_start {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        message("port is already allocated"),
+                    )
+                        .into_response();
+                }
                 StatusCode::NO_CONTENT.into_response()
             }
             (Method::GET, p) if p.starts_with("containers/") && p.ends_with("/json") => {
@@ -3784,7 +3842,11 @@ mod failed_create_cleanup_tests {
                 }
             }
             (Method::DELETE, p) if p.starts_with("containers/") => {
-                daemon.record(format!("remove container {}", &p["containers/".len()..]));
+                daemon.record(format!(
+                    "remove container {} ?{}",
+                    &p["containers/".len()..],
+                    uri.query().unwrap_or_default()
+                ));
                 StatusCode::NO_CONTENT.into_response()
             }
             _ => (StatusCode::NOT_FOUND, message("not stubbed")).into_response(),
@@ -3966,6 +4028,125 @@ mod failed_create_cleanup_tests {
                 daemon.events()
             );
             assert_eq!(daemon.count(&format!("remove volume {volume}")), 1);
+            server.abort();
+        }
+    }
+
+    /// A request mounting `fresh`, which the create makes, and `existing`,
+    /// which was on the node before it.
+    fn create_request_with_volumes(
+        name: &str,
+        fresh: &str,
+        existing: &str,
+    ) -> crate::ServiceCreateRequest {
+        let mut request = create_request(name, fresh);
+        request.volumes.insert(
+            existing.to_string(),
+            "/var/lib/postgresql/backup".to_string(),
+        );
+        request
+    }
+
+    /// Each failure before or during the start answers with its own error and
+    /// hands cleanup exactly what this attempt made: the volume it created,
+    /// never the one that existed before, and the container only once it
+    /// exists. A failed start removes the container with its anonymous
+    /// volumes (`v`), forcibly, so a retry finds the name free.
+    #[tokio::test]
+    async fn each_failed_create_step_cleans_up_only_what_the_attempt_made() {
+        struct Case {
+            step: &'static str,
+            daemon: StubDaemon,
+            network: Option<String>,
+            error: &'static str,
+            reached_container: bool,
+        }
+        let cases = [
+            Case {
+                step: "network",
+                daemon: StubDaemon::new(Pull::Succeed, ContainerCreate::Created, false)
+                    .failing_networks(),
+                network: Some(temps_core::NETWORK_NAME.to_string()),
+                error: "Failed to create Docker network",
+                reached_container: false,
+            },
+            Case {
+                step: "pull",
+                daemon: StubDaemon::new(Pull::Fail, ContainerCreate::Created, false),
+                network: None,
+                error: "Failed to pull image 'stub/postgres:1'",
+                reached_container: false,
+            },
+            Case {
+                step: "start",
+                daemon: StubDaemon::new(Pull::Succeed, ContainerCreate::Created, false)
+                    .failing_start(),
+                network: None,
+                error: "Container created but failed to start",
+                reached_container: true,
+            },
+        ];
+        for case in cases {
+            let name = unique("postgres-failed-step");
+            let fresh = unique("postgres-failed-step_data");
+            let existing = unique("postgres-failed-step_kept");
+            let daemon = std::sync::Arc::new(case.daemon.with_existing_volume(&existing));
+            let (state, server) = agent_on(&daemon).await;
+            let mut request = create_request_with_volumes(&name, &fresh, &existing);
+            request.network = case.network;
+
+            let response = start_create(state, request).await.expect("create answers");
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{}",
+                case.step
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("response body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+            let error = body["error"].as_str().unwrap_or_default();
+            assert!(error.contains(case.error), "{}: {error}", case.step);
+            assert!(
+                !error.contains("Could not remove"),
+                "{}: cleanup left nothing behind: {error}",
+                case.step
+            );
+
+            let events = daemon.events();
+            assert_eq!(
+                daemon.count(&format!("remove volume {fresh}")),
+                1,
+                "{}: the volume this attempt created is removed: {events:?}",
+                case.step
+            );
+            assert_eq!(
+                daemon.count(&format!("remove volume {existing}")),
+                0,
+                "{}: a volume that existed before stays: {events:?}",
+                case.step
+            );
+            let removals: Vec<&String> = events
+                .iter()
+                .filter(|event| event.starts_with("remove container"))
+                .collect();
+            if case.reached_container {
+                assert_eq!(removals.len(), 1, "{}: {events:?}", case.step);
+                let removal = removals[0];
+                assert!(
+                    removal.starts_with(&format!("remove container {name} ?")),
+                    "{removal}"
+                );
+                assert!(
+                    removal.contains("v=true"),
+                    "anonymous volumes go too: {removal}"
+                );
+                assert!(removal.contains("force=true"), "{removal}");
+            } else {
+                assert!(removals.is_empty(), "{}: {events:?}", case.step);
+                assert_eq!(daemon.count("create container"), 0, "{}", case.step);
+            }
             server.abort();
         }
     }
