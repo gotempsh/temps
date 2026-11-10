@@ -157,3 +157,71 @@ test('loading displays skeleton rows before consumer data arrives', () => {
     client.clear()
   }
 })
+
+for (const kind of ['project', 'sandbox'] as const) {
+  test(`link form validates a ${kind} selection and sends the typed consumer`, async () => {
+    const bodies: unknown[] = []
+    const api = mockApi({
+      'GET /access-vaults/vault_fixture/links': () =>
+        jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
+      'GET /projects': () =>
+        jsonResponse({
+          projects: [
+            { id: 7, name: 'Fixture project', source_type: 'external' },
+          ],
+          total: 1,
+        }),
+      'GET /v1/sandboxes': () =>
+        jsonResponse({
+          sandboxes: [{ id: 'sbx_fixture', name: 'Fixture sandbox' }],
+          pagination: { count: 1 },
+        }),
+      'POST /access-vaults/vault_fixture/links': async (request) => {
+        bodies.push(await request.json())
+        return jsonResponse(
+          { id: 'link_fixture', vault_id: 'vault_fixture' },
+          201
+        )
+      },
+    })
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <VaultLinks vaultId="vault_fixture" />
+        </QueryClientProvider>
+      )
+      const ui = within(document.body)
+      fireEvent.click(
+        ui.getByRole('button', { name: 'Link project or sandbox' })
+      )
+      const dialog = within(ui.getByRole('dialog'))
+      if (kind === 'sandbox')
+        fireEvent.click(
+          dialog.getByRole('button', { name: 'Sandbox' })
+        )
+      fireEvent.click(dialog.getByRole('button', { name: 'Link consumer' }))
+      await waitFor(() =>
+        expect(dialog.getByRole('alert').textContent).toBe(`Select a ${kind}.`)
+      )
+      expect(bodies).toHaveLength(0)
+      fireEvent.click(
+        await dialog.findByRole('button', { name: `Fixture ${kind}` })
+      )
+      fireEvent.click(dialog.getByRole('button', { name: 'Link consumer' }))
+      await waitFor(() => expect(ui.queryByRole('dialog')).toBeNull())
+      expect(bodies).toEqual([
+        kind === 'project' ? { project_id: 7 } : { sandbox_id: 'sbx_fixture' },
+      ])
+    } finally {
+      cleanup()
+      client.clear()
+      api.restore()
+    }
+  })
+}

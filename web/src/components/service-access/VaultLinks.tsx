@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Button,
@@ -21,11 +24,29 @@ import { VaultConsumerPicker } from './VaultConsumerPicker'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { problemDetail } from '@/lib/api-problem'
 
+const consumerSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('project'),
+    selected: z.number({ error: 'Select a project.' }).int().positive(),
+  }),
+  z.object({
+    kind: z.literal('sandbox'),
+    selected: z
+      .string({ error: 'Select a sandbox.' })
+      .trim()
+      .min(1, 'Select a sandbox.'),
+  }),
+])
+
 export function VaultLinks({ vaultId }: { vaultId: string }) {
   const client = useQueryClient()
   const [page, setPage] = useState(1)
-  const [kind, setKind] = useState<'project' | 'sandbox'>('project')
-  const [selected, setSelected] = useState<number | string>()
+  const form = useForm<z.infer<typeof consumerSchema>>({
+    resolver: zodResolver(consumerSchema),
+    defaultValues: { kind: 'project' },
+  })
+  const kind = useWatch({ control: form.control, name: 'kind' })
+  const selected = useWatch({ control: form.control, name: 'selected' })
   const [open, setOpen] = useState(false)
   const [removing, setRemoving] = useState<VaultLinkResponse>()
   const links = useQuery(
@@ -41,19 +62,19 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
     })
   }
   const add = useMutation({
-    mutationFn: () =>
+    mutationFn: (values: z.infer<typeof consumerSchema>) =>
       createVaultLink({
         path: { vault_id: vaultId },
         body:
-          kind === 'project'
-            ? { project_id: Number(selected) }
-            : { sandbox_id: String(selected) },
+          values.kind === 'project'
+            ? { project_id: values.selected }
+            : { sandbox_id: values.selected },
         throwOnError: true,
       }),
     onSuccess: () => {
       refresh()
       setOpen(false)
-      setSelected(undefined)
+      form.reset({ kind: 'project' })
     },
   })
   const remove = useMutation({
@@ -141,41 +162,65 @@ export function VaultLinks({ vaultId }: { vaultId: string }) {
           <DialogHeader>
             <DialogTitle>Link a consumer</DialogTitle>
           </DialogHeader>
-          <div className="flex gap-2">
-            {(['project', 'sandbox'] as const).map((value) => (
-              <Button
-                key={value}
-                variant={kind === value ? 'default' : 'outline'}
-                onClick={() => {
-                  setKind(value)
-                  setSelected(undefined)
-                }}
-              >
-                {value === 'project' ? 'Project' : 'Sandbox'}
-              </Button>
-            ))}
-          </div>
-          <VaultConsumerPicker
-            key={kind}
-            kind={kind}
-            selected={selected}
-            onSelect={setSelected}
-          />
-          {add.isError && (
-            <Callout tone="error" title="Could not link consumer">
-              {problemDetail(
-                add.error,
-                'Check the selected consumer and retry.'
-              )}
-            </Callout>
-          )}
-          <Button
-            disabled={!selected || add.isPending}
-            aria-busy={add.isPending}
-            onClick={() => add.mutate()}
+          <form
+            className="space-y-3"
+            onSubmit={form.handleSubmit((values) => {
+              if (!add.isPending) add.mutate(values)
+            })}
           >
-            Link consumer
-          </Button>
+            <fieldset disabled={add.isPending} className="space-y-3">
+              <legend className="sr-only">Consumer</legend>
+              <div className="flex gap-2">
+                {(['project', 'sandbox'] as const).map((value) => (
+                  <Button
+                    key={value}
+                    type="button"
+                    variant={kind === value ? 'default' : 'outline'}
+                    onClick={() => {
+                      form.reset(
+                        value === 'project'
+                          ? { kind: 'project' }
+                          : { kind: 'sandbox' }
+                      )
+                    }}
+                  >
+                    {value === 'project' ? 'Project' : 'Sandbox'}
+                  </Button>
+                ))}
+              </div>
+              <VaultConsumerPicker
+                key={kind}
+                kind={kind}
+                selected={selected}
+                onSelect={(id) =>
+                  form.setValue('selected', id, {
+                    shouldDirty: true,
+                    shouldValidate: true,
+                  })
+                }
+              />
+            </fieldset>
+            {form.formState.errors.selected && (
+              <p role="alert" className="text-sm text-destructive">
+                {form.formState.errors.selected.message}
+              </p>
+            )}
+            {add.isError && (
+              <Callout tone="error" title="Could not link consumer">
+                {problemDetail(
+                  add.error,
+                  'Check the selected consumer and retry.'
+                )}
+              </Callout>
+            )}
+            <Button
+              type="submit"
+              disabled={add.isPending}
+              aria-busy={add.isPending}
+            >
+              Link consumer
+            </Button>
+          </form>
         </DialogContent>
       </Dialog>
       <ConfirmDeleteDialog
