@@ -22,6 +22,8 @@ struct Provider {
     recoveries: Mutex<Vec<(Option<i32>, String)>>,
     hang: AtomicBool,
     fail: AtomicBool,
+    capacity: Semaphore,
+    delay: Duration,
 }
 #[async_trait]
 impl SandboxProvider for Provider {
@@ -30,7 +32,16 @@ impl SandboxProvider for Provider {
         handle: &SandboxHandle,
         command: ServiceAccessCommand,
     ) -> Result<ServiceAccessReply, AgentError> {
+        let _permit = self
+            .capacity
+            .try_acquire()
+            .map_err(|_| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: "worker request capacity exceeded".into(),
+            })?;
         self.calls.lock().unwrap().push((handle.clone(), command));
+        tokio::time::sleep(self.delay).await;
         if self.hang.load(Ordering::Relaxed) {
             std::future::pending::<()>().await;
         }
@@ -173,6 +184,8 @@ fn provider(target: &StoredTarget) -> Arc<Provider> {
         recoveries: Mutex::new(vec![]),
         hang: AtomicBool::new(false),
         fail: AtomicBool::new(false),
+        capacity: Semaphore::new(2),
+        delay: Duration::ZERO,
     })
 }
 fn delivery(target: &StoredTarget) -> SessionDelivery {
@@ -464,4 +477,59 @@ async fn inspection_saturation_does_not_block_retirement_delivery() {
         target: observed.target.clone(),
     };
     transport.retire(&observed).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn four_inspections_queue_within_the_same_worker_capacity() {
+    let target = target();
+    let mut provider = provider(&target);
+    Arc::get_mut(&mut provider).unwrap().delay = Duration::from_secs(4);
+    let transport = WorkerTransport::new(provider.clone());
+    let sandbox = sandbox();
+    let (a, b, c, d) = tokio::join!(
+        transport.inspect(&sandbox),
+        transport.inspect(&sandbox),
+        transport.inspect(&sandbox),
+        transport.inspect(&sandbox),
+    );
+    for result in [a, b, c, d] {
+        result.unwrap();
+    }
+    assert_eq!(provider.calls.lock().unwrap().len(), 4);
+    assert_eq!(provider.capacity.available_permits(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn inspections_apply_and_retire_share_worker_admission() {
+    let target = target();
+    let mut provider = provider(&target);
+    Arc::get_mut(&mut provider).unwrap().delay = Duration::from_millis(100);
+    let transport = WorkerTransport::new(provider.clone());
+    let sandbox = sandbox();
+    let (inspection, another, apply, retire) = tokio::join!(
+        transport.inspect(&sandbox),
+        transport.inspect(&sandbox),
+        transport.apply(&target, 1, delivery(&target)),
+        transport.retire(&target),
+    );
+    inspection.unwrap();
+    another.unwrap();
+    // This fixture returns an Inspect receipt for every command. Reaching the
+    // receipt validation proves apply and retire were admitted, not rejected.
+    assert!(matches!(
+        apply,
+        Err(TransportError::Invalid {
+            operation: "apply",
+            ..
+        })
+    ));
+    assert!(matches!(
+        retire,
+        Err(TransportError::Invalid {
+            operation: "retire",
+            ..
+        })
+    ));
+    assert_eq!(provider.calls.lock().unwrap().len(), 4);
+    assert_eq!(provider.capacity.available_permits(), 2);
 }

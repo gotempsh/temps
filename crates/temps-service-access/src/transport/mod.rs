@@ -4,6 +4,7 @@
 //! Control-plane transport over the existing authenticated provider. Identity
 //! comes from a scoped database row and host inspection, never a guest request.
 mod delivery_budget;
+mod worker_budget;
 pub(crate) use delivery_budget::DISPATCH_CONCURRENCY;
 
 use std::{future::Future, sync::Arc, time::Duration};
@@ -159,11 +160,13 @@ fn parse_backend(value: Option<&str>) -> Option<SandboxBackend> {
 }
 
 /// One instance per control plane. Admission is bounded and has no waiting
-/// queue. Provider routing preserves the owning node and never falls back.
+/// queue globally. Admitted calls share a FIFO two-slot queue per worker,
+/// inside their operation deadline. Routing never falls back to another node.
 pub struct WorkerTransport {
     provider: Arc<dyn SandboxProvider>,
     slots: Semaphore,
     delivery: delivery_budget::DeliveryBudget,
+    workers: worker_budget::WorkerBudget,
 }
 impl WorkerTransport {
     pub fn new(provider: Arc<dyn SandboxProvider>) -> Self {
@@ -171,6 +174,7 @@ impl WorkerTransport {
             provider,
             slots: Semaphore::new(4),
             delivery: delivery_budget::DeliveryBudget::default(),
+            workers: worker_budget::WorkerBudget::default(),
         }
     }
     async fn bounded<T>(
@@ -245,6 +249,7 @@ impl WorkerTransport {
                     "recovered sandbox has a different owner, name or backend",
                 ));
             }
+            let _worker = self.workers.acquire(handle.node_id).await;
             let reply = self
                 .provider
                 .service_access(&handle, ServiceAccessCommand::Inspect)
@@ -307,6 +312,7 @@ impl WorkerTransport {
         let binding_version = delivery.version;
         self.delivery
             .run(id, "apply", 10, async {
+                let _worker = self.workers.acquire(target.handle.node_id).await;
                 let reply = self
                     .provider
                     .service_access(
@@ -344,6 +350,7 @@ impl WorkerTransport {
         let id = target.target.incarnation.as_str();
         self.delivery
             .run(id, "retire", 5, async {
+                let _worker = self.workers.acquire(target.handle.node_id).await;
                 let reply = self
                     .provider
                     .service_access(
