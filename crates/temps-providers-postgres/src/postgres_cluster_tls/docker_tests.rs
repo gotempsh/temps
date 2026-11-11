@@ -221,6 +221,22 @@ fn app_query(sslmode: &str, extra: &str) -> String {
     )
 }
 
+/// Exits 0 when any file of the managed layout (or an earlier one) exists.
+const ANY_TLS_FILES: &str = "for p in /var/lib/postgresql/tls /var/lib/postgresql/tls-current \
+     /var/lib/postgresql/tls-a /var/lib/postgresql/tls-b /var/lib/postgresql/tls-staging; do \
+     if [ -e \"$p\" ] || [ -L \"$p\" ]; then exit 0; fi; done; exit 1";
+
+/// pg_autoctl's certificate and key settings, on one line.
+const CONFIGURED_PAIR: &str = "echo $(gosu postgres pg_autoctl config get --pgdata /var/lib/postgresql/pgdata ssl.cert_file) \
+     $(gosu postgres pg_autoctl config get --pgdata /var/lib/postgresql/pgdata ssl.key_file)";
+
+const LINKED_PAIR: &str =
+    "/var/lib/postgresql/tls-current/server.crt /var/lib/postgresql/tls-current/server.key";
+
+/// How many of the two slot directories exist.
+const SLOTS_PRESENT: &str =
+    "ls -d /var/lib/postgresql/tls-a /var/lib/postgresql/tls-b 2>/dev/null | wc -l";
+
 #[tokio::test]
 async fn data_node_switches_to_the_managed_certificate_and_back_while_running() {
     let Some(mut h) = Harness::new().await else {
@@ -351,7 +367,7 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
         .await;
     assert_eq!(code, NOT_INITIALIZED_EXIT_CODE, "{out}");
     assert!(out.contains("still creating"), "{out}");
-    let (code, _) = h.sh(&node_name, "test -e /var/lib/postgresql/tls").await;
+    let (code, _) = h.sh(&node_name, ANY_TLS_FILES).await;
     assert_ne!(code, 0, "files written while pg_autoctl create ran");
     let (code, out) = h
         .sh(&node_name, "kill \"$(cat /tmp/fake-create.pid)\"")
@@ -389,7 +405,7 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
     let (code, out) = h
         .sh(
             &node_name,
-            "stat -c '%U %a' /var/lib/postgresql/tls/server.key /var/lib/postgresql/tls",
+            "stat -L -c '%U %a' /var/lib/postgresql/tls-current/server.key /var/lib/postgresql/tls-current",
         )
         .await;
     assert_eq!(
@@ -397,6 +413,14 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
         (0, "postgres 600\npostgres 700"),
         "key ownership and mode"
     );
+    let (code, out) = h.sh(&node_name, CONFIGURED_PAIR).await;
+    assert_eq!(
+        (code, out.trim()),
+        (0, LINKED_PAIR),
+        "pg_autoctl names the pair through the link"
+    );
+    let (code, out) = h.sh(&node_name, SLOTS_PRESENT).await;
+    assert_eq!((code, out.trim()), (0, "1"), "only the slot in use is kept");
     // The monitor still drives the node: replication and failover use
     // pg_autoctl's own connections, unaffected by the served certificate.
     h.wait_for(
@@ -441,6 +465,8 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
         .await;
     assert_eq!(code, 0, "re-apply: {out}");
 
+    renewal_switches_slots(&h, &node_name, &ca, &leaf.fingerprint_sha256, &verified).await;
+
     // Back to pg_auto_failover's self-signed certificate.
     let (code, out) = h
         .exec(
@@ -458,8 +484,17 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
     assert_ne!(code, 0, "managed certificate still served after off");
     let (code, out) = h.sh(&node_name, &app_query("require", "")).await;
     assert_eq!((code, out.trim()), (0, "t"), "self-signed TLS: {out}");
-    let (code, _) = h.sh(&node_name, "test -e /var/lib/postgresql/tls").await;
+    let (code, _) = h.sh(&node_name, ANY_TLS_FILES).await;
     assert_ne!(code, 0, "managed files left behind");
+    let (code, out) = h.sh(&node_name, CONFIGURED_PAIR).await;
+    assert_eq!(
+        (code, out.trim()),
+        (
+            0,
+            "/var/lib/postgresql/pgdata/server.crt /var/lib/postgresql/pgdata/server.key"
+        ),
+        "pg_autoctl is back on its self-signed pair"
+    );
 
     // The monitor is refused: it is not a data node.
     let (code, out) = h
@@ -471,4 +506,63 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
         .await;
     assert_ne!(code, 0, "{out}");
     assert!(out.contains("not a pg_auto_failover data node"), "{out}");
+}
+
+/// A renewal switches both files together through the link, leaving
+/// pg_autoctl's settings as they are, and keeps only the slot in use.
+async fn renewal_switches_slots(
+    h: &Harness,
+    node_name: &str,
+    ca: &temps_core::managed_service_pki::ManagedServicesCa,
+    previous: &str,
+    verified: &str,
+) {
+    let (_, before) = h
+        .sh(node_name, "readlink /var/lib/postgresql/tls-current")
+        .await;
+    let renewed = match issue_server_certificate(
+        &ca.cert_pem,
+        &ca.key_pem,
+        node_name,
+        &["localhost".to_string(), "127.0.0.1".to_string()],
+        chrono::Utc::now(),
+    ) {
+        Ok(renewed) => renewed,
+        Err(e) => panic!("issuing the renewed certificate for {node_name} failed: {e}"),
+    };
+    assert_ne!(renewed.fingerprint_sha256, previous);
+    let (code, out) = h
+        .exec(
+            node_name,
+            server_tls_apply_command(ClusterServerCertificate::Managed),
+            &HashMap::from([
+                (CLUSTER_TLS_CERT_ENV.to_string(), renewed.cert_pem.clone()),
+                (CLUSTER_TLS_KEY_ENV.to_string(), renewed.key_pem.clone()),
+            ]),
+        )
+        .await;
+    assert_eq!(code, 0, "renew: {out}");
+    assert_eq!(
+        parse_served_fingerprint(&out).as_deref(),
+        Some(renewed.fingerprint_sha256.as_str()),
+        "{out}"
+    );
+    let (_, after) = h
+        .sh(node_name, "readlink /var/lib/postgresql/tls-current")
+        .await;
+    assert_ne!(
+        before.trim(),
+        after.trim(),
+        "the renewal went into the other slot"
+    );
+    let (code, out) = h.sh(node_name, CONFIGURED_PAIR).await;
+    assert_eq!((code, out.trim()), (0, LINKED_PAIR));
+    let (code, out) = h.sh(node_name, SLOTS_PRESENT).await;
+    assert_eq!((code, out.trim()), (0, "1"), "the old slot is removed");
+    let (code, out) = h.sh(node_name, verified).await;
+    assert_eq!(
+        (code, out.trim()),
+        (0, "t"),
+        "verify-full after renewal: {out}"
+    );
 }

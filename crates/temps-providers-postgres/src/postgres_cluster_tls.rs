@@ -11,23 +11,39 @@
 //! running member and without a restart:
 //!
 //! 1. the certificate and key arrive in the exec environment (never in the
-//!    container's configuration) and are written to [`CLUSTER_TLS_DIR`],
-//!    outside `PGDATA`, so a standby's base backup never copies them;
-//! 2. `pg_autoctl config set ssl.cert_file / ssl.key_file` records the paths
-//!    in pg_autoctl's own configuration, on the member's volume, which
-//!    pg_autoctl turns into `ssl_cert_file` / `ssl_key_file` at every start;
-//! 3. a reload makes PostgreSQL load the new pair (it reloads its TLS context
+//!    container's configuration) and are written whole into one of two slot
+//!    directories ([`CLUSTER_TLS_SLOTS`]), outside `PGDATA`, so a standby's
+//!    base backup never copies them;
+//! 2. [`CLUSTER_TLS_LINK`] is switched to that slot by one rename, so the
+//!    certificate and key it names change together: no reload or restart
+//!    ever finds one file of the new pair beside one of the old;
+//! 3. pg_autoctl's `ssl.cert_file / ssl.key_file`, on the member's volume,
+//!    name the files through the link, so a renewal never changes them;
+//!    they are moved onto the link once, each step through a copy of the
+//!    pair already served, so every intermediate setting is a matching pair;
+//! 4. a reload makes PostgreSQL load the new pair (it reloads its TLS context
 //!    on SIGHUP), and the script checks the certificate the member actually
 //!    serves before reporting success.
 //!
-//! Turning it off points pg_autoctl back at its self-signed pair in `PGDATA`.
+//! Turning it off switches the link to a copy of pg_autoctl's self-signed
+//! pair in `PGDATA`, points the settings back at that pair (again one
+//! matching step at a time), then removes the link and both slots.
 //! pg_autoctl's own connections to the monitor and its peers keep
 //! `sslmode=require`, so replication and failover never depend on which
 //! certificate a member serves.
 
-/// Directory of a data node's managed certificate and key, on the member's
-/// persistent volume and outside `PGDATA`.
-pub const CLUSTER_TLS_DIR: &str = "/var/lib/postgresql/tls";
+/// Symlink naming the slot of the pair a data node serves, on the member's
+/// persistent volume and outside `PGDATA`; pg_autoctl's settings name
+/// `server.crt` / `server.key` through it.
+pub const CLUSTER_TLS_LINK: &str = "/var/lib/postgresql/tls-current";
+
+/// The two slot directories a pair is written into: always the one the
+/// link does not name, so the pair in use is never rewritten.
+pub const CLUSTER_TLS_SLOTS: [&str; 2] = ["/var/lib/postgresql/tls-a", "/var/lib/postgresql/tls-b"];
+
+/// A directory an earlier build wrote the pair into in place. Removed once
+/// nothing points at it.
+const LEGACY_CLUSTER_TLS_DIR: &str = "/var/lib/postgresql/tls";
 
 /// Exec environment variable carrying the certificate PEM.
 pub const CLUSTER_TLS_CERT_ENV: &str = "TEMPS_TLS_CERT_PEM";
@@ -98,32 +114,93 @@ if [ -z "$KEEPER" ]; then
   exit 10
 fi"#;
 
+/// Shell helpers for the slots and the link. `config set` is pg_autoctl's
+/// own command: it rewrites its configuration and reloads PostgreSQL.
+const SLOT_FNS: &str = r#"LINK_CERT="$LINK/server.crt"
+LINK_KEY="$LINK/server.key"
+# The slot the link does not name: the one a new pair goes into.
+other_slot() {
+  case "$(readlink "$LINK" 2>/dev/null || true)" in
+    "$(basename "$SLOT_A")") echo "$SLOT_B" ;;
+    *) echo "$SLOT_A" ;;
+  esac
+}
+# A complete, private copy of a pair in a slot no setting names.
+fill_slot() {
+  rm -rf "$1"
+  install -d -o postgres -g postgres -m 0700 "$1"
+  install -o postgres -g postgres -m 0644 "$2" "$1/server.crt"
+  install -o postgres -g postgres -m 0600 "$3" "$1/server.key"
+}
+# Switch the link to a slot in one rename: both files change together.
+point_link_at() {
+  ln -sfn "$(basename "$1")" "$LINK.next"
+  chown -h postgres:postgres "$LINK.next"
+  mv -Tf "$LINK.next" "$LINK"
+}
+set_pair() {
+  gosu postgres pg_autoctl config set --pgdata "$PGDATA" ssl.cert_file "$1" >/dev/null
+  gosu postgres pg_autoctl config set --pgdata "$PGDATA" ssl.key_file "$2" >/dev/null
+}
+CUR_CERT=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" ssl.cert_file 2>/dev/null || true)
+CUR_KEY=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" ssl.key_file 2>/dev/null || true)
+[ -n "$CUR_CERT" ] || CUR_CERT="$PGDATA/server.crt"
+[ -n "$CUR_KEY" ] || CUR_KEY="$PGDATA/server.key"
+# Name the files through the link. A copy of the pair served now goes into
+# a slot first, so each of the two settings, set one after the other, names
+# a file of that same pair: no step leaves a certificate beside another key.
+move_onto_link() {
+  if [ "$CUR_CERT" = "$LINK_CERT" ] && [ "$CUR_KEY" = "$LINK_KEY" ]; then
+    return 0
+  fi
+  if [ ! -f "$CUR_CERT" ] || [ ! -f "$CUR_KEY" ]; then
+    echo "temps: the certificate pair this data node is configured with ($CUR_CERT, $CUR_KEY) is missing; nothing was changed" >&2
+    exit 4
+  fi
+  SLOT=$(other_slot)
+  fill_slot "$SLOT" "$CUR_CERT" "$CUR_KEY"
+  point_link_at "$SLOT"
+  set_pair "$LINK_CERT" "$LINK_KEY"
+  CUR_CERT="$LINK_CERT"
+  CUR_KEY="$LINK_KEY"
+}"#;
+
 const INSTALL_MANAGED: &str = r#"if [ -z "${TEMPS_TLS_CERT_PEM:-}" ] || [ -z "${TEMPS_TLS_KEY_PEM:-}" ]; then
   echo "temps: the managed certificate or key was not passed to the member" >&2
   exit 2
 fi
 umask 077
-install -d -o postgres -g postgres -m 0700 "$TLS_DIR"
-printf '%s\n' "$TEMPS_TLS_CERT_PEM" > "$TLS_DIR/server.crt.new"
-printf '%s\n' "$TEMPS_TLS_KEY_PEM" > "$TLS_DIR/server.key.new"
-chown postgres:postgres "$TLS_DIR/server.crt.new" "$TLS_DIR/server.key.new"
-chmod 0644 "$TLS_DIR/server.crt.new"
-chmod 0600 "$TLS_DIR/server.key.new"
-if [ "$(openssl x509 -in "$TLS_DIR/server.crt.new" -noout -pubkey)" != "$(openssl pkey -in "$TLS_DIR/server.key.new" -pubout)" ]; then
-  rm -f "$TLS_DIR/server.crt.new" "$TLS_DIR/server.key.new"
+STAGING="$TLS_HOME/tls-staging"
+rm -rf "$STAGING"
+install -d -o root -g root -m 0700 "$STAGING"
+printf '%s\n' "$TEMPS_TLS_CERT_PEM" > "$STAGING/server.crt"
+printf '%s\n' "$TEMPS_TLS_KEY_PEM" > "$STAGING/server.key"
+if [ "$(openssl x509 -in "$STAGING/server.crt" -noout -pubkey)" != "$(openssl pkey -in "$STAGING/server.key" -pubout)" ]; then
+  rm -rf "$STAGING"
   echo "temps: the managed certificate does not match its private key; nothing was changed" >&2
   exit 3
 fi
-mv -f "$TLS_DIR/server.key.new" "$TLS_DIR/server.key"
-mv -f "$TLS_DIR/server.crt.new" "$TLS_DIR/server.crt"
-CERT="$TLS_DIR/server.crt"
-KEY="$TLS_DIR/server.key""#;
+move_onto_link
+SLOT=$(other_slot)
+fill_slot "$SLOT" "$STAGING/server.crt" "$STAGING/server.key"
+rm -rf "$STAGING"
+point_link_at "$SLOT"
+CERT="$LINK_CERT"
+KEY="$LINK_KEY""#;
 
 const SELECT_SELF_SIGNED: &str = r#"CERT="$PGDATA/server.crt"
 KEY="$PGDATA/server.key"
 if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
   echo "temps: pg_auto_failover's self-signed certificate is missing from $PGDATA; the managed certificate stays in place" >&2
   exit 4
+fi
+if [ "$CUR_CERT" != "$CERT" ] || [ "$CUR_KEY" != "$KEY" ]; then
+  # Serve a copy of the self-signed pair through the link first: the two
+  # settings then move from one copy of that pair to the other.
+  move_onto_link
+  SLOT=$(other_slot)
+  fill_slot "$SLOT" "$CERT" "$KEY"
+  point_link_at "$SLOT"
 fi"#;
 
 /// pg_autoctl reloads its configuration on `config set`, and a second change
@@ -179,20 +256,32 @@ fn bounded_bash(deadline_secs: u64, script: String) -> Vec<String> {
 }
 
 pub fn server_tls_apply_command(target: ClusterServerCertificate) -> Vec<String> {
+    let [slot_a, slot_b] = CLUSTER_TLS_SLOTS;
     let mut script = vec![
         PREAMBLE.to_string(),
-        format!("TLS_DIR={CLUSTER_TLS_DIR}"),
+        "TLS_HOME=/var/lib/postgresql".to_string(),
+        format!("LINK={CLUSTER_TLS_LINK}"),
+        format!("SLOT_A={slot_a}"),
+        format!("SLOT_B={slot_b}"),
+        format!("LEGACY_DIR={LEGACY_CLUSTER_TLS_DIR}"),
         SERVED_FINGERPRINT_FN.to_string(),
+        SLOT_FNS.to_string(),
     ];
     match target {
         ClusterServerCertificate::Managed => script.push(INSTALL_MANAGED.to_string()),
         ClusterServerCertificate::SelfSigned => script.push(SELECT_SELF_SIGNED.to_string()),
     }
     script.push(APPLY_AND_VERIFY.to_string());
-    if target == ClusterServerCertificate::SelfSigned {
-        // Nothing points at the managed files any more.
-        script.push(r#"rm -rf "$TLS_DIR""#.to_string());
-    }
+    script.push(match target {
+        // Only the slot the link names is in use.
+        ClusterServerCertificate::Managed => r#"rm -rf "$(other_slot)" "$LEGACY_DIR""#
+            .to_string(),
+        // Nothing points at the link or the slots any more.
+        ClusterServerCertificate::SelfSigned => {
+            r#"rm -rf "$LINK" "$LINK.next" "$SLOT_A" "$SLOT_B" "$TLS_HOME/tls-staging" "$LEGACY_DIR""#
+                .to_string()
+        }
+    });
     script.push(format!(r#"echo "{SERVED_FINGERPRINT_MARKER}$EXPECTED""#));
     bounded_bash(MEMBER_APPLY_DEADLINE_SECS, script.join("\n"))
 }
@@ -236,16 +325,67 @@ mod tests {
     #[test]
     fn managed_certificate_is_written_outside_pgdata_with_a_private_key() {
         let s = script(ClusterServerCertificate::Managed);
-        assert!(s.contains("TLS_DIR=/var/lib/postgresql/tls"));
-        assert!(s.contains("install -d -o postgres -g postgres -m 0700"));
-        assert!(s.contains(r#"chmod 0600 "$TLS_DIR/server.key.new""#));
+        assert!(s.contains("LINK=/var/lib/postgresql/tls-current"));
+        assert!(s.contains("SLOT_A=/var/lib/postgresql/tls-a"));
+        assert!(s.contains("SLOT_B=/var/lib/postgresql/tls-b"));
+        assert!(s.contains(r#"install -d -o postgres -g postgres -m 0700 "$1""#));
+        assert!(s.contains(r#"install -o postgres -g postgres -m 0600 "$3" "$1/server.key""#));
         assert!(s.contains("umask 077"));
-        // Written whole, then renamed into place.
-        assert!(s.contains(r#"mv -f "$TLS_DIR/server.key.new" "$TLS_DIR/server.key""#));
         // A mismatched pair is refused before anything is switched.
         let check = s.find("does not match its private key").unwrap();
-        assert!(check < s.find("pg_autoctl config set").unwrap());
-        assert!(!s.contains("rm -rf \"$TLS_DIR\""));
+        assert!(check < s.find("\nmove_onto_link\n").unwrap());
+        assert!(check < s.find("\nfill_slot \"$SLOT\"").unwrap());
+        // Only the slot no longer named is removed; the link stays.
+        assert!(s.contains(r#"rm -rf "$(other_slot)" "$LEGACY_DIR""#));
+        assert!(!s.contains(r#"rm -rf "$LINK""#));
+    }
+
+    /// The pair in use is never rewritten in place, and the certificate and
+    /// key always switch together: the new pair is written whole into the
+    /// slot the link does not name, then the link is renamed onto it.
+    #[test]
+    fn a_new_pair_switches_in_one_rename() {
+        let s = script(ClusterServerCertificate::Managed);
+        assert!(!s.contains("server.key.new") && !s.contains("server.crt.new"));
+        assert!(s.contains(r#"ln -sfn "$(basename "$1")" "$LINK.next""#));
+        assert!(s.contains(r#"mv -Tf "$LINK.next" "$LINK""#));
+        assert_eq!(
+            s.matches("mv ").count(),
+            1,
+            "the link rename is the only move: {s}"
+        );
+        let fill = s
+            .find("fill_slot \"$SLOT\" \"$STAGING/server.crt\"")
+            .unwrap();
+        let switch = s[fill..].find("point_link_at \"$SLOT\"").unwrap() + fill;
+        let verify = s.find("EXPECTED=").unwrap();
+        assert!(fill < switch && switch < verify);
+        // pg_autoctl's settings name the files through the link.
+        assert!(s.contains(r#"CERT="$LINK_CERT""#));
+        assert!(s.contains(r#"KEY="$LINK_KEY""#));
+    }
+
+    /// Moving the settings onto the link (or back to `PGDATA`) changes them
+    /// one at a time, each time to a copy of the pair already served.
+    #[test]
+    fn the_settings_move_through_a_copy_of_the_served_pair() {
+        let s = script(ClusterServerCertificate::Managed);
+        let body = &s[s.find("move_onto_link() {").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        let copy = body
+            .find(r#"fill_slot "$SLOT" "$CUR_CERT" "$CUR_KEY""#)
+            .unwrap();
+        let switch = body.find(r#"point_link_at "$SLOT""#).unwrap();
+        let set = body.find(r#"set_pair "$LINK_CERT" "$LINK_KEY""#).unwrap();
+        assert!(copy < switch && switch < set, "{body}");
+        assert!(body.contains("exit 4"));
+
+        let s = script(ClusterServerCertificate::SelfSigned);
+        let select = &s[s.find("\nCERT=\"$PGDATA/server.crt\"").unwrap()..];
+        let copy = select.find(r#"fill_slot "$SLOT" "$CERT" "$KEY""#).unwrap();
+        let switch = select.find(r#"point_link_at "$SLOT""#).unwrap();
+        let set = select.find("pg_autoctl config set").unwrap();
+        assert!(copy < switch && switch < set, "{select}");
     }
 
     #[test]
@@ -292,7 +432,9 @@ mod tests {
         assert!(s.contains(r#"KEY="$PGDATA/server.key""#));
         assert!(!s.contains("TEMPS_TLS_KEY_PEM"));
         let applied = s.find("APPLIED=1").unwrap();
-        let removed = s.find(r#"rm -rf "$TLS_DIR""#).unwrap();
+        let removed = s
+            .find(r#"rm -rf "$LINK" "$LINK.next" "$SLOT_A" "$SLOT_B""#)
+            .unwrap();
         assert!(removed > applied, "files are removed only once unused");
     }
 
