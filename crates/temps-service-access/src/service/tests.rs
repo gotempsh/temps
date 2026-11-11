@@ -48,6 +48,7 @@ fn policy() -> SandboxAccessPolicy {
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
         methods: vec![AccessMethod::Get],
+        delivery: None,
     }
 }
 fn row() -> services::Model {
@@ -624,6 +625,58 @@ async fn stored_bearer_cannot_follow_an_origin_change() {
         !log.contains(" SET "),
         "an unsafe edit must roll back before writing"
     );
+}
+
+#[tokio::test]
+async fn stored_credential_cannot_follow_a_credential_format_change() {
+    use crate::types::{CredentialDelivery, CredentialFormat};
+    let mut old = row();
+    old.credential_encrypted = Some(encryption().encrypt_string("original-test-secret").unwrap());
+    let s = service(
+        service_write_db()
+            .append_query_results([vec![project_row()]])
+            .append_query_results([vec![old]]),
+    );
+    let mut req = request();
+    req.expected_version = Some(1);
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::Header {
+            name: "x-api-key".into(),
+            prefix: None,
+        },
+        headers: Vec::new(),
+    });
+    assert!(matches!(
+        s.save_service(7, Some("svc_test".into()), req).await,
+        Err(AccessError::Validation {
+            field: "credential",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn credential_shape_follows_the_selected_format() {
+    use crate::types::{CredentialDelivery, CredentialFormat};
+    let mut req = request();
+    req.policy.delivery = Some(CredentialDelivery {
+        format: CredentialFormat::Basic,
+        headers: Vec::new(),
+    });
+    req.credential = Some(temps_core::secret_string::SecretString::new(
+        "token-without-a-password",
+    ));
+    assert!(matches!(
+        validate_service(&mut req),
+        Err(AccessError::Validation {
+            field: "credential",
+            ..
+        })
+    ));
+    req.credential = Some(temps_core::secret_string::SecretString::new(
+        "account:secret",
+    ));
+    validate_service(&mut req).unwrap();
 }
 
 #[tokio::test]

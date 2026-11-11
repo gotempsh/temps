@@ -109,6 +109,7 @@ async fn session_route(projectless: bool, removal: &str) {
                         origin: "https://api.example.com".into(),
                         path_prefixes: vec!["/v1".into()],
                         methods: vec![AccessMethod::Get],
+                        delivery: None,
                     },
                     max_ttl_seconds: 900,
                     enabled: true,

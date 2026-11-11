@@ -11,6 +11,7 @@ fn policy(prefix: &str) -> SandboxAccessPolicy {
         origin: "https://api.example.com".into(),
         path_prefixes: vec![prefix.into()],
         methods: vec![AccessMethod::Get],
+        delivery: None,
     }
 }
 

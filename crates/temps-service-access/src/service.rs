@@ -6,6 +6,7 @@ mod audit_scope;
 use audit_scope::capture_service_audit_scope;
 pub(crate) use audit_scope::service_audit_scope_key;
 mod catalog;
+mod credential_links;
 pub use catalog::{ServiceCatalog, ServiceCatalogEntry, ServiceCatalogQuery};
 mod consent;
 mod links;
@@ -225,6 +226,18 @@ impl ServiceAccessService {
                 let (previous, _) = crate::tokenless::compile_policy(&previous)?;
                 if previous.origin != request.policy.origin {
                     return Err(invalid("credential", "changing the HTTPS origin requires a replacement credential or explicit credential clearing"));
+                }
+                // The stored secret was entered for one format (a token, or a
+                // username:password pair); a different format needs a new one.
+                let format = |policy: &SandboxAccessPolicy| {
+                    policy
+                        .delivery
+                        .as_ref()
+                        .map(|delivery| delivery.format.clone())
+                        .unwrap_or_default()
+                };
+                if format(&previous) != format(&request.policy) {
+                    return Err(invalid("credential", "changing the credential format requires a replacement credential or explicit credential clearing"));
                 }
             }
             let mut model = current.into_active_model();
@@ -539,11 +552,17 @@ pub fn validate_service(request: &mut SaveAccessService) -> Result<(), AccessErr
             || secret.len() > 16384
             || !secret.bytes().all(|c| (33..=126).contains(&c))
         {
-            return Err(invalid("credential", "must be a nonempty bearer value of at most 16384 printable ASCII bytes, without whitespace"));
+            return Err(invalid("credential", "must be a nonempty value of at most 16384 printable ASCII bytes, without whitespace"));
         }
     }
     let (policy, _) = crate::tokenless::compile_policy(&request.policy)?;
     request.policy = policy;
+    if let Some(secret) = &request.credential {
+        crate::tokenless::delivery::validate_credential_shape(
+            request.policy.delivery.as_ref(),
+            secret.expose(),
+        )?;
+    }
     Ok(())
 }
 
@@ -559,6 +578,7 @@ fn service_response(model: services::Model) -> Result<AccessServiceResponse, Acc
         project_id: model.project_id,
         name: model.name,
         has_credential: model.credential_encrypted.is_some() || policy.github_repository.is_some(),
+        catalog: catalog::reference_for_origin(&policy.origin),
         policy,
         max_ttl_seconds: model.max_ttl_seconds,
         enabled: model.enabled,

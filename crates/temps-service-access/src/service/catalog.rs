@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::ServiceAccessService;
-use crate::{error::AccessError, types::AccessServiceProvider};
+use crate::{
+    error::AccessError,
+    types::{
+        AccessServiceProvider, CatalogReference, CredentialDelivery, CredentialFormat,
+        CredentialHelp, RequestHeader,
+    },
+};
 use serde::{Deserialize, Serialize};
 use tokenless_core::{
     injection::InjectionSpec,
@@ -31,6 +37,16 @@ pub struct ServiceCatalogEntry {
     /// Existing presentation identity, when known. New catalog selections use
     /// the ordinary custom-HTTP policy shape for older-reader compatibility.
     pub provider: Option<AccessServiceProvider>,
+    /// How this service takes its credential and which fixed headers it needs.
+    /// Present when it differs from a plain bearer token; the console sends it
+    /// back as the policy's `delivery`.
+    pub delivery: Option<CredentialDelivery>,
+    /// One label for a single credential, or two (username, password) when the
+    /// service signs in with a pair that is stored as `username:password`.
+    pub credential_labels: Vec<String>,
+    /// Where to create the credential: a page when Temps knows one, and the
+    /// template's own notes about each field. Both may be absent.
+    pub credential_help: CredentialHelp,
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ServiceCatalog {
@@ -90,13 +106,11 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
         }
         let reason = if template.kind == ServiceKind::Mcp {
             Some("MCP tool-scoped access is not supported by Temps vault sessions yet.")
-        } else if !matches!(template.injection, InjectionSpec::Bearer { .. }) {
-            Some("This service needs a credential format other than a bearer token; Temps vault sessions do not support that format yet.")
-        } else if !template.default_headers.is_empty() {
-            Some("This service requires additional request headers; Temps vault sessions do not support those headers yet.")
         } else {
             None
         };
+        let (delivery, credential_labels) = delivery_for(&template);
+        let credential_help = help_for(&template);
         let origin = template
             .hosts
             .iter()
@@ -125,6 +139,9 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
             supported: reason.is_none(),
             reason: reason.map(str::to_owned),
             provider,
+            delivery,
+            credential_labels,
+            credential_help,
         });
     }
     items.sort_by(|a, b| {
@@ -147,6 +164,131 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
         page_size,
     })
 }
+/// The delivery a template needs, or `None` for a plain bearer token, with the
+/// labels for its credential inputs. Header values that are `{{VARIABLE}}`
+/// placeholders ship empty: the operator supplies them for their own account.
+fn delivery_for(
+    template: &tokenless_core::template::ServiceTemplate,
+) -> (Option<CredentialDelivery>, Vec<String>) {
+    let label = |name: &str| {
+        template
+            .credential_fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.label.clone())
+    };
+    let (format, labels) = match &template.injection {
+        InjectionSpec::Bearer { field } => (CredentialFormat::Bearer, vec![label(field)]),
+        InjectionSpec::Header {
+            name,
+            field,
+            prefix,
+        } => (
+            CredentialFormat::Header {
+                name: name.to_ascii_lowercase(),
+                prefix: prefix.clone(),
+            },
+            vec![label(field)],
+        ),
+        InjectionSpec::BasicToken {
+            username,
+            password_field,
+        } => (
+            CredentialFormat::BasicToken {
+                username: username.clone(),
+            },
+            vec![label(password_field)],
+        ),
+        InjectionSpec::Basic {
+            username_field,
+            password_field,
+        } => (
+            CredentialFormat::Basic,
+            vec![label(username_field), label(password_field)],
+        ),
+    };
+    let headers: Vec<RequestHeader> = template
+        .default_headers
+        .iter()
+        .map(|header| RequestHeader {
+            name: header.name.to_ascii_lowercase(),
+            value: if header.value.contains("{{") {
+                String::new()
+            } else {
+                header.value.clone()
+            },
+        })
+        .collect();
+    let labels = labels
+        .into_iter()
+        .map(|label| label.unwrap_or_else(|| "Credential".into()))
+        .collect();
+    let delivery = (format != CredentialFormat::Bearer || !headers.is_empty())
+        .then_some(CredentialDelivery { format, headers });
+    (delivery, labels)
+}
+
+/// Where the credential for `template` is created, plus the template's own
+/// notes about its credential fields.
+fn help_for(template: &tokenless_core::template::ServiceTemplate) -> CredentialHelp {
+    CredentialHelp {
+        url: super::credential_links::credential_url(&template.id).map(str::to_owned),
+        notes: template
+            .credential_fields
+            .iter()
+            .filter(|field| !field.description.is_empty())
+            .map(|field| format!("{}: {}", field.label, field.description))
+            .collect(),
+    }
+}
+
+/// The catalog entry whose own host is `origin`, so a service saved from the
+/// catalog keeps its logo, credential labels and credential help without storing
+/// anything beyond the ordinary custom-HTTP policy. Exact hosts win over
+/// wildcards; ties go to the popular, then shortest, template id so the answer
+/// is stable across releases.
+pub(crate) fn reference_for_origin(origin: &str) -> Option<CatalogReference> {
+    static INDEX: std::sync::OnceLock<Vec<(String, CatalogReference)>> = std::sync::OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let Ok(templates) = builtin_templates() else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for (template, _) in templates {
+            if template.kind == ServiceKind::Mcp {
+                continue;
+            }
+            let reference = CatalogReference {
+                id: template.id.clone(),
+                name: template.name.clone(),
+                logo: template.logo.clone().unwrap_or_else(|| template.id.clone()),
+                credential_labels: delivery_for(&template).1,
+                credential_help: help_for(&template),
+            };
+            for host in &template.hosts {
+                entries.push((host.to_string(), reference.clone(), !template.popular));
+            }
+        }
+        entries.sort_by(|a, b| (&a.2, a.1.id.len(), &a.1.id).cmp(&(&b.2, b.1.id.len(), &b.1.id)));
+        entries
+            .into_iter()
+            .map(|(host, reference, _)| (host, reference))
+            .collect()
+    });
+    let host = origin.strip_prefix("https://")?.to_ascii_lowercase();
+    let exact = index.iter().find(|(pattern, _)| *pattern == host);
+    let wildcard = || {
+        index.iter().find(|(pattern, _)| {
+            pattern
+                .strip_prefix("*.")
+                .is_some_and(|suffix| host.ends_with(&format!(".{suffix}")))
+        })
+    };
+    exact
+        .or_else(wildcard)
+        .map(|(_, reference)| reference.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,10 +336,12 @@ mod tests {
             .items
             .iter()
             .any(|item| item.id == "deepseek" && item.supported));
-        assert!(all
-            .items
-            .iter()
-            .any(|item| item.id == "anthropic" && !item.supported && item.reason.is_some()));
+        let mcp = catalog(ServiceCatalogQuery {
+            id: Some("supabase-mcp".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!mcp.items[0].supported && mcp.items[0].reason.is_some());
         assert!(!all
             .items
             .iter()
@@ -216,5 +360,62 @@ mod tests {
         })
         .unwrap();
         assert!(last.items.is_empty());
+    }
+    #[test]
+    fn origin_resolves_to_its_catalog_reference_without_inventing_one() {
+        let slack = reference_for_origin("https://slack.com").expect("slack is in the catalog");
+        assert!(!slack.logo.is_empty() && !slack.credential_labels.is_empty());
+        assert_eq!(
+            slack.credential_help.url.as_deref(),
+            Some("https://api.slack.com/apps")
+        );
+        assert_eq!(
+            reference_for_origin("https://SLACK.com").map(|r| r.id),
+            Some(slack.id)
+        );
+        assert!(reference_for_origin("https://internal.example.invalid").is_none());
+        assert!(reference_for_origin("http://slack.com").is_none());
+    }
+    #[test]
+    fn every_listed_http_service_is_supported_with_a_deliverable_credential_format() {
+        let mut checked = 0;
+        for page in 1..=3 {
+            let all = catalog(ServiceCatalogQuery {
+                page: Some(page),
+                page_size: Some(100),
+                ..Default::default()
+            })
+            .unwrap();
+            for entry in all.items {
+                if entry.id.ends_with("-mcp") || entry.id == "generic-mcp" {
+                    assert!(!entry.supported, "{} needs tool-scoped access", entry.id);
+                    continue;
+                }
+                assert!(entry.supported, "{} must be supported", entry.id);
+                assert!(!entry.credential_labels.is_empty(), "{}", entry.id);
+                let mut delivery = entry.delivery.clone();
+                if let Some(value) = &mut delivery {
+                    // Account-specific header values ship empty for the operator to fill.
+                    for header in &mut value.headers {
+                        if header.value.is_empty() {
+                            header.value = "account-value".into();
+                        }
+                    }
+                }
+                crate::tokenless::delivery::validate_delivery(&mut delivery)
+                    .unwrap_or_else(|error| panic!("{}: {error}", entry.id));
+                let secret = if crate::tokenless::delivery::credential_is_login(delivery.as_ref()) {
+                    assert_eq!(entry.credential_labels.len(), 2, "{}", entry.id);
+                    "user:secret"
+                } else {
+                    assert_eq!(entry.credential_labels.len(), 1, "{}", entry.id);
+                    "secret"
+                };
+                crate::tokenless::delivery::render(delivery.as_ref(), secret)
+                    .unwrap_or_else(|error| panic!("{}: {error}", entry.id));
+                checked += 1;
+            }
+        }
+        assert!(checked > 60, "only {checked} HTTP services were checked");
     }
 }

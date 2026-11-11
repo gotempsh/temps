@@ -681,3 +681,250 @@ test('operator approval is explicit and retries the same consent without extendi
     api.restore()
   }
 })
+
+const catalogSlack = {
+  id: 'slack',
+  name: 'Slack',
+  description: 'Messaging API.',
+  category: 'Communication',
+  logo: 'slack',
+  popular: true,
+  origin: 'https://slack.com',
+  supported: true,
+  credential_labels: ['Bot token'],
+  credential_help: { notes: [] },
+}
+const noop = () => {}
+
+test('a catalog service other than GitHub offers no GitHub credential source and shows its logo', () => {
+  render(
+    provider(
+      <AccessServiceEditor
+        catalogEntry={catalogSlack}
+        canUseProjectGithub
+        onClose={noop}
+        onSaved={noop}
+      />
+    )
+  )
+  const body = within(document.body)
+  expect(body.queryByText('Credential source')).toBeNull()
+  expect(body.queryByRole('button', { name: 'GitHub API reads' })).toBeNull()
+  expect(body.queryByRole('button', { name: 'GitHub clone/fetch' })).toBeNull()
+  expect(body.getByLabelText('Bot token')).toBeTruthy()
+  expect(
+    body.getByRole('heading', { name: /Slack/ }).querySelector('img')
+  ).not.toBeNull()
+})
+
+test('the GitHub catalog entry still offers repository sources', () => {
+  render(
+    provider(
+      <AccessServiceEditor
+        catalogEntry={{
+          ...catalogSlack,
+          id: 'github',
+          name: 'GitHub',
+          logo: 'github',
+          origin: 'https://github.com',
+        }}
+        canUseProjectGithub
+        onClose={noop}
+        onSaved={noop}
+      />
+    )
+  )
+  const body = within(document.body)
+  expect(body.getByRole('button', { name: 'GitHub API reads' })).toBeTruthy()
+  expect(body.getByRole('button', { name: 'GitHub clone/fetch' })).toBeTruthy()
+})
+
+test('editing a saved catalog service keeps its logo and hides GitHub sources', () => {
+  render(
+    provider(
+      <AccessServiceEditor
+        service={{
+          ...service,
+          name: 'Slack',
+          catalog: {
+            id: 'slack',
+            name: 'Slack',
+            logo: 'slack',
+            credential_labels: ['Bot token'],
+            credential_help: { url: 'https://api.slack.com/apps', notes: [] },
+          },
+          policy: { ...service.policy, origin: 'https://slack.com' },
+        }}
+        canUseProjectGithub
+        onClose={noop}
+        onSaved={noop}
+      />
+    )
+  )
+  const body = within(document.body)
+  expect(body.queryByRole('button', { name: 'GitHub API reads' })).toBeNull()
+  expect(
+    body.getByRole('heading', { name: /Edit service/ }).querySelector('img')
+  ).not.toBeNull()
+  // Rotating the key: the replacement field is named and points to where to get one.
+  expect(body.getByLabelText('Replace Bot token')).toBeTruthy()
+  expect(
+    body
+      .getByRole('link', { name: /Open Slack credentials/ })
+      .getAttribute('href')
+  ).toBe('https://api.slack.com/apps')
+})
+
+async function fill(label: string, value: string) {
+  await act(async () => {
+    fireEvent.change(within(document.body).getByLabelText(label), {
+      target: { value },
+    })
+  })
+}
+async function saveCatalogService(
+  entry: typeof catalogSlack & Record<string, unknown>,
+  respond: (body: CreateAccessServiceData['body']) => void
+) {
+  const api = mockApi({
+    'POST /access-services': async (request) => {
+      respond((await request.json()) as CreateAccessServiceData['body'])
+      return jsonResponse(service, 201)
+    },
+  })
+  render(
+    provider(
+      <AccessServiceEditor catalogEntry={entry} onClose={noop} onSaved={noop} />
+    )
+  )
+  return api
+}
+
+test('a bearer service with a fixed version header sends the header and the token', async () => {
+  let body: CreateAccessServiceData['body'] | undefined
+  const api = await saveCatalogService(
+    {
+      ...catalogSlack,
+      id: 'notion',
+      name: 'Notion',
+      origin: 'https://api.notion.com',
+      credential_labels: ['Integration secret'],
+      delivery: {
+        format: { method: 'bearer' },
+        headers: [{ name: 'notion-version', value: '2022-06-28' }],
+      },
+    },
+    (value) => (body = value)
+  )
+  try {
+    expect(
+      (
+        within(document.body).getByLabelText(
+          'notion-version header value'
+        ) as HTMLInputElement
+      ).value
+    ).toBe('2022-06-28')
+    await fill('Integration secret', 'secret_value')
+    await click('Save service')
+    await waitFor(() => expect(body).toBeDefined())
+    expect(body?.credential).toBe('secret_value')
+    expect(body?.policy.delivery).toEqual({
+      format: { method: 'bearer' },
+      headers: [{ name: 'notion-version', value: '2022-06-28' }],
+    })
+  } finally {
+    api.restore()
+  }
+})
+
+test('an API-key header service names its header and keeps the account header editable', async () => {
+  let body: CreateAccessServiceData['body'] | undefined
+  const api = await saveCatalogService(
+    {
+      ...catalogSlack,
+      id: 'algolia',
+      name: 'Search host',
+      origin: 'https://search.example.com',
+      credential_labels: ['API key'],
+      delivery: {
+        format: { method: 'header', name: 'x-api-key' },
+        headers: [{ name: 'x-application-id', value: '' }],
+      },
+    },
+    (value) => (body = value)
+  )
+  try {
+    await fill('API key', 'key_value')
+    // The account-specific header ships empty and must be filled in.
+    await click('Save service')
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        'Enter a value for x-application-id'
+      )
+    )
+    expect(body).toBeUndefined()
+    await fill('x-application-id header value', 'APP123')
+    await click('Save service')
+    await waitFor(() => expect(body).toBeDefined())
+    expect(body?.credential).toBe('key_value')
+    expect(body?.policy.delivery).toEqual({
+      format: { method: 'header', name: 'x-api-key' },
+      headers: [{ name: 'x-application-id', value: 'APP123' }],
+    })
+  } finally {
+    api.restore()
+  }
+})
+
+test('a username and password service stores them together as one credential', async () => {
+  let body: CreateAccessServiceData['body'] | undefined
+  const api = await saveCatalogService(
+    {
+      ...catalogSlack,
+      id: 'sms',
+      name: 'SMS',
+      origin: 'https://api.sms.example.com',
+      credential_labels: ['Account SID', 'Auth token'],
+      delivery: { format: { method: 'basic' }, headers: [] },
+    },
+    (value) => (body = value)
+  )
+  try {
+    await fill('Auth token', 'token_value')
+    await click('Save service')
+    await waitFor(() =>
+      expect(document.body.textContent).toContain('Enter the username')
+    )
+    expect(body).toBeUndefined()
+    await fill('Account SID', 'AC123')
+    await click('Save service')
+    await waitFor(() => expect(body).toBeDefined())
+    expect(body?.credential).toBe('AC123:token_value')
+    expect(body?.policy.delivery?.format).toEqual({ method: 'basic' })
+  } finally {
+    api.restore()
+  }
+})
+
+test('a catalog service shows where to create its credential', () => {
+  render(
+    provider(
+      <AccessServiceEditor
+        catalogEntry={{
+          ...catalogSlack,
+          credential_help: {
+            url: 'https://api.slack.com/apps',
+            notes: [],
+          },
+        }}
+        onClose={noop}
+        onSaved={noop}
+      />
+    )
+  )
+  expect(
+    within(document.body)
+      .getByRole('link', { name: /Open Slack credentials/ })
+      .getAttribute('href')
+  ).toBe('https://api.slack.com/apps')
+})

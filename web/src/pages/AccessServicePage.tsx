@@ -71,6 +71,8 @@ export default function AccessServicePage() {
           supported: true,
           logo: 'custom',
           popular: false,
+          credential_labels: [],
+          credential_help: { notes: [] },
         }
       : selected.data?.items.find((item) => item.id === providerId)
   const catalogStep = () => {

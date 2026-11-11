@@ -113,6 +113,7 @@ export type AccessServiceList = {
 export type AccessServiceProvider = 'github' | 'gitlab' | 'openai' | 'anthropic' | 'stripe' | 'resend' | 'sendgrid' | 'vercel' | 'netlify' | 'mistral' | 'groq';
 
 export type AccessServiceResponse = {
+    catalog?: CatalogReference | null;
     created_at: string;
     enabled: boolean;
     has_credential: boolean;
@@ -4286,6 +4287,21 @@ export type Candidate = {
     description: string;
     evidence: DetectionEvidence;
     id: string;
+};
+
+/**
+ * What the catalog knows about a saved service's destination: how to show it
+ * and where its credential is created, so a key can be rotated from the edit page.
+ */
+export type CatalogReference = {
+    credential_help: CredentialHelp;
+    /**
+     * One label for a single credential, or two (username, password).
+     */
+    credential_labels: Array<string>;
+    id: string;
+    logo: string;
+    name: string;
 };
 
 /**
@@ -9245,6 +9261,47 @@ export type CreatedShieldTokenResponse = ShieldTokenResponse & {
      * Send it in `X-Temps-Shield-Token`.
      */
     secret: string;
+};
+
+/**
+ * How a stored credential is presented to the destination, plus any fixed
+ * headers the API requires. Changing it changes the policy, so consent given
+ * for the previous delivery does not carry over.
+ */
+export type CredentialDelivery = {
+    format?: CredentialFormat;
+    /**
+     * Fixed, non-secret headers sent with every request, such as an API
+     * version. At most 16; values are printable ASCII and never templates.
+     */
+    headers?: Array<RequestHeader>;
+};
+
+/**
+ * The credential is one stored secret. Formats differ only in how it is sent.
+ */
+export type CredentialFormat = {
+    method: 'bearer';
+} | {
+    method: 'header';
+    name: string;
+    prefix?: string | null;
+} | {
+    method: 'basic_token';
+    username: string;
+} | {
+    method: 'basic';
+};
+
+export type CredentialHelp = {
+    /**
+     * Notes the service's template gives for its credential fields.
+     */
+    notes: Array<string>;
+    /**
+     * HTTPS page where this service's key or token is created.
+     */
+    url?: string | null;
 };
 
 export type CronExecutionInfo = {
@@ -27180,6 +27237,11 @@ export type RequestDiscoveredRouteCertRequest = {
     challenge_type: string;
 };
 
+export type RequestHeader = {
+    name: string;
+    value: string;
+};
+
 export type RequestRow = {
     client_ip?: string | null;
     country?: string | null;
@@ -28415,6 +28477,7 @@ export type S3SourceResponse = {
  * against its supported protocols before installing a policy.
  */
 export type SandboxAccessPolicy = {
+    delivery?: CredentialDelivery | null;
     github_repository?: GithubRepositoryAccess | null;
     methods: Array<AccessMethod>;
     /**
@@ -29926,6 +29989,17 @@ export type ServiceCatalog = {
 
 export type ServiceCatalogEntry = {
     category: string;
+    /**
+     * Where to create the credential: a page when Temps knows one, and the
+     * template's own notes about each field. Both may be absent.
+     */
+    credential_help: CredentialHelp;
+    /**
+     * One label for a single credential, or two (username, password) when the
+     * service signs in with a pair that is stored as `username:password`.
+     */
+    credential_labels: Array<string>;
+    delivery?: CredentialDelivery | null;
     description: string;
     id: string;
     logo: string;

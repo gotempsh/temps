@@ -7,12 +7,18 @@ import type { AccessServiceResponse } from '@/api/client'
 export function ServiceProviderLogo({
   service,
 }: {
-  service: Pick<AccessServiceResponse, 'policy'>
+  service: Pick<AccessServiceResponse, 'policy'> & {
+    catalog?: { logo: string } | null
+  }
 }) {
+  // An explicit provider wins; a catalog service falls back to the catalog logo the
+  // server derives from its origin, so Slack shows Slack rather than a blank.
   return (
     <CredentialProviderMark
       provider={
-        service.policy.github_repository ? 'github' : service.policy.provider
+        service.policy.github_repository
+          ? 'github'
+          : (service.policy.provider ?? service.catalog?.logo ?? undefined)
       }
     />
   )

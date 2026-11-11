@@ -99,6 +99,8 @@ export function ServiceCatalogPicker({
               popular: false,
               supported: true,
               reason: null,
+              credential_labels: [],
+              credential_help: { notes: [] },
             },
           ].map((entry) => (
             <button

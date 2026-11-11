@@ -670,6 +670,7 @@ mod tests {
                 repository: "repository".into(),
                 protocol: GithubAccessProtocol::Api,
             }),
+            delivery: None,
         };
         db.execute(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO sandbox_access_services(id,project_id,name,policy,max_ttl_seconds,enabled) VALUES('svc_git_fixture',9911,'Git fixture',$1,60,true)",[serde_json::to_value(policy).unwrap().into()])).await.unwrap();

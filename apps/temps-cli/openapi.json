@@ -307,6 +307,17 @@
       },
       "AccessServiceResponse": {
         "properties": {
+          "catalog": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CatalogReference",
+                "description": "The catalog service this origin belongs to, when it is one. Derived on\nread from the origin; never stored in the policy."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -9179,6 +9190,38 @@
           "id",
           "description",
           "evidence"
+        ],
+        "type": "object"
+      },
+      "CatalogReference": {
+        "description": "What the catalog knows about a saved service's destination: how to show it\nand where its credential is created, so a key can be rotated from the edit page.",
+        "properties": {
+          "credential_help": {
+            "$ref": "#/components/schemas/CredentialHelp"
+          },
+          "credential_labels": {
+            "description": "One label for a single credential, or two (username, password).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "logo": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "logo",
+          "credential_labels",
+          "credential_help"
         ],
         "type": "object"
       },
@@ -19152,6 +19195,124 @@
           }
         ],
         "description": "A new bypass token. `secret` is shown this once and never again."
+      },
+      "CredentialDelivery": {
+        "additionalProperties": false,
+        "description": "How a stored credential is presented to the destination, plus any fixed\nheaders the API requires. Changing it changes the policy, so consent given\nfor the previous delivery does not carry over.",
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/CredentialFormat"
+          },
+          "headers": {
+            "description": "Fixed, non-secret headers sent with every request, such as an API\nversion. At most 16; values are printable ASCII and never templates.",
+            "items": {
+              "$ref": "#/components/schemas/RequestHeader"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "CredentialFormat": {
+        "description": "The credential is one stored secret. Formats differ only in how it is sent.",
+        "oneOf": [
+          {
+            "description": "`Authorization: Bearer <credential>`.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "bearer"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`<name>: <prefix><credential>`, for example `x-api-key`.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "header"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`Authorization: Basic base64(<username>:<credential>)` with a fixed username.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "basic_token"
+                ],
+                "type": "string"
+              },
+              "username": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "username",
+              "method"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "`Authorization: Basic base64(<credential>)`; the stored credential is\n`username:password`.",
+            "properties": {
+              "method": {
+                "enum": [
+                  "basic"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "CredentialHelp": {
+        "properties": {
+          "notes": {
+            "description": "Notes the service's template gives for its credential fields.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "url": {
+            "description": "HTTPS page where this service's key or token is created.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "notes"
+        ],
+        "type": "object"
       },
       "CronExecutionInfo": {
         "properties": {
@@ -58257,6 +58418,22 @@
         ],
         "type": "object"
       },
+      "RequestHeader": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
       "RequestRow": {
         "properties": {
           "client_ip": {
@@ -61327,6 +61504,17 @@
         "additionalProperties": false,
         "description": "Exact destination and request scope. The broker must validate this again\nagainst its supported protocols before installing a policy.",
         "properties": {
+          "delivery": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CredentialDelivery",
+                "description": "How the stored credential reaches the destination. Omitted means a\nbearer token in `Authorization`, the shape every older policy has."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "github_repository": {
             "oneOf": [
               {
@@ -64301,6 +64489,28 @@
           "category": {
             "type": "string"
           },
+          "credential_help": {
+            "$ref": "#/components/schemas/CredentialHelp",
+            "description": "Where to create the credential: a page when Temps knows one, and the\ntemplate's own notes about each field. Both may be absent."
+          },
+          "credential_labels": {
+            "description": "One label for a single credential, or two (username, password) when the\nservice signs in with a pair that is stored as `username:password`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "delivery": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CredentialDelivery",
+                "description": "How this service takes its credential and which fixed headers it needs.\nPresent when it differs from a plain bearer token; the console sends it\nback as the policy's `delivery`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "description": {
             "type": "string"
           },
@@ -64350,7 +64560,9 @@
           "category",
           "logo",
           "popular",
-          "supported"
+          "supported",
+          "credential_labels",
+          "credential_help"
         ],
         "type": "object"
       },

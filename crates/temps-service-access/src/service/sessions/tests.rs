@@ -122,6 +122,7 @@ async fn sessions_are_atomic_scoped_expiring_revocable_and_retry_safe() {
                         path_prefixes: vec!["/v1".into()],
                         methods: vec![AccessMethod::Get],
                         github_repository: None,
+                        delivery: None,
                     },
                     max_ttl_seconds: 900,
                     enabled: true,

@@ -16,11 +16,15 @@ import {
 } from '@/api/client'
 import { VaultConsumerPicker } from './VaultConsumerPicker'
 import { VaultRepositoryPicker } from './VaultRepositoryPicker'
+import { ServiceCredentialHelp } from './ServiceCredentialHelp'
+import { CredentialProviderMark } from '@temps-sdk/ds'
+import { ServiceProviderLogo } from './service-providers'
 import { problemDetail } from '@/lib/api-problem'
 import {
   serviceEditorSchema,
   serviceDefaults,
   serviceBody,
+  isLogin,
   type AccessServiceValues,
 } from './service-access-form'
 
@@ -64,13 +68,23 @@ export function AccessServiceEditor({
     defaultValues: service
       ? serviceDefaults(service)
       : {
-          ...serviceDefaults(),
+          ...serviceDefaults(undefined, catalogEntry),
           name: catalogEntry?.id === 'custom' ? '' : (catalogEntry?.name ?? ''),
           provider: catalogEntry?.provider ?? 'custom',
           origin: catalogEntry?.origin ?? '',
         },
   })
   const github = useWatch({ control: form.control, name: 'githubRepository' })
+  const delivery = useWatch({ control: form.control, name: 'delivery' })
+  const login = isLogin(delivery)
+  const reference = catalogEntry ?? service?.catalog ?? undefined
+  const labels = reference?.credential_labels ?? []
+  const defaultLabel = 'Bearer credential'
+  const credentialLabel = login
+    ? (labels[1] ?? 'Password')
+    : (labels[0] ??
+      (delivery?.format?.method === 'header' ? 'API key' : defaultLabel))
+  const fixedHeaders = delivery?.headers ?? []
   function selectRepository(
     reference: NonNullable<AccessServiceValues['githubRepository']>
   ) {
@@ -146,9 +160,39 @@ export function AccessServiceEditor({
       onClose()
     },
   })
+  // Only GitHub (and a custom service, which may point at it) can take a
+  // repository from a connection; every other service just stores a credential.
+  const offersGithubSource = service
+    ? !!service.policy.github_repository ||
+      service.policy.provider === 'github' ||
+      service.policy.origin === 'https://github.com' ||
+      !service.catalog
+    : catalogEntry
+      ? catalogEntry.id === 'github' || catalogEntry.id === 'custom'
+      : true
+  const heading = service
+    ? 'Edit service'
+    : (catalogEntry?.name ?? 'Add service')
   return (
     <Settings
-      title={service ? 'Edit service' : (catalogEntry?.name ?? 'Add service')}
+      title={
+        service || catalogEntry ? (
+          <span className="flex items-center gap-3">
+            <span aria-hidden="true">
+              {service ? (
+                <ServiceProviderLogo service={service} />
+              ) : (
+                <CredentialProviderMark
+                  provider={catalogEntry?.logo ?? catalogEntry?.id}
+                />
+              )}
+            </span>
+            <span>{heading}</span>
+          </span>
+        ) : (
+          heading
+        )
+      }
       headerActions={
         onChangeService && (
           <Button type="button" variant="outline" onClick={onChangeService}>
@@ -177,7 +221,9 @@ export function AccessServiceEditor({
         'Allowed path prefixes': form.formState.errors.paths?.message,
         'Allowed HTTP methods': form.formState.errors.methods?.message,
         'Maximum access lifetime': form.formState.errors.maxTtl?.message,
-        'Bearer credential': form.formState.errors.credential?.message,
+        [credentialLabel]: form.formState.errors.credential?.message,
+        Username: form.formState.errors.loginUsername?.message,
+        'Request headers': form.formState.errors.delivery?.message,
         Repository: form.formState.errors.githubRepository?.message,
       }}
     >
@@ -212,53 +258,55 @@ export function AccessServiceEditor({
             }
           </Field>
         )}
-        <Field
-          label="Credential source"
-          description="Choose a stored bearer credential or an explicit repository from a GitHub connection. Credentials stay on the host."
-        >
-          {(props) => (
-            <div
-              {...props}
-              role="group"
-              className="flex flex-col gap-2 sm:flex-row sm:flex-wrap"
-            >
-              <Button
-                type="button"
-                variant={sourceMode === 'bearer' ? 'default' : 'outline'}
-                onClick={() => {
-                  if (save.isPending) return
-                  setSourceMode('bearer')
-                  form.setValue('githubRepository', undefined, {
-                    shouldDirty: true,
-                  })
-                  form.setValue('credential', '')
-                  form.setValue('clearCredential', false)
-                }}
+        {offersGithubSource && (
+          <Field
+            label="Credential source"
+            description="Choose a stored bearer credential or an explicit repository from a GitHub connection. Credentials stay on the host."
+          >
+            {(props) => (
+              <div
+                {...props}
+                role="group"
+                className="flex flex-col gap-2 sm:flex-row sm:flex-wrap"
               >
-                Bearer credential
-              </Button>
-              {(['api', 'git'] as const).map((protocol) => (
                 <Button
-                  key={protocol}
                   type="button"
-                  variant={sourceMode === protocol ? 'default' : 'outline'}
-                  disabled={!canUseProjectGithub}
+                  variant={sourceMode === 'bearer' ? 'default' : 'outline'}
                   onClick={() => {
-                    setSourceMode(protocol)
+                    if (save.isPending) return
+                    setSourceMode('bearer')
+                    form.setValue('githubRepository', undefined, {
+                      shouldDirty: true,
+                    })
                     form.setValue('credential', '')
                     form.setValue('clearCredential', false)
-                    if (github) selectRepository({ ...github, protocol })
                   }}
                 >
-                  {protocol === 'api'
-                    ? 'GitHub API reads'
-                    : 'GitHub clone/fetch'}
+                  Bearer credential
                 </Button>
-              ))}
-            </div>
-          )}
-        </Field>
-        {!canUseProjectGithub && (
+                {(['api', 'git'] as const).map((protocol) => (
+                  <Button
+                    key={protocol}
+                    type="button"
+                    variant={sourceMode === protocol ? 'default' : 'outline'}
+                    disabled={!canUseProjectGithub}
+                    onClick={() => {
+                      setSourceMode(protocol)
+                      form.setValue('credential', '')
+                      form.setValue('clearCredential', false)
+                      if (github) selectRepository({ ...github, protocol })
+                    }}
+                  >
+                    {protocol === 'api'
+                      ? 'GitHub API reads'
+                      : 'GitHub clone/fetch'}
+                  </Button>
+                ))}
+              </div>
+            )}
+          </Field>
+        )}
+        {offersGithubSource && !canUseProjectGithub && (
           <p className="text-sm text-muted-foreground">
             GitHub profiles require project write and Git repository read
             permissions.
@@ -388,11 +436,74 @@ export function AccessServiceEditor({
         </Field>
         {sourceMode === 'bearer' && (
           <>
+            {fixedHeaders.length > 0 && (
+              <Field
+                label="Request headers"
+                error={form.formState.errors.delivery?.message}
+                description="Sent with every request this service makes. Fixed text, not secret."
+              >
+                {() => (
+                  <div className="space-y-2">
+                    {fixedHeaders.map((header, index) => (
+                      <div
+                        key={header.name}
+                        className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3"
+                      >
+                        <code className="text-sm sm:w-56 sm:shrink-0 [overflow-wrap:anywhere]">
+                          {header.name}
+                        </code>
+                        <Input
+                          aria-label={`${header.name} header value`}
+                          value={header.value}
+                          onChange={(event) =>
+                            form.setValue(
+                              'delivery',
+                              {
+                                ...(delivery ?? {
+                                  format: { method: 'bearer' },
+                                }),
+                                headers: fixedHeaders.map((item, at) =>
+                                  at === index
+                                    ? { ...item, value: event.target.value }
+                                    : item
+                                ),
+                              },
+                              { shouldDirty: true, shouldValidate: true }
+                            )
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Field>
+            )}
+            {login && (
+              <Field
+                label={labels[0] ?? 'Username'}
+                error={form.formState.errors.loginUsername?.message}
+                description={
+                  service?.has_credential
+                    ? 'Enter the username and password together to replace the stored login.'
+                    : 'Required with the password to enable access requests.'
+                }
+              >
+                {(props) => (
+                  <Input
+                    {...form.register('loginUsername')}
+                    {...props}
+                    autoComplete="off"
+                  />
+                )}
+              </Field>
+            )}
             <Field
               label={
                 service?.has_credential && !service.policy.github_repository
-                  ? 'Replace bearer credential'
-                  : 'Bearer credential'
+                  ? credentialLabel === defaultLabel
+                    ? 'Replace bearer credential'
+                    : `Replace ${credentialLabel}`
+                  : credentialLabel
               }
               error={form.formState.errors.credential?.message}
               description={
@@ -411,6 +522,9 @@ export function AccessServiceEditor({
                 />
               )}
             </Field>
+            {reference && reference.id !== 'custom' && !github && (
+              <ServiceCredentialHelp entry={reference} />
+            )}
             {service?.has_credential && !service.policy.github_repository && (
               <Controller
                 control={form.control}

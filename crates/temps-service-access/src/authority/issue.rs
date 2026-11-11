@@ -195,22 +195,36 @@ impl AuthorityStore {
                     invalid(row.id, "seal grant credential", "grant rule is missing")
                 })?;
                 let credential_id = CredentialId(rule_id.0);
-                let headers = InjectedHeaders {
-                    headers: vec![InjectedHeader {
-                        name: "authorization".into(),
-                        value: if grant.rule().git.is_some() {
-                            use base64::Engine;
-                            let basic =
-                                Zeroizing::new(format!("x-access-token:{}", credential.expose()));
-                            format!(
-                                "Basic {}",
-                                base64::engine::general_purpose::STANDARD.encode(basic.as_bytes())
-                            )
-                        } else {
-                            format!("Bearer {}", credential.expose())
+                let (headers, strip_headers) = if grant.rule().git.is_some() {
+                    use base64::Engine;
+                    let basic = Zeroizing::new(format!("x-access-token:{}", credential.expose()));
+                    (
+                        InjectedHeaders {
+                            headers: vec![InjectedHeader {
+                                name: "authorization".into(),
+                                value: format!(
+                                    "Basic {}",
+                                    base64::engine::general_purpose::STANDARD
+                                        .encode(basic.as_bytes())
+                                ),
+                            }],
+                            substitutions: Vec::new(),
                         },
-                    }],
-                    substitutions: Vec::new(),
+                        vec![
+                            "authorization".to_string(),
+                            "proxy-authorization".to_string(),
+                            "cookie".to_string(),
+                        ],
+                    )
+                } else {
+                    crate::tokenless::delivery::render(grant.delivery(), credential.expose())
+                        .map_err(|_| {
+                            invalid(
+                                row.id,
+                                "render grant credential",
+                                "stored credential does not fit the service's credential format",
+                            )
+                        })?
                 };
                 let encoded = Zeroizing::new(serde_json::to_vec(&headers).map_err(|source| {
                     AuthorityError::Encoding {
@@ -229,11 +243,7 @@ impl AuthorityStore {
                     scope: grant.claims().scope.clone(),
                     credential_id,
                     allow: grant.rule().clone(),
-                    strip_headers: vec![
-                        "authorization".into(),
-                        "proxy-authorization".into(),
-                        "cookie".into(),
-                    ],
+                    strip_headers,
                     headers: sealed,
                     not_after: Some(grant.claims().exp),
                 });

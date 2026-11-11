@@ -8,6 +8,7 @@ mod binding;
 pub use binding::{PreparedBinding, MAX_BINDING_GRANTS};
 mod policy;
 pub use policy::compile_policy;
+pub mod delivery;
 
 use std::collections::BTreeMap;
 
@@ -97,6 +98,7 @@ pub enum PreparationError {
 pub struct PreparedSession {
     target: BindingTarget,
     grant_id: String,
+    delivery: Option<crate::types::CredentialDelivery>,
     rule: RuleScope,
     claims: SessionClaims,
 }
@@ -154,7 +156,7 @@ impl PreparedSession {
         // the absolute deadline. This does not claim the SDK cuts open streams.
         let ttl = u64::try_from(remaining.num_seconds())
             .map_err(|_| invalid("remaining lifetime cannot be represented"))?;
-        let (_, rule) =
+        let (policy, rule) =
             compile_policy(&request.policy).map_err(|source| PreparationError::Policy {
                 grant_id: request.grant_id.clone(),
                 source,
@@ -197,6 +199,7 @@ impl PreparedSession {
         Ok(Self {
             target: request.target,
             grant_id: request.grant_id.clone(),
+            delivery: policy.delivery,
             rule,
             claims,
         })
@@ -207,6 +210,10 @@ impl PreparedSession {
     }
     pub fn grant_id(&self) -> &str {
         &self.grant_id
+    }
+    /// How this grant's credential is sent; `None` is a plain bearer token.
+    pub fn delivery(&self) -> Option<&crate::types::CredentialDelivery> {
+        self.delivery.as_ref()
     }
     pub fn rule(&self) -> &RuleScope {
         &self.rule

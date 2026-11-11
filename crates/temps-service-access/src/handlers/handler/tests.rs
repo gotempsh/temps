@@ -428,6 +428,7 @@ fn policy() -> SandboxAccessPolicy {
         origin: "https://api.example.com".into(),
         path_prefixes: vec!["/v1".into()],
         methods: vec![AccessMethod::Get],
+        delivery: None,
     }
 }
 fn row() -> services::Model {
@@ -901,6 +902,7 @@ async fn postgres_approval_route_is_fresh_scoped_idempotent_and_audited() {
                     origin: "https://api.example.com".into(),
                     path_prefixes: vec!["/user".into()],
                     methods: vec![AccessMethod::Get],
+                    delivery: None,
                 },
                 max_ttl_seconds: 900,
                 enabled: true,
