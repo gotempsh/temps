@@ -161,7 +161,9 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
             .unwrap();
         }
         if mode == "deleted_project" {
-            db.execute_unprepared("DELETE FROM projects WHERE id=9703").await.unwrap();
+            db.execute_unprepared("DELETE FROM projects WHERE id=9703")
+                .await
+                .unwrap();
         }
         let checker = Checker::new(0);
         checker.deny.store(mode != "legacy", Ordering::SeqCst);
