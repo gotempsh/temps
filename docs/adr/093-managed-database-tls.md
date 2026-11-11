@@ -103,7 +103,10 @@ Either can be rotated without touching the other.
   uniquely and removes only the container it created, by ID, so it can never
   touch an operator's container or a concurrent install's helper. A guard
   removes it on every path, including the install being cancelled (a dropped
-  backup or request), so no helper keeps the volume referenced. Docker's archive API reads the
+  backup or request), so no helper keeps the volume referenced. If the
+  cancellation comes before Docker answered the create, the guard keeps
+  retrying the removal by the helper's unique name for a bounded window,
+  because the daemon may finish that create afterwards. Docker's archive API reads the
   image's own `/etc/passwd` to resolve the engine user's uid/gid (999 in the
   Debian PostgreSQL images, other values elsewhere), then uploads a tar whose
   headers set owner and mode: directory `0700`, certificate `0644`, key `0600`.
@@ -162,14 +165,21 @@ node agent's exec on a worker. The steps:
 
 1. The certificate and key travel in the exec environment, never in the
    container's configuration or command line.
-2. They are written to `/var/lib/postgresql/tls/` on the member's volume,
-   outside PGDATA, so a standby's base backup never copies them: directory
-   `0700`, key `0600`, both owned by `postgres`.
-3. A pair whose public keys differ is refused before anything is switched.
-4. The paths are recorded with `pg_autoctl config set ssl.cert_file /
-   ssl.key_file`. That writes pg_autoctl's own configuration on the volume,
-   which pg_autoctl turns into `ssl_cert_file` / `ssl_key_file` at every start,
-   so the setting survives restarts.
+2. A pair whose public keys differ is refused before anything is switched.
+3. The pair is written whole into one of two slots on the member's volume
+   (`/var/lib/postgresql/tls-a`, `tls-b`), outside PGDATA, so a standby's
+   base backup never copies them: directory `0700`, key `0600`, both owned by
+   `postgres`. It always goes into the slot that the symlink
+   `/var/lib/postgresql/tls-current` does not name, and the link is then
+   switched by one rename. The certificate and key therefore change together:
+   no reload or restart ever finds one file of the new pair beside one of the
+   old.
+4. pg_autoctl's `ssl.cert_file` / `ssl.key_file` name the files through the
+   link, so a renewal never changes them. That configuration is on the
+   volume, and pg_autoctl turns it into `ssl_cert_file` / `ssl_key_file` at
+   every start, so the setting survives restarts. The two settings are set
+   one after the other, so they move onto the link once, through a copy of
+   the pair already served: each intermediate state names a matching pair.
 5. pg_autoctl reloads PostgreSQL, which loads a new TLS context on SIGHUP. The
    reload is repeated until both settings landed, because a second
    `config set` arriving during pg_autoctl's own reload can be missed.
@@ -187,8 +197,9 @@ exec has stopped. A mode change holds a per-service lock from reading the
 current mode through its rollback, and every apply pass takes the same lock and
 reads the setting under it, so no older change or pass lands after a newer one.
 
-`off` points pg_autoctl back at its self-signed pair in PGDATA and removes the
-managed files. HBA rules are never touched, so plaintext stays accepted in
+`off` first switches the link to a copy of pg_autoctl's self-signed pair in
+PGDATA. It then points the settings back at that pair, again one matching step
+at a time, and removes the link and both slots. HBA rules are never touched, so plaintext stays accepted in
 both modes, exactly as before.
 
 ### D3. A per-service TLS setting on the service's record
@@ -225,13 +236,23 @@ one instance can be in different modes.
   runs: a standalone service is re-initialized on it (the failure may come
   after its container was already replaced, or after it was stopped), a
   cluster's members that had switched switch back. The error says whether that
-  succeeded. After the recreate guard's verdict (a refusal, or a rollback)
+  succeeded. When the previous mode cannot be recorded again, the new one
+  stays recorded, and the failed change is audited like a successful one. So
+  is a change whose resulting status cannot be read once it was written.
+  After the recreate guard's verdict (a refusal, or a rollback)
   the standalone service is not re-initialized: that could recreate over an
   original still set aside, or start a replacement that failed verification.
 - Start-time drift repair keeps the original container when the guard refuses
   or rolls back, so a mode change checks what the restarted container serves:
   if it is not the new mode, the previous one is recorded again and the change
   fails (409) instead of reporting success.
+- A standalone service's initialization and start hold the same per-service
+  TLS lock as a mode change. Neither can rewrite the certificate directory or
+  recreate the container while a change or its rollback does. A container
+  recreate that re-initializes the service (a new `/dev/shm` size) takes that
+  lock before the container's own recreate lock, in the order a mode change
+  takes them. A cluster's start releases it: its data nodes take it in their
+  own TLS pass.
 - A mode change with its audit entry, and each cluster pass a caller awaits
   with its follow-up retry, runs on a task of its own. A request dropped
   mid-change does not release the service's TLS lock while a data node's exec,
