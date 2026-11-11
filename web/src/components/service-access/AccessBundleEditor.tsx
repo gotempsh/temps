@@ -58,7 +58,8 @@ export function AccessBundleEditor({
   const selected = useWatch({ control: form.control, name: 'service_ids' })
   const save = useMutation({
     mutationFn: async (values: z.infer<typeof schema>) => {
-      if (!canWrite) throw new Error('Project write permission required')
+      if (!canWrite)
+        throw new Error('Instance administrator permission is required')
       if (initialSnapshot)
         return updateAccessBundleGeneral({
           path: {
@@ -98,6 +99,11 @@ export function AccessBundleEditor({
         Services: form.formState.errors.service_ids?.message,
       }}
     >
+      {!canWrite && (
+        <p className="text-sm text-muted-foreground">
+          Instance administrator permission is required
+        </p>
+      )}
       <fieldset disabled={save.isPending} className="space-y-4">
         <Field label="Bundle name" error={form.formState.errors.name?.message}>
           {(props) => <Input {...form.register('name')} {...props} />}

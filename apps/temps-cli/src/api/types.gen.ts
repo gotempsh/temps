@@ -36657,7 +36657,7 @@ export type VaultLinkResponse = {
     id: string;
     project_id?: number | null;
     revoked_at?: string | null;
-    sandbox_id?: number | null;
+    sandbox_id?: string | null;
     vault_id: string;
 };
 

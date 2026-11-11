@@ -66,7 +66,19 @@ async fn session_route(projectless: bool, removal: &str) {
         );
         let linked: crate::link_types::VaultLinkResponse = serde_json::from_slice(&raw).unwrap();
         assert_eq!(linked.vault_id, vault.id);
-        assert_eq!(linked.sandbox_id, Some(9801));
+        assert_eq!(linked.sandbox_id.as_deref(), Some("sbx_dispatch"));
+        let listed = state
+            .service
+            .list_vault_links(
+                &vault.id,
+                crate::types::AccessPageQuery {
+                    page: None,
+                    page_size: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.items[0].sandbox_id.as_deref(), Some("sbx_dispatch"));
         assert_eq!(linked.project_id, None);
         assert!(linked.revoked_at.is_none());
         let events = audit.0.lock().unwrap();

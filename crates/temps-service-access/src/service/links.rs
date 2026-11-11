@@ -36,16 +36,21 @@ impl ServiceAccessService {
         &self,
         vault_id: &str,
         request: crate::link_types::CreateVaultLink,
-    ) -> Result<links::Model, AccessError> {
+    ) -> Result<crate::link_types::VaultLinkResponse, AccessError> {
         if request.project_id.is_some() == request.sandbox_id.is_some() {
             return Err(invalid("consumer", "select exactly one project or sandbox"));
         }
-        let sandbox_id = match request.sandbox_id {
-            Some(id) => Some(self.owned_consumer(&id, 0, true).await?.0),
+        let sandbox_id = match request.sandbox_id.as_ref() {
+            Some(id) => Some(self.owned_consumer(id, 0, true).await?.0),
             None => None,
         };
-        self.link_vault(vault_id, request.project_id, sandbox_id)
-            .await
+        let row = self
+            .link_vault(vault_id, request.project_id, sandbox_id)
+            .await?;
+        Ok(crate::link_types::VaultLinkResponse::new(
+            row,
+            request.sandbox_id,
+        ))
     }
 
     pub async fn retire_service(&self, service_id: &str) -> Result<i32, AccessError> {
@@ -222,7 +227,7 @@ impl ServiceAccessService {
             .await
             .map_err(|e| AccessError::resource_database("count vault links", vault_id, e))?;
         let items = crate::link_types::VaultLinkResponse::find_by_statement(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
-            "SELECT l.*,COALESCE(p.name,b.name) AS consumer_name FROM access_vault_links l LEFT JOIN projects p ON p.id=l.project_id LEFT JOIN sandboxes b ON b.id=l.sandbox_id WHERE l.vault_id=$1 AND l.revoked_at IS NULL ORDER BY l.created_at DESC,l.id DESC LIMIT $2 OFFSET $3",
+            "SELECT l.id,l.vault_id,l.project_id,b.public_id AS sandbox_id,l.created_at,l.revoked_at,COALESCE(p.name,b.name) AS consumer_name FROM access_vault_links l LEFT JOIN projects p ON p.id=l.project_id LEFT JOIN sandboxes b ON b.id=l.sandbox_id WHERE l.vault_id=$1 AND l.revoked_at IS NULL ORDER BY l.created_at DESC,l.id DESC LIMIT $2 OFFSET $3",
             [vault_id.into(),(page_size as i64).into(),(((page-1)*page_size) as i64).into()])).all(self.db.as_ref()).await
             .map_err(|e| AccessError::resource_database("list named vault links", vault_id, e))?;
         Ok(crate::link_types::VaultLinkList {
@@ -243,10 +248,11 @@ impl ServiceAccessService {
         let sandbox = self
             .sandbox(self.db.as_ref(), None, sandbox_id, user_id, admin)
             .await?;
-        Ok(self
+        let row = self
             .covering_vault_link(vault_id, sandbox.id, sandbox.project_id)
-            .await?
-            .into())
+            .await?;
+        let public_id = row.sandbox_id.map(|_| sandbox.public_id);
+        Ok(crate::link_types::VaultLinkResponse::new(row, public_id))
     }
 
     /// Caller must authorize the consumer before exposing this result.

@@ -78985,9 +78985,8 @@
             ]
           },
           "sandbox_id": {
-            "format": "int32",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },

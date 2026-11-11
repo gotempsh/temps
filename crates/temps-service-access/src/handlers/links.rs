@@ -64,7 +64,7 @@ pub async fn create_vault_link(
         "CREATE_ACCESS_VAULT_LINK",
     )
     .await;
-    Ok((StatusCode::CREATED, Json(row.into())))
+    Ok((StatusCode::CREATED, Json(row)))
 }
 #[utoipa::path(delete, path="/access-vaults/{vault_id}/links/{link_id}", tag="Vault", params(("vault_id"=String, Path),("link_id"=String, Path)), responses((status=204),(status=401),(status=403),(status=404),(status=500)), security(("bearer_auth"=[])))]
 pub async fn delete_vault_link(

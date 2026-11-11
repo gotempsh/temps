@@ -97,7 +97,7 @@ impl From<crate::services::AuditQueryError> for temps_core::problemdetails::Prob
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .type_("https://temps.sh/probs/audit-error")
                     .title("Audit Log Error")
-                    .detail(error.to_string())
+                    .detail("Could not list audit logs; see the server logs")
                     .build()
             }
         }
@@ -276,6 +276,9 @@ mod tests {
         .unwrap();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("Could not list audit logs; see the server logs"));
+        assert!(!serde_json::to_string(&problem.body)
             .unwrap()
             .contains("vault_fixture"));
     }
