@@ -1806,7 +1806,10 @@ async fn test_available_tls_accepts_verified_tls_and_plaintext() {
             )
             .await
             .map_err(|e| EngineError::failed(&name, e.to_string()))?;
-        assert!(row.get::<_, bool>(0), "still encrypted after the swap rebuild");
+        assert!(
+            row.get::<_, bool>(0),
+            "still encrypted after the swap rebuild"
+        );
 
         // Turning TLS off goes through the reconcile-on-start recreate.
         service
