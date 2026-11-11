@@ -213,3 +213,120 @@ test.each([false, true])(
     }
   }
 )
+
+test('a host that cannot host service access says so and stops offering the same approval', async () => {
+  const bodies: unknown[] = []
+  const handler = async (request: Request) => {
+    const url = new URL(request.url)
+    if (url.pathname.includes('/consumers/'))
+      return jsonResponse({
+        id: 'link_fixture',
+        vault_id: 'vault_test',
+        sandbox_id: 42,
+        project_id: null,
+        created_at: date,
+      })
+    if (request.method === 'POST') {
+      bodies.push(await request.json())
+      return jsonResponse(
+        {
+          title: 'Service access is unavailable for this sandbox',
+          detail:
+            'this control plane cannot share Unix sockets with the Docker daemon',
+        },
+        409
+      )
+    }
+    if (url.pathname.endsWith('/capability'))
+      return jsonResponse({
+        configured: true,
+        can_manage_requests: true,
+        can_manage_services: true,
+      })
+    if (url.pathname.endsWith('/bundles'))
+      return jsonResponse({
+        items: [bundle],
+        total: 1,
+        page: 1,
+        page_size: 100,
+      })
+    if (url.pathname.endsWith('/sandboxes'))
+      return jsonResponse({
+        sandboxes: [
+          { id: 'sbx_ready', name: 'Ready sandbox', status: 'running' },
+          { id: 'sbx_other', name: 'Other sandbox', status: 'running' },
+        ],
+        pagination: { page: 1, page_size: 20, count: 2 },
+      })
+    return jsonResponse({
+      vault: { id: 'vault_test', name: 'Work', service_ids: ['svc_test'] },
+      services: [service],
+    })
+  }
+  const api = mockApi(
+    Object.fromEntries(
+      [
+        'POST /access-vaults/vault_test/sessions',
+        'GET /service-access/capability',
+        'GET /access-vaults/vault_test/bundles',
+        'GET /access-vaults/vault_test',
+        'GET /v1/sandboxes',
+        'GET /access-vaults/vault_test/consumers/sbx_ready',
+        'GET /access-vaults/vault_test/consumers/sbx_other',
+      ].map((path) => [path, handler])
+    )
+  )
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  try {
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter
+          initialEntries={[
+            '/vault/vaults/vault_test/bundles/bundle_test/sessions/new?sandbox=sbx_ready',
+          ]}
+        >
+          <BreadcrumbProvider>
+            <Routes>
+              <Route
+                path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                element={<AccessSessionCreatePage />}
+              />
+            </Routes>
+          </BreadcrumbProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    await waitFor(() =>
+      expect(
+        ui
+          .getByRole('button', { name: 'Approve session' })
+          .getAttribute('aria-disabled')
+      ).toBe('false')
+    )
+    fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
+    await waitFor(() =>
+      expect(
+        ui.getByText("This sandbox can't host service access")
+      ).toBeTruthy()
+    )
+    expect(ui.queryByText('Could not issue session')).toBeNull()
+    expect(
+      ui
+        .getByRole('button', { name: 'Approve session' })
+        .getAttribute('aria-disabled')
+    ).toBe('true')
+    // Choosing another sandbox is a new decision, so the refusal is cleared.
+    fireEvent.click(ui.getByLabelText(/Other sandbox/))
+    await waitFor(() =>
+      expect(
+        ui.queryByText("This sandbox can't host service access")
+      ).toBeNull()
+    )
+    expect(bodies.length).toBe(1)
+  } finally {
+    api.restore()
+  }
+})

@@ -31,6 +31,8 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
 import { ServiceProviderLogo } from '@/components/service-access/service-providers'
+import { formatLifetime } from '@/components/service-access/lifetime'
+import { isServiceAccessUnavailable } from '@/components/service-access/session-issue-error'
 import { sessionHref } from '@/components/service-access/session-navigation'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
@@ -293,6 +295,13 @@ function SessionForm({
       if (mounted.current) navigate(sessionHref(data))
     },
   })
+  const { reset: resetIssue } = issue
+  useEffect(() => {
+    resetIssue()
+  }, [selected, resetIssue])
+  // This refusal is about the host or the sandbox image, so retrying the same
+  // request cannot work; say so and keep Approve inert until the choice changes.
+  const unavailable = issue.isError && isServiceAccessUnavailable(issue.error)
   const invalidBundle =
     snapshot.services.length === 0 ||
     snapshot.services.length > 16 ||
@@ -307,6 +316,7 @@ function SessionForm({
         eligibility.isSuccess &&
         !eligibility.isFetching &&
         !invalidBundle &&
+        !unavailable &&
         !sandboxes.isError
       }
       saving={issue.isPending}
@@ -320,15 +330,23 @@ function SessionForm({
       }}
     >
       <fieldset disabled={issue.isPending} className="space-y-6">
-        <div className="rounded-lg border p-4 space-y-3">
-          <h2 className="font-semibold">{snapshot.bundle.name}</h2>
+        <div className="space-y-3 rounded-lg border p-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <h2 className="font-semibold">{snapshot.bundle.name}</h2>
+            <p className="text-xs text-muted-foreground">
+              Up to {formatLifetime(maxTtl)}
+            </p>
+          </div>
           {snapshot.services.map((s) => (
             <div key={s.id} className="flex items-start gap-3">
               <ServiceProviderLogo service={s} />
               <div className="min-w-0">
                 <p className="text-sm font-medium">{s.name}</p>
                 <p className="break-all text-xs text-muted-foreground">
-                  {s.policy.origin} · {s.policy.methods.join(', ')} ·{' '}
+                  {s.policy.origin}
+                </p>
+                <p className="break-all text-xs text-muted-foreground">
+                  {s.policy.methods.join(', ')} ·{' '}
                   {s.policy.path_prefixes.join(', ')}
                 </p>
               </div>
@@ -381,9 +399,6 @@ function SessionForm({
             Only this sandbox can use the session. Credentials stay in the
             Vault.
           </p>
-          {selected && (
-            <p className="text-xs break-all">Selected: {selected}</p>
-          )}
           {sandboxes.isError && (
             <Callout tone="error" title="Could not load sandboxes">
               <Button type="button" onClick={() => void sandboxes.refetch()}>
@@ -418,7 +433,10 @@ function SessionForm({
                         : 'Resume this sandbox before issuing access'}
                     </span>
                   </span>
-                  <Status tone="idle" label={s.status} />
+                  <Status
+                    tone={s.status === 'running' ? 'ok' : 'idle'}
+                    label={s.status}
+                  />
                 </label>
               ))}
             </div>
@@ -450,7 +468,7 @@ function SessionForm({
         </fieldset>
         <Field
           label="Session lifetime (seconds)"
-          description={`Maximum ${maxTtl / 60} minutes. This session cannot be extended; create a new one when it expires.`}
+          description={`Maximum ${formatLifetime(maxTtl)}. It cannot be extended; create a new session when it expires.`}
           error={form.formState.errors.ttl_seconds?.message}
         >
           {(props) => (
@@ -466,7 +484,15 @@ function SessionForm({
             />
           )}
         </Field>
-        {issue.isError && (
+        {unavailable && (
+          <Callout tone="error" title="This sandbox can't host service access">
+            {problemDetail(
+              issue.error,
+              'Service access needs a Linux host running Docker locally, or a worker node.'
+            )}
+          </Callout>
+        )}
+        {issue.isError && !unavailable && (
           <Callout tone="error" title="Could not issue session">
             {problemDetail(
               issue.error,

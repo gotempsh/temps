@@ -8,6 +8,7 @@ import {
   Callout,
   DataTable,
   Detail,
+  HelpPopover,
   PageContainer,
   Status,
 } from '@temps-sdk/ds'
@@ -17,6 +18,7 @@ import {
   getAccessVaultOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
+import { formatLifetime } from '@/components/service-access/lifetime'
 import { ServiceProviderLogo } from '@/components/service-access/service-providers'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
@@ -84,6 +86,11 @@ export default function AccessBundleDetailPage() {
     vault.data?.services.filter((service) =>
       bundle.data?.service_ids.includes(service.id)
     ) ?? []
+  const blocked = services.filter(
+    (service) => !service.enabled || !service.has_credential
+  ).length
+  const missing = (bundle.data?.service_ids.length ?? 0) - services.length
+  const unusable = blocked + Math.max(missing, 0)
   return (
     <PageContainer width="full">
       {!valid ? (
@@ -115,7 +122,16 @@ export default function AccessBundleDetailPage() {
         <Detail
           embedded
           title={bundle.data.name}
-          verdict={<Status tone="idle" label="Approval required" />}
+          verdict={
+            unusable === 0 ? (
+              <Status tone="ok" label="Ready for sessions" />
+            ) : (
+              <Status
+                tone="warn"
+                label={`${unusable} ${unusable === 1 ? 'service' : 'services'} can't be used`}
+              />
+            )
+          }
           actions={
             <div className="flex flex-wrap gap-2">
               <Button variant="outline" asChild>
@@ -153,16 +169,21 @@ export default function AccessBundleDetailPage() {
             { label: 'Services', value: bundle.data.service_ids.length },
             {
               label: 'Access lifetime',
-              value: `${bundle.data.ttl_seconds / 60} min`,
+              value: formatLifetime(bundle.data.ttl_seconds),
             },
             { label: 'Version', value: bundle.data.version },
           ]}
           main={
             <div className="space-y-4">
-              <p className="text-sm text-muted-foreground">
-                This bundle defines a service selection and lifetime. Saving it
-                grants no access.
-              </p>
+              <div className="flex items-center gap-1">
+                <h2 className="text-sm font-medium">Services</h2>
+                <HelpPopover label="What a bundle does">
+                  <p>
+                    A bundle is a reusable selection of services and a maximum
+                    lifetime. Saving it grants no access; a session does.
+                  </p>
+                </HelpPopover>
+              </div>
               <DataTable
                 aria-label="Bundle services"
                 rows={services}
@@ -204,13 +225,15 @@ export default function AccessBundleDetailPage() {
                   },
                   {
                     key: 'state',
-                    header: 'Requests',
-                    render: (service) => (
-                      <Status
-                        tone={service.enabled ? 'idle' : 'warn'}
-                        label={service.enabled ? 'Allowed' : 'Disabled'}
-                      />
-                    ),
+                    header: 'Status',
+                    render: (service) =>
+                      !service.enabled ? (
+                        <Status tone="warn" label="Disabled" />
+                      ) : !service.has_credential ? (
+                        <Status tone="warn" label="No credential" />
+                      ) : (
+                        <Status tone="ok" label="Ready" />
+                      ),
                   },
                 ]}
               />
