@@ -10,7 +10,8 @@ use temps_core::DBDateTime;
 /// A single restore operation run by the generic RestoreOrchestrator.
 /// Covers every engine (Postgres, Redis, MongoDB, S3/RustFS) so the UI
 /// and API can observe progress uniformly.
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
+/// `Debug` is written out below so the recorded login stays out of logs.
+#[derive(Clone, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "restore_runs")]
 pub struct Model {
     #[sea_orm(primary_key)]
@@ -67,8 +68,42 @@ pub struct Model {
     /// The login a worker restore's data answers to, captured before the
     /// restore was sent and encrypted with `EncryptionService`: what the
     /// target's stored login is patched to when the run settles, also after
-    /// a restart. `NULL` when no worker restore recorded one.
+    /// a restart. `NULL` when no worker restore recorded one. Never
+    /// serialized nor debug-printed: it is a credential, sealed or not.
+    #[serde(skip_serializing, default)]
     pub restored_login_encrypted: Option<String>,
+}
+
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestoreRun")
+            .field("id", &self.id)
+            .field("source_backup_id", &self.source_backup_id)
+            .field("source_service_id", &self.source_service_id)
+            .field("target_service_id", &self.target_service_id)
+            .field("target_service_name", &self.target_service_name)
+            .field("mode", &self.mode)
+            .field("status", &self.status)
+            .field("phase", &self.phase)
+            .field("recovery_target", &self.recovery_target)
+            .field("parameter_overrides", &self.parameter_overrides)
+            .field("resume_token", &self.resume_token)
+            .field("log_id", &self.log_id)
+            .field("error_message", &self.error_message)
+            .field("attempt", &self.attempt)
+            .field("started_at", &self.started_at)
+            .field("finished_at", &self.finished_at)
+            .field("created_by", &self.created_by)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("cancel_requested_at", &self.cancel_requested_at)
+            .field("cancel_requested_by", &self.cancel_requested_by)
+            .field(
+                "has_restored_login",
+                &self.restored_login_encrypted.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -128,5 +163,56 @@ impl ActiveModelBehavior for ActiveModel {
         // explicitly Set() before save, though no caller currently does.
         self.updated_at = Set(now);
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    const SEALED: &str = "sealed-login-ciphertext-1f2e3d";
+
+    fn run() -> Model {
+        Model {
+            id: 7,
+            source_backup_id: 3,
+            source_service_id: 4,
+            target_service_id: None,
+            target_service_name: None,
+            mode: "in_place".into(),
+            status: "running".into(),
+            phase: "restore".into(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "log-1".into(),
+            error_message: None,
+            attempt: 1,
+            started_at: None,
+            finished_at: None,
+            created_by: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            cancel_requested_at: None,
+            cancel_requested_by: None,
+            restored_login_encrypted: Some(SEALED.into()),
+        }
+    }
+
+    /// The sealed login a worker restore recorded never leaves through the
+    /// model's serialized form or its debug output.
+    #[test]
+    fn the_recorded_login_is_neither_serialized_nor_debug_printed() {
+        let run = run();
+        let json = serde_json::to_string(&run).expect("serialize");
+        assert!(!json.contains(SEALED), "serialized: {json}");
+        assert!(
+            !json.contains("restored_login_encrypted"),
+            "serialized: {json}"
+        );
+        let debug = format!("{run:?}");
+        assert!(!debug.contains(SEALED), "debug: {debug}");
+        assert!(debug.contains("has_restored_login: true"), "debug: {debug}");
     }
 }
