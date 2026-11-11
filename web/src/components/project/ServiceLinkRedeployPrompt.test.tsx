@@ -123,9 +123,47 @@ test('on a project page, each environment gets its own deploy dialog, in turn', 
   expect(view.getByText(/Redeploy staging to apply/)).toBeTruthy()
 
   // The last one is an ordinary deploy, which goes on to the deployments list.
-  fireEvent.click(view.getByRole('button', { name: /Redeploy now/ }))
+  // (held back for a moment while what is left is looked up again)
+  fireEvent.click(await enabledButton(view, /Redeploy now/))
   expect(opened[1].environmentId).toBe(4)
   expect(opened[1].onStarted).toBeUndefined()
+})
+
+// One environment runs Git, the other an uploaded archive. While both wait,
+// a Redeploy is offered (one of them can use it); once the Git one is started
+// the prompt must follow what is left, or it keeps offering a Redeploy the
+// archive would decline.
+test('after the redeployable environment is started, the archive left behind is sent to the upload page', async () => {
+  mockApi({
+    'GET /projects/7/environments': () =>
+      jsonResponse([
+        environment(4, 'staging', 41),
+        environment(3, 'production', 31),
+      ]),
+    'GET /projects/7/deployments/31': () =>
+      jsonResponse(deploymentOf(31, 'git')),
+    'GET /projects/7/deployments/41': () =>
+      jsonResponse(deploymentOf(41, 'archive')),
+  })
+  const opened: OpenDeployOptions[] = []
+  const view = renderPrompt((children) => (
+    <ProjectDeployContext.Provider
+      value={{ openDeploy: (options) => opened.push(options ?? {}) }}
+    >
+      {children}
+    </ProjectDeployContext.Provider>
+  ))
+
+  fireEvent.click(await enabledButton(view, /Redeploy production/))
+  act(() => opened[0].onStarted?.(3))
+
+  const upload = await view.findByRole('link', {
+    name: /Upload source again/,
+  })
+  expect(upload.getAttribute('href')).toBe(
+    '/projects/synthetic-api/drop?environment=4'
+  )
+  expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
 })
 
 test('a Git project whose live deployments are uploaded archives is sent to the upload page, not the Git dialog', async () => {

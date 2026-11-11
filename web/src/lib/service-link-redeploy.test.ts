@@ -267,6 +267,20 @@ describe('canRedeployAnyInPlace', () => {
     ).toBe(false)
   })
 
+  // Nothing was uploaded for these, so "upload the source again" would send
+  // the user to something they never used; the redeploy explains instead.
+  test.each(['manual', 'external'] as const)(
+    'a deployment with source type %s keeps the Redeploy action, which explains there is no source',
+    async (made) => {
+      const api = apiFor({
+        31: deployment(31, 3, { metadata: { deploymentSourceType: made } }),
+      })
+      expect(
+        await canRedeployAnyInPlace(7, 'git', [env(3, 'production', 31)], api)
+      ).toBe(true)
+    }
+  )
+
   test('one redeployable environment is enough to offer the action', async () => {
     const api = apiFor({
       31: deployment(31, 3, {}),

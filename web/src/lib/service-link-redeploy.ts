@@ -164,13 +164,16 @@ const REDEPLOYABILITY_DEADLINE_MS = 4000
  * source type: a project's type is its primary source, not a restriction, so a
  * manual project can run an image or a Git ref, and a Git project can hold an
  * uploaded archive. Only a deployment whose own source is an uploaded archive
- * (or a manual or external one with nothing to rebuild from) has to be
- * uploaded again.
+ * has to be uploaded again, so only that makes this say no. A manual or
+ * external deployment has no archive to upload either: for those the redeploy
+ * itself explains that there is no reusable source, which is more accurate
+ * than sending the user to an upload they never used.
  *
  * It answers as soon as one environment is known to be redeployable, and gives
  * up waiting after a few seconds. When a deployment cannot be read, there is
- * nothing to decide, or the lookup is too slow, this says yes: the redeploy itself reports why an environment was skipped, and
- * withholding the action on a failed read would regress working projects.
+ * nothing to decide, or the lookup is too slow, this says yes: the redeploy
+ * itself reports why an environment was skipped, and withholding the action on
+ * a failed read would regress working projects.
  */
 export async function canRedeployAnyInPlace(
   projectId: number,
@@ -205,7 +208,11 @@ export async function canRedeployAnyInPlace(
         })
         .then(({ data: deployment }) => {
           const plan = deploymentRedeployPlan(deployment, projectSourceType)
-          if (plan.kind !== 'unsupported') return finish(true)
+          if (
+            plan.kind !== 'unsupported' ||
+            plan.sourceType !== 'uploaded_source'
+          )
+            return finish(true)
           unredeployable += 1
           if (unredeployable === environments.length) finish(false)
         })

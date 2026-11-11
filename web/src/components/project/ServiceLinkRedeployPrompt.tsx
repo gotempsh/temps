@@ -98,20 +98,22 @@ export function ServiceLinkRedeployPrompt({
   const targets = environmentsToRedeploy(environments.data).filter(
     (environment) => !startedIds.includes(environment.id)
   )
-  // Whether the running deployments can be redeployed by the console, from
-  // each one's own source. Unknown until read, and treated as yes if it cannot
-  // be read, so the action is never withheld on a failed lookup.
-  const running = environmentsToRedeploy(environments.data)
+  // Whether the deployments still to redeploy can be redeployed by the
+  // console, from each one's own source. It follows `targets`, not every
+  // running environment: once the redeployable one has been started, an
+  // uploaded archive left behind must be offered the upload, not a redeploy
+  // that would be declined. Unknown until read, and treated as yes if it
+  // cannot be read, so the action is never withheld on a failed lookup.
   const redeployability = useQuery({
     queryKey: [
       'service-link-redeployability',
       project.id,
       project.source_type,
-      running.map((e) => `${e.id}:${e.current_deployment_id}`),
+      targets.map((e) => `${e.id}:${e.current_deployment_id}`),
     ],
     queryFn: () =>
-      canRedeployAnyInPlace(project.id, project.source_type, running),
-    enabled: change != null && environments.isSuccess && running.length > 0,
+      canRedeployAnyInPlace(project.id, project.source_type, targets),
+    enabled: change != null && environments.isSuccess && targets.length > 0,
   })
   if (!change || (environments.isSuccess && targets.length === 0)) return null
 
