@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, expect, test } from 'bun:test'
 import {
@@ -16,6 +16,20 @@ import { mockApi, jsonResponse } from '@/test/fetch-mock'
 import { VaultLinks } from './VaultLinks'
 installBrowserWindow()
 afterEach(cleanup)
+
+function UrlProbe() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  return (
+    <>
+      <output aria-label="URL">
+        {location.pathname}
+        {location.search}
+      </output>
+      <button onClick={() => navigate(-1)}>Back</button>
+    </>
+  )
+}
 
 test('unlinking the final row on page two returns to the remaining consumers', async () => {
   let removed = false
@@ -55,13 +69,23 @@ test('unlinking the final row on page two returns to the remaining consumers', a
   try {
     render(
       <QueryClientProvider client={client}>
-        <VaultLinks vaultId="vault_fixture" />
+        <MemoryRouter
+          initialEntries={[
+            '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture',
+          ]}
+        >
+          <UrlProbe />
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
       </QueryClientProvider>
     )
     const ui = within(document.body)
     await waitFor(() => expect(ui.getByText('Project 1')).toBeTruthy())
     fireEvent.click(ui.getByRole('button', { name: 'Next page' }))
     await waitFor(() => expect(ui.getByText('Project 21')).toBeTruthy())
+    expect(ui.getByLabelText('URL').textContent).toBe(
+      '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture&links_page=2'
+    )
     fireEvent.click(ui.getByRole('button', { name: 'Unlink' }))
     fireEvent.click(
       within(ui.getByRole('alertdialog')).getByRole('button', {
@@ -73,6 +97,9 @@ test('unlinking the final row on page two returns to the remaining consumers', a
       expect(ui.getByText('Project 1')).toBeTruthy()
       expect(ui.getAllByRole('button', { name: 'Unlink' })).toHaveLength(20)
     })
+    expect(ui.getByLabelText('URL').textContent).toBe(
+      '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture'
+    )
     expect(removed).toBe(true)
     expect(pages).toContain(2)
     expect(ui.queryByText(/No consumers linked/)).toBeNull()
@@ -110,7 +137,14 @@ test('unlink requires a revocation confirmation and preserves failures', async (
   try {
     render(
       <QueryClientProvider client={client}>
-        <VaultLinks vaultId="vault_fixture" />
+        <MemoryRouter
+          initialEntries={[
+            '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture',
+          ]}
+        >
+          <UrlProbe />
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
       </QueryClientProvider>
     )
     const ui = within(document.body)
@@ -146,7 +180,12 @@ test('loading displays skeleton rows before consumer data arrives', () => {
   try {
     const html = renderToStaticMarkup(
       <QueryClientProvider client={client}>
-        <MemoryRouter>
+        <MemoryRouter
+          initialEntries={[
+            '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture',
+          ]}
+        >
+          <UrlProbe />
           <VaultLinks vaultId="vault_fixture" />
         </MemoryRouter>
       </QueryClientProvider>
@@ -193,7 +232,14 @@ for (const kind of ['project', 'sandbox'] as const) {
     try {
       render(
         <QueryClientProvider client={client}>
-          <VaultLinks vaultId="vault_fixture" />
+          <MemoryRouter
+            initialEntries={[
+              '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture',
+            ]}
+          >
+            <UrlProbe />
+            <VaultLinks vaultId="vault_fixture" />
+          </MemoryRouter>
         </QueryClientProvider>
       )
       const ui = within(document.body)
@@ -235,7 +281,14 @@ test('empty links keep the status and linking action in the heading row', async 
   try {
     render(
       <QueryClientProvider client={client}>
-        <VaultLinks vaultId="vault_fixture" />
+        <MemoryRouter
+          initialEntries={[
+            '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture',
+          ]}
+        >
+          <UrlProbe />
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
       </QueryClientProvider>
     )
     const ui = within(document.body)
@@ -256,3 +309,125 @@ test('empty links keep the status and linking action in the heading row', async 
     api.restore()
   }
 })
+
+test('linked-consumer URLs restore pagination and browser history without changing vault context', async () => {
+  const pages: number[] = []
+  const api = mockApi({
+    'GET /access-vaults/vault_fixture/links': (request) => {
+      const page = Number(new URL(request.url).searchParams.get('page'))
+      pages.push(page)
+      return jsonResponse({
+        items: [
+          {
+            id: `link_${page}`,
+            vault_id: 'vault_fixture',
+            project_id: page,
+            sandbox_id: null,
+            consumer_name: `Consumer page ${page}`,
+            created_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        total: 60,
+        page,
+        page_size: 20,
+      })
+    },
+  })
+  const url =
+    '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture&page=4&links_page=2'
+  const clients: QueryClient[] = []
+  const mount = () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    clients.push(client)
+    return render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[url]}>
+          <UrlProbe />
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+  }
+  try {
+    const first = mount()
+    const ui = within(document.body)
+    await waitFor(() => expect(ui.getByText('Consumer page 2')).toBeTruthy())
+    expect(pages[0]).toBe(2)
+    fireEvent.click(ui.getByRole('button', { name: 'Next page' }))
+    await waitFor(() => expect(ui.getByText('Consumer page 3')).toBeTruthy())
+    expect(ui.getByLabelText('URL').textContent).toBe(
+      url.replace('links_page=2', 'links_page=3')
+    )
+    fireEvent.click(ui.getByRole('button', { name: 'Back' }))
+    await waitFor(() => expect(ui.getByText('Consumer page 2')).toBeTruthy())
+    expect(ui.getByLabelText('URL').textContent).toBe(url)
+    first.unmount()
+    mount()
+    await waitFor(() => expect(ui.getByText('Consumer page 2')).toBeTruthy())
+    expect(ui.getByLabelText('URL').textContent).toBe(url)
+  } finally {
+    cleanup()
+    clients.forEach((client) => client.clear())
+    api.restore()
+  }
+})
+
+test.each(['invalid', '-1', '2.5', '99'])(
+  'recovers a linked-consumer page of %s',
+  async (value) => {
+    const api = mockApi({
+      'GET /access-vaults/vault_fixture/links': (request) => {
+        const page = Number(new URL(request.url).searchParams.get('page'))
+        return jsonResponse({
+          items:
+            page === 1
+              ? [
+                  {
+                    id: 'link_fixture',
+                    vault_id: 'vault_fixture',
+                    project_id: 7,
+                    sandbox_id: null,
+                    consumer_name: 'Remaining consumer',
+                    created_at: '2026-01-01T00:00:00Z',
+                  },
+                ]
+              : [],
+          total: 1,
+          page,
+          page_size: 20,
+        })
+      },
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter
+            initialEntries={[
+              `/vault/vaults/vault_fixture?tab=links&links_page=${value}`,
+            ]}
+          >
+            <UrlProbe />
+            <VaultLinks vaultId="vault_fixture" />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const ui = within(document.body)
+      await waitFor(() =>
+        expect(ui.getByText('Remaining consumer')).toBeTruthy()
+      )
+      if (value === '99')
+        expect(ui.getByLabelText('URL').textContent).toBe(
+          '/vault/vaults/vault_fixture?tab=links'
+        )
+    } finally {
+      cleanup()
+      client.clear()
+      api.restore()
+    }
+  }
+)

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -46,7 +47,26 @@ export function VaultLinks({
   active?: boolean
 }) {
   const client = useQueryClient()
-  const [page, setPage] = useState(1)
+  const [search, setSearch] = useSearchParams()
+  const requestedPage = Number(search.get('links_page'))
+  const page =
+    Number.isSafeInteger(requestedPage) && requestedPage > 0
+      ? Math.min(requestedPage, 1_000_000)
+      : 1
+  const setPage = useCallback(
+    (nextPage: number, replace = false) => {
+      setSearch(
+        (current) => {
+          const next = new URLSearchParams(current)
+          if (nextPage === 1) next.delete('links_page')
+          else next.set('links_page', String(nextPage))
+          return next
+        },
+        { replace }
+      )
+    },
+    [setSearch]
+  )
   const form = useForm<z.infer<typeof consumerSchema>>({
     resolver: zodResolver(consumerSchema),
     defaultValues: { kind: 'project' },
@@ -62,6 +82,11 @@ export function VaultLinks({
     }),
     enabled: active,
   })
+  useEffect(() => {
+    if (!active || !links.isSuccess) return
+    const lastPage = Math.max(1, Math.ceil(links.data.total / 20))
+    if (page > lastPage) setPage(lastPage, true)
+  }, [active, links.isSuccess, links.data?.total, page, setPage])
   const refresh = () => {
     void client.invalidateQueries({ queryKey: [{ _id: 'listVaultLinks' }] })
     void client.invalidateQueries({
@@ -156,7 +181,7 @@ export function VaultLinks({
           pageSize={20}
           total={links.data?.total ?? 0}
           totalPages={Math.ceil((links.data?.total ?? 0) / 20)}
-          onPageChange={setPage}
+          onPageChange={(nextPage) => setPage(nextPage)}
         />
       )}
       <Dialog
