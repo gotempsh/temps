@@ -192,6 +192,12 @@ export default function ApiKeyCreate() {
       })
       return
     }
+    // A role chosen before the catalogue arrived can turn out to be one this
+    // user may not grant. Go back to choosing instead of sending an empty role.
+    if (!useCustomPermissions && !selectedRole) {
+      setStep(2)
+      return
+    }
     isSubmittingRef.current = true
 
     const data: CreateApiKeyRequest = {
@@ -217,8 +223,11 @@ export default function ApiKeyCreate() {
   const canProceed = () => {
     if (step === 1) return keyName.trim().length > 0
     if (step === 2)
+      // Not before the catalogue is known: a role preselected from the link is
+      // only checked against the user's own permissions once it has loaded.
       return (
-        selectedRole || (useCustomPermissions && selectedPermissions.size > 0)
+        !isLoadingPermissions &&
+        (selectedRole || (useCustomPermissions && selectedPermissions.size > 0))
       )
     return true
   }

@@ -12,6 +12,7 @@
  * unit-testable without rendering the dialog.
  */
 
+import { httpStatusOf } from '@/lib/http-error-status'
 import { extractProblemDetails } from '@/utils/errorHandling'
 
 /** Headline for any failed read of the destination list. */
@@ -134,7 +135,7 @@ export function classifyDestinationError(error: unknown): DestinationFailure {
 
   const problem = extractProblemDetails(error)
   const status =
-    typeof problem?.status === 'number' ? problem.status : undefined
+    typeof problem?.status === 'number' ? problem.status : httpStatusOf(error)
   const detail =
     typeof problem?.detail === 'string' && problem.detail.trim().length > 0
       ? problem.detail
@@ -264,6 +265,17 @@ export function canSubmitBackup<T extends DestinationLike>(
   const destinations = knownDestinations(state)
   if (!destinations) return false
   return selectionStatus(destinations, selectedId) === 'valid'
+}
+
+/**
+ * The destination to submit with the backup: none when the list is refused
+ * (the server uses the default), whatever the form still holds from before.
+ */
+export function destinationToSubmit<T extends DestinationLike>(
+  state: DestinationState<T>,
+  selectedId: number | undefined
+): number | undefined {
+  return state.kind === 'restricted' ? undefined : selectedId
 }
 
 /** What the server said a backup run would do, as far as the dialog cares. */

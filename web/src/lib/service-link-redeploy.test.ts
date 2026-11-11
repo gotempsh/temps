@@ -406,6 +406,10 @@ describe('toastRedeployAfterLinkChange', () => {
     const api = mockApi({
       'GET /projects/7/environments': () =>
         jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(
+          deployment(31, 3, { branch: 'main', commit_hash: 'abc123' })
+        ),
     })
     const { info, notify } = notifier()
     await toastRedeployAfterLinkChange(
@@ -414,6 +418,8 @@ describe('toastRedeployAfterLinkChange', () => {
       notify as never
     )
     expect(info[0].options.action).toMatchObject({ label: 'Redeploy now' })
+    // Eligibility came from reading the live deployment, not from a failed read.
+    expect(api.called('GET', '/projects/7/deployments/31')).toBe(true)
     api.restore()
   })
 

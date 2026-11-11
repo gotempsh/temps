@@ -3,7 +3,7 @@
 
 import type { QueryClient } from '@tanstack/react-query'
 import { httpStatusOf } from './http-error-status'
-import { isForbiddenRead } from './read-failure'
+import { isForbiddenRead, isRoleRefusal } from './read-failure'
 
 /**
  * A page cannot be trusted to look at `isError`. Many routes read their data
@@ -68,6 +68,14 @@ function isHandled(error: unknown): boolean {
  */
 export const ROUTE_FAILURE_IGNORE = 'ignore'
 
+/**
+ * `meta: { routeFailure: 'ignore-refusal' }` on a query whose page works
+ * without its data for a role that may not read it: a 403 is expected and not
+ * reported, but any other failure (a 500, an unreachable server) still is,
+ * because the page would otherwise show an empty list in place of an error.
+ */
+export const ROUTE_FAILURE_IGNORE_REFUSAL = 'ignore-refusal'
+
 export interface RouteQueryFailure {
   queryHash: string
   error: unknown
@@ -93,6 +101,10 @@ export function collectRouteQueryFailures(
         !query.isDisabled() &&
         query.getObserversCount() > 0 &&
         query.meta?.routeFailure !== ROUTE_FAILURE_IGNORE &&
+        !(
+          query.meta?.routeFailure === ROUTE_FAILURE_IGNORE_REFUSAL &&
+          isRoleRefusal(query.state.error)
+        ) &&
         isReportableReadFailure(query.state.error) &&
         !isHandled(query.state.error),
     })

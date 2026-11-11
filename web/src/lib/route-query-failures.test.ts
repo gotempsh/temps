@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import {
   ROUTE_FAILURE_IGNORE,
+  ROUTE_FAILURE_IGNORE_REFUSAL,
   collectRouteQueryFailures,
   isReportableReadFailure,
   markReadFailureHandled,
@@ -80,6 +81,35 @@ describe('collectRouteQueryFailures', () => {
     expect(client.getQueryState(['optional-banner'])?.status).toBe('error')
     expect(collectRouteQueryFailures(client)).toHaveLength(0)
     stop()
+  })
+
+  test('ignores a refusal on a read that opted out of refusals, but still reports a real failure', async () => {
+    const client = new QueryClient()
+    const observe = async (key: string, error: unknown) => {
+      const observer = new QueryObserver(client, {
+        queryKey: [key],
+        queryFn: () => Promise.reject(error),
+        retry: false,
+        meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
+      })
+      const stop = observer.subscribe(() => {})
+      await observer.refetch().catch(() => {})
+      return stop
+    }
+    const stopRefused = await observe('refused', problem(403, 'Forbidden'))
+    expect(collectRouteQueryFailures(client)).toHaveLength(0)
+    // A 403 whose body names neither a status nor a title is still a refusal.
+    const stopBare = await observe(
+      'refused-bare',
+      Object.assign(new Error('denied'), { status: 403 })
+    )
+    expect(collectRouteQueryFailures(client)).toHaveLength(0)
+    // A server error on the same kind of read is not swallowed.
+    const stopBroken = await observe('broken', problem(500))
+    expect(collectRouteQueryFailures(client)).toHaveLength(1)
+    stopRefused()
+    stopBare()
+    stopBroken()
   })
 
   test('ignores a failed refetch that still has data to show', async () => {

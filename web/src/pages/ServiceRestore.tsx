@@ -87,7 +87,10 @@ import {
 } from '@/components/operations/operations-tray-store'
 import { invalidateOperations } from '@/lib/operations'
 import { RunTrackingPanel } from './service-restore/RunTrackingPanel'
-import { ownBackupsAsEntries } from './service-restore/own-backups'
+import {
+  noBackupsMessage,
+  ownBackupsAsEntries,
+} from './service-restore/own-backups'
 import {
   restoreCapabilitiesQuery,
   restoreRunQuery,
@@ -964,9 +967,25 @@ export function ServiceRestore() {
             />
           ) : filteredBackups.length === 0 ? (
             <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
-              {sourcesRefused
-                ? 'This database has no backups yet.'
-                : 'No compatible backups on this source.'}
+              {noBackupsMessage({
+                fromOwnList: sourcesRefused,
+                total: allBackups.length,
+                filter: search,
+              })}
+              {search.trim() !== '' && allBackups.length > 0 ? (
+                <div className="mt-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setSearch('')
+                      setBackupsPage(1)
+                    }}
+                  >
+                    Clear filter
+                  </Button>
+                </div>
+              ) : null}
             </div>
           ) : (
             <div className="border rounded-md">

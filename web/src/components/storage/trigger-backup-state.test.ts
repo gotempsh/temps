@@ -10,6 +10,7 @@ import {
   canSubmitBackup,
   confirmRestartParam,
   deriveRestartGate,
+  destinationToSubmit,
   restartGateAllowsSubmit,
   classifyDestinationError,
   deriveDestinationState,
@@ -48,6 +49,41 @@ function failedInitialRead(error: unknown) {
     isError: true,
   })
 }
+
+describe('refusals recognised from the status line', () => {
+  test('a 403 whose body carries no status or title is still a permission failure', () => {
+    const bare = Object.assign(new Error('denied'), { status: 403 })
+    expect(classifyDestinationError(bare).reason).toBe('permission')
+    expect(classifyDestinationError(bare).status).toBe(403)
+  })
+})
+
+describe('destinationToSubmit', () => {
+  test('a refused list submits no destination, whatever the form still holds', () => {
+    const restricted = deriveDestinationState<Destination>({
+      data: [],
+      error: forbidden,
+      isPending: false,
+      isError: true,
+    })
+    expect(restricted.kind).toBe('restricted')
+    // A destination chosen while the list was still readable.
+    expect(destinationToSubmit(restricted, 5)).toBeUndefined()
+    expect(
+      canSubmitBackup(restricted, destinationToSubmit(restricted, 5))
+    ).toBe(true)
+  })
+
+  test('a readable list keeps the chosen destination', () => {
+    const ready = deriveDestinationState<Destination>({
+      data: [primary],
+      error: null,
+      isPending: false,
+      isError: false,
+    })
+    expect(destinationToSubmit(ready, primary.id)).toBe(primary.id)
+  })
+})
 
 describe('classifyDestinationError', () => {
   test('403 problem is a permission failure carrying the server detail', () => {

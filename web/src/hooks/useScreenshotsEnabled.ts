@@ -3,7 +3,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { getSettingsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 
 /**
  * Whether the platform captures deployment screenshots.
@@ -17,7 +17,7 @@ export function useScreenshotsEnabled(): boolean {
   const { data: settings } = useQuery({
     ...getSettingsOptions(),
     retry: false,
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   return settings?.screenshots?.enabled ?? false
 }

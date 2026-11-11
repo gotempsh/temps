@@ -4,6 +4,23 @@
 import type { ServiceBackupListResponse, SourceBackupEntry } from '@/api/client'
 
 /**
+ * What to say when no backup is shown: no backups at all, a filter that
+ * matches none of them, or nothing compatible on the chosen source.
+ */
+export function noBackupsMessage(state: {
+  fromOwnList: boolean
+  total: number
+  filter: string
+}): string {
+  if (state.total > 0 && state.filter.trim() !== '') {
+    return 'No backups match this filter.'
+  }
+  return state.fromOwnList
+    ? 'This database has no backups yet.'
+    : 'No compatible backups on this source.'
+}
+
+/**
  * The restore page normally lists backups per storage source, which needs the
  * list of sources and so a role that may read them. A role that may not (the
  * built-in `user`) can still list and restore its own database's backups, so

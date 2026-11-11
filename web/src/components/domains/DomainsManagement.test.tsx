@@ -117,3 +117,25 @@ test('a role refused the tunnel reads still lists certificates, with no page fai
   })
   expect(collectRouteQueryFailures(client)).toEqual([])
 })
+
+test('a real failure of the tunnel reads is still reported, not shown as an empty list', async () => {
+  const broken = () =>
+    jsonResponse({ title: 'Internal Server Error', status: 500 }, 500)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = renderTable(client, {
+    'GET /ingress/connectors': broken,
+    'GET /ingress/hostnames': broken,
+  })
+
+  expect(view.getByRole('link', { name: 'app.example.com' })).toBeTruthy()
+  await waitFor(() => {
+    const errored = client
+      .getQueryCache()
+      .findAll()
+      .filter((q) => q.state.status === 'error')
+    expect(errored.length).toBe(2)
+  })
+  expect(collectRouteQueryFailures(client)).toHaveLength(2)
+})

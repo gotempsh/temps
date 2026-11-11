@@ -5,7 +5,6 @@ import {
   getRestoreCapabilitiesQueryKey,
   getRestoreRunQueryKey,
   getServiceQueryKey,
-  listExternalServiceBackupsQueryKey,
   listRestoreRunsForServiceQueryKey,
   listS3SourcesQueryKey,
   listSourceBackupsQueryKey,
@@ -19,7 +18,11 @@ import {
   listS3Sources,
   listSourceBackups,
 } from '@/api/client/sdk.gen'
-import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
+import type {
+  ServiceBackupEntryResponse,
+  ServiceBackupListResponse,
+} from '@/api/client'
 import { queryOptions } from '@tanstack/react-query'
 import { shouldRetryRead, toQueryError } from './restore-state'
 
@@ -70,11 +73,10 @@ export function restoreSourcesQuery() {
     queryKey: listS3SourcesQueryKey(),
     // A role that may not list sources is refused, and the page then falls back
     // to the database's own backups, so the refusal is not a failure of the
-    // page. A real failure is explained by the page itself ("Could not load
-    // storage sources"), so the shell must not report it a second time.
+    // page. Any other failure is still reported.
     queryFn: ({ signal }) =>
       requireData(listS3Sources({ signal, throwOnError: false })),
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
     retry: (count, error) => shouldRetryRead(count, error),
   })
 }
@@ -91,22 +93,43 @@ export function restoreSourceBackupsQuery(sourceId: number) {
   })
 }
 
+/** The server's maximum page size. */
+const OWN_BACKUPS_PAGE_SIZE = 100
+/** A safety cap on how many pages are read: 2,000 backups. */
+const OWN_BACKUPS_MAX_PAGES = 20
+
 /**
  * The database's own backups, newest first, for a role that may not list
- * storage sources. One page of the most recent backups (the server's maximum
- * page size); the source-based list stays the way to reach older ones.
+ * storage sources. Every page is read, so an older recovery point stays
+ * reachable (up to a cap of {@link OWN_BACKUPS_MAX_PAGES} pages).
  */
 export function restoreOwnBackupsQuery(serviceId: number) {
-  const options = {
-    path: { service_id: serviceId },
-    query: { page_size: 100 },
-  }
   return queryOptions({
-    queryKey: listExternalServiceBackupsQueryKey(options),
-    queryFn: ({ signal }) =>
-      requireData(
-        listExternalServiceBackups({ ...options, signal, throwOnError: false })
-      ),
+    // Its own key: this holds every page merged, not the first page the
+    // generated key stands for.
+    queryKey: ['restore-own-backups', serviceId],
+    queryFn: async ({ signal }): Promise<ServiceBackupListResponse> => {
+      const backups: ServiceBackupEntryResponse[] = []
+      let last: ServiceBackupListResponse | undefined
+      for (let page = 1; page <= OWN_BACKUPS_MAX_PAGES; page++) {
+        last = await requireData(
+          listExternalServiceBackups({
+            path: { service_id: serviceId },
+            query: { page, page_size: OWN_BACKUPS_PAGE_SIZE },
+            signal,
+            throwOnError: false,
+          })
+        )
+        backups.push(...last.backups)
+        if (last.backups.length === 0 || backups.length >= last.total) break
+      }
+      return {
+        page: 1,
+        page_size: OWN_BACKUPS_PAGE_SIZE,
+        total: last?.total ?? backups.length,
+        backups,
+      }
+    },
     retry: (count, error) => shouldRetryRead(count, error),
   })
 }

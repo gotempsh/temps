@@ -145,6 +145,33 @@ describe('backup compatibility check that cannot be answered', () => {
     api.restore()
   })
 
+  test('a 403 whose body names no status or title is still treated as a refusal', async () => {
+    const api = mockApi({
+      'GET /backups/external-services/7/capability': () =>
+        new Response('Forbidden', { status: 403 }),
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      <QueryClientProvider client={client}>
+        <WalHealthPanel serviceId={7} serviceType="postgres" />
+      </QueryClientProvider>
+    )
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryCache()
+          .findAll()
+          .some((q) => q.state.status === 'error')
+      ).toBe(true)
+    )
+    expect(view.container.textContent).not.toContain(
+      'Backup compatibility unavailable'
+    )
+    api.restore()
+  })
+
   test('a real failure of the check is still reported, with a retry', async () => {
     const { api, client, view } = renderUnanswered(500)
     expect(

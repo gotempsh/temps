@@ -20,7 +20,7 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { getErrorMessage } from '@/utils/errorHandling'
-import { isForbiddenRead } from '@/lib/read-failure'
+import { isRoleRefusal } from '@/lib/read-failure'
 import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ShieldAlert } from 'lucide-react'
@@ -67,7 +67,7 @@ export function WalHealthPanel({
   // went wrong and a retry cannot change it, so only a real failure of the
   // check is shown as one.
   const checkFailed =
-    backupCapability.isError && !isForbiddenRead(backupCapability.error)
+    backupCapability.isError && !isRoleRefusal(backupCapability.error)
 
   const snapshot = data?.wal_health ?? null
   const incompatible = backupCapability.data?.cloud_backup_compatible === false

@@ -3,7 +3,7 @@
 
 import { expect, test } from 'bun:test'
 import type { ServiceBackupListResponse } from '@/api/client'
-import { ownBackupsAsEntries } from './own-backups'
+import { noBackupsMessage, ownBackupsAsEntries } from './own-backups'
 
 const list: ServiceBackupListResponse = {
   page: 1,
@@ -59,4 +59,24 @@ test('an empty list stays empty', () => {
       { name: 'synthetic-db', service_type: 'postgres' }
     )
   ).toEqual([])
+})
+
+test('says what is actually empty: no backups, a filter that matches none, or nothing on the source', () => {
+  expect(noBackupsMessage({ fromOwnList: true, total: 0, filter: '' })).toBe(
+    'This database has no backups yet.'
+  )
+  // Backups exist but the filter hides them all: not "no backups yet".
+  expect(noBackupsMessage({ fromOwnList: true, total: 4, filter: 'zzz' })).toBe(
+    'No backups match this filter.'
+  )
+  expect(
+    noBackupsMessage({ fromOwnList: false, total: 4, filter: 'zzz' })
+  ).toBe('No backups match this filter.')
+  expect(noBackupsMessage({ fromOwnList: false, total: 0, filter: '' })).toBe(
+    'No compatible backups on this source.'
+  )
+  // A blank filter is not an active filter.
+  expect(noBackupsMessage({ fromOwnList: true, total: 0, filter: '   ' })).toBe(
+    'This database has no backups yet.'
+  )
 })

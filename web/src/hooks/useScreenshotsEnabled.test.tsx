@@ -49,3 +49,19 @@ test('reflects the platform setting when it can be read', async () => {
   await waitFor(() => expect(result.current).toBe(true))
   api.restore()
 })
+
+test('a real failure of the settings read is still reported', async () => {
+  const api = mockApi({
+    'GET /settings': () =>
+      jsonResponse({ title: 'Internal Server Error', status: 500 }, 500),
+  })
+  const { client, wrapper } = setup()
+  const { result } = renderHook(() => useScreenshotsEnabled(), { wrapper })
+
+  await waitFor(() =>
+    expect(client.getQueryCache().findAll()[0]?.state.status).toBe('error')
+  )
+  expect(result.current).toBe(false)
+  expect(collectRouteQueryFailures(client)).toHaveLength(1)
+  api.restore()
+})

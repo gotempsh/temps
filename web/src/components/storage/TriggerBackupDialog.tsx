@@ -36,7 +36,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { announceOperation } from '@/components/operations/operations-tray-store'
 import { AlertTriangle, HardDrive, Loader2, Star } from 'lucide-react'
 import { useEffect } from 'react'
@@ -54,6 +54,7 @@ import {
   confirmRestartParam,
   deriveDestinationState,
   deriveRestartGate,
+  destinationToSubmit,
   restartGateAllowsSubmit,
   type RestartGate,
   knownDestinations,
@@ -87,9 +88,9 @@ export function TriggerBackupDialog({
     ...listS3SourcesOptions(),
     enabled: open,
     retry: shouldRetryDestinationRead,
-    // The dialog explains a failed read itself (a neutral note for a refusal,
-    // an alert with Retry otherwise), so the shell must not report it too.
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    // A refusal is expected and handled by the dialog (a neutral note); any
+    // other failure is still reported.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
 
   // Loading, failed read, failed refresh over cached data, empty, or ready.
@@ -138,8 +139,10 @@ export function TriggerBackupDialog({
     ? selectionStatus(s3Sources, selectedSourceId)
     : 'none'
   const canSubmit =
-    canSubmitBackup(destinationState, selectedSourceId) &&
-    restartGateAllowsSubmit(restartGate, restartConfirmed)
+    canSubmitBackup(
+      destinationState,
+      destinationToSubmit(destinationState, selectedSourceId)
+    ) && restartGateAllowsSubmit(restartGate, restartConfirmed)
 
   // The user's explicitly-flagged default S3 source, if any. Used in
   // the FormDescription render below ("Defaults to ⭐ Cloudflare …") and
@@ -194,8 +197,7 @@ export function TriggerBackupDialog({
     // the default. Otherwise never submit while availability is unknown, or to
     // a destination the loaded list no longer contains. The submit button is
     // already disabled in those states; this guards Enter-key submission.
-    const sourceId =
-      destinationState.kind === 'restricted' ? undefined : values.s3_source_id
+    const sourceId = destinationToSubmit(destinationState, values.s3_source_id)
     if (!canSubmitBackup(destinationState, sourceId)) return
     const confirmed = values.confirm_restart === true
     if (!restartGateAllowsSubmit(restartGate, confirmed)) return

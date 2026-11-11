@@ -16,7 +16,7 @@ import {
   staleBannerMessage,
   withoutResolverForProject,
 } from '@/lib/cluster-dns-coverage'
-import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { CLUSTER_DNS_URL } from '@/lib/worker-nodes'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, CheckCircle2, Loader2, RefreshCw } from 'lucide-react'
@@ -175,7 +175,7 @@ export function ClusterDnsStaleBanner({ projectId }: { projectId: number }) {
     retry: false,
     // A banner nobody is owed: a role that cannot read the status is refused
     // and simply sees nothing, which is not a failure of the page it is on.
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const redeploy = useRedeployWithoutResolver()
   const entries = withoutResolverForProject(status.data, projectId)

@@ -188,3 +188,32 @@ test('an admin is offered every role', async () => {
   expect(view.container.querySelector('[aria-disabled]')).toBeNull()
   api.restore()
 })
+
+// Until the role catalogue arrives the user's own permissions are unknown, so a
+// role preselected from the link cannot be judged yet. Proceeding in that
+// window would carry an ungrantable role to the Review step.
+test('a role preselected from the link cannot be carried past a catalogue that has not loaded', async () => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const api = mockApi({
+    'GET /api-keys/permissions': async () => {
+      await gate
+      return jsonResponse(CEILING_CATALOGUE)
+    },
+  })
+  const view = renderPage('user', '/settings/keys/new?role=admin&name=ci-key')
+  fireEvent.click(
+    await view.findByRole('button', { name: 'Next: Permissions' })
+  )
+  const next = view.getByRole('button', { name: 'Next: Review' })
+  expect(next.hasAttribute('disabled')).toBe(true)
+
+  release()
+  await view.findByText('Standard access')
+  expect(
+    view.getByRole('button', { name: 'Next: Review' }).hasAttribute('disabled')
+  ).toBe(true)
+  api.restore()
+})
