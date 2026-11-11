@@ -2,18 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { useCallback, useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router'
-import { useForm, useWatch } from 'react-hook-form'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { z } from 'zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  Button,
-  Skeleton,
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@temps-sdk/ui'
+import { Button, Skeleton } from '@temps-sdk/ui'
 import { Callout, DataTable, ResponsivePagination } from '@temps-sdk/ds'
 import {
   createVaultLink,
@@ -25,19 +15,8 @@ import { VaultConsumerPicker } from './VaultConsumerPicker'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { problemDetail } from '@/lib/api-problem'
 
-const consumerSchema = z.discriminatedUnion('kind', [
-  z.object({
-    kind: z.literal('project'),
-    selected: z.number({ error: 'Select a project.' }).int().positive(),
-  }),
-  z.object({
-    kind: z.literal('sandbox'),
-    selected: z
-      .string({ error: 'Select a sandbox.' })
-      .trim()
-      .min(1, 'Select a sandbox.'),
-  }),
-])
+type Consumer =
+  { kind: 'project'; selected: number } | { kind: 'sandbox'; selected: string }
 
 export function VaultLinks({
   vaultId,
@@ -48,11 +27,13 @@ export function VaultLinks({
 }) {
   const client = useQueryClient()
   const [search, setSearch] = useSearchParams()
-  const requestedPage = Number(search.get('links_page'))
-  const page =
-    Number.isSafeInteger(requestedPage) && requestedPage > 0
-      ? Math.min(requestedPage, 1_000_000)
+  const readPage = (key: string) => {
+    const value = Number(search.get(key))
+    return Number.isSafeInteger(value) && value > 0
+      ? Math.min(value, 1_000_000)
       : 1
+  }
+  const page = readPage('links_page')
   const setPage = useCallback(
     (nextPage: number, replace = false) => {
       setSearch(
@@ -67,13 +48,6 @@ export function VaultLinks({
     },
     [setSearch]
   )
-  const form = useForm<z.infer<typeof consumerSchema>>({
-    resolver: zodResolver(consumerSchema),
-    defaultValues: { kind: 'project' },
-  })
-  const kind = useWatch({ control: form.control, name: 'kind' })
-  const selected = useWatch({ control: form.control, name: 'selected' })
-  const [open, setOpen] = useState(false)
   const [removing, setRemoving] = useState<VaultLinkResponse>()
   const links = useQuery({
     ...listVaultLinksOptions({
@@ -94,7 +68,7 @@ export function VaultLinks({
     })
   }
   const add = useMutation({
-    mutationFn: (values: z.infer<typeof consumerSchema>) =>
+    mutationFn: (values: Consumer) =>
       createVaultLink({
         path: { vault_id: vaultId },
         body:
@@ -103,11 +77,7 @@ export function VaultLinks({
             : { sandbox_id: values.selected },
         throwOnError: true,
       }),
-    onSuccess: () => {
-      refresh()
-      setOpen(false)
-      form.reset({ kind: 'project' })
-    },
+    onSuccess: refresh,
   })
   const remove = useMutation({
     mutationFn: (link: VaultLinkResponse) =>
@@ -119,15 +89,6 @@ export function VaultLinks({
   })
   return (
     <section className="space-y-3" aria-label="Linked to">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <h2 className="text-sm font-medium">Linked to</h2>
-        {!links.isPending && !links.isError && links.data?.total === 0 && (
-          <p className="text-sm text-muted-foreground">No consumers linked</p>
-        )}
-        <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
-          Link project or sandbox
-        </Button>
-      </div>
       {links.isError && (
         <Callout tone="error" title="Could not load links">
           <Button onClick={() => void links.refetch()}>Retry</Button>
@@ -180,77 +141,62 @@ export function VaultLinks({
           onPageChange={(nextPage) => setPage(nextPage)}
         />
       )}
-      <Dialog
-        open={open}
-        onOpenChange={(next) => {
-          if (!add.isPending) setOpen(next)
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Link a consumer</DialogTitle>
-          </DialogHeader>
-          <form
-            className="space-y-3"
-            onSubmit={form.handleSubmit((values) => {
-              if (!add.isPending) add.mutate(values)
-            })}
-          >
-            <fieldset disabled={add.isPending} className="space-y-3">
-              <legend className="sr-only">Consumer</legend>
-              <div className="flex gap-2">
-                {(['project', 'sandbox'] as const).map((value) => (
-                  <Button
-                    key={value}
-                    type="button"
-                    variant={kind === value ? 'default' : 'outline'}
-                    onClick={() => {
-                      form.reset(
+      <section aria-label="Link a consumer" className="space-y-4">
+        <fieldset disabled={add.isPending} className="space-y-3">
+          <legend className="sr-only">Consumer</legend>
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+            {(['project', 'sandbox'] as const).map((value) => (
+              <section
+                key={value}
+                aria-label={value === 'project' ? 'Projects' : 'Sandboxes'}
+                className="min-w-0 space-y-3"
+              >
+                <h3 className="text-sm font-medium">
+                  {value === 'project' ? 'Projects' : 'Sandboxes'}
+                </h3>
+                <VaultConsumerPicker
+                  kind={value}
+                  active={active}
+                  linkAction
+                  pending={add.isPending}
+                  linkedIds={(links.data?.items ?? []).flatMap<string | number>(
+                    (link) =>
+                      value === 'project'
+                        ? link.project_id == null
+                          ? []
+                          : [link.project_id]
+                        : link.sandbox_id == null
+                          ? []
+                          : [link.sandbox_id]
+                  )}
+                  page={readPage(`links_${value}_page`)}
+                  onPageChange={(nextPage) =>
+                    setSearch((current) => {
+                      const next = new URLSearchParams(current)
+                      if (nextPage === 1) next.delete(`links_${value}_page`)
+                      else next.set(`links_${value}_page`, String(nextPage))
+                      return next
+                    })
+                  }
+                  onSelect={(id) => {
+                    if (!add.isPending)
+                      add.mutate(
                         value === 'project'
-                          ? { kind: 'project' }
-                          : { kind: 'sandbox' }
+                          ? { kind: value, selected: Number(id) }
+                          : { kind: value, selected: String(id) }
                       )
-                    }}
-                  >
-                    {value === 'project' ? 'Project' : 'Sandbox'}
-                  </Button>
-                ))}
-              </div>
-              <VaultConsumerPicker
-                key={kind}
-                kind={kind}
-                selected={selected}
-                onSelect={(id) =>
-                  form.setValue('selected', id, {
-                    shouldDirty: true,
-                    shouldValidate: true,
-                  })
-                }
-              />
-            </fieldset>
-            {form.formState.errors.selected && (
-              <p role="alert" className="text-sm text-destructive">
-                {form.formState.errors.selected.message}
-              </p>
-            )}
-            {add.isError && (
-              <Callout tone="error" title="Could not link consumer">
-                {problemDetail(
-                  add.error,
-                  'Check the selected consumer and retry.'
-                )}
-              </Callout>
-            )}
-            <Button
-              type="submit"
-              disabled={add.isPending}
-              aria-busy={add.isPending}
-            >
-              Link consumer
-            </Button>
-          </form>
-        </DialogContent>
-      </Dialog>
+                  }}
+                />
+              </section>
+            ))}
+          </div>
+        </fieldset>
+        {add.isError && (
+          <Callout tone="error" title="Could not link consumer">
+            {problemDetail(add.error, 'Check the selected consumer and retry.')}
+          </Callout>
+        )}
+      </section>
       <ConfirmDeleteDialog
         open={!!removing}
         onOpenChange={(next) => {

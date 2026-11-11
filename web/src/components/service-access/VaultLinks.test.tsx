@@ -205,7 +205,7 @@ test('loading displays skeleton rows before consumer data arrives', () => {
 })
 
 for (const kind of ['project', 'sandbox'] as const) {
-  test(`link form validates a ${kind} selection and sends the typed consumer`, async () => {
+  test(`row action links a ${kind} and sends the typed consumer`, async () => {
     const bodies: unknown[] = []
     const api = mockApi({
       'GET /access-vaults/vault_fixture/links': () =>
@@ -250,22 +250,18 @@ for (const kind of ['project', 'sandbox'] as const) {
         </QueryClientProvider>
       )
       const ui = within(document.body)
-      fireEvent.click(
-        ui.getByRole('button', { name: 'Link project or sandbox' })
-      )
-      const dialog = within(ui.getByRole('dialog'))
-      if (kind === 'sandbox')
-        fireEvent.click(dialog.getByRole('button', { name: 'Sandbox' }))
-      fireEvent.click(dialog.getByRole('button', { name: 'Link consumer' }))
-      await waitFor(() =>
-        expect(dialog.getByRole('alert').textContent).toBe(`Select a ${kind}.`)
-      )
+      const dialog = within(ui.getByRole('region', { name: 'Link a consumer' }))
+      expect(
+        await dialog.findByRole('button', { name: 'Link Fixture project' })
+      ).toBeTruthy()
+      expect(
+        await dialog.findByRole('button', { name: 'Link Fixture sandbox' })
+      ).toBeTruthy()
       expect(bodies).toHaveLength(0)
       fireEvent.click(
-        await dialog.findByRole('button', { name: `Fixture ${kind}` })
+        await dialog.findByRole('button', { name: `Link Fixture ${kind}` })
       )
-      fireEvent.click(dialog.getByRole('button', { name: 'Link consumer' }))
-      await waitFor(() => expect(ui.queryByRole('dialog')).toBeNull())
+      await waitFor(() => expect(bodies).toHaveLength(1))
       expect(bodies).toEqual([
         kind === 'project' ? { project_id: 7 } : { sandbox_id: 'sbx_fixture' },
       ])
@@ -277,7 +273,7 @@ for (const kind of ['project', 'sandbox'] as const) {
   })
 }
 
-test('empty links keep the status and linking action in the heading row', async () => {
+test('empty links show both consumer lists without opening a dialog', async () => {
   const api = mockApi({
     'GET /access-vaults/vault_fixture/links': () =>
       jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
@@ -299,17 +295,11 @@ test('empty links keep the status and linking action in the heading row', async 
       </QueryClientProvider>
     )
     const ui = within(document.body)
-    await waitFor(() =>
-      expect(ui.getByText('No consumers linked')).toBeTruthy()
-    )
-    const row = ui.getByRole('heading', { name: 'Linked to' }).parentElement!
-    expect(within(row).getByText('No consumers linked')).toBeTruthy()
-    fireEvent.click(
-      within(row).getByRole('button', { name: 'Link project or sandbox' })
-    )
-    await waitFor(() =>
-      expect(ui.getByRole('dialog', { name: 'Link a consumer' })).toBeTruthy()
-    )
+    expect(ui.queryByText('No consumers linked')).toBeNull()
+    expect(ui.getByRole('region', { name: 'Projects' })).toBeTruthy()
+    expect(ui.getByRole('region', { name: 'Sandboxes' })).toBeTruthy()
+    expect(ui.getByRole('region', { name: 'Link a consumer' })).toBeTruthy()
+    expect(ui.queryByRole('dialog')).toBeNull()
   } finally {
     cleanup()
     client.clear()
@@ -541,3 +531,71 @@ test.each(['link', 'back'])(
     }
   }
 )
+
+test('inline consumer lists restore independent pages and preserve vault context', async () => {
+  const requested: string[] = []
+  const api = mockApi({
+    'GET /access-vaults/vault_fixture/links': () =>
+      jsonResponse({ items: [], total: 0, page: 1, page_size: 20 }),
+    'GET /projects': (request) => {
+      const page = new URL(request.url).searchParams.get('page')
+      requested.push(`project:${page}`)
+      return jsonResponse({
+        projects: [
+          { id: 7, name: `Project page ${page}`, source_type: 'external' },
+        ],
+        total: 60,
+      })
+    },
+    'GET /v1/sandboxes': (request) => {
+      const page = new URL(request.url).searchParams.get('page')
+      requested.push(`sandbox:${page}`)
+      return jsonResponse({
+        sandboxes: [{ id: 'sbx_fixture', name: `Sandbox page ${page}` }],
+        pagination: { count: 60 },
+      })
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter
+          initialEntries={[
+            '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture&links_project_page=2&links_sandbox_page=3',
+          ]}
+        >
+          <UrlProbe />
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    expect(
+      await ui.findByRole('button', { name: 'Link Project page 2' })
+    ).toBeTruthy()
+    expect(
+      await ui.findByRole('button', { name: 'Link Sandbox page 3' })
+    ).toBeTruthy()
+    expect(requested).toEqual(
+      expect.arrayContaining(['project:2', 'sandbox:3'])
+    )
+    fireEvent.click(
+      within(ui.getByRole('region', { name: 'Projects' })).getByRole('button', {
+        name: 'Next page',
+      })
+    )
+    expect(
+      await ui.findByRole('button', { name: 'Link Project page 3' })
+    ).toBeTruthy()
+    expect(ui.getByLabelText('URL').textContent).toBe(
+      '/vault/vaults/vault_fixture?tab=links&sandbox=sbx_fixture&links_project_page=3&links_sandbox_page=3'
+    )
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})

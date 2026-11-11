@@ -79,3 +79,42 @@ test('loading displays skeleton rows before consumer data arrives', () => {
     client.clear()
   }
 })
+
+for (const kind of ['project', 'sandbox'] as const) {
+  test(`${kind} list uses the compact empty state with a relevant destination`, async () => {
+    const api = mockApi({
+      'GET /projects': () => jsonResponse({ projects: [], total: 0 }),
+      'GET /v1/sandboxes': () =>
+        jsonResponse({ sandboxes: [], pagination: { count: 0 } }),
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <VaultConsumerPicker kind={kind} onSelect={() => {}} />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const ui = within(document.body)
+      const heading = await ui.findByRole('heading', {
+        name: `No ${kind === 'project' ? 'projects' : 'sandboxes'} yet`,
+      })
+      expect(heading.closest('.min-h-60')).toBeTruthy()
+      expect(
+        ui
+          .getByRole('link', {
+            name: `View ${kind === 'project' ? 'projects' : 'sandboxes'}`,
+          })
+          .getAttribute('href')
+      ).toBe(kind === 'project' ? '/projects' : '/sandboxes')
+      expect(ui.queryByText('Retry')).toBeNull()
+    } finally {
+      cleanup()
+      client.clear()
+      api.restore()
+    }
+  })
+}

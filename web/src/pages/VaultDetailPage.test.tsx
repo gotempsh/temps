@@ -766,9 +766,7 @@ test('compact vault header has one ancestor and only the name and edit icon', ()
     )
     expect(ui.queryByRole('link', { name: 'All vaults' })).toBeNull()
     expect(ui.queryByRole('link', { name: /Audit logs/ })).toBeNull()
-    expect(
-      ui.queryByRole('button', { name: 'Link project or sandbox' })
-    ).toBeNull()
+    expect(ui.queryByRole('region', { name: 'Link a consumer' })).toBeNull()
     for (const name of ['Linked to', 'Audit logs']) {
       expect(ui.getByRole('tab', { name }).querySelector('svg')).toBeTruthy()
     }
@@ -819,9 +817,7 @@ test('vault tabs render links and resource-filtered audit rows without changing 
     expect(requests).toEqual([])
     await selectTab('Linked to')
     await waitFor(() => expect(requests).toContain('links'))
-    expect(
-      ui.getByRole('button', { name: 'Link project or sandbox' })
-    ).toBeTruthy()
+    expect(ui.getByRole('region', { name: 'Link a consumer' })).toBeTruthy()
     await selectTab('Audit logs')
     await waitFor(() =>
       expect(ui.getByRole('table', { name: 'Audit logs' })).toBeTruthy()
