@@ -563,9 +563,13 @@ pub struct DatabaseMetricsResponse {
 // Must stay in sync with the web `PG_PER_DATABASE_GROUPS` list in
 // ServiceMonitoring.tsx — every metric the per-database section displays has to
 // be requested here, or the UI shows "—" for the missing ones.
+// `pg.cache_blocks_accessed_15m` is not a tile: the UI reads it to show the cache
+// hit ratio as empty when the same scrape's 15-minute window saw no block
+// access (the latest stored ratio can be older than that window).
 const PG_PER_DATABASE_METRICS: &[&str] = &[
     "pg.database_size_bytes",
     "pg.cache_hit_ratio",
+    "pg.cache_blocks_accessed_15m",
     "pg.tuple_fetch_ratio",
     "pg.commits_total",
     "pg.rollbacks_total",
@@ -2882,6 +2886,10 @@ mod tests {
         assert_eq!(layout.label_key, "datname");
         assert!(layout.metrics.contains(&layout.size_metric));
         assert!(layout.metrics.iter().all(|m| m.starts_with("pg.")));
+        // The UI needs the ratio's own volume to tell a stale ratio from a
+        // current one.
+        assert!(layout.metrics.contains(&"pg.cache_hit_ratio"));
+        assert!(layout.metrics.contains(&"pg.cache_blocks_accessed_15m"));
     }
 
     #[test]

@@ -816,7 +816,7 @@ impl InternalApiCaller {
             &permit,
             crate::cli::CliMode::ReadOnly,
         ) {
-            crate::cli::CliAction::Terminal(text) => text,
+            crate::cli::CliAction::Terminal(text) | crate::cli::CliAction::Invalid(text) => text,
             // resolve("--help") is always Terminal; this arm is unreachable.
             crate::cli::CliAction::Execute(..) => String::new(),
         }
@@ -829,7 +829,7 @@ impl InternalApiCaller {
     pub fn cli_write_root_help(&self, auth: &AuthContext) -> String {
         let permit = |op: &ApiOperation| self.permitted_write(op, auth);
         match crate::cli::resolve(&self.index, "--help", &permit, crate::cli::CliMode::Write) {
-            crate::cli::CliAction::Terminal(text) => text,
+            crate::cli::CliAction::Terminal(text) | crate::cli::CliAction::Invalid(text) => text,
             crate::cli::CliAction::Execute(..) => String::new(),
         }
     }
@@ -883,33 +883,65 @@ impl InternalApiCaller {
     /// caller's scope (auth + `project_id` auto-fill + allowlist all apply).
     /// Always returns model-facing text — help, an error, or the response body.
     pub async fn run_cli(&self, command: &str, scope: &ApiCallScope) -> String {
+        self.run_cli_result(command, scope)
+            .await
+            .unwrap_or_else(|error| error.to_string())
+    }
+
+    /// Structured read CLI result for protocol adapters. Router failures retain
+    /// their operation and HTTP status instead of becoming successful tool text.
+    pub async fn run_cli_result(
+        &self,
+        command: &str,
+        scope: &ApiCallScope,
+    ) -> Result<String, ApiToolError> {
         let permit = |op: &ApiOperation| self.permitted(op, &scope.auth);
-        match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::ReadOnly) {
-            crate::cli::CliAction::Terminal(text) => text,
+        let action = crate::cli::resolve_with_project_context(
+            &self.index,
+            command,
+            &permit,
+            crate::cli::CliMode::ReadOnly,
+            scope
+                .project_scope
+                .allowed_ids()
+                .is_some_and(|ids| ids.len() == 1),
+        );
+        let action = if matches!(action, crate::cli::CliAction::Invalid(_)) {
+            match crate::cli::resolve(
+                &self.index,
+                command,
+                &|_| true,
+                crate::cli::CliMode::ReadOnly,
+            ) {
+                execute @ crate::cli::CliAction::Execute(_, _) => execute,
+                _ => action,
+            }
+        } else {
+            action
+        };
+        match action {
+            crate::cli::CliAction::Terminal(text) => Ok(text),
+            crate::cli::CliAction::Invalid(detail) => Err(ApiToolError::InvalidCommand { detail }),
             crate::cli::CliAction::Execute(op, params) => {
-                let op_id = op.operation_id.clone();
-                match self.call(&op_id, params, scope).await {
-                    Ok(resp) => {
-                        // Structured result: a clean `{operation, status, data}`
-                        // object rather than a status-prefixed text blob. The model
-                        // gets `status` as a number and `data` as real JSON (not a
-                        // stringified body), and the UI can pretty-print it.
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("operation".to_string(), Value::String(op_id.clone()));
-                        obj.insert("status".to_string(), Value::from(resp.status));
-                        obj.insert("data".to_string(), resp.body);
-                        if resp.truncated {
-                            obj.insert("truncated".to_string(), Value::Bool(true));
-                        }
-                        serde_json::to_string(&Value::Object(obj)).unwrap_or_else(|_| {
-                            format!("{{\"operation\":\"{op_id}\",\"status\":{}}}", resp.status)
-                        })
-                    }
-                    Err(e) => format!(
-                        "`{op_id}` failed: {e}\nRun `{op_id} --help` to check its flags, or \
-                         `--help` to list sections."
-                    ),
+                // Label-value responses omit the requested label name. Refuse
+                // credential-like labels while that trusted context is available,
+                // before arbitrary secret strings reach the response redactor.
+                if op.operation_id == "list_metric_label_values"
+                    && params
+                        .get("label_key")
+                        .and_then(Value::as_str)
+                        .is_none_or(crate::redaction::is_sensitive_field_name)
+                {
+                    return Err(ApiToolError::InvalidCommand {
+                        detail: "Operation 'list_metric_label_values' requires a non-sensitive label_key; credential-like label values are unavailable. Use list_metric_label_values --help.".into(),
+                    });
                 }
+                let response = self.call(&op.operation_id, params, scope).await?;
+                Ok(
+                    serde_json::json!({"operation": op.operation_id, "status": response.status,
+                    "data": response.body, "truncated": response.truncated})
+                    .to_string(),
+                )
             }
         }
     }
@@ -928,9 +960,39 @@ impl InternalApiCaller {
     /// (in another crate) calls [`Self::execute_write`] with the `params` from
     /// the returned [`PreparedWrite`].
     pub fn prepare_write_cli(&self, command: &str, scope: &ApiCallScope) -> WritePrepareOutcome {
+        self.prepare_write_cli_with_secret_policy(command, scope, false)
+    }
+
+    /// Prepare for adapters with no secret-input flow, such as external MCP.
+    /// Chat may bind its secret resolver only at confirmation, so a missing
+    /// resolver during ordinary preparation does not imply missing capability.
+    pub fn prepare_write_cli_without_secret_input(
+        &self,
+        command: &str,
+        scope: &ApiCallScope,
+    ) -> WritePrepareOutcome {
+        self.prepare_write_cli_with_secret_policy(command, scope, true)
+    }
+
+    fn prepare_write_cli_with_secret_policy(
+        &self,
+        command: &str,
+        scope: &ApiCallScope,
+        reject_secret_input: bool,
+    ) -> WritePrepareOutcome {
         let permit = |op: &ApiOperation| self.permitted_write(op, &scope.auth);
-        match crate::cli::resolve(&self.index, command, &permit, crate::cli::CliMode::Write) {
+        match crate::cli::resolve_with_project_context(
+            &self.index,
+            command,
+            &permit,
+            crate::cli::CliMode::Write,
+            scope
+                .project_scope
+                .allowed_ids()
+                .is_some_and(|ids| ids.len() == 1),
+        ) {
             crate::cli::CliAction::Terminal(text) => WritePrepareOutcome::Help(text),
+            crate::cli::CliAction::Invalid(text) => WritePrepareOutcome::Invalid(text),
             crate::cli::CliAction::Execute(op, params) => {
                 if op.operation_id.starts_with("plugin.")
                     && self.plugins.as_ref().is_none_or(|binding| {
@@ -953,8 +1015,19 @@ impl InternalApiCaller {
                     self.default_limit,
                     self.max_limit,
                 )
-                .and_then(|built| self.validate_plugin_route(op, &built))
-                {
+                .and_then(|built| {
+                    self.validate_plugin_route(op, &built)?;
+                    if reject_secret_input {
+                        if let Some(body) = &built.body {
+                            crate::secrets::validate_without_resolver(
+                                &op.operation_id,
+                                body,
+                                self.index.secret_fields(&op.operation_id),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                }) {
                     Err(e) => WritePrepareOutcome::Invalid(format!(
                         "{e}\nRun `{} --help` to check its flags.",
                         op.operation_id
@@ -1286,16 +1359,11 @@ impl InternalApiCaller {
         // Step 5: collect body with size cap.
         let (mut body_value, truncated) =
             collect_body(response.into_body(), self.max_response_bytes, operation_id).await?;
-        // A byte cap can cut through a credential (including its JSON-escaped
-        // representation). Full-value replacement cannot safely mask that prefix.
-        // Keep bounded output, but withhold truncated credential-bearing responses.
-        if truncated
-            && (!substituted.is_empty()
-                || plugin_guard
-                    .as_ref()
-                    .is_some_and(|guard| guard.has_response_credentials()))
-        {
-            body_value = Value::String("Truncated response omitted to protect credentials".into());
+        // A byte cap destroys the JSON structure needed for field/label
+        // redaction and can split credentials. Never return that raw prefix,
+        // including for native reads and non-success responses.
+        if truncated {
+            body_value = Value::String("Truncated response omitted to protect credentials; narrow the query or reduce the page size".into());
         }
         crate::secrets::scrub(&mut body_value, &substituted);
         if let Some(guard) = &plugin_guard {
@@ -1476,7 +1544,7 @@ fn check_object_shape(value: &Value, shape: &ObjectShape) -> Option<String> {
                 let mut known: Vec<&str> = shape.variants.keys().map(String::as_str).collect();
                 known.sort_unstable();
                 return Some(format!(
-                    "'{discriminator}' is '{tag}', which is not one of: {}",
+                    "'{discriminator}' must be one of: {}",
                     known.join(", ")
                 ));
             };
@@ -1552,13 +1620,9 @@ fn json_matches_type(value: &Value, ty: &str) -> bool {
     }
 }
 
-/// Render a supplied value compactly for an error message, so the caller can
-/// see that it sent `"0.5"` rather than `0.5`.
+/// Describe only the type of a rejected input; never echo its contents.
 fn render_value(value: &Value) -> String {
-    match value {
-        Value::String(s) => format!("the string \"{s}\""),
-        other => other.to_string(),
-    }
+    json_kind(value).to_string()
 }
 
 /// Name a JSON value's kind, for error messages.
@@ -2474,9 +2538,9 @@ mod tests {
             panic!("expected BadObjectShape, got {err:?}");
         };
         assert!(problem.contains("threshold"), "{problem}");
-        // Showing the quotes is the whole point — `0.5` and `"0.5"` are
-        // indistinguishable in a message that just echoes the value.
-        assert!(problem.contains("the string \"0.5\""), "{problem}");
+        // The type distinguishes a quoted number without exposing the input.
+        assert!(problem.contains("a string"), "{problem}");
+        assert!(!problem.contains("0.5"), "{problem}");
         assert!(problem.contains("number"), "{problem}");
     }
 
@@ -3129,6 +3193,101 @@ mod tests {
                 "create_service".to_string(),
             ],
         )
+    }
+
+    #[tokio::test]
+    async fn chat_prepares_secret_handles_and_binds_resolver_only_at_confirmation() {
+        use chrono::Utc;
+        use temps_authz::{context::AuthContext, permissions::Role};
+        use temps_entities::users;
+
+        let now = Utc::now();
+        let user = users::Model {
+            id: 1,
+            name: "Test".into(),
+            email: "t@t.com".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let auth = AuthContext::new_session(user, Role::Admin);
+        let mut scope = ApiCallScope {
+            auth,
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+
+        #[derive(Debug)]
+        struct Resolver;
+        #[async_trait::async_trait]
+        impl crate::secrets::SecretResolver for Resolver {
+            async fn resolve(
+                &self,
+                handle: &str,
+                usage: &crate::secrets::SecretUse<'_>,
+            ) -> Result<temps_core::secret_string::SecretString, crate::secrets::SecretResolveError>
+            {
+                assert_eq!(handle, "secret_ref:v1:fixture-slot");
+                assert_eq!(usage.operation_id, "create_source");
+                assert_eq!(usage.field, "/secret_key");
+                Ok(temps_core::secret_string::SecretString::new(
+                    "fixture-credential",
+                ))
+            }
+        }
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = writes.clone();
+        let router = axum::Router::new().route(
+            "/sources",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert_eq!(body["secret_key"], "fixture-credential");
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"created":true}))
+                }
+            }),
+        );
+        let api = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Fixture","version":"1"},
+            "paths":{"/sources":{"post":{"operationId":"create_source","requestBody":{"content":{"application/json":{
+                "schema":{"type":"object","properties":{"secret_key":{"type":"string","x-temps-secret":true}}}
+            }}},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let caller =
+            InternalApiCaller::new_write_allowlisted(router, &api, vec!["create_source".into()]);
+        let command = "create_source --secret_key secret_ref:v1:fixture-slot";
+        let WritePrepareOutcome::Prepared(prepared) = caller.prepare_write_cli(command, &scope)
+        else {
+            panic!("chat must be able to stage handles before binding its resolver");
+        };
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(matches!(
+            caller.prepare_write_cli_without_secret_input(command, &scope),
+            WritePrepareOutcome::Invalid(_)
+        ));
+        assert!(matches!(caller.execute_approved_write(
+            &prepared.operation_id, prepared.params.clone(), &scope, None
+        ).await, Err(ApiToolError::SecretsUnavailable { operation_id, field })
+            if operation_id == "create_source" && field == "/secret_key"));
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        scope.secrets = Some(std::sync::Arc::new(Resolver));
+        caller
+            .execute_approved_write(&prepared.operation_id, prepared.params, &scope, None)
+            .await
+            .unwrap();
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

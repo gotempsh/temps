@@ -8172,3 +8172,122 @@ INSERT INTO sandbox_service_assignments(id,project_id,sandbox_id,service_id,serv
     migration.up(&manager).await?;
     Ok(())
 }
+
+/// ADR 093: existing services get no TLS row (which means `off`), the mode and
+/// "all certificate columns or none" are enforced by the database, rows go
+/// with their service, the CA purpose is unique, and `down` removes both
+/// tables.
+#[tokio::test]
+async fn test_managed_service_tls_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "⏭️  Skipping test_managed_service_tls_migration_up_and_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "⏭️  Skipping test_managed_service_tls_migration_up_and_down: Docker unavailable ({error})"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20261110_000001_managed_service_tls";
+    let before = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(before as u32)).await?;
+    // A service that exists before the migration.
+    db.execute_unprepared(
+        "INSERT INTO external_services (name, service_type, status, created_at, updated_at) \
+         VALUES ('existing-db', 'postgres', 'running', now(), now())",
+    )
+    .await?;
+    assert!(!table_exists(&db, "external_service_tls").await?);
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(table_exists(&db, "external_service_tls").await?);
+    assert!(table_exists(&db, "managed_service_certificate_authorities").await?);
+
+    // No backfill: the existing service has no row, which means `off`.
+    let rows = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM external_service_tls".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(rows.try_get::<i32>("", "count")?, 0);
+
+    // A row created without a mode is `off`.
+    db.execute_unprepared(
+        "INSERT INTO external_service_tls (service_id) \
+         SELECT id FROM external_services WHERE name = 'existing-db'",
+    )
+    .await?;
+    let mode = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT mode FROM external_service_tls".to_string(),
+        ))
+        .await?
+        .expect("mode row");
+    assert_eq!(mode.try_get::<String>("", "mode")?, "off");
+
+    // Unknown modes and half-written certificates are refused.
+    assert!(db
+        .execute_unprepared("UPDATE external_service_tls SET mode = 'sometimes'")
+        .await
+        .is_err());
+    assert!(db
+        .execute_unprepared("UPDATE external_service_tls SET certificate_pem = 'cert'")
+        .await
+        .is_err());
+
+    // One CA per purpose.
+    let ca = "INSERT INTO managed_service_certificate_authorities \
+              (purpose, certificate_pem, private_key_encrypted, fingerprint_sha256, not_before, not_after) \
+              VALUES ('managed-services', 'c', 'k', 'f', now(), now() + interval '1 day')";
+    db.execute_unprepared(ca).await?;
+    assert!(db.execute_unprepared(ca).await.is_err());
+
+    // A service's TLS row goes with it.
+    db.execute_unprepared("DELETE FROM external_services WHERE name = 'existing-db'")
+        .await?;
+    let rows = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM external_service_tls".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(rows.try_get::<i32>("", "count")?, 0);
+
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    assert!(!table_exists(&db, "external_service_tls").await?);
+    assert!(!table_exists(&db, "managed_service_certificate_authorities").await?);
+    Ok(())
+}

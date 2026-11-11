@@ -115,6 +115,13 @@ pub struct ExternalServiceManager {
             HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
         >,
     >,
+    /// One lock per service, held by a TLS mode change (through its
+    /// rollback), by every pass that switches a cluster's data nodes, and by
+    /// a standalone service's initialization and start, which read the TLS
+    /// mode they create the container with (ADR 093), so they never
+    /// interleave and none acts on a stale setting. Taken before a
+    /// container's recreate lock, never after.
+    service_tls_locks: Arc<manager::ServiceTlsLocks>,
     /// The control plane's cluster resolver address (ADR-024), published by
     /// the deployer's probe only while cluster DNS is enabled and the
     /// resolver answers. Empty otherwise, and on processes that run no
@@ -151,6 +158,7 @@ impl ExternalServiceManager {
             local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -172,6 +180,7 @@ impl ExternalServiceManager {
             local_workloads_enabled,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
     }

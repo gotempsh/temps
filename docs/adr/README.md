@@ -110,7 +110,8 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
 | [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
 | [092](./092-plugin-ai-tools.md) | Plugin AI tools are marked API operations | Accepted |  |
-| [093](./093-general-access-vaults.md) | General access vaults with explicit consumer links | Proposed |  |
+| [093](./093-managed-database-tls.md) | Server-Side TLS for Managed Databases | Proposed |  |
+| [094](./094-general-access-vaults.md) | General access vaults with explicit consumer links | Proposed |  |
 
 ## Supporting documents
 

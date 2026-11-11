@@ -313,12 +313,15 @@ impl TempsPlugin for ProvidersPlugin {
         let data_import_routes =
             crate::handlers::data_import_handlers::configure_routes().with_state(app_state.clone());
         let workload_routes =
-            crate::handlers::workload_handlers::configure_routes().with_state(app_state);
+            crate::handlers::workload_handlers::configure_routes().with_state(app_state.clone());
+        let server_tls_routes =
+            crate::handlers::server_tls_handlers::configure_routes().with_state(app_state);
 
         let router = providers_routes
             .merge(pg_stat_routes)
             .merge(data_import_routes)
-            .merge(workload_routes);
+            .merge(workload_routes)
+            .merge(server_tls_routes);
         Some(PluginRoutes::new(router))
     }
 
@@ -331,9 +334,11 @@ impl TempsPlugin for ProvidersPlugin {
         let data_import = <DataImportApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::workload_handlers::WorkloadModeApiDoc;
         let workload = <WorkloadModeApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::server_tls_handlers::ServerTlsApiDoc;
+        let server_tls = <ServerTlsApiDoc as OpenApiTrait>::openapi();
         Some(merge_openapi_schemas(
             base,
-            vec![pg_stat, data_import, workload],
+            vec![pg_stat, data_import, workload, server_tls],
         ))
     }
 }

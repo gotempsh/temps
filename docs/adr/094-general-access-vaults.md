@@ -2,7 +2,7 @@
 SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
-# ADR-093: General access vaults with explicit consumer links
+# ADR-094: General access vaults with explicit consumer links
 
 **Status:** Proposed
 **Date:** 2026-11-10

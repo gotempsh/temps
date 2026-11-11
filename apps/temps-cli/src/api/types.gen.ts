@@ -19553,6 +19553,37 @@ export type ManagedBackupSetupAction = 'none' | 'retry' | 'renew_subscription';
 export type ManagedBackupSetupStatus = 'disabled' | 'ready' | 'needs_setup' | 'subscription_required' | 'unavailable';
 
 /**
+ * The managed-services CA certificate, to add to a client's trust store.
+ */
+export type ManagedCaCertificateResponse = {
+    /**
+     * PEM-encoded CA certificate. Public material; the key never leaves
+     * the control plane.
+     */
+    certificate_pem: string;
+    /**
+     * Suggested file name for the download.
+     */
+    file_name: string;
+    fingerprint_sha256: string;
+    not_after: string;
+    not_before: string;
+};
+
+/**
+ * The managed-services CA. Public facts only.
+ */
+export type ManagedCaInfoResponse = {
+    /**
+     * SHA-256 (lowercase hex) of the CA certificate's DER encoding: compare
+     * it with the downloaded file before trusting it.
+     */
+    fingerprint_sha256: string;
+    not_after: string;
+    not_before: string;
+};
+
+/**
  * Response of the container-name settings endpoints.
  */
 export type ManagedContainerNameSettings = {
@@ -20494,7 +20525,11 @@ export type MonitoringSettings = {
     retention_raw_days?: number;
     /**
      * How often the MetricsScraper collects data from all sources, in seconds.
-     * Minimum effective value is 10 s; values below that are clamped at runtime.
+     * Saving accepts 15 to 300 s: windowed metrics such as the Postgres
+     * cache hit ratio need several scrapes in their 15 minutes. A value
+     * above 300 s stored before that limit is kept
+     * when a save leaves it unchanged, and the MetricsScraper clamps it to
+     * 300 s at runtime, as it clamps anything below 10 s to 10 s.
      */
     scrape_interval_secs?: number;
     /**
@@ -29836,6 +29871,11 @@ export type SeriesStateEntry = {
 };
 
 /**
+ * Server-side TLS mode of one managed service.
+ */
+export type ServerTlsMode = 'off' | 'available' | 'required';
+
+/**
  * Response containing information about how the service is being accessed
  */
 export type ServiceAccessInfo = {
@@ -30491,6 +30531,100 @@ export type ServiceTemplateUpgradeChange = {
     field: string;
     kind: ServiceTemplateChangeKind;
     target?: string | null;
+};
+
+/**
+ * The certificate currently issued for a service. Public facts only.
+ */
+export type ServiceTlsCertificateResponse = {
+    /**
+     * SHA-256 (lowercase hex) of the certificate's DER encoding.
+     */
+    fingerprint_sha256: string;
+    not_after: string;
+    not_before: string;
+    /**
+     * Names the certificate is valid for.
+     */
+    subject_alt_names: Array<string>;
+};
+
+/**
+ * What one data node of a cluster serves.
+ */
+export type ServiceTlsMemberResponse = {
+    /**
+     * Whether it serves the managed certificate. `null` when it could not
+     * be read (see `detail`).
+     */
+    active?: boolean | null;
+    container_name: string;
+    /**
+     * Why its state is unknown, when it is.
+     */
+    detail?: string | null;
+    /**
+     * Whether it lags the setting; the next start applies it.
+     */
+    pending: boolean;
+    /**
+     * Whether it still serves pg_auto_failover's self-signed certificate,
+     * which clients cannot verify.
+     */
+    self_signed: boolean;
+    /**
+     * The member's lifecycle status (`running`, `stopped`, ...).
+     */
+    status: string;
+};
+
+/**
+ * A service's effective server TLS status.
+ */
+export type ServiceTlsStatusResponse = {
+    /**
+     * Whether the server accepts unencrypted connections in this mode.
+     */
+    accepts_plaintext: boolean;
+    /**
+     * Whether the managed certificate is served: by the container, or by
+     * every data node of a cluster. `null` when it cannot be inspected (not
+     * created yet, no Docker daemon here, or cluster members disagree).
+     */
+    active?: boolean | null;
+    /**
+     * Where to download the CA certificate, once it exists.
+     */
+    ca_certificate_path?: string | null;
+    certificate?: ServiceTlsCertificateResponse | null;
+    certificate_authority?: ManagedCaInfoResponse | null;
+    /**
+     * Whether changing the mode restarts the database. False for a
+     * cluster, whose data nodes switch certificates in place.
+     */
+    change_restarts_database: boolean;
+    /**
+     * A cluster's data nodes; empty for a standalone service.
+     */
+    members: Array<ServiceTlsMemberResponse>;
+    /**
+     * `off`, `available` (TLS offered, plaintext still accepted) or
+     * `required` (plaintext rejected; not yet supported).
+     */
+    mode: ServerTlsMode;
+    /**
+     * What runs lags the setting; the next start (or a restart) applies it.
+     */
+    pending_restart: boolean;
+    service_id: number;
+    /**
+     * Whether this service can use managed TLS at all.
+     */
+    supported: boolean;
+    /**
+     * Why not, when `supported` is false.
+     */
+    unsupported_reason?: string | null;
 };
 
 export type ServiceTypeInfo = {
@@ -36080,6 +36214,18 @@ export type UpdateServiceTemplateRuntimeRequest = {
     memoryRequest?: number | null;
 };
 
+export type UpdateServiceTlsRequest = {
+    /**
+     * The new mode. `required` is rejected until it is supported.
+     */
+    mode: ServerTlsMode;
+};
+
+export type UpdateServiceTlsResponse = {
+    previous_mode: ServerTlsMode;
+    tls: ServiceTlsStatusResponse;
+};
+
 export type UpdateSessionDurationRequest = {
     duration: number;
 };
@@ -39501,11 +39647,14 @@ export type ListVaultLinksData = {
     query?: {
         page?: number | null;
         page_size?: number | null;
+        project_ids?: string | null;
+        sandbox_ids?: string | null;
     };
     url: '/access-vaults/{vault_id}/links';
 };
 
 export type ListVaultLinksErrors = {
+    400: unknown;
     401: unknown;
     403: unknown;
     404: unknown;
@@ -55463,6 +55612,140 @@ export type StopServiceResponses = {
 };
 
 export type StopServiceResponse = StopServiceResponses[keyof StopServiceResponses];
+
+export type GetServiceTlsData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/tls';
+};
+
+export type GetServiceTlsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetServiceTlsError = GetServiceTlsErrors[keyof GetServiceTlsErrors];
+
+export type GetServiceTlsResponses = {
+    /**
+     * Effective server TLS status
+     */
+    200: ServiceTlsStatusResponse;
+};
+
+export type GetServiceTlsResponse = GetServiceTlsResponses[keyof GetServiceTlsResponses];
+
+export type UpdateServiceTlsData = {
+    body: UpdateServiceTlsRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/tls';
+};
+
+export type UpdateServiceTlsErrors = {
+    /**
+     * The service cannot use this mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied
+     */
+    409: ProblemDetails;
+    /**
+     * Applying the mode failed; the previous mode was kept
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateServiceTlsError = UpdateServiceTlsErrors[keyof UpdateServiceTlsErrors];
+
+export type UpdateServiceTlsResponses = {
+    /**
+     * Mode changed and applied (a running database is restarted)
+     */
+    200: UpdateServiceTlsResponse;
+};
+
+export type UpdateServiceTlsResponse2 = UpdateServiceTlsResponses[keyof UpdateServiceTlsResponses];
+
+export type GetManagedCaCertificateData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/tls/ca-certificate';
+};
+
+export type GetManagedCaCertificateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found, or no CA exists yet
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetManagedCaCertificateError = GetManagedCaCertificateErrors[keyof GetManagedCaCertificateErrors];
+
+export type GetManagedCaCertificateResponses = {
+    /**
+     * The managed-services CA certificate (public)
+     */
+    200: ManagedCaCertificateResponse;
+};
+
+export type GetManagedCaCertificateResponse = GetManagedCaCertificateResponses[keyof GetManagedCaCertificateResponses];
 
 export type UpgradeServiceData = {
     body: UpgradeExternalServiceRequest;

@@ -780,7 +780,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "edge rules decide who reaches the app and are live within seconds; agents change them through the MCP tools, which only propose and leave enforcing to a human",
+        "edge rules decide who reaches the app and can contain secret match values; manage them in the console or REST API until the shared CLI has a redacted representation",
         &[
             "create_edge_rule",
             "delete_edge_rule",

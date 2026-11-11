@@ -1118,6 +1118,10 @@ impl ExternalServiceManager {
             }
             return;
         }
+        // The new data node starts on its self-signed certificate, and the
+        // cluster certificate must now name it too: re-issue and apply.
+        self.reconcile_cluster_server_tls(service_id, "cluster member added")
+            .await;
         info!(
             service_id,
             member_id,
