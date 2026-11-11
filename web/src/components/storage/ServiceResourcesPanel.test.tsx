@@ -3,7 +3,7 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -64,17 +64,28 @@ function renderPanel(
             members: stats === 'ok' ? [member] : [],
           }),
   })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
   render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <MemoryRouter>
         <ServiceResourcesPanel serviceId={5} serviceName="service-postgres" />
       </MemoryRouter>
     </QueryClientProvider>
   )
+  return client
+}
+
+/** Resolves once every query has its first response (data or error). */
+async function queriesSettled(client: QueryClient) {
+  await waitFor(() => {
+    const queries = client.getQueryCache().getAll()
+    expect(queries.length).toBeGreaterThan(0)
+    for (const query of queries) {
+      expect(query.state.status).not.toBe('pending')
+    }
+  })
 }
 
 test('the live CPU meter reads cores against the limit, like the Monitoring tile', async () => {
@@ -92,19 +103,18 @@ test('an uncapped container reads cores without a denominator', async () => {
 })
 
 test('a member missing from the stats response is not labelled live', async () => {
-  renderPanel(6_000_000_000, 14, 'member-missing')
+  const client = renderPanel(6_000_000_000, 14, 'member-missing')
 
+  await queriesSettled(client)
   await screen.findByText('service-postgres')
-  // Give the stats query time to settle before asserting the absence.
-  await new Promise((resolve) => setTimeout(resolve, 50))
   expect(screen.queryByText('live')).toBeNull()
 })
 
 test('a failed stats request is not labelled live', async () => {
-  renderPanel(6_000_000_000, 14, 'fails')
+  const client = renderPanel(6_000_000_000, 14, 'fails')
 
+  await queriesSettled(client)
   await screen.findByText('service-postgres')
-  await new Promise((resolve) => setTimeout(resolve, 50))
   expect(screen.queryByText('live')).toBeNull()
 })
 

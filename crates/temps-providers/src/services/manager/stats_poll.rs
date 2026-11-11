@@ -211,23 +211,32 @@ fn cpu_counter_went_back(
     )
 }
 
-/// The cached CPU limit while it is still current for this container: same
-/// container (same ID, and a counter that did not go back, which is how a
-/// recreate shows when the stats carry no ID), no limit change applied
-/// through Temps since (`epoch`), and younger than `CPU_LIMIT_REFRESH`.
-fn fresh_cpu_limit(
+/// The CPU limit last read for this same container, of any age: same ID,
+/// and a counter that did not go back (which is how a recreate shows when the
+/// stats carry no ID), with no limit change applied through Temps since
+/// (`epoch`).
+fn last_known_cpu_limit(
     previous: Option<&ContainerStatsBaseline>,
     current: &ContainerStatsResponse,
-    now: Instant,
     epoch: u64,
 ) -> Option<CachedCpuLimit> {
     let previous = previous?;
     if is_other_container(previous, current) || cpu_counter_went_back(previous, current) {
         return None;
     }
-    previous.cpu_limit.filter(|cached| {
-        cached.epoch == epoch && now.saturating_duration_since(cached.read_at) < CPU_LIMIT_REFRESH
-    })
+    previous.cpu_limit.filter(|cached| cached.epoch == epoch)
+}
+
+/// The cached CPU limit while it is still current for this container: the
+/// last known one, younger than `CPU_LIMIT_REFRESH`.
+fn fresh_cpu_limit(
+    previous: Option<&ContainerStatsBaseline>,
+    current: &ContainerStatsResponse,
+    now: Instant,
+    epoch: u64,
+) -> Option<CachedCpuLimit> {
+    last_known_cpu_limit(previous, current, epoch)
+        .filter(|cached| now.saturating_duration_since(cached.read_at) < CPU_LIMIT_REFRESH)
 }
 
 /// One container's tick: the reported stats and the baseline for the next
@@ -343,23 +352,27 @@ impl ExternalServiceManager {
                         read_at: now,
                         epoch,
                     }),
+                    // The last limit read for this container is kept (with its
+                    // old read time, so the next tick inspects again): with
+                    // none, the usage would still be recorded but its share
+                    // and limit would not, and an older pair would stay
+                    // "latest" beside the fresh usage. Unknown only when this
+                    // container has none yet.
                     Ok(None) => {
-                        // Left unknown, so the next tick inspects again.
                         debug!(
                             service_id = service.id,
                             container = %name,
-                            "Container inspect has no HostConfig; CPU limit left unknown"
+                            "Container inspect has no HostConfig; keeping the last known CPU limit"
                         );
-                        None
+                        last_known_cpu_limit(previous, &current, epoch)
                     }
                     Err(e) => {
-                        // Left unknown, so the next tick inspects again.
                         debug!(
                             service_id = service.id,
                             container = %name,
-                            "Reading the container CPU limit failed: {}", e
+                            "Reading the container CPU limit failed, keeping the last known one: {}", e
                         );
-                        None
+                        last_known_cpu_limit(previous, &current, epoch)
                     }
                 },
             };
@@ -645,6 +658,29 @@ mod tests {
         let next_tick = read_at + Duration::from_secs(30);
         assert!(fresh_cpu_limit(Some(&baseline), &current, next_tick, 4).is_some());
         assert!(fresh_cpu_limit(Some(&baseline), &current, next_tick, 5).is_none());
+    }
+
+    /// When re-reading the limit fails, the expired limit of the same
+    /// container is kept, so its usage, share and limit are still recorded
+    /// together; never another container's, nor one from before a limit
+    /// change applied through Temps.
+    #[test]
+    fn a_failed_limit_read_keeps_the_last_known_limit() {
+        let read_at = Instant::now();
+        let current = one_shot_stats(CONTAINER_ID, LIFETIME_CPU_NS, LIFETIME_SYSTEM_NS);
+        let baseline = baseline_with_limit(read_at, 4);
+        let expired = read_at + CPU_LIMIT_REFRESH;
+
+        assert!(fresh_cpu_limit(Some(&baseline), &current, expired, 4).is_none());
+        let kept = last_known_cpu_limit(Some(&baseline), &current, 4).expect("same container");
+        assert_eq!(kept.limit, CpuLimit::Cores(6.0));
+        // Still expired, so the next tick inspects again.
+        assert_eq!(kept.read_at, read_at);
+
+        assert!(last_known_cpu_limit(Some(&baseline), &current, 5).is_none());
+        let other = one_shot_stats("0".repeat(64).as_str(), LIFETIME_CPU_NS, LIFETIME_SYSTEM_NS);
+        assert!(last_known_cpu_limit(Some(&baseline), &other, 4).is_none());
+        assert!(last_known_cpu_limit(None, &current, 4).is_none());
     }
 
     #[test]
