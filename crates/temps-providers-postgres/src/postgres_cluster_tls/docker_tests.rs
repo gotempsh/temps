@@ -466,6 +466,7 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
     assert_eq!(code, 0, "re-apply: {out}");
 
     renewal_switches_slots(&h, &node_name, &ca, &leaf.fingerprint_sha256, &verified).await;
+    unreadable_or_mismatched_settings_change_nothing(&h, &node_name, &material).await;
 
     // Back to pg_auto_failover's self-signed certificate.
     let (code, out) = h
@@ -565,4 +566,109 @@ async fn renewal_switches_slots(
         (0, "t"),
         "verify-full after renewal: {out}"
     );
+}
+
+/// What the node serves, as `<link target> <served fingerprint>`.
+async fn served_state(h: &Harness, node_name: &str) -> String {
+    let (_, link) = h
+        .sh(node_name, "readlink /var/lib/postgresql/tls-current")
+        .await;
+    let (_, out) = h
+        .exec(node_name, served_certificate_command(), &HashMap::new())
+        .await;
+    format!(
+        "{} {}",
+        link.trim(),
+        parse_served_fingerprint(&out).unwrap_or_default()
+    )
+}
+
+/// A setting pg_autoctl fails to report is never guessed, and a configured
+/// pair whose halves differ is never copied behind the link: either way the
+/// apply stops before changing anything.
+async fn unreadable_or_mismatched_settings_change_nothing(
+    h: &Harness,
+    node_name: &str,
+    material: &HashMap<String, String>,
+) {
+    let before = served_state(h, node_name).await;
+
+    // `pg_autoctl config get ssl.key_file` fails (the keeper rewriting its
+    // configuration); every other pg_autoctl call goes through.
+    let (code, out) = h
+        .sh(
+            node_name,
+            "mkdir -p /tmp/fakebin && REAL=$(command -v pg_autoctl) && \
+             printf '#!/bin/sh\ncase \"$*\" in *\"config get\"*ssl.key_file*) exit 1 ;; esac\nexec %s \"$@\"\n' \"$REAL\" \
+               > /tmp/fakebin/pg_autoctl && chmod 755 /tmp/fakebin/pg_autoctl && echo \"$PATH\"",
+        )
+        .await;
+    assert_eq!(code, 0, "{out}");
+    let mut env = material.clone();
+    env.insert("PATH".to_string(), format!("/tmp/fakebin:{}", out.trim()));
+    let (code, out) = h
+        .exec(
+            node_name,
+            server_tls_apply_command(ClusterServerCertificate::SelfSigned),
+            &env,
+        )
+        .await;
+    assert_eq!(code, 6, "an unreadable setting stops the apply: {out}");
+    assert!(out.contains("could not be read"), "{out}");
+    assert_eq!(served_state(h, node_name).await, before, "nothing changed");
+
+    // pg_autoctl names a key that does not belong to the certificate.
+    let (code, out) = h
+        .sh(
+            node_name,
+            "openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+               -out /var/lib/postgresql/other.key 2>&1 && \
+             chown postgres:postgres /var/lib/postgresql/other.key && \
+             chmod 600 /var/lib/postgresql/other.key && \
+             gosu postgres pg_autoctl config set --pgdata /var/lib/postgresql/pgdata \
+               ssl.key_file /var/lib/postgresql/other.key >/dev/null",
+        )
+        .await;
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = h
+        .exec(
+            node_name,
+            server_tls_apply_command(ClusterServerCertificate::SelfSigned),
+            &HashMap::new(),
+        )
+        .await;
+    assert_eq!(
+        code, 4,
+        "a mismatched configured pair stops the apply: {out}"
+    );
+    assert!(out.contains("does not match"), "{out}");
+    let (_, link) = h
+        .sh(node_name, "readlink /var/lib/postgresql/tls-current")
+        .await;
+    assert_eq!(
+        before.split(' ').next(),
+        Some(link.trim()),
+        "the link was not switched"
+    );
+
+    // Put the node back on its managed pair.
+    let (code, out) = h
+        .sh(
+            node_name,
+            "gosu postgres pg_autoctl config set --pgdata /var/lib/postgresql/pgdata \
+               ssl.key_file /var/lib/postgresql/tls-current/server.key >/dev/null && \
+             rm -f /var/lib/postgresql/other.key /tmp/fakebin/pg_autoctl",
+        )
+        .await;
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = h
+        .exec(
+            node_name,
+            server_tls_apply_command(ClusterServerCertificate::Managed),
+            material,
+        )
+        .await;
+    assert_eq!(code, 0, "re-apply after the refused ones: {out}");
+    let (code, out) = h.sh(node_name, CONFIGURED_PAIR).await;
+    assert_eq!((code, out.trim()), (0, LINKED_PAIR));
 }

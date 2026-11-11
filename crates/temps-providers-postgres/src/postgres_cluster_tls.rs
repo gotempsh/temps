@@ -118,6 +118,12 @@ fi"#;
 /// own command: it rewrites its configuration and reloads PostgreSQL.
 const SLOT_FNS: &str = r#"LINK_CERT="$LINK/server.crt"
 LINK_KEY="$LINK/server.key"
+# Whether a certificate and key exist and belong together.
+pair_matches() {
+  [ -f "$1" ] && [ -f "$2" ] || return 1
+  PUB=$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null) || return 1
+  [ -n "$PUB" ] && [ "$PUB" = "$(openssl pkey -in "$2" -pubout 2>/dev/null)" ]
+}
 # The slot the link does not name: the one a new pair goes into.
 other_slot() {
   case "$(readlink "$LINK" 2>/dev/null || true)" in
@@ -133,7 +139,13 @@ fill_slot() {
   install -o postgres -g postgres -m 0600 "$3" "$1/server.key"
 }
 # Switch the link to a slot in one rename: both files change together.
+# Never to a slot whose certificate and key do not belong together.
 point_link_at() {
+  if ! pair_matches "$1/server.crt" "$1/server.key"; then
+    rm -rf "$1"
+    echo "temps: the certificate and key prepared in $1 do not match; the served pair was left as it was" >&2
+    exit 4
+  fi
   ln -sfn "$(basename "$1")" "$LINK.next"
   chown -h postgres:postgres "$LINK.next"
   mv -Tf "$LINK.next" "$LINK"
@@ -142,10 +154,30 @@ set_pair() {
   gosu postgres pg_autoctl config set --pgdata "$PGDATA" ssl.cert_file "$1" >/dev/null
   gosu postgres pg_autoctl config set --pgdata "$PGDATA" ssl.key_file "$2" >/dev/null
 }
-CUR_CERT=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" ssl.cert_file 2>/dev/null || true)
-CUR_KEY=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" ssl.key_file 2>/dev/null || true)
-[ -n "$CUR_CERT" ] || CUR_CERT="$PGDATA/server.crt"
-[ -n "$CUR_KEY" ] || CUR_KEY="$PGDATA/server.key"
+# One pg_autoctl setting. The keeper rewrites its configuration while it
+# reloads, so a failed read is retried, and one that keeps failing stops the
+# script: guessing a value could pair one pair's certificate with another's key.
+read_setting() {
+  for _ in 1 2 3 4 5; do
+    if VALUE=$(gosu postgres pg_autoctl config get --pgdata "$PGDATA" "$1" 2>/dev/null); then
+      printf '%s' "$VALUE"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+if ! CUR_CERT=$(read_setting ssl.cert_file) || ! CUR_KEY=$(read_setting ssl.key_file); then
+  echo "temps: pg_autoctl's certificate settings could not be read on this data node; nothing was changed" >&2
+  exit 6
+fi
+if [ -z "$CUR_CERT" ] && [ -z "$CUR_KEY" ]; then
+  CUR_CERT="$PGDATA/server.crt"
+  CUR_KEY="$PGDATA/server.key"
+elif [ -z "$CUR_CERT" ] || [ -z "$CUR_KEY" ]; then
+  echo "temps: pg_autoctl names only one of a certificate ('$CUR_CERT') and a key ('$CUR_KEY') on this data node; nothing was changed" >&2
+  exit 6
+fi
 # Name the files through the link. A copy of the pair served now goes into
 # a slot first, so each of the two settings, set one after the other, names
 # a file of that same pair: no step leaves a certificate beside another key.
@@ -153,8 +185,8 @@ move_onto_link() {
   if [ "$CUR_CERT" = "$LINK_CERT" ] && [ "$CUR_KEY" = "$LINK_KEY" ]; then
     return 0
   fi
-  if [ ! -f "$CUR_CERT" ] || [ ! -f "$CUR_KEY" ]; then
-    echo "temps: the certificate pair this data node is configured with ($CUR_CERT, $CUR_KEY) is missing; nothing was changed" >&2
+  if ! pair_matches "$CUR_CERT" "$CUR_KEY"; then
+    echo "temps: the certificate pair this data node is configured with ($CUR_CERT, $CUR_KEY) is missing or does not match; nothing was changed" >&2
     exit 4
   fi
   SLOT=$(other_slot)
@@ -175,7 +207,7 @@ rm -rf "$STAGING"
 install -d -o root -g root -m 0700 "$STAGING"
 printf '%s\n' "$TEMPS_TLS_CERT_PEM" > "$STAGING/server.crt"
 printf '%s\n' "$TEMPS_TLS_KEY_PEM" > "$STAGING/server.key"
-if [ "$(openssl x509 -in "$STAGING/server.crt" -noout -pubkey)" != "$(openssl pkey -in "$STAGING/server.key" -pubout)" ]; then
+if ! pair_matches "$STAGING/server.crt" "$STAGING/server.key"; then
   rm -rf "$STAGING"
   echo "temps: the managed certificate does not match its private key; nothing was changed" >&2
   exit 3
@@ -190,8 +222,8 @@ KEY="$LINK_KEY""#;
 
 const SELECT_SELF_SIGNED: &str = r#"CERT="$PGDATA/server.crt"
 KEY="$PGDATA/server.key"
-if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
-  echo "temps: pg_auto_failover's self-signed certificate is missing from $PGDATA; the managed certificate stays in place" >&2
+if ! pair_matches "$CERT" "$KEY"; then
+  echo "temps: pg_auto_failover's self-signed certificate is missing from $PGDATA or does not match its key; the managed certificate stays in place" >&2
   exit 4
 fi
 if [ "$CUR_CERT" != "$CERT" ] || [ "$CUR_KEY" != "$KEY" ]; then
@@ -363,6 +395,41 @@ mod tests {
         // pg_autoctl's settings name the files through the link.
         assert!(s.contains(r#"CERT="$LINK_CERT""#));
         assert!(s.contains(r#"KEY="$LINK_KEY""#));
+    }
+
+    /// A setting that cannot be read is never guessed: a guess could pair
+    /// one pair's certificate with another's key. And the link is never
+    /// switched to, nor a setting moved to, a pair whose halves differ.
+    #[test]
+    fn unreadable_settings_and_mismatched_pairs_change_nothing() {
+        for target in [
+            ClusterServerCertificate::Managed,
+            ClusterServerCertificate::SelfSigned,
+        ] {
+            let s = script(target);
+            assert!(!s.contains("ssl.cert_file 2>/dev/null || true"), "{s}");
+            assert!(s.contains(
+                r#"if ! CUR_CERT=$(read_setting ssl.cert_file) || ! CUR_KEY=$(read_setting ssl.key_file); then"#
+            ));
+            let read = s.find("could not be read on this data node").unwrap();
+            let one_only = s.find("names only one of a certificate").unwrap();
+            let first_change = s
+                .find("\nmove_onto_link\n")
+                .or_else(|| s.find("  move_onto_link\n"))
+                .unwrap();
+            assert!(read < first_change && one_only < first_change, "{s}");
+            // Both default together, never one at a time.
+            assert!(s.contains(r#"if [ -z "$CUR_CERT" ] && [ -z "$CUR_KEY" ]; then"#));
+
+            let switch = &s[s.find("point_link_at() {").unwrap()..];
+            let check = switch
+                .find(r#"if ! pair_matches "$1/server.crt" "$1/server.key"; then"#)
+                .unwrap();
+            assert!(check < switch.find("ln -sfn").unwrap(), "{switch}");
+            assert!(s.contains(r#"if ! pair_matches "$CUR_CERT" "$CUR_KEY"; then"#));
+        }
+        let s = script(ClusterServerCertificate::SelfSigned);
+        assert!(s.contains(r#"if ! pair_matches "$CERT" "$KEY"; then"#));
     }
 
     /// Moving the settings onto the link (or back to `PGDATA`) changes them

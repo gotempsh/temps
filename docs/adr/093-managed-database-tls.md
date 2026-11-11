@@ -179,7 +179,11 @@ node agent's exec on a worker. The steps:
    volume, and pg_autoctl turns it into `ssl_cert_file` / `ssl_key_file` at
    every start, so the setting survives restarts. The two settings are set
    one after the other, so they move onto the link once, through a copy of
-   the pair already served: each intermediate state names a matching pair.
+   the pair already served: each intermediate state names a matching pair. A
+   setting pg_autoctl fails to report (it rewrites its configuration while
+   reloading) is retried, then stops the apply; it is never guessed. The link
+   is never switched to a slot, nor a setting moved to a pair, whose
+   certificate and key do not share a public key.
 5. pg_autoctl reloads PostgreSQL, which loads a new TLS context on SIGHUP. The
    reload is repeated until both settings landed, because a second
    `config set` arriving during pg_autoctl's own reload can be missed.
