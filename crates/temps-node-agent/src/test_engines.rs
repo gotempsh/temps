@@ -43,6 +43,9 @@ pub(crate) struct StubRuntime {
             Option<std::net::IpAddr>,
         )>,
     >,
+    /// When set, a WAL-G base backup waits for a permit here and then
+    /// completes, so a test can keep one running.
+    pub(crate) walg_backup_hold: Option<Arc<tokio::sync::Semaphore>>,
     /// The WAL-G archive re-points asked for, with the attachment.
     pub(crate) walg_archives: Mutex<
         Vec<(
@@ -225,6 +228,17 @@ impl NodeServiceRuntime for StubRuntime {
             .lock()
             .expect("walg_backups")
             .push((request, node, published_address));
+        if let Some(hold) = &self.walg_backup_hold {
+            let _released = hold.acquire().await;
+            return Ok(
+                temps_service_protocol::PostgresWalgBackupResult::Completed {
+                    restarted: false,
+                    stdout: "Wrote backup with name base_000000010000000000000004".to_string(),
+                    stderr: String::new(),
+                    lsn: Some("0/4000100".to_string()),
+                },
+            );
+        }
         Err(not_available("postgres_walg_backup"))
     }
 

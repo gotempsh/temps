@@ -22,13 +22,14 @@ use std::time::Duration;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use temps_service_protocol::{
     MongodbBackupRequest, MongodbBackupResult, MongodbRestoreRequest, MongodbRestoreResult,
-    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupRequest,
-    PostgresWalgBackupResult, PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult,
-    PostgresWalgRestoreRequest, PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest,
-    RedisRdbBackupResult, RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest,
-    RedisWalgBackupResult, RemoteServiceBackupRequest, RemoteServiceBackupResponse,
-    RemoteServiceRestoreRequest, RemoteServiceRestoreResponse, TargetWriteBoundary,
-    WorkerRestoreEngine, WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
+    PostgresWalgArchiveRequest, PostgresWalgArchiveResult, PostgresWalgBackupOutcomeRequest,
+    PostgresWalgBackupProgress, PostgresWalgBackupRequest, PostgresWalgBackupResult,
+    PostgresWalgCredentialsRequest, PostgresWalgCredentialsResult, PostgresWalgRestoreRequest,
+    PostgresWalgRestoreResult, RecreateHook, RedisRdbBackupRequest, RedisRdbBackupResult,
+    RedisRestoreRequest, RedisRestoreResult, RedisWalgBackupRequest, RedisWalgBackupResult,
+    RemoteServiceBackupRequest, RemoteServiceBackupResponse, RemoteServiceRestoreRequest,
+    RemoteServiceRestoreResponse, TargetWriteBoundary, WorkerRestoreEngine,
+    WorkerRestoreOutcomeRequest, WorkerRestoreProgress,
 };
 use tokio::sync::Semaphore;
 
@@ -54,6 +55,24 @@ pub(crate) fn busy(operation: &str, service: &str) -> axum::response::Response {
         format!(
             "Cannot {operation} service '{service}': this node already runs \
              {MAX_DATA_OPERATIONS} backups or restores; retry when one finishes"
+        ),
+    )
+    .into_response()
+}
+
+/// A backup of `service` is already running on this node: another would
+/// overlap it against the same database. Answered as busy, which the control
+/// plane waits on.
+pub(crate) fn backup_in_flight(
+    service: &str,
+    running: &crate::backup_outcomes::BackupInFlight,
+) -> axum::response::Response {
+    error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "Cannot back up service '{service}': backup {} of it is still running on this \
+             node; retry when it finishes",
+            running.backup_uuid
         ),
     )
     .into_response()
@@ -260,11 +279,20 @@ pub async fn postgres_walg_backup(
     let Some(docker) = state.docker.as_ref() else {
         return docker_missing("back up", &service);
     };
+    // Recorded under the request's id, for a control plane whose request
+    // goes unanswered to ask for, and holding the service against another
+    // backup until the engine ends.
+    let tracker = match crate::backup_outcomes::WORKER_BACKUPS.begin(&service, &request.backup_uuid)
+    {
+        Ok(tracker) => tracker,
+        Err(running) => return backup_in_flight(&service, &running),
+    };
     tracing::info!(
         service = %service,
         service_id = request.service_id,
         bucket = %request.destination.bucket,
         allow_restart = request.allow_restart,
+        backup_uuid = %request.backup_uuid,
         "Taking a WAL-G base backup of a service on this node"
     );
     let node = crate::service_handlers::node_attachment(
@@ -277,7 +305,7 @@ pub async fn postgres_walg_backup(
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
     let outcome = match run_detached(permit, None, async move {
-        runtime
+        let result = runtime
             .postgres_walg_backup(
                 request,
                 engine_docker,
@@ -285,7 +313,9 @@ pub async fn postgres_walg_backup(
                 after_create,
                 published_address,
             )
-            .await
+            .await;
+        tracker.finish_walg(&result);
+        result
     })
     .await
     {
@@ -787,6 +817,36 @@ pub async fn worker_restore_outcome(
     AgentResponse::ok(progress).into_response()
 }
 
+/// `POST /agent/services/postgres/walg-backup/outcome`: where the WAL-G base
+/// backup of a service started under a `backup_uuid` is: still running, its
+/// outcome, or that it ended without one. `unknown` when this node has no
+/// such backup (it never received it, or the agent restarted since, which
+/// ended it). Read-only.
+#[utoipa::path(
+    tag = "Services",
+    post,
+    path = "/agent/services/postgres/walg-backup/outcome",
+    request_body = PostgresWalgBackupOutcomeRequest,
+    responses(
+        (status = 200, description = "Where the backup is", body = AgentResponse<PostgresWalgBackupProgress>),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn postgres_walg_backup_outcome(
+    Json(request): Json<PostgresWalgBackupOutcomeRequest>,
+) -> axum::response::Response {
+    let progress = crate::backup_outcomes::WORKER_BACKUPS
+        .walg_progress(&request.service, &request.backup_uuid);
+    tracing::debug!(
+        service = %request.service,
+        backup_uuid = %request.backup_uuid,
+        ?progress,
+        "WAL-G base backup outcome asked for"
+    );
+    AgentResponse::ok(progress).into_response()
+}
+
 /// `POST /agent/services/mongodb/backup`: back up a MongoDB service this
 /// node runs with the control plane's own engine (ADR-099). The engine checks
 /// the image for WAL-G as on the control plane: with it, `wal-g backup-push`
@@ -820,6 +880,11 @@ pub async fn mongodb_backup(
     let Some(docker) = state.docker.as_ref() else {
         return docker_missing("back up", &service);
     };
+    let tracker = match crate::backup_outcomes::WORKER_BACKUPS.begin(&service, &request.backup_uuid)
+    {
+        Ok(tracker) => tracker,
+        Err(running) => return backup_in_flight(&service, &running),
+    };
     tracing::info!(
         service = %service,
         service_id = request.service_id,
@@ -831,9 +896,11 @@ pub async fn mongodb_backup(
     let runtime = state.service_runtime.clone();
     let engine_docker = Arc::new(docker.clone());
     let outcome = match run_detached(permit, None, async move {
-        runtime
+        let result = runtime
             .mongodb_backup(request, engine_docker, published_address)
-            .await
+            .await;
+        tracker.finish();
+        result
     })
     .await
     {
@@ -1260,6 +1327,10 @@ mod tests {
                 "/agent/services/postgres/walg-credentials",
                 post(postgres_walg_credentials),
             )
+            .route(
+                "/agent/services/postgres/walg-backup/outcome",
+                post(postgres_walg_backup_outcome),
+            )
             .route("/agent/services/mongodb/backup", post(mongodb_backup))
             .route("/agent/services/mongodb/restore", post(mongodb_restore))
             .route("/agent/services/redis/walg-backup", post(redis_walg_backup))
@@ -1421,6 +1492,81 @@ mod tests {
             node.network.as_deref(),
             Some(temps_core::NETWORK_NAME.as_str())
         );
+    }
+
+    /// The live failure: the control plane's request for a WAL-G base
+    /// backup went unanswered while the node's detached backup kept running,
+    /// and its retry started a second `backup-push` of the same database.
+    /// Now the node refuses another backup of the service as busy while one
+    /// runs, and reports the first one's outcome under its id.
+    #[tokio::test]
+    async fn a_running_walg_backup_is_reported_and_never_overlapped() {
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        let runtime = Arc::new(crate::test_engines::StubRuntime {
+            walg_backup_hold: Some(Arc::clone(&hold)),
+            ..Default::default()
+        });
+        let state = agent_state(runtime, plugin_builder());
+        // A name of its own: the node's backup registry is process-wide.
+        let body = |backup_uuid: &str| {
+            let mut body = walg_body();
+            body["service_config"]["name"] = serde_json::json!("orders-overlap");
+            body["backup_uuid"] = serde_json::json!(backup_uuid);
+            body
+        };
+        let outcome = |state: Arc<AgentState>, backup_uuid: &'static str| async move {
+            post_json(
+                app(state),
+                "/agent/services/postgres/walg-backup/outcome",
+                serde_json::json!({"service": "orders-overlap", "backup_uuid": backup_uuid}),
+            )
+            .await
+        };
+
+        let first = tokio::spawn(post_json(
+            app(state.clone()),
+            "/agent/services/postgres/walg-backup",
+            body("u-1"),
+        ));
+        let mut running = false;
+        for _ in 0..200 {
+            let (status, json) = outcome(state.clone(), "u-1").await;
+            assert_eq!(status, StatusCode::OK);
+            if json["data"]["state"] == "running" {
+                running = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(running, "the first backup is reported running");
+
+        for retry in ["u-2", "u-1"] {
+            let (status, json) = post_json(
+                app(state.clone()),
+                "/agent/services/postgres/walg-backup",
+                body(retry),
+            )
+            .await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{retry}");
+            let error = json["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("backup u-1 of it is still running"),
+                "{error}"
+            );
+        }
+        let (_, json) = outcome(state.clone(), "u-2").await;
+        assert_eq!(
+            json["data"]["state"], "unknown",
+            "the refused one never ran"
+        );
+
+        hold.add_permits(1);
+        let (status, json) = first.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let (_, json) = outcome(state.clone(), "u-1").await;
+        assert_eq!(json["data"]["state"], "finished", "{json}");
+        assert_eq!(json["data"]["outcome"]["status"], "completed", "{json}");
+        assert_eq!(json["data"]["outcome"]["lsn"], "0/4000100", "{json}");
     }
 
     /// Re-pointing archiving takes a service and a destination only, and

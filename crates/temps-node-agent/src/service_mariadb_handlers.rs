@@ -31,7 +31,8 @@ use temps_service_protocol::{
 
 use crate::handlers::{error_response, AgentResponse, AgentState};
 use crate::service_data_handlers::{
-    admit, busy, deadline_exceeded, docker_missing, run_detached, Detached, DATA_OPERATIONS,
+    admit, backup_in_flight, busy, deadline_exceeded, docker_missing, run_detached, Detached,
+    DATA_OPERATIONS,
 };
 
 /// Run `engine` with this node's runtime and Docker in a data-operation
@@ -142,15 +143,23 @@ pub async fn mariadb_physical_backup(
         bucket = %request.destination.bucket,
         "Taking a MariaDB physical backup on this node"
     );
+    // Holds the service against another backup until the engine ends.
+    let tracker = match crate::backup_outcomes::WORKER_BACKUPS.begin(&service, &request.backup_uuid)
+    {
+        Ok(tracker) => tracker,
+        Err(running) => return backup_in_flight(&service, &running),
+    };
     match run_on_node(
         &state,
         "physical backup",
         &service,
         None,
         move |runtime, docker, published| async move {
-            runtime
+            let result = runtime
                 .mariadb_physical_backup(request, docker, published)
-                .await
+                .await;
+            tracker.finish();
+            result
         },
     )
     .await
@@ -195,15 +204,22 @@ pub async fn mariadb_dump_backup(
         bucket = %request.destination.bucket,
         "Dumping a MariaDB on this node"
     );
+    // Holds the service against another backup until the engine ends.
+    let tracker = match crate::backup_outcomes::WORKER_BACKUPS.begin(&service, &request.key) {
+        Ok(tracker) => tracker,
+        Err(running) => return backup_in_flight(&service, &running),
+    };
     match run_on_node(
         &state,
         "dump",
         &service,
         None,
         move |runtime, docker, published| async move {
-            runtime
+            let result = runtime
                 .mariadb_dump_backup(request, docker, published)
-                .await
+                .await;
+            tracker.finish();
+            result
         },
     )
     .await

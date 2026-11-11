@@ -691,7 +691,52 @@ impl ExternalServiceManager {
                 allow_restart,
             })
             .await?;
-        // A recreated container has a new address on the node's networks.
+        self.republish_after_walg_backup(service_id, node_id, &result)
+            .await;
+        Ok(result)
+    }
+
+    /// Where the WAL-G base backup of worker PostgreSQL `service_id` started
+    /// under `backup_uuid` is on its node, for a backup whose request went
+    /// unanswered while the node's backup ran on. A finished backup that
+    /// recreated the container republishes its address, as when the request
+    /// is answered.
+    pub async fn walg_backup_outcome_worker_postgres(
+        &self,
+        service_id: i32,
+        backup_uuid: &str,
+    ) -> Result<crate::remote_service_client::PostgresWalgBackupProgress, ExternalServiceError>
+    {
+        let (node_id, service_config) = self
+            .worker_service_target(service_id, "WAL-G backup outcome")
+            .await?;
+        let progress = self
+            .get_remote_client(node_id)
+            .await?
+            .postgres_walg_backup_outcome(
+                &crate::remote_service_client::PostgresWalgBackupOutcomeRequest {
+                    service: service_config.name,
+                    backup_uuid: backup_uuid.to_string(),
+                },
+            )
+            .await?;
+        if let crate::remote_service_client::PostgresWalgBackupProgress::Finished { outcome } =
+            &progress
+        {
+            self.republish_after_walg_backup(service_id, node_id, outcome)
+                .await;
+        }
+        Ok(progress)
+    }
+
+    /// A WAL-G base backup that turned archiving on recreated the container,
+    /// which has a new address on the node's networks.
+    async fn republish_after_walg_backup(
+        &self,
+        service_id: i32,
+        node_id: i32,
+        result: &crate::remote_service_client::PostgresWalgBackupResult,
+    ) {
         if matches!(
             result,
             crate::remote_service_client::PostgresWalgBackupResult::Completed {
@@ -709,7 +754,6 @@ impl ExternalServiceManager {
                 );
             }
         }
-        Ok(result)
     }
 
     /// Point the continuous WAL-G archiving of PostgreSQL service

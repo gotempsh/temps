@@ -32,6 +32,7 @@ use temps_providers::externalsvc::postgres_walg_backup::{
     self as node_half, ArchiveRecreate, WalgBaseBackup, WalgBaseBackupError, WalgBaseBackupOutcome,
 };
 use temps_providers::remote_service_client::PostgresWalgBackupResult;
+use temps_providers::services::ExternalServiceError;
 use tracing::{info, warn};
 
 use super::dispatch::service_container_name;
@@ -345,17 +346,162 @@ async fn backup_on_worker(
         |wait| super::worker_agent::wait_for_node_slot_minting(ctx.backup_id, service.id, wait),
     );
     let result = tokio::select! {
-        // Dropping the request ends it on the node too.
-        _ = ctx.cancel.cancelled() => return Err(BackupError::Cancelled),
+        _ = ctx.cancel.cancelled() => {
+            node_backup_runs_on(service, node_id, backup_uuid);
+            return Err(BackupError::Cancelled);
+        }
         result = request => result?,
-    }
-    .map_err(|e| BackupError::Failed {
+    };
+    let result = match result {
+        Ok(result) => result,
+        // The node runs the backup in a task of its own, which a dropped
+        // connection or a timeout here does not end: its outcome is asked
+        // for under the backup's id. Failing (and so retrying) instead would
+        // start another `backup-push` of the same database beside it.
+        Err(ExternalServiceError::AgentUnanswered { detail, .. }) => {
+            warn!(
+                service_id = service.id,
+                node_id,
+                backup_uuid,
+                "The WAL-G backup request to the node went unanswered ({detail}); following the \
+                 node's backup until it ends"
+            );
+            await_worker_backup(
+                &BACKUP_OUTCOME_WAIT,
+                &ctx.cancel,
+                service,
+                node_id,
+                backup_uuid,
+                || {
+                    deps.manager
+                        .walg_backup_outcome_worker_postgres(service.id, backup_uuid)
+                },
+            )
+            .await?
+        }
+        Err(e) => {
+            return Err(BackupError::Failed {
+                reason: format!(
+                    "WAL-G backup of service {} ('{}') on node {node_id}: {e}",
+                    service.id, service.name
+                ),
+            })
+        }
+    };
+    worker_outcome(service, node_id, result)
+}
+
+/// How a WAL-G backup whose request went unanswered is followed on its node.
+#[derive(Debug, Clone, Copy)]
+struct BackupOutcomeWait {
+    /// Between two asks.
+    interval: std::time::Duration,
+    /// How long the node may go unanswering before the backup is failed. A
+    /// retry then cannot overlap a backup the node still runs: the node
+    /// refuses another backup of the service until it ends.
+    unreachable_for: std::time::Duration,
+}
+
+const BACKUP_OUTCOME_WAIT: BackupOutcomeWait = BackupOutcomeWait {
+    interval: std::time::Duration::from_secs(10),
+    unreachable_for: std::time::Duration::from_secs(10 * 60),
+};
+
+/// Log that a cancelled worker backup runs on to its end on the node: it
+/// cannot be stopped there safely (a backup turning archiving on recreates
+/// the container, and the upload runs inside it), and the node refuses
+/// another backup of the service until it ends.
+fn node_backup_runs_on(
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    backup_uuid: &str,
+) {
+    warn!(
+        service_id = service.id,
+        node_id,
+        backup_uuid,
+        "WAL-G backup cancelled; the node finishes the base backup it started, and takes no \
+         other backup of the service until it ends"
+    );
+}
+
+/// Ask the node, with `ask`, for the outcome of the WAL-G base backup it
+/// runs under `backup_uuid`, until it ends.
+///
+/// - Running: asked again after `wait.interval`.
+/// - Finished: the engine's result, as if the request had been answered.
+/// - Ended without an outcome, or unknown to the node (it never received
+///   the request, or its agent restarted, which ended it): failed, so the
+///   executor may retry; nothing of it runs on the node.
+/// - Unanswered for `wait.unreachable_for`: failed. A retry then waits for
+///   the node, which refuses another backup of the service while one runs.
+async fn await_worker_backup<Ask, Fut>(
+    wait: &BackupOutcomeWait,
+    cancel: &tokio_util::sync::CancellationToken,
+    service: &temps_entities::external_services::Model,
+    node_id: i32,
+    backup_uuid: &str,
+    mut ask: Ask,
+) -> Result<PostgresWalgBackupResult, BackupError>
+where
+    Ask: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<
+            temps_providers::remote_service_client::PostgresWalgBackupProgress,
+            ExternalServiceError,
+        >,
+    >,
+{
+    use temps_providers::remote_service_client::PostgresWalgBackupProgress;
+    let failed = |what: String| BackupError::Failed {
         reason: format!(
-            "WAL-G backup of service {} ('{}') on node {node_id}: {e}",
+            "WAL-G backup {backup_uuid} of service {} ('{}') on node {node_id}: {what}",
             service.id, service.name
         ),
-    })?;
-    worker_outcome(service, node_id, result)
+    };
+    let mut unanswered_since: Option<std::time::Instant> = None;
+    loop {
+        let asked = tokio::select! {
+            _ = cancel.cancelled() => {
+                node_backup_runs_on(service, node_id, backup_uuid);
+                return Err(BackupError::Cancelled);
+            }
+            asked = ask() => asked,
+        };
+        match asked {
+            Ok(PostgresWalgBackupProgress::Running) => unanswered_since = None,
+            Ok(PostgresWalgBackupProgress::Finished { outcome }) => return Ok(outcome),
+            Ok(PostgresWalgBackupProgress::Ended { reason }) => {
+                return Err(failed(format!(
+                    "ended on the node without an outcome: {reason}"
+                )))
+            }
+            Ok(PostgresWalgBackupProgress::Unknown) => {
+                return Err(failed(
+                    "the node has no record of it (it never received the request, or its \
+                     agent restarted, which ended it)"
+                        .to_string(),
+                ))
+            }
+            Err(error) => {
+                let since = *unanswered_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= wait.unreachable_for {
+                    return Err(failed(format!(
+                        "its outcome could not be read for {} s ({error}); the node takes no \
+                         other backup of the service while this one may still run",
+                        wait.unreachable_for.as_secs()
+                    )));
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                node_backup_runs_on(service, node_id, backup_uuid);
+                return Err(BackupError::Cancelled);
+            }
+            _ = tokio::time::sleep(wait.interval) => {}
+        }
+    }
 }
 
 /// A worker's answer, as the outcome or error of the same run here.
@@ -720,5 +866,141 @@ mod tests {
             }),
             BackupError::Cancelled
         ));
+    }
+
+    const FAST: BackupOutcomeWait = BackupOutcomeWait {
+        interval: std::time::Duration::from_millis(5),
+        unreachable_for: std::time::Duration::from_millis(60),
+    };
+
+    fn worker_postgres() -> temps_entities::external_services::Model {
+        worker_service(3)
+    }
+
+    fn completed() -> PostgresWalgBackupResult {
+        PostgresWalgBackupResult::Completed {
+            restarted: false,
+            stdout: "Wrote backup with name base_000000010000000000000004".to_string(),
+            stderr: String::new(),
+            lsn: Some("0/4000100".to_string()),
+        }
+    }
+
+    /// The node's answers in order, the last one repeated.
+    fn answers(
+        answers: Vec<
+            Result<
+                temps_providers::remote_service_client::PostgresWalgBackupProgress,
+                ExternalServiceError,
+            >,
+        >,
+    ) -> impl FnMut() -> std::future::Ready<
+        Result<
+            temps_providers::remote_service_client::PostgresWalgBackupProgress,
+            ExternalServiceError,
+        >,
+    > {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        move || {
+            let mut answers = answers.lock().unwrap();
+            let next = if answers.len() > 1 {
+                answers.pop_front().unwrap()
+            } else {
+                match answers.front().unwrap() {
+                    Ok(progress) => Ok(progress.clone()),
+                    Err(_) => Err(unreachable()),
+                }
+            };
+            std::future::ready(next)
+        }
+    }
+
+    fn unreachable() -> ExternalServiceError {
+        ExternalServiceError::AgentUnanswered {
+            node: "worker-3".to_string(),
+            route: "/agent/services/postgres/walg-backup/outcome".to_string(),
+            detail: "connection refused".to_string(),
+        }
+    }
+
+    /// The live failure: a dropped connection failed the attempt while the
+    /// node's backup ran on, and the retry overlapped it. The attempt now
+    /// waits for the node's own outcome, through a node briefly unreachable.
+    #[tokio::test]
+    async fn an_unanswered_backup_settles_on_the_nodes_outcome() {
+        use temps_providers::remote_service_client::PostgresWalgBackupProgress as P;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = await_worker_backup(
+            &FAST,
+            &cancel,
+            &worker_postgres(),
+            3,
+            "u-1",
+            answers(vec![
+                Ok(P::Running),
+                Err(unreachable()),
+                Ok(P::Running),
+                Ok(P::Finished {
+                    outcome: completed(),
+                }),
+            ]),
+        )
+        .await;
+        assert_eq!(result.expect("completed"), completed());
+    }
+
+    /// A backup the node never received, or one that ended without an
+    /// outcome, fails the attempt (nothing of it runs on the node, so a
+    /// retry cannot overlap it); one whose outcome stays unreadable fails
+    /// after the bound, saying the node takes no other backup meanwhile.
+    #[tokio::test]
+    async fn an_unanswered_backup_fails_only_when_nothing_runs_or_the_node_stays_silent() {
+        use temps_providers::remote_service_client::PostgresWalgBackupProgress as P;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for (answer, expected) in [
+            (Ok(P::Unknown), "has no record of it"),
+            (
+                Ok(P::Ended {
+                    reason: "passed its deadline".to_string(),
+                }),
+                "passed its deadline",
+            ),
+            (Err(unreachable()), "takes no other backup"),
+        ] {
+            let error = await_worker_backup(
+                &FAST,
+                &cancel,
+                &worker_postgres(),
+                3,
+                "u-1",
+                answers(vec![answer]),
+            )
+            .await
+            .expect_err("failed");
+            assert!(!error.is_permanent(), "{error:?}");
+            let message = error.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert!(
+                message.contains("u-1") && message.contains("node 3"),
+                "{message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_wait_returns_cancelled() {
+        use temps_providers::remote_service_client::PostgresWalgBackupProgress as P;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let result = await_worker_backup(
+            &FAST,
+            &cancel,
+            &worker_postgres(),
+            3,
+            "u-1",
+            answers(vec![Ok(P::Running)]),
+        )
+        .await;
+        assert!(matches!(result, Err(BackupError::Cancelled)), "{result:?}");
     }
 }

@@ -15,6 +15,7 @@
     )
 )]
 pub mod auth;
+pub(crate) mod backup_outcomes;
 mod build_admission;
 pub mod build_handler;
 pub mod compose_handlers;

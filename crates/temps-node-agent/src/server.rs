@@ -334,6 +334,10 @@ fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState
             post(crate::service_data_handlers::postgres_walg_backup),
         )
         .route(
+            "/agent/services/postgres/walg-backup/outcome",
+            post(crate::service_data_handlers::postgres_walg_backup_outcome),
+        )
+        .route(
             "/agent/services/postgres/walg-restore",
             post(crate::service_data_handlers::postgres_walg_restore),
         )

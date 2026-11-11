@@ -535,6 +535,38 @@ pub struct PostgresWalgBackupRequest {
     pub allow_restart: bool,
 }
 
+/// `POST /agent/services/postgres/walg-backup/outcome`: what became of the
+/// WAL-G base backup of service `service` started under `backup_uuid`.
+///
+/// The node runs a base backup in its own task, which outlives the request
+/// that started it: a control plane whose request went unanswered (its
+/// connection dropped, or it timed out) asks for the outcome under the same
+/// id instead of starting another backup of the same database.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresWalgBackupOutcomeRequest {
+    /// The service's name on the node (its configuration's `name`).
+    pub service: String,
+    /// The `backup_uuid` the backup request was started with.
+    pub backup_uuid: String,
+}
+
+/// Where a WAL-G base backup started under a `backup_uuid` is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PostgresWalgBackupProgress {
+    /// Still running on the node.
+    Running,
+    /// The engine ended with this outcome.
+    Finished { outcome: PostgresWalgBackupResult },
+    /// The engine ended without an outcome: it could not run, passed its
+    /// deadline, or stopped unexpectedly.
+    Ended { reason: String },
+    /// The node has no backup of this service under this id: it never
+    /// received it, or its agent restarted since (which ended it).
+    Unknown,
+}
+
 /// What a [`PostgresWalgBackupRequest`] did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
