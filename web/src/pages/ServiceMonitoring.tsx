@@ -89,6 +89,7 @@ import {
   CONTAINER_CPU_TILE_HINT,
   CONTAINER_CPU_TILE_LABEL,
   CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from '@/lib/container-cpu'
@@ -871,7 +872,9 @@ function AddAlertRuleDialog({
   onSuccess,
 }: AddAlertRuleDialogProps) {
   const [name, setName] = useState('')
-  const [metricName, setMetricName] = useState(ALL_METRICS[engine][0] ?? '')
+  // CPU alerts threshold the share of the limit, never cores × 100.
+  const alertMetrics = alertableMetrics(ALL_METRICS[engine])
+  const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
   const [comparator, setComparator] = useState<ServiceAlertComparator>('>')
   const [severity, setSeverity] = useState<Severity>('warning')
@@ -927,7 +930,7 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {ALL_METRICS[engine].map((m) => (
+                {alertMetrics.map((m) => (
                   <SelectItem key={m} value={m}>
                     {labelForMetric(m)}
                   </SelectItem>

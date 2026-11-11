@@ -7,6 +7,7 @@ import {
   CONTAINER_CPU_METRIC,
   CONTAINER_CPU_METRIC_LABELS,
   CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from './container-cpu'
@@ -80,5 +81,36 @@ test('labels name the unit of each CPU metric', () => {
   expect(CONTAINER_CPU_METRIC_LABELS[CONTAINER_CPU_METRIC]).toBe('CPU (cores)')
   expect(CONTAINER_CPU_METRIC_LABELS[CONTAINER_CPU_UTILIZATION_METRIC]).toBe(
     'CPU (% of limit)'
+  )
+})
+
+describe('alertableMetrics', () => {
+  test('offers the share of the limit first and never cores × 100', () => {
+    expect(
+      alertableMetrics([
+        CONTAINER_CPU_METRIC,
+        CONTAINER_CPU_UTILIZATION_METRIC,
+        'container.memory_used_bytes',
+        'pg.connections',
+      ])
+    ).toEqual([
+      CONTAINER_CPU_UTILIZATION_METRIC,
+      'container.memory_used_bytes',
+      'pg.connections',
+    ])
+  })
+})
+
+test('an uncapped limit (recorded as 0) reads without a denominator', () => {
+  expect(
+    containerCpuTileText(
+      lookupOf({
+        [CONTAINER_CPU_METRIC]: 68.1,
+        [CONTAINER_CPU_LIMIT_METRIC]: 0,
+      })
+    )
+  ).toBe('0.68 cores')
+  expect(formatContainerCpuMetric(CONTAINER_CPU_LIMIT_METRIC, 0)).toBe(
+    'unlimited'
   )
 })

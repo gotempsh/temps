@@ -3,7 +3,13 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -53,4 +59,15 @@ test('an uncapped container shows cores used without a denominator', async () =>
 
   const label = await screen.findByText('CPU (cores, last scrape)')
   expect(label.nextElementSibling?.textContent).toBe('0.85 cores')
+})
+
+test('a new alert rule defaults to CPU as a share of the limit, not cores × 100', async () => {
+  renderCard({ 'container.cpu_percent': 68.1, 'container.cpu_limit_cores': 6 })
+
+  fireEvent.click(await screen.findByText('Alert rules'))
+  fireEvent.click(await screen.findByRole('button', { name: /Add rule/ }))
+
+  const dialog = await screen.findByRole('dialog')
+  const [metric] = within(dialog).getAllByRole('combobox')
+  expect(metric.textContent).toBe('CPU (% of limit)')
 })

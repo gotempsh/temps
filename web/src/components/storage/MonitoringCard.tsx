@@ -29,6 +29,7 @@ import {
   CONTAINER_CPU_TILE_HINT,
   CONTAINER_CPU_TILE_LABEL,
   CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from '@/lib/container-cpu'
@@ -478,7 +479,10 @@ function AddAlertRuleDialog({
   engine,
   onSuccess,
 }: AddAlertRuleDialogProps) {
-  const alertMetrics = [...CONTAINER_METRICS, ...KNOWN_METRICS[engine]]
+  const alertMetrics = alertableMetrics([
+    ...CONTAINER_METRICS,
+    ...KNOWN_METRICS[engine],
+  ])
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')

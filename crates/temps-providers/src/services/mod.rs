@@ -124,6 +124,10 @@ pub struct ExternalServiceManager {
     /// resolver answers. Empty otherwise, and on processes that run no
     /// resolver: local cluster members then keep Docker's embedded DNS.
     cluster_dns_slot: temps_dns::OverlayDnsSlot,
+    /// Bumped whenever Temps applies CPU/memory limits to a service's
+    /// containers, so pollers caching a container's CPU limit
+    /// (`stats_poll`) re-read it on their next tick. Shared by every clone.
+    cpu_limits_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ExternalServiceManager {
@@ -156,6 +160,7 @@ impl ExternalServiceManager {
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
+            cpu_limits_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -177,6 +182,7 @@ impl ExternalServiceManager {
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
+            cpu_limits_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

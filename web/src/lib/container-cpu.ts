@@ -16,7 +16,9 @@ export const CONTAINER_CPU_METRIC = 'container.cpu_percent'
 /** Share of the cores the container may use: its limit, else every host core. */
 export const CONTAINER_CPU_UTILIZATION_METRIC =
   'container.cpu_utilization_percent'
-/** The container's CPU limit in cores; absent when uncapped. */
+/** The container's CPU limit in cores; 0 when uncapped. Recorded on every
+ *  scrape where the limit is known, so removing a cap shows up as 0 rather
+ *  than the last capped value lingering in the latest-values window. */
 export const CONTAINER_CPU_LIMIT_METRIC = 'container.cpu_limit_cores'
 
 export const CONTAINER_CPU_TILE_LABEL = 'CPU (cores, last scrape)'
@@ -31,6 +33,22 @@ export const CONTAINER_CPU_METRIC_LABELS: Record<string, string> = {
   [CONTAINER_CPU_METRIC]: 'CPU (cores)',
   [CONTAINER_CPU_UTILIZATION_METRIC]: 'CPU (% of limit)',
   [CONTAINER_CPU_LIMIT_METRIC]: 'CPU limit',
+}
+
+/**
+ * The metrics an alert rule may be created on, from a page's metric list.
+ * `container.cpu_percent` is dropped: a threshold on it is cores × 100, so a
+ * user reading "0.68 cores" who types 2 would get a rule at 0.02 cores. CPU
+ * alerts use the share of the limit instead, offered first.
+ */
+export function alertableMetrics(metrics: string[]): string[] {
+  const rest = metrics.filter(
+    (m) =>
+      m !== CONTAINER_CPU_METRIC &&
+      m !== CONTAINER_CPU_UTILIZATION_METRIC &&
+      m !== CONTAINER_CPU_LIMIT_METRIC
+  )
+  return [CONTAINER_CPU_UTILIZATION_METRIC, ...rest]
 }
 
 /** The CPU tile's text, e.g. "0.68 / 6 cores", from the latest values. */
@@ -53,6 +71,7 @@ export function formatContainerCpuMetric(
 ): string | null {
   if (name === CONTAINER_CPU_METRIC) return formatCpuUsage(value, null)
   if (name === CONTAINER_CPU_LIMIT_METRIC) {
+    if (value <= 0) return 'unlimited'
     const cores = parseFloat(value.toFixed(3))
     return `${cores} ${cores === 1 ? 'core' : 'cores'}`
   }

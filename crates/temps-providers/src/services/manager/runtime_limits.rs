@@ -407,6 +407,9 @@ impl ExternalServiceManager {
             results.push(outcome);
         }
 
+        // The health monitor caches each container's CPU limit; make it read
+        // the one just applied on its next tick.
+        self.note_cpu_limits_changed();
         results
     }
 

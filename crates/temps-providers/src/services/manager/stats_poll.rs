@@ -17,15 +17,18 @@ use super::runtime_limits::{compute_stats_sample, sample_container_stats_once};
 use crate::services::*;
 use bollard::models::{ContainerCpuStats, ContainerStatsResponse, HostConfig};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use temps_entities::external_services;
 use tracing::debug;
 
 /// How long a poller trusts a container's cached CPU limit before inspecting
-/// the container again. A live `docker update` of the limit shows up within
-/// this window; a recreated container (new ID) is inspected on its first
-/// tick. At the default 30 s tick this is one inspect per container every ten
-/// ticks instead of one per tick.
+/// the container again. Limits changed through Temps are re-read on the next
+/// tick (`ExternalServiceManager::cpu_limits_epoch`), and a recreated
+/// container (new ID) is inspected on its first tick; this window only bounds
+/// how long a change made outside Temps (`docker update` by hand) goes
+/// unnoticed. At the default 30 s tick this is one inspect per container
+/// every ten ticks instead of one per tick.
 pub const CPU_LIMIT_REFRESH: Duration = Duration::from_secs(300);
 
 /// The CPU a container may use, read from its `HostConfig`.
@@ -87,6 +90,9 @@ pub fn cpu_utilization_percent(cpu_percent: f64, limit: CpuLimit, online_cpus: O
 struct CachedCpuLimit {
     limit: CpuLimit,
     read_at: Instant,
+    /// `ExternalServiceManager::cpu_limits_epoch` when it was read; a later
+    /// epoch means Temps has changed some service's limits since.
+    epoch: u64,
 }
 
 /// What a poller keeps per container between ticks: the container's ID, its
@@ -97,6 +103,18 @@ pub struct ContainerStatsBaseline {
     container_id: Option<String>,
     cpu_stats: Option<ContainerCpuStats>,
     cpu_limit: Option<CachedCpuLimit>,
+}
+
+#[cfg(test)]
+impl ContainerStatsBaseline {
+    /// A baseline with no counters, for tests of the code that stores them.
+    pub(crate) fn seeded_for_test() -> Self {
+        Self {
+            container_id: None,
+            cpu_stats: None,
+            cpu_limit: None,
+        }
+    }
 }
 
 /// One container's result from a polling tick.
@@ -155,19 +173,22 @@ fn cpu_baseline<'a>(
     previous.cpu_stats.as_ref()
 }
 
-/// The cached CPU limit while it is still current for this container.
+/// The cached CPU limit while it is still current for this container: same
+/// container, no limit change applied through Temps since (`epoch`), and
+/// younger than `CPU_LIMIT_REFRESH`.
 fn fresh_cpu_limit(
     previous: Option<&ContainerStatsBaseline>,
     current: &ContainerStatsResponse,
     now: Instant,
+    epoch: u64,
 ) -> Option<CachedCpuLimit> {
     let previous = previous?;
     if previous.container_id != current.id {
         return None;
     }
-    previous
-        .cpu_limit
-        .filter(|cached| now.saturating_duration_since(cached.read_at) < CPU_LIMIT_REFRESH)
+    previous.cpu_limit.filter(|cached| {
+        cached.epoch == epoch && now.saturating_duration_since(cached.read_at) < CPU_LIMIT_REFRESH
+    })
 }
 
 /// One container's tick: the reported stats and the baseline for the next
@@ -216,6 +237,19 @@ async fn read_cpu_limit(
 }
 
 impl ExternalServiceManager {
+    /// The current limits epoch; see `note_cpu_limits_changed`.
+    fn cpu_limits_epoch(&self) -> u64 {
+        self.cpu_limits_epoch.load(Ordering::Acquire)
+    }
+
+    /// Record that Temps has just applied resource limits to some service's
+    /// containers: every cached CPU limit is re-read on the next tick, so a
+    /// removed or changed cap is reported at once instead of after
+    /// `CPU_LIMIT_REFRESH`. Process-wide, as limit changes are rare.
+    pub(super) fn note_cpu_limits_changed(&self) {
+        self.cpu_limits_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Sample stats for every container in this service against a
     /// caller-held baseline map (`container_name` → previous tick).
     ///
@@ -225,11 +259,13 @@ impl ExternalServiceManager {
     /// The first tick for a container has no baseline, so `cpu_percent` is
     /// `None` (memory is still reported) and the baseline is seeded.
     ///
-    /// The map is rewritten on every call, so it never holds more entries
-    /// than the service has containers: entries for containers that no longer
-    /// back the service are dropped, and entries whose sample failed this tick
-    /// (container stopped / remote node) are carried over unchanged, since
-    /// cumulative counters stay valid across a longer window.
+    /// The map is replaced once the pass completes, so it never holds more
+    /// entries than the service has containers: entries for containers that no
+    /// longer back the service are dropped, and entries whose sample failed
+    /// this tick (container stopped / remote node) are carried over unchanged,
+    /// since cumulative counters stay valid across a longer window. It is not
+    /// touched before then, so a caller whose future is dropped mid-pass (a
+    /// manual check whose client disconnected) keeps its baselines.
     pub async fn sample_service_stats(
         &self,
         service: &external_services::Model,
@@ -242,7 +278,7 @@ impl ExternalServiceManager {
         let mut next_baselines = HashMap::with_capacity(containers.len());
 
         for (role, name) in containers {
-            let previous = baselines.remove(&name);
+            let previous = baselines.get(&name);
             let current = match docker {
                 Some(docker) => sample_container_stats_once(docker, &name).await,
                 None => None,
@@ -252,19 +288,23 @@ impl ExternalServiceManager {
                 // Docker: keep the old baseline so a later success still has a
                 // valid rate window.
                 if let Some(previous) = previous {
-                    next_baselines.insert(name.clone(), previous);
+                    next_baselines.insert(name.clone(), previous.clone());
                 }
                 members.push(PolledContainerStats::unavailable(role, name));
                 continue;
             };
 
             let now = Instant::now();
-            let cpu_limit = match fresh_cpu_limit(previous.as_ref(), &current, now) {
+            // Read before inspecting: a limit applied while the inspect is in
+            // flight bumps the epoch past this one and is re-read next tick.
+            let epoch = self.cpu_limits_epoch();
+            let cpu_limit = match fresh_cpu_limit(previous, &current, now, epoch) {
                 Some(cached) => Some(cached),
                 None => match read_cpu_limit(docker, &name).await {
                     Ok(limit) => Some(CachedCpuLimit {
                         limit,
                         read_at: now,
+                        epoch,
                     }),
                     Err(e) => {
                         // Left unknown, so the next tick inspects again.
@@ -278,8 +318,7 @@ impl ExternalServiceManager {
                 },
             };
 
-            let (polled, baseline) =
-                poll_step(role, name.clone(), previous.as_ref(), current, cpu_limit);
+            let (polled, baseline) = poll_step(role, name.clone(), previous, current, cpu_limit);
             members.push(polled);
             next_baselines.insert(name, baseline);
         }
@@ -341,6 +380,7 @@ mod tests {
         Some(CachedCpuLimit {
             limit: CpuLimit::Cores(6.0),
             read_at: Instant::now(),
+            epoch: 0,
         })
     }
 
@@ -406,6 +446,7 @@ mod tests {
         let unlimited = Some(CachedCpuLimit {
             limit: CpuLimit::Unlimited,
             read_at: Instant::now(),
+            epoch: 0,
         });
 
         let (_, baseline) = step(None, first, unlimited);
@@ -469,10 +510,23 @@ mod tests {
 
         let (_, baseline) = step(None, old, six_core_limit());
         assert!(cpu_baseline(Some(&baseline), &recreated).is_none());
-        assert!(fresh_cpu_limit(Some(&baseline), &recreated, Instant::now()).is_none());
+        assert!(fresh_cpu_limit(Some(&baseline), &recreated, Instant::now(), 0).is_none());
 
         let (polled, _) = step(Some(&baseline), recreated, six_core_limit());
         assert_eq!(polled.sample.cpu_percent, None);
+    }
+
+    /// The limit is reused within `CPU_LIMIT_REFRESH` and read again after.
+    fn baseline_with_limit(read_at: Instant, epoch: u64) -> ContainerStatsBaseline {
+        ContainerStatsBaseline {
+            container_id: Some(CONTAINER_ID.to_string()),
+            cpu_stats: None,
+            cpu_limit: Some(CachedCpuLimit {
+                limit: CpuLimit::Cores(6.0),
+                read_at,
+                epoch,
+            }),
+        }
     }
 
     /// The limit is reused within `CPU_LIMIT_REFRESH` and read again after.
@@ -480,19 +534,33 @@ mod tests {
     fn cached_cpu_limit_expires_after_the_refresh_window() {
         let read_at = Instant::now();
         let current = one_shot_stats(CONTAINER_ID, LIFETIME_CPU_NS, LIFETIME_SYSTEM_NS);
-        let baseline = ContainerStatsBaseline {
-            container_id: Some(CONTAINER_ID.to_string()),
-            cpu_stats: None,
-            cpu_limit: Some(CachedCpuLimit {
-                limit: CpuLimit::Cores(6.0),
-                read_at,
-            }),
-        };
+        let baseline = baseline_with_limit(read_at, 4);
 
-        let cached = fresh_cpu_limit(Some(&baseline), &current, read_at + Duration::from_secs(30));
+        let cached = fresh_cpu_limit(
+            Some(&baseline),
+            &current,
+            read_at + Duration::from_secs(30),
+            4,
+        );
         assert_eq!(cached.map(|c| c.limit), Some(CpuLimit::Cores(6.0)));
-        assert!(fresh_cpu_limit(Some(&baseline), &current, read_at + CPU_LIMIT_REFRESH).is_none());
-        assert!(fresh_cpu_limit(None, &current, read_at).is_none());
+        assert!(
+            fresh_cpu_limit(Some(&baseline), &current, read_at + CPU_LIMIT_REFRESH, 4).is_none()
+        );
+        assert!(fresh_cpu_limit(None, &current, read_at, 4).is_none());
+    }
+
+    /// Removing or changing a cap through Temps bumps the epoch: the very
+    /// next tick reads the limit again instead of reporting the old cap for
+    /// up to `CPU_LIMIT_REFRESH`.
+    #[test]
+    fn a_limit_change_through_temps_invalidates_the_cached_limit() {
+        let read_at = Instant::now();
+        let current = one_shot_stats(CONTAINER_ID, LIFETIME_CPU_NS, LIFETIME_SYSTEM_NS);
+        let baseline = baseline_with_limit(read_at, 4);
+
+        let next_tick = read_at + Duration::from_secs(30);
+        assert!(fresh_cpu_limit(Some(&baseline), &current, next_tick, 4).is_some());
+        assert!(fresh_cpu_limit(Some(&baseline), &current, next_tick, 5).is_none());
     }
 
     #[test]

@@ -17,9 +17,7 @@ use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
-use crate::services::{
-    ContainerStatsBaseline, CpuLimit, ExternalServiceManager, PolledContainerStats,
-};
+use crate::services::{ContainerStatsBaseline, ExternalServiceManager, PolledContainerStats};
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use sea_orm::{
@@ -128,7 +126,7 @@ pub struct ExternalServiceHealthMonitor {
     /// the baseline and emits memory only. Holds entries only for services
     /// that are sampled (`samples_container_metrics`), and per service only
     /// for its current containers.
-    stats_baselines: Arc<Mutex<HashMap<i32, HashMap<String, ContainerStatsBaseline>>>>,
+    stats_baselines: Arc<StatsBaselines>,
 }
 
 impl ExternalServiceHealthMonitor {
@@ -149,7 +147,7 @@ impl ExternalServiceHealthMonitor {
             encryption_service,
             last_binlog_archive: Arc::new(Mutex::new(HashMap::new())),
             metrics_store: None,
-            stats_baselines: Arc::new(Mutex::new(HashMap::new())),
+            stats_baselines: Arc::new(StatsBaselines::default()),
         }
     }
 
@@ -226,10 +224,7 @@ impl ExternalServiceHealthMonitor {
             })
             .await;
 
-        {
-            let mut baselines = self.stats_baselines.lock().await;
-            baselines.retain(|id, _| sampled_ids.contains(id));
-        }
+        self.stats_baselines.retain(&sampled_ids).await;
 
         Ok(())
     }
@@ -456,23 +451,17 @@ impl ExternalServiceHealthMonitor {
         store: &Arc<dyn MetricsStore>,
         service: &external_services::Model,
     ) {
-        // Take this service's baselines out of the shared map so the lock is
-        // not held across the Docker calls; checks of other services run
-        // concurrently and sample their own containers meanwhile.
-        let mut service_baselines = self
-            .stats_baselines
-            .lock()
-            .await
-            .remove(&service.id)
-            .unwrap_or_default();
-        let sampled = self
-            .manager
-            .sample_service_stats(service, &mut service_baselines)
-            .await;
-        self.stats_baselines
-            .lock()
-            .await
-            .insert(service.id, service_baselines);
+        // Hold only this service's lock across the Docker calls: a manual
+        // check and the periodic loop sampling the same service take turns,
+        // other services are sampled meanwhile, and the baselines stay in the
+        // map if this future is dropped (a manual check whose client left).
+        let service_baselines = self.stats_baselines.for_service(service.id).await;
+        let sampled = {
+            let mut baselines = service_baselines.lock().await;
+            self.manager
+                .sample_service_stats(service, &mut baselines)
+                .await
+        };
 
         let members = match sampled {
             Ok(members) => members,
@@ -1103,6 +1092,40 @@ enum LifecycleProbe {
     Down,
 }
 
+/// One service's stats baselines (`container_name` → previous tick).
+type ServiceStatsBaselines = Arc<Mutex<HashMap<String, ContainerStatsBaseline>>>;
+
+/// The health monitor's stats baselines, one entry per sampled service.
+///
+/// Each service has its own lock, held for the whole of that service's
+/// sampling pass. The outer lock is only held to look the entry up, never
+/// across Docker calls. Entries are never taken out of the map while a
+/// service is sampled, so a sampler whose future is dropped cannot lose them.
+#[derive(Default)]
+struct StatsBaselines {
+    services: Mutex<HashMap<i32, ServiceStatsBaselines>>,
+}
+
+impl StatsBaselines {
+    /// The baselines of `service_id`, created empty on first use.
+    async fn for_service(&self, service_id: i32) -> ServiceStatsBaselines {
+        self.services
+            .lock()
+            .await
+            .entry(service_id)
+            .or_default()
+            .clone()
+    }
+
+    /// Keep only the services in `sampled`.
+    async fn retain(&self, sampled: &std::collections::HashSet<i32>) {
+        self.services
+            .lock()
+            .await
+            .retain(|id, _| sampled.contains(id));
+    }
+}
+
 /// Whether the health loop samples this service's container stats: a
 /// running service on the local Docker host with metrics enabled (the same
 /// per-service flag the engine-metrics scraper uses).
@@ -1120,8 +1143,11 @@ fn samples_container_metrics(service: &external_services::Model) -> bool {
 ///   the cores the container may use, its CPU limit or else every host core
 ///   (100 == saturated). What CPU alert rules threshold. Absent while the
 ///   limit is unknown.
-/// - `container.cpu_limit_cores`: the applied CPU limit, when capped, so a
-///   tile can read "used / limit cores".
+/// - `container.cpu_limit_cores`: the applied CPU limit in cores, `0` when
+///   uncapped, so a tile can read "used / limit cores". Written on every tick
+///   where the limit is known, uncapped included: written only while capped,
+///   the last capped value would stay the "latest" for the store's whole
+///   latest-values window after a cap was removed.
 /// - `container.memory_used_bytes`: RSS excluding page cache.
 /// - `container.memory_percent`: usage relative to the container's memory
 ///   limit (host RAM when no limit is set, as on the live stats endpoint).
@@ -1159,7 +1185,8 @@ fn container_metric_points(
         if let Some(utilization) = member.cpu_utilization_percent() {
             points.push(make_point("container.cpu_utilization_percent", utilization));
         }
-        if let Some(cores) = member.cpu_limit.and_then(CpuLimit::cores) {
+        if let Some(limit) = member.cpu_limit {
+            let cores = limit.cores().unwrap_or(0.0);
             points.push(make_point("container.cpu_limit_cores", cores));
         }
         if let Some(mem) = sample.memory_usage_bytes {
@@ -1188,6 +1215,7 @@ fn lifecycle_probe(status: &str) -> LifecycleProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::CpuLimit;
 
     #[test]
     fn health_status_strings() {
@@ -1277,10 +1305,11 @@ mod tests {
         }
     }
 
-    /// Uncapped, utilization is against the host's cores and no limit is
-    /// recorded.
+    /// Uncapped, utilization is against the host's cores and the limit is
+    /// recorded as 0, so a removed cap replaces the old value in the latest
+    /// values instead of lingering there.
     #[test]
-    fn uncapped_container_records_no_limit() {
+    fn uncapped_container_records_a_zero_limit() {
         let points = container_metric_points(
             &running_service(),
             &[polled(Some(80.0), Some(CpuLimit::Unlimited))],
@@ -1291,7 +1320,7 @@ mod tests {
             point_value(&points, "container.cpu_utilization_percent"),
             Some(5.0)
         );
-        assert_eq!(point_value(&points, "container.cpu_limit_cores"), None);
+        assert_eq!(point_value(&points, "container.cpu_limit_cores"), Some(0.0));
     }
 
     /// The first tick (no rate yet) and an unknown limit record no CPU
@@ -1318,6 +1347,56 @@ mod tests {
             None
         );
         assert_eq!(point_value(&unknown, "container.cpu_limit_cores"), None);
+    }
+
+    /// A sampler whose future is dropped mid-pass (a manual check whose
+    /// client disconnected) leaves the service's baselines in place.
+    #[tokio::test]
+    async fn a_dropped_sampler_keeps_the_service_baselines() {
+        let store = StatsBaselines::default();
+        store.for_service(7).await.lock().await.insert(
+            "service-postgres".into(),
+            ContainerStatsBaseline::seeded_for_test(),
+        );
+
+        let handle = store.for_service(7).await;
+        let sampler = async {
+            let _baselines = handle.lock().await;
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(10), sampler)
+            .await
+            .is_err());
+
+        let baselines = store.for_service(7).await;
+        assert!(baselines.lock().await.contains_key("service-postgres"));
+    }
+
+    /// Samplers of one service share its lock and take turns; another
+    /// service is not blocked by it.
+    #[tokio::test]
+    async fn samplers_of_one_service_share_its_lock() {
+        let store = StatsBaselines::default();
+        let a = store.for_service(7).await;
+        let b = store.for_service(7).await;
+        assert!(Arc::ptr_eq(&a, &b));
+
+        let _held = a.lock().await;
+        assert!(b.try_lock().is_err());
+        let other = store.for_service(8).await;
+        assert!(other.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn baselines_of_unsampled_services_are_dropped() {
+        let store = StatsBaselines::default();
+        store.for_service(7).await;
+        store.for_service(8).await;
+
+        store.retain(&[7].into_iter().collect()).await;
+
+        assert_eq!(store.services.lock().await.len(), 1);
+        assert!(store.services.lock().await.contains_key(&7));
     }
 
     /// Only running local services with metrics on are sampled; every other
