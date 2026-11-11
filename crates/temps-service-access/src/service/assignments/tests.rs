@@ -647,15 +647,25 @@ async fn historical_declarations_release_capacity_but_reapproval_cannot_overfill
 
 #[tokio::test]
 async fn vault_membership_stops_existing_durable_approval_and_worker_binding() {
-    vault_approval_transition(false).await;
+    vault_approval_transition(false, "unlink", false).await;
 }
 
 #[tokio::test]
 async fn upgrade_preserves_standalone_approval_until_original_link_is_revoked() {
-    vault_approval_transition(true).await;
+    vault_approval_transition(true, "unlink", false).await;
 }
 
-async fn vault_approval_transition(upgrade: bool) {
+#[tokio::test]
+async fn legacy_one_shot_link_deletion_fences_prepared_policy() {
+    vault_approval_transition(true, "delete", true).await;
+}
+
+#[tokio::test]
+async fn legacy_vault_retirement_fences_prepared_policy() {
+    vault_approval_transition(true, "retire", false).await;
+}
+
+async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: bool) {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
     {
@@ -816,11 +826,16 @@ async fn vault_approval_transition(upgrade: bool) {
         .unwrap();
     let link_id = if upgrade {
         use temps_migrations::{
-            LegacyStandaloneVaultCoverageMigration, MigrationTrait, SchemaManager,
+            LegacyStandaloneVaultCoverageMigration, LegacyVaultRevocationFenceMigration,
+            MigrationTrait, SchemaManager,
         };
         // Reproduce the pre-upgrade persisted state, then apply the real additive
         // migration. The old version permitted membership alongside approval.
         let manager = SchemaManager::new(db.as_ref());
+        LegacyVaultRevocationFenceMigration
+            .down(&manager)
+            .await
+            .unwrap();
         LegacyStandaloneVaultCoverageMigration
             .down(&manager)
             .await
@@ -877,23 +892,30 @@ async fn vault_approval_transition(upgrade: bool) {
             .unwrap()
             .revoked_at
             .is_none());
-        // Rotation keeps the original consent date, not the new grant's date.
-        let mut restarted = observed.clone();
-        restarted.incarnation = uuid::Uuid::new_v4();
-        assert!(service
-            .renew_assignment(&approved.id, 9751, 9751, restarted)
-            .await
-            .unwrap()
-            .is_some());
-        assert_eq!(
-            planner
-                .prepare(worker.identity().boot_id)
+        if !one_shot {
+            // Rotation keeps the original consent date, not the new grant's date.
+            let mut restarted = observed.clone();
+            restarted.incarnation = uuid::Uuid::new_v4();
+            assert!(service
+                .renew_assignment(&approved.id, 9751, 9751, restarted)
                 .await
                 .unwrap()
-                .bindings
-                .len(),
-            1
-        );
+                .is_some());
+            assert_eq!(
+                planner
+                    .prepare(worker.identity().boot_id)
+                    .await
+                    .unwrap()
+                    .bindings
+                    .len(),
+                1
+            );
+        }
+        // Install the fence over existing consent, including rotated durable grants.
+        LegacyVaultRevocationFenceMigration
+            .up(&manager)
+            .await
+            .unwrap();
         format!("link_legacy_{}", vault.id)
     } else {
         // Post-upgrade membership requires fresh vault consent even with a link.
@@ -902,7 +924,58 @@ async fn vault_approval_transition(upgrade: bool) {
         assert_eq!(plan.retire.len(), 1);
         link.id.clone()
     };
-    service.unlink_vault(&vault.id, &link_id).await.unwrap();
+    if one_shot {
+        db.execute_unprepared(
+            "UPDATE sandbox_service_grants SET assignment_id=NULL WHERE revoked_at IS NULL",
+        )
+        .await
+        .unwrap();
+    }
+    let stale = planner.prepare(worker.identity().boot_id).await.unwrap();
+    if upgrade {
+        assert_eq!(stale.bindings.len(), 1);
+    }
+    match revoke_mode {
+        "delete" => {
+            db.execute_unprepared(&format!(
+                "DELETE FROM access_vault_links WHERE id='{link_id}'"
+            ))
+            .await
+            .unwrap();
+        }
+        "retire" => service
+            .retire_vault_resource(&vault.id, None)
+            .await
+            .unwrap(),
+        _ => service.unlink_vault(&vault.id, &link_id).await.unwrap(),
+    }
+    if upgrade {
+        let store = crate::authority::AuthorityStore::new(
+            db.clone(),
+            crate::service::tests::encryption(),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+        assert!(
+            store
+                .issue(
+                    stale.node_id,
+                    &stale.worker,
+                    stale.expected_revision,
+                    stale.bindings
+                )
+                .await
+                .is_err(),
+            "revocation must reject signing a plan read before it committed"
+        );
+        assert_eq!(
+            grants::Entity::find()
+                .filter(grants::Column::RevokedAt.is_null())
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+    }
     assert!(planner
         .prepare(worker.identity().boot_id)
         .await
@@ -942,7 +1015,13 @@ async fn vault_approval_transition(upgrade: bool) {
             .count(db.as_ref())
             .await
             .unwrap(),
-        if upgrade { 2 } else { 1 }
+        if one_shot {
+            0
+        } else if upgrade {
+            2
+        } else {
+            1
+        }
     );
     test.cleanup().await;
 }
