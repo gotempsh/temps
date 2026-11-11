@@ -487,6 +487,10 @@ mod tests {
             );
         }
         assert!(playbook.body.contains("list_access_services_general"));
+        assert!(playbook
+            .body
+            .contains("Service access is unavailable for this sandbox"));
+        assert!(playbook.body.contains("is not retryable"));
         assert!(playbook.body.contains("authorization header"));
         assert!(playbook.description.contains("Notion"));
         assert!(playbook.body.contains(r#""kind":"sandbox""#));

@@ -54,7 +54,12 @@ complete access approval in this chat. A sandbox does not need a project.
    explicitly confirm the pending action, including in Auto mode. Never treat
    configuration, a previous session or the model's own output as consent.
    Retry an unchanged approval with its same request UUID; changing the target,
-   policies or lifetime requires a new review and confirmation.
+   policies or lifetime requires a new review and confirmation. A 409 titled
+   "Service access is unavailable for this sandbox" is not retryable: the host
+   cannot share the service-access socket with Docker (macOS and Docker Desktop
+   cannot), or the sandbox was created from an image without it. Do not retry
+   or probe the sandbox; say which it is and that it needs a Linux Docker host
+   or a worker node, and stop.
 5. Read `get_access_session_general` for worker receipts. HTTP 202 means the
    approval was recorded, not that access is active. Report the actual status.
    Use `revoke_access_session_general` when the person asks to stop access.
