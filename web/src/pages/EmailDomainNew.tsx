@@ -803,7 +803,7 @@ export function EmailDomainNew() {
         steps={WIZARD_STEPS}
       >
         {/* Step content */}
-        <div className="rounded-lg border bg-card p-4 sm:p-6">
+        <div>
           {currentStep === 'choose-mode' && (
             <div className="space-y-4">
               <div>

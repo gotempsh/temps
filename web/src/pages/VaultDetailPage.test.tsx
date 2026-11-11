@@ -116,6 +116,14 @@ function mount(tab = 'services', write = true, entry?: string) {
             <BreadcrumbProbe />
             <Routes>
               <Route
+                path="/vault/projects/:projectId/vaults/:vaultId"
+                element={<VaultDetailPage />}
+              />
+              <Route
+                path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+                element={<AccessBundleDetailPage />}
+              />
+              <Route
                 path="/access-services/:serviceId/edit"
                 element={<h1>Service details destination</h1>}
               />
@@ -831,3 +839,128 @@ test('non-admin vault readers do not see management or audit tabs', () => {
     client.clear()
   }
 })
+
+test('legacy project vault and bundle navigation use project-scoped APIs without a sandbox', async () => {
+  const reads: string[] = []
+  const api = mockApi({
+    'GET /projects/7/access-vaults/vault_test': () => {
+      reads.push('vault')
+      return jsonResponse({ vault, services: [service] })
+    },
+    'GET /projects/7/access-vaults/vault_test/bundles': () => {
+      reads.push('bundles')
+      return jsonResponse({
+        items: [
+          {
+            id: 'bundle_legacy',
+            name: 'Legacy bundle',
+            service_ids: [service.id],
+            ttl_seconds: 300,
+            version: 1,
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      })
+    },
+    'GET /access-vaults/vault_test': () =>
+      jsonResponse({ detail: 'Sandbox required' }, 403),
+    'GET /access-vaults/vault_test/bundles': () =>
+      jsonResponse({ detail: 'Sandbox required' }, 403),
+  })
+  const client = mount(
+    'bundles',
+    false,
+    '/vault/projects/7/vaults/vault_test?tab=bundles'
+  )
+  try {
+    const ui = within(document.body)
+    const link = await ui.findByRole('link', { name: 'Legacy bundle' })
+    expect(link.getAttribute('href')).toBe(
+      '/vault/projects/7/vaults/vault_test/bundles/bundle_legacy'
+    )
+    fireEvent.click(link)
+    await waitFor(() =>
+      expect(ui.getByRole('heading', { name: 'Legacy bundle' })).toBeTruthy()
+    )
+    expect(ui.queryByText('Could not load access bundle')).toBeNull()
+    expect(
+      ui
+        .getAllByRole('link', { name: 'All access bundles' })[0]
+        .getAttribute('href')
+    ).toBe('/vault/projects/7/vaults/vault_test?tab=bundles')
+    expect(reads).toContain('vault')
+    expect(reads.filter((x) => x === 'bundles').length).toBeGreaterThanOrEqual(
+      2
+    )
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
+test('legacy project vault session lists retain project scope', async () => {
+  let scopedReads = 0
+  let generalReads = 0
+  const api = mockApi({
+    'GET /projects/7/access-vaults/vault_test': () =>
+      jsonResponse({ vault, services: [service] }),
+    'GET /projects/7/access-sessions': (request) => {
+      const query = new URL(request.url).searchParams
+      expect(query.get('vault_id')).toBe(vault.id)
+      expect(query.get('page_size')).toBe('20')
+      scopedReads++
+      return jsonResponse({ items: [], total: 0, page: 1, page_size: 20 })
+    },
+    'GET /access-sessions': () => {
+      generalReads++
+      return jsonResponse({ detail: 'Sandbox required' }, 403)
+    },
+  })
+  const client = mount(
+    'sessions',
+    false,
+    '/vault/projects/7/vaults/vault_test?tab=sessions'
+  )
+  try {
+    await within(document.body).findByText('No sessions')
+    expect(scopedReads).toBe(1)
+    expect(generalReads).toBe(0)
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})
+
+test.each([
+  '/vault/projects/7/vaults/vault_test',
+  '/vault/projects/7/vaults/vault_test/bundles/bundle_legacy',
+])(
+  'denied legacy project read does not fall back to cached general data: %s',
+  async (entry) => {
+    const api = mockApi({
+      'GET /projects/7/access-vaults/vault_test': () =>
+        jsonResponse({ detail: 'Project access denied' }, 403),
+      'GET /projects/7/access-vaults/vault_test/bundles': () =>
+        jsonResponse({ detail: 'Project access denied' }, 403),
+    })
+    const client = mount('services', false, entry)
+    try {
+      const ui = within(document.body)
+      await ui.findByText(
+        entry.includes('/bundles/')
+          ? 'Could not load access bundle'
+          : 'Could not load vault'
+      )
+      expect(ui.queryByRole('heading', { name: vault.name })).toBeNull()
+      expect(ui.queryByText(service.name)).toBeNull()
+    } finally {
+      cleanup()
+      client.clear()
+      api.restore()
+    }
+  }
+)

@@ -21,12 +21,14 @@ import { problemDetail } from '@/lib/api-problem'
 function Editor({
   vaultId,
   catalogEntry,
+  onChangeService,
   service,
   canUseProjectGithub,
   onClose,
   onSaved,
 }: {
   catalogEntry?: ServiceCatalogEntry
+  onChangeService?: () => void
   vaultId?: string
   service?: AccessServiceResponse
   canUseProjectGithub: boolean
@@ -39,6 +41,7 @@ function Editor({
   return (
     <AccessServiceEditor
       catalogEntry={catalogEntry}
+      onChangeService={onChangeService}
       vaultId={vaultId}
       service={initialService}
       canUseProjectGithub={canUseProjectGithub}
@@ -197,7 +200,7 @@ export default function AccessServicePage() {
               </Button>
             </Callout>
           )}
-          {!serviceId && (
+          {!serviceId && (!configure || !entry?.supported) && (
             <PageHeader
               title={
                 configure
@@ -273,6 +276,7 @@ export default function AccessServicePage() {
               <Editor
                 key={`${editorKey}:${providerId}`}
                 catalogEntry={entry}
+                onChangeService={!serviceId ? catalogStep : undefined}
                 vaultId={params.get('vault') ?? undefined}
                 service={service.data}
                 canUseProjectGithub={

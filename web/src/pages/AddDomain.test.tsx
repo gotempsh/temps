@@ -26,7 +26,8 @@ test.each([AddDomain, EmailDomainNew])(
       expect(html).toContain('aria-label="Setup progress"')
       expect(html.match(/<h1/g)).toHaveLength(1)
       expect(html).not.toContain('overflow-auto')
-      expect(html).toContain('rounded-lg border bg-card')
+      expect(html).not.toContain('space-y-6 rounded-lg border bg-card')
+      expect(html).not.toContain('rounded-lg border bg-card p-4 sm:p-6')
     } finally {
       client.clear()
     }

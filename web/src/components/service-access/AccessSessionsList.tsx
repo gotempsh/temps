@@ -13,7 +13,10 @@ import {
   ResponsivePagination,
   Status,
 } from '@temps-sdk/ds'
-import { listAccessSessionsGeneralOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  listAccessSessionsGeneralOptions,
+  listAccessSessionsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import type { AccessSessionResponse } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
 
@@ -28,6 +31,7 @@ export function SessionStatus({ session }: { session: AccessSessionResponse }) {
 }
 export function AccessSessionsList({
   vaultId,
+  projectId,
   sandboxId,
   active = true,
 }: {
@@ -37,13 +41,26 @@ export function AccessSessionsList({
   active?: boolean
 }) {
   const [page, setPage] = useState(1)
-  const query = useQuery({
-    ...listAccessSessionsGeneralOptions({
-      query: { vault_id: vaultId, sandbox_id: sandboxId, page, page_size: 20 },
+  const filters = {
+    vault_id: vaultId,
+    sandbox_id: sandboxId,
+    page,
+    page_size: 20,
+  }
+  const projectSessions = useQuery({
+    ...listAccessSessionsOptions({
+      path: { project_id: projectId ?? 0 },
+      query: filters,
     }),
-    enabled: active,
-    refetchInterval: active ? 5000 : false,
+    enabled: active && projectId !== undefined,
+    refetchInterval: active && projectId !== undefined ? 5000 : false,
   })
+  const generalSessions = useQuery({
+    ...listAccessSessionsGeneralOptions({ query: filters }),
+    enabled: active && projectId === undefined,
+    refetchInterval: active && projectId === undefined ? 5000 : false,
+  })
+  const query = projectId === undefined ? generalSessions : projectSessions
   return (
     <div className="space-y-4">
       {query.isError && (

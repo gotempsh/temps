@@ -182,7 +182,7 @@ test('new service has a direct routed form without reading an existing service',
     within(document.body).getByLabelText('Shared breadcrumbs').textContent
   ).toContain('Add service')
   expect(
-    within(document.body).getByRole('heading', { name: 'Add service' })
+    within(document.body).getByRole('heading', { name: 'Custom HTTP service' })
   ).toBeTruthy()
   expect(within(document.body).queryByRole('dialog')).toBeNull()
   expect(
@@ -409,6 +409,7 @@ test('catalog wizard preserves URL search and selection, hides form until select
     expect(ui.queryByRole('button', { name: 'Save service' })).toBeNull()
     fireEvent.click(await ui.findByRole('button', { name: /DeepSeek/ }))
     await waitFor(() => expect(ui.getByLabelText('Name')).toBeTruthy())
+    expect(document.querySelectorAll('h1')).toHaveLength(1)
     expect(ui.getByLabelText('URL').textContent).toContain('step=configure')
     expect(ui.getByLabelText('URL').textContent).toContain('provider=deepseek')
     expect(ui.getByLabelText('URL').textContent).toContain('vault=vault_test')

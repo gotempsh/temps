@@ -31,6 +31,8 @@ import {
 } from '@temps-sdk/ds'
 import {
   getAccessVaultGeneralOptions,
+  getAccessVaultOptions,
+  listAccessBundlesOptions,
   listAccessBundlesGeneralOptions,
   generalAccessCapabilityOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -53,13 +55,29 @@ import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 
 export default function VaultDetailPage() {
-  const { vaultId = '' } = useParams()
-  return <VaultDetail key={`${vaultId}`} vaultId={vaultId} />
+  const { vaultId = '', projectId } = useParams()
+  return (
+    <VaultDetail
+      key={`${projectId}:${vaultId}`}
+      vaultId={vaultId}
+      projectId={projectId === undefined ? undefined : Number(projectId)}
+    />
+  )
 }
-function VaultDetail({ vaultId }: { vaultId: string }) {
+function VaultDetail({
+  vaultId,
+  projectId,
+}: {
+  vaultId: string
+  projectId?: number
+}) {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
-  const valid = !!vaultId
+  const valid =
+    !!vaultId &&
+    (projectId === undefined ||
+      (Number.isSafeInteger(projectId) && projectId > 0))
+  const base = `/vault${projectId === undefined ? '' : `/projects/${projectId}`}/vaults/${encodeURIComponent(vaultId)}`
   const requestedTab = params.get('tab') ?? 'services'
   const canViewAuditLogs = useCanViewAuditLogs()
   const page = Math.max(
@@ -71,28 +89,37 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
     ? `?sandbox=${encodeURIComponent(sandboxId)}`
     : ''
   const path = { vault_id: vaultId }
-  const vault = useQuery({
+  const projectVault = useQuery({
+    ...getAccessVaultOptions({ path: { ...path, project_id: projectId ?? 0 } }),
+    enabled: valid && projectId !== undefined,
+  })
+  const generalVault = useQuery({
     ...getAccessVaultGeneralOptions({
       path,
       query: sandboxId ? { sandbox_id: sandboxId } : undefined,
     }),
-    enabled: valid,
+    enabled: valid && projectId === undefined,
   })
+  const vault = projectId === undefined ? generalVault : projectVault
   const capability = useQuery({
     ...generalAccessCapabilityOptions(),
     enabled: valid,
   })
-  const bundles = useQuery({
+  const projectBundles = useQuery({
+    ...listAccessBundlesOptions({
+      path: { ...path, project_id: projectId ?? 0 },
+      query: { page, page_size: 20 },
+    }),
+    enabled: valid && projectId !== undefined && requestedTab === 'bundles',
+  })
+  const generalBundles = useQuery({
     ...listAccessBundlesGeneralOptions({
       path,
-      query: {
-        page,
-        page_size: 20,
-        sandbox_id: sandboxId,
-      },
+      query: { page, page_size: 20, sandbox_id: sandboxId },
     }),
-    enabled: valid && requestedTab === 'bundles',
+    enabled: valid && projectId === undefined && requestedTab === 'bundles',
   })
+  const bundles = projectId === undefined ? generalBundles : projectBundles
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
     setBreadcrumbs([
@@ -326,6 +353,7 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
               <AccessSessionsList
                 key={vaultId}
                 vaultId={vaultId}
+                projectId={projectId}
                 sandboxId={sandboxId}
                 active={tab === 'sessions'}
               />
@@ -336,9 +364,7 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
               <Button
                 disabled={!canWrite}
                 onClick={() => {
-                  navigate(
-                    `/vault/vaults/${encodeURIComponent(vaultId)}/bundles/new`
-                  )
+                  navigate(`${base}/bundles/new`)
                 }}
               >
                 <Plus className="size-4" />
@@ -370,7 +396,7 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
                       <div className="flex items-center justify-between gap-2">
                         <h2 className="min-w-0 break-words font-semibold">
                           <Link
-                            to={`/vault/vaults/${encodeURIComponent(vaultId)}/bundles/${encodeURIComponent(b.id)}${consumerQuery}`}
+                            to={`${base}/bundles/${encodeURIComponent(b.id)}${consumerQuery}`}
                             className="after:absolute after:inset-0 focus:outline-none"
                           >
                             {b.name}
@@ -396,7 +422,7 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
                               }
                               onSelect={() => {
                                 navigate(
-                                  `/vault/vaults/${encodeURIComponent(vaultId)}/bundles/${encodeURIComponent(b.id)}/edit`
+                                  `${base}/bundles/${encodeURIComponent(b.id)}/edit`
                                 )
                               }}
                             >

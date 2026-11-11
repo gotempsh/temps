@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { listAccessBundlesGeneral } from '@/api/client'
+import { listAccessBundlesGeneral, listAccessBundles } from '@/api/client'
 export function accessBundleOptions(
   vaultId: string,
   bundleId: string,
-  sandboxId?: string
+  sandboxId?: string,
+  projectId?: number
 ) {
   return {
-    queryKey: ['accessBundle', vaultId, bundleId, sandboxId],
+    queryKey: ['accessBundle', vaultId, bundleId, sandboxId, projectId],
     retry: false,
     refetchOnMount: 'always' as const,
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
@@ -19,12 +20,20 @@ export function accessBundleOptions(
       ])
       let pages = 1
       for (let page = 1; page <= pages; page++) {
-        const { data } = await listAccessBundlesGeneral({
-          path: { vault_id: vaultId },
-          query: { page, page_size: 100, sandbox_id: sandboxId },
-          signal: boundedSignal,
-          throwOnError: true,
-        })
+        const { data } =
+          projectId !== undefined
+            ? await listAccessBundles({
+                path: { project_id: projectId, vault_id: vaultId },
+                query: { page, page_size: 100 },
+                signal: boundedSignal,
+                throwOnError: true,
+              })
+            : await listAccessBundlesGeneral({
+                path: { vault_id: vaultId },
+                query: { page, page_size: 100, sandbox_id: sandboxId },
+                signal: boundedSignal,
+                throwOnError: true,
+              })
         if (page === 1) pages = Math.ceil(data.total / 100)
         const found = data.items.find((item) => item.id === bundleId)
         if (found) return found

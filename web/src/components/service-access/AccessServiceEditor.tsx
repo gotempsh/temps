@@ -27,6 +27,7 @@ import {
 export function AccessServiceEditor({
   projectId,
   catalogEntry,
+  onChangeService,
   vaultId,
   service,
   canUseProjectGithub = false,
@@ -34,6 +35,7 @@ export function AccessServiceEditor({
   onSaved,
 }: {
   catalogEntry?: ServiceCatalogEntry
+  onChangeService?: () => void
   vaultId?: string
   projectId?: number | null
   service?: AccessServiceResponse
@@ -146,7 +148,14 @@ export function AccessServiceEditor({
   })
   return (
     <Settings
-      title={service ? 'Edit service' : 'Add service'}
+      title={service ? 'Edit service' : (catalogEntry?.name ?? 'Add service')}
+      headerActions={
+        onChangeService && (
+          <Button type="button" variant="outline" onClick={onChangeService}>
+            Change service
+          </Button>
+        )
+      }
       description="Save a scoped service. Connecting a sandbox requires a separate approval."
       onCancel={() => {
         if (!save.isPending) onClose()

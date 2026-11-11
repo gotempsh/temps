@@ -69,13 +69,13 @@ test('outside a frame a page title stays an h1', () => {
   expect(html).toContain('<h1 class="text-2xl font-semibold tracking-tight">')
 })
 
-test('a form inside a full-width shell centers without adding a second gutter', () => {
+test('a nested form inherits its full-width route shell without a second gutter', () => {
   const html = renderToStaticMarkup(
     <PageContainer>
       <PageContainer width="form">Fields</PageContainer>
     </PageContainer>
   )
   expect(html).toContain('data-page-container-nested')
-  expect(html).toContain('mx-auto max-w-5xl')
+  expect(html).not.toContain('max-w-5xl')
   expect(html.match(/px-4 py-6/g)).toHaveLength(1)
 })

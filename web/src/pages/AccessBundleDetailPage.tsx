@@ -14,6 +14,7 @@ import {
 import {
   generalAccessCapabilityOptions,
   getAccessVaultGeneralOptions,
+  getAccessVaultOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
 import { ServiceProviderLogo } from '@/components/service-access/service-providers'
@@ -21,26 +22,39 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 export default function AccessBundleDetailPage() {
-  const { vaultId = '', bundleId = '' } = useParams()
+  const { vaultId = '', bundleId = '', projectId: routeProjectId } = useParams()
+  const projectId =
+    routeProjectId === undefined ? undefined : Number(routeProjectId)
   const [search] = useSearchParams()
   const sandboxId = search.get('sandbox') ?? undefined
   const consumerQuery = sandboxId
     ? `?sandbox=${encodeURIComponent(sandboxId)}`
     : ''
-  const valid = !!vaultId && !!bundleId
-  const base = `/vault/vaults/${encodeURIComponent(vaultId)}`
+  const valid =
+    !!vaultId &&
+    !!bundleId &&
+    (projectId === undefined ||
+      (Number.isSafeInteger(projectId) && projectId > 0))
+  const base = `/vault${projectId === undefined ? '' : `/projects/${projectId}`}/vaults/${encodeURIComponent(vaultId)}`
   const back = `${base}?tab=bundles${sandboxId ? `&sandbox=${encodeURIComponent(sandboxId)}` : ''}`
   const bundle = useQuery({
-    ...accessBundleOptions(vaultId, bundleId, sandboxId),
+    ...accessBundleOptions(vaultId, bundleId, sandboxId, projectId),
     enabled: valid,
   })
-  const vault = useQuery({
+  const projectVault = useQuery({
+    ...getAccessVaultOptions({
+      path: { project_id: projectId ?? 0, vault_id: vaultId },
+    }),
+    enabled: valid && projectId !== undefined,
+  })
+  const generalVault = useQuery({
     ...getAccessVaultGeneralOptions({
       path: { vault_id: vaultId },
       query: sandboxId ? { sandbox_id: sandboxId } : undefined,
     }),
-    enabled: valid,
+    enabled: valid && projectId === undefined,
   })
+  const vault = projectId === undefined ? generalVault : projectVault
   const capability = useQuery({
     ...generalAccessCapabilityOptions(),
     enabled: valid,

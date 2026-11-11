@@ -61,12 +61,7 @@ export function PageContainer({
     return (
       <div
         data-page-container-nested
-        className={cn(
-          'w-full min-w-0 space-y-6',
-          width === 'form' && PAGE_WIDTH_CLASS.form,
-          className,
-          innerClassName
-        )}
+        className={cn('w-full min-w-0 space-y-6', className, innerClassName)}
       >
         {children}
       </div>

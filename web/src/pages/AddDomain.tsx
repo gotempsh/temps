@@ -269,7 +269,7 @@ export function AddDomain() {
             <Form {...form}>
               <form
                 onSubmit={form.handleSubmit(handleSubmit)}
-                className="space-y-6 rounded-lg border bg-card p-4 sm:p-6"
+                className="space-y-6"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && step !== 'confirm') {
                     e.preventDefault()
