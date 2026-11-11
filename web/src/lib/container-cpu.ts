@@ -20,13 +20,16 @@ export const CONTAINER_CPU_UTILIZATION_METRIC =
  *  scrape where the limit is known, so removing a cap shows up as 0 rather
  *  than the last capped value lingering in the latest-values window. */
 export const CONTAINER_CPU_LIMIT_METRIC = 'container.cpu_limit_cores'
+/** A cluster's busiest member's cores used × 100, recorded in the same tick as
+ *  that member's limit and share (the cluster's unlabelled
+ *  `cpu_limit_cores` / `cpu_utilization_percent`). Clusters only. */
+export const CONTAINER_CLUSTER_CPU_METRIC = 'container.cluster_cpu_percent'
 
 export const CONTAINER_CPU_TILE_LABEL = 'CPU (cores, last scrape)'
 
 export const CONTAINER_CPU_TILE_HINT =
   'Cores used, averaged since the previous health check (about every 30 seconds), ' +
-  "against the container's CPU limit (for a cluster with a limit, its busiest " +
-  'member). ' +
+  "against the container's CPU limit (for a cluster, its busiest member's). " +
   'The resources card samples one second ' +
   'every few seconds, so its reading moves more.'
 
@@ -68,28 +71,21 @@ export function containerCpuAxisWidth(name: string): number | undefined {
  * The CPU tile's text, e.g. "0.68 / 6 cores", from the latest values.
  *
  * A single container reads its own `container.cpu_percent`, recorded every
- * health check, against its limit. A cluster's limit and share of limit are
- * its busiest member's, written together, while its latest
- * `container.cpu_percent` may be any member's: under a limit, a cluster's
- * cores come from that pair (share × limit), so usage and limit belong to one
- * container. Uncapped (or with no share yet), `container.cpu_percent` is read
- * as is.
- *
- * Only a cluster derives cores from the pair: a single container's share and
- * limit stop being recorded on a tick where its limit cannot be read, and
- * would then show older usage than `container.cpu_percent`.
+ * health check, against its limit. A cluster's limit is its busiest
+ * member's, while its latest `container.cpu_percent` may be any member's: a
+ * cluster reads that member's own cores (`container.cluster_cpu_percent`,
+ * written with the limit), so usage and limit belong to one container,
+ * capped or not. Until the first such reading after an upgrade it falls back
+ * to `container.cpu_percent`.
  */
 export function containerCpuTileText(
   lookup: (metric: string) => number | undefined,
   cluster: boolean
 ): string {
-  const limit = lookup(CONTAINER_CPU_LIMIT_METRIC)
-  const share = lookup(CONTAINER_CPU_UTILIZATION_METRIC)
   const cpuPercent =
-    cluster && limit != null && limit > 0 && share != null
-      ? share * limit
-      : lookup(CONTAINER_CPU_METRIC)
-  return formatCpuUsage(cpuPercent, limit)
+    (cluster ? lookup(CONTAINER_CLUSTER_CPU_METRIC) : undefined) ??
+    lookup(CONTAINER_CPU_METRIC)
+  return formatCpuUsage(cpuPercent, lookup(CONTAINER_CPU_LIMIT_METRIC))
 }
 
 /**

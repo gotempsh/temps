@@ -77,10 +77,12 @@ test('a new alert rule defaults to CPU as a share of the limit, not cores × 100
   expect(metric.textContent).toBe('CPU (% of limit or host)')
 })
 
-// One member's latest usage (0.20 cores) beside the busiest member's limit and
-// share (75% of 2 cores), as the health monitor records a cluster.
+// One member's latest usage (0.20 cores) beside the busiest member's own
+// reading, limit and share (1.5 of 2 cores, 75%), as the health monitor
+// records a cluster.
 const CLUSTER_LATEST = {
   'container.cpu_percent': 20,
+  'container.cluster_cpu_percent': 150,
   'container.cpu_limit_cores': 2,
   'container.cpu_utilization_percent': 75,
 }

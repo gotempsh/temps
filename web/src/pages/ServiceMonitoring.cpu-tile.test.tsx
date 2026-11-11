@@ -50,9 +50,9 @@ describe('container CPU tiles on the monitoring dashboard', () => {
   })
 })
 
-// The latest cpu_percent is one member's (0.20 cores); the limit and share are
-// the busiest member's, 75% of 2 cores, as the health monitor records a
-// cluster. A single container has no such pair to prefer.
+// The latest cpu_percent is one member's (0.20 cores); the cluster reading,
+// limit and share are the busiest member's, 1.5 of 2 cores, as the health
+// monitor records a cluster. A single container has no cluster reading.
 function renderDashboard(topology: 'standalone' | 'cluster') {
   mockApi({
     'GET /external-services/3': () =>
@@ -63,6 +63,7 @@ function renderDashboard(topology: 'standalone' | 'cluster') {
     'GET /external-services/3/metrics/latest': () =>
       jsonResponse({
         'container.cpu_percent': 20,
+        'container.cluster_cpu_percent': 150,
         'container.cpu_limit_cores': 2,
         'container.cpu_utilization_percent': 75,
       }),

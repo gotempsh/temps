@@ -1155,17 +1155,19 @@ fn samples_container_metrics(service: &external_services::Model) -> bool {
 /// The names and meanings match what deployment containers record.
 ///
 /// A service with more than one container (a cluster) also gets an
-/// unlabelled `cpu_limit_cores` and `cpu_utilization_percent`: its busiest
-/// container's reading; see `busiest_member`. The store reads the series
-/// with the fewest label keys for latest values and charts, so that pair is
-/// what tiles, charts and alerts see, and the tile reads cores from it.
-/// Without it, the latest usage and limit could each come from a different
-/// member and pair into a reading that belongs to no container.
+/// unlabelled `cpu_limit_cores` and `cpu_utilization_percent`, and
+/// `container.cluster_cpu_percent` (cores used × 100): its busiest
+/// container's reading, all three from one tick; see `busiest_member`. The
+/// store reads the series with the fewest label keys for latest values and
+/// charts, so that set is what tiles, charts and alerts see. Without it, the
+/// latest usage and limit could each come from a different member and pair
+/// into a reading that belongs to no container.
 ///
-/// `container.cpu_percent` gets no unlabelled series: it is the one CPU
-/// metric with history from before these were recorded, all of it labelled,
-/// and a chart follows the fewest-label series, so an unlabelled one would
-/// hide that history until it ages out.
+/// The busiest member's cores go under their own name rather than an
+/// unlabelled `container.cpu_percent`: that is the one CPU metric with
+/// history from before these were recorded, all of it labelled, and a chart
+/// follows the fewest-label series, so an unlabelled one would hide that
+/// history until it ages out.
 fn container_metric_points(
     service: &external_services::Model,
     members: &[PolledContainerStats],
@@ -1223,6 +1225,10 @@ fn container_metric_points(
             node_id: service.node_id,
             labels: HashMap::new(),
         };
+        points.push(make_point(
+            "container.cluster_cpu_percent",
+            busiest.cpu_percent,
+        ));
         points.push(make_point("container.cpu_limit_cores", busiest.limit_cores));
         points.push(make_point(
             "container.cpu_utilization_percent",
@@ -1237,6 +1243,8 @@ fn container_metric_points(
 /// from one tick.
 #[derive(Debug, PartialEq)]
 struct BusiestMemberCpu {
+    /// Cores used × 100 by that container.
+    cpu_percent: f64,
     /// Its CPU limit in cores; 0 when uncapped.
     limit_cores: f64,
     /// Its share of the cores it may use.
@@ -1267,6 +1275,7 @@ fn busiest_member(members: &[PolledContainerStats]) -> Option<BusiestMemberCpu> 
         .iter()
         .filter_map(|member| {
             Some(BusiestMemberCpu {
+                cpu_percent: member.sample.cpu_percent?,
                 limit_cores: member.cpu_limit?.cores().unwrap_or(0.0),
                 utilization_percent: member.cpu_utilization_percent()?,
             })
@@ -1456,6 +1465,10 @@ mod tests {
 
         // member-0: 1.5 of its 2 cores (75%), busier than 0.3 of 4 (7.5%).
         assert_eq!(
+            unlabelled_value(&points, "container.cluster_cpu_percent"),
+            Some(150.0)
+        );
+        assert_eq!(
             unlabelled_value(&points, "container.cpu_limit_cores"),
             Some(2.0)
         );
@@ -1538,6 +1551,29 @@ mod tests {
         assert_eq!(busiest.utilization_percent, 10.0);
     }
 
+    /// An uncapped busiest member still has its own cores recorded for the
+    /// service, so the tile shows them rather than any member's usage beside
+    /// a zero limit.
+    #[test]
+    fn an_uncapped_busiest_member_records_its_own_cores() {
+        let points = container_metric_points(
+            &running_service(),
+            &[
+                member("member-0", Some(50.0), Some(CpuLimit::Cores(2.0))),
+                member("member-1", Some(800.0), Some(CpuLimit::Unlimited)),
+            ],
+            Utc::now(),
+        );
+        assert_eq!(
+            unlabelled_value(&points, "container.cluster_cpu_percent"),
+            Some(800.0)
+        );
+        assert_eq!(
+            unlabelled_value(&points, "container.cpu_limit_cores"),
+            Some(0.0)
+        );
+    }
+
     #[test]
     fn an_uncapped_busiest_member_reads_a_zero_limit() {
         let busiest = busiest_member(&[
@@ -1546,6 +1582,7 @@ mod tests {
         ])
         .expect("both members reported");
         // member-1: 8 cores of the host's 16 (50%), busier than 0.5 of 2 (25%).
+        assert_eq!(busiest.cpu_percent, 800.0);
         assert_eq!(busiest.limit_cores, 0.0);
         assert_eq!(busiest.utilization_percent, 50.0);
     }

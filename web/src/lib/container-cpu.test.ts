@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  CONTAINER_CLUSTER_CPU_METRIC,
   CONTAINER_CPU_LIMIT_METRIC,
   CONTAINER_CPU_METRIC,
   CONTAINER_CPU_METRIC_LABELS,
@@ -47,17 +48,41 @@ describe('containerCpuTileText', () => {
   })
 
   test("a cluster's tile pairs its busiest member's usage with that member's limit", () => {
-    // The latest cpu_percent is some member's (0.20 cores); the limit and
-    // share are the busiest member's: 75% of 2 cores.
+    // The latest cpu_percent is some member's (0.20 cores); the cluster
+    // reading and limit are the busiest member's: 1.5 of 2 cores.
     const text = containerCpuTileText(
       lookupOf({
         [CONTAINER_CPU_METRIC]: 20,
+        [CONTAINER_CLUSTER_CPU_METRIC]: 150,
         [CONTAINER_CPU_LIMIT_METRIC]: 2,
         [CONTAINER_CPU_UTILIZATION_METRIC]: 75,
       }),
       true
     )
     expect(text).toBe('1.50 / 2 cores')
+  })
+
+  test("an uncapped cluster's tile shows its busiest member's cores, not any member's", () => {
+    // The busiest member is uncapped (limit 0) and uses 8 cores; the latest
+    // cpu_percent is another member's 0.5 cores.
+    const text = containerCpuTileText(
+      lookupOf({
+        [CONTAINER_CPU_METRIC]: 50,
+        [CONTAINER_CLUSTER_CPU_METRIC]: 800,
+        [CONTAINER_CPU_LIMIT_METRIC]: 0,
+        [CONTAINER_CPU_UTILIZATION_METRIC]: 50,
+      }),
+      true
+    )
+    expect(text).toBe('8.00 cores')
+  })
+
+  test('a cluster without its reading yet (just upgraded) reads the recorded usage', () => {
+    const text = containerCpuTileText(
+      lookupOf({ [CONTAINER_CPU_METRIC]: 20, [CONTAINER_CPU_LIMIT_METRIC]: 2 }),
+      true
+    )
+    expect(text).toBe('0.20 / 2 cores')
   })
 
   test('a single container reads its own recorded usage, never an older share', () => {
