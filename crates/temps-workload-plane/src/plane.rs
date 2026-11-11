@@ -1363,8 +1363,11 @@ impl WorkloadPlane {
 
     /// Every workload of `owner` the plane still has, finished or being
     /// deleted included, oldest first: a finished job is kept until its
-    /// time-to-live. Bounded by the owner's rows; each view carries its
-    /// row's status, not its latest instance's ([`Self::get`] has that).
+    /// time-to-live. Each view is complete, as [`Self::get`] would return
+    /// it: its status (phase, conditions, exit code) from its row, its
+    /// attempt and finish time from its latest instance. Two queries
+    /// whatever the number of workloads: the owner's rows, then the latest
+    /// instances of all of them at once.
     pub async fn list_owned(&self, owner: &Owner) -> Result<Vec<WorkloadView>, PlaneError> {
         let rows = workloads::Entity::find()
             .filter(workloads::Column::OwnerKind.eq(owner.kind.as_str()))
@@ -1373,7 +1376,30 @@ impl WorkloadPlane {
             .all(self.db.as_ref())
             .await
             .map_err(PlaneError::db("listing the owner's workloads", owner))?;
-        rows.into_iter().map(|row| view_from(row, None)).collect()
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let instances = workload_instances::Entity::find()
+            .filter(workload_instances::Column::WorkloadId.is_in(rows.iter().map(|row| row.id)))
+            .order_by_asc(workload_instances::Column::WorkloadId)
+            .order_by_desc(workload_instances::Column::Attempt)
+            .all(self.db.as_ref())
+            .await
+            .map_err(PlaneError::db(
+                "listing the latest instances of the owner's workloads",
+                owner,
+            ))?;
+        // Ordered by attempt, newest first: the first seen is the latest.
+        let mut latest: HashMap<i64, workload_instances::Model> = HashMap::new();
+        for instance in instances {
+            latest.entry(instance.workload_id).or_insert(instance);
+        }
+        rows.into_iter()
+            .map(|row| {
+                let instance = latest.get(&row.id);
+                view_from(row, instance)
+            })
+            .collect()
     }
 
     /// The workload's events, newest first.
@@ -1779,6 +1805,17 @@ mod tests {
         let ids: Vec<i64> = owned.iter().map(|view| view.id).collect();
         assert_eq!(ids, vec![finished, live]);
         assert_eq!(owned[0].status.phase, WorkloadPhase::Succeeded);
+        // Each view is the one `get` returns, latest instance included,
+        // read in two queries rather than one per workload.
+        for view in &owned {
+            let one = plane.get(view.id).await.expect("read");
+            assert_eq!(view.status, one.status, "workload {}", view.id);
+            assert_eq!(view.attempt, one.attempt, "workload {}", view.id);
+            assert_eq!(view.finished_at, one.finished_at, "workload {}", view.id);
+        }
+        assert_eq!(owned[0].status.exit_code, Some(0));
+        assert_eq!(owned[0].attempt, 1);
+        assert!(owned[0].finished_at.is_some());
         let active: Vec<i64> = plane
             .list_active(&owner)
             .await

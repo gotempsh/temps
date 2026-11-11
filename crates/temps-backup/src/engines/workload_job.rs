@@ -855,23 +855,18 @@ impl RestoreJobLookup for WorkloadPlane {
     ) -> Result<Vec<RestoreJobRecord>, PlaneError> {
         let owner = Owner::new(DATABASE_OWNER_KIND, i64::from(service_id));
         let run = restore_run_id.to_string();
-        let mut jobs = Vec::new();
-        for view in self.list_owned(&owner).await? {
-            if view.spec.labels.get(RESTORE_RUN_LABEL) != Some(&run) {
-                continue;
-            }
-            // The latest instance's status carries the exit code.
-            let status = match self.get(view.id).await {
-                Ok(view) => view.status,
-                Err(PlaneError::NotFound { .. }) => continue,
-                Err(error) => return Err(error),
-            };
-            jobs.push(RestoreJobRecord {
+        // One listing carries each job's status, exit code included: no
+        // read per job.
+        Ok(self
+            .list_owned(&owner)
+            .await?
+            .into_iter()
+            .filter(|view| view.spec.labels.get(RESTORE_RUN_LABEL) == Some(&run))
+            .map(|view| RestoreJobRecord {
                 workload_id: view.id,
-                status,
-            });
-        }
-        Ok(jobs)
+                status: view.status,
+            })
+            .collect())
     }
 }
 

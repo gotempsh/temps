@@ -301,6 +301,28 @@ impl OutcomeHold for RunHold<'_> {
     }
 }
 
+/// Why `run` is held, when the previous process held it: its message,
+/// without the advice the hold adds.
+fn held_reason(run: &temps_entities::restore_runs::Model) -> Option<String> {
+    if run.phase != OUTCOME_UNKNOWN_PHASE {
+        return None;
+    }
+    let message = run.error_message.as_deref().unwrap_or_default();
+    let reason = message
+        .strip_suffix(HOLD_ADVICE)
+        .unwrap_or(message)
+        .trim()
+        .to_string();
+    Some(if reason.is_empty() {
+        format!(
+            "restore run {}: its outcome was unknown when Temps restarted.",
+            run.id
+        )
+    } else {
+        reason
+    })
+}
+
 /// The run's terminal outcome once an operator released it while its
 /// outcome was unknown for `reason`.
 fn released(run_id: i32, reason: &str) -> RestoreError {
@@ -403,6 +425,7 @@ impl WorkerRestoreRun<'_> {
                     OutcomeSource::node(self.engine, node_id),
                     run_id,
                     hold,
+                    None,
                     ask,
                 )
                 .await?
@@ -529,12 +552,19 @@ fn no_record(asking: Asking<'_>, source: OutcomeSource, run_id: i32) -> Result<S
 /// it may still be writing (a source that stays unreachable, an agent with
 /// no record of a restore it may have received) is held with `hold`, and
 /// asked for until it answers or an operator releases the run.
+///
+/// `held` is why the run is already held, when it is: a run the previous
+/// process held (phase [`OUTCOME_UNKNOWN_PHASE`]) starts held, so a report
+/// that the restore runs again lets go of that hold too. Whatever the
+/// source reports, every pass checks for the operator's release: one the
+/// API accepted is honoured, never left to wait for the restore's end.
 async fn await_outcome<Ask, AskFut, E>(
     wait: &OutcomeWait,
     asking: Asking<'_>,
     source: OutcomeSource,
     run_id: i32,
     hold: &dyn OutcomeHold,
+    held: Option<String>,
     mut ask: Ask,
 ) -> Result<WorkerRestoreResult, RestoreError>
 where
@@ -544,8 +574,10 @@ where
 {
     let OutcomeSource { label, node_id, .. } = source;
     let mut unreachable_since: Option<tokio::time::Instant> = None;
-    // Why the run is held, while it is.
-    let mut held: Option<String> = None;
+    // Why the run is held, while it is; and why it was last held, which a
+    // release accepted before the hold was let go of explains.
+    let mut held = held;
+    let mut last_held = held.clone();
     loop {
         match ask().await {
             Ok(WorkerRestoreProgress::Finished { outcome }) => {
@@ -588,6 +620,7 @@ where
                     Ok(reason) => {
                         if held.is_none() {
                             hold.hold(&reason).await;
+                            last_held = Some(reason.clone());
                             held = Some(reason);
                         }
                     }
@@ -638,20 +671,27 @@ where
                         wait.unreachable_for.as_secs()
                     );
                     hold.hold(&reason).await;
+                    last_held = Some(reason.clone());
                     held = Some(reason);
                 }
             }
         }
-        if let Some(reason) = &held {
-            if hold.released().await {
-                warn!(
-                    run_id,
-                    node_id,
-                    engine = label,
-                    "a held restore was released by an operator while its outcome was unknown"
-                );
-                return Err(released(run_id, reason));
-            }
+        // Every pass, whatever was reported: the API accepts a release only
+        // while the run is held, so one on record is the operator's.
+        if hold.released().await {
+            warn!(
+                run_id,
+                node_id,
+                engine = label,
+                "a held restore was released by an operator while its outcome was unknown"
+            );
+            let reason = last_held.unwrap_or_else(|| {
+                format!(
+                    "restore run {run_id}: the outcome of the {label} on node {node_id} was not \
+                     known when the release was accepted."
+                )
+            });
+            return Err(released(run_id, &reason));
         }
         tokio::time::sleep(wait.interval).await;
     }
@@ -780,6 +820,7 @@ impl ResumedWorkerRestore {
             source,
             run_id,
             hold,
+            held_reason(&self.run),
             ask,
         )
         .await?;
@@ -911,10 +952,12 @@ mod tests {
     };
 
     /// A hold that records what it is told, and reports the run released
-    /// once it was held when `release` says so.
+    /// once it was held when `release` says so, or at once when a release
+    /// was `accepted`.
     #[derive(Default)]
     struct RecordedHold {
         release: bool,
+        accepted: bool,
         events: std::sync::Mutex<Vec<String>>,
     }
 
@@ -942,13 +985,14 @@ mod tests {
         }
 
         async fn released(&self) -> bool {
-            self.release
-                && self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .last()
-                    .is_some_and(|event| event.starts_with("hold"))
+            self.accepted
+                || self.release
+                    && self
+                        .events
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .is_some_and(|event| event.starts_with("hold"))
         }
     }
 
@@ -964,9 +1008,63 @@ mod tests {
             OutcomeSource::node(PG, 2),
             41,
             hold,
+            None,
             answers,
         )
         .await
+    }
+
+    /// A release the API accepted is honoured on the next pass even while
+    /// the node reports the restore running: it is never left waiting for
+    /// the restore to end. A run held before the restart starts held, so the
+    /// running report lets go of that hold, and the release keeps its
+    /// reason.
+    #[tokio::test]
+    async fn a_release_accepted_while_the_node_reports_running_is_never_ignored() {
+        let running = || {
+            answers(vec![Ok(WorkerRestoreProgress::Running {
+                writes_began: true,
+            })])
+        };
+
+        let hold = RecordedHold {
+            accepted: true,
+            ..Default::default()
+        };
+        let error = await_unanswered(&hold, running())
+            .await
+            .expect_err("released");
+        assert!(
+            matches!(&error, RestoreError::Cancelled { phase, .. } if phase == OUTCOME_UNKNOWN_PHASE),
+            "{error:?}"
+        );
+        assert!(error
+            .to_string()
+            .contains("not known when the release was accepted"));
+        assert!(hold.events().is_empty(), "{:?}", hold.events());
+
+        let hold = RecordedHold {
+            accepted: true,
+            ..Default::default()
+        };
+        let error = await_outcome(
+            &FAST,
+            Asking::AfterRestart {
+                phase: OUTCOME_UNKNOWN_PHASE,
+            },
+            OutcomeSource::node(PG, 2),
+            41,
+            &hold,
+            Some("restore run 41: node 2 was unreachable.".to_string()),
+            running(),
+        )
+        .await
+        .expect_err("released");
+        assert_eq!(hold.events(), vec!["unhold".to_string()]);
+        assert!(
+            error.to_string().contains("node 2 was unreachable"),
+            "{error}"
+        );
     }
 
     /// The node's answers to the outcome asks, in order; the last repeats.
@@ -2242,6 +2340,95 @@ mod tests {
             .start_in_place()
             .await
             .expect("the service is free once released");
+    }
+
+    /// Temps restarts while a run is held. The API accepted a release (the
+    /// run's stored phase is cancellable); the node then reports the restore
+    /// running. The release is honoured on the first pass, and the service
+    /// is free; it is not left blocked until the restore ends.
+    #[tokio::test]
+    async fn a_release_accepted_before_a_restart_is_honoured_while_the_node_runs() {
+        let Some(fixture) = run_fixture("mongodb").await else {
+            return;
+        };
+        fixture.on_a_worker_node().await;
+        let run = fixture.start_in_place().await.expect("restore");
+        RunHold::new(fixture.db.as_ref(), run.id, "restore")
+            .hold("restore run: node 2 could not be asked for its outcome.")
+            .await;
+        let held = fixture.held(run.id).await;
+        release(&fixture, &held).await;
+
+        let resumed = fixture.found_at_startup(run.id).await;
+        let (_report, progress) =
+            tokio::sync::watch::channel(WorkerRestoreProgress::Running { writes_began: true });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.settle_resumed(resumed, origin("mongodb"), watched(progress)),
+        )
+        .await
+        .expect("the release is not ignored")
+        .unwrap();
+        let message = result.as_ref().expect_err("released").to_string();
+        assert!(message.starts_with("Released by an operator"), "{message}");
+        assert!(
+            message.contains("node 2 could not be asked for its outcome"),
+            "{message}"
+        );
+        fixture.settle(run.id, &result).await;
+        assert_eq!(fixture.run_status(run.id).await, "cancelled");
+        fixture
+            .start_in_place()
+            .await
+            .expect("the service is free once released");
+    }
+
+    /// Temps restarts while a run is held, and the node reports the restore
+    /// running: the run is let go of its hold (back to `restore`, its
+    /// message cleared, no longer releasable) and settles on the node's
+    /// outcome.
+    #[tokio::test]
+    async fn a_run_held_before_a_restart_is_let_go_when_its_node_runs_again() {
+        let Some(fixture) = run_fixture("mongodb").await else {
+            return;
+        };
+        fixture.on_a_worker_node().await;
+        let run = fixture.start_in_place().await.expect("restore");
+        RunHold::new(fixture.db.as_ref(), run.id, "restore")
+            .hold("restore run: node 2 could not be asked for its outcome.")
+            .await;
+        fixture.held(run.id).await;
+
+        let resumed = fixture.found_at_startup(run.id).await;
+        let (report, progress) =
+            tokio::sync::watch::channel(WorkerRestoreProgress::Running { writes_began: true });
+        let settling = fixture.settle_resumed(resumed, origin("mongodb"), watched(progress));
+        let mut unheld = None;
+        for _ in 0..200 {
+            let current = fixture.run(run.id).await;
+            if current.phase == "restore" {
+                unheld = Some(current);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let unheld = unheld.expect("the hold is let go");
+        assert_eq!(unheld.error_message, None);
+        assert!(
+            crate::services::restore_cancel::not_cancellable_reason(&unheld).is_some(),
+            "a running restore cannot be released"
+        );
+        fixture.assert_holds_the_service(run.id, "running").await;
+
+        report
+            .send(WorkerRestoreProgress::Finished {
+                outcome: WorkerRestoreResult::Completed,
+            })
+            .unwrap();
+        let result = settling.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        fixture.settle(run.id, &result).await;
+        assert_eq!(fixture.run_status(run.id).await, "completed");
     }
 
     /// A held live run whose node answers again is let go of its hold: back
