@@ -54781,7 +54781,7 @@ export type UpdateServiceTlsErrors = {
      */
     404: ProblemDetails;
     /**
-     * A major upgrade is in progress
+     * A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied
      */
     409: ProblemDetails;
     /**

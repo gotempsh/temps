@@ -44,11 +44,26 @@ const _: () = assert!(
     MEMBER_INSPECT_TIMEOUT.as_secs() > MEMBER_STATUS_DEADLINE_SECS + MEMBER_KILL_GRACE_SECS
 );
 
+/// A standalone service between being created and running: its creation or
+/// start may already have read the TLS mode, so a change recorded now could
+/// be missed until the next restart, and re-initializing it would race that
+/// start. A TLS change waits until it is running or stopped.
+fn standalone_mid_start(status: &str) -> bool {
+    matches!(status, "pending" | "creating" | "starting")
+}
+
 /// Put a standalone database back on its previous TLS mode after applying
 /// a new one failed: record the previous mode again, then run the service's
 /// initialisation again so the container serves it (and runs, if the failed
-/// attempt had stopped it). Returns what happened, for the error.
-async fn standalone_rollback<R, RE, F, Fut, FE>(record_previous: R, reapply: F) -> String
+/// attempt had stopped it). Not after the recreate guard's verdict
+/// (`reinitialize` false): re-initializing then would recreate over an
+/// original that may still be set aside, or start a replacement that failed
+/// verification. Returns what happened, for the error.
+async fn standalone_rollback<R, RE, F, Fut, FE>(
+    record_previous: R,
+    reinitialize: bool,
+    reapply: F,
+) -> String
 where
     R: std::future::Future<Output = Result<ServerTlsMode, RE>>,
     RE: std::fmt::Display,
@@ -62,6 +77,11 @@ where
              failed attempt left it; the TLS status shows what it serves"
         );
     }
+    if !reinitialize {
+        return "it is recorded, but the database was not re-initialized: the recreate guard \
+                stopped the change (below), and its container is left as the guard left it"
+            .to_string();
+    }
     match reapply().await {
         Ok(()) => "the database serves it again".to_string(),
         Err(error) => format!(
@@ -69,6 +89,42 @@ where
              the TLS status shows what it serves and its next start applies it"
         ),
     }
+}
+
+/// After a running standalone was re-initialized for a new TLS mode: the
+/// error to return when its container still does not serve that mode. Its
+/// start repairs configuration drift only when the recreate guard lets it;
+/// a guard that refuses, or rolls back to the original, leaves the original
+/// running unchanged, and the change must not be reported as done. The
+/// previous mode, which that container still serves, is recorded again.
+async fn standalone_not_applied<R, RE>(
+    service: &external_services::Model,
+    mode: ServerTlsMode,
+    previous: ServerTlsMode,
+    served: &ServiceTlsStatus,
+    record_previous: R,
+) -> Option<ServerTlsError>
+where
+    R: std::future::Future<Output = Result<ServerTlsMode, RE>>,
+    RE: std::fmt::Display,
+{
+    if !served.pending_restart() {
+        return None;
+    }
+    let rollback = match record_previous.await {
+        Ok(_) => "the previous mode is recorded again".to_string(),
+        Err(error) => format!(
+            "recording the previous mode again failed ({error}), so the TLS status shows the \
+             setting ahead of the container until its next start"
+        ),
+    };
+    Some(ServerTlsError::NotApplied {
+        service_id: service.id,
+        name: service.name.clone(),
+        mode,
+        previous,
+        rollback,
+    })
 }
 
 /// When a pass may treat a failed apply on a member as finished. A local
@@ -553,8 +609,21 @@ impl ExternalServiceManager {
         service_id: i32,
         trigger: &'static str,
     ) {
-        if self.converge_cluster_server_tls(service_id, trigger).await {
-            return;
+        // On a task of its own, like a mode change: a caller dropped
+        // mid-pass must not release the TLS lock while a data node's exec
+        // still runs.
+        let manager = self.clone();
+        let pass = tokio::spawn(async move {
+            manager
+                .converge_cluster_server_tls(service_id, trigger)
+                .await
+        });
+        match pass.await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(service_id, trigger, error = %error, "Cluster server TLS pass did not finish");
+            }
         }
         self.spawn_cluster_tls_follow_up(service_id, trigger);
     }
@@ -709,7 +778,28 @@ impl ExternalServiceManager {
     /// the mode; its next start applies it. If applying fails, the previous
     /// mode is restored so the record keeps describing what runs. Returns the
     /// previous mode and the resulting status.
+    ///
+    /// The change runs on a task of its own, which this future only awaits:
+    /// a request dropped mid-change (a client that hangs up) must neither
+    /// release the service's TLS lock while a data node's exec, which
+    /// Docker never kills, still runs, nor stop a standalone change between
+    /// its recreate and its rollback.
     pub async fn set_service_tls_mode(
+        &self,
+        service_id: i32,
+        mode: ServerTlsMode,
+    ) -> Result<(ServerTlsMode, ServiceTlsStatus), ServerTlsError> {
+        let manager = self.clone();
+        tokio::spawn(async move { manager.change_service_tls_mode(service_id, mode).await })
+            .await
+            .map_err(|error| ServerTlsError::ChangeAborted {
+                service_id,
+                mode,
+                reason: error.to_string(),
+            })?
+    }
+
+    async fn change_service_tls_mode(
         &self,
         service_id: i32,
         mode: ServerTlsMode,
@@ -743,6 +833,13 @@ impl ExternalServiceManager {
         if current.mode == mode && !current.pending_restart() {
             return Ok((mode, current));
         }
+        if service.topology != "cluster" && standalone_mid_start(&service.status) {
+            return Err(ServerTlsError::Busy {
+                service_id,
+                name: service.name.clone(),
+                status: service.status.clone(),
+            });
+        }
         let previous = tls.set_mode(service_id, mode).await?;
         if service.topology == "cluster" {
             if service.status == "running" {
@@ -765,9 +862,11 @@ impl ExternalServiceManager {
                 // The failure may come after the container was already
                 // replaced (a later status write), or after the original was
                 // stopped: put the database itself back, not only the row.
-                let rollback = standalone_rollback(tls.set_mode(service_id, previous), || {
-                    self.initialize_service(service_id)
-                })
+                let rollback = standalone_rollback(
+                    tls.set_mode(service_id, previous),
+                    !Self::is_recreate_guard_verdict(&error),
+                    || self.initialize_service(service_id),
+                )
                 .await;
                 warn!(service_id, previous = %previous, rollback = %rollback, "Server TLS mode rollback");
                 return Err(ServerTlsError::Apply {
@@ -778,6 +877,21 @@ impl ExternalServiceManager {
                     source: Box::new(error),
                 });
             }
+            let served = self.tls_status_for(&service, &parameters).await?;
+            if let Some(error) = standalone_not_applied(
+                &service,
+                mode,
+                previous,
+                &served,
+                tls.set_mode(service_id, previous),
+            )
+            .await
+            {
+                warn!(service_id, mode = %mode, previous = %previous, error = %error, "Server TLS mode not applied");
+                return Err(error);
+            }
+            info!(service_id, previous = %previous, mode = %mode, "Server TLS mode of external service changed");
+            return Ok((previous, served));
         }
         info!(
             service_id,
@@ -899,6 +1013,7 @@ mod tests {
         let reapplied = std::sync::atomic::AtomicBool::new(false);
         let outcome = standalone_rollback(
             async { Ok::<_, String>(ServerTlsMode::Available) },
+            true,
             || async {
                 reapplied.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, String>(())
@@ -910,6 +1025,7 @@ mod tests {
 
         let outcome = standalone_rollback(
             async { Ok::<_, String>(ServerTlsMode::Available) },
+            true,
             || async { Err::<(), _>("container 'postgres-orders' did not start".to_string()) },
         )
         .await;
@@ -921,6 +1037,7 @@ mod tests {
         let reapplied = std::sync::atomic::AtomicBool::new(false);
         let outcome = standalone_rollback(
             async { Err::<ServerTlsMode, _>("connection reset".to_string()) },
+            true,
             || async {
                 reapplied.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, String>(())
@@ -929,6 +1046,104 @@ mod tests {
         .await;
         assert!(!reapplied.load(std::sync::atomic::Ordering::SeqCst));
         assert!(outcome.contains("could not be recorded again (connection reset)"));
+
+        // After the recreate guard's verdict the database is never
+        // re-initialized, though the previous mode is recorded again.
+        let recorded = std::sync::atomic::AtomicBool::new(false);
+        let reapplied = std::sync::atomic::AtomicBool::new(false);
+        let outcome = standalone_rollback(
+            async {
+                recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(ServerTlsMode::Available)
+            },
+            false,
+            || async {
+                reapplied.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+        assert!(recorded.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!reapplied.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(outcome.contains("not re-initialized"));
+    }
+
+    /// A start that kept the original container (the recreate guard refused
+    /// or rolled back the drift repair) does not count as applying the mode.
+    #[tokio::test]
+    async fn a_standalone_change_the_guard_kept_out_is_not_reported_as_done() {
+        let service = service("postgres");
+        let on = ContainerTlsState::On {
+            fingerprint_sha256: Some("a".into()),
+        };
+
+        // The container serves the new mode: nothing recorded, no error.
+        let recorded = std::sync::atomic::AtomicBool::new(false);
+        let outcome = standalone_not_applied(
+            &service,
+            ServerTlsMode::Available,
+            ServerTlsMode::Off,
+            &status(ServerTlsMode::Available, on.clone(), Some("a")),
+            async {
+                recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(ServerTlsMode::Available)
+            },
+        )
+        .await;
+        assert!(outcome.is_none());
+        assert!(!recorded.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Still plaintext after the start: the previous mode is recorded
+        // again and the change fails with what the database still serves.
+        let outcome = standalone_not_applied(
+            &service,
+            ServerTlsMode::Available,
+            ServerTlsMode::Off,
+            &status(ServerTlsMode::Available, ContainerTlsState::Off, None),
+            async {
+                recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(ServerTlsMode::Available)
+            },
+        )
+        .await
+        .expect("an unapplied mode is an error");
+        assert!(recorded.load(std::sync::atomic::Ordering::SeqCst));
+        let message = outcome.to_string();
+        assert!(
+            matches!(
+                outcome,
+                ServerTlsError::NotApplied {
+                    service_id: 7,
+                    mode: ServerTlsMode::Available,
+                    previous: ServerTlsMode::Off,
+                    ..
+                }
+            ),
+            "{message}"
+        );
+        assert!(message.contains("still serves 'off'"), "{message}");
+        assert!(message.contains("recorded again"), "{message}");
+
+        let outcome = standalone_not_applied(
+            &service,
+            ServerTlsMode::Off,
+            ServerTlsMode::Available,
+            &status(ServerTlsMode::Off, on, Some("a")),
+            async { Err::<ServerTlsMode, _>("connection reset".to_string()) },
+        )
+        .await
+        .expect("an unapplied mode is an error");
+        assert!(outcome.to_string().contains("failed (connection reset)"));
+    }
+
+    #[test]
+    fn a_standalone_change_waits_for_a_start_in_progress() {
+        for status in ["pending", "creating", "starting"] {
+            assert!(standalone_mid_start(status), "{status}");
+        }
+        for status in ["running", "stopped", "failed"] {
+            assert!(!standalone_mid_start(status), "{status}");
+        }
     }
 
     #[test]
@@ -1002,6 +1217,66 @@ mod tests {
             change.await,
             Err(ServerTlsError::Service(_)) | Err(ServerTlsError::NotFound { .. })
         ));
+    }
+
+    /// A request dropped while its change waits for (or holds) the TLS
+    /// lock does not stop the change: it still runs to the end on its own
+    /// task, so the lock is never released mid-change.
+    #[tokio::test]
+    async fn a_dropped_request_does_not_stop_its_change() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let manager = ExternalServiceManager::new_with_handle(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "server-tls-detach-test",
+            )),
+            Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "server TLS detach test",
+            )),
+            true,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        );
+        let lock = manager.service_tls_locks.for_service(7).await;
+        let held = lock.lock().await;
+        {
+            let mut change = Box::pin(manager.set_service_tls_mode(7, ServerTlsMode::Off));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut change)
+                    .await
+                    .is_err(),
+                "the change waits for the lock"
+            );
+            // The request goes away while its change waits.
+        }
+        drop(held);
+        drop(lock);
+        drop(manager);
+        // The change's task holds the last other handles on the database
+        // until it has run; then the log shows it looked the service up.
+        let mut db = db;
+        let mut owned = None;
+        for _ in 0..100 {
+            match Arc::try_unwrap(db) {
+                Ok(connection) => {
+                    owned = Some(connection);
+                    break;
+                }
+                Err(shared) => {
+                    db = shared;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        let log = owned
+            .expect("the change's task finished")
+            .into_transaction_log();
+        assert!(
+            !log.is_empty(),
+            "the dropped request's change never ran: it was cancelled with the request"
+        );
     }
 
     #[test]

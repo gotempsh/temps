@@ -111,6 +111,13 @@ Either can be rotated without touching the other.
   the mode is load-bearing. No image code ever runs against the data to fix
   permissions. Files live outside PGDATA (`/var/lib/postgresql/tls/`), so base
   backups, restores and major upgrades never copy or replace them.
+- **A renewed pair never overwrites the one in use**: `tls` is a symlink to
+  one of two slots (`tls-a`, `tls-b`). An install writes the pair into the
+  slot the link does not name, and the link entry comes last in the tar, so the
+  switch is a single entry. An upload that fails or is cut off leaves the link
+  on the previous, complete pair, and the original container the recreate guard
+  restarts after a failed replacement finds a matching certificate and key. A
+  `tls` directory written before slots is replaced by the link the same way.
 - The material reaches the engine through `ServiceConfig.parameters`
   (`server_tls_mode`, `server_tls_material`) only on container lifecycle paths.
   Engines never serialize those keys back, the parameter strategy rejects them
@@ -210,12 +217,25 @@ one instance can be in different modes.
   path a parameter update takes (stop, init, start with drift repair). The
   container is recreated through the recreate guard, so **it restarts the
   database**. A running cluster's data nodes switch certificates in place with
-  no restart. A service that is not running (stopped, still being created or
-  starting) only records the mode; its initialization or next start applies
-  it, and re-initializing it meanwhile would race that. If applying fails, the previous mode is recorded again and re-applied to
-  what runs: a standalone service is re-initialized on it (the failure may come
-  after its container was already replaced, or after it was stopped), a cluster's
-  members that had switched switch back. The error says whether that succeeded.
+  no restart. A stopped service only records the mode; its next start applies
+  it. A standalone service still being created or starting refuses the change
+  (409) until it is running or stopped: its creation or start may already
+  have read the old mode, and re-initializing it would race that start. If
+  applying fails, the previous mode is recorded again and re-applied to what
+  runs: a standalone service is re-initialized on it (the failure may come
+  after its container was already replaced, or after it was stopped), a
+  cluster's members that had switched switch back. The error says whether that
+  succeeded. After the recreate guard's verdict (a refusal, or a rollback)
+  the standalone service is not re-initialized: that could recreate over an
+  original still set aside, or start a replacement that failed verification.
+- Start-time drift repair keeps the original container when the guard refuses
+  or rolls back, so a mode change checks what the restarted container serves:
+  if it is not the new mode, the previous one is recorded again and the change
+  fails (409) instead of reporting success.
+- A mode change, and each cluster pass a caller awaits, runs on a task of its
+  own. A request dropped mid-change does not release the service's TLS lock
+  while a data node's exec, which Docker never kills, still runs, and does not
+  stop a standalone change between its recreate and its rollback.
 - A cluster is converged on its setting at every point where the cluster code
   already converges authentication:
   - control-plane start, which also renews a certificate inside its renewal

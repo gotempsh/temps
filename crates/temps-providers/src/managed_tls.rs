@@ -87,6 +87,15 @@ pub enum ServerTlsError {
     )]
     NoAuthority { service_id: i32 },
     #[error(
+        "External service {service_id} ('{name}') is {status}: its TLS mode can be changed \
+         once it is running or stopped, so the change cannot race its start"
+    )]
+    Busy {
+        service_id: i32,
+        name: String,
+        status: String,
+    },
+    #[error(
         "Failed to apply server TLS mode '{mode}' to external service {service_id}; \
          restoring the previous mode '{previous}': {rollback}. The failure: {source}"
     )]
@@ -100,6 +109,20 @@ pub enum ServerTlsError {
         source: Box<ExternalServiceError>,
     },
     #[error(
+        "Server TLS mode '{mode}' was not applied to external service {service_id} \
+         ('{name}'): it restarted on its existing container, which the recreate guard \
+         kept in place to protect its data (the service's logs say why), so it still \
+         serves '{previous}'; {rollback}"
+    )]
+    NotApplied {
+        service_id: i32,
+        name: String,
+        mode: ServerTlsMode,
+        previous: ServerTlsMode,
+        /// Whether `previous` is recorded again.
+        rollback: String,
+    },
+    #[error(
         "Failed to apply server TLS mode '{mode}' to cluster service {service_id}; \
          the previous mode '{previous}' was restored: {failures}"
     )]
@@ -109,6 +132,15 @@ pub enum ServerTlsError {
         previous: ServerTlsMode,
         /// One `member: reason` entry per data node that did not converge.
         failures: String,
+    },
+    #[error(
+        "Changing the server TLS mode of external service {service_id} to '{mode}' did not \
+         finish: {reason}; the TLS status shows what it serves"
+    )]
+    ChangeAborted {
+        service_id: i32,
+        mode: ServerTlsMode,
+        reason: String,
     },
     #[error(transparent)]
     Service(#[from] ExternalServiceError),

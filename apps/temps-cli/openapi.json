@@ -110019,7 +110019,7 @@
                 }
               }
             },
-            "description": "A major upgrade is in progress"
+            "description": "A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied"
           },
           "500": {
             "content": {

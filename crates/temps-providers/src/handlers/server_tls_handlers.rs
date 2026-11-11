@@ -249,6 +249,14 @@ impl From<ServerTlsError> for Problem {
                 .detail(detail)
                 .value("service_id", service_id)
                 .build(),
+            ServerTlsError::Busy {
+                service_id, status, ..
+            } => ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Service Is Starting")
+                .detail(detail)
+                .value("service_id", service_id)
+                .value("status", status)
+                .build(),
             ServerTlsError::Apply {
                 service_id, source, ..
             } => {
@@ -258,10 +266,26 @@ impl From<ServerTlsError> for Problem {
                     });
                 problem.with_value("service_id", service_id)
             }
+            ServerTlsError::NotApplied {
+                service_id, mode, ..
+            } => ErrorBuilder::new(StatusCode::CONFLICT)
+                .title("Server TLS Not Applied")
+                .detail(detail)
+                .value("service_id", service_id)
+                .value("mode", mode.as_str())
+                .build(),
             ServerTlsError::ClusterApply {
                 service_id, mode, ..
             } => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Server TLS Not Applied To The Cluster")
+                .detail(detail)
+                .value("service_id", service_id)
+                .value("mode", mode.as_str())
+                .build(),
+            ServerTlsError::ChangeAborted {
+                service_id, mode, ..
+            } => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Server TLS Change Did Not Finish")
                 .detail(detail)
                 .value("service_id", service_id)
                 .value("mode", mode.as_str())
@@ -316,7 +340,7 @@ pub async fn get_service_tls(
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 404, description = "Service not found", body = temps_core::problemdetails::ProblemDetails),
-        (status = 409, description = "A major upgrade is in progress", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Applying the mode failed; the previous mode was kept", body = temps_core::problemdetails::ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -1074,6 +1098,14 @@ mod tests {
                 StatusCode::NOT_FOUND,
             ),
             (
+                ServerTlsError::Busy {
+                    service_id: 3,
+                    name: "orders".into(),
+                    status: "starting".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
                 ServerTlsError::Service(crate::services::ExternalServiceError::UpgradeInProgress {
                     id: 3,
                     upgrade_id: 1,
@@ -1082,11 +1114,29 @@ mod tests {
                 StatusCode::CONFLICT,
             ),
             (
+                ServerTlsError::NotApplied {
+                    service_id: 3,
+                    name: "orders".into(),
+                    mode: ServerTlsMode::Available,
+                    previous: ServerTlsMode::Off,
+                    rollback: "the previous mode is recorded again".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
                 ServerTlsError::ClusterApply {
                     service_id: 3,
                     mode: ServerTlsMode::Available,
                     previous: ServerTlsMode::Off,
                     failures: "postgres-orders-1: exit 5".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerTlsError::ChangeAborted {
+                    service_id: 3,
+                    mode: ServerTlsMode::Available,
+                    reason: "task 12 panicked".into(),
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),

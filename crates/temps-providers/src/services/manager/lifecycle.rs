@@ -87,21 +87,10 @@ impl ExternalServiceManager {
         }
 
         // Initialize the service
-        let inferred_params = service_instance.init(config).await.map_err(|e| match e {
-            EngineError::RecreateGuard(guard) if guard.is_refusal() => {
-                ExternalServiceError::DataSafetyRefusal {
-                    service_id,
-                    name: service.name.clone(),
-                    reason: guard.to_string(),
-                }
-            }
-            other => ExternalServiceError::from_engine(service_id, other, |reason| {
-                ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason,
-                }
-            }),
-        })?;
+        let inferred_params = service_instance
+            .init(config)
+            .await
+            .map_err(|e| Self::initialization_failure(service_id, &service.name, e, ""))?;
 
         // Store inferred parameters
         self.store_inferred_parameters(service_id, service_instance.as_ref(), inferred_params)
@@ -109,12 +98,12 @@ impl ExternalServiceManager {
 
         // Start the service (create and start container)
         service_instance.start().await.map_err(|error| {
-            ExternalServiceError::from_engine(service_id, error, |e| {
-                ExternalServiceError::InitializationFailed {
-                    id: service_id,
-                    reason: format!("Failed to start service: {}", e),
-                }
-            })
+            Self::initialization_failure(
+                service_id,
+                &service.name,
+                error,
+                "Failed to start service: ",
+            )
         })?;
 
         // `running`, or `starting` until the engine's readiness gate
@@ -599,6 +588,52 @@ impl ExternalServiceManager {
         }
     }
 
+    /// An engine failure while (re)initializing a service. The recreate
+    /// guard's verdict stays typed, so a caller can tell it apart and never
+    /// re-initialize over it ([`Self::guard_failure_for_start`]): a refusal
+    /// is [`ExternalServiceError::DataSafetyRefusal`], a failed replacement
+    /// an [`ExternalServiceError::Engine`] holding the guard's error.
+    fn initialization_failure(
+        service_id: i32,
+        name: &str,
+        error: EngineError,
+        prefix: &str,
+    ) -> ExternalServiceError {
+        match error {
+            EngineError::RecreateGuard(guard) if guard.is_refusal() => {
+                ExternalServiceError::DataSafetyRefusal {
+                    service_id,
+                    name: name.to_string(),
+                    reason: guard.to_string(),
+                }
+            }
+            guard @ EngineError::RecreateGuard(_) => ExternalServiceError::Engine {
+                service_id: Some(service_id),
+                source: Box::new(guard),
+            },
+            other => ExternalServiceError::from_engine(service_id, other, |reason| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("{prefix}{reason}"),
+                }
+            }),
+        }
+    }
+
+    /// Whether `error` is the recreate guard's verdict on a replacement:
+    /// re-initializing after it would stop whatever holds the container's
+    /// name and recreate it again, over an original that may still be set
+    /// aside or a replacement that failed verification.
+    pub(super) fn is_recreate_guard_verdict(error: &ExternalServiceError) -> bool {
+        match error {
+            ExternalServiceError::DataSafetyRefusal { .. } => true,
+            ExternalServiceError::Engine { source, .. } => {
+                matches!(source.as_ref(), EngineError::RecreateGuard(_))
+            }
+            _ => false,
+        }
+    }
+
     /// The error to return from a failed start when the failure came from
     /// the recreate guard, or `None` for any other failure (which may fall
     /// back to re-initialising the service). A guard error is never retried
@@ -752,6 +787,50 @@ mod tests {
             original_in_place: restored,
         }
         .into()
+    }
+
+    #[test]
+    fn an_initialization_keeps_the_guard_verdict_typed() {
+        for restored in [true, false] {
+            let error =
+                ExternalServiceManager::initialization_failure(7, "app", guard_error(restored), "");
+            assert!(
+                ExternalServiceManager::is_recreate_guard_verdict(&error),
+                "restored={restored}: {error:?}"
+            );
+            assert!(error.to_string().contains("postgres-app"), "{error}");
+        }
+        let refusal = ExternalServiceManager::initialization_failure(
+            7,
+            "app",
+            crate::externalsvc::recreate_guard::RecreateGuardError::DataInContainerLayer {
+                engine: crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
+                service: "app".into(),
+                container: "postgres-app".into(),
+                operation: "a test".into(),
+                data_dir: "/data".into(),
+            }
+            .into(),
+            "",
+        );
+        assert!(matches!(
+            refusal,
+            ExternalServiceError::DataSafetyRefusal { service_id: 7, .. }
+        ));
+        assert!(ExternalServiceManager::is_recreate_guard_verdict(&refusal));
+
+        let other = ExternalServiceManager::initialization_failure(
+            7,
+            "app",
+            EngineError::failed("app", "container exited"),
+            "Failed to start service: ",
+        );
+        assert!(!ExternalServiceManager::is_recreate_guard_verdict(&other));
+        assert!(matches!(
+            other,
+            ExternalServiceError::InitializationFailed { id: 7, ref reason }
+                if reason.starts_with("Failed to start service: ")
+        ));
     }
 
     #[test]
