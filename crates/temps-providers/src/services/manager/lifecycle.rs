@@ -11,10 +11,30 @@ use std::collections::HashMap;
 use temps_entities::external_services;
 use tracing::{info, warn};
 
+/// Proof that the caller holds the service's TLS lock
+/// ([`ExternalServiceManager::service_tls_locks`]).
+pub(super) type TlsLockHeld<'a> = tokio::sync::MutexGuard<'a, ()>;
+
 impl ExternalServiceManager {
+    /// (Re)create and start a service's container from its stored
+    /// configuration, holding the service's TLS lock: the TLS mode and
+    /// certificate it reads cannot change until the container serves them
+    /// (ADR 093).
     pub(super) async fn initialize_service(
         &self,
         service_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        let lock = self.service_tls_locks.for_service(service_id).await;
+        let held = lock.lock().await;
+        self.initialize_service_holding(service_id, &held).await
+    }
+
+    /// [`Self::initialize_service`] for a caller that already holds the
+    /// service's TLS lock (a TLS mode change, a start).
+    pub(super) async fn initialize_service_holding(
+        &self,
+        service_id: i32,
+        _held: &TlsLockHeld<'_>,
     ) -> Result<(), ExternalServiceError> {
         info!("Initializing service: {}", service_id);
         self.ensure_no_active_upgrade(service_id).await?;
@@ -326,12 +346,19 @@ impl ExternalServiceManager {
         &self,
         service_id: i32,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
+        // ADR 093: a standalone start reads the TLS mode and certificate it
+        // starts the container with; a mode change waits for it, and it
+        // waits for a mode change, so neither undoes the other.
+        let lock = self.service_tls_locks.for_service(service_id).await;
+        let held = lock.lock().await;
         self.ensure_no_active_upgrade(service_id).await?;
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
         // Never fall back to `initialize_service` here: that builds a
         // standalone container under the service's own name.
         if service.topology == "cluster" {
+            // A cluster's data nodes take the lock in their own TLS pass.
+            drop(held);
             self.run_cluster_lifecycle(service_id, ClusterLifecycleAction::Start)
                 .await?;
             return self.get_service_info(service_id).await;
@@ -363,7 +390,7 @@ impl ExternalServiceManager {
                         "Remote start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
                     );
-                    self.initialize_service(service_id)
+                    self.initialize_service_holding(service_id, &held)
                         .await
                         .map_err(|init_err| {
                             Self::start_fallback_failure(service_id, &e, init_err)
@@ -460,7 +487,7 @@ impl ExternalServiceManager {
                             "Container {} of service {} ({}) is missing; re-initializing it",
                             container, service_id, service.name
                         );
-                        self.initialize_service(service_id).await?;
+                        self.initialize_service_holding(service_id, &held).await?;
                         return self.get_service_info(service_id).await;
                     }
                     Err(e) => {
@@ -514,7 +541,7 @@ impl ExternalServiceManager {
                         "Direct start failed for service {} ({}), falling back to initialize: {}",
                         service_id, service.name, e
                     );
-                    self.initialize_service(service_id)
+                    self.initialize_service_holding(service_id, &held)
                         .await
                         .map_err(|init_err| {
                             Self::start_fallback_failure(service_id, &e, init_err)

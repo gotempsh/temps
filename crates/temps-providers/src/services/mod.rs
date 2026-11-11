@@ -116,8 +116,11 @@ pub struct ExternalServiceManager {
         >,
     >,
     /// One lock per service, held by a TLS mode change (through its
-    /// rollback) and by every pass that switches a cluster's data nodes
-    /// (ADR 093), so they never interleave and none acts on a stale setting.
+    /// rollback), by every pass that switches a cluster's data nodes, and by
+    /// a standalone service's initialization and start, which read the TLS
+    /// mode they create the container with (ADR 093), so they never
+    /// interleave and none acts on a stale setting. Taken before a
+    /// container's recreate lock, never after.
     service_tls_locks: Arc<manager::ServiceTlsLocks>,
     /// The control plane's cluster resolver address (ADR-024), published by
     /// the deployer's probe only while cluster DNS is enabled and the
