@@ -1,0 +1,97 @@
+export const metadata = {
+  title: 'Deploy From Local Files',
+  description:
+    'Deploy a folder, an HTML file or a ZIP archive to Temps without a Git account: where to start, the size limits, what is left out of the upload, and how to ship a new version.',
+  alternates: {
+    canonical: '/docs/deploy-from-local-files',
+  },
+}
+
+export const sections = [
+  { title: 'Where to start', id: 'where-to-start' },
+  { title: 'What you can drop', id: 'what-you-can-drop' },
+  { title: 'What is left out', id: 'what-is-left-out' },
+  { title: 'Review and deploy', id: 'review-and-deploy' },
+  { title: 'Static sites and other apps', id: 'static-and-other-apps' },
+  { title: 'Ship a new version', id: 'ship-a-new-version' },
+]
+
+# Deploy From Local Files
+
+You do not need a Git account or a repository to deploy on Temps. Drop a source folder, a single HTML file or a `.zip` archive into the console, review what Temps detected, and deploy. {{ className: 'lead' }}
+
+---
+
+## Where to start {{ anchor: true, id: 'where-to-start' }}
+
+The same flow is available in three places:
+
+- **First run.** On a fresh install the first screen offers **From local files**: "No Git account needed. Review the detected settings before deploying."
+- **New project.** Open **Projects** and click **New project**, then choose the **Drop files** tab.
+- **From the top bar.** The **Drop files to deploy** button in the console's top bar.
+
+<Note>
+  **Deploy a sample app in one click**, also on the first-run screen, is a different path: it runs a public sample image and does not use your files.
+</Note>
+
+---
+
+## What you can drop {{ anchor: true, id: 'what-you-can-drop' }}
+
+The drop zone, headed **Drag your app here**, accepts a source folder, one HTML file, or a `.zip` archive. Use **Choose folder** or **Choose file**, or drag them in. A folder is packaged in your browser before it is uploaded.
+
+| Limit | Value |
+|-------|-------|
+| An uploaded archive | 500 MB |
+| A folder | 100 MB of files that will be uploaded, counted after the [left-out files](#what-is-left-out) are removed. For anything larger, zip it first. |
+
+---
+
+## What is left out {{ anchor: true, id: 'what-is-left-out' }}
+
+A folder and a ZIP follow the same rules, so a project behaves the same whichever way it arrives.
+
+| Left out | Examples | Why |
+|----------|----------|-----|
+| Version control | `.git/` | History is not part of the build. |
+| Installed dependencies | `node_modules/` | The build installs its own. |
+| Environment files | `.env`, `.env.local`, `.env.production` | They may hold secrets. Set the variables in the environment's settings instead. Template files such as `.env.example`, `.env.sample`, `.env.template` and `.env.dist` are kept. |
+| Operating system metadata | `__MACOSX/`, `.DS_Store`, `Thumbs.db` | Written by the OS, not part of the project. |
+
+The console lists what it skipped under **Left out of the upload**, with the reason for each.
+
+Private keys and credentials are never uploaded. When you drop a **folder**, files such as `*.pem`, `*.key` and `credentials.json` are left out and listed. When a **ZIP** contains one, the whole archive is refused and the entry is named, because silently dropping a key could break the build in a way that is hard to trace back to it. Remove the file from the archive and drop it again.
+
+---
+
+## Review and deploy {{ anchor: true, id: 'review-and-deploy' }}
+
+Temps inspects the files and shows what it detected before anything is deployed: the app, its preset and its directory. If the folder holds several apps, choose the one to deploy. The deploy button names the detected app. If nothing was detected, it reads **Retry preset detection**.
+
+Name the service, then deploy. Temps takes you to the new deployment.
+
+---
+
+## Static sites and other apps {{ anchor: true, id: 'static-and-other-apps' }}
+
+What happens next depends on what was detected:
+
+| Detected | What Temps does | Service source |
+|----------|-----------------|----------------|
+| Plain static files (for example an `index.html` with no build step) | Uploads the files as a static bundle and serves them directly from the proxy, with no container at runtime. See [Static sites](/docs/static-sites). | **Static files** |
+| Anything else (a framework app, a `Dockerfile`, and so on) | Uploads the source and builds it on the server, then runs the result like any other deployment. | **Uploaded source** |
+
+See [Projects](/docs/projects#service-sources) for all the ways a service can get its code.
+
+---
+
+## Ship a new version {{ anchor: true, id: 'ship-a-new-version' }}
+
+Open the service and start a new deployment. For a service created from files, this opens **Upload new source** instead of the Git deploy dialog: drop the folder or ZIP again, choose the environment, and deploy. Only the build directory and the preset can change on this page. Ports, resource limits and environment variables stay as configured.
+
+**Redeploy** works differently depending on how the service was created:
+
+- A **static** drop can be redeployed from the bundle Temps stored.
+- An **uploaded source** deployment cannot be rebuilt by the console's **Redeploy**. The dialog says "Uploaded source archives cannot be redeployed without uploading the source again" and offers **Upload source again**. This also applies after you change an environment variable and want it to take effect now.
+
+Temps keeps the archive you uploaded on the server. It is used when Temps has to move a workload itself, such as when it drains or fails over a node in a [multi-node](/docs/multi-node) setup. If the archive is no longer on the server, a drain is refused and names the deployment, and you upload the source again.

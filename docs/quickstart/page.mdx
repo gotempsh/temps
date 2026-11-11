@@ -18,7 +18,7 @@ Deploy your first app in 60 seconds. No configuration files, no Docker Compose, 
 Before you begin, make sure you have:
 
 - **Docker** installed and running
-- **A Git repository to deploy** — hosted on GitHub, GitLab, Bitbucket Cloud, Gitea (or Forgejo/Codeberg), or any HTTPS-cloneable Git server
+- **Something to deploy** — either a Git repository (hosted on GitHub, GitLab, Bitbucket Cloud, Gitea (or Forgejo/Codeberg), or any HTTPS-cloneable Git server), or a folder, an HTML file or a ZIP archive of your app. No Git account? See [Deploy from local files](/docs/deploy-from-local-files).
 
 ---
 
@@ -94,6 +94,10 @@ Open [http://localhost:8080](http://localhost:8080) in your browser.
 2. Select your repository from the list
 3. Choose the branch to deploy (e.g., `main`)
 4. Click **Deploy**
+
+<Note>
+  **No Git account?** Create your admin account in Step 4 and skip connecting a Git provider. In Step 5, choose the **Drop files** tab on the **New project** page and drop a folder, an HTML file or a ZIP archive instead of selecting a repository. Temps detects the app and deploys it. See [Deploy from local files](/docs/deploy-from-local-files).
+</Note>
 
 That's it! Watch the build logs in real-time. Your app will be live in ~30-60 seconds with:
 

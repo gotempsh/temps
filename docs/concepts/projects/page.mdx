@@ -72,7 +72,8 @@ graph TD
 |------------|-------------|
 | **Git repository** | Temps clones the repo, detects the framework, builds a Docker image, and deploys it. Pushes to the tracked branch trigger automatic deploys. |
 | **Docker image** | You provide a registry image (or upload a tarball). Temps pulls and deploys it without building. |
-| **Static files** | You upload a zip or tar.gz of pre-built static files. Temps serves them directly. |
+| **Static files** | You upload a zip or tar.gz of pre-built static files, or drop a folder or HTML file with no build step. Temps serves them directly. |
+| **Uploaded source** | You drop a folder or ZIP of source, not Git and not pre-built. Temps builds it on the server. To ship a new version you upload the source again. See [Deploy from local files](/docs/deploy-from-local-files). |
 | **Template** | Temps creates the service (or several, in a project) from the template catalog. |
 | **External** | The app runs somewhere else (Vercel, Netlify, your own VPS). Temps never deploys it; it only receives its analytics, errors and traces. See [Track an app hosted elsewhere](/docs/track-an-app-hosted-elsewhere). |
 
