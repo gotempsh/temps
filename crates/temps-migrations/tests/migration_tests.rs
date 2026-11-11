@@ -7669,9 +7669,7 @@ async fn test_sandbox_service_access_migration_constraints_and_downgrade() -> an
 async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downgrade(
 ) -> anyhow::Result<()> {
     use sea_orm::{EntityTrait, FromQueryResult, QuerySelect};
-    use temps_entities::{
-        sandbox_access_delivery as delivery, sandbox_access_runtimes as runtimes,
-    };
+    use temps_entities::sandbox_access_delivery as delivery;
     // Project only this historical migration's columns, independently of
     // additive fields in the current entities.
     #[derive(FromQueryResult)]
@@ -7690,16 +7688,10 @@ async fn test_sandbox_access_delivery_survives_deletion_and_refuses_unsafe_downg
         completed_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
     }
     let runtime_rows = || {
-        runtimes::Entity::find()
-            .select_only()
-            .columns([
-                runtimes::Column::Id,
-                runtimes::Column::DesiredVersion,
-                runtimes::Column::AppliedVersion,
-                runtimes::Column::ClosedAt,
-                runtimes::Column::NodeId,
-            ])
-            .into_model::<Runtime>()
+        Runtime::find_by_statement(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id,desired_version,applied_version,closed_at,node_id FROM sandbox_access_runtimes",
+    ))
     };
     let delivery_rows = || {
         delivery::Entity::find()

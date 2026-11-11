@@ -51,20 +51,21 @@ impl PolicyPlanner {
         // role resolution (admin role, otherwise User), without a query per row.
         let grants = Candidate::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
             r#"SELECT r.id AS runtime_id,
-               CASE WHEN s.policy->'github_repository' IS NULL AND EXISTS (
-                   SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
-                   WHERE session.grant_ids @> ARRAY[g.id] AND link.sandbox_id=b.id
-                     AND link.revoked_at IS NULL AND session.revoked_at IS NULL
-               ) THEN NULL ELSE a.project_id END AS project_id, a.approved_by,
+               CASE WHEN direct.allowed THEN NULL ELSE a.project_id END AS project_id, a.approved_by,
                EXISTS(SELECT 1 FROM user_roles ur JOIN roles role ON role.id=ur.role_id
                       WHERE ur.user_id=a.approved_by AND role.name='admin') AS admin,
                g.id AS grant_id, g.service_id, g.service_version, g.policy_snapshot AS policy,
                s.max_ttl_seconds, g.expires_at, s.credential_encrypted
             FROM sandbox_access_authorizations a
-            JOIN sandbox_service_grants g ON g.id=a.grant_id AND g.project_id IS NOT DISTINCT FROM a.project_id AND g.sandbox_id=a.sandbox_id
+            JOIN sandbox_service_grants g ON g.id=a.grant_id AND g.sandbox_id=a.sandbox_id
             JOIN sandbox_access_services s ON s.id=g.service_id
-            JOIN sandbox_access_runtime_records r ON r.id=a.runtime_id AND r.project_id IS NOT DISTINCT FROM a.project_id AND r.sandbox_id=a.sandbox_id
-            JOIN sandboxes b ON b.id=r.sandbox_id AND b.project_id IS NOT DISTINCT FROM r.project_id
+            JOIN sandbox_access_runtime_records r ON r.id=a.runtime_id AND r.sandbox_id=a.sandbox_id
+            JOIN sandboxes b ON b.id=r.sandbox_id
+            CROSS JOIN LATERAL (SELECT (s.policy->'github_repository' IS NULL AND EXISTS (
+                   SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
+                   WHERE session.grant_ids @> ARRAY[g.id] AND link.sandbox_id=b.id
+                     AND link.revoked_at IS NULL AND session.revoked_at IS NULL
+               )) AS allowed OFFSET 0) direct
             LEFT JOIN projects p ON p.id=a.project_id
             JOIN users u ON u.id=a.approved_by
             LEFT JOIN git_provider_connections c ON to_jsonb(c.id)=s.policy->'github_repository'->'connection_id'
@@ -76,7 +77,11 @@ impl PolicyPlanner {
                   CASE WHEN b.agent_run_id IS NOT NULL THEN b.agent_run_id::text
                        WHEN left(b.public_id,4)='sbx_' THEN substring(b.public_id FROM 5)
                        ELSE b.public_id END
-              AND (a.project_id IS NULL OR (NOT p.is_deleted AND p.deleted_at IS NULL)) AND u.deleted_at IS NULL
+              AND (direct.allowed OR (g.project_id IS NOT DISTINCT FROM a.project_id
+                AND r.project_id IS NOT DISTINCT FROM a.project_id
+                AND b.project_id IS NOT DISTINCT FROM r.project_id
+                AND (a.project_id IS NULL OR (NOT p.is_deleted AND p.deleted_at IS NULL))))
+              AND u.deleted_at IS NULL
               AND (b.user_id=a.approved_by OR EXISTS(
                   SELECT 1 FROM user_roles ur JOIN roles role ON role.id=ur.role_id
                   WHERE ur.user_id=a.approved_by AND role.name='admin'))

@@ -24,7 +24,7 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
         vault_types::*,
     };
     use temps_service_access_runtime::{HostAudit, WorkerControl};
-    for mode in ["direct", "projectless", "legacy"] {
+    for mode in ["direct", "deleted_project", "projectless", "legacy"] {
         let mut test = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
@@ -159,6 +159,9 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
             ))
             .await
             .unwrap();
+        }
+        if mode == "deleted_project" {
+            db.execute_unprepared("DELETE FROM projects WHERE id=9703").await.unwrap();
         }
         let checker = Checker::new(0);
         checker.deny.store(mode != "legacy", Ordering::SeqCst);
