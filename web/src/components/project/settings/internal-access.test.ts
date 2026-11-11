@@ -9,6 +9,7 @@ import type {
 import {
   allowLabel,
   callerLabel,
+  clampGrantsPage,
   emptyGrantForm,
   exampleAddress,
   internalAccessDiagnostic,
@@ -132,4 +133,14 @@ test('the DNS test links to the owner when calls get 403', () => {
       'the selected project'
     )
   ).toBeNull()
+})
+
+test('a page past the end of the grants goes back to the last page that has any', () => {
+  expect(clampGrantsPage(2, 21, 20)).toBe(2)
+  // The only grant of page 2 was removed.
+  expect(clampGrantsPage(2, 20, 20)).toBe(1)
+  expect(clampGrantsPage(5, 41, 20)).toBe(3)
+  // No grants left: page 1, which says so.
+  expect(clampGrantsPage(3, 0, 20)).toBe(1)
+  expect(clampGrantsPage(0, 10, 20)).toBe(1)
 })

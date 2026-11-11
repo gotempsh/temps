@@ -55,6 +55,7 @@ import { useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import {
+  clampGrantsPage,
   GRANTS_PAGE_SIZE,
   INTERNAL_ACCESS_SECTION_ID,
   MAX_GRANT_DESCRIPTION_LENGTH,
@@ -204,6 +205,13 @@ export function InternalAccessCard({
     },
     onSuccess: (grant) => {
       setRemoving(null)
+      // Removing the only grant of the last page leaves `page` past the
+      // end, an empty page with no pager to leave it by: show the last page
+      // that still has grants.
+      const listed = grantsQuery.data
+      if (listed) {
+        setPage(clampGrantsPage(page, listed.total - 1, listed.page_size))
+      }
       invalidateGrants()
       toast.success(`${callerLabel(grant)} can no longer call ${projectName}`)
     },

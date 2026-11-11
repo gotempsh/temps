@@ -19,6 +19,21 @@ export const MAX_GRANT_DESCRIPTION_LENGTH = 200
 export const MAX_GRANTS_PER_PROJECT = 100
 export const GRANTS_PAGE_SIZE = 20
 
+/**
+ * The page of grants to show: `page`, or the last page that still has
+ * grants once the list shrank below it (a removal, here or elsewhere). A
+ * page past the end lists nothing and, with one page left, has no pager to
+ * leave it by.
+ */
+export function clampGrantsPage(
+  page: number,
+  total: number,
+  pageSize: number
+): number {
+  const lastPage = Math.max(1, Math.ceil(total / pageSize))
+  return Math.min(Math.max(1, page), lastPage)
+}
+
 /** The section other screens link to (the DNS test tool). */
 export const INTERNAL_ACCESS_SECTION_ID = 'internal-access'
 
