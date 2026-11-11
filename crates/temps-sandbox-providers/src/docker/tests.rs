@@ -1894,10 +1894,20 @@ fn only_current_preset_reference_can_be_materialized_locally() {
 }
 
 #[test]
-fn test_sandbox_channel_default_is_stable() {
-    // Whatever the developer's env happens to be, an unset / non-`beta`
-    // value must always resolve to stable. The matcher only treats the
-    // exact string "beta" as opt-in.
+fn unpinned_sandbox_images_default_to_the_published_beta_channel() {
+    // A source build has no release manifest, and the stable tag only exists
+    // once a release publishes it (a host may cache an older one). Only an
+    // explicit "stable" opts back into the canonical tag.
+    assert_eq!(SandboxChannel::from_setting(None), SandboxChannel::Beta);
+    assert_eq!(SandboxChannel::from_setting(Some("")), SandboxChannel::Beta);
+    assert_eq!(
+        SandboxChannel::from_setting(Some("beta")),
+        SandboxChannel::Beta
+    );
+    assert_eq!(
+        SandboxChannel::from_setting(Some("stable")),
+        SandboxChannel::Stable
+    );
     assert_eq!(SandboxChannel::Stable.tag_suffix(), "");
     assert_eq!(SandboxChannel::Beta.tag_suffix(), "-beta");
 }
