@@ -5,6 +5,27 @@ use super::*;
 use sea_orm::{sea_query::Expr, Condition, FromQueryResult};
 use temps_entities::access_vault_links as links;
 
+/// Parse a comma-separated consumer filter: at most 100 non-empty IDs.
+/// `None` when the parameter is absent, so "no filter" differs from an empty
+/// one, which is rejected instead of silently matching nothing.
+fn parse_consumer_ids<T: std::str::FromStr>(
+    field: &'static str,
+    raw: Option<&str>,
+) -> Result<Option<Vec<T>>, AccessError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let ids = raw
+        .split(',')
+        .map(|id| id.trim().parse::<T>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid(field, "use a comma-separated list of valid IDs"))?;
+    if ids.is_empty() || ids.len() > 100 {
+        return Err(invalid(field, "provide between 1 and 100 IDs"));
+    }
+    Ok(Some(ids))
+}
+
 impl ServiceAccessService {
     pub(super) async fn require_standalone_service<C: ConnectionTrait>(
         &self,
@@ -214,25 +235,59 @@ impl ServiceAccessService {
         vault_id: &str,
         query: AccessPageQuery,
     ) -> Result<crate::link_types::VaultLinkList, AccessError> {
+        self.list_vault_links_for(
+            vault_id,
+            crate::link_types::VaultLinkQuery {
+                page: query.page,
+                page_size: query.page_size,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Active links of a vault, newest first. With `project_ids` or
+    /// `sandbox_ids`, only links to those consumers: the total and the page
+    /// both follow the filter, so membership of a displayed consumer never
+    /// depends on which page of links it would fall on.
+    pub async fn list_vault_links_for(
+        &self,
+        vault_id: &str,
+        query: crate::link_types::VaultLinkQuery,
+    ) -> Result<crate::link_types::VaultLinkList, AccessError> {
+        let project_ids = parse_consumer_ids::<i32>("project_ids", query.project_ids.as_deref())?;
+        let sandbox_ids =
+            parse_consumer_ids::<String>("sandbox_ids", query.sandbox_ids.as_deref())?;
+        let filtered = project_ids.is_some() || sandbox_ids.is_some();
         self.vault(self.db.as_ref(), None, vault_id, false).await?;
-        let (page, page_size) = query.normalized();
-        let pages = links::Entity::find()
-            .filter(links::Column::VaultId.eq(vault_id))
-            .filter(links::Column::RevokedAt.is_null())
-            .order_by_desc(links::Column::CreatedAt)
-            .order_by_desc(links::Column::Id)
-            .paginate(self.db.as_ref(), page_size);
-        let total = pages
-            .num_items()
+        let (page, page_size) = AccessPageQuery {
+            page: query.page,
+            page_size: query.page_size,
+        }
+        .normalized();
+        let project_ids = project_ids.unwrap_or_default();
+        let sandbox_ids = sandbox_ids.unwrap_or_default();
+        let predicate = "l.vault_id=$1 AND l.revoked_at IS NULL AND (NOT $2::bool OR l.project_id=ANY($3::int[]) OR b.public_id=ANY($4::text[]))";
+        let total = self
+            .db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT COUNT(*)::bigint AS total FROM access_vault_links l LEFT JOIN sandboxes b ON b.id=l.sandbox_id WHERE {predicate}"),
+                [vault_id.into(), filtered.into(), project_ids.clone().into(), sandbox_ids.clone().into()],
+            ))
             .await
-            .map_err(|e| AccessError::resource_database("count vault links", vault_id, e))?;
+            .map_err(|e| AccessError::resource_database("count vault links", vault_id, e))?
+            .map(|row| row.try_get::<i64>("", "total"))
+            .transpose()
+            .map_err(|e| AccessError::resource_database("decode vault link count", vault_id, e))?
+            .unwrap_or(0);
         let items = crate::link_types::VaultLinkResponse::find_by_statement(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres,
-            "SELECT l.id,l.vault_id,l.project_id,b.public_id AS sandbox_id,l.created_at,l.revoked_at,COALESCE(p.name,b.name) AS consumer_name FROM access_vault_links l LEFT JOIN projects p ON p.id=l.project_id LEFT JOIN sandboxes b ON b.id=l.sandbox_id WHERE l.vault_id=$1 AND l.revoked_at IS NULL ORDER BY l.created_at DESC,l.id DESC LIMIT $2 OFFSET $3",
-            [vault_id.into(),(page_size as i64).into(),(((page-1)*page_size) as i64).into()])).all(self.db.as_ref()).await
+            format!("SELECT l.id,l.vault_id,l.project_id,b.public_id AS sandbox_id,l.created_at,l.revoked_at,COALESCE(p.name,b.name) AS consumer_name FROM access_vault_links l LEFT JOIN projects p ON p.id=l.project_id LEFT JOIN sandboxes b ON b.id=l.sandbox_id WHERE {predicate} ORDER BY l.created_at DESC,l.id DESC LIMIT $5 OFFSET $6"),
+            [vault_id.into(), filtered.into(), project_ids.into(), sandbox_ids.into(), (page_size as i64).into(), (((page-1)*page_size) as i64).into()])).all(self.db.as_ref()).await
             .map_err(|e| AccessError::resource_database("list named vault links", vault_id, e))?;
         Ok(crate::link_types::VaultLinkList {
             items,
-            total,
+            total: u64::try_from(total).unwrap_or(0),
             page,
             page_size,
         })
@@ -497,6 +552,68 @@ mod tests {
                 .id,
             project_link.id
         );
+        // Membership of displayed consumers is answered by the filter, not by
+        // which page of links a consumer falls on.
+        let links_for =
+            |projects: Option<&str>, sandboxes: Option<&str>, page_size: Option<u64>| {
+                service.list_vault_links_for(
+                    &vault.id,
+                    crate::link_types::VaultLinkQuery {
+                        page: None,
+                        page_size,
+                        project_ids: projects.map(str::to_owned),
+                        sandbox_ids: sandboxes.map(str::to_owned),
+                    },
+                )
+            };
+        let everything = links_for(None, None, None).await.unwrap();
+        assert_eq!(everything.total, 2);
+        let by_sandbox = links_for(None, Some("sbx_link_fixture"), None)
+            .await
+            .unwrap();
+        assert_eq!(by_sandbox.total, 1);
+        assert_eq!(by_sandbox.items[0].id, link.id);
+        let by_project = links_for(Some("9911"), None, None).await.unwrap();
+        assert_eq!(by_project.total, 1);
+        assert_eq!(by_project.items[0].id, project_link.id);
+        assert_eq!(
+            links_for(Some("9911"), Some("sbx_link_fixture"), None)
+                .await
+                .unwrap()
+                .total,
+            2
+        );
+        let none = links_for(Some("4242"), Some("sbx_missing"), None)
+            .await
+            .unwrap();
+        assert_eq!((none.total, none.items.len()), (0, 0));
+        let paged = links_for(Some("9911"), Some("sbx_link_fixture"), Some(1))
+            .await
+            .unwrap();
+        assert_eq!((paged.total, paged.items.len()), (2, 1));
+        for bad in ["", "abc", "9911,,"] {
+            assert!(
+                matches!(
+                    links_for(Some(bad), None, None).await,
+                    Err(AccessError::Validation {
+                        field: "project_ids",
+                        ..
+                    })
+                ),
+                "project_ids={bad:?} must be rejected"
+            );
+        }
+        let too_many = (1..=101)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(matches!(
+            links_for(Some(&too_many), None, None).await,
+            Err(AccessError::Validation {
+                field: "project_ids",
+                ..
+            })
+        ));
         assert!(service.link_vault(&vault.id, None, None).await.is_err());
         assert!(
             matches!(service.link_vault(&vault.id,None,Some(9999)).await,Err(AccessError::NotFound { id,.. }) if id=="9999")

@@ -61,12 +61,16 @@ export function VaultLinks({
     const lastPage = Math.max(1, Math.ceil(links.data.total / 20))
     if (page > lastPage) setPage(lastPage, true)
   }, [active, links.isSuccess, links.data?.total, page, setPage])
-  const refresh = () => {
-    void client.invalidateQueries({ queryKey: [{ _id: 'listVaultLinks' }] })
-    void client.invalidateQueries({
-      queryKey: [{ _id: 'listAccessSessionsGeneral' }],
-    })
-  }
+  // Returned so a mutation stays pending until the link queries, including
+  // each picker's membership check, have refreshed: a consumer that was just
+  // linked then reads "Linked" instead of offering the same action again.
+  const refresh = () =>
+    Promise.all([
+      client.invalidateQueries({ queryKey: [{ _id: 'listVaultLinks' }] }),
+      client.invalidateQueries({
+        queryKey: [{ _id: 'listAccessSessionsGeneral' }],
+      }),
+    ])
   const add = useMutation({
     mutationFn: (values: Consumer) =>
       createVaultLink({
@@ -159,16 +163,7 @@ export function VaultLinks({
                   active={active}
                   linkAction
                   pending={add.isPending}
-                  linkedIds={(links.data?.items ?? []).flatMap<string | number>(
-                    (link) =>
-                      value === 'project'
-                        ? link.project_id == null
-                          ? []
-                          : [link.project_id]
-                        : link.sandbox_id == null
-                          ? []
-                          : [link.sandbox_id]
-                  )}
+                  vaultId={vaultId}
                   page={readPage(`links_${value}_page`)}
                   onPageChange={(nextPage) =>
                     setSearch((current) => {

@@ -21,18 +21,18 @@ fn manager(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
     }
 }
 
-#[utoipa::path(get, path="/access-vaults/{vault_id}/links", tag="Vault", params(("vault_id"=String, Path), AccessPageQuery), responses((status=200,body=VaultLinkList),(status=401),(status=403),(status=404),(status=500)), security(("bearer_auth"=[])))]
+#[utoipa::path(get, path="/access-vaults/{vault_id}/links", tag="Vault", params(("vault_id"=String, Path), VaultLinkQuery), responses((status=200,body=VaultLinkList),(status=400),(status=401),(status=403),(status=404),(status=500)), security(("bearer_auth"=[])))]
 pub async fn list_vault_links(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AccessAppState>>,
     Path(vault_id): Path<String>,
-    Query(query): Query<AccessPageQuery>,
+    Query(query): Query<VaultLinkQuery>,
 ) -> Result<Json<VaultLinkList>, Problem> {
     deny_deployment_token!(auth);
     permission_guard!(auth, ProjectsRead);
     manager(&auth)?;
     Ok(Json(
-        state.service.list_vault_links(&vault_id, query).await?,
+        state.service.list_vault_links_for(&vault_id, query).await?,
     ))
 }
 #[utoipa::path(post, path="/access-vaults/{vault_id}/links", tag="Vault", params(("vault_id"=String, Path)), request_body=CreateVaultLink, responses((status=201,body=VaultLinkResponse),(status=400),(status=401),(status=403),(status=404),(status=409),(status=500)), security(("bearer_auth"=[])))]

@@ -1,13 +1,26 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateVaultLink {
     pub project_id: Option<i32>,
     pub sandbox_id: Option<String>,
+}
+/// Page and consumer filter for a vault's links.
+///
+/// `project_ids` and `sandbox_ids` are comma-separated lists of at most 100
+/// IDs each. When either is present, only links to those consumers are
+/// returned, so a client can ask whether the consumers it displays are linked
+/// without walking every page of links.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct VaultLinkQuery {
+    pub page: Option<u64>,
+    pub page_size: Option<u64>,
+    pub project_ids: Option<String>,
+    pub sandbox_ids: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct VaultLinkResponse {

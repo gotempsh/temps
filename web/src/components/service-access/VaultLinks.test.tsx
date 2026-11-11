@@ -599,3 +599,91 @@ test('inline consumer lists restore independent pages and preserve vault context
     api.restore()
   }
 })
+
+test('a linked consumer reads Linked even when its link is not on the visible links page', async () => {
+  const filters: string[] = []
+  const links = new Set<number>([7])
+  const api = mockApi({
+    'GET /access-vaults/vault_fixture/links': (request) => {
+      const params = new URL(request.url).searchParams
+      const wanted = params.get('project_ids')
+      const item = (id: number) => ({
+        id: `link_${id}`,
+        vault_id: 'vault_fixture',
+        project_id: id,
+        sandbox_id: null,
+        consumer_name: `Project ${id}`,
+        created_at: '2026-01-01T00:00:00Z',
+      })
+      if (wanted !== null) {
+        filters.push(wanted)
+        const items = wanted
+          .split(',')
+          .map(Number)
+          .filter((id) => links.has(id))
+          .map(item)
+        return jsonResponse({
+          items,
+          total: items.length,
+          page: 1,
+          page_size: 100,
+        })
+      }
+      // The visible page of 20 never contains projects 7 or 8.
+      return jsonResponse({
+        items: Array.from({ length: 20 }, (_, i) => item(100 + i)),
+        total: 22,
+        page: 1,
+        page_size: 20,
+      })
+    },
+    'GET /projects': () =>
+      jsonResponse({
+        projects: [
+          { id: 7, name: 'Already linked', source_type: 'external' },
+          { id: 8, name: 'Not yet linked', source_type: 'external' },
+        ],
+        total: 2,
+      }),
+    'GET /v1/sandboxes': () =>
+      jsonResponse({ sandboxes: [], pagination: { count: 0 } }),
+    'POST /access-vaults/vault_fixture/links': async (request) => {
+      const body = (await request.json()) as { project_id: number }
+      links.add(body.project_id)
+      return jsonResponse(
+        { id: `link_${body.project_id}`, vault_id: 'vault_fixture' },
+        201
+      )
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  try {
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter
+          initialEntries={['/vault/vaults/vault_fixture?tab=links']}
+        >
+          <VaultLinks vaultId="vault_fixture" />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    const linked = await ui.findByRole('button', {
+      name: 'Linked Already linked',
+    })
+    expect((linked as HTMLButtonElement).disabled).toBe(true)
+    expect(filters).toContain('7,8')
+    const link = await ui.findByRole('button', { name: 'Link Not yet linked' })
+    fireEvent.click(link)
+    // Once the membership check refreshes, the new link reads Linked too.
+    expect(
+      await ui.findByRole('button', { name: 'Linked Not yet linked' })
+    ).toBeTruthy()
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})

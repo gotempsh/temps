@@ -11,6 +11,7 @@ import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   getProjectsOptions,
   listSandboxesOptions,
+  listVaultLinksOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 
 export function VaultConsumerPicker({
@@ -22,13 +23,14 @@ export function VaultConsumerPicker({
   onPageChange,
   linkAction = false,
   pending = false,
-  linkedIds = [],
+  vaultId,
 }: {
   kind: 'project' | 'sandbox'
   active?: boolean
   linkAction?: boolean
   pending?: boolean
-  linkedIds?: (number | string)[]
+  /** With `linkAction`, the vault whose links decide which rows read "Linked". */
+  vaultId?: string
   page?: number
   onPageChange?: (page: number) => void
   selected?: number | string
@@ -56,6 +58,29 @@ export function VaultConsumerPicker({
       : sandboxes.data?.sandboxes.map((sandbox) => ({ ...sandbox, icon: null }))
   const total =
     kind === 'project' ? projects.data?.total : sandboxes.data?.pagination.count
+  // Whether a displayed consumer is linked is asked of the server for exactly
+  // the rows on screen. The vault's own links table is paged separately, so
+  // deriving it from that page marks a linked consumer as unlinked.
+  const displayedIds = (rows ?? []).map((row) => String(row.id)).join(',')
+  const membership = useQuery({
+    ...listVaultLinksOptions({
+      path: { vault_id: vaultId ?? '' },
+      query: {
+        page_size: 100,
+        ...(kind === 'project'
+          ? { project_ids: displayedIds }
+          : { sandbox_ids: displayedIds }),
+      },
+    }),
+    enabled: active && linkAction && !!vaultId && displayedIds !== '',
+  })
+  const linkedIds = (membership.data?.items ?? []).flatMap<string | number>(
+    (link) => {
+      const id = kind === 'project' ? link.project_id : link.sandbox_id
+      return id == null ? [] : [id]
+    }
+  )
+  const membershipPending = linkAction && !!vaultId && membership.isPending
   return (
     <div className="space-y-3">
       {query.isError ? (
@@ -123,7 +148,9 @@ export function VaultConsumerPicker({
                 type="button"
                 variant="outline"
                 size="sm"
-                disabled={pending || linkedIds.includes(row.id)}
+                disabled={
+                  pending || membershipPending || linkedIds.includes(row.id)
+                }
                 aria-label={`${linkedIds.includes(row.id) ? 'Linked' : 'Link'} ${row.name}`}
                 onClick={() => onSelect(row.id)}
               >
