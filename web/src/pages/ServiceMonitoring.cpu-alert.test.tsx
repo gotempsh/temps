@@ -61,5 +61,5 @@ test('a new alert rule defaults to CPU as a share of the limit, not cores × 100
 
   const dialog = await screen.findByRole('dialog')
   const [metric] = within(dialog).getAllByRole('combobox')
-  expect(metric.textContent).toBe('CPU (% of limit)')
+  expect(metric.textContent).toBe('CPU (% of limit or host)')
 })

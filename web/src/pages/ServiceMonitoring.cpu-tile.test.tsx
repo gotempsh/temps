@@ -36,7 +36,7 @@ describe('container CPU tiles on the monitoring dashboard', () => {
         selected={false}
       />
     )
-    expect(markup).toContain('CPU (% of limit)')
+    expect(markup).toContain('CPU (% of limit or host)')
     expect(markup).toContain('11.3%')
   })
 })

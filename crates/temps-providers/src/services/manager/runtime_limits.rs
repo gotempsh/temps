@@ -100,7 +100,10 @@ impl ExternalServiceManager {
                             .memory_swap
                             .filter(|&m| m > 0)
                             .map(|m| m / (1024 * 1024)),
-                        nano_cpus: hc.nano_cpus.filter(|&n| n > 0),
+                        // The effective cap: `NanoCpus`, or a quota set by
+                        // hand (`docker update --cpu-quota`), so this card
+                        // and the Monitoring tile read the same limit.
+                        nano_cpus: effective_nano_cpus(hc),
                         cpu_shares: hc.cpu_shares.filter(|&n| n > 0),
                         shm_size_mb: hc.shm_size.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
                     })
@@ -375,12 +378,21 @@ impl ExternalServiceManager {
                         // role, etc.) slots in cleanly.
                         let body = build_container_update_body(limits);
                         match docker.update_container(&container_name, body).await {
-                            Ok(()) => ResourceLimitApplyResult {
-                                role,
-                                container_name,
-                                outcome: if is_running { "applied" } else { "stopped" }.to_string(),
-                                error: None,
-                            },
+                            Ok(()) => {
+                                // The health monitor caches each container's
+                                // CPU limit: make it read this one on its next
+                                // tick. Done per member, before the next await,
+                                // so a caller dropped mid-loop cannot leave an
+                                // applied cap behind a stale cached one.
+                                self.note_cpu_limits_changed();
+                                ResourceLimitApplyResult {
+                                    role,
+                                    container_name,
+                                    outcome: if is_running { "applied" } else { "stopped" }
+                                        .to_string(),
+                                    error: None,
+                                }
+                            }
                             Err(e) => {
                                 // Most common failure: setting memory
                                 // below current usage (Docker rejects).
@@ -407,9 +419,6 @@ impl ExternalServiceManager {
             results.push(outcome);
         }
 
-        // The health monitor caches each container's CPU limit; make it read
-        // the one just applied on its next tick.
-        self.note_cpu_limits_changed();
         results
     }
 
@@ -813,6 +822,17 @@ async fn sample_container_stats_twice(
     let second = sample_container_stats_once(docker, name).await?;
 
     Some((first, second))
+}
+
+/// The CPU cap a container's `HostConfig` applies, in `NanoCpus` units
+/// (1e9 = one core): `NanoCpus` itself, else the `CpuQuota`/`CpuPeriod`
+/// equivalent. `None` when uncapped. Same reading as the health monitor's
+/// `CpuLimit::from_host_config`.
+fn effective_nano_cpus(host_config: &bollard::models::HostConfig) -> Option<i64> {
+    super::CpuLimit::from_host_config(host_config)
+        .cores()
+        .map(|cores| (cores * 1_000_000_000.0).round() as i64)
+        .filter(|&n| n > 0)
 }
 
 /// Take a single `one_shot` stats sample from a container. Returns `None`
@@ -1332,6 +1352,31 @@ mod tests {
             later.cpu_stats.as_ref(),
         );
         assert_eq!(sample.cpu_percent, None);
+    }
+
+    /// The runtime endpoint reports a quota-only cap as the resources card's
+    /// limit, so the card and the Monitoring tile agree on it.
+    #[test]
+    fn effective_nano_cpus_reads_nano_cpus_then_quota() {
+        let nano = bollard::models::HostConfig {
+            nano_cpus: Some(2_000_000_000),
+            ..Default::default()
+        };
+        assert_eq!(effective_nano_cpus(&nano), Some(2_000_000_000));
+
+        let quota_only = bollard::models::HostConfig {
+            nano_cpus: Some(0),
+            cpu_quota: Some(50_000),
+            cpu_period: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(effective_nano_cpus(&quota_only), Some(500_000_000));
+
+        let uncapped = bollard::models::HostConfig {
+            nano_cpus: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(effective_nano_cpus(&uncapped), None);
     }
 
     // ── End container stats helpers ──────────────────────────────────────────

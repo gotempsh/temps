@@ -81,7 +81,7 @@ describe('formatContainerCpuMetric', () => {
 test('labels name the unit of each CPU metric', () => {
   expect(CONTAINER_CPU_METRIC_LABELS[CONTAINER_CPU_METRIC]).toBe('CPU (cores)')
   expect(CONTAINER_CPU_METRIC_LABELS[CONTAINER_CPU_UTILIZATION_METRIC]).toBe(
-    'CPU (% of limit)'
+    'CPU (% of limit or host)'
   )
 })
 

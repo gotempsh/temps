@@ -1155,11 +1155,12 @@ fn samples_container_metrics(service: &external_services::Model) -> bool {
 /// The names and meanings match what deployment containers record.
 ///
 /// A service with more than one container (a cluster) also gets one
-/// unlabelled service-wide CPU set; see `service_cpu_total`. The store reads
-/// the series with the fewest label keys for latest values and charts, so
-/// that set is what tiles, charts and alerts see. Without it, the latest
-/// `cpu_percent` and `cpu_limit_cores` could each come from a different
-/// member and pair into a reading that belongs to no container.
+/// unlabelled CPU set: its busiest container's reading; see
+/// `busiest_member`. The store reads the series with the fewest label keys
+/// for latest values and charts, so that set is what tiles, charts and
+/// alerts see. Without it, the latest `cpu_percent` and `cpu_limit_cores`
+/// could each come from a different member and pair into a reading that
+/// belongs to no container.
 fn container_metric_points(
     service: &external_services::Model,
     members: &[PolledContainerStats],
@@ -1204,7 +1205,7 @@ fn container_metric_points(
         }
     }
 
-    if let Some(total) = service_cpu_total(members) {
+    if let Some(busiest) = busiest_member(members) {
         let make_point = |name: &str, value: f64| MetricPoint {
             time: now,
             source_kind: SourceKind::Database,
@@ -1217,61 +1218,60 @@ fn container_metric_points(
             node_id: service.node_id,
             labels: HashMap::new(),
         };
-        points.push(make_point("container.cpu_percent", total.cpu_percent));
-        points.push(make_point("container.cpu_limit_cores", total.limit_cores));
+        points.push(make_point("container.cpu_percent", busiest.cpu_percent));
+        points.push(make_point("container.cpu_limit_cores", busiest.limit_cores));
         points.push(make_point(
             "container.cpu_utilization_percent",
-            total.utilization_percent,
+            busiest.utilization_percent,
         ));
     }
 
     points
 }
 
-/// Service-wide CPU across a cluster's containers, from one tick.
+/// The service-level CPU reading of a cluster: one container's own values,
+/// from one tick.
 #[derive(Debug, PartialEq)]
-struct ServiceCpuTotal {
-    /// Cores used × 100, summed over the members.
+struct BusiestMemberCpu {
+    /// Cores used × 100 by that container.
     cpu_percent: f64,
-    /// Sum of the members' CPU limits in cores; 0 when any member is
-    /// uncapped, as the service then has no fixed ceiling.
+    /// Its CPU limit in cores; 0 when uncapped.
     limit_cores: f64,
-    /// The busiest member's share of the cores it may use. The highest, not
-    /// the service-wide ratio, so one saturated member (a primary taking all
-    /// writes) still crosses an alert threshold.
+    /// Its share of the cores it may use.
     utilization_percent: f64,
 }
 
-/// The service-wide CPU set for a service with more than one container.
-/// `None` for a single container (its own series already pair up), and on
-/// any tick where a member has no rate or no known limit yet. Writing a
-/// partial set would let an older total pair with a newer one in the latest
-/// values; skipping the tick keeps the previous complete set instead.
-fn service_cpu_total(members: &[PolledContainerStats]) -> Option<ServiceCpuTotal> {
+/// For a service with more than one container, the reading of the container
+/// using the largest share of the cores it may use, among the containers that
+/// reported a rate and a known limit this tick.
+///
+/// - One container's values, never a sum: usage and limit always pair up,
+///   and a threshold keeps its per-container meaning however many members
+///   the service has (a rule written against one container's
+///   `container.cpu_percent` reads the same unit).
+/// - The busiest, so one saturated member (a primary taking all writes)
+///   still crosses an alert threshold.
+/// - From whichever members reported: a stopped or unreadable member is left
+///   out rather than holding the whole reading back, so the set is written
+///   on every tick any member reports and never goes stale as "latest"
+///   while the service runs degraded.
+///
+/// `None` for a single container (its own series already pair up) and on a
+/// tick where no member reported both a rate and a limit.
+fn busiest_member(members: &[PolledContainerStats]) -> Option<BusiestMemberCpu> {
     if members.len() < 2 {
         return None;
     }
-    let mut total = ServiceCpuTotal {
-        cpu_percent: 0.0,
-        limit_cores: 0.0,
-        utilization_percent: 0.0,
-    };
-    let mut any_uncapped = false;
-    for member in members {
-        let cpu_percent = member.sample.cpu_percent?;
-        let limit = member.cpu_limit?;
-        let utilization = member.cpu_utilization_percent()?;
-        total.cpu_percent += cpu_percent;
-        match limit.cores() {
-            Some(cores) => total.limit_cores += cores,
-            None => any_uncapped = true,
-        }
-        total.utilization_percent = total.utilization_percent.max(utilization);
-    }
-    if any_uncapped {
-        total.limit_cores = 0.0;
-    }
-    Some(total)
+    members
+        .iter()
+        .filter_map(|member| {
+            Some(BusiestMemberCpu {
+                cpu_percent: member.sample.cpu_percent?,
+                limit_cores: member.cpu_limit?.cores().unwrap_or(0.0),
+                utilization_percent: member.cpu_utilization_percent()?,
+            })
+        })
+        .max_by(|a, b| a.utilization_percent.total_cmp(&b.utilization_percent))
 }
 
 fn lifecycle_probe(status: &str) -> LifecycleProbe {
@@ -1441,10 +1441,10 @@ mod tests {
     }
 
     /// A cluster whose members have different caps gets one unlabelled CPU
-    /// set from the same tick: the reading the store returns as "latest", so
-    /// the tile never pairs one member's usage with another member's cap.
+    /// set: the busiest member's own usage, limit and share, from one tick.
+    /// The tile never pairs one member's usage with another member's cap.
     #[test]
-    fn cluster_records_a_service_wide_cpu_set_from_one_tick() {
+    fn cluster_records_its_busiest_member_as_the_service_reading() {
         let points = container_metric_points(
             &running_service(),
             &[
@@ -1454,16 +1454,15 @@ mod tests {
             Utc::now(),
         );
 
-        // 1.5 + 0.3 cores used of 2 + 4.
+        // member-0: 1.5 of its 2 cores (75%), busier than 0.3 of 4 (7.5%).
         assert_eq!(
             unlabelled_value(&points, "container.cpu_percent"),
-            Some(180.0)
+            Some(150.0)
         );
         assert_eq!(
             unlabelled_value(&points, "container.cpu_limit_cores"),
-            Some(6.0)
+            Some(2.0)
         );
-        // The busiest member: 1.5 of its 2 cores.
         assert_eq!(
             unlabelled_value(&points, "container.cpu_utilization_percent"),
             Some(75.0)
@@ -1476,40 +1475,82 @@ mod tests {
         assert_eq!(labelled_cpu, 2);
     }
 
+    /// The service reading never sums members, so a threshold on
+    /// `container.cpu_percent` keeps one container's meaning: three members
+    /// at 0.5 cores read 50, not 150.
     #[test]
-    fn cluster_with_an_uncapped_member_has_no_service_limit() {
-        let total = service_cpu_total(&[
-            member("member-0", Some(50.0), Some(CpuLimit::Cores(2.0))),
-            member("member-1", Some(80.0), Some(CpuLimit::Unlimited)),
+    fn cluster_reading_does_not_grow_with_member_count() {
+        let capped = Some(CpuLimit::Cores(2.0));
+        let busiest = busiest_member(&[
+            member("member-0", Some(50.0), capped),
+            member("member-1", Some(50.0), capped),
+            member("member-2", Some(50.0), capped),
         ])
-        .expect("both members have a rate and a known limit");
-        assert_eq!(total.cpu_percent, 130.0);
-        assert_eq!(total.limit_cores, 0.0);
-        // member-1: 0.8 cores of the host's 16.
-        assert_eq!(total.utilization_percent, 25.0);
+        .expect("every member reported");
+        assert_eq!(busiest.cpu_percent, 50.0);
+        assert_eq!(busiest.limit_cores, 2.0);
     }
 
-    /// No total from an incomplete tick, so the previous complete set stays
-    /// the latest instead of a mix; none for a single container either.
+    /// A stopped or unreadable member is left out: the surviving members keep
+    /// the service reading current every tick, so an older reading never
+    /// stays "latest" while the cluster runs degraded, and a survivor
+    /// saturating after failover reaches the alert.
     #[test]
-    fn no_service_wide_cpu_set_from_an_incomplete_tick_or_one_container() {
+    fn a_down_member_does_not_freeze_the_service_reading() {
         let capped = Some(CpuLimit::Cores(2.0));
-        assert_eq!(
-            service_cpu_total(&[
-                member("member-0", Some(50.0), capped),
-                member("member-1", None, capped)
-            ]),
-            None
+        let points = container_metric_points(
+            &running_service(),
+            &[
+                member("member-0", Some(190.0), capped),
+                member("member-1", None, None),
+            ],
+            Utc::now(),
         );
         assert_eq!(
-            service_cpu_total(&[
-                member("member-0", Some(50.0), capped),
+            unlabelled_value(&points, "container.cpu_utilization_percent"),
+            Some(95.0)
+        );
+        assert_eq!(
+            unlabelled_value(&points, "container.cpu_percent"),
+            Some(190.0)
+        );
+
+        // A member with a rate but no known limit is left out too.
+        let busiest = busiest_member(&[
+            member("member-0", Some(20.0), capped),
+            member("member-1", Some(150.0), None),
+        ])
+        .expect("member-0 is complete");
+        assert_eq!(busiest.cpu_percent, 20.0);
+    }
+
+    #[test]
+    fn an_uncapped_busiest_member_reads_a_zero_limit() {
+        let busiest = busiest_member(&[
+            member("member-0", Some(50.0), Some(CpuLimit::Cores(2.0))),
+            member("member-1", Some(800.0), Some(CpuLimit::Unlimited)),
+        ])
+        .expect("both members reported");
+        // member-1: 8 cores of the host's 16 (50%), busier than 0.5 of 2 (25%).
+        assert_eq!(busiest.cpu_percent, 800.0);
+        assert_eq!(busiest.limit_cores, 0.0);
+        assert_eq!(busiest.utilization_percent, 50.0);
+    }
+
+    /// Nothing when no member reported a rate and a limit, and nothing for a
+    /// single container, whose own series already pair up.
+    #[test]
+    fn no_service_reading_without_a_complete_member_or_for_one_container() {
+        let capped = Some(CpuLimit::Cores(2.0));
+        assert_eq!(
+            busiest_member(&[
+                member("member-0", None, capped),
                 member("member-1", Some(20.0), None)
             ]),
             None
         );
         assert_eq!(
-            service_cpu_total(&[member("member-0", Some(50.0), capped)]),
+            busiest_member(&[member("member-0", Some(50.0), capped)]),
             None
         );
 

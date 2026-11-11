@@ -25,14 +25,15 @@ export const CONTAINER_CPU_TILE_LABEL = 'CPU (cores, last scrape)'
 
 export const CONTAINER_CPU_TILE_HINT =
   'Cores used, averaged since the previous health check (about every 30 seconds), ' +
-  "against the container's CPU limit (for a cluster, the total across its " +
-  'members). The resources card samples one second ' +
+  "against the container's CPU limit (for a cluster, its busiest member). " +
+  'The resources card samples one second ' +
   'every few seconds, so its reading moves more.'
 
 /** Chart and alert-picker labels for the container CPU metrics. */
 export const CONTAINER_CPU_METRIC_LABELS: Record<string, string> = {
   [CONTAINER_CPU_METRIC]: 'CPU (cores)',
-  [CONTAINER_CPU_UTILIZATION_METRIC]: 'CPU (% of limit)',
+  // Uncapped containers are measured against the host's cores, not a limit.
+  [CONTAINER_CPU_UTILIZATION_METRIC]: 'CPU (% of limit or host)',
   [CONTAINER_CPU_LIMIT_METRIC]: 'CPU limit',
 }
 

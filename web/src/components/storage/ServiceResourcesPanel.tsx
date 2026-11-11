@@ -90,6 +90,7 @@ export function ServiceResourcesPanel({
                     member={member}
                     stats={stats}
                     isLive={isLive && idx === 0}
+                    statsFresh={isLive}
                     onEditLimits={
                       idx === 0 ? () => setDialogOpen(true) : undefined
                     }
@@ -121,11 +122,14 @@ function MemberRow({
   member,
   stats,
   isLive,
+  statsFresh,
   onEditLimits,
 }: {
   member: ContainerRuntimeInfo
   stats: ContainerStatsSample | undefined
   isLive: boolean
+  /** The stats query succeeded and is not stale: readings are current. */
+  statsFresh: boolean
   onEditLimits?: () => void
 }) {
   const restartCount = member.restart_count ?? 0
@@ -151,7 +155,11 @@ function MemberRow({
         {/* Live meters — beside the identity when the panel has room for both,
             below it otherwise. */}
         <div className="grid flex-1 grid-cols-2 gap-3 sm:gap-6 @3xl:max-w-[420px] @3xl:flex-none @3xl:shrink-0 @3xl:basis-[420px]">
-          <CpuMeter sample={stats} limits={member.resource_limits} />
+          <CpuMeter
+            sample={stats}
+            limits={member.resource_limits}
+            fresh={statsFresh}
+          />
           <MemoryMeter sample={stats} limits={member.resource_limits} />
         </div>
 
@@ -267,9 +275,12 @@ function EditLimitsButton({ onClick }: { onClick: () => void }) {
 function CpuMeter({
   sample,
   limits,
+  fresh,
 }: {
   sample: ContainerStatsSample | undefined
   limits: ContainerRuntimeInfo['resource_limits']
+  /** Whether the stats query is current; "live" is shown only then. */
+  fresh: boolean
 }) {
   const hostCpuPercent = sample?.cpu_percent ?? null
   const onlineCpus = sample?.online_cpus ?? null
@@ -295,7 +306,10 @@ function CpuMeter({
     <Meter
       icon={<Cpu className="size-3.5" />}
       label="CPU"
-      hint="live"
+      // "live" only for a current reading: not for a missing sample, nor for
+      // the last value kept while the stats request fails or the tab is in
+      // the background.
+      hint={fresh && hostCpuPercent != null ? 'live' : undefined}
       title={CPU_METER_TITLE}
       value={
         hostCpuPercent != null ? formatCpuUsage(hostCpuPercent, capCores) : '—'

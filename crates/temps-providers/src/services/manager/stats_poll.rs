@@ -168,22 +168,53 @@ impl PolledContainerStats {
 /// The previous CPU counters usable as this tick's rate baseline: only those
 /// of the same container. A recreated container (new ID, same name) restarts
 /// its counters, and diffing against the old container's total yields no
-/// meaningful rate. A restart in place (same ID) shows up as a counter going
-/// backwards, which `cpu_percent_from_delta` rejects.
+/// meaningful rate. A restart in place, or a recreate whose stats carry no
+/// ID, shows up as a counter going backwards, which `cpu_percent_from_delta`
+/// rejects.
 fn cpu_baseline<'a>(
     previous: Option<&'a ContainerStatsBaseline>,
     current: &ContainerStatsResponse,
 ) -> Option<&'a ContainerCpuStats> {
     let previous = previous?;
-    if previous.container_id != current.id {
+    if is_other_container(previous, current) {
         return None;
     }
     previous.cpu_stats.as_ref()
 }
 
+/// Whether `current` is a different container from the one `previous` was
+/// taken from: a different ID when both responses carry one. Some Docker
+/// versions omit the ID from one-shot stats, and a missing ID alone is not
+/// proof of a new container, so then this is `false` and a counter reset
+/// (`cpu_counter_went_back`) is the signal instead.
+fn is_other_container(previous: &ContainerStatsBaseline, current: &ContainerStatsResponse) -> bool {
+    matches!(
+        (&previous.container_id, &current.id),
+        (Some(before), Some(now)) if before != now
+    )
+}
+
+/// Whether the container's cumulative CPU counter is lower than in
+/// `previous`: it restarted in place or was recreated under the same name.
+fn cpu_counter_went_back(
+    previous: &ContainerStatsBaseline,
+    current: &ContainerStatsResponse,
+) -> bool {
+    let total = |stats: Option<&ContainerCpuStats>| {
+        stats
+            .and_then(|s| s.cpu_usage.as_ref())
+            .and_then(|u| u.total_usage)
+    };
+    matches!(
+        (total(previous.cpu_stats.as_ref()), total(current.cpu_stats.as_ref())),
+        (Some(before), Some(now)) if now < before
+    )
+}
+
 /// The cached CPU limit while it is still current for this container: same
-/// container, no limit change applied through Temps since (`epoch`), and
-/// younger than `CPU_LIMIT_REFRESH`.
+/// container (same ID, and a counter that did not go back, which is how a
+/// recreate shows when the stats carry no ID), no limit change applied
+/// through Temps since (`epoch`), and younger than `CPU_LIMIT_REFRESH`.
 fn fresh_cpu_limit(
     previous: Option<&ContainerStatsBaseline>,
     current: &ContainerStatsResponse,
@@ -191,7 +222,7 @@ fn fresh_cpu_limit(
     epoch: u64,
 ) -> Option<CachedCpuLimit> {
     let previous = previous?;
-    if previous.container_id != current.id {
+    if is_other_container(previous, current) || cpu_counter_went_back(previous, current) {
         return None;
     }
     previous.cpu_limit.filter(|cached| {
@@ -226,22 +257,20 @@ fn poll_step(
     (polled, baseline)
 }
 
-/// Read the CPU limit Docker applies to `name` right now.
+/// Read the CPU limit Docker applies to `name` right now. `Ok(None)` when
+/// the inspect response carries no `HostConfig`: the cap is unknown, which
+/// is not the same as uncapped.
 async fn read_cpu_limit(
     docker: &bollard::Docker,
     name: &str,
-) -> Result<CpuLimit, bollard::errors::Error> {
+) -> Result<Option<CpuLimit>, bollard::errors::Error> {
     let info = docker
         .inspect_container(
             name,
             None::<bollard::query_parameters::InspectContainerOptions>,
         )
         .await?;
-    Ok(info
-        .host_config
-        .as_ref()
-        .map(CpuLimit::from_host_config)
-        .unwrap_or(CpuLimit::Unlimited))
+    Ok(info.host_config.as_ref().map(CpuLimit::from_host_config))
 }
 
 impl ExternalServiceManager {
@@ -309,11 +338,20 @@ impl ExternalServiceManager {
             let cpu_limit = match fresh_cpu_limit(previous, &current, now, epoch) {
                 Some(cached) => Some(cached),
                 None => match read_cpu_limit(docker, &name).await {
-                    Ok(limit) => Some(CachedCpuLimit {
+                    Ok(Some(limit)) => Some(CachedCpuLimit {
                         limit,
                         read_at: now,
                         epoch,
                     }),
+                    Ok(None) => {
+                        // Left unknown, so the next tick inspects again.
+                        debug!(
+                            service_id = service.id,
+                            container = %name,
+                            "Container inspect has no HostConfig; CPU limit left unknown"
+                        );
+                        None
+                    }
                     Err(e) => {
                         // Left unknown, so the next tick inspects again.
                         debug!(
@@ -525,6 +563,44 @@ mod tests {
     }
 
     /// The limit is reused within `CPU_LIMIT_REFRESH` and read again after.
+    /// Stats without a container ID still get a rate: a missing ID alone is
+    /// not taken as a new container.
+    #[test]
+    fn stats_without_an_id_still_get_a_rate() {
+        let mut first = one_shot_stats(CONTAINER_ID, LIFETIME_CPU_NS, LIFETIME_SYSTEM_NS);
+        first.id = None;
+        let mut second = one_shot_stats(
+            CONTAINER_ID,
+            LIFETIME_CPU_NS + 3 * SECOND_NS,
+            LIFETIME_SYSTEM_NS + 30 * SECOND_NS * HOST_CPUS as u64,
+        );
+        second.id = None;
+
+        let (_, baseline) = step(None, first, six_core_limit());
+        let (polled, _) = step(Some(&baseline), second, six_core_limit());
+        assert_eq!(polled.sample.cpu_percent, Some(10.0));
+    }
+
+    /// Recreated under the same name with no ID in the stats: the counter
+    /// starting over is the signal, so the old container's cached limit is
+    /// dropped and read again, and no rate is taken across it.
+    #[test]
+    fn a_recreate_without_ids_drops_the_cached_limit() {
+        let mut before = one_shot_stats(CONTAINER_ID, LIFETIME_CPU_NS, LIFETIME_SYSTEM_NS);
+        before.id = None;
+        let (_, baseline) = step(None, before, six_core_limit());
+        let mut recreated = one_shot_stats(
+            CONTAINER_ID,
+            2 * SECOND_NS,
+            LIFETIME_SYSTEM_NS + 30 * SECOND_NS * HOST_CPUS as u64,
+        );
+        recreated.id = None;
+
+        assert!(fresh_cpu_limit(Some(&baseline), &recreated, Instant::now(), 0).is_none());
+        let (polled, _) = step(Some(&baseline), recreated, six_core_limit());
+        assert_eq!(polled.sample.cpu_percent, None);
+    }
+
     fn baseline_with_limit(read_at: Instant, epoch: u64) -> ContainerStatsBaseline {
         ContainerStatsBaseline {
             container_id: Some(CONTAINER_ID.to_string()),

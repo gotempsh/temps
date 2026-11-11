@@ -12,7 +12,22 @@ import { ServiceResourcesPanel } from './ServiceResourcesPanel'
 installBrowserWindow()
 afterEach(cleanup)
 
-function renderPanel(nanoCpus: number | null, cpuPercent: number) {
+type StatsMode = 'ok' | 'member-missing' | 'fails'
+
+function renderPanel(
+  nanoCpus: number | null,
+  cpuPercent: number,
+  stats: StatsMode = 'ok'
+) {
+  const member = {
+    role: 'primary',
+    container_name: 'service-postgres',
+    cpu_percent: cpuPercent,
+    memory_usage_bytes: 8_870_000_000,
+    memory_limit_bytes: 34_359_738_368,
+    memory_percent: 25.8,
+    online_cpus: 16,
+  }
   mockApi({
     'GET /external-services/5/runtime': () =>
       jsonResponse({
@@ -41,21 +56,13 @@ function renderPanel(nanoCpus: number | null, cpuPercent: number) {
         ],
       }),
     'GET /external-services/5/stats': () =>
-      jsonResponse({
-        service_id: 5,
-        topology: 'standalone',
-        members: [
-          {
-            role: 'primary',
-            container_name: 'service-postgres',
-            cpu_percent: cpuPercent,
-            memory_usage_bytes: 8_870_000_000,
-            memory_limit_bytes: 34_359_738_368,
-            memory_percent: 25.8,
-            online_cpus: 16,
-          },
-        ],
-      }),
+      stats === 'fails'
+        ? jsonResponse({ title: 'Docker unavailable' }, 500)
+        : jsonResponse({
+            service_id: 5,
+            topology: 'standalone',
+            members: stats === 'ok' ? [member] : [],
+          }),
   })
   render(
     <QueryClientProvider
@@ -82,4 +89,21 @@ test('an uncapped container reads cores without a denominator', async () => {
   renderPanel(null, 89)
 
   expect(await screen.findByText('0.89 cores')).toBeTruthy()
+})
+
+test('a member missing from the stats response is not labelled live', async () => {
+  renderPanel(6_000_000_000, 14, 'member-missing')
+
+  await screen.findByText('service-postgres')
+  // Give the stats query time to settle before asserting the absence.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(screen.queryByText('live')).toBeNull()
+})
+
+test('a failed stats request is not labelled live', async () => {
+  renderPanel(6_000_000_000, 14, 'fails')
+
+  await screen.findByText('service-postgres')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(screen.queryByText('live')).toBeNull()
 })
