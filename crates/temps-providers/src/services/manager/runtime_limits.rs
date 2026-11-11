@@ -592,6 +592,10 @@ impl ExternalServiceManager {
                 ),
             }
         })?;
+        // The TLS lock before the container's: a TLS mode change takes them
+        // in that order, and the recreate reads the TLS mode (ADR 093).
+        let tls_lock = self.service_tls_locks.for_service(service.id).await;
+        let held = tls_lock.lock().await;
         let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
             crate::externalsvc::recreate_guard::RecreateRequest {
                 docker: docker.as_ref(),
@@ -601,7 +605,7 @@ impl ExternalServiceManager {
                 replacement,
                 operation: "applying a new /dev/shm size",
             },
-            || self.initialize_service(service.id),
+            || self.initialize_service_holding(service.id, &held),
         )
         .await
         .map_err(|e| {

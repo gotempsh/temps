@@ -31,6 +31,7 @@ import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
+import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
 import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
@@ -1316,6 +1317,15 @@ export function ServiceDetail() {
               serviceId={service.service.id}
               serviceName={service.service.name}
             />
+
+            {/* Server TLS for managed PostgreSQL (ADR-093) */}
+            {service.service.service_type === 'postgres' && (
+              <ServiceTlsCard
+                serviceId={service.service.id}
+                serviceName={service.service.name}
+                serviceStatus={service.service.status}
+              />
+            )}
 
             {/*
               How the database's container is built (ADR-055 workload plane)

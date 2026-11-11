@@ -41995,6 +41995,61 @@
         ],
         "type": "string"
       },
+      "ManagedCaCertificateResponse": {
+        "description": "The managed-services CA certificate, to add to a client's trust store.",
+        "properties": {
+          "certificate_pem": {
+            "description": "PEM-encoded CA certificate. Public material; the key never leaves\nthe control plane.",
+            "type": "string"
+          },
+          "file_name": {
+            "description": "Suggested file name for the download.",
+            "type": "string"
+          },
+          "fingerprint_sha256": {
+            "type": "string"
+          },
+          "not_after": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "certificate_pem",
+          "file_name",
+          "fingerprint_sha256",
+          "not_before",
+          "not_after"
+        ],
+        "type": "object"
+      },
+      "ManagedCaInfoResponse": {
+        "description": "The managed-services CA. Public facts only.",
+        "properties": {
+          "fingerprint_sha256": {
+            "description": "SHA-256 (lowercase hex) of the CA certificate's DER encoding: compare\nit with the downloaded file before trusting it.",
+            "type": "string"
+          },
+          "not_after": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fingerprint_sha256",
+          "not_before",
+          "not_after"
+        ],
+        "type": "object"
+      },
       "ManagedContainerNameSettings": {
         "description": "Response of the container-name settings endpoints.",
         "properties": {
@@ -63987,6 +64042,15 @@
         ],
         "type": "object"
       },
+      "ServerTlsMode": {
+        "description": "Server-side TLS mode of one managed service.",
+        "enum": [
+          "off",
+          "available",
+          "required"
+        ],
+        "type": "string"
+      },
       "ServiceAccessInfo": {
         "description": "Response containing information about how the service is being accessed",
         "properties": {
@@ -65155,6 +65219,166 @@
         "required": [
           "field",
           "kind"
+        ],
+        "type": "object"
+      },
+      "ServiceTlsCertificateResponse": {
+        "description": "The certificate currently issued for a service. Public facts only.",
+        "properties": {
+          "fingerprint_sha256": {
+            "description": "SHA-256 (lowercase hex) of the certificate's DER encoding.",
+            "type": "string"
+          },
+          "not_after": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_before": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "subject_alt_names": {
+            "description": "Names the certificate is valid for.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "fingerprint_sha256",
+          "subject_alt_names",
+          "not_before",
+          "not_after"
+        ],
+        "type": "object"
+      },
+      "ServiceTlsMemberResponse": {
+        "description": "What one data node of a cluster serves.",
+        "properties": {
+          "active": {
+            "description": "Whether it serves the managed certificate. `null` when it could not\nbe read (see `detail`).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "detail": {
+            "description": "Why its state is unknown, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending": {
+            "description": "Whether it lags the setting; the next start applies it.",
+            "type": "boolean"
+          },
+          "self_signed": {
+            "description": "Whether it still serves pg_auto_failover's self-signed certificate,\nwhich clients cannot verify.",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "The member's lifecycle status (`running`, `stopped`, ...).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_name",
+          "status",
+          "self_signed",
+          "pending"
+        ],
+        "type": "object"
+      },
+      "ServiceTlsStatusResponse": {
+        "description": "A service's effective server TLS status.",
+        "properties": {
+          "accepts_plaintext": {
+            "description": "Whether the server accepts unencrypted connections in this mode.",
+            "type": "boolean"
+          },
+          "active": {
+            "description": "Whether the managed certificate is served: by the container, or by\nevery data node of a cluster. `null` when it cannot be inspected (not\ncreated yet, no Docker daemon here, or cluster members disagree).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ca_certificate_path": {
+            "description": "Where to download the CA certificate, once it exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "certificate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceTlsCertificateResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "certificate_authority": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ManagedCaInfoResponse",
+                "description": "Absent until TLS is first enabled on any service."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "change_restarts_database": {
+            "description": "Whether changing the mode restarts the database. False for a\ncluster, whose data nodes switch certificates in place.",
+            "type": "boolean"
+          },
+          "members": {
+            "description": "A cluster's data nodes; empty for a standalone service.",
+            "items": {
+              "$ref": "#/components/schemas/ServiceTlsMemberResponse"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ServerTlsMode",
+            "description": "`off`, `available` (TLS offered, plaintext still accepted) or\n`required` (plaintext rejected; not yet supported)."
+          },
+          "pending_restart": {
+            "description": "What runs lags the setting; the next start (or a restart) applies it.",
+            "type": "boolean"
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "supported": {
+            "description": "Whether this service can use managed TLS at all.",
+            "type": "boolean"
+          },
+          "unsupported_reason": {
+            "description": "Why not, when `supported` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "service_id",
+          "mode",
+          "supported",
+          "accepts_plaintext",
+          "pending_restart",
+          "change_restarts_database",
+          "members"
         ],
         "type": "object"
       },
@@ -77409,6 +77633,33 @@
         "required": [
           "imageRef",
           "healthCheckPath"
+        ],
+        "type": "object"
+      },
+      "UpdateServiceTlsRequest": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/ServerTlsMode",
+            "description": "The new mode. `required` is rejected until it is supported."
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "UpdateServiceTlsResponse": {
+        "properties": {
+          "previous_mode": {
+            "$ref": "#/components/schemas/ServerTlsMode"
+          },
+          "tls": {
+            "$ref": "#/components/schemas/ServiceTlsStatusResponse"
+          }
+        },
+        "required": [
+          "previous_mode",
+          "tls"
         ],
         "type": "object"
       },
@@ -109604,6 +109855,265 @@
           }
         },
         "summary": "Stop an external service",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/tls": {
+      "get": {
+        "operationId": "get_service_tls",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceTlsStatusResponse"
+                }
+              }
+            },
+            "description": "Effective server TLS status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "operationId": "update_service_tls",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceTlsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdateServiceTlsResponse"
+                }
+              }
+            },
+            "description": "Mode changed and applied (a running database is restarted)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The service cannot use this mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A major upgrade is in progress, the service is still being created or starting, or the recreate guard kept its existing container so the mode was not applied"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Applying the mode failed; the previous mode was kept"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/tls/ca-certificate": {
+      "get": {
+        "operationId": "get_managed_ca_certificate",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedCaCertificateResponse"
+                }
+              }
+            },
+            "description": "The managed-services CA certificate (public)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found, or no CA exists yet"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "External Services"
         ]
