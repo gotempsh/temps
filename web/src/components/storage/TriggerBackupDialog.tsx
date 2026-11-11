@@ -4,7 +4,6 @@
 import {
   externalServiceBackupPreflightOptions,
   externalServiceBackupPreflightQueryKey,
-  listS3SourcesOptions,
   runExternalServiceBackupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -36,7 +35,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
+import { backupDestinationsOptions } from './backup-destinations-query'
 import { announceOperation } from '@/components/operations/operations-tray-store'
 import { AlertTriangle, HardDrive, Loader2, Star } from 'lucide-react'
 import { useEffect } from 'react'
@@ -85,12 +84,9 @@ export function TriggerBackupDialog({
   onSuccess,
 }: TriggerBackupDialogProps) {
   const destinationsQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     enabled: open,
     retry: shouldRetryDestinationRead,
-    // A refusal is expected and handled by the dialog (a neutral note); any
-    // other failure is still reported.
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
 
   // Loading, failed read, failed refresh over cached data, empty, or ready.
