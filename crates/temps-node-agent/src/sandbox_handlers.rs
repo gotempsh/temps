@@ -278,7 +278,9 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-        AgentError::SandboxConflictOnNode { .. } => StatusCode::CONFLICT,
+        AgentError::SandboxConflictOnNode { .. } | AgentError::ServiceAccessUnavailable { .. } => {
+            StatusCode::CONFLICT
+        }
         // Kept apart from 422 (not available on worker nodes): this backend
         // can never enforce the policy, wherever it runs.
         AgentError::SandboxEgressPolicyUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
