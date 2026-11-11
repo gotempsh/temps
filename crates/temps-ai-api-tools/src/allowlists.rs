@@ -39,6 +39,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "sandbox_access_vaults",
     "project_access_vaults",
     "general_access_capability",
+    // Static provider metadata only; no saved credentials or configuration.
+    "service_catalog",
     "list_access_services_general",
     "get_access_service_general",
     "list_access_vaults_general",
@@ -1529,6 +1531,7 @@ mod sandbox_service_tests {
     #[test]
     fn chat_can_discover_and_manage_scoped_sandbox_access() {
         for operation in [
+            "service_catalog",
             "list_access_services",
             "get_access_service",
             "list_sandbox_services",
