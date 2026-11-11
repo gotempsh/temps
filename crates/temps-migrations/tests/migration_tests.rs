@@ -8700,3 +8700,63 @@ async fn test_managed_service_tls_migration_up_and_down() -> anyhow::Result<()> 
     assert!(!table_exists(&db, "managed_service_certificate_authorities").await?);
     Ok(())
 }
+
+/// A restore run records, encrypted, the login its restored data answers to
+/// (`restored_login_encrypted`), so a worker restore resumed after a restart
+/// patches its target to that login. Existing runs read NULL; down drops it.
+#[tokio::test]
+async fn test_restore_runs_restored_login_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping restored login migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping restored login migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261111_000002_restore_runs_restored_login";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    async fn has_column(db: &DatabaseConnection) -> anyhow::Result<bool> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT 1 AS present FROM information_schema.columns WHERE table_name = \
+                 'restore_runs' AND column_name = 'restored_login_encrypted'"
+                    .to_string(),
+            ))
+            .await?
+            .is_some())
+    }
+    assert!(!has_column(&db).await?, "absent before the migration");
+
+    Migrator::up(&db, Some(1)).await?;
+    assert!(has_column(&db).await?, "added by the migration");
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert!(!has_column(&db).await?, "dropped by down");
+    Ok(())
+}

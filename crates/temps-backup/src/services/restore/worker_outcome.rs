@@ -883,11 +883,15 @@ impl super::super::restore_reconcile::WorkerRestoreResume for ManagerWorkerResto
             let hold = RunHold::new(db.as_ref(), run_id, &resumed.run.phase);
             let result = match &resumed.how {
                 Resume::Node { engine, backup } => {
-                    let origin = origin_credentials_to_reconcile(
-                        db.as_ref(),
-                        mgr.as_ref(),
-                        backup,
-                        &resumed.target,
+                    let origin = resumed_origin_credentials(
+                        enc.as_ref(),
+                        &resumed.run,
+                        origin_credentials_to_reconcile(
+                            db.as_ref(),
+                            mgr.as_ref(),
+                            backup,
+                            &resumed.target,
+                        ),
                     )
                     .await;
                     let operation_id = operation_id(run_id);
@@ -900,11 +904,15 @@ impl super::super::restore_reconcile::WorkerRestoreResume for ManagerWorkerResto
                 Resume::Job { backup } => {
                     // As `run_job_restore`: the job keeps the target's login,
                     // only the database the data lives in is reconciled.
-                    let origin = origin_credentials_to_reconcile(
-                        db.as_ref(),
-                        mgr.as_ref(),
-                        backup,
-                        &resumed.target,
+                    let origin = resumed_origin_credentials(
+                        enc.as_ref(),
+                        &resumed.run,
+                        origin_credentials_to_reconcile(
+                            db.as_ref(),
+                            mgr.as_ref(),
+                            backup,
+                            &resumed.target,
+                        ),
                     )
                     .await
                     .and_then(|origin| origin.into_database_only());
@@ -1361,6 +1369,7 @@ mod tests {
                     updated_at: NotSet,
                     cancel_requested_at: Set(None),
                     cancel_requested_by: Set(None),
+                    restored_login_encrypted: Set(None),
                 },
                 Some(self.backup_id),
                 self.service_id,
@@ -1720,6 +1729,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 
@@ -2020,6 +2030,125 @@ mod tests {
                 .await
                 .expect("the service is free once the run completed");
         }
+    }
+
+    /// The origin's login after the restore started: another restore into
+    /// the origin, or a password reset, changed it.
+    fn origin_changed_since() -> Option<RestoredServiceCredentials> {
+        RestoredServiceCredentials::from_origin(
+            "postgres",
+            &serde_json::json!({"username": "billing_owner", "password": "changed-since"}),
+        )
+    }
+
+    /// The live failure: after a restart, a cross-service restore on a
+    /// worker patched its target to the origin's login as it was at the
+    /// restart, not the one the restored data answers to. The login is now
+    /// recorded, encrypted, on the run before the restore is sent, and the
+    /// resumed run settles with it.
+    #[tokio::test]
+    async fn a_resumed_restore_patches_the_login_recorded_when_it_started() {
+        let Some(fixture) = run_fixture("postgres").await else {
+            return;
+        };
+        fixture.on_a_worker_node().await;
+        let run = fixture.start_in_place().await.expect("first restore");
+        let started_with = origin("postgres");
+        record_restored_login(
+            fixture.db.as_ref(),
+            &fixture.enc,
+            run.id,
+            started_with.as_ref(),
+        )
+        .await
+        .expect("record the login");
+        let sealed = fixture
+            .run(run.id)
+            .await
+            .restored_login_encrypted
+            .expect("recorded");
+        assert!(
+            !sealed.contains("origin-password"),
+            "the recorded login is encrypted"
+        );
+
+        let resumed_run = fixture.run(run.id).await;
+        let origin = resumed_origin_credentials(&fixture.enc, &resumed_run, async {
+            origin_changed_since()
+        })
+        .await;
+        assert_eq!(origin, started_with, "the login recorded at the start wins");
+
+        let resumed = fixture.found_at_startup(run.id).await;
+        let settling = fixture.settle_resumed(resumed, origin, || {
+            std::future::ready(Ok::<_, ExternalServiceError>(
+                WorkerRestoreProgress::Finished {
+                    outcome: WorkerRestoreResult::Completed,
+                },
+            ))
+        });
+        let result = settling.await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fixture.stored_login().await,
+            serde_json::json!({"username": "billing_owner", "password": "origin-password"}),
+            "the target answers to the login its restored data uses"
+        );
+    }
+
+    /// A run that recorded no login to reconcile settles with none, whatever
+    /// the origin's login is now; only a run from before the login was
+    /// recorded falls back to the origin's current one.
+    #[tokio::test]
+    async fn a_resumed_restore_reads_only_its_own_record_of_the_login() {
+        let Some(fixture) = run_fixture("postgres").await else {
+            return;
+        };
+        let run = fixture.start_in_place().await.expect("first restore");
+        record_restored_login(fixture.db.as_ref(), &fixture.enc, run.id, None)
+            .await
+            .expect("record none");
+        let none_recorded = fixture.run(run.id).await;
+        assert!(none_recorded.restored_login_encrypted.is_some());
+        assert_eq!(
+            resumed_origin_credentials(&fixture.enc, &none_recorded, async {
+                origin_changed_since()
+            })
+            .await,
+            None,
+            "none to reconcile stays none"
+        );
+
+        let before_upgrade = temps_entities::restore_runs::Model {
+            restored_login_encrypted: None,
+            ..none_recorded.clone()
+        };
+        assert_eq!(
+            resumed_origin_credentials(&fixture.enc, &before_upgrade, async {
+                origin_changed_since()
+            })
+            .await,
+            origin_changed_since(),
+            "a run from before the record falls back to the origin's login"
+        );
+
+        let unreadable = temps_entities::restore_runs::Model {
+            restored_login_encrypted: Some("not-a-sealed-value".to_string()),
+            ..none_recorded
+        };
+        assert_eq!(
+            resumed_origin_credentials(&fixture.enc, &unreadable, async { origin_changed_since() })
+                .await,
+            origin_changed_since(),
+            "an unreadable record falls back too"
+        );
+
+        assert!(matches!(
+            record_restored_login(fixture.db.as_ref(), &fixture.enc, 999_999, None).await,
+            Err(RestoreError::RestoreRunNotFound {
+                restore_run_id: 999_999
+            })
+        ));
     }
 
     /// A storage service (or another engine's dump) on a worker is restored

@@ -1391,6 +1391,7 @@ impl RestoreService {
             updated_at: NotSet,
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
+            restored_login_encrypted: Set(None),
         };
         let run = insert_restore_run(
             self.db.as_ref(),
@@ -2093,6 +2094,102 @@ async fn origin_credentials_to_reconcile(
                 origin_id, backup.id, target.id, e
             );
             None
+        }
+    }
+}
+
+/// [`origin_credentials_to_reconcile`] for a restore that runs on a worker
+/// node, recorded on the run before the restore is sent: the node's restore
+/// can outlive this process, and the one that settles it after a restart
+/// patches the target to this login ([`resumed_origin_credentials`]), not to
+/// whatever the origin's login has become since (another restore into the
+/// origin, a password reset).
+///
+/// Encrypted, as it carries passwords; "none to reconcile" is recorded too.
+/// A run whose login cannot be recorded is not started: nothing has been
+/// sent yet, and a restart could otherwise patch the target to a login its
+/// data does not answer to.
+async fn capture_origin_credentials(
+    db: &DatabaseConnection,
+    enc: &temps_core::EncryptionService,
+    mgr: &ExternalServiceManager,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+) -> Result<Option<RestoredServiceCredentials>, RestoreError> {
+    let origin = origin_credentials_to_reconcile(db, mgr, backup, target).await;
+    record_restored_login(db, enc, run_id, origin.as_ref()).await?;
+    Ok(origin)
+}
+
+/// Store `origin` (or "none") encrypted on restore run `run_id`.
+async fn record_restored_login(
+    db: &DatabaseConnection,
+    enc: &temps_core::EncryptionService,
+    run_id: i32,
+    origin: Option<&RestoredServiceCredentials>,
+) -> Result<(), RestoreError> {
+    let plain = serde_json::to_string(&origin).map_err(|e| RestoreError::Internal {
+        reason: format!("restore run {run_id}: serializing the restored login: {e}"),
+    })?;
+    let sealed = enc
+        .encrypt_string(&plain)
+        .map_err(|e| RestoreError::Encryption {
+            reason: format!("restore run {run_id}: encrypting the restored login: {e}"),
+        })?;
+    let updated = temps_entities::restore_runs::Entity::update_many()
+        .col_expr(
+            temps_entities::restore_runs::Column::RestoredLoginEncrypted,
+            sea_orm::sea_query::Expr::value(sealed),
+        )
+        .filter(temps_entities::restore_runs::Column::Id.eq(run_id))
+        .exec(db)
+        .await?;
+    if updated.rows_affected == 0 {
+        return Err(RestoreError::RestoreRunNotFound {
+            restore_run_id: run_id,
+        });
+    }
+    Ok(())
+}
+
+/// The login a resumed worker restore patches its target to: the one
+/// recorded on the run when it started ([`capture_origin_credentials`]).
+/// `None` when it recorded that there is none to reconcile.
+///
+/// A run from before the login was recorded (or one whose record cannot be
+/// read) falls back to `current`, the origin's login now, the only one
+/// there is; that is logged, since the origin may have changed since.
+async fn resumed_origin_credentials<F>(
+    enc: &temps_core::EncryptionService,
+    run: &temps_entities::restore_runs::Model,
+    current: F,
+) -> Option<RestoredServiceCredentials>
+where
+    F: std::future::Future<Output = Option<RestoredServiceCredentials>>,
+{
+    let Some(sealed) = run.restored_login_encrypted.as_deref() else {
+        warn!(
+            "Restore run {} recorded no restored login (it started before Temps recorded one);              it settles with the origin's current login",
+            run.id
+        );
+        return current.await;
+    };
+    let recorded = enc
+        .decrypt_string(sealed)
+        .map_err(|e| e.to_string())
+        .and_then(|plain| {
+            serde_json::from_str::<Option<RestoredServiceCredentials>>(&plain)
+                .map_err(|e| e.to_string())
+        });
+    match recorded {
+        Ok(origin) => origin,
+        Err(e) => {
+            error!(
+                "Restore run {}: its recorded restored login cannot be read ({e}); it settles                  with the origin's current login, which may have changed since",
+                run.id
+            );
+            current.await
         }
     }
 }
@@ -3213,6 +3310,10 @@ async fn cancel_new_service(
 /// answers to the origin's root username as well as its password; its
 /// database is the target's own. Other engines retain their existing
 /// login-identity behavior.
+///
+/// Serialized only into a run's encrypted `restored_login_encrypted`
+/// ([`capture_origin_credentials`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RestoredServiceCredentials {
     /// `None` when the restore keeps the target's own password (a logical
     /// PostgreSQL restore by a job, [`Self::into_database_only`]).
@@ -3922,7 +4023,8 @@ async fn run_agent_restore(
     // destructive restore was confirmed at `start_restore`); a dump that
     // carries its origin's users (MongoDB) leaves the target with the
     // origin's credentials, which its stored config is patched to below.
-    let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
+    let origin_credentials =
+        capture_origin_credentials(db, enc, mgr, run_id, backup, target).await?;
     let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
         .await
         .map_err(|e| RestoreError::ExternalService {
@@ -4036,7 +4138,8 @@ async fn run_job_restore(
     // A backup of another database is admitted as on the control plane (the
     // destructive restore was confirmed at `start_restore`). Its dump carries
     // the origin's roles and their passwords; see below.
-    let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
+    let origin_credentials =
+        capture_origin_credentials(db, enc, mgr, run_id, backup, target).await?;
     let plane = plane.get().ok_or_else(|| RestoreError::Internal {
         reason: format!(
             "restore run {run_id}: database {} is on worker node {node_id}, and restoring it \
@@ -6021,6 +6124,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         };
         let view: RestoreRunView = model.clone().into();
         assert!(view.cancellable);
@@ -6060,6 +6164,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         };
         let v: RestoreRunView = model.into();
         assert_eq!(v.id, 42);
@@ -6222,6 +6327,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: Some(now),
             cancel_requested_by: Some(1),
+            restored_login_encrypted: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_exec_results([sea_orm::MockExecResult {
@@ -7049,6 +7155,7 @@ mod tests {
             updated_at: NotSet,
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
+            restored_login_encrypted: Set(None),
         }
     }
 
@@ -7491,6 +7598,7 @@ mod tests {
             updated_at: Utc::now(),
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 

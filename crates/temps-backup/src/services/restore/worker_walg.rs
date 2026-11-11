@@ -310,7 +310,8 @@ pub(super) async fn run(
     // The base backup carries its origin's `pg_authid`: the restored server
     // answers to the origin's login, which recovery and the readiness check
     // use, and which the target's stored config is patched to afterwards.
-    let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
+    let origin_credentials =
+        capture_origin_credentials(db, enc, mgr, run_id, backup, target).await?;
     let restored_login = origin_credentials.as_ref().map(|origin| {
         let mut login = serde_json::Map::new();
         origin.apply(&mut login);

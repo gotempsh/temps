@@ -629,6 +629,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 

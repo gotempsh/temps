@@ -64,6 +64,11 @@ pub struct Model {
     pub cancel_requested_at: Option<DBDateTime>,
     /// Who asked to cancel the run.
     pub cancel_requested_by: Option<i32>,
+    /// The login a worker restore's data answers to, captured before the
+    /// restore was sent and encrypted with `EncryptionService`: what the
+    /// target's stored login is patched to when the run settles, also after
+    /// a restart. `NULL` when no worker restore recorded one.
+    pub restored_login_encrypted: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
