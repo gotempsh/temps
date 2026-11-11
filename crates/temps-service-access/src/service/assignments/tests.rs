@@ -644,3 +644,212 @@ async fn historical_declarations_release_capacity_but_reapproval_cannot_overfill
     );
     test.cleanup().await;
 }
+
+#[tokio::test]
+async fn vault_membership_stops_existing_durable_approval_and_worker_binding() {
+    if !temps_test_utils::external_database_configured()
+        && !temps_test_utils::docker_available().await
+    {
+        eprintln!("Skipping durable approvals: database unavailable");
+        return;
+    }
+    let mut test = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .unwrap();
+    let db = test.connection_arc();
+    db.execute_unprepared("INSERT INTO users(id,name,email) VALUES(9751,'Access user','access@example.com'); INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9751,'Access test','repo','owner','/','main','nodejs','access-test',now(),now()); INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9751,'sbx_durable','durable',9751,9751,'running','docker')").await.unwrap();
+    let encryption = crate::service::tests::encryption();
+    let service = ServiceAccessService::new(
+        db.clone(),
+        encryption.clone(),
+        Arc::new(crate::broker::UnavailableTokenlessBroker),
+    );
+    let svc = service
+        .save_service(
+            9751,
+            None,
+            SaveAccessService {
+                vault_id: None,
+                name: "Example API".into(),
+                policy: SandboxAccessPolicy {
+                    provider: None,
+                    origin: "https://api.example.com".into(),
+                    path_prefixes: vec!["/v1".into()],
+                    methods: vec![AccessMethod::Get],
+                    github_repository: None,
+                },
+                max_ttl_seconds: 60,
+                enabled: true,
+                credential: Some(temps_core::secret_string::SecretString::new(
+                    "test-only-token",
+                )),
+                clear_credential: false,
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    let request = || RequestSandboxService {
+        service_id: svc.id.clone(),
+        service_version: svc.version,
+    };
+    let pending = service
+        .request_sandbox_service(9751, "sbx_durable", 9751, false, request())
+        .await
+        .unwrap();
+    assert_eq!(pending.status, SandboxServiceStatus::PendingApproval);
+    assert!(service
+        .due_assignments()
+        .await
+        .unwrap()
+        .assignments
+        .is_empty());
+    assert_eq!(
+        service
+            .request_sandbox_service(9751, "sbx_durable", 9751, false, request())
+            .await
+            .unwrap()
+            .id,
+        pending.id
+    );
+    assert!(service
+        .approve_sandbox_service(
+            9751,
+            "sbx_durable",
+            &pending.id,
+            9752,
+            false,
+            ApproveSandboxService {
+                expected_version: 1,
+                service_version: 1,
+                expires_at: None
+            }
+        )
+        .await
+        .is_err());
+    let approved = service
+        .approve_sandbox_service(
+            9751,
+            "sbx_durable",
+            &pending.id,
+            9751,
+            false,
+            ApproveSandboxService {
+                expected_version: 1,
+                service_version: 1,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(approved.status, SandboxServiceStatus::Approved);
+    assert!(!approved.connected);
+    assert!(approved.expires_at.is_none());
+    let worker = temps_service_access_runtime::WorkerControl::new(Arc::new(
+        temps_service_access_runtime::HostAudit,
+    ));
+    crate::authority::AuthorityStore::new(
+        db.clone(),
+        encryption,
+        Arc::new(temps_core::NoopAuditLogger),
+    )
+    .register(None, &worker.identity())
+    .await
+    .unwrap();
+    let observed = HostObservation {
+        worker: worker.identity(),
+        incarnation: uuid::Uuid::new_v4(),
+        node_id: None,
+        container_id: "durable-container".into(),
+        container_name: "temps-sandbox-durable".into(),
+        backend: "docker".into(),
+    };
+    let grant = service
+        .renew_assignment(&approved.id, 9751, 9751, observed.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let planner = crate::planner::PolicyPlanner::new(
+        db.clone(),
+        crate::service::tests::encryption(),
+        None,
+        Arc::new(crate::github::NoGithub),
+    );
+    assert_eq!(
+        planner
+            .prepare(worker.identity().boot_id)
+            .await
+            .unwrap()
+            .bindings
+            .len(),
+        1
+    );
+    let before = grants::Entity::find_by_id(&grant)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    let vault = service
+        .save_vault(
+            None,
+            None,
+            crate::vault_types::SaveAccessVault {
+                name: "Scoped vault".into(),
+                service_ids: vec![svc.id.clone()],
+                expected_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    let link = service
+        .link_vault(&vault.id, Some(9751), None)
+        .await
+        .unwrap();
+    // Coverage alone is insufficient: the old approval never consented to a vault session.
+    let plan = planner.prepare(worker.identity().boot_id).await.unwrap();
+    assert!(plan.bindings.is_empty());
+    assert_eq!(plan.retire.len(), 1);
+    service.unlink_vault(&vault.id, &link.id).await.unwrap();
+    assert!(planner
+        .prepare(worker.identity().boot_id)
+        .await
+        .unwrap()
+        .bindings
+        .is_empty());
+    assert!(service
+        .renew_assignment(&approved.id, 9751, 9751, observed.clone())
+        .await
+        .unwrap()
+        .is_none());
+    let retired = assignments::Entity::find_by_id(&approved.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(retired.revoked_at.is_some());
+    assert!(retired.next_reconcile_at.is_none());
+    assert_eq!(retired.version, approved.version + 1);
+    let after = grants::Entity::find_by_id(&grant)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.expires_at, after.expires_at);
+    // A fresh incarnation must not turn the old durable approval into a new grant.
+    let mut restarted = observed;
+    restarted.incarnation = uuid::Uuid::new_v4();
+    assert!(service
+        .renew_assignment(&approved.id, 9751, 9751, restarted)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        grants::Entity::find()
+            .filter(grants::Column::AssignmentId.eq(&approved.id))
+            .count(db.as_ref())
+            .await
+            .unwrap(),
+        1
+    );
+    test.cleanup().await;
+}

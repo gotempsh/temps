@@ -101,6 +101,31 @@ FROM due WHERE a.id=due.id RETURNING a.*
         if !service.enabled || service.version != row.service_version {
             return Ok(None);
         };
+        // A durable standalone approval does not become vault consent when its
+        // service is added to a vault. Stop both extension and grant rotation.
+        match self.require_standalone_service(&tx, &service.id).await {
+            Ok(()) => {}
+            Err(AccessError::VaultSessionRequired { .. }) => {
+                let next_version = row.version + 1;
+                let mut retired = row.into_active_model();
+                retired.version = Set(next_version);
+                retired.revoked_at = Set(Some(now));
+                retired.next_reconcile_at = Set(None);
+                retired.updated_at = Set(now);
+                retired.update(&tx).await.map_err(|e| {
+                    AccessError::database(
+                        "retire standalone approval after vault membership",
+                        project_id,
+                        e,
+                    )
+                })?;
+                tx.commit().await.map_err(|e| {
+                    AccessError::database("commit retired standalone approval", project_id, e)
+                })?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
         let sandbox = self
             .sandbox(
                 &tx,
