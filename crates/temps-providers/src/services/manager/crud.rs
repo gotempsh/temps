@@ -491,10 +491,18 @@ impl ExternalServiceManager {
     /// from the container's own image — it just drives the engine's
     /// `force_recreate` (see `ExternalService::force_recreate`) with a
     /// properly hydrated config so the recreate step has what it needs.
+    ///
+    /// Holds the service's TLS lock from reading its TLS mode through the
+    /// recreate (ADR 093): a mode change finishing in between would
+    /// otherwise be undone by a recreate with the mode read before it.
     pub async fn force_recreate_service_container(
         &self,
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
+        // Before the container's recreate lock, in the order a TLS mode
+        // change takes them.
+        let tls_lock = self.service_tls_locks.for_service(service_id).await;
+        let _held = tls_lock.lock().await;
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {

@@ -1346,6 +1346,28 @@ mod tests {
         assert!(start.await.is_err(), "it ran once the lock was free");
     }
 
+    /// A forced recreate (enabling pg_stat_statements) reads the TLS mode it
+    /// recreates with under the same lock: a mode change finishing in between
+    /// would otherwise be undone by a recreate with the mode read before it.
+    #[tokio::test]
+    async fn a_forced_recreate_waits_while_a_tls_change_holds_the_service() {
+        let manager = manager_without_data();
+        let lock = manager.service_tls_locks.for_service(7).await;
+        let held = lock.lock().await;
+        let recreate = manager.force_recreate_service_container(7);
+        tokio::pin!(recreate);
+        // The mock database has no rows: one that did not wait would fail at
+        // once looking the service up, instead of still pending.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut recreate)
+                .await
+                .is_err(),
+            "the recreate must not read the TLS mode while a change holds the lock"
+        );
+        drop(held);
+        assert!(recreate.await.is_err(), "it ran once the lock was free");
+    }
+
     /// A request dropped while its change waits for (or holds) the TLS
     /// lock does not stop the change: it still runs to the end on its own
     /// task, so the lock is never released mid-change.
