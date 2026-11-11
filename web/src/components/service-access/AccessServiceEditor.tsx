@@ -12,10 +12,10 @@ import {
   createAccessServiceGeneral,
   updateAccessServiceGeneral,
   type AccessServiceResponse,
+  type ServiceCatalogEntry,
 } from '@/api/client'
 import { VaultConsumerPicker } from './VaultConsumerPicker'
 import { VaultRepositoryPicker } from './VaultRepositoryPicker'
-import { ServiceCatalogPicker } from './ServiceCatalogPicker'
 import { problemDetail } from '@/lib/api-problem'
 import {
   serviceEditorSchema,
@@ -26,12 +26,14 @@ import {
 
 export function AccessServiceEditor({
   projectId,
+  catalogEntry,
   vaultId,
   service,
   canUseProjectGithub = false,
   onClose,
   onSaved,
 }: {
+  catalogEntry?: ServiceCatalogEntry
   vaultId?: string
   projectId?: number | null
   service?: AccessServiceResponse
@@ -57,9 +59,15 @@ export function AccessServiceEditor({
   )
   const form = useForm<AccessServiceValues>({
     resolver: zodResolver(serviceEditorSchema(service, sourceMode)),
-    defaultValues: serviceDefaults(service),
+    defaultValues: service
+      ? serviceDefaults(service)
+      : {
+          ...serviceDefaults(),
+          name: catalogEntry?.id === 'custom' ? '' : (catalogEntry?.name ?? ''),
+          provider: catalogEntry?.provider ?? 'custom',
+          origin: catalogEntry?.origin ?? '',
+        },
   })
-  const provider = useWatch({ control: form.control, name: 'provider' })
   const github = useWatch({ control: form.control, name: 'githubRepository' })
   function selectRepository(
     reference: NonNullable<AccessServiceValues['githubRepository']>
@@ -195,19 +203,6 @@ export function AccessServiceEditor({
             }
           </Field>
         )}
-        <ServiceCatalogPicker
-          selectedId={form.watch('catalogId') ?? provider}
-          disabled={!!github}
-          onSelect={(entry) => {
-            form.setValue('catalogId', entry.id, { shouldDirty: true })
-            form.setValue('provider', entry.provider ?? 'custom', {
-              shouldDirty: true,
-            })
-            form.setValue('origin', entry.origin ?? '', { shouldDirty: true })
-            if (!form.getValues('name'))
-              form.setValue('name', entry.name, { shouldDirty: true })
-          }}
-        />
         <Field
           label="Credential source"
           description="Choose a stored bearer credential or an explicit repository from a GitHub connection. Credentials stay on the host."

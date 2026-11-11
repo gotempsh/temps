@@ -4,25 +4,29 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Callout, PageContainer, PageState } from '@temps-sdk/ds'
+import { Callout, PageContainer, PageHeader, PageState } from '@temps-sdk/ds'
 import { Button, Skeleton } from '@temps-sdk/ui'
 import { PlugZap } from 'lucide-react'
-import type { AccessServiceResponse } from '@/api/client'
+import type { AccessServiceResponse, ServiceCatalogEntry } from '@/api/client'
 import {
   generalAccessCapabilityOptions,
   getAccessServiceGeneralOptions,
+  serviceCatalogOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ServiceCatalogPicker } from '@/components/service-access/ServiceCatalogPicker'
 import { AccessServiceEditor } from '@/components/service-access/AccessServiceEditor'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { problemDetail } from '@/lib/api-problem'
 
 function Editor({
   vaultId,
+  catalogEntry,
   service,
   canUseProjectGithub,
   onClose,
   onSaved,
 }: {
+  catalogEntry?: ServiceCatalogEntry
   vaultId?: string
   service?: AccessServiceResponse
   canUseProjectGithub: boolean
@@ -34,6 +38,7 @@ function Editor({
   const [initialService] = useState(service)
   return (
     <AccessServiceEditor
+      catalogEntry={catalogEntry}
       vaultId={vaultId}
       service={initialService}
       canUseProjectGithub={canUseProjectGithub}
@@ -45,7 +50,31 @@ function Editor({
 
 export default function AccessServicePage() {
   const { serviceId } = useParams()
-  const [params] = useSearchParams()
+  const [params, setParams] = useSearchParams()
+  const providerId = params.get('provider') ?? ''
+  const configure =
+    !serviceId && params.get('step') === 'configure' && !!providerId
+  const selected = useQuery({
+    ...serviceCatalogOptions({ query: { id: providerId } }),
+    enabled: !serviceId && !!providerId && providerId !== 'custom',
+  })
+  const entry: ServiceCatalogEntry | undefined =
+    providerId === 'custom'
+      ? {
+          id: 'custom',
+          name: 'Custom HTTP service',
+          description: '',
+          category: 'Custom',
+          supported: true,
+          logo: 'custom',
+          popular: false,
+        }
+      : selected.data?.items.find((item) => item.id === providerId)
+  const catalogStep = () => {
+    const next = new URLSearchParams(params)
+    next.set('step', 'select')
+    setParams(next)
+  }
   const navigate = useNavigate()
   const client = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -108,7 +137,7 @@ export default function AccessServicePage() {
     })
   }
   return (
-    <PageContainer width="form">
+    <PageContainer width={!serviceId && !configure ? 'full' : 'form'}>
       {serviceId && service.isError && !hasLoadedService ? (
         <PageState
           variant="failed"
@@ -168,17 +197,91 @@ export default function AccessServicePage() {
               </Button>
             </Callout>
           )}
-          <fieldset disabled={capability.isError} className="min-w-0">
-            <Editor
-              key={editorKey}
-              vaultId={params.get('vault') ?? undefined}
-              service={service.data}
-              canUseProjectGithub={
-                capability.data?.can_use_project_github === true
+          {!serviceId && (
+            <PageHeader
+              title={
+                configure
+                  ? (entry?.name ?? 'Configure service')
+                  : 'Choose a service'
               }
-              onClose={back}
-              onSaved={saved}
+              actions={
+                <Button
+                  variant="outline"
+                  onClick={configure ? catalogStep : back}
+                >
+                  {configure ? 'Change service' : 'Cancel'}
+                </Button>
+              }
             />
+          )}
+          {!serviceId && !configure && (
+            <ServiceCatalogPicker
+              selectedId={providerId}
+              disabled={capability.isError}
+              searchValue={params.get('q') ?? ''}
+              pageValue={Math.min(
+                1_000_000,
+                Math.max(1, Math.floor(Number(params.get('page')) || 1))
+              )}
+              onSearchChange={(q) => {
+                const next = new URLSearchParams(params)
+                next.set('q', q)
+                next.delete('page')
+                setParams(next, { replace: true })
+              }}
+              onPageChange={(page) => {
+                const next = new URLSearchParams(params)
+                next.set('page', String(page))
+                setParams(next)
+              }}
+              onSelect={(item) => {
+                const next = new URLSearchParams(params)
+                next.set('provider', item.id)
+                next.set('step', 'configure')
+                setParams(next)
+                window.scrollTo({ top: 0 })
+              }}
+            />
+          )}
+          {!serviceId &&
+            configure &&
+            !entry &&
+            (selected.isPending ? (
+              <Skeleton className="h-48" />
+            ) : (
+              <Callout tone="error" title="Could not load selected service">
+                <Button onClick={catalogStep}>Choose a service</Button>
+                <Button
+                  variant="outline"
+                  onClick={() => void selected.refetch()}
+                >
+                  Retry
+                </Button>
+              </Callout>
+            ))}
+          {!serviceId && configure && entry && !entry.supported && (
+            <Callout title="This service is not supported yet">
+              {entry.reason}
+            </Callout>
+          )}
+          <fieldset
+            hidden={!serviceId && (!configure || !entry?.supported)}
+            disabled={capability.isError}
+            className="min-w-0"
+          >
+            {(serviceId || entry?.supported) && (
+              <Editor
+                key={`${editorKey}:${providerId}`}
+                catalogEntry={entry}
+                vaultId={params.get('vault') ?? undefined}
+                service={service.data}
+                canUseProjectGithub={
+                  capability.data?.can_use_project_github === true
+                }
+                onClose={back}
+                onSaved={saved}
+              />
+            )}
           </fieldset>
         </>
       )}

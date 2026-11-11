@@ -10,7 +10,13 @@ import {
   waitFor,
   within,
 } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import {
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from 'react-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { AccessServiceResponse } from '@/api/client'
 import {
@@ -43,6 +49,17 @@ const service: AccessServiceResponse = {
   version: 4,
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-01T00:00:00Z',
+}
+
+function WizardProbe() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  return (
+    <>
+      <output aria-label="URL">{location.search}</output>
+      <button onClick={() => navigate(-1)}>Browser back</button>
+    </>
+  )
 }
 
 function BreadcrumbProbe() {
@@ -88,6 +105,7 @@ function mount(
       <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
           <BreadcrumbProbe />
+          <WizardProbe />
           <Routes>
             <Route
               path="/access-services/new"
@@ -157,7 +175,9 @@ test('direct editor URL loads masked service and preserves edits and version acr
 })
 
 test('new service has a direct routed form without reading an existing service', () => {
-  const client = mount('/access-services/new?sandbox=sbx_test')
+  const client = mount(
+    '/access-services/new?sandbox=sbx_test&step=configure&provider=custom'
+  )
   expect(
     within(document.body).getByLabelText('Shared breadcrumbs').textContent
   ).toContain('Add service')
@@ -192,7 +212,7 @@ test('failed deep-link read shows error and retry instead of a blank creation fo
 })
 
 test('new services are independent of a project', () => {
-  const client = mount('/access-services/new')
+  const client = mount('/access-services/new?step=configure&provider=custom')
   expect(within(document.body).getByLabelText('Name')).toBeTruthy()
   expect(document.body.textContent).not.toContain('Project 7')
   client.clear()
@@ -361,6 +381,82 @@ test('an initial refresh failure cannot open an obsolete cached policy', async (
       expect(document.body.textContent).toContain('Read unavailable')
     )
     expect(within(document.body).queryByLabelText('Name')).toBeNull()
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('catalog wizard preserves URL search and selection, hides form until selected, and restores draft on Back', async () => {
+  const entry = {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    category: 'AI models',
+    description: '',
+    origin: 'https://api.example.com',
+    supported: true,
+    logo: 'deepseek',
+    popular: true,
+  }
+  const api = mockApi({
+    'GET /service-access/catalog': () =>
+      jsonResponse({ items: [entry], total: 1, page: 1, page_size: 20 }),
+  })
+  try {
+    const client = mount('/access-services/new?vault=vault_test&q=deep')
+    const ui = within(document.body)
+    expect(ui.queryByLabelText('Name')).toBeNull()
+    expect(ui.queryByRole('button', { name: 'Save service' })).toBeNull()
+    fireEvent.click(await ui.findByRole('button', { name: /DeepSeek/ }))
+    await waitFor(() => expect(ui.getByLabelText('Name')).toBeTruthy())
+    expect(ui.getByLabelText('URL').textContent).toContain('step=configure')
+    expect(ui.getByLabelText('URL').textContent).toContain('provider=deepseek')
+    expect(ui.getByLabelText('URL').textContent).toContain('vault=vault_test')
+    fireEvent.change(ui.getByLabelText('Name'), {
+      target: { value: 'Draft service' },
+    })
+    fireEvent.click(ui.getByRole('button', { name: 'Change service' }))
+    expect(ui.getByRole('textbox', { name: 'Search services' })).toBeTruthy()
+    expect(ui.queryByRole('button', { name: 'Save service' })).toBeNull()
+    fireEvent.click(ui.getByRole('button', { name: 'Browser back' }))
+    expect((ui.getByLabelText('Name') as HTMLInputElement).value).toBe(
+      'Draft service'
+    )
+    client.clear()
+  } finally {
+    api.restore()
+  }
+})
+
+test('unsupported provider deep link explains capability without a save form', async () => {
+  const api = mockApi({
+    'GET /service-access/catalog': () =>
+      jsonResponse({
+        items: [
+          {
+            id: 'anthropic',
+            name: 'Anthropic',
+            supported: false,
+            reason: 'Requires a custom credential header',
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      }),
+  })
+  try {
+    const client = mount(
+      '/access-services/new?step=configure&provider=anthropic'
+    )
+    await waitFor(() =>
+      expect(document.body.textContent).toContain(
+        'Requires a custom credential header'
+      )
+    )
+    expect(
+      within(document.body).queryByRole('button', { name: 'Save service' })
+    ).toBeNull()
     client.clear()
   } finally {
     api.restore()

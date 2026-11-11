@@ -15,6 +15,7 @@ pub struct ServiceCatalogQuery {
     pub page: Option<u64>,
     pub page_size: Option<u64>,
     pub search: Option<String>,
+    pub id: Option<String>,
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ServiceCatalogEntry {
@@ -22,6 +23,8 @@ pub struct ServiceCatalogEntry {
     pub name: String,
     pub description: String,
     pub category: String,
+    pub logo: String,
+    pub popular: bool,
     pub origin: Option<String>,
     pub supported: bool,
     pub reason: Option<String>,
@@ -52,6 +55,9 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
     let search = query.search.unwrap_or_default().trim().to_lowercase();
     let mut items = Vec::new();
     for (template, _) in templates {
+        if query.id.as_ref().is_some_and(|id| id != &template.id) {
+            continue;
+        }
         if ["vercel", "netlify", "resend"]
             .iter()
             .any(|id| template.id == *id || template.id.starts_with(&format!("{id}-")))
@@ -109,6 +115,8 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
             _ => None,
         };
         items.push(ServiceCatalogEntry {
+            logo: template.logo.unwrap_or_else(|| template.id.clone()),
+            popular: template.popular,
             id: template.id,
             name: template.name,
             description: template.description,
@@ -119,7 +127,12 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
             provider,
         });
     }
-    items.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    items.sort_by(|a, b| {
+        b.popular
+            .cmp(&a.popular)
+            .then(a.name.cmp(&b.name))
+            .then(a.id.cmp(&b.id))
+    });
     let total = items.len() as u64;
     let page = query.page.unwrap_or(1).clamp(1, 1_000_000);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
@@ -137,6 +150,38 @@ fn catalog(query: ServiceCatalogQuery) -> Result<ServiceCatalog, AccessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn popular_entries_precede_alphabetical_catalog_and_exact_selection_is_stable() {
+        let all = catalog(ServiceCatalogQuery {
+            page_size: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(all.items[0].popular);
+        assert!(all
+            .items
+            .windows(2)
+            .all(|pair| pair[0].popular || !pair[1].popular));
+        for entry in &all.items {
+            let selected = catalog(ServiceCatalogQuery {
+                id: Some(entry.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(selected.total, 1);
+            assert_eq!(selected.items[0].id, entry.id);
+            assert!(!selected.items[0].logo.is_empty());
+        }
+        assert_eq!(
+            catalog(ServiceCatalogQuery {
+                id: Some("vercel".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .total,
+            0
+        );
+    }
     #[test]
     fn catalog_is_sdk_backed_paginated_and_explains_unsupported_entries() {
         let all = catalog(ServiceCatalogQuery {

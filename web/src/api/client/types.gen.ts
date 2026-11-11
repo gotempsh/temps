@@ -30270,8 +30270,10 @@ export type ServiceCatalogEntry = {
     category: string;
     description: string;
     id: string;
+    logo: string;
     name: string;
     origin?: string | null;
+    popular: boolean;
     provider?: AccessServiceProvider | null;
     reason?: string | null;
     supported: boolean;
@@ -87883,6 +87885,7 @@ export type ServiceCatalogData = {
         page?: number | null;
         page_size?: number | null;
         search?: string | null;
+        id?: string | null;
     };
     url: '/service-access/catalog';
 };

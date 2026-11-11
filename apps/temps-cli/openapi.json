@@ -64307,6 +64307,9 @@
           "id": {
             "type": "string"
           },
+          "logo": {
+            "type": "string"
+          },
           "name": {
             "type": "string"
           },
@@ -64315,6 +64318,9 @@
               "string",
               "null"
             ]
+          },
+          "popular": {
+            "type": "boolean"
           },
           "provider": {
             "oneOf": [
@@ -64342,6 +64348,8 @@
           "name",
           "description",
           "category",
+          "logo",
+          "popular",
           "supported"
         ],
         "type": "object"
@@ -164423,6 +164431,17 @@
           {
             "in": "query",
             "name": "search",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "id",
             "required": false,
             "schema": {
               "type": [
