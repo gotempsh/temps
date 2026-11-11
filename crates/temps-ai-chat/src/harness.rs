@@ -490,6 +490,8 @@ mod tests {
         assert!(playbook.description.contains("Notion"));
         assert!(playbook.body.contains(r#""kind":"sandbox""#));
         assert!(playbook.body.contains("is not the vault id"));
+        assert!(playbook.body.contains("/bundles/new"));
+        assert!(playbook.body.contains("allows the method and path"));
         assert!(playbook.body.contains("explicitly confirm"));
         assert!(playbook.body.contains("does not need a project"));
         assert!(playbook.body.contains("including in Auto mode"));

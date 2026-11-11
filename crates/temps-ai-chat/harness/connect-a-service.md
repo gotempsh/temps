@@ -23,6 +23,14 @@ complete access approval in this chat. A sandbox does not need a project.
    the sandbox_access_vaults operation for that sandbox, then `list_access_bundles_general`
    and `get_access_vault_general` with its sandbox ID query parameter to inspect masked policy
    versions. Follow pagination; do not assume the first page is the whole list.
+   A session needs a bundle that contains the service. When
+   `list_access_bundles_general` returns none for the vault, stop: say so and
+   send the person to `/vault/vaults/<vault id>/bundles/new` to create one
+   (pick the service and a lifetime; saving a bundle grants nothing), then
+   continue when they say it exists. Never use the vault id as the bundle id.
+   Also check that the service allows the method and path the task needs: a
+   service limited to GET cannot `POST /v1/search`, so say that and point to
+   the service's edit page instead of requesting a session that cannot help.
 2. Explain the bundle's services, origins, methods, paths, target sandbox and
    fixed lifetime. Secrets stay in the vault and are never copied into chat,
    commands, files, environment variables or the sandbox.
