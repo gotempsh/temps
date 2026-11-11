@@ -50,7 +50,11 @@ export function ServiceCatalogPicker({
         placeholder="Search services or categories…"
         value={search}
         onChange={(value) => {
-          onSearchChange ? onSearchChange(value) : setSearch(value)
+          if (onSearchChange) {
+            onSearchChange(value)
+          } else {
+            setSearch(value)
+          }
           setPage(1)
         }}
         summary={
