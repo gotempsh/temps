@@ -37,6 +37,7 @@ pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.
 pub mod log_transitions;
 pub mod managed_backup_schedule;
+pub mod managed_service_pki;
 pub mod node_address;
 pub mod node_pki;
 pub mod notifications;

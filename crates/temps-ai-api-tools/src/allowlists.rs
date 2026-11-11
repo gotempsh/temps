@@ -142,6 +142,12 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // stay out: those return plaintext.
     "get_service",
     "get_service_by_slug",
+    // Server TLS of a managed database: mode, whether each container or
+    // data node serves it, and the certificate's public details. The CA
+    // download is the public certificate clients verify against; no
+    // private key is ever returned.
+    "get_service_tls",
+    "get_managed_ca_certificate",
     // ── Agentic follow-up reads: what a change did, and what to do next ──
     "list_container_history",
     "tail_deployment_job_logs",
@@ -987,6 +993,9 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "stop_service",
     "update_service_resources",
     "trigger_service_health_check",
+    // Turning a managed database's server TLS on or off. Takes only the
+    // mode, no credential; like a resize it restarts a standalone database.
+    "update_service_tls",
     "add_cluster_member",
     "unlink_service_from_project",
     // Removing a service is the only way to clean up a cluster that failed
@@ -1430,6 +1439,7 @@ mod tests {
             "start_service",
             "stop_service",
             "update_service_resources",
+            "update_service_tls",
             "add_cluster_member",
             "retry_cluster",
             "delete_service",
@@ -1444,7 +1454,13 @@ mod tests {
                 "operating flow cannot stage `{operation}`"
             );
         }
-        for operation in ["get_service", "get_service_by_slug", "get_access_info"] {
+        for operation in [
+            "get_service",
+            "get_service_by_slug",
+            "get_access_info",
+            "get_service_tls",
+            "get_managed_ca_certificate",
+        ] {
             assert!(
                 reads.contains(operation),
                 "operating flow cannot read `{operation}`"

@@ -233,6 +233,13 @@ impl ExternalServiceManager {
 
         let topology = request.topology.clone();
         let topology_for_txn = topology.clone();
+        // ADR 093: new PostgreSQL services (standalone local, and clusters) offer TLS.
+        let default_tls_mode = super::server_tls::default_tls_mode_for_new_service(
+            request.service_type,
+            &topology,
+            request.node_id,
+            &parameters,
+        );
 
         // Start transaction
         let service = self
@@ -265,6 +272,8 @@ impl ExternalServiceManager {
                     };
 
                     let service = new_service.insert(txn).await?;
+                    super::server_tls::record_initial_tls_mode(txn, service.id, default_tls_mode)
+                        .await?;
 
                     Ok(service)
                 })
@@ -482,10 +491,18 @@ impl ExternalServiceManager {
     /// from the container's own image — it just drives the engine's
     /// `force_recreate` (see `ExternalService::force_recreate`) with a
     /// properly hydrated config so the recreate step has what it needs.
+    ///
+    /// Holds the service's TLS lock from reading its TLS mode through the
+    /// recreate (ADR 093): a mode change finishing in between would
+    /// otherwise be undone by a recreate with the mode read before it.
     pub async fn force_recreate_service_container(
         &self,
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
+        // Before the container's recreate lock, in the order a TLS mode
+        // change takes them.
+        let tls_lock = self.service_tls_locks.for_service(service_id).await;
+        let _held = tls_lock.lock().await;
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
@@ -494,12 +511,18 @@ impl ExternalServiceManager {
                 service_type: service.service_type.clone(),
             }
         })?;
-        let config = self.get_service_config(service_id).await?;
+        let mut config = self.get_service_config(service_id).await?;
         let instance = self.create_service_instance_for_parameter_value(
             service.name.clone(),
             service_type,
             &config.parameters,
         )?;
+        // ADR 093: a recreate keeps (or applies) the service's server TLS.
+        let parameters = self.get_service_parameters(service_id).await?;
+        let tls_parameters = self.server_tls_parameters(&service, &parameters).await?;
+        if let Some(object) = config.parameters.as_object_mut() {
+            object.extend(tls_parameters);
+        }
         instance.force_recreate(config).await.map_err(|error| {
             ExternalServiceError::from_engine(service_id, error, |e| {
                 ExternalServiceError::InternalError {
