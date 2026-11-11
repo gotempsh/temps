@@ -11,8 +11,10 @@ import {
   alertableMetrics,
   containerCpuAxisWidth,
   containerCpuChartMetric,
+  containerCpuHistoryMetric,
   containerCpuTileText,
   formatContainerCpuMetric,
+  withCpuHistory,
 } from './container-cpu'
 
 function lookupOf(values: Record<string, number>) {
@@ -231,5 +233,55 @@ describe('containerCpuChartMetric', () => {
     expect(CONTAINER_CPU_METRIC_LABELS[CONTAINER_CLUSTER_CPU_METRIC]).toBe(
       'CPU (cores, busiest member)'
     )
+  })
+})
+
+describe('withCpuHistory', () => {
+  const at = (minute: number, value: number | null) => ({
+    time: `2026-01-01T00:${String(minute).padStart(2, '0')}:00Z`,
+    value,
+  })
+
+  test("a cluster's CPU chart falls back to the members' history before it charts its busiest member", () => {
+    expect(
+      containerCpuHistoryMetric(
+        CONTAINER_CPU_METRIC,
+        containerCpuChartMetric(CONTAINER_CPU_METRIC, true)
+      )
+    ).toBe(CONTAINER_CPU_METRIC)
+    expect(
+      containerCpuHistoryMetric(
+        CONTAINER_CPU_METRIC,
+        containerCpuChartMetric(CONTAINER_CPU_METRIC, false)
+      )
+    ).toBeUndefined()
+    expect(
+      containerCpuHistoryMetric(
+        CONTAINER_CPU_UTILIZATION_METRIC,
+        containerCpuChartMetric(CONTAINER_CPU_UTILIZATION_METRIC, true)
+      )
+    ).toBeUndefined()
+  })
+
+  test('history fills the range before the first busiest-member reading', () => {
+    const busiest = [at(0, null), at(1, null), at(2, 150), at(3, null)]
+    const history = [at(0, 40), at(1, 45), at(2, 50), at(3, 55)]
+    expect(withCpuHistory(busiest, history)).toEqual([
+      at(0, 40),
+      at(1, 45),
+      at(2, 150),
+      // A later gap stays a gap: no member had a complete reading then.
+      at(3, null),
+    ])
+  })
+
+  test('with no busiest-member reading yet, the whole range is history', () => {
+    const history = [at(0, 40), at(1, null)]
+    expect(withCpuHistory([at(0, null), at(1, null)], history)).toEqual(history)
+  })
+
+  test('with neither series holding a reading, the busiest-member range stays', () => {
+    const busiest = [at(0, null)]
+    expect(withCpuHistory(busiest, [])).toEqual(busiest)
   })
 })

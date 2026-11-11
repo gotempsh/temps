@@ -92,8 +92,10 @@ import {
   alertableMetrics,
   containerCpuAxisWidth,
   containerCpuChartMetric,
+  containerCpuHistoryMetric,
   containerCpuTileText,
   formatContainerCpuMetric,
+  withCpuHistory,
 } from '@/lib/container-cpu'
 import {
   PG_CACHE_HIT_RATIO_METRIC,
@@ -752,10 +754,17 @@ export function MetricTile({
 type MetricChartProps = {
   serviceId: number
   metricName: string
+  /** Charted before `metricName` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   range: string
 }
 
-function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
+function MetricChart({
+  serviceId,
+  metricName,
+  historyMetric,
+  range,
+}: MetricChartProps) {
   const refetchInterval = useRefreshInterval()
   const { data, isLoading } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
@@ -765,13 +774,25 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
     staleTime: 15_000,
     refetchInterval,
   })
+  const { data: historyData, isLoading: historyLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metricName, range },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 15_000,
+    refetchInterval,
+  })
 
-  const chartData = (data ?? []).map((p) => ({
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
+  const chartData = points.map((p) => ({
     time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
-  if (isLoading) {
+  if (isLoading || (historyMetric != null && historyLoading)) {
     return (
       <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin text-muted-foreground" />
@@ -1414,6 +1435,7 @@ function MonitoringDashboard({
   const [range, setRange] = useState('1h')
   // The series behind the selected tile.
   const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
+  const historyMetric = containerCpuHistoryMetric(selectedMetric, chartMetric)
 
   const latestByName = new Map<string, number>()
   for (const m of latestMetrics) {
@@ -1519,6 +1541,7 @@ function MonitoringDashboard({
           <MetricChart
             serviceId={serviceId}
             metricName={chartMetric}
+            historyMetric={historyMetric}
             range={range}
           />
         </div>

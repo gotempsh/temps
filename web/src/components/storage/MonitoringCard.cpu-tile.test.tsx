@@ -22,15 +22,17 @@ afterEach(cleanup)
 function renderCard(
   latest: Record<string, number>,
   cluster = false,
-  charted: string[] = []
+  charted: string[] = [],
+  ranges: Record<string, { time: string; value: number | null }[]> = {}
 ) {
   mockApi({
     'GET /external-services/3/metrics/latest': () => jsonResponse(latest),
     'GET /external-services/3/metrics/status': () =>
       jsonResponse({ last_received_at: null }),
     'GET /external-services/3/metrics': (request) => {
-      charted.push(new URL(request.url).searchParams.get('metric') ?? '')
-      return jsonResponse([])
+      const metric = new URL(request.url).searchParams.get('metric') ?? ''
+      charted.push(metric)
+      return jsonResponse(ranges[metric] ?? [])
     },
     'GET /external-services/3/metrics/alert-rules': () => jsonResponse([]),
   })
@@ -117,8 +119,27 @@ test("selecting a cluster's CPU tile charts its busiest member, not the mean of 
   await waitFor(() =>
     expect(charted).toContain('container.cluster_cpu_percent')
   )
-  expect(charted).not.toContain('container.cpu_percent')
   expect(await screen.findByText('CPU (cores, busiest member)')).toBeTruthy()
+})
+
+test("a cluster's CPU chart shows the members' history before its busiest-member series starts", async () => {
+  // Right after an upgrade the busiest-member series has no readings yet,
+  // while the members' `container.cpu_percent` covers the whole range.
+  const charted: string[] = []
+  renderCard(CLUSTER_LATEST, true, charted, {
+    'container.cluster_cpu_percent': [
+      { time: '2026-01-01T00:00:00Z', value: null },
+    ],
+    'container.cpu_percent': [{ time: '2026-01-01T00:00:00Z', value: 40 }],
+  })
+
+  fireEvent.click(await screen.findByText('CPU (cores, last scrape)'))
+  await waitFor(() => {
+    expect(charted).toContain('container.cluster_cpu_percent')
+    expect(charted).toContain('container.cpu_percent')
+  })
+  await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull())
+  expect(screen.queryByText('No data for this range')).toBeNull()
 })
 
 test("selecting a single container's CPU tile charts its own usage", async () => {

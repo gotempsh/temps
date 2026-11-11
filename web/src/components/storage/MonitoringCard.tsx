@@ -32,8 +32,10 @@ import {
   alertableMetrics,
   containerCpuAxisWidth,
   containerCpuChartMetric,
+  containerCpuHistoryMetric,
   containerCpuTileText,
   formatContainerCpuMetric,
+  withCpuHistory,
 } from '@/lib/container-cpu'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -953,8 +955,23 @@ function LiveMetrics({
     staleTime: 15_000,
     refetchInterval: 30_000,
   })
+  // Before a cluster's busiest-member series starts, chart the members' CPU
+  // history instead of an empty range.
+  const historyMetric = containerCpuHistoryMetric(selectedMetric, chartMetric)
+  const { data: historyData, isLoading: historyLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? chartMetric, range: rangeLabel },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
 
-  const chartData = (rangeData ?? []).map((p) => ({
+  const chartPoints = historyMetric
+    ? withCpuHistory(rangeData ?? [], historyData ?? [])
+    : (rangeData ?? [])
+  const chartData = chartPoints.map((p) => ({
     time: new Date(p.time).getTime(),
     value: p.value,
   }))
@@ -1041,7 +1058,7 @@ function LiveMetrics({
           </div>
         </div>
         <div className="relative z-20 h-48 w-full overflow-visible">
-          {rangeLoading ? (
+          {rangeLoading || (historyMetric != null && historyLoading) ? (
             <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin mr-2" />
               Loading…

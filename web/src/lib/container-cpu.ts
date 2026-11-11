@@ -58,6 +58,40 @@ export function containerCpuChartMetric(
 }
 
 /**
+ * The series whose history fills a chart before `chartMetric` has any:
+ * `container.cpu_percent` behind a cluster's busiest-member series, which only
+ * exists from the upgrade that records it. `undefined` when the tile charts its
+ * own metric.
+ */
+export function containerCpuHistoryMetric(
+  name: string,
+  chartMetric: string
+): string | undefined {
+  return chartMetric === CONTAINER_CLUSTER_CPU_METRIC && name !== chartMetric
+    ? name
+    : undefined
+}
+
+/**
+ * A cluster's CPU chart points: the busiest member's series from its first
+ * reading on, and before that the members' `container.cpu_percent` history,
+ * so a range reaching back past the upgrade (or a cluster that has not
+ * recorded a busiest member yet) still charts. Gaps after the first reading
+ * stay gaps: they are ticks where no member had a complete reading.
+ */
+export function withCpuHistory<
+  P extends { time: string; value?: number | null },
+>(busiest: P[], history: P[]): P[] {
+  const first = busiest.find((p) => p.value != null)
+  if (!first) return history.some((p) => p.value != null) ? history : busiest
+  const since = Date.parse(first.time)
+  return [
+    ...history.filter((p) => Date.parse(p.time) < since),
+    ...busiest.filter((p) => Date.parse(p.time) >= since),
+  ]
+}
+
+/**
  * The metrics an alert rule may be created on, from a page's metric list.
  * `container.cpu_percent` is dropped: a threshold on it is cores × 100, so a
  * user reading "0.68 cores" who types 2 would get a rule at 0.02 cores. CPU
