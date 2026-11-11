@@ -7,11 +7,6 @@ use super::{build_index_with_retry, MaintenanceProgress, SchemaError, SchemaResu
 // protected by the former project-qualified foreign keys. Validate history
 // after DDL commits, under PostgreSQL's write-compatible validation locks.
 const CONSTRAINTS: &[(&str, &str)] = &[
-    ("grant_project_provenance", "sandbox_service_grants"),
-    (
-        "runtime_project_provenance",
-        "sandbox_access_runtime_records",
-    ),
     ("access_vaults_project_id_fkey", "access_vaults"),
     (
         "sandbox_access_services_project_id_fkey",
@@ -118,17 +113,6 @@ where
         });
     }
     for &(constraint, table) in CONSTRAINTS {
-        // Older partial upgrades may not yet have installed provenance constraints.
-        if matches!(
-            constraint,
-            "grant_project_provenance" | "runtime_project_provenance"
-        ) {
-            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname=current_schema() AND c.conname=$1)")
-                .bind(constraint).fetch_one(&mut *connection).await.map_err(|error| SchemaError::VaultConstraint { constraint, table, reason:error.to_string() })?;
-            if !exists {
-                continue;
-            }
-        }
         sqlx::query(&format!(
             "ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}"
         ))

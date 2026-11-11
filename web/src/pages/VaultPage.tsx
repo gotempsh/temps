@@ -145,9 +145,9 @@ function VaultCollection() {
           </Button>
         </Callout>
       )}
-      {capability.data?.can_manage_services && (
+      {(capability.isPending || capability.data?.can_manage_services) && (
         <div className="space-y-5">
-          {vaults.isPending ? (
+          {capability.isPending || vaults.isPending ? (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
               {[0, 1, 2].map((i) => (
                 <Skeleton key={i} className="h-44 rounded-lg" />

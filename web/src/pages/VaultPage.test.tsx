@@ -391,3 +391,24 @@ test('empty later vault pages return to page one', async () => {
     client.clear()
   }
 })
+
+test('cold capability requests show the vault skeleton layout', () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <BreadcrumbProvider>
+            <VaultPage />
+          </BreadcrumbProvider>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    expect(html).toContain('h-44 rounded-lg')
+    expect(html).not.toContain('Create your first vault')
+  } finally {
+    client.clear()
+  }
+})

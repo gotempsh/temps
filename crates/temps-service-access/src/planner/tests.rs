@@ -24,7 +24,13 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
         vault_types::*,
     };
     use temps_service_access_runtime::{HostAudit, WorkerControl};
-    for mode in ["direct", "deleted_project", "projectless", "legacy"] {
+    for mode in [
+        "direct",
+        "deleted_project",
+        "deleted_before",
+        "projectless",
+        "legacy",
+    ] {
         let mut test = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
@@ -120,6 +126,11 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
         .register(None, &identity)
         .await
         .unwrap();
+        if mode == "deleted_before" {
+            db.execute_unprepared("DELETE FROM projects WHERE id=9703")
+                .await
+                .unwrap();
+        }
         let approved = service
             .authorize_session(
                 None,
@@ -155,7 +166,7 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
             db.execute(sea_orm::Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 "UPDATE access_sessions SET link_id=NULL,legacy_project_link=true WHERE id=$1",
-                [approved.id.into()],
+                [approved.id.clone().into()],
             ))
             .await
             .unwrap();
@@ -164,6 +175,15 @@ async fn linked_sessions_plan_projectless_and_direct_access_and_retire_after_unl
             db.execute_unprepared("DELETE FROM projects WHERE id=9703")
                 .await
                 .unwrap();
+        }
+        if mode == "deleted_project" {
+            // Also cover rows cleared by the preceding SET NULL migration.
+            db.execute_unprepared("UPDATE sandbox_service_grants SET project_id=NULL; UPDATE sandbox_access_runtime_records SET project_id=NULL").await.unwrap();
+            let detail = service
+                .get_session(None, &approved.id, 9703, false)
+                .await
+                .unwrap();
+            assert_eq!(detail.grants[0].status, ServiceGrantStatus::Approved);
         }
         let checker = Checker::new(0);
         checker.deny.store(mode != "legacy", Ordering::SeqCst);

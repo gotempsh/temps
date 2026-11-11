@@ -36,9 +36,9 @@ SELECT c.grant_id,r.lease_expires_at,
     c.grant_id=ANY(r.applied_grant_ids) AS installed,
     (r.closed_at IS NOT NULL AND r.applied_version=r.desired_version AND r.applied_version>0 AND r.lease_expires_at IS NULL AND cardinality(r.applied_grant_ids)=0) AS cut_confirmed,
     (r.closed_at IS NOT NULL OR a.closed_at IS NOT NULL) AS closed,
-    (s.status='running' AND s.node_id IS NOT DISTINCT FROM r.node_id AND s.project_id IS NOT DISTINCT FROM r.project_id) AS running
+    (s.status='running' AND s.node_id IS NOT DISTINCT FROM r.node_id) AS running
 FROM sandbox_access_authorizations c
-JOIN sandbox_access_runtime_records r ON r.id=c.runtime_id AND r.project_id IS NOT DISTINCT FROM c.project_id AND r.sandbox_id=c.sandbox_id
+JOIN sandbox_access_runtime_records r ON r.id=c.runtime_id AND r.sandbox_id=c.sandbox_id
 JOIN sandbox_access_authorities a ON a.id=r.authority_id
 JOIN sandboxes s ON s.id=c.sandbox_id
 WHERE c.project_id IS NOT DISTINCT FROM $1 AND c.sandbox_id=$2 AND c.grant_id=ANY($3::text[])
