@@ -5,6 +5,12 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AccessError {
+    #[error("Cannot load Tokenless service catalog at SDK revision {revision}: {source}")]
+    Catalog {
+        revision: &'static str,
+        #[source]
+        source: tokenless_core::CoreError,
+    },
     #[error("Service {service_id} belongs to vault {vault_id}; approve a bundle session through a covering vault link")]
     VaultSessionRequired {
         service_id: String,

@@ -29917,6 +29917,24 @@ export type ServiceBackupListResponse = {
     total: number;
 };
 
+export type ServiceCatalog = {
+    items: Array<ServiceCatalogEntry>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ServiceCatalogEntry = {
+    category: string;
+    description: string;
+    id: string;
+    name: string;
+    origin?: string | null;
+    provider?: AccessServiceProvider | null;
+    reason?: string | null;
+    supported: boolean;
+};
+
 /**
  * Request body for creating an alert rule on an external service.
  *
@@ -87511,6 +87529,29 @@ export type GeneralAccessCapabilityResponses = {
 };
 
 export type GeneralAccessCapabilityResponse = GeneralAccessCapabilityResponses[keyof GeneralAccessCapabilityResponses];
+
+export type ServiceCatalogData = {
+    body?: never;
+    path?: never;
+    query?: {
+        page?: number | null;
+        page_size?: number | null;
+        search?: string | null;
+    };
+    url: '/service-access/catalog';
+};
+
+export type ServiceCatalogErrors = {
+    401: unknown;
+    403: unknown;
+    500: unknown;
+};
+
+export type ServiceCatalogResponses = {
+    200: ServiceCatalog;
+};
+
+export type ServiceCatalogResponse = ServiceCatalogResponses[keyof ServiceCatalogResponses];
 
 export type GetProjectSessionReplaysData = {
     body?: never;

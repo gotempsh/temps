@@ -157,3 +157,15 @@ pub async fn delete_access_service_general(
     .await;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[utoipa::path(get,path="/service-access/catalog",tag="Vault",params(crate::service::ServiceCatalogQuery),responses((status=200,body=crate::service::ServiceCatalog),(status=401),(status=403),(status=500)),security(("bearer_auth"=[])))]
+pub async fn service_catalog(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AccessAppState>>,
+    Query(query): Query<crate::service::ServiceCatalogQuery>,
+) -> Result<Json<crate::service::ServiceCatalog>, Problem> {
+    deny_deployment_token!(auth);
+    permission_guard!(auth, ProjectsRead);
+    manager(&auth)?;
+    Ok(Json(state.service.service_catalog(query)?))
+}

@@ -18,6 +18,7 @@ function pathPrefixes(value: string): string[] {
 export const accessServiceSchema = z
   .object({
     name: z.string().trim().min(1).max(80),
+    catalogId: z.string().optional(),
     provider: z.enum([
       'custom',
       'github',

@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Controller, useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { Callout, Field, Settings, CredentialProviderMark } from '@temps-sdk/ds'
+import { Callout, Field, Settings } from '@temps-sdk/ds'
 import { Input, Textarea, Checkbox, Button } from '@temps-sdk/ui'
 import { toast } from 'sonner'
 import {
@@ -15,7 +15,7 @@ import {
 } from '@/api/client'
 import { VaultConsumerPicker } from './VaultConsumerPicker'
 import { VaultRepositoryPicker } from './VaultRepositoryPicker'
-import { serviceProviders } from './service-provider-registry'
+import { ServiceCatalogPicker } from './ServiceCatalogPicker'
 import { problemDetail } from '@/lib/api-problem'
 import {
   serviceEditorSchema,
@@ -195,39 +195,19 @@ export function AccessServiceEditor({
             }
           </Field>
         )}
-        <Field label="Service provider">
-          {(props) => (
-            <div
-              {...props}
-              role="group"
-              className="grid grid-cols-1 gap-2 lg:grid-cols-3"
-            >
-              {[
-                ...serviceProviders,
-                {
-                  id: 'custom' as const,
-                  name: 'Custom HTTP service',
-                  origin: '',
-                },
-              ].map((p) => (
-                <button
-                  key={p.id}
-                  type="button"
-                  aria-pressed={provider === p.id}
-                  disabled={!!github}
-                  className={`flex items-center gap-3 rounded-md border p-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${provider === p.id ? 'border-foreground bg-muted' : 'hover:bg-muted/50'}`}
-                  onClick={() => {
-                    form.setValue('provider', p.id, { shouldDirty: true })
-                    form.setValue('origin', p.origin, { shouldDirty: true })
-                  }}
-                >
-                  <CredentialProviderMark provider={p.id} />
-                  <span>{p.name}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </Field>
+        <ServiceCatalogPicker
+          selectedId={form.watch('catalogId') ?? provider}
+          disabled={!!github}
+          onSelect={(entry) => {
+            form.setValue('catalogId', entry.id, { shouldDirty: true })
+            form.setValue('provider', entry.provider ?? 'custom', {
+              shouldDirty: true,
+            })
+            form.setValue('origin', entry.origin ?? '', { shouldDirty: true })
+            if (!form.getValues('name'))
+              form.setValue('name', entry.name, { shouldDirty: true })
+          }}
+        />
         <Field
           label="Credential source"
           description="Choose a stored bearer credential or an explicit repository from a GitHub connection. Credentials stay on the host."

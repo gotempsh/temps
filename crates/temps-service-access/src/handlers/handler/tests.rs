@@ -184,6 +184,7 @@ fn routes() -> Vec<(&'static str, &'static str, &'static str)> {
         .collect();
     routes.extend(global);
     routes.extend([
+        ("GET", "/service-access/catalog", ""),
         ("GET", "/service-access/capability", ""),
         ("GET", "/access-vaults/vault_test/consumers/sbx_test", ""),
         ("DELETE", "/access-services/svc_test", ""),
@@ -1496,4 +1497,30 @@ async fn general_management_http_contracts_mask_secrets_and_audit_resource_ids()
     drop(state);
     drop(db);
     test.cleanup().await;
+}
+
+#[tokio::test]
+async fn service_catalog_returns_sdk_entries_without_credentials() {
+    let response = send(
+        "GET",
+        "/service-access/catalog?search=deepseek",
+        "",
+        Some(AuthContext::new_session(test_user(), Role::Admin)),
+        state(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            Arc::new(Audit::default()),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["id"] == "deepseek" && row["supported"] == true));
+    assert!(!body.to_string().contains("credential_encrypted"));
 }

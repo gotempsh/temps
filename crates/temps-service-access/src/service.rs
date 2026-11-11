@@ -5,6 +5,8 @@ pub(crate) mod assignments;
 mod audit_scope;
 use audit_scope::capture_service_audit_scope;
 pub(crate) use audit_scope::service_audit_scope_key;
+mod catalog;
+pub use catalog::{ServiceCatalog, ServiceCatalogEntry, ServiceCatalogQuery};
 mod consent;
 mod links;
 pub(crate) mod sessions;
