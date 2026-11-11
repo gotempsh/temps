@@ -552,16 +552,7 @@ impl ExternalServiceManager {
         self.release_cluster_claim(service_id, action, status, error_message)
             .await?;
 
-        // Data nodes keep their certificate across restarts; this applies a
-        // mode changed while the cluster was stopped, a renewal, or a member
-        // that missed an earlier change.
-        // On its own task: it never fails the Start, and waiting for every
-        // data node to switch would hold the Start response for minutes.
-        if matches!(action, ClusterLifecycleAction::Start)
-            && outcome.as_ref().is_ok_and(|report| !report.done.is_empty())
-        {
-            self.spawn_cluster_server_tls_reconcile(vec![service_id], "cluster start");
-        }
+        self.spawn_server_tls_pass_after_start(service_id, action, &outcome);
 
         let report = outcome?;
         if report.failures.is_empty() {
@@ -569,6 +560,27 @@ impl ExternalServiceManager {
         } else {
             Err(cluster_lifecycle_failure(&service, action, &report))
         }
+    }
+
+    /// After a Start that brought members up, converge the data nodes on
+    /// their TLS setting. Data nodes keep their certificate across
+    /// restarts, so this applies a mode changed while the cluster was
+    /// stopped, a renewal, or a member that missed an earlier change.
+    ///
+    /// Not async on purpose: the pass runs on its own task, which this only
+    /// starts. It never fails the Start, and waiting for every data node to
+    /// switch (each up to the member apply deadline, behind any TLS change
+    /// holding the service's lock) would hold the Start response for
+    /// minutes. Returns the pass's task, or `None` when there is none.
+    fn spawn_server_tls_pass_after_start(
+        &self,
+        service_id: i32,
+        action: ClusterLifecycleAction,
+        outcome: &Result<ClusterLifecycleReport, ExternalServiceError>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        (action == ClusterLifecycleAction::Start
+            && outcome.as_ref().is_ok_and(|report| !report.done.is_empty()))
+        .then(|| self.spawn_cluster_server_tls_reconcile(vec![service_id], "cluster start"))
     }
 
     /// Claim cluster `service_id` for `action`: under the row lock, check
@@ -921,6 +933,58 @@ mod tests {
             crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown::new(),
         );
         assert!(manager.reconciler_shutdowns.lock().await.contains_key(&100));
+    }
+
+    /// A cluster Start does not wait for its data nodes' TLS pass: with a TLS
+    /// change holding the service's lock, the Start still returns at once,
+    /// and the pass runs once the lock is free. Only a Start that brought a
+    /// member up starts one.
+    #[tokio::test]
+    async fn a_cluster_start_does_not_wait_for_its_tls_pass() {
+        let mut cluster = encrypted_service_model(7, serde_json::json!({}));
+        cluster.service_type = "postgres".to_string();
+        cluster.topology = "cluster".to_string();
+        cluster.status = "running".to_string();
+        // The pass loads the cluster, then waits for the TLS lock.
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![cluster]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db);
+        let lock = manager.service_tls_locks.for_service(7).await;
+        let held = lock.lock().await;
+
+        let started = Ok(ClusterLifecycleReport {
+            done: vec!["postgres-orders-1".to_string()],
+            ..Default::default()
+        });
+        let pass = manager
+            .spawn_server_tls_pass_after_start(7, ClusterLifecycleAction::Start, &started)
+            .expect("a Start that brought a member up converges its TLS");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !pass.is_finished(),
+            "the pass waits for the TLS change, in the background"
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), pass)
+            .await
+            .expect("the pass runs once the lock is free")
+            .expect("the pass did not panic");
+
+        // No pass without a member brought up, or for a Stop.
+        let nothing_started = Ok(ClusterLifecycleReport::default());
+        assert!(manager
+            .spawn_server_tls_pass_after_start(7, ClusterLifecycleAction::Start, &nothing_started)
+            .is_none());
+        let refused = Err(ExternalServiceError::ServiceNotFound { id: 7 });
+        assert!(manager
+            .spawn_server_tls_pass_after_start(7, ClusterLifecycleAction::Start, &refused)
+            .is_none());
+        assert!(manager
+            .spawn_server_tls_pass_after_start(7, ClusterLifecycleAction::Stop, &started)
+            .is_none());
     }
 
     /// Run a cluster Stop or Start against a mock database holding a
