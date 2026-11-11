@@ -4,10 +4,18 @@
 use super::{build_index_with_retry, MaintenanceProgress, SchemaError, SchemaResult};
 
 const INDEXES: &[(&str, &str, &str)] = &[
-    ("audit_logs_resource_id", "audit_logs", "((temps_audit_json(data)->>'resource_id')) WHERE temps_audit_json(data)->>'resource_id' IS NOT NULL"),
-    ("audit_logs_vault_id", "audit_logs", "((temps_audit_json(data)->>'vault_id')) WHERE temps_audit_json(data)->>'vault_id' IS NOT NULL"),
-    ("audit_logs_service_scope_key", "audit_logs", "((temps_audit_json(data)->>'service_scope_key')) WHERE temps_audit_json(data)->>'service_scope_key' IS NOT NULL"),
+    ("audit_logs_resource_id_recent", "audit_logs", "((temps_audit_json(data)->>'resource_id'), audit_date DESC, id DESC) WHERE temps_audit_json(data)->>'resource_id' IS NOT NULL"),
+    ("audit_logs_vault_id_recent", "audit_logs", "((temps_audit_json(data)->>'vault_id'), audit_date DESC, id DESC) WHERE temps_audit_json(data)->>'vault_id' IS NOT NULL"),
+    ("audit_logs_service_scope_key_recent", "audit_logs", "((temps_audit_json(data)->>'service_scope_key'), audit_date DESC, id DESC) WHERE temps_audit_json(data)->>'service_scope_key' IS NOT NULL"),
     ("access_service_audit_scopes_vault", "access_service_audit_scopes", "(vault_id,scope_key)"),
+];
+
+/// Single-column predecessors of the `_recent` indexes. The composites serve the
+/// same equality lookups, so keeping both only adds write cost to every audit insert.
+const SUPERSEDED_INDEXES: &[&str] = &[
+    "audit_logs_resource_id",
+    "audit_logs_vault_id",
+    "audit_logs_service_scope_key",
 ];
 
 pub(super) async fn build<F>(connection: &mut sqlx::PgConnection, progress: &F) -> SchemaResult<()>
@@ -43,6 +51,16 @@ where
             name,
             elapsed: started.elapsed(),
         });
+    }
+    for &name in SUPERSEDED_INDEXES {
+        sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name}"))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| SchemaError::VaultIndex {
+                index: name,
+                operation: "drop superseded audit scope index",
+                reason: error.to_string(),
+            })?;
     }
     Ok(())
 }

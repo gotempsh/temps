@@ -24,34 +24,50 @@ pub struct AuditLogFilter<'a> {
     pub offset: i32,
 }
 
-// Each branch can use a payload index before loading audit rows or parsing legacy scope.
-// Materialization and the lateral OFFSET fence keep the planner from scanning
-// unrelated history to join the matching IDs back to their timestamps.
-const RESOURCE_IDS_SQL: &str = r"WITH candidate_ids AS MATERIALIZED (
- SELECT id FROM audit_logs WHERE temps_audit_json(data)->>'resource_id' = $1
+// Every branch applies the filters and keeps only its newest `offset + limit`
+// rows, walking a `(payload key, audit_date DESC, id DESC)` index so it stops
+// at the page boundary instead of enumerating the resource's whole history.
+// Child resources (sessions, bundles, links, services, service scopes) are
+// probed one key at a time through LATERAL, so each key also contributes at
+// most `offset + limit` rows. The outer query merges those bounded candidates.
+// The `audit_logs_*_recent` indexes serve those orderings; OFFSET 0 on the LATERAL
+// subqueries keeps the planner from flattening them back into an unbounded join.
+const RESOURCE_IDS_SQL: &str = r"WITH candidates AS (
+ (SELECT id, audit_date FROM audit_logs WHERE temps_audit_json(data)->>'resource_id' = $1
+  AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
+  AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
+  ORDER BY audit_date DESC, id DESC LIMIT ($6::bigint + $7::bigint))
  UNION
- SELECT id FROM audit_logs WHERE temps_audit_json(data)->>'vault_id' = $1
+ (SELECT id, audit_date FROM audit_logs WHERE temps_audit_json(data)->>'vault_id' = $1
+  AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
+  AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
+  ORDER BY audit_date DESC, id DESC LIMIT ($6::bigint + $7::bigint))
  UNION
- SELECT event.id FROM access_service_audit_scopes scope
- JOIN audit_logs event ON temps_audit_json(event.data)->>'service_scope_key' = scope.scope_key
- WHERE scope.vault_id = $1
+ (SELECT event.id, event.audit_date FROM access_service_audit_scopes scope
+  CROSS JOIN LATERAL (
+   SELECT id, audit_date FROM audit_logs
+   WHERE temps_audit_json(data)->>'service_scope_key' = scope.scope_key
+   AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
+   AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
+   ORDER BY audit_date DESC, id DESC LIMIT ($6::bigint + $7::bigint) OFFSET 0
+  ) event WHERE scope.vault_id = $1)
  UNION
- SELECT event.id FROM (
-  SELECT id FROM access_bundles WHERE vault_id = $1
-  UNION SELECT id FROM access_sessions WHERE vault_id = $1
-  UNION SELECT id FROM access_vault_links WHERE vault_id = $1
-  UNION SELECT unnest(service_ids) FROM access_vaults WHERE id = $1
-  UNION SELECT service_id FROM access_vault_service_history WHERE vault_id = $1
- ) child JOIN audit_logs event ON temps_audit_json(event.data)->>'resource_id' = child.id
- WHERE NOT (temps_audit_json(event.data) ? 'vault_id' OR temps_audit_json(event.data) ? 'service_scope_key')
+ (SELECT event.id, event.audit_date FROM (
+   SELECT id FROM access_bundles WHERE vault_id = $1
+   UNION SELECT id FROM access_sessions WHERE vault_id = $1
+   UNION SELECT id FROM access_vault_links WHERE vault_id = $1
+   UNION SELECT unnest(service_ids) FROM access_vaults WHERE id = $1
+   UNION SELECT service_id FROM access_vault_service_history WHERE vault_id = $1
+  ) child CROSS JOIN LATERAL (
+   SELECT id, audit_date FROM audit_logs
+   WHERE temps_audit_json(data)->>'resource_id' = child.id
+   AND NOT (temps_audit_json(data) ? 'vault_id' OR temps_audit_json(data) ? 'service_scope_key')
+   AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
+   AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
+   ORDER BY audit_date DESC, id DESC LIMIT ($6::bigint + $7::bigint) OFFSET 0
+  ) event)
 )
-SELECT entry.id FROM candidate_ids ids
-JOIN LATERAL (SELECT id,audit_date,operation_type,user_id FROM audit_logs WHERE id=ids.id OFFSET 0) entry ON true
-WHERE ($2::text IS NULL OR entry.operation_type LIKE $2)
-AND ($3::integer IS NULL OR entry.user_id=$3)
-AND ($4::timestamptz IS NULL OR entry.audit_date >= $4)
-AND ($5::timestamptz IS NULL OR entry.audit_date <= $5)
-ORDER BY entry.audit_date DESC,entry.id DESC LIMIT $6 OFFSET $7";
+SELECT id FROM candidates ORDER BY audit_date DESC, id DESC LIMIT $6 OFFSET $7";
 
 #[derive(FromQueryResult)]
 struct AuditId {
@@ -535,6 +551,92 @@ mod tests {
             "unrelated audit history was scanned: {plan}"
         );
         assert!(plan.to_string().contains("audit_logs_resource_id"));
+        test.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn vault_first_page_work_does_not_grow_with_matching_history() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping bounded vault audit page: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        temps_schema::run_post_migration_indexes(db.as_ref())
+            .await
+            .unwrap();
+        // A long-lived vault: thousands of matching events spread over its own
+        // payload, its service's events and its service-scope events.
+        db.execute_unprepared(r#"INSERT INTO access_vaults(id,name,service_ids) VALUES('vault_busy','Busy',ARRAY['svc_busy']);
+ INSERT INTO access_service_audit_scopes VALUES('svc_busy:1','vault_busy');
+ INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at)
+ SELECT 'fixture','UPDATE_ACCESS_VAULT',jsonb_build_object('resource_id','vault_busy')::text,now()-n*interval '1 second',now() FROM generate_series(1,4000) n;
+ INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at)
+ SELECT 'fixture','UPDATE_ACCESS_SERVICE',jsonb_build_object('resource_id','svc_busy')::text,now()-n*interval '1 second',now() FROM generate_series(1,4000) n;
+ INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at)
+ SELECT 'fixture','UPDATE_ACCESS_SERVICE',jsonb_build_object('service_scope_key','svc_busy:1')::text,now()-n*interval '1 second',now() FROM generate_series(1,4000) n;
+ INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at)
+ SELECT 'fixture','UPDATE_ACCESS_SERVICE',jsonb_build_object('resource_id','svc_unrelated_' || n)::text,now(),now() FROM generate_series(1,20000) n;
+ ANALYZE audit_logs;"#).await.unwrap();
+        let mut statement = resource_ids_statement(
+            "vault_busy",
+            &AuditLogFilter {
+                action: None,
+                resource_id: Some("vault_busy"),
+                user_id: None,
+                from: None,
+                to: None,
+                limit: 20,
+                offset: 0,
+            },
+        );
+        statement.sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", statement.sql);
+        let row = db.query_one(statement).await.unwrap().unwrap();
+        let plan: serde_json::Value = row.try_get("", "QUERY PLAN").unwrap();
+        fn examined(node: &serde_json::Value) -> f64 {
+            let own = if node["Relation Name"] == "audit_logs" {
+                (node["Actual Rows"].as_f64().unwrap_or(0.0)
+                    + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0))
+                    * node["Actual Loops"].as_f64().unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            own + node["Plans"]
+                .as_array()
+                .map_or(0.0, |children| children.iter().map(examined).sum())
+        }
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(20.0));
+        // 12,000 events match; each of the four candidate branches may read only
+        // one page worth of its newest rows.
+        assert!(
+            examined(&plan[0]["Plan"]) < 400.0,
+            "first page examined the vault's whole matching history: {plan}"
+        );
+        assert!(plan.to_string().contains("_recent"));
+        // Deep pages stay correct: the merged window still returns distinct,
+        // newest-first ids with no duplicates across branches.
+        let deep = AuditId::find_by_statement(resource_ids_statement(
+            "vault_busy",
+            &AuditLogFilter {
+                action: None,
+                resource_id: Some("vault_busy"),
+                user_id: None,
+                from: None,
+                to: None,
+                limit: 100,
+                offset: 100,
+            },
+        ))
+        .all(db.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(deep.len(), 100);
+        let unique: std::collections::BTreeSet<i32> = deep.iter().map(|row| row.id).collect();
+        assert_eq!(unique.len(), 100);
         test.cleanup().await;
     }
 

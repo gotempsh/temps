@@ -24,7 +24,7 @@ $$;
         Ok(())
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.get_connection().execute_unprepared("DROP INDEX IF EXISTS audit_logs_resource_id; DROP INDEX IF EXISTS audit_logs_vault_id; DROP INDEX IF EXISTS audit_logs_service_scope_key; DROP FUNCTION IF EXISTS temps_audit_json(text)").await?;
+        manager.get_connection().execute_unprepared("DROP INDEX IF EXISTS audit_logs_resource_id_recent; DROP INDEX IF EXISTS audit_logs_vault_id_recent; DROP INDEX IF EXISTS audit_logs_service_scope_key_recent; DROP INDEX IF EXISTS audit_logs_resource_id; DROP INDEX IF EXISTS audit_logs_vault_id; DROP INDEX IF EXISTS audit_logs_service_scope_key; DROP FUNCTION IF EXISTS temps_audit_json(text)").await?;
         Ok(())
     }
 }
@@ -52,7 +52,7 @@ mod tests {
         assert!(row.try_get::<bool>("", "valid").unwrap());
         // Maintenance builds these after migration commit; rollback must also
         // work after those indexes have been installed.
-        db.execute_unprepared("CREATE TABLE audit_logs(data text); CREATE INDEX audit_logs_resource_id ON audit_logs ((temps_audit_json(data)->>'resource_id')); CREATE INDEX audit_logs_vault_id ON audit_logs ((temps_audit_json(data)->>'vault_id')); CREATE INDEX audit_logs_service_scope_key ON audit_logs ((temps_audit_json(data)->>'service_scope_key'))").await.unwrap();
+        db.execute_unprepared("CREATE TABLE audit_logs(data text); CREATE INDEX audit_logs_resource_id_recent ON audit_logs ((temps_audit_json(data)->>'resource_id')); CREATE INDEX audit_logs_vault_id ON audit_logs ((temps_audit_json(data)->>'vault_id')); CREATE INDEX audit_logs_service_scope_key ON audit_logs ((temps_audit_json(data)->>'service_scope_key'))").await.unwrap();
         Migration.down(&manager).await.unwrap();
         let row = db.query_one(Statement::from_string(DbBackend::Postgres, "SELECT to_regprocedure('temps_audit_json(text)') IS NULL AS removed")).await.unwrap().unwrap();
         assert!(row.try_get::<bool>("", "removed").unwrap());
