@@ -44,6 +44,30 @@ describe('containerCpuTileText', () => {
     expect(text).toBe('2.40 / 4 cores')
   })
 
+  test("a cluster's tile pairs its busiest member's usage with that member's limit", () => {
+    // The latest cpu_percent is some member's (0.20 cores); the limit and
+    // share are the busiest member's: 75% of 2 cores.
+    const text = containerCpuTileText(
+      lookupOf({
+        [CONTAINER_CPU_METRIC]: 20,
+        [CONTAINER_CPU_LIMIT_METRIC]: 2,
+        [CONTAINER_CPU_UTILIZATION_METRIC]: 75,
+      })
+    )
+    expect(text).toBe('1.50 / 2 cores')
+  })
+
+  test('an uncapped reading uses the cores recorded, not the host share', () => {
+    const text = containerCpuTileText(
+      lookupOf({
+        [CONTAINER_CPU_METRIC]: 85,
+        [CONTAINER_CPU_LIMIT_METRIC]: 0,
+        [CONTAINER_CPU_UTILIZATION_METRIC]: 5.3,
+      })
+    )
+    expect(text).toBe('0.85 cores')
+  })
+
   test('no sample yet shows a dash', () => {
     expect(
       containerCpuTileText(lookupOf({ [CONTAINER_CPU_LIMIT_METRIC]: 6 }))

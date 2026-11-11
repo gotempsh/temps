@@ -107,3 +107,13 @@ test('a failed stats request is not labelled live', async () => {
   await new Promise((resolve) => setTimeout(resolve, 50))
   expect(screen.queryByText('live')).toBeNull()
 })
+
+test('a healthy panel stays live between polls', async () => {
+  renderPanel(6_000_000_000, 14)
+  await screen.findByText('live')
+
+  // Past the old 4s staleTime, before the next 5s poll: the reading is
+  // still the current one and keeps its label.
+  await new Promise((resolve) => setTimeout(resolve, 4_500))
+  expect(screen.queryByText('live')).not.toBeNull()
+}, 10_000)

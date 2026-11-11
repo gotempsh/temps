@@ -27,6 +27,13 @@ interface ServiceResourcesPanelProps {
   serviceName: string
 }
 
+const STATS_POLL_MS = 5_000
+// Longer than the poll interval, so a reading stays "live" from one poll to
+// the next on a working connection, and goes stale only after missed polls
+// (the tab in the background, where polling stops). A request that fails,
+// retries included, puts the query in error, which is not live either.
+const STATS_FRESH_MS = 2 * STATS_POLL_MS + 2_000
+
 /**
  * Compact runtime + live-stats panel for an external service.
  *
@@ -49,9 +56,9 @@ export function ServiceResourcesPanel({
 
   const statsQuery = useQuery({
     ...getServiceStatsOptions({ path: { id: serviceId } }),
-    refetchInterval: 5_000,
+    refetchInterval: STATS_POLL_MS,
     refetchIntervalInBackground: false,
-    staleTime: 4_000,
+    staleTime: STATS_FRESH_MS,
   })
 
   const firstMember = runtimeQuery.data?.members?.[0]

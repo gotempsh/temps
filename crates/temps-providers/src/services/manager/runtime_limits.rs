@@ -94,19 +94,7 @@ impl ExternalServiceManager {
                 let host_config_limits = info
                     .host_config
                     .as_ref()
-                    .map(|hc| crate::externalsvc::ServiceResourceLimits {
-                        memory_mb: hc.memory.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
-                        memory_swap_mb: hc
-                            .memory_swap
-                            .filter(|&m| m > 0)
-                            .map(|m| m / (1024 * 1024)),
-                        // The effective cap: `NanoCpus`, or a quota set by
-                        // hand (`docker update --cpu-quota`), so this card
-                        // and the Monitoring tile read the same limit.
-                        nano_cpus: effective_nano_cpus(hc),
-                        cpu_shares: hc.cpu_shares.filter(|&n| n > 0),
-                        shm_size_mb: hc.shm_size.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
-                    })
+                    .map(resource_limits_from_host_config)
                     .unwrap_or_default();
 
                 ContainerRuntimeInfo {
@@ -824,15 +812,26 @@ async fn sample_container_stats_twice(
     Some((first, second))
 }
 
-/// The CPU cap a container's `HostConfig` applies, in `NanoCpus` units
-/// (1e9 = one core): `NanoCpus` itself, else the `CpuQuota`/`CpuPeriod`
-/// equivalent. `None` when uncapped. Same reading as the health monitor's
-/// `CpuLimit::from_host_config`.
-fn effective_nano_cpus(host_config: &bollard::models::HostConfig) -> Option<i64> {
-    super::CpuLimit::from_host_config(host_config)
-        .cores()
-        .map(|cores| (cores * 1_000_000_000.0).round() as i64)
-        .filter(|&n| n > 0)
+/// The limits Temps manages, as a container's `HostConfig` holds them: the
+/// values the edit dialog starts from and sends back through
+/// `build_container_update_body`.
+///
+/// `nano_cpus` is `NanoCpus` only. A quota set by hand
+/// (`docker update --cpu-quota`) is not reported as one: sent back, Docker
+/// rejects a `NanoCpus` update on a container with a quota, failing the
+/// whole update (memory included), and clearing it would send `NanoCpus=0`,
+/// which leaves the quota in place. The health monitor still reads such a
+/// quota as the container's limit.
+fn resource_limits_from_host_config(
+    hc: &bollard::models::HostConfig,
+) -> crate::externalsvc::ServiceResourceLimits {
+    crate::externalsvc::ServiceResourceLimits {
+        memory_mb: hc.memory.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
+        memory_swap_mb: hc.memory_swap.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
+        nano_cpus: hc.nano_cpus.filter(|&n| n > 0),
+        cpu_shares: hc.cpu_shares.filter(|&n| n > 0),
+        shm_size_mb: hc.shm_size.filter(|&m| m > 0).map(|m| m / (1024 * 1024)),
+    }
 }
 
 /// Take a single `one_shot` stats sample from a container. Returns `None`
@@ -1354,15 +1353,20 @@ mod tests {
         assert_eq!(sample.cpu_percent, None);
     }
 
-    /// The runtime endpoint reports a quota-only cap as the resources card's
-    /// limit, so the card and the Monitoring tile agree on it.
+    /// The runtime limits are what the edit dialog sends back, so a quota
+    /// set by hand is not reported as `nano_cpus`: saving a memory change
+    /// would send it as `NanoCpus`, which Docker rejects on a container with
+    /// a quota, failing the whole update.
     #[test]
-    fn effective_nano_cpus_reads_nano_cpus_then_quota() {
+    fn runtime_limits_report_nano_cpus_but_not_a_hand_set_quota() {
         let nano = bollard::models::HostConfig {
             nano_cpus: Some(2_000_000_000),
+            memory: Some(512 * 1024 * 1024),
             ..Default::default()
         };
-        assert_eq!(effective_nano_cpus(&nano), Some(2_000_000_000));
+        let limits = resource_limits_from_host_config(&nano);
+        assert_eq!(limits.nano_cpus, Some(2_000_000_000));
+        assert_eq!(limits.memory_mb, Some(512));
 
         let quota_only = bollard::models::HostConfig {
             nano_cpus: Some(0),
@@ -1370,13 +1374,13 @@ mod tests {
             cpu_period: Some(0),
             ..Default::default()
         };
-        assert_eq!(effective_nano_cpus(&quota_only), Some(500_000_000));
+        assert_eq!(
+            resource_limits_from_host_config(&quota_only).nano_cpus,
+            None
+        );
 
-        let uncapped = bollard::models::HostConfig {
-            nano_cpus: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(effective_nano_cpus(&uncapped), None);
+        let update = build_container_update_body(&resource_limits_from_host_config(&quota_only));
+        assert_eq!(update.nano_cpus, Some(0));
     }
 
     // ── End container stats helpers ──────────────────────────────────────────
