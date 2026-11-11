@@ -7,6 +7,7 @@ import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { installBrowserWindow } from '@/test/dom'
 import {
   canRedeployAnyInPlace,
+  redeployAvailability,
   environmentsToRedeploy,
   redeployCurrentDeployments,
   redeploySummary,
@@ -211,6 +212,55 @@ describe('redeploySummary', () => {
       ]).message
     ).toBe('Redeploying 2 environments')
     expect(redeploySummary([]).message).toBe('Nothing to redeploy')
+  })
+})
+
+describe('redeployAvailability', () => {
+  const apiFor = (
+    deployments: Record<number, DeploymentResponse>
+  ): Pick<RedeployApi, 'getDeployment'> =>
+    ({
+      getDeployment: async ({ path }: { path: { deployment_id: number } }) => ({
+        data: deployments[path.deployment_id],
+      }),
+    }) as unknown as Pick<RedeployApi, 'getDeployment'>
+  const made = (
+    id: number,
+    envId: number,
+    type: 'manual' | 'external' | 'uploaded_source'
+  ) => deployment(id, envId, { metadata: { deploymentSourceType: type } })
+  const two = [env(3, 'production', 31), env(4, 'staging', 41)]
+
+  test.each(['manual', 'external'] as const)(
+    'every deployment being %s means there is no source to rebuild or upload',
+    async (type) => {
+      const api = apiFor({ 31: made(31, 3, type), 41: made(41, 4, type) })
+      expect(await redeployAvailability(7, 'git', two, api)).toBe('no-source')
+    }
+  )
+
+  test('every deployment being an uploaded archive means upload again', async () => {
+    const api = apiFor({
+      31: made(31, 3, 'uploaded_source'),
+      41: made(41, 4, 'uploaded_source'),
+    })
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('upload')
+  })
+
+  test('a mix of archive and no-source deployments is left to the redeploy to report', async () => {
+    const api = apiFor({
+      31: made(31, 3, 'uploaded_source'),
+      41: made(41, 4, 'manual'),
+    })
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('redeploy')
+  })
+
+  test('one redeployable deployment is enough', async () => {
+    const api = apiFor({
+      31: made(31, 3, 'manual'),
+      41: deployment(41, 4, { branch: 'main', commit_hash: 'abc123' }),
+    })
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('redeploy')
   })
 })
 

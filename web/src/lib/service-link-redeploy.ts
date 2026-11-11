@@ -157,45 +157,54 @@ export async function redeployDeployment(
 const REDEPLOYABILITY_DEADLINE_MS = 4000
 
 /**
- * Whether the console can start a redeploy for at least one of `environments`.
+ * What the console can do for the live deployments of `environments`:
+ *
+ * - `redeploy`: at least one can be redeployed in place (or this cannot be
+ *   told, see below).
+ * - `upload`: every one was made from an uploaded archive, which the console
+ *   cannot rebuild, so the source has to be uploaded again.
+ * - `no-source`: every one is a manual or external deployment, which has
+ *   nothing to rebuild from and nothing to upload. The redeploy itself says
+ *   so; sending the user to an upload, or to a new-deployment dialog, would
+ *   hide that.
  *
  * Decided from each environment's current deployment, the way the redeploy
  * itself decides ({@link deploymentRedeployPlan}), not from the project's
  * source type: a project's type is its primary source, not a restriction, so a
  * manual project can run an image or a Git ref, and a Git project can hold an
- * uploaded archive. Only a deployment whose own source is an uploaded archive
- * has to be uploaded again, so only that makes this say no. A manual or
- * external deployment has no archive to upload either: for those the redeploy
- * itself explains that there is no reusable source, which is more accurate
- * than sending the user to an upload they never used.
+ * uploaded archive. A mix of the two unredeployable kinds stays `redeploy`,
+ * and the redeploy reports each environment on its own.
  *
  * It answers as soon as one environment is known to be redeployable, and gives
  * up waiting after a few seconds. When a deployment cannot be read, there is
- * nothing to decide, or the lookup is too slow, this says yes: the redeploy
- * itself reports why an environment was skipped, and withholding the action on
- * a failed read would regress working projects.
+ * nothing to decide, or the lookup is too slow, this says `redeploy`: the
+ * redeploy itself reports why an environment was skipped, and withholding the
+ * action on a failed read would regress working projects.
  */
-export async function canRedeployAnyInPlace(
+export type RedeployAvailability = 'redeploy' | 'upload' | 'no-source'
+
+export async function redeployAvailability(
   projectId: number,
   projectSourceType: SourceType,
   environments: EnvironmentResponse[],
   api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi,
   deadlineMs = REDEPLOYABILITY_DEADLINE_MS
-): Promise<boolean> {
-  if (environments.length === 0) return true
+): Promise<RedeployAvailability> {
+  if (environments.length === 0) return 'redeploy'
   const controller = new AbortController()
-  return new Promise<boolean>((resolve) => {
-    let unredeployable = 0
-    const finish = (redeployable: boolean) => {
+  return new Promise<RedeployAvailability>((resolve) => {
+    let uploads = 0
+    let withoutSource = 0
+    const finish = (availability: RedeployAvailability) => {
       clearTimeout(timer)
       // Stop reads that are still waiting: the answer is known.
       controller.abort()
-      resolve(redeployable)
+      resolve(availability)
     }
     // A lookup that never answers must not hold back the confirmation that
     // depends on it; without an answer the action is offered, as for a failed
     // read.
-    const timer = setTimeout(() => finish(true), deadlineMs)
+    const timer = setTimeout(() => finish('redeploy'), deadlineMs)
     for (const environment of environments) {
       void api
         .getDeployment({
@@ -208,17 +217,40 @@ export async function canRedeployAnyInPlace(
         })
         .then(({ data: deployment }) => {
           const plan = deploymentRedeployPlan(deployment, projectSourceType)
-          if (
-            plan.kind !== 'unsupported' ||
-            plan.sourceType !== 'uploaded_source'
-          )
-            return finish(true)
-          unredeployable += 1
-          if (unredeployable === environments.length) finish(false)
+          if (plan.kind !== 'unsupported') return finish('redeploy')
+          if (plan.sourceType === 'uploaded_source') uploads += 1
+          else withoutSource += 1
+          if (uploads + withoutSource < environments.length) return
+          if (withoutSource === 0) finish('upload')
+          else if (uploads === 0) finish('no-source')
+          else finish('redeploy')
         })
-        .catch(() => finish(true))
+        .catch(() => finish('redeploy'))
     }
   })
+}
+
+/**
+ * Whether the console should offer to redeploy rather than send the user to
+ * upload the source again: false only when every live deployment was made
+ * from an uploaded archive. See {@link redeployAvailability}.
+ */
+export async function canRedeployAnyInPlace(
+  projectId: number,
+  projectSourceType: SourceType,
+  environments: EnvironmentResponse[],
+  api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi,
+  deadlineMs = REDEPLOYABILITY_DEADLINE_MS
+): Promise<boolean> {
+  return (
+    (await redeployAvailability(
+      projectId,
+      projectSourceType,
+      environments,
+      api,
+      deadlineMs
+    )) !== 'upload'
+  )
 }
 
 /**

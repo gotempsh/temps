@@ -34,7 +34,7 @@ const environment = (id: number, slug: string, deployment: number) => ({
 })
 
 /** What each environment's live deployment was made from. */
-type Made = 'git' | 'image' | 'archive'
+type Made = 'git' | 'image' | 'archive' | 'manual'
 const deploymentOf = (id: number, made: Made) => ({
   id,
   ...(made === 'git' ? { branch: 'main', commit_hash: 'abc123' } : {}),
@@ -43,6 +43,10 @@ const deploymentOf = (id: number, made: Made) => ({
   // project's own source type is.
   ...(made === 'archive'
     ? { metadata: { deploymentSourceType: 'uploaded_source' } }
+    : {}),
+  // Nothing to rebuild and nothing to upload.
+  ...(made === 'manual'
+    ? { metadata: { deploymentSourceType: 'manual' } }
     : {}),
 })
 
@@ -164,6 +168,41 @@ test('after the redeployable environment is started, the archive left behind is 
     '/projects/synthetic-api/drop?environment=4'
   )
   expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
+})
+
+// The deploy dialog would offer the project's default source and say nothing of
+// why the running deployment cannot be redeployed; the redeploy itself does.
+test('on a project page, deployments with no source go straight to the redeploy, not the deploy dialog', async () => {
+  const api = serveEnvironments('manual')
+  const opened: OpenDeployOptions[] = []
+  const view = renderPrompt((children) => (
+    <ProjectDeployContext.Provider
+      value={{ openDeploy: (options) => opened.push(options ?? {}) }}
+    >
+      {children}
+    </ProjectDeployContext.Provider>
+  ))
+
+  // Re-query until the final button is there: the first one rendered, before
+  // the environments load, is replaced by the per-environment buttons and then
+  // by this one.
+  await waitFor(() =>
+    expect(
+      (view.getByRole('button', { name: /Redeploy now/ }) as HTMLButtonElement)
+        .disabled
+    ).toBe(false)
+  )
+  fireEvent.click(view.getByRole('button', { name: /Redeploy now/ }))
+  await waitFor(() =>
+    expect(
+      api.calls.filter((call) => call.path === '/projects/7/deployments/31')
+        .length
+    ).toBeGreaterThan(1)
+  )
+  expect(opened).toEqual([])
+  expect(api.calls.filter((call) => call.method !== 'GET')).toEqual([])
+  // Not sent to an upload they never made.
+  expect(view.queryByRole('link', { name: /Upload source again/ })).toBeNull()
 })
 
 test('a Git project whose live deployments are uploaded archives is sent to the upload page, not the Git dialog', async () => {

@@ -9,7 +9,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
-  canRedeployAnyInPlace,
+  redeployAvailability,
   environmentsToRedeploy,
   redeployCurrentDeployments,
   redeploySummary,
@@ -112,14 +112,20 @@ export function ServiceLinkRedeployPrompt({
       targets.map((e) => `${e.id}:${e.current_deployment_id}`),
     ],
     queryFn: () =>
-      canRedeployAnyInPlace(project.id, project.source_type, targets),
+      redeployAvailability(project.id, project.source_type, targets),
     enabled: change != null && environments.isSuccess && targets.length > 0,
   })
   if (!change || (environments.isSuccess && targets.length === 0)) return null
 
   // An uploaded archive cannot be rebuilt by the console, so the action opens
   // the upload instead of promising a redeploy that would be declined.
-  const redeployable = redeployability.data ?? true
+  const availability = redeployability.data ?? 'redeploy'
+  const redeployable = availability !== 'upload'
+  // Deployments with no source (manual, external) cannot be rebuilt or
+  // uploaded. The deploy dialog would offer the project's default source
+  // instead of saying so, so these go straight to the redeploy, which reports
+  // that there is no reusable source to rebuild from.
+  const useDeployDialog = deployDialog != null && availability !== 'no-source'
   const { title, description } = serviceLinkRedeployMessage(
     change,
     targets,
@@ -203,7 +209,7 @@ export function ServiceLinkRedeployPrompt({
                 </Link>
               </Button>
             )
-          ) : deployDialog && targets.length > 1 ? (
+          ) : useDeployDialog && targets.length > 1 ? (
             targets.map((environment) => (
               <Button
                 key={environment.id}
@@ -221,7 +227,7 @@ export function ServiceLinkRedeployPrompt({
             <Button
               size="sm"
               onClick={() =>
-                deployDialog
+                useDeployDialog
                   ? reviewRedeploy(firstTarget?.id)
                   : redeploy.mutate()
               }
