@@ -8,6 +8,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
@@ -18,12 +19,19 @@ import { MonitoringCard } from './MonitoringCard'
 installBrowserWindow()
 afterEach(cleanup)
 
-function renderCard(latest: Record<string, number>, cluster = false) {
+function renderCard(
+  latest: Record<string, number>,
+  cluster = false,
+  charted: string[] = []
+) {
   mockApi({
     'GET /external-services/3/metrics/latest': () => jsonResponse(latest),
     'GET /external-services/3/metrics/status': () =>
       jsonResponse({ last_received_at: null }),
-    'GET /external-services/3/metrics': () => jsonResponse([]),
+    'GET /external-services/3/metrics': (request) => {
+      charted.push(new URL(request.url).searchParams.get('metric') ?? '')
+      return jsonResponse([])
+    },
     'GET /external-services/3/metrics/alert-rules': () => jsonResponse([]),
   })
   render(
@@ -99,4 +107,25 @@ test("a single container's tile reads its own recorded usage", async () => {
 
   const label = await screen.findByText('CPU (cores, last scrape)')
   expect(label.nextElementSibling?.textContent).toBe('0.20 / 2 cores')
+})
+
+test("selecting a cluster's CPU tile charts its busiest member, not the mean of all members", async () => {
+  const charted: string[] = []
+  renderCard(CLUSTER_LATEST, true, charted)
+
+  fireEvent.click(await screen.findByText('CPU (cores, last scrape)'))
+  await waitFor(() =>
+    expect(charted).toContain('container.cluster_cpu_percent')
+  )
+  expect(charted).not.toContain('container.cpu_percent')
+  expect(await screen.findByText('CPU (cores, busiest member)')).toBeTruthy()
+})
+
+test("selecting a single container's CPU tile charts its own usage", async () => {
+  const charted: string[] = []
+  renderCard(CLUSTER_LATEST, false, charted)
+
+  fireEvent.click(await screen.findByText('CPU (cores, last scrape)'))
+  await waitFor(() => expect(charted).toContain('container.cpu_percent'))
+  expect(charted).not.toContain('container.cluster_cpu_percent')
 })

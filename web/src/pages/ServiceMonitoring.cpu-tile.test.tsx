@@ -3,7 +3,13 @@
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
@@ -53,7 +59,10 @@ describe('container CPU tiles on the monitoring dashboard', () => {
 // The latest cpu_percent is one member's (0.20 cores); the cluster reading,
 // limit and share are the busiest member's, 1.5 of 2 cores, as the health
 // monitor records a cluster. A single container has no cluster reading.
-function renderDashboard(topology: 'standalone' | 'cluster') {
+function renderDashboard(
+  topology: 'standalone' | 'cluster',
+  charted: string[] = []
+) {
   mockApi({
     'GET /external-services/3': () =>
       jsonResponse({
@@ -69,7 +78,10 @@ function renderDashboard(topology: 'standalone' | 'cluster') {
       }),
     'GET /external-services/3/metrics/status': () =>
       jsonResponse({ last_received_at: null }),
-    'GET /external-services/3/metrics': () => jsonResponse([]),
+    'GET /external-services/3/metrics': (request) => {
+      charted.push(new URL(request.url).searchParams.get('metric') ?? '')
+      return jsonResponse([])
+    },
     'GET /external-services/3/metrics/by-database': () =>
       jsonResponse({ databases: [] }),
     'GET /external-services/3/metrics/alert-rules': () => jsonResponse([]),
@@ -104,5 +116,27 @@ describe('the dashboard CPU tile for each topology', () => {
     renderDashboard('standalone')
     expect(await screen.findByText('0.20 / 2 cores')).toBeTruthy()
     expect(screen.queryByText('1.50 / 2 cores')).toBeNull()
+  })
+})
+
+describe('the dashboard CPU chart for each topology', () => {
+  test("a cluster's CPU tile charts its busiest member, not the mean of all members", async () => {
+    const charted: string[] = []
+    renderDashboard('cluster', charted)
+
+    fireEvent.click(await screen.findByText('1.50 / 2 cores'))
+    await waitFor(() =>
+      expect(charted).toContain('container.cluster_cpu_percent')
+    )
+    expect(charted).not.toContain('container.cpu_percent')
+  })
+
+  test("a single container's CPU tile charts its own usage", async () => {
+    const charted: string[] = []
+    renderDashboard('standalone', charted)
+
+    fireEvent.click(await screen.findByText('0.20 / 2 cores'))
+    await waitFor(() => expect(charted).toContain('container.cpu_percent'))
+    expect(charted).not.toContain('container.cluster_cpu_percent')
   })
 })

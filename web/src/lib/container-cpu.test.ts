@@ -10,6 +10,7 @@ import {
   CONTAINER_CPU_UTILIZATION_METRIC,
   alertableMetrics,
   containerCpuAxisWidth,
+  containerCpuChartMetric,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from './container-cpu'
@@ -201,5 +202,34 @@ describe('containerCpuAxisWidth', () => {
       containerCpuAxisWidth(CONTAINER_CPU_UTILIZATION_METRIC)
     ).toBeUndefined()
     expect(containerCpuAxisWidth('pg.connections')).toBeUndefined()
+  })
+})
+
+describe('containerCpuChartMetric', () => {
+  test("a cluster's CPU tile charts its busiest member, the reading it shows", () => {
+    expect(containerCpuChartMetric(CONTAINER_CPU_METRIC, true)).toBe(
+      CONTAINER_CLUSTER_CPU_METRIC
+    )
+  })
+
+  test('a single container and every other tile chart their own metric', () => {
+    expect(containerCpuChartMetric(CONTAINER_CPU_METRIC, false)).toBe(
+      CONTAINER_CPU_METRIC
+    )
+    expect(
+      containerCpuChartMetric(CONTAINER_CPU_UTILIZATION_METRIC, true)
+    ).toBe(CONTAINER_CPU_UTILIZATION_METRIC)
+  })
+
+  test('the busiest-member chart reads in cores, with room for its ticks', () => {
+    expect(formatContainerCpuMetric(CONTAINER_CLUSTER_CPU_METRIC, 150)).toBe(
+      '1.50 cores'
+    )
+    expect(containerCpuAxisWidth(CONTAINER_CLUSTER_CPU_METRIC)).toBe(
+      containerCpuAxisWidth(CONTAINER_CPU_METRIC)
+    )
+    expect(CONTAINER_CPU_METRIC_LABELS[CONTAINER_CLUSTER_CPU_METRIC]).toBe(
+      'CPU (cores, busiest member)'
+    )
   })
 })

@@ -31,6 +31,7 @@ import {
   CONTAINER_CPU_UTILIZATION_METRIC,
   alertableMetrics,
   containerCpuAxisWidth,
+  containerCpuChartMetric,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from '@/lib/container-cpu'
@@ -941,12 +942,13 @@ function LiveMetrics({
 
   const firingCount = 0
 
-  // Range chart data
+  // Range chart data: the series behind the selected tile.
+  const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
   const rangeLabel = HOURS_TO_RANGE[rangeHours] ?? '1h'
   const { data: rangeData, isLoading: rangeLoading } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
       path: { id: serviceId },
-      query: { metric: selectedMetric, range: rangeLabel },
+      query: { metric: chartMetric, range: rangeLabel },
     }),
     staleTime: 15_000,
     refetchInterval: 30_000,
@@ -1022,7 +1024,7 @@ function LiveMetrics({
       <div className="space-y-2 overflow-visible">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm font-medium">
-            {labelForMetric(selectedMetric)}
+            {labelForMetric(chartMetric)}
           </span>
           <div className="flex gap-1">
             {RANGE_OPTIONS.map((opt) => (
@@ -1070,17 +1072,17 @@ function LiveMetrics({
                   tickLine={false}
                   axisLine={false}
                   width={
-                    containerCpuAxisWidth(selectedMetric) ??
-                    (selectedMetric.endsWith('_ratio') ||
-                    selectedMetric.endsWith('_percent')
+                    containerCpuAxisWidth(chartMetric) ??
+                    (chartMetric.endsWith('_ratio') ||
+                    chartMetric.endsWith('_percent')
                       ? 56
-                      : selectedMetric.endsWith('_bytes')
+                      : chartMetric.endsWith('_bytes')
                         ? 60
                         : 44)
                   }
                   {...yAxisTickProps(
                     chartData.map((p) => p.value),
-                    { format: (v) => formatMetricValue(selectedMetric, v) }
+                    { format: (v) => formatMetricValue(chartMetric, v) }
                   )}
                 />
                 <Tooltip
@@ -1094,8 +1096,8 @@ function LiveMetrics({
                     formatChartTooltipLabel(Number(label))
                   }
                   formatter={(v) => [
-                    formatMetricValue(selectedMetric, Number(v)),
-                    labelForMetric(selectedMetric),
+                    formatMetricValue(chartMetric, Number(v)),
+                    labelForMetric(chartMetric),
                   ]}
                 />
                 <Line

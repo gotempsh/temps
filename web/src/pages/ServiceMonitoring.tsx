@@ -91,6 +91,7 @@ import {
   CONTAINER_CPU_UTILIZATION_METRIC,
   alertableMetrics,
   containerCpuAxisWidth,
+  containerCpuChartMetric,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from '@/lib/container-cpu'
@@ -1411,6 +1412,8 @@ function MonitoringDashboard({
     heroMetrics[0] ?? groups[0]?.metrics[0] ?? ''
   )
   const [range, setRange] = useState('1h')
+  // The series behind the selected tile.
+  const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
 
   const latestByName = new Map<string, number>()
   for (const m of latestMetrics) {
@@ -1492,10 +1495,10 @@ function MonitoringDashboard({
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium text-foreground">
-              {labelForMetric(selectedMetric)}
+              {labelForMetric(chartMetric)}
             </p>
             <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
-              {selectedMetric}
+              {chartMetric}
             </p>
           </div>
           <div className="flex shrink-0 gap-1">
@@ -1515,7 +1518,7 @@ function MonitoringDashboard({
         <div className="h-56 px-2 py-4 overflow-visible">
           <MetricChart
             serviceId={serviceId}
-            metricName={selectedMetric}
+            metricName={chartMetric}
             range={range}
           />
         </div>

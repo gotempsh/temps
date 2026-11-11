@@ -39,6 +39,22 @@ export const CONTAINER_CPU_METRIC_LABELS: Record<string, string> = {
   // Uncapped containers are measured against the host's cores, not a limit.
   [CONTAINER_CPU_UTILIZATION_METRIC]: 'CPU (% of limit or host)',
   [CONTAINER_CPU_LIMIT_METRIC]: 'CPU limit',
+  [CONTAINER_CLUSTER_CPU_METRIC]: 'CPU (cores, busiest member)',
+}
+
+/**
+ * The series a selected tile charts. A cluster's CPU tile shows its busiest
+ * member's cores, so its chart is that series too: charting
+ * `container.cpu_percent` would plot the mean of every member's labelled
+ * series, a different reading under the same tile.
+ */
+export function containerCpuChartMetric(
+  name: string,
+  cluster: boolean
+): string {
+  return cluster && name === CONTAINER_CPU_METRIC
+    ? CONTAINER_CLUSTER_CPU_METRIC
+    : name
 }
 
 /**
@@ -64,7 +80,9 @@ export function alertableMetrics(metrics: string[]): string[] {
  * text in a 52px axis. `undefined` for any other metric.
  */
 export function containerCpuAxisWidth(name: string): number | undefined {
-  return name === CONTAINER_CPU_METRIC ? 64 : undefined
+  return name === CONTAINER_CPU_METRIC || name === CONTAINER_CLUSTER_CPU_METRIC
+    ? 64
+    : undefined
 }
 
 /**
@@ -96,7 +114,8 @@ export function formatContainerCpuMetric(
   name: string,
   value: number
 ): string | null {
-  if (name === CONTAINER_CPU_METRIC) return formatCpuUsage(value, null)
+  if (name === CONTAINER_CPU_METRIC || name === CONTAINER_CLUSTER_CPU_METRIC)
+    return formatCpuUsage(value, null)
   if (name === CONTAINER_CPU_LIMIT_METRIC) {
     if (value <= 0) return 'unlimited'
     const cores = parseFloat(value.toFixed(3))
