@@ -48,6 +48,15 @@ pub enum TransportError {
         #[source]
         source: Box<AgentError>,
     },
+    /// The sandbox cannot host service access at all (an unsupported host or
+    /// a sandbox created without the proxy mount). The reason is the provider's
+    /// own operator-facing fix, never a provider response.
+    #[error("Cannot {operation} service access for sandbox {sandbox_id}: {reason}")]
+    Unsupported {
+        sandbox_id: String,
+        operation: &'static str,
+        reason: String,
+    },
 }
 fn invalid(id: &str, operation: &'static str, reason: &'static str) -> TransportError {
     TransportError::Invalid {
@@ -197,14 +206,22 @@ impl WorkerTransport {
             })?
     }
     fn provider_error(id: &str, operation: &'static str, source: AgentError) -> TransportError {
-        // The API response stays masked; the operator-only log carries the
-        // provider's reason (for example a sandbox image without the proxy
-        // mount) so the cause is findable without a debugger.
-        tracing::error!(sandbox_id = %id, operation, error = %source, "Sandbox provider failed a service access operation");
-        TransportError::Provider {
-            sandbox_id: id.into(),
-            operation,
-            source: Box::new(source),
+        match source {
+            AgentError::ServiceAccessUnavailable { reason, .. } => TransportError::Unsupported {
+                sandbox_id: id.into(),
+                operation,
+                reason,
+            },
+            source => {
+                // The API response stays masked; the operator-only log carries
+                // the provider's reason so the cause is findable.
+                tracing::error!(sandbox_id = %id, operation, error = %source, "Sandbox provider failed a service access operation");
+                TransportError::Provider {
+                    sandbox_id: id.into(),
+                    operation,
+                    source: Box::new(source),
+                }
+            }
         }
     }
     /// The caller loads and authorizes this sandbox row before inspection. A

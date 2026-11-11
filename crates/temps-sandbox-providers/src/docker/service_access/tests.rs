@@ -297,3 +297,31 @@ async fn unavailable_optional_mount_does_not_block_ordinary_sandbox_creation() {
     assert!(fake.calls().is_empty());
     assert_eq!(std::fs::read(not_a_directory).unwrap(), b"preserve");
 }
+
+#[tokio::test]
+async fn a_host_without_local_unix_mounts_reports_service_access_as_unavailable() {
+    let fake = FakeDocker::start().await.unwrap();
+    let provider =
+        DockerSandboxProvider::new(Arc::new(fake.docker()), DockerSandboxConfig::default());
+    let handle = SandboxHandle {
+        node_id: None,
+        sandbox_id: "sbx-test".into(),
+        sandbox_name: "temps-sandbox-test".into(),
+        work_dir: PathBuf::from("/workspace"),
+        backend: SandboxBackend::Docker,
+        image: String::new(),
+        conditions: vec![],
+    };
+    let error = provider
+        .service_access_command(
+            &handle,
+            crate::service_access::ServiceAccessCommand::Inspect,
+        )
+        .await
+        .unwrap_err();
+    let AgentError::ServiceAccessUnavailable { sandbox_id, reason } = error else {
+        panic!("expected ServiceAccessUnavailable, got {error:?}");
+    };
+    assert_eq!(sandbox_id, "sbx-test");
+    assert!(reason.contains("Linux host running Docker"), "{reason}");
+}
