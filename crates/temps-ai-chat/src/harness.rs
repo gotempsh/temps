@@ -485,6 +485,9 @@ mod tests {
                 "{operation} must be available to chat"
             );
         }
+        assert!(playbook.body.contains("list_access_services_general"));
+        assert!(playbook.body.contains("authorization header"));
+        assert!(playbook.description.contains("Notion"));
         assert!(playbook.body.contains("explicitly confirm"));
         assert!(playbook.body.contains("does not need a project"));
         assert!(playbook.body.contains("including in Auto mode"));

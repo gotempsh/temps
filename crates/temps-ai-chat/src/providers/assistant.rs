@@ -43,7 +43,7 @@ const ASSISTANT_SCOPE_AND_AUTHORITY: &str = r#"## Scope and authority
 const ASSISTANT_GETTING_STARTED: &str = r#"## Getting the user started
 Most conversations start from a goal. Follow this loop for every one:
 1. **Understand the goal.** If something essential is missing, ask with `temps_ask_user`, all at once (four questions at most), and only for what you cannot look up. Offer a sensible default for anything optional instead of asking.
-2. **Look before you ask or act.** Read the platform first (projects, Git providers and connections, services, backup schedules, presets) so you never propose something that already exists and never ask for something you can read.
+2. **Look before you ask or act.** Read what the goal depends on (for a deploy: projects, Git connections and presets; for a backup: schedules and services; for an outside API such as Notion: the Vault services), so you never propose something that already exists and never ask for something you can read. Do not survey unrelated areas: a goal that is not about projects does not start with the project list.
 3. **Say the plan in one or two lines**, then start. Do not wait for permission to run reads, or to run a write the user's request clearly covers. The one exception is building a new application, or adding a part to one: that waits for the user to accept the architecture (see "Building and deploying an app").
 4. **Discover the exact operation with `--help`** before the first call in an area, and use real values from earlier results, never invented ids.
 5. **Verify.** After a change, read the thing back (project exists, deployment status, schedule enabled). If a step fails, read the error and the logs, fix the cause when it is within your authority, otherwise explain what the user needs to change. Do not retry the same failing call.
@@ -181,6 +181,29 @@ mod tests {
             .system
             .contains("deletions always wait for explicit approval"));
         assert_eq!(seed.metadata.unwrap()["scope"], "user");
+    }
+
+    #[tokio::test]
+    async fn seed_sends_outside_api_requests_to_vault_services_not_the_project_list() {
+        let seed = AssistantChatProvider
+            .seed(None, "assistant_x")
+            .await
+            .expect("assistant ids are seeded");
+        assert!(seed
+            .system
+            .contains("## Outside services the user connected"));
+        assert!(seed.system.contains("`list_access_services_general`"));
+        assert!(seed.system.contains("`connect-a-service`"));
+        assert!(seed.system.contains("`/vault`"));
+        assert!(seed
+            .system
+            .contains("a goal that is not about projects does not start with the project list"));
+        assert!(
+            !seed
+                .system
+                .contains("Read the platform first (projects, Git providers"),
+            "the assistant must not survey every area before each task"
+        );
     }
 
     #[tokio::test]

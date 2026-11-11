@@ -862,7 +862,7 @@ function PendingActionCard({
     return (
       <div className="min-w-0 overflow-hidden rounded-lg border border-green-500/30 bg-green-500/5 text-xs">
         <GeneratedProjectCollection
-          title="Application services"
+          title="Application projects"
           presentation={committedApplicationProjects}
           framed={false}
         />

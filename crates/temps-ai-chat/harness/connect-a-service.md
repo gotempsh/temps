@@ -1,10 +1,19 @@
 ---
 name: connect-a-service
-description: Connect managed databases to apps or request time-limited vault access for a sandbox directly in chat
+description: Use an outside API the user saved in a Vault (Notion, Slack, Anthropic and similar) from a sandbox, or connect a managed database to an app
 contexts: assistant, project
 ---
 
 # Request vault access for a sandbox
+
+Start here when the user wants to use an outside API they connected (for
+example "try Notion"). Read `list_access_services_general` and match the
+provider name or origin host; never start with the project list and never ask
+what "access" means. No match: say no such service is configured and link
+`/vault`; do not substitute an app or a reachability check. A match: continue
+below, then call the service's origin from the sandbox with plain HTTPS and no
+authorization header, because Temps adds the credential. Only the methods and
+paths the service allows will go through.
 
 For a configured credential service in a vault, use the platform API tools to
 complete access approval in this chat. A sandbox does not need a project.
