@@ -18,7 +18,7 @@ import { MonitoringCard } from './MonitoringCard'
 installBrowserWindow()
 afterEach(cleanup)
 
-function renderCard(latest: Record<string, number>) {
+function renderCard(latest: Record<string, number>, cluster = false) {
   mockApi({
     'GET /external-services/3/metrics/latest': () => jsonResponse(latest),
     'GET /external-services/3/metrics/status': () =>
@@ -33,7 +33,12 @@ function renderCard(latest: Record<string, number>) {
       }
     >
       <MemoryRouter>
-        <MonitoringCard serviceId={3} engine="postgres" metricsEnabled />
+        <MonitoringCard
+          serviceId={3}
+          engine="postgres"
+          metricsEnabled
+          cluster={cluster}
+        />
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -70,4 +75,26 @@ test('a new alert rule defaults to CPU as a share of the limit, not cores × 100
   const dialog = await screen.findByRole('dialog')
   const [metric] = within(dialog).getAllByRole('combobox')
   expect(metric.textContent).toBe('CPU (% of limit or host)')
+})
+
+// One member's latest usage (0.20 cores) beside the busiest member's limit and
+// share (75% of 2 cores), as the health monitor records a cluster.
+const CLUSTER_LATEST = {
+  'container.cpu_percent': 20,
+  'container.cpu_limit_cores': 2,
+  'container.cpu_utilization_percent': 75,
+}
+
+test("a cluster's tile reads its busiest member's usage against that member's limit", async () => {
+  renderCard(CLUSTER_LATEST, true)
+
+  const label = await screen.findByText('CPU (cores, last scrape)')
+  expect(label.nextElementSibling?.textContent).toBe('1.50 / 2 cores')
+})
+
+test("a single container's tile reads its own recorded usage", async () => {
+  renderCard(CLUSTER_LATEST)
+
+  const label = await screen.findByText('CPU (cores, last scrape)')
+  expect(label.nextElementSibling?.textContent).toBe('0.20 / 2 cores')
 })

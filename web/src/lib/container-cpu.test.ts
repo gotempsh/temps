@@ -23,15 +23,16 @@ describe('containerCpuTileText', () => {
       lookupOf({
         [CONTAINER_CPU_METRIC]: 68.1,
         [CONTAINER_CPU_LIMIT_METRIC]: 6,
-      })
+      }),
+      false
     )
     expect(text).toBe('0.68 / 6 cores')
   })
 
   test('an uncapped container shows cores without a denominator', () => {
-    expect(containerCpuTileText(lookupOf({ [CONTAINER_CPU_METRIC]: 85 }))).toBe(
-      '0.85 cores'
-    )
+    expect(
+      containerCpuTileText(lookupOf({ [CONTAINER_CPU_METRIC]: 85 }), false)
+    ).toBe('0.85 cores')
   })
 
   test('more than one core reads above 1, never as a percentage over 100', () => {
@@ -39,7 +40,8 @@ describe('containerCpuTileText', () => {
       lookupOf({
         [CONTAINER_CPU_METRIC]: 240,
         [CONTAINER_CPU_LIMIT_METRIC]: 4,
-      })
+      }),
+      false
     )
     expect(text).toBe('2.40 / 4 cores')
   })
@@ -52,7 +54,23 @@ describe('containerCpuTileText', () => {
         [CONTAINER_CPU_METRIC]: 20,
         [CONTAINER_CPU_LIMIT_METRIC]: 2,
         [CONTAINER_CPU_UTILIZATION_METRIC]: 75,
-      })
+      }),
+      true
+    )
+    expect(text).toBe('1.50 / 2 cores')
+  })
+
+  test('a single container reads its own recorded usage, never an older share', () => {
+    // The limit could not be re-read on the latest ticks, so its share and
+    // limit kept older values (0.30 of 2 cores) while the usage recorded
+    // every tick moved on to 1.50 cores.
+    const text = containerCpuTileText(
+      lookupOf({
+        [CONTAINER_CPU_METRIC]: 150,
+        [CONTAINER_CPU_LIMIT_METRIC]: 2,
+        [CONTAINER_CPU_UTILIZATION_METRIC]: 15,
+      }),
+      false
     )
     expect(text).toBe('1.50 / 2 cores')
   })
@@ -63,14 +81,15 @@ describe('containerCpuTileText', () => {
         [CONTAINER_CPU_METRIC]: 85,
         [CONTAINER_CPU_LIMIT_METRIC]: 0,
         [CONTAINER_CPU_UTILIZATION_METRIC]: 5.3,
-      })
+      }),
+      true
     )
     expect(text).toBe('0.85 cores')
   })
 
   test('no sample yet shows a dash', () => {
     expect(
-      containerCpuTileText(lookupOf({ [CONTAINER_CPU_LIMIT_METRIC]: 6 }))
+      containerCpuTileText(lookupOf({ [CONTAINER_CPU_LIMIT_METRIC]: 6 }), false)
     ).toBe('—')
   })
 })
@@ -132,7 +151,8 @@ test('an uncapped limit (recorded as 0) reads without a denominator', () => {
       lookupOf({
         [CONTAINER_CPU_METRIC]: 68.1,
         [CONTAINER_CPU_LIMIT_METRIC]: 0,
-      })
+      }),
+      false
     )
   ).toBe('0.68 cores')
   expect(formatContainerCpuMetric(CONTAINER_CPU_LIMIT_METRIC, 0)).toBe(

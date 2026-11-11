@@ -677,9 +677,11 @@ function metricTileText(
 /** A tile's text when it reads more than its own metric. */
 function metricTileDisplay(
   name: string,
-  lookup: (metric: string) => number | undefined
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
 ): string | undefined {
-  if (name === CONTAINER_CPU_METRIC) return containerCpuTileText(lookup)
+  if (name === CONTAINER_CPU_METRIC)
+    return containerCpuTileText(lookup, cluster)
   return undefined
 }
 
@@ -1387,6 +1389,8 @@ type MonitoringDashboardProps = {
   /** Raw service type, named in the notice for engines without a collector. */
   serviceType: string
   latestMetrics: MetricLatest[]
+  /** The service runs as a cluster; see `containerCpuTileText`. */
+  cluster: boolean
 }
 
 function MonitoringDashboard({
@@ -1394,6 +1398,7 @@ function MonitoringDashboard({
   engine,
   serviceType,
   latestMetrics,
+  cluster,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
   // Container CPU/memory first — resource saturation is the first thing an
@@ -1467,7 +1472,11 @@ function MonitoringDashboard({
               key={name}
               name={name}
               value={metricTileValue(name, (m) => latestByName.get(m))}
-              display={metricTileDisplay(name, (m) => latestByName.get(m))}
+              display={metricTileDisplay(
+                name,
+                (m) => latestByName.get(m),
+                cluster
+              )}
               selected={selectedMetric === name}
               onClick={() => setSelectedMetric(name)}
               alert={firingBySeverity.get(name)}
@@ -1526,7 +1535,11 @@ function MonitoringDashboard({
                 key={name}
                 name={name}
                 value={metricTileValue(name, (m) => latestByName.get(m))}
-                display={metricTileDisplay(name, (m) => latestByName.get(m))}
+                display={metricTileDisplay(
+                  name,
+                  (m) => latestByName.get(m),
+                  cluster
+                )}
                 selected={selectedMetric === name}
                 onClick={() => setSelectedMetric(name)}
                 alert={firingBySeverity.get(name)}
@@ -1751,6 +1764,7 @@ export function ServiceMonitoring() {
               engine={engine}
               serviceType={serviceData?.service?.service_type ?? ''}
               latestMetrics={latestMetrics}
+              cluster={serviceData?.service?.topology === 'cluster'}
             />
           )}
         </div>

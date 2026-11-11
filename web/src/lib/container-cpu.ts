@@ -67,19 +67,26 @@ export function containerCpuAxisWidth(name: string): number | undefined {
 /**
  * The CPU tile's text, e.g. "0.68 / 6 cores", from the latest values.
  *
- * Under a limit, cores used come from the share of that limit, which is
- * recorded with it in the same tick: for a cluster both are its busiest
- * member's, while the latest `container.cpu_percent` may be any member's and
- * would pair one member's usage with another's limit. Uncapped (or with no
- * share yet), `container.cpu_percent` is read as is.
+ * A single container reads its own `container.cpu_percent`, recorded every
+ * health check, against its limit. A cluster's limit and share of limit are
+ * its busiest member's, written together, while its latest
+ * `container.cpu_percent` may be any member's: under a limit, a cluster's
+ * cores come from that pair (share × limit), so usage and limit belong to one
+ * container. Uncapped (or with no share yet), `container.cpu_percent` is read
+ * as is.
+ *
+ * Only a cluster derives cores from the pair: a single container's share and
+ * limit stop being recorded on a tick where its limit cannot be read, and
+ * would then show older usage than `container.cpu_percent`.
  */
 export function containerCpuTileText(
-  lookup: (metric: string) => number | undefined
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
 ): string {
   const limit = lookup(CONTAINER_CPU_LIMIT_METRIC)
   const share = lookup(CONTAINER_CPU_UTILIZATION_METRIC)
   const cpuPercent =
-    limit != null && limit > 0 && share != null
+    cluster && limit != null && limit > 0 && share != null
       ? share * limit
       : lookup(CONTAINER_CPU_METRIC)
   return formatCpuUsage(cpuPercent, limit)

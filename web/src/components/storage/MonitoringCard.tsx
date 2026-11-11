@@ -434,9 +434,11 @@ function statTileHint(name: string): string | undefined {
 // same way the resources card shows it.
 function statTileText(
   name: string,
-  lookup: (metric: string) => number | undefined
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
 ): string {
-  if (name === CONTAINER_CPU_METRIC) return containerCpuTileText(lookup)
+  if (name === CONTAINER_CPU_METRIC)
+    return containerCpuTileText(lookup, cluster)
   const latest = metricTileValue(name, lookup)
   return latest != null ? formatMetricValue(name, latest) : '—'
 }
@@ -896,6 +898,8 @@ type LiveMetricsProps = {
   /** Raw service type, named in the notice for engines without a collector. */
   serviceType: string
   latestMetrics: MetricLatest[]
+  /** The service runs as a cluster; see `containerCpuTileText`. */
+  cluster: boolean
 }
 
 // --chart-1 is oklch(0.59 0.2032 256.82) = #0070f3 in globals.css.
@@ -908,6 +912,7 @@ function LiveMetrics({
   engine,
   serviceType,
   latestMetrics,
+  cluster,
 }: LiveMetricsProps) {
   // Container CPU/memory first — resource saturation is the first thing an
   // operator checks — then the engine-specific headline stats.
@@ -981,7 +986,11 @@ function LiveMetrics({
       <div className="@container">
         <div className="grid grid-cols-2 gap-2 @lg:grid-cols-3 @3xl:grid-cols-6">
           {statMetrics.map((name) => {
-            const text = statTileText(name, (m) => latestByName.get(m)?.value)
+            const text = statTileText(
+              name,
+              (m) => latestByName.get(m)?.value,
+              cluster
+            )
             const isSelected = name === selectedMetric
             return (
               <button
@@ -1125,6 +1134,8 @@ export interface MonitoringCardProps {
   /** Called after monitoring is toggled on/off so the parent can refetch the
    *  service (which owns the `metricsEnabled` flag). */
   onMonitoringChange?: () => void
+  /** The service runs as a cluster (more than one container). */
+  cluster?: boolean
 }
 
 /**
@@ -1139,6 +1150,7 @@ export function MonitoringCard({
   dockerImage,
   metricsEnabled = false,
   onMonitoringChange,
+  cluster = false,
 }: MonitoringCardProps) {
   const queryClient = useQueryClient()
   const normalEngine = serviceMetricsEngine(engine, dockerImage)
@@ -1358,6 +1370,7 @@ export function MonitoringCard({
           engine={normalEngine}
           serviceType={engine}
           latestMetrics={latestMetrics}
+          cluster={cluster}
         />
       </CardContent>
     </Card>
