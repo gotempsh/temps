@@ -105,6 +105,9 @@ pub enum ServerTlsError {
         previous: ServerTlsMode,
         /// What became of the database: whether it serves `previous` again.
         rollback: String,
+        /// Whether `previous` is recorded again. When it is not, `mode`
+        /// stays recorded, and the change is audited.
+        previous_recorded: bool,
         #[source]
         source: Box<ExternalServiceError>,
     },
@@ -119,12 +122,14 @@ pub enum ServerTlsError {
         name: String,
         mode: ServerTlsMode,
         previous: ServerTlsMode,
-        /// Whether `previous` is recorded again.
+        /// Whether `previous` is recorded again, in words.
         rollback: String,
+        /// Whether `previous` is recorded again.
+        previous_recorded: bool,
     },
     #[error(
         "Failed to apply server TLS mode '{mode}' to cluster service {service_id}; \
-         the previous mode '{previous}' was restored: {failures}"
+         {rollback}: {failures}"
     )]
     ClusterApply {
         service_id: i32,
@@ -132,6 +137,21 @@ pub enum ServerTlsError {
         previous: ServerTlsMode,
         /// One `member: reason` entry per data node that did not converge.
         failures: String,
+        /// What became of the setting: whether `previous` is recorded again.
+        rollback: String,
+        /// Whether `previous` is recorded again.
+        previous_recorded: bool,
+    },
+    #[error(
+        "The server TLS mode of external service {service_id} was changed from '{previous}' \
+         to '{mode}', but reading its resulting TLS status failed: {source}"
+    )]
+    StatusUnavailable {
+        service_id: i32,
+        mode: ServerTlsMode,
+        previous: ServerTlsMode,
+        #[source]
+        source: Box<ServerTlsError>,
     },
     #[error(
         "Changing the server TLS mode of external service {service_id} to '{mode}' did not \
@@ -146,6 +166,36 @@ pub enum ServerTlsError {
     Service(#[from] ExternalServiceError),
     #[error(transparent)]
     Storage(#[from] ManagedTlsError),
+}
+
+impl ServerTlsError {
+    /// `(previous, recorded)` when this failure still left a different mode
+    /// recorded than before the change: the change was written, so it must
+    /// be audited like a successful one.
+    pub fn recorded_change(&self) -> Option<(ServerTlsMode, ServerTlsMode)> {
+        match self {
+            Self::StatusUnavailable { previous, mode, .. }
+            | Self::Apply {
+                previous,
+                mode,
+                previous_recorded: false,
+                ..
+            }
+            | Self::NotApplied {
+                previous,
+                mode,
+                previous_recorded: false,
+                ..
+            }
+            | Self::ClusterApply {
+                previous,
+                mode,
+                previous_recorded: false,
+                ..
+            } => (previous != mode).then_some((*previous, *mode)),
+            _ => None,
+        }
+    }
 }
 
 /// What the running container does about TLS.
@@ -669,6 +719,71 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use sea_orm::{DatabaseBackend, MockDatabase};
+
+    /// Only a failure that left a different mode recorded counts as a
+    /// change to audit.
+    #[test]
+    fn a_failure_is_a_recorded_change_only_when_the_new_mode_stays() {
+        use ServerTlsMode::{Available, Off};
+        let source = || Box::new(ExternalServiceError::ServiceNotFound { id: 7 });
+        let apply = |previous_recorded| ServerTlsError::Apply {
+            service_id: 7,
+            mode: Available,
+            previous: Off,
+            rollback: String::new(),
+            previous_recorded,
+            source: source(),
+        };
+        assert_eq!(apply(true).recorded_change(), None);
+        assert_eq!(apply(false).recorded_change(), Some((Off, Available)));
+
+        let not_applied = |previous_recorded| ServerTlsError::NotApplied {
+            service_id: 7,
+            name: "orders".into(),
+            mode: Available,
+            previous: Off,
+            rollback: String::new(),
+            previous_recorded,
+        };
+        assert_eq!(not_applied(true).recorded_change(), None);
+        assert_eq!(not_applied(false).recorded_change(), Some((Off, Available)));
+
+        let cluster = |previous_recorded| ServerTlsError::ClusterApply {
+            service_id: 7,
+            mode: Available,
+            previous: Off,
+            failures: "postgres-orders-1: exit 5".into(),
+            rollback: String::new(),
+            previous_recorded,
+        };
+        assert_eq!(cluster(true).recorded_change(), None);
+        assert_eq!(cluster(false).recorded_change(), Some((Off, Available)));
+
+        let unavailable = |previous| ServerTlsError::StatusUnavailable {
+            service_id: 7,
+            mode: Available,
+            previous,
+            source: Box::new(ServerTlsError::NotFound { service_id: 7 }),
+        };
+        assert_eq!(unavailable(Off).recorded_change(), Some((Off, Available)));
+        // Re-selecting the same mode is no change.
+        assert_eq!(unavailable(Available).recorded_change(), None);
+
+        // Failures before anything was written are not changes.
+        assert_eq!(
+            ServerTlsError::NotFound { service_id: 7 }.recorded_change(),
+            None
+        );
+        assert_eq!(
+            ServerTlsError::ChangeAborted {
+                service_id: 7,
+                mode: Available,
+                reason: "task 3 panicked".into(),
+            }
+            .recorded_change(),
+            None
+        );
+    }
 
     fn encryption() -> Arc<EncryptionService> {
         Arc::new(EncryptionService::new_from_password("managed-tls-test"))

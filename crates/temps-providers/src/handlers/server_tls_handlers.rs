@@ -282,6 +282,14 @@ impl From<ServerTlsError> for Problem {
                 .value("service_id", service_id)
                 .value("mode", mode.as_str())
                 .build(),
+            ServerTlsError::StatusUnavailable {
+                service_id, mode, ..
+            } => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Server TLS Status Unavailable")
+                .detail(detail)
+                .value("service_id", service_id)
+                .value("mode", mode.as_str())
+                .build(),
             ServerTlsError::ChangeAborted {
                 service_id, mode, ..
             } => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -387,45 +395,68 @@ pub async fn update_service_tls(
     }))
 }
 
-/// Change the mode, then audit-log the change when the mode moved.
+/// Change the mode, then audit-log the change when the recorded mode moved:
+/// after a success, and after a failure that still left the new mode
+/// recorded (its rollback could not record the previous one again, or the
+/// resulting status could not be read).
 async fn change_and_audit(
     app_state: Arc<AppState>,
     id: i32,
     mode: ServerTlsMode,
     context: AuditContext,
 ) -> Result<(ServerTlsMode, ServiceTlsStatus), ServerTlsError> {
-    let (previous, status) = app_state
+    match app_state
         .external_service_manager
         .set_service_tls_mode(id, mode)
-        .await?;
-    if previous != status.mode {
-        let service = app_state.external_service_manager.get_service(id).await;
-        let (name, service_type) = match service {
-            Ok(service) => (service.name, service.service_type),
-            Err(_) => (String::new(), String::new()),
-        };
-        let audit = ExternalServiceTlsModeChangedAudit {
-            context,
-            service_id: id,
-            name,
-            service_type,
-            previous_mode: previous,
-            new_mode: status.mode,
-        };
-        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-            error!(
-                service_id = id,
-                "Failed to create audit log for a server TLS mode change: {}", e
-            );
+        .await
+    {
+        Ok((previous, status)) => {
+            if previous != status.mode {
+                audit_mode_change(&app_state, id, previous, status.mode, context).await;
+            }
+            Ok((previous, status))
         }
-        info!(
+        Err(error) => {
+            if let Some((previous, recorded)) = error.recorded_change() {
+                audit_mode_change(&app_state, id, previous, recorded, context).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn audit_mode_change(
+    app_state: &AppState,
+    id: i32,
+    previous: ServerTlsMode,
+    recorded: ServerTlsMode,
+    context: AuditContext,
+) {
+    let service = app_state.external_service_manager.get_service(id).await;
+    let (name, service_type) = match service {
+        Ok(service) => (service.name, service.service_type),
+        Err(_) => (String::new(), String::new()),
+    };
+    let audit = ExternalServiceTlsModeChangedAudit {
+        context,
+        service_id: id,
+        name,
+        service_type,
+        previous_mode: previous,
+        new_mode: recorded,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
             service_id = id,
-            previous_mode = %previous,
-            mode = %status.mode,
-            "Server TLS mode of external service changed"
+            "Failed to create audit log for a server TLS mode change: {}", e
         );
     }
-    Ok((previous, status))
+    info!(
+        service_id = id,
+        previous_mode = %previous,
+        mode = %recorded,
+        "Server TLS mode of external service changed"
+    );
 }
 
 #[utoipa::path(
@@ -887,6 +918,58 @@ mod tests {
         assert_eq!(body["context"]["user_id"], 42);
     }
 
+    /// A change that was written but whose resulting status could not be
+    /// read fails, and is still audited: the new mode is recorded.
+    #[tokio::test]
+    async fn a_change_whose_status_cannot_be_read_is_still_audited() {
+        let audit = RecordingAuditLogger::default();
+        let svc = service("postgres", "stopped");
+        let db = owned(MockDatabase::new(DatabaseBackend::Postgres), &svc)
+            .append_query_results([vec![svc.clone()]])
+            .append_query_results([vec![svc.clone()]])
+            .append_query_results([Vec::<postgres_major_upgrades::Model>::new()])
+            .append_query_results([Vec::<external_service_tls::Model>::new()])
+            .append_query_results([Vec::<managed_service_certificate_authorities::Model>::new()])
+            // set_mode: no row, then the inserted row
+            .append_query_results([Vec::<external_service_tls::Model>::new()])
+            .append_query_results([vec![tls_row("available")]])
+            // the resulting status cannot be read
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".into())])
+            // the audit's service lookup
+            .append_query_results([vec![svc.clone()]]);
+        let app = state(db, audit.clone());
+        let (status, body) = body_json(
+            update_service_tls(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(7),
+                Extension(metadata()),
+                Json(UpdateServiceTlsRequest {
+                    mode: ServerTlsMode::Available,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["title"], "Server TLS Status Unavailable", "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("was changed from 'off' to 'available'"),
+            "{body}"
+        );
+
+        let operations = audit.operations.lock().unwrap().clone();
+        assert_eq!(operations.len(), 1, "{operations:?}");
+        let (kind, body) = &operations[0];
+        assert_eq!(kind, "EXTERNAL_SERVICE_TLS_MODE_CHANGED");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["previous_mode"], "off");
+        assert_eq!(body["new_mode"], "available");
+    }
+
     /// A client that hangs up mid-change still leaves the change audited.
     #[tokio::test]
     async fn a_change_whose_request_is_dropped_is_still_audited() {
@@ -1189,6 +1272,7 @@ mod tests {
                     mode: ServerTlsMode::Available,
                     previous: ServerTlsMode::Off,
                     rollback: "the previous mode is recorded again".into(),
+                    previous_recorded: true,
                 },
                 StatusCode::CONFLICT,
             ),
@@ -1198,6 +1282,17 @@ mod tests {
                     mode: ServerTlsMode::Available,
                     previous: ServerTlsMode::Off,
                     failures: "postgres-orders-1: exit 5".into(),
+                    rollback: "the previous mode 'off' is restored".into(),
+                    previous_recorded: true,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ServerTlsError::StatusUnavailable {
+                    service_id: 3,
+                    mode: ServerTlsMode::Available,
+                    previous: ServerTlsMode::Off,
+                    source: Box::new(ServerTlsError::NotFound { service_id: 3 }),
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),

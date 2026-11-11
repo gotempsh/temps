@@ -58,12 +58,13 @@ fn standalone_mid_start(status: &str) -> bool {
 /// attempt had stopped it). Not after the recreate guard's verdict
 /// (`reinitialize` false): re-initializing then would recreate over an
 /// original that may still be set aside, or start a replacement that failed
-/// verification. Returns what happened, for the error.
+/// verification. Returns what happened, for the error, and whether the
+/// previous mode is recorded again.
 async fn standalone_rollback<R, RE, F, Fut, FE>(
     record_previous: R,
     reinitialize: bool,
     reapply: F,
-) -> String
+) -> (String, bool)
 where
     R: std::future::Future<Output = Result<ServerTlsMode, RE>>,
     RE: std::fmt::Display,
@@ -72,23 +73,31 @@ where
     FE: std::fmt::Display,
 {
     if let Err(error) = record_previous.await {
-        return format!(
-            "it could not be recorded again ({error}), so the database was left as the \
-             failed attempt left it; the TLS status shows what it serves"
+        return (
+            format!(
+                "it could not be recorded again ({error}), so the new mode stays recorded and \
+                 the database was left as the failed attempt left it; the TLS status shows \
+                 what it serves"
+            ),
+            false,
         );
     }
     if !reinitialize {
-        return "it is recorded, but the database was not re-initialized: the recreate guard \
-                stopped the change (below), and its container is left as the guard left it"
-            .to_string();
+        return (
+            "it is recorded, but the database was not re-initialized: the recreate guard \
+             stopped the change (below), and its container is left as the guard left it"
+                .to_string(),
+            true,
+        );
     }
-    match reapply().await {
+    let outcome = match reapply().await {
         Ok(()) => "the database serves it again".to_string(),
         Err(error) => format!(
             "it is recorded, but putting the database back on it failed too ({error}); \
              the TLS status shows what it serves and its next start applies it"
         ),
-    }
+    };
+    (outcome, true)
 }
 
 /// After a running standalone was re-initialized for a new TLS mode: the
@@ -111,11 +120,15 @@ where
     if !served.pending_restart() {
         return None;
     }
-    let rollback = match record_previous.await {
-        Ok(_) => "the previous mode is recorded again".to_string(),
-        Err(error) => format!(
-            "recording the previous mode again failed ({error}), so the TLS status shows the \
-             setting ahead of the container until its next start"
+    let (rollback, previous_recorded) = match record_previous.await {
+        Ok(_) => ("the previous mode is recorded again".to_string(), true),
+        Err(error) => (
+            format!(
+                "recording the previous mode again failed ({error}), so the new mode stays \
+                 recorded and the TLS status shows the setting ahead of the container until \
+                 its next start"
+            ),
+            false,
         ),
     };
     Some(ServerTlsError::NotApplied {
@@ -124,6 +137,7 @@ where
         mode,
         previous,
         rollback,
+        previous_recorded,
     })
 }
 
@@ -852,7 +866,7 @@ impl ExternalServiceManager {
             // created, starting or stopped only records the mode, which its
             // initialization or next start applies: initializing it here
             // would race the creation or start in progress.
-            if let Err(error) = self.initialize_service(service_id).await {
+            if let Err(error) = self.initialize_service_holding(service_id, &held).await {
                 warn!(
                     service_id,
                     mode = %mode,
@@ -863,10 +877,10 @@ impl ExternalServiceManager {
                 // The failure may come after the container was already
                 // replaced (a later status write), or after the original was
                 // stopped: put the database itself back, not only the row.
-                let rollback = standalone_rollback(
+                let (rollback, previous_recorded) = standalone_rollback(
                     tls.set_mode(service_id, previous),
                     !Self::is_recreate_guard_verdict(&error),
-                    || self.initialize_service(service_id),
+                    || self.initialize_service_holding(service_id, &held),
                 )
                 .await;
                 warn!(service_id, previous = %previous, rollback = %rollback, "Server TLS mode rollback");
@@ -875,10 +889,14 @@ impl ExternalServiceManager {
                     mode,
                     previous,
                     rollback,
+                    previous_recorded,
                     source: Box::new(error),
                 });
             }
-            let served = self.tls_status_for(&service, &parameters).await?;
+            let served = self
+                .tls_status_for(&service, &parameters)
+                .await
+                .map_err(|error| status_unavailable(service_id, mode, previous, error))?;
             if let Some(error) = standalone_not_applied(
                 &service,
                 mode,
@@ -900,7 +918,10 @@ impl ExternalServiceManager {
             mode = %mode,
             "Server TLS mode of external service changed"
         );
-        let status = self.tls_status_for(&service, &parameters).await?;
+        let status = self
+            .tls_status_for(&service, &parameters)
+            .await
+            .map_err(|error| status_unavailable(service_id, mode, previous, error))?;
         Ok((previous, status))
     }
 
@@ -941,33 +962,82 @@ impl ExternalServiceManager {
             "Applying the server TLS mode to the cluster failed; restoring the previous mode"
         );
         let tls = self.managed_tls();
-        match tls.set_mode(service.id, previous).await {
-            Ok(_) => match self.apply_cluster_server_tls_holding(service, held).await {
-                Ok(report) if report.failed.is_empty() => {}
-                Ok(report) => warn!(
-                    service_id = service.id,
-                    failures = %report.describe_failures(),
-                    "Some data nodes could not be put back on the previous server TLS mode; \
-                     the TLS status lists them and the next start retries"
-                ),
-                Err(error) => warn!(
+        let (rollback, previous_recorded) = match tls.set_mode(service.id, previous).await {
+            Ok(_) => {
+                let rollback = match self.apply_cluster_server_tls_holding(service, held).await {
+                    Ok(report) if report.failed.is_empty() => {
+                        format!("the previous mode '{previous}' is restored")
+                    }
+                    Ok(report) => {
+                        let failures = report.describe_failures();
+                        warn!(
+                            service_id = service.id,
+                            failures = %failures,
+                            "Some data nodes could not be put back on the previous server TLS mode; \
+                             the TLS status lists them and the next start retries"
+                        );
+                        format!(
+                            "the previous mode '{previous}' is recorded again, but putting some \
+                             data nodes back on it failed ({failures}); the TLS status lists them \
+                             and their next start applies it"
+                        )
+                    }
+                    Err(error) => {
+                        warn!(
+                            service_id = service.id,
+                            error = %error,
+                            "Could not put the cluster back on the previous server TLS mode"
+                        );
+                        format!(
+                            "the previous mode '{previous}' is recorded again, but putting the \
+                             cluster back on it failed ({error}); the TLS status shows what each \
+                             data node serves"
+                        )
+                    }
+                };
+                (rollback, true)
+            }
+            Err(error) => {
+                warn!(
                     service_id = service.id,
                     error = %error,
-                    "Could not put the cluster back on the previous server TLS mode"
-                ),
-            },
-            Err(error) => warn!(
-                service_id = service.id,
-                error = %error,
-                "Failed to restore the previous server TLS mode"
-            ),
-        }
+                    "Failed to restore the previous server TLS mode"
+                );
+                (
+                    format!(
+                        "recording the previous mode '{previous}' again failed ({error}), so \
+                         '{mode}' stays recorded and the TLS status shows what each data node \
+                         serves"
+                    ),
+                    false,
+                )
+            }
+        };
         Err(ServerTlsError::ClusterApply {
             service_id: service.id,
             mode,
             previous,
             failures,
+            rollback,
+            previous_recorded,
         })
+    }
+}
+
+/// A change whose new mode is already recorded, and possibly applied, but
+/// whose resulting status could not be read: still a change, so it is
+/// audited, but not one to report as done.
+fn status_unavailable(
+    service_id: i32,
+    mode: ServerTlsMode,
+    previous: ServerTlsMode,
+    error: ServerTlsError,
+) -> ServerTlsError {
+    ServerTlsError::StatusUnavailable {
+        service_id,
+        mode,
+        previous,
+        source: Box::new(error),
     }
 }
 
@@ -1022,7 +1092,7 @@ mod tests {
         )
         .await;
         assert!(reapplied.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(outcome, "the database serves it again");
+        assert_eq!(outcome, ("the database serves it again".to_string(), true));
 
         let outcome = standalone_rollback(
             async { Ok::<_, String>(ServerTlsMode::Available) },
@@ -1030,8 +1100,13 @@ mod tests {
             || async { Err::<(), _>("container 'postgres-orders' did not start".to_string()) },
         )
         .await;
-        assert!(outcome.contains("putting the database back on it failed too"));
-        assert!(outcome.contains("container 'postgres-orders' did not start"));
+        assert!(outcome
+            .0
+            .contains("putting the database back on it failed too"));
+        assert!(outcome
+            .0
+            .contains("container 'postgres-orders' did not start"));
+        assert!(outcome.1, "the previous mode is recorded again");
 
         // Without the previous mode recorded, re-initialising would apply the
         // failed one again: it is not attempted.
@@ -1046,7 +1121,11 @@ mod tests {
         )
         .await;
         assert!(!reapplied.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(outcome.contains("could not be recorded again (connection reset)"));
+        assert!(outcome
+            .0
+            .contains("could not be recorded again (connection reset)"));
+        // The new mode stays recorded: the change must still be audited.
+        assert!(!outcome.1, "the previous mode is not recorded again");
 
         // After the recreate guard's verdict the database is never
         // re-initialized, though the previous mode is recorded again.
@@ -1066,7 +1145,8 @@ mod tests {
         .await;
         assert!(recorded.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!reapplied.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(outcome.contains("not re-initialized"));
+        assert!(outcome.0.contains("not re-initialized"));
+        assert!(outcome.1);
     }
 
     /// A start that kept the original container (the recreate guard refused
@@ -1124,6 +1204,7 @@ mod tests {
         );
         assert!(message.contains("still serves 'off'"), "{message}");
         assert!(message.contains("recorded again"), "{message}");
+        assert_eq!(outcome.recorded_change(), None, "the previous mode is back");
 
         let outcome = standalone_not_applied(
             &service,
@@ -1135,6 +1216,11 @@ mod tests {
         .await
         .expect("an unapplied mode is an error");
         assert!(outcome.to_string().contains("failed (connection reset)"));
+        // The new mode stays recorded, so the failed change is still audited.
+        assert_eq!(
+            outcome.recorded_change(),
+            Some((ServerTlsMode::Available, ServerTlsMode::Off))
+        );
     }
 
     #[test]
@@ -1218,6 +1304,37 @@ mod tests {
             change.await,
             Err(ServerTlsError::Service(_)) | Err(ServerTlsError::NotFound { .. })
         ));
+    }
+
+    /// A standalone's initialization and start take the same lock as a TLS
+    /// change: neither may rewrite the certificate directory or recreate
+    /// the container while a change or its rollback does.
+    #[tokio::test]
+    async fn initialization_and_start_wait_while_a_tls_change_holds_the_service() {
+        let manager = manager_without_data();
+        let lock = manager.service_tls_locks.for_service(7).await;
+        let held = lock.lock().await;
+        let initialize = manager.initialize_service(7);
+        let start = manager.start_service(7);
+        tokio::pin!(initialize);
+        tokio::pin!(start);
+        // The mock database has no rows: one that did not wait would fail at
+        // once looking the service up, instead of still pending.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut initialize)
+                .await
+                .is_err(),
+            "initialization must wait for the TLS change"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut start)
+                .await
+                .is_err(),
+            "a start must wait for the TLS change"
+        );
+        drop(held);
+        assert!(initialize.await.is_err(), "it ran once the lock was free");
+        assert!(start.await.is_err(), "it ran once the lock was free");
     }
 
     /// A request dropped while its change waits for (or holds) the TLS
