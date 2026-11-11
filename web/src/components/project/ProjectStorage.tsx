@@ -53,6 +53,13 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
+import {
+  CONTAINER_CPU_METRIC,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
+import { formatCpuUsage } from '@/lib/cpu-format'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
@@ -64,11 +71,14 @@ import { toast } from 'sonner'
 function ResourceSparkline({
   serviceId,
   metric,
+  historyMetric,
   label,
   format,
 }: {
   serviceId: number
   metric: string
+  /** Charted before `metric` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   label: string
   format: (value: number) => string
 }) {
@@ -82,9 +92,22 @@ function ResourceSparkline({
     // Metrics disabled on the service → the endpoint 503s; don't retry-spam.
     retry: false,
   })
+  const { data: historyData } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metric, range: '1h' },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    retry: false,
+  })
 
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
   // Trend glyph only: buckets nothing was sampled in (`null`) are dropped.
-  const values = (data ?? [])
+  const values = points
     .map((p) => p.value)
     .filter((v): v is number => v != null && Number.isFinite(v))
   if (values.length === 0) return null
@@ -100,7 +123,7 @@ function ResourceSparkline({
   )
 }
 
-function ServiceRow({
+export function ServiceRow({
   service,
   isLinked,
   isBusy,
@@ -129,6 +152,12 @@ function ServiceRow({
     : `/storage/${service.id}`
 
   const goToPrimary = () => navigate(primaryHref)
+  // A cluster's `container.cpu_percent` is one series per member, which a
+  // range query averages; read its busiest member, as its service page does.
+  const cpuMetric = containerCpuChartMetric(
+    CONTAINER_CPU_METRIC,
+    service.topology === 'cluster'
+  )
 
   return (
     <li
@@ -192,9 +221,13 @@ function ServiceRow({
         <>
           <ResourceSparkline
             serviceId={service.id}
-            metric="container.cpu_percent"
+            metric={cpuMetric}
+            historyMetric={containerCpuHistoryMetric(
+              CONTAINER_CPU_METRIC,
+              cpuMetric
+            )}
             label="CPU"
-            format={(v) => `${v.toFixed(1)}%`}
+            format={(v) => formatCpuUsage(v, null)}
           />
           <ResourceSparkline
             serviceId={service.id}

@@ -23,4 +23,10 @@ mod readiness;
 mod remote;
 mod runtime_limits;
 mod server_tls;
+mod stats_poll;
+
 pub(super) use server_tls::ServiceTlsLocks;
+pub use stats_poll::{
+    cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
+    CPU_LIMIT_REFRESH,
+};
