@@ -456,13 +456,7 @@ impl Drop for HelperCleanup {
 async fn remove_pending_helper(docker: &bollard::Docker, name: &str, pending: PendingCreate) {
     for attempt in 1..=pending.attempts {
         match docker
-            .remove_container(
-                name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
+            .remove_container(name, Some(helper_remove_options()))
             .await
         {
             Ok(()) => return,
@@ -625,16 +619,23 @@ async fn read_small_file(
     Err(format!("{path} is not a regular file"))
 }
 
+/// How a helper is removed: forced, with its anonymous volumes. An image
+/// that declares a volume below the mount (`/var/lib/postgresql/data` in the
+/// PostgreSQL images) gives every helper an anonymous volume there; `v`
+/// removes those and never a named volume, so the service's data volume
+/// stays.
+fn helper_remove_options() -> bollard::query_parameters::RemoveContainerOptions {
+    bollard::query_parameters::RemoveContainerOptions {
+        force: true,
+        v: true,
+        ..Default::default()
+    }
+}
+
 /// Remove the helper this module created, by the ID Docker returned for it.
 async fn remove_helper(docker: &bollard::Docker, helper: &str) {
     match docker
-        .remove_container(
-            helper,
-            Some(bollard::query_parameters::RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
+        .remove_container(helper, Some(helper_remove_options()))
         .await
     {
         // Gone already, or a dropped create that never reached the daemon.
@@ -926,6 +927,117 @@ mod tests {
         assert_eq!(read("/data/tls/server.key").await, "KEY 3\n");
 
         remove_helper(&docker, &reader).await;
+        let _ = docker
+            .remove_volume(
+                &volume,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+    }
+
+    /// Removing a helper also removes the anonymous volume its image
+    /// declares below the mount (the PostgreSQL images declare
+    /// `/var/lib/postgresql/data` under the mounted `/var/lib/postgresql`),
+    /// and never the service's named volume. Both removal paths.
+    #[tokio::test]
+    async fn removing_a_helper_removes_its_anonymous_volumes_only() {
+        use crate::externalsvc::recreate_guard::test_support::{docker_or_skip, ensure_image};
+        let Some(docker) =
+            docker_or_skip("removing_a_helper_removes_its_anonymous_volumes_only").await
+        else {
+            return;
+        };
+        // Declares `VOLUME /data`.
+        ensure_image(&docker, "redis:7-alpine").await;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let volume = format!("tls-anon-test-{run}");
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(volume.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect("create test volume");
+        // A helper as `install_tls_directory` creates one: never started,
+        // the named volume mounted beside the declared one.
+        let create = |name: String| {
+            let docker = docker.clone();
+            let volume = volume.clone();
+            async move {
+                let id = docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&name)
+                                .build(),
+                        ),
+                        bollard::models::ContainerCreateBody {
+                            image: Some("redis:7-alpine".to_string()),
+                            network_disabled: Some(true),
+                            host_config: Some(bollard::models::HostConfig {
+                                mounts: Some(vec![bollard::models::Mount {
+                                    target: Some("/srv".to_string()),
+                                    source: Some(volume),
+                                    typ: Some(bollard::models::MountType::VOLUME),
+                                    ..Default::default()
+                                }]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create helper")
+                    .id;
+                let anonymous = docker
+                    .inspect_container(
+                        &id,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                    .expect("inspect helper")
+                    .mounts
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|m| m.destination.as_deref() == Some("/data"))
+                    .and_then(|m| m.name)
+                    .expect("the image's declared volume is an anonymous volume");
+                (id, anonymous)
+            }
+        };
+        let volume_exists = |name: String| {
+            let docker = docker.clone();
+            async move { docker.inspect_volume(&name).await.is_ok() }
+        };
+
+        let (id, anonymous) = create(format!("tls-anon-test-{run}-id")).await;
+        assert!(volume_exists(anonymous.clone()).await);
+        remove_helper(&docker, &id).await;
+        assert!(
+            !volume_exists(anonymous.clone()).await,
+            "the helper's anonymous volume {anonymous} is removed with it"
+        );
+
+        let name = format!("tls-anon-test-{run}-pending");
+        let (_, anonymous) = create(name.clone()).await;
+        remove_pending_helper(
+            &docker,
+            &name,
+            PendingCreate {
+                attempts: 1,
+                delay: std::time::Duration::from_millis(10),
+            },
+        )
+        .await;
+        assert!(
+            !volume_exists(anonymous).await,
+            "a helper removed by name loses its anonymous volume too"
+        );
+
+        assert!(
+            volume_exists(volume.clone()).await,
+            "the named volume is never removed"
+        );
         let _ = docker
             .remove_volume(
                 &volume,
