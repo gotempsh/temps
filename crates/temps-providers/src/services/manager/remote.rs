@@ -1054,7 +1054,11 @@ impl ExternalServiceManager {
         let engine = match engine {
             WorkerRestoreEngine::PostgresWalg => "PostgreSQL WAL-G",
             WorkerRestoreEngine::Mariadb => "MariaDB",
-            WorkerRestoreEngine::Mongodb | WorkerRestoreEngine::Redis => return,
+            // The generic restore keeps its container (a storage service's
+            // mirror, another engine's dump applied in it).
+            WorkerRestoreEngine::Mongodb
+            | WorkerRestoreEngine::Redis
+            | WorkerRestoreEngine::Data => return,
         };
         if let Err(error) = self.register_standalone_service_dns(service_id).await {
             warn!(
@@ -1436,11 +1440,16 @@ impl ExternalServiceManager {
 
     /// Restore service `service_id`, which runs on a worker node, in place on
     /// that node from the backup at `location` in `source`.
+    ///
+    /// `operation_id` names the restore on the node, which keeps its outcome
+    /// under it ([`Self::worker_restore_outcome`] with
+    /// [`crate::remote_service_client::WorkerRestoreEngine::Data`]).
     pub async fn restore_worker_service(
         &self,
         service_id: i32,
         source: crate::remote_service_client::WorkerS3Destination,
         location: String,
+        operation_id: Option<String>,
     ) -> Result<crate::remote_service_client::RemoteServiceRestoreResponse, ExternalServiceError>
     {
         let (node_id, service_config) = self.worker_service_target(service_id, "restore").await?;
@@ -1450,6 +1459,7 @@ impl ExternalServiceManager {
                 service_config,
                 source,
                 location,
+                operation_id,
             })
             .await
     }

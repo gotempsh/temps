@@ -14,10 +14,14 @@
 //! none of them has an owner in the new process.
 //!
 //! A restore run on a worker node is not orphaned by the restart: the node
-//! keeps restoring and records the outcome. It is handed to
-//! [`WorkerRestoreResume`], which keeps it active and settles it from that
-//! outcome (credential reconcile included), so it is never marked
-//! interrupted here. For each other run, reconciliation:
+//! keeps restoring, and its agent (or, for a job, the workload plane)
+//! records the outcome. It is handed to [`WorkerRestoreResume`], which keeps
+//! it active and settles it from that outcome (credential reconcile
+//! included), so it is never marked interrupted here. A worker run whose
+//! outcome cannot be established stays active, holding its service, until
+//! the outcome is known or an operator releases it. Only runs that wrote in
+//! this process (its own Docker helpers, a restore into a new service)
+//! reach the steps below. For each of them, reconciliation:
 //!
 //! 1. **Fences** the restore: stops any restore helper container that is
 //!    still writing into the target (see

@@ -8508,3 +8508,76 @@ async fn test_oidc_cloud_sessions_confirmed_at_migration_up_and_down() -> anyhow
     assert_eq!(survivors.len(), 1, "down must keep the provider");
     Ok(())
 }
+
+/// A restore on a worker node records `waiting_for_node` (the node is busy)
+/// and `outcome_unknown` (the run holds its service while its node's outcome
+/// cannot be established). Down maps them to the closest older phases and
+/// restores the previous constraint.
+#[tokio::test]
+async fn test_restore_runs_worker_phases_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping restore run phase migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping restore run phase migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261111_000001_restore_runs_worker_phases";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    async fn phase_check(db: &DatabaseConnection) -> anyhow::Result<String> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conname \
+                 = 'restore_runs_phase_check'"
+                    .to_string(),
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("restore_runs_phase_check is missing"))?
+            .try_get::<String>("", "definition")?)
+    }
+    let previous = phase_check(&db).await?;
+    assert!(!previous.contains("outcome_unknown"), "{previous}");
+
+    Migrator::up(&db, Some(1)).await?;
+    let applied = phase_check(&db).await?;
+    for phase in ["waiting_for_node", "outcome_unknown", "download", "verify"] {
+        assert!(
+            applied.contains(&format!("'{phase}'")),
+            "{phase}: {applied}"
+        );
+    }
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert_eq!(
+        phase_check(&db).await?,
+        previous,
+        "down restores the constraint"
+    );
+    Ok(())
+}

@@ -1257,19 +1257,7 @@ impl RestoreService {
         // ADR-055 Phase 9: a database on a worker node is restored by a job
         // on its node, which applies a dump in place. Refuse anything else
         // now, not after the run started.
-        if worker_walg::takes_walg_path(&target, &backup_location) {
-            worker_walg::walg_restore_supported(&target, &mode)?;
-        } else if worker_mariadb::takes_mariadb_path(&target) {
-            worker_mariadb::restore_supported(&target, &mode)?;
-        } else if crate::engines::workload_job::takes_job_path(&target) {
-            job_restore_supported(&target, &backup_location, &mode)?;
-        } else if worker_mongodb::takes_path(&target) {
-            worker_mongodb::supported(&target, &mode)?;
-        } else if worker_redis::takes_redis_path(&target) {
-            worker_redis::restore_supported(&target, &backup_location, &mode)?;
-        } else if crate::engines::worker_agent::takes_agent_path(&target) {
-            agent_restore_supported(&target, &backup_location, &mode)?;
-        }
+        worker_restore_admitted(&target, &backup_location, &mode)?;
 
         // Engine-compat guard: refuse to restore a postgres backup onto a
         // redis target, etc.
@@ -2432,20 +2420,24 @@ async fn run_restore_inner(
                 service_id: run.source_service_id,
             })?;
 
-    // ADR-099: a PostgreSQL WAL-G, MariaDB, MongoDB or Redis restore into a
-    // service on a worker node is the control plane's own restore, run by
-    // its agent, which records the outcome under the run's operation id.
-    // The same choice decides, after a restart, which runs are resumed from
-    // their node (`worker_outcome::worker_restore_engine`).
+    // A restore into a service on a worker node writes there: a PostgreSQL
+    // WAL-G, MariaDB, MongoDB or Redis restore is the control plane's own
+    // engine run by the node's agent (ADR-099), a PostgreSQL dump is applied
+    // by a job on the node (ADR-055 Phase 9), and every other service is
+    // restored by the agent's generic restore. Each records its outcome
+    // (under the run's operation id, or as the run's job). The same
+    // classification decides, after a restart, which runs are resumed from
+    // their node instead of interrupted (`worker_outcome::restore_placement`).
     use temps_providers::remote_service_client::WorkerRestoreEngine;
+    use worker_outcome::RestorePlacement;
     let worker_deps = WorkerRestoreDeps {
         db: &db,
         enc: &enc,
         scoper: &scoper,
         mgr: &mgr,
     };
-    match worker_outcome::worker_restore_engine(&target_service, &backup_model.s3_location) {
-        Some(WorkerRestoreEngine::PostgresWalg) => {
+    match worker_outcome::restore_placement(&target_service, &backup_model.s3_location) {
+        RestorePlacement::Node(WorkerRestoreEngine::PostgresWalg) => {
             return worker_walg::run(
                 &db,
                 &enc,
@@ -2458,15 +2450,15 @@ async fn run_restore_inner(
             )
             .await;
         }
-        Some(WorkerRestoreEngine::Mariadb) => {
+        RestorePlacement::Node(WorkerRestoreEngine::Mariadb) => {
             return worker_mariadb::run(worker_deps, run_id, &backup_model, &target_service, &mode)
                 .await;
         }
-        Some(WorkerRestoreEngine::Mongodb) => {
+        RestorePlacement::Node(WorkerRestoreEngine::Mongodb) => {
             return worker_mongodb::run(worker_deps, run_id, &backup_model, &target_service, &mode)
                 .await;
         }
-        Some(WorkerRestoreEngine::Redis) => {
+        RestorePlacement::Node(WorkerRestoreEngine::Redis) => {
             return worker_redis::run(
                 &db,
                 &scoper,
@@ -2478,38 +2470,35 @@ async fn run_restore_inner(
             )
             .await;
         }
-        None => {}
-    }
-    // ADR-055 Phase 9: a database on a worker node is restored by a job on
-    // its node. Every other target takes the path below, unchanged.
-    if crate::engines::workload_job::takes_job_path(&target_service) {
-        return run_job_restore(
-            &db,
-            &enc,
-            &scoper,
-            &mgr,
-            &plane,
-            run_id,
-            &backup_model,
-            &target_service,
-            &mode,
-        )
-        .await;
-    }
-    // The other services on a worker node are restored in place by the
-    // node's agent, with the engine's own restore.
-    if crate::engines::worker_agent::takes_agent_path(&target_service) {
-        return run_agent_restore(
-            &db,
-            &enc,
-            &scoper,
-            &mgr,
-            run_id,
-            &backup_model,
-            &target_service,
-            &mode,
-        )
-        .await;
+        RestorePlacement::Node(WorkerRestoreEngine::Data) => {
+            return run_agent_restore(
+                &db,
+                &enc,
+                &scoper,
+                &mgr,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        RestorePlacement::Job => {
+            return run_job_restore(
+                &db,
+                &enc,
+                &scoper,
+                &mgr,
+                &plane,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        // Every other target is restored by this process's own Docker.
+        RestorePlacement::ControlPlane => {}
     }
 
     let service_type = ServiceType::from_str(&target_service.service_type).map_err(|e| {
@@ -3716,6 +3705,39 @@ async fn load_run_for_update(
         })
 }
 
+/// Refuse, at admission, a restore that the worker path its target takes
+/// ([`worker_outcome::restore_placement`], the classification the run and
+/// the startup reconciliation use too) cannot do. Every worker path refuses
+/// a restore into a new service (or to a point in time elsewhere), so such
+/// a run always writes in this process.
+fn worker_restore_admitted(
+    target: &temps_entities::external_services::Model,
+    backup_location: &str,
+    mode: &RestoreRequestMode,
+) -> Result<(), RestoreError> {
+    use temps_providers::remote_service_client::WorkerRestoreEngine;
+    use worker_outcome::RestorePlacement;
+    match worker_outcome::restore_placement(target, backup_location) {
+        RestorePlacement::Node(WorkerRestoreEngine::PostgresWalg) => {
+            worker_walg::walg_restore_supported(target, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Mariadb) => {
+            worker_mariadb::restore_supported(target, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Mongodb) => {
+            worker_mongodb::supported(target, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Redis) => {
+            worker_redis::restore_supported(target, backup_location, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Data) => {
+            agent_restore_supported(target, backup_location, mode)
+        }
+        RestorePlacement::Job => job_restore_supported(target, backup_location, mode),
+        RestorePlacement::ControlPlane => Ok(()),
+    }
+}
+
 /// Whether a restore of `backup_location` onto `target`, a database whose
 /// backups and restores run as jobs on its worker node, is one a job can do:
 /// an in-place apply of a `pg_dumpall` dump.
@@ -3955,22 +3977,35 @@ async fn run_agent_restore(
     // A node already running its maximum of backups and restores is waited
     // for, visibly and cancellably, instead of failing the run.
     // A try after a wait gets a credential minted after it.
-    crate::node_busy::retry_while_node_busy_with_fresh_credential(
+    // The node records the restore's outcome under the run's operation id:
+    // a request that goes unanswered (or a restart of this process) is
+    // settled from it, never by guessing (see `worker_outcome`).
+    let operation_id = worker_outcome::operation_id(run_id);
+    let answered = crate::node_busy::retry_while_node_busy_with_fresh_credential(
         &crate::node_busy::NodeBusyPolicy::DEFAULT,
         destination,
         mint,
-        |destination| mgr.restore_worker_service(target.id, destination, location.clone()),
+        |destination| {
+            mgr.restore_worker_service(
+                target.id,
+                destination,
+                location.clone(),
+                Some(operation_id.clone()),
+            )
+        },
         |wait| wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
     )
-    .await?
-    .map_err(|e| RestoreError::ExternalService {
-        reason: format!("restore run {run_id} on node {node_id}: {e}"),
-    })?;
-    reconcile_restored_credentials(db, enc, target.id, origin_credentials.as_ref()).await;
-    if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
-        warn!("Restore run {run_id}: recording the verify phase failed: {e}");
+    .await?;
+    worker_outcome::WorkerRestoreRun {
+        db,
+        run_id,
+        node_id,
+        target_id: target.id,
+        engine: temps_providers::remote_service_client::WorkerRestoreEngine::Data,
+        reconcile: origin_credentials.as_ref().map(|origin| (enc, origin)),
     }
-    Ok(None)
+    .finish(mgr, answered)
+    .await
 }
 
 /// Restore `backup` in place into `target`, a database on a worker node, by

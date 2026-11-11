@@ -160,7 +160,7 @@ pub async fn data_restore(
     Json(request): Json<RemoteServiceRestoreRequest>,
 ) -> axum::response::Response {
     let service = request.service_config.name.clone();
-    let Some(_permit) = admit(&DATA_OPERATIONS) else {
+    let Some(permit) = admit(&DATA_OPERATIONS) else {
         return busy("restore", &service);
     };
     let Some(docker) = state.docker.as_ref() else {
@@ -170,20 +170,41 @@ pub async fn data_restore(
         service = %service,
         service_type = %request.service_config.service_type,
         location = %request.location,
+        operation_id = request.operation_id.as_deref().unwrap_or(""),
         "Restoring a service on this node in place"
     );
     let published_address =
         crate::service_handlers::published_probe_address(&state.host_bind_address());
-    match tokio::time::timeout(
-        DATA_OPERATION_DEADLINE,
-        state
-            .service_runtime
-            .restore_service(request, Arc::new(docker.clone()), published_address),
-    )
-    .await
-    {
-        Ok(Ok(response)) => AgentResponse::ok(response).into_response(),
-        Ok(Err(error)) => {
+    let runtime = state.service_runtime.clone();
+    let engine_docker = Arc::new(docker.clone());
+    // The generic restores have no safe point: a mirror or a dump applies
+    // from its first step. Its outcome is recorded as one that may have
+    // written from the start.
+    let writes = Arc::new(TargetWriteBoundary::new(service.clone()));
+    writes.begin_target_writes();
+    // A restore named by its caller keeps its outcome after this request
+    // ends: the caller asks for it when its request timed out or dropped,
+    // or after it restarted. Detached, a dropped request no longer stops
+    // the restore halfway; the deadline still does.
+    let recorder = crate::restore_outcomes::WORKER_RESTORES.track_named(
+        WorkerRestoreEngine::Data,
+        &service,
+        request.operation_id.as_deref(),
+        &writes,
+    );
+    let outcome = run_detached(permit, None, async move {
+        let result = runtime
+            .restore_service(request, engine_docker, published_address)
+            .await;
+        if let Some(recorder) = recorder {
+            recorder.finish_with(&result);
+        }
+        result
+    })
+    .await;
+    match outcome {
+        Detached::Done(Ok(response)) => AgentResponse::ok(response).into_response(),
+        Detached::Done(Err(error)) => {
             tracing::error!(service = %service, %error, "Service restore failed");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -191,7 +212,15 @@ pub async fn data_restore(
             )
             .into_response()
         }
-        Err(_) => deadline_exceeded("restore", &service),
+        Detached::Panicked(error) => {
+            tracing::error!(service = %service, %error, "Service restore panicked");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Restore of service '{service}' stopped unexpectedly: {error}"),
+            )
+            .into_response()
+        }
+        Detached::DeadlineExceeded => deadline_exceeded("restore", &service),
     }
 }
 

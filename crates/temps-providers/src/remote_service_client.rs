@@ -2081,6 +2081,7 @@ mod tests {
                 service_config: config,
                 source: worker_destination(),
                 location: "redis/cache/u1/dump.rdb.gz".to_string(),
+                operation_id: None,
             })
             .await
             .unwrap();
@@ -2774,6 +2775,7 @@ mod tests {
                 },
                 source: worker_destination(),
                 location: "external_services/redis/orders/dump.rdb.gz".to_string(),
+                operation_id: None,
             })
             .await
             .expect_err("a busy node runs nothing");

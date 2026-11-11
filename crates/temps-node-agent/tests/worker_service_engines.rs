@@ -2431,6 +2431,7 @@ async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
             service_config: config.clone(),
             source: destination.clone(),
             location: prefix.to_string(),
+            operation_id: Some("restore-run-91".to_string()),
         };
         let agent = agent.clone();
         async move {
@@ -2461,6 +2462,19 @@ async fn a_worker_s3_restore_in_place_leaves_exactly_the_backed_up_objects() {
         .expect("the restored object's body")
         .into_bytes();
     assert_eq!(&first[..], b"backed up");
+    // Named by its run, the restore's outcome is kept for a control plane
+    // whose request went unanswered, or that restarted meanwhile.
+    assert_eq!(
+        recorded_restore_outcome(
+            temps_service_protocol::WorkerRestoreEngine::Data,
+            &config.name,
+            "restore-run-91",
+        )
+        .await,
+        temps_service_protocol::WorkerRestoreProgress::Finished {
+            outcome: temps_service_protocol::WorkerRestoreResult::Completed,
+        }
+    );
     println!(
         "worker S3 restore proof: 45 objects before, {} after",
         restored.len()

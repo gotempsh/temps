@@ -1361,6 +1361,21 @@ impl WorkloadPlane {
         rows.into_iter().map(|row| view_from(row, None)).collect()
     }
 
+    /// Every workload of `owner` the plane still has, finished or being
+    /// deleted included, oldest first: a finished job is kept until its
+    /// time-to-live. Bounded by the owner's rows; each view carries its
+    /// row's status, not its latest instance's ([`Self::get`] has that).
+    pub async fn list_owned(&self, owner: &Owner) -> Result<Vec<WorkloadView>, PlaneError> {
+        let rows = workloads::Entity::find()
+            .filter(workloads::Column::OwnerKind.eq(owner.kind.as_str()))
+            .filter(workloads::Column::OwnerId.eq(owner.id))
+            .order_by_asc(workloads::Column::Id)
+            .all(self.db.as_ref())
+            .await
+            .map_err(PlaneError::db("listing the owner's workloads", owner))?;
+        rows.into_iter().map(|row| view_from(row, None)).collect()
+    }
+
     /// The workload's events, newest first.
     pub async fn events(&self, id: i64) -> Result<Vec<temps_workload::WorkloadEvent>, PlaneError> {
         events::list(self.db.as_ref(), id).await
@@ -1729,6 +1744,49 @@ mod tests {
         let view = plane.get(kept).await.expect("the disarmed workload stays");
         assert!(view.deleted_at.is_none());
         assert_eq!(driver.running().len(), 1);
+    }
+
+    /// A finished job stays listed for its owner until its time-to-live,
+    /// with the phase it ended in; `list_active` drops it at once. Another
+    /// owner's workloads are never listed.
+    #[tokio::test]
+    async fn an_owners_finished_job_is_listed_until_it_is_removed() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let finished = plane
+            .apply(apply_request(41, "restore-a", job_spec("app:1")))
+            .await
+            .expect("applied");
+        let live = plane
+            .apply(apply_request(41, "restore-b", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane
+            .apply(apply_request(42, "restore-c", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        let instance = driver
+            .running()
+            .into_iter()
+            .find(|name| name.ends_with(&format!("-{finished}-a1")))
+            .expect("the finished job's instance");
+        driver.exit(&instance, 0);
+        plane.reconcile_at(Utc::now(), false).await;
+
+        let owner = apply_request(41, "unused", job_spec("app:1")).owner;
+        let owned = plane.list_owned(&owner).await.expect("listed");
+        let ids: Vec<i64> = owned.iter().map(|view| view.id).collect();
+        assert_eq!(ids, vec![finished, live]);
+        assert_eq!(owned[0].status.phase, WorkloadPhase::Succeeded);
+        let active: Vec<i64> = plane
+            .list_active(&owner)
+            .await
+            .expect("listed")
+            .iter()
+            .map(|view| view.id)
+            .collect();
+        assert_eq!(active, vec![live]);
     }
 
     #[tokio::test]

@@ -637,11 +637,17 @@ impl TempsPlugin for BackupPlugin {
                         context.require_service::<temps_providers::ExternalServiceManager>();
                     let fence = crate::services::ManagerRestoreFence::new(Arc::clone(&manager));
                     // A worker restore keeps running on its node: it is
-                    // resumed from the node's outcome, not interrupted.
+                    // resumed from the node's outcome (or its job, through
+                    // the workload plane the deployments plugin binds once
+                    // `temps serve` starts it), not interrupted.
+                    let plane_slot = context
+                        .get_service::<temps_workload_plane::PlaneSlot>()
+                        .unwrap_or_else(|| Arc::new(temps_workload_plane::PlaneSlot::new()));
                     let workers = crate::services::ManagerWorkerRestoreResume::new(
                         db.clone(),
                         Arc::clone(&encryption_service),
                         manager,
+                        plane_slot,
                     );
                     let restore_db = db.clone();
                     tokio::spawn(async move {

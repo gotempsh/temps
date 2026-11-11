@@ -468,6 +468,7 @@ mod tests {
                 session_token: None,
             },
             location: "external_services/s3/orders/backup-1".to_string(),
+            operation_id: None,
         };
         let waits = Arc::new(Mutex::new(Vec::new()));
         let restored = retry_while_node_busy(

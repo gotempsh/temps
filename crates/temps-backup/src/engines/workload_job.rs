@@ -507,10 +507,7 @@ pub fn job_spec(
             labels.insert("sh.temps.backup_id".to_string(), backup_id.to_string());
         }
         JobPurpose::Restore { restore_run_id } => {
-            labels.insert(
-                "sh.temps.restore_run_id".to_string(),
-                restore_run_id.to_string(),
-            );
+            labels.insert(RESTORE_RUN_LABEL.to_string(), restore_run_id.to_string());
         }
     }
     WorkloadSpec {
@@ -823,6 +820,107 @@ impl DatabaseJobControl for WorkloadPlane {
     }
 }
 
+/// The label a restore job carries with its restore run's id.
+pub const RESTORE_RUN_LABEL: &str = "sh.temps.restore_run_id";
+
+/// A restore run's job, as the plane still has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreJobRecord {
+    pub workload_id: i64,
+    /// Its latest status (phase and exit code).
+    pub status: temps_workload::WorkloadStatus,
+}
+
+/// Finding the job a restore run started, for a run whose waiting process
+/// restarted: the plane keeps the job, running or finished (until its
+/// time-to-live), labelled with the run's id. A trait so a resumed restore
+/// can be tested without a plane.
+#[async_trait]
+pub trait RestoreJobLookup: Send + Sync {
+    /// The jobs of database `service_id` labelled with `restore_run_id`,
+    /// oldest first.
+    async fn restore_jobs(
+        &self,
+        service_id: i32,
+        restore_run_id: i32,
+    ) -> Result<Vec<RestoreJobRecord>, PlaneError>;
+}
+
+#[async_trait]
+impl RestoreJobLookup for WorkloadPlane {
+    async fn restore_jobs(
+        &self,
+        service_id: i32,
+        restore_run_id: i32,
+    ) -> Result<Vec<RestoreJobRecord>, PlaneError> {
+        let owner = Owner::new(DATABASE_OWNER_KIND, i64::from(service_id));
+        let run = restore_run_id.to_string();
+        let mut jobs = Vec::new();
+        for view in self.list_owned(&owner).await? {
+            if view.spec.labels.get(RESTORE_RUN_LABEL) != Some(&run) {
+                continue;
+            }
+            // The latest instance's status carries the exit code.
+            let status = match self.get(view.id).await {
+                Ok(view) => view.status,
+                Err(PlaneError::NotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            jobs.push(RestoreJobRecord {
+                workload_id: view.id,
+                status,
+            });
+        }
+        Ok(jobs)
+    }
+}
+
+/// Where a restore run's job stands, from the plane's records of it.
+#[derive(Debug)]
+pub enum RestoreJobProgress {
+    /// The plane has no job for the run: it was never started, or it
+    /// finished longer ago than its time-to-live and was removed. Either
+    /// way nothing runs.
+    NoJob,
+    /// A job is running (or being stopped): it may be writing.
+    Running,
+    /// The latest job applied the dump.
+    Succeeded { workload_id: i64 },
+    /// The latest job failed, as this says.
+    Failed(DatabaseJobError),
+}
+
+/// What became of the job restore run `restore_run_id` started on database
+/// `service_id` (on node `node_id`), as `jobs` records it.
+pub async fn restore_job_progress(
+    jobs: &dyn RestoreJobLookup,
+    service_id: i32,
+    node_id: i32,
+    restore_run_id: i32,
+) -> Result<RestoreJobProgress, PlaneError> {
+    let records = jobs.restore_jobs(service_id, restore_run_id).await?;
+    if records.iter().any(|job| !job.status.phase.is_terminal()) {
+        return Ok(RestoreJobProgress::Running);
+    }
+    let Some(latest) = records.iter().max_by_key(|job| job.workload_id) else {
+        return Ok(RestoreJobProgress::NoJob);
+    };
+    Ok(if latest.status.phase == WorkloadPhase::Succeeded {
+        RestoreJobProgress::Succeeded {
+            workload_id: latest.workload_id,
+        }
+    } else {
+        RestoreJobProgress::Failed(failed_on(
+            service_id,
+            node_id,
+            "restore",
+            latest.workload_id,
+            &latest.status,
+            None,
+        ))
+    })
+}
+
 /// How long to wait for a stopped job to be removed, and how often to look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemovalTiming {
@@ -889,6 +987,25 @@ fn failed(
     status: &temps_workload::WorkloadStatus,
     fallback: Option<String>,
 ) -> DatabaseJobError {
+    failed_on(
+        target.service_id,
+        target.node_id,
+        operation,
+        workload_id,
+        status,
+        fallback,
+    )
+}
+
+/// [`failed`], for the job of database `service_id` on node `node_id`.
+fn failed_on(
+    service_id: i32,
+    node_id: i32,
+    operation: &'static str,
+    workload_id: i64,
+    status: &temps_workload::WorkloadStatus,
+    fallback: Option<String>,
+) -> DatabaseJobError {
     let step = match status.exit_code {
         Some(exit::DUMP_FAILED) => Some("pg_dumpall failed"),
         Some(exit::UPLOAD_FAILED) => Some("uploading the dump to S3 failed"),
@@ -920,10 +1037,10 @@ fn failed(
         .collect::<Vec<_>>()
         .join("; ");
     DatabaseJobError::Failed {
-        service_id: target.service_id,
+        service_id,
         operation,
         workload_id,
-        node_id: target.node_id,
+        node_id,
         exit_code: status.exit_code,
         reason: if reason.is_empty() {
             format!("the job ended in phase {}", status.phase.as_str())

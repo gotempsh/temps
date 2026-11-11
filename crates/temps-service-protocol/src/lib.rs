@@ -471,14 +471,29 @@ pub struct RemoteServiceRestoreRequest {
     pub service_config: ServiceConfig,
     pub source: WorkerS3Destination,
     pub location: String,
+    /// The caller's name for this restore (the control plane's restore run).
+    /// With one, the node keeps the restore's outcome after the request
+    /// ends, under [`WorkerRestoreEngine::Data`], so a caller whose request
+    /// timed out or lost its connection (or that restarted) can ask for it
+    /// ([`WorkerRestoreOutcomeRequest`]) instead of guessing.
+    #[serde(default)]
+    pub operation_id: Option<String>,
 }
 
 /// What a worker restore applied.
-#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct RemoteServiceRestoreResponse {
     /// The buckets a storage service's restore copied back.
     #[serde(default)]
     pub buckets: Vec<String>,
+}
+
+/// A generic restore that answered applied its backup: it fails with an
+/// error, never with a result.
+impl From<RemoteServiceRestoreResponse> for WorkerRestoreResult {
+    fn from(_: RemoteServiceRestoreResponse) -> Self {
+        WorkerRestoreResult::Completed
+    }
 }
 
 /// `POST /agent/services/postgres/walg-backup`: a WAL-G base backup of a
@@ -683,6 +698,9 @@ pub enum WorkerRestoreEngine {
     Mongodb,
     Redis,
     Mariadb,
+    /// The agent's generic restore (`/agent/services/data-restore`): a
+    /// storage service's bucket mirror, or another engine's dump.
+    Data,
 }
 
 impl WorkerRestoreEngine {
@@ -693,6 +711,7 @@ impl WorkerRestoreEngine {
             Self::Mongodb => "MongoDB restore",
             Self::Redis => "Redis restore",
             Self::Mariadb => "MariaDB restore",
+            Self::Data => "restore on the node",
         }
     }
 }

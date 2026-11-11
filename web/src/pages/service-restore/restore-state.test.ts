@@ -503,3 +503,20 @@ describe('waiting for the node', () => {
     expect(phaseLabel('waiting_for_node')).toBe('Wait for the node')
   })
 })
+
+describe('a restore whose outcome is unknown', () => {
+  // The worker node is unreachable (or has no record of the restore): the
+  // server holds the run in `outcome_unknown`, between writing and verifying.
+  test('shows the outcome step active after the write steps', () => {
+    const states = phaseStates(
+      { phase: 'outcome_unknown', status: 'running' },
+      true
+    )
+    expect(states.find((s) => s.id === 'restore')?.state).toBe('done')
+    expect(states.find((s) => s.id === 'outcome_unknown')?.state).toBe('active')
+    expect(states.find((s) => s.id === 'verify')?.state).toBe('pending')
+    expect(phaseLabel('outcome_unknown')).toBe(
+      'Confirm the outcome with the node'
+    )
+  })
+})

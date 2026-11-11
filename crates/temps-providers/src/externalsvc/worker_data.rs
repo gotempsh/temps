@@ -294,6 +294,8 @@ pub async fn restore_service_on_node(
         service_config: mut config,
         source,
         location: backup_location,
+        // Recorded by the agent's handler, which keeps the outcome.
+        operation_id: _,
     } = request;
     let service = config.name.clone();
     resolve_runtime_target(&mut config, published_address).map_err(|error| {
@@ -1407,6 +1409,7 @@ mod tests {
                     service_config: config(service_type, serde_json::json!({})),
                     source: destination.clone(),
                     location: "store/1/dump.sql.gz".to_string(),
+                    operation_id: None,
                 },
                 docker(),
                 None,
@@ -1448,6 +1451,7 @@ mod tests {
                 service_config: config(ServiceType::Mongodb, serde_json::json!({})),
                 source: destination,
                 location: "mongodb/store/1/dump.archive".to_string(),
+                operation_id: None,
             },
             docker(),
             None,
@@ -1496,6 +1500,7 @@ mod tests {
                 service_config: config(ServiceType::Redis, serde_json::json!({})),
                 source: destination,
                 location: "redis/store/1/dump.rdb.gz".to_string(),
+                operation_id: None,
             },
             docker(),
             None,

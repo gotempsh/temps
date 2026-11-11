@@ -231,6 +231,10 @@ export const PHASES: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'waiting_for_node', label: 'Wait for the node' },
   { id: 'restore', label: 'Restore data' },
   { id: 'recover', label: 'Recover WAL' },
+  // A restore on a worker node whose outcome Temps cannot establish (the node
+  // is unreachable, or has no record of it): the run keeps the database held
+  // until the node answers or an operator releases it.
+  { id: 'outcome_unknown', label: 'Confirm the outcome with the node' },
   { id: 'verify', label: 'Verify' },
   { id: 'completed', label: 'Completed' },
 ]
