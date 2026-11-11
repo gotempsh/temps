@@ -9,7 +9,7 @@ manager is `bun`.
 
 - **Design**: root [`DESIGN.md`](../DESIGN.md) is authoritative for existing console
   UI: the route shell, not the page, picks the width (`form`, about 1024px and
-  aligned with the header, for settings and forms; `full` for lists, tables,
+  centered with its header, for settings and forms; `full` for lists, tables,
   dashboards and logs), with one `PageContainer` padding owner and no
   `max-w-*`/`mx-auto` wrappers of a page's own; compact empty states, shared
   tables and pagination, shadcn controls. `web/packages/ds` (`@temps-sdk/ds`) codifies it into page, record,

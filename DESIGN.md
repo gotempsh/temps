@@ -45,7 +45,7 @@ squeezed. The page shell picks one of two widths per route.
 
 | Width | About | For |
 |---|---|---|
-| `form` | 1024px (`max-w-5xl`), aligned left with the header | Settings and other forms: Configure pages that are forms, environment settings |
+| `form` | 1024px (`mx-auto max-w-5xl`), centered with its header | Settings and other forms: Configure pages that are forms, environment settings |
 | `full` | the whole content area, inside the gutters | Everything else: overview, deployments, environments, errors, analytics, monitoring, logs, traces, session replay, environment variables, secrets, tokens, scans |
 
 A `full` page starts at the same left edge as the project/environment bar
@@ -421,7 +421,7 @@ selected text after its hover background becomes light.
 
 - Check at 320px, 390px, 768px, and a wide desktop width. Widths are measured in the
   content area after the sidebar, not the entire viewport; on a wide screen a
-  `form` page is a column that starts at the left edge with the header, and a
+  `form` page is a centered, capped column including its header, and a
   `full` page fills it.
 - Verify both light and dark mode, including hover, selected, pending, and
   disabled controls.

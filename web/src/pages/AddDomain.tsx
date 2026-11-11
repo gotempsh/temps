@@ -34,7 +34,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
-import { PageHeader } from '@/components/layout/PageContainer'
+import { PageContainer, Wizard } from '@temps-sdk/ds'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -45,7 +45,6 @@ import {
   Globe,
   Info,
   Shield,
-  ArrowLeft,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -254,496 +253,423 @@ export function AddDomain() {
   })
 
   return (
-    <div className="flex-1 overflow-auto">
-      <div className="space-y-6 p-4 sm:p-6" onKeyDown={handleEnterSubmit}>
-        {/* Header */}
-        <div className="flex items-start gap-4">
-          <Button
-            aria-label="Back"
-            variant="ghost"
-            size="icon"
-            onClick={() => navigate('/domains')}
-          >
-            <ArrowLeft className="h-4 w-4" />
-          </Button>
-          <PageHeader
-            className="min-w-0 flex-1"
-            title="Add domain"
-            description="Add a custom domain and choose how it gets HTTPS: a certificate from Let's Encrypt, or a tunnel that brings its own"
-          />
-        </div>
-
-        <div>
-          <Form {...form}>
-            <form
-              onSubmit={form.handleSubmit(handleSubmit)}
-              className="space-y-6"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && step !== 'confirm') {
-                  e.preventDefault()
-                  handleNext()
-                }
-              }}
-            >
-              {/* Step 1: Domain */}
-              {step === 'domain' && (
-                <div className="space-y-4">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
-                        1
-                      </div>
-                      <span className="font-medium">Domain</span>
-                    </div>
-                    <div className="h-px flex-1 bg-border" />
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
-                        2
-                      </div>
-                      <span>HTTPS</span>
-                    </div>
-                    <div className="h-px flex-1 bg-border" />
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
-                        3
-                      </div>
-                      <span>Confirm</span>
-                    </div>
-                  </div>
-
-                  <FormField
-                    control={form.control}
-                    name="domain"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Domain name</FormLabel>
-                        <FormControl>
-                          <Input
-                            {...field}
-                            placeholder="example.com or *.example.com"
-                            autoFocus
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Enter your custom domain (e.g., example.com,
-                          app.example.com, or *.example.com for wildcard)
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  <Alert>
-                    <Info className="h-4 w-4" />
-                    <AlertDescription>
-                      {covering.length > 0
-                        ? `It's under ${covering[0].domain}, which tunnel ${covering[0].name} carries: it can go through the tunnel with no DNS records or certificate to set up.`
-                        : "You'll need to point your domain's DNS records to your server after creation. We'll provide detailed instructions in the next steps."}
-                    </AlertDescription>
-                  </Alert>
-
-                  <div className="flex justify-between gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => navigate('/domains')}
-                    >
-                      Cancel
-                    </Button>
-                    <Button type="button" onClick={handleNext}>
-                      Next
-                    </Button>
-                  </div>
-                </div>
-              )}
-
-              {/* Step 2: Challenge Type */}
-              {step === 'challenge' && (
-                <div className="space-y-4">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
-                        <CheckCircle className="h-4 w-4 text-green-600" />
-                      </div>
-                      <span>Domain</span>
-                    </div>
-                    <div className="h-px flex-1 bg-border" />
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
-                        2
-                      </div>
-                      <span className="font-medium">HTTPS</span>
-                    </div>
-                    <div className="h-px flex-1 bg-border" />
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
-                        3
-                      </div>
-                      <span>Confirm</span>
-                    </div>
-                  </div>
-
-                  <FormField
-                    control={form.control}
-                    name="challengeType"
-                    render={({ field }) => {
-                      const isWildcard = watchedValues.domain?.startsWith('*.')
-                      const choices = certificateChoices({
-                        coveringTunnels: covering.length,
-                        wildcard: !!isWildcard,
-                        http01Available,
-                      })
-                      return (
-                        <FormItem className="space-y-4">
-                          <FormLabel>How it gets HTTPS</FormLabel>
-                          <FormDescription>
-                            {covering.length > 0
-                              ? "A tunnel covers this domain, so its provider can serve HTTPS with no certificate here. Or issue one from Let's Encrypt."
-                              : isWildcard
-                                ? 'Wildcard domains require DNS-01 challenge'
-                                : "Choose how you want to verify domain ownership for Let's Encrypt"}
-                          </FormDescription>
+    <PageContainer width="form">
+      <div onKeyDown={handleEnterSubmit}>
+        <Wizard
+          fullWidth
+          title="Add domain"
+          currentStep={step}
+          steps={[
+            { id: 'domain', label: 'Domain' },
+            { id: 'challenge', label: 'HTTPS' },
+            { id: 'confirm', label: 'Confirm' },
+          ]}
+        >
+          <div>
+            <Form {...form}>
+              <form
+                onSubmit={form.handleSubmit(handleSubmit)}
+                className="space-y-6 rounded-lg border bg-card p-4 sm:p-6"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && step !== 'confirm') {
+                    e.preventDefault()
+                    handleNext()
+                  }
+                }}
+              >
+                {/* Step 1: Domain */}
+                {step === 'domain' && (
+                  <div className="space-y-4">
+                    <FormField
+                      control={form.control}
+                      name="domain"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Domain name</FormLabel>
                           <FormControl>
-                            <RadioGroup
-                              onValueChange={field.onChange}
-                              value={field.value}
-                              className="grid gap-4"
-                            >
-                              {covering.map((connector, index) => {
-                                const value = tunnelChoice(connector.id)
-                                return (
+                            <Input
+                              {...field}
+                              placeholder="example.com or *.example.com"
+                              autoFocus
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            Enter your custom domain (e.g., example.com,
+                            app.example.com, or *.example.com for wildcard)
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <Alert>
+                      <Info className="h-4 w-4" />
+                      <AlertDescription>
+                        {covering.length > 0
+                          ? `It's under ${covering[0].domain}, which tunnel ${covering[0].name} carries: it can go through the tunnel with no DNS records or certificate to set up.`
+                          : "You'll need to point your domain's DNS records to your server after creation. We'll provide detailed instructions in the next steps."}
+                      </AlertDescription>
+                    </Alert>
+
+                    <div className="flex justify-between gap-2 border-t pt-4">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => navigate('/domains')}
+                      >
+                        Cancel
+                      </Button>
+                      <Button type="button" onClick={handleNext}>
+                        Next
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Step 2: Challenge Type */}
+                {step === 'challenge' && (
+                  <div className="space-y-4">
+                    <FormField
+                      control={form.control}
+                      name="challengeType"
+                      render={({ field }) => {
+                        const isWildcard =
+                          watchedValues.domain?.startsWith('*.')
+                        const choices = certificateChoices({
+                          coveringTunnels: covering.length,
+                          wildcard: !!isWildcard,
+                          http01Available,
+                        })
+                        return (
+                          <FormItem className="space-y-4">
+                            <FormLabel>How it gets HTTPS</FormLabel>
+                            <FormDescription>
+                              {covering.length > 0
+                                ? "A tunnel covers this domain, so its provider can serve HTTPS with no certificate here. Or issue one from Let's Encrypt."
+                                : isWildcard
+                                  ? 'Wildcard domains require DNS-01 challenge'
+                                  : "Choose how you want to verify domain ownership for Let's Encrypt"}
+                            </FormDescription>
+                            <FormControl>
+                              <RadioGroup
+                                onValueChange={field.onChange}
+                                value={field.value}
+                                className="grid gap-4"
+                              >
+                                {covering.map((connector, index) => {
+                                  const value = tunnelChoice(connector.id)
+                                  return (
+                                    <Card
+                                      key={connector.id}
+                                      className={`relative cursor-pointer border-2 transition-colors ${field.value === value ? 'border-primary' : 'border-border hover:border-primary/50'}`}
+                                    >
+                                      <label className="flex cursor-pointer items-start gap-4 p-4">
+                                        <RadioGroupItem
+                                          value={value}
+                                          id={value}
+                                          className="mt-1"
+                                        />
+                                        <div className="flex-1 space-y-2">
+                                          <div className="flex items-center gap-2">
+                                            <Cloud className="h-5 w-5 text-primary" />
+                                            <div className="font-semibold">
+                                              Through tunnel {connector.name}
+                                              {index === 0 && ' (Recommended)'}
+                                            </div>
+                                          </div>
+                                          <p className="text-sm text-muted-foreground">
+                                            The tunnel carries every name under{' '}
+                                            {connector.domain}. Temps creates
+                                            the DNS record and the provider
+                                            serves HTTPS, so there is no
+                                            certificate to issue and no port to
+                                            open.
+                                          </p>
+                                          <div className="space-y-1 text-sm">
+                                            <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+                                              <CheckCircle className="h-4 w-4" />
+                                              <span>
+                                                DNS record created for you
+                                              </span>
+                                            </div>
+                                            <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+                                              <CheckCircle className="h-4 w-4" />
+                                              <span>
+                                                HTTPS from the tunnel&apos;s
+                                                provider
+                                              </span>
+                                            </div>
+                                            <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+                                              <CheckCircle className="h-4 w-4" />
+                                              <span>
+                                                Works behind NAT, no open ports
+                                              </span>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      </label>
+                                    </Card>
+                                  )
+                                })}
+                                {choices.showHttp01 && (
                                   <Card
-                                    key={connector.id}
-                                    className={`relative cursor-pointer border-2 transition-colors ${field.value === value ? 'border-primary' : 'border-border hover:border-primary/50'}`}
+                                    className={`relative cursor-pointer border-2 transition-colors ${field.value === 'http-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
                                   >
                                     <label className="flex cursor-pointer items-start gap-4 p-4">
                                       <RadioGroupItem
-                                        value={value}
-                                        id={value}
+                                        value="http-01"
+                                        id="http-01"
                                         className="mt-1"
                                       />
                                       <div className="flex-1 space-y-2">
                                         <div className="flex items-center gap-2">
-                                          <Cloud className="h-5 w-5 text-primary" />
+                                          <Globe className="h-5 w-5 text-primary" />
                                           <div className="font-semibold">
-                                            Through tunnel {connector.name}
-                                            {index === 0 && ' (Recommended)'}
+                                            HTTP-01 Challenge
+                                            {choices.recommended ===
+                                              'http-01' && ' (Recommended)'}
                                           </div>
                                         </div>
                                         <p className="text-sm text-muted-foreground">
-                                          The tunnel carries every name under{' '}
-                                          {connector.domain}. Temps creates the
-                                          DNS record and the provider serves
-                                          HTTPS, so there is no certificate to
-                                          issue and no port to open.
+                                          Validates domain ownership by serving
+                                          a file over HTTP. Requires port 80 to
+                                          be accessible. Best for single domains
+                                          and simpler setup.
                                         </p>
                                         <div className="space-y-1 text-sm">
                                           <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                             <CheckCircle className="h-4 w-4" />
                                             <span>
-                                              DNS record created for you
+                                              Simple setup - just point DNS
                                             </span>
                                           </div>
                                           <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                             <CheckCircle className="h-4 w-4" />
-                                            <span>
-                                              HTTPS from the tunnel&apos;s
-                                              provider
-                                            </span>
+                                            <span>Automatic validation</span>
                                           </div>
                                           <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                             <CheckCircle className="h-4 w-4" />
                                             <span>
-                                              Works behind NAT, no open ports
+                                              No additional DNS configuration
                                             </span>
                                           </div>
                                         </div>
                                       </div>
                                     </label>
                                   </Card>
-                                )
-                              })}
-                              {choices.showHttp01 && (
+                                )}
+
                                 <Card
-                                  className={`relative cursor-pointer border-2 transition-colors ${field.value === 'http-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
+                                  className={`relative cursor-pointer border-2 transition-colors ${field.value === 'dns-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
                                 >
                                   <label className="flex cursor-pointer items-start gap-4 p-4">
                                     <RadioGroupItem
-                                      value="http-01"
-                                      id="http-01"
+                                      value="dns-01"
+                                      id="dns-01"
                                       className="mt-1"
                                     />
                                     <div className="flex-1 space-y-2">
                                       <div className="flex items-center gap-2">
-                                        <Globe className="h-5 w-5 text-primary" />
+                                        <Shield className="h-5 w-5 text-primary" />
                                         <div className="font-semibold">
-                                          HTTP-01 Challenge
-                                          {choices.recommended === 'http-01' &&
+                                          DNS-01 Challenge
+                                          {choices.recommended === 'dns-01' &&
                                             ' (Recommended)'}
                                         </div>
                                       </div>
                                       <p className="text-sm text-muted-foreground">
-                                        Validates domain ownership by serving a
-                                        file over HTTP. Requires port 80 to be
-                                        accessible. Best for single domains and
-                                        simpler setup.
+                                        Validates domain ownership via DNS TXT
+                                        records. Required for wildcard
+                                        certificates and when port 80 is not
+                                        accessible.
                                       </p>
                                       <div className="space-y-1 text-sm">
                                         <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                           <CheckCircle className="h-4 w-4" />
                                           <span>
-                                            Simple setup - just point DNS
+                                            Supports wildcard certificates
+                                            (*.example.com)
                                           </span>
                                         </div>
                                         <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
                                           <CheckCircle className="h-4 w-4" />
-                                          <span>Automatic validation</span>
+                                          <span>Works without HTTP access</span>
                                         </div>
-                                        <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
-                                          <CheckCircle className="h-4 w-4" />
+                                        <div className="flex items-center gap-2 text-yellow-700 dark:text-yellow-600">
+                                          <Info className="h-4 w-4" />
                                           <span>
-                                            No additional DNS configuration
+                                            Requires manual DNS record creation
                                           </span>
                                         </div>
                                       </div>
                                     </div>
                                   </label>
                                 </Card>
-                              )}
-
-                              <Card
-                                className={`relative cursor-pointer border-2 transition-colors ${field.value === 'dns-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
-                              >
-                                <label className="flex cursor-pointer items-start gap-4 p-4">
-                                  <RadioGroupItem
-                                    value="dns-01"
-                                    id="dns-01"
-                                    className="mt-1"
-                                  />
-                                  <div className="flex-1 space-y-2">
-                                    <div className="flex items-center gap-2">
-                                      <Shield className="h-5 w-5 text-primary" />
-                                      <div className="font-semibold">
-                                        DNS-01 Challenge
-                                        {choices.recommended === 'dns-01' &&
-                                          ' (Recommended)'}
-                                      </div>
-                                    </div>
-                                    <p className="text-sm text-muted-foreground">
-                                      Validates domain ownership via DNS TXT
-                                      records. Required for wildcard
-                                      certificates and when port 80 is not
-                                      accessible.
-                                    </p>
-                                    <div className="space-y-1 text-sm">
-                                      <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
-                                        <CheckCircle className="h-4 w-4" />
-                                        <span>
-                                          Supports wildcard certificates
-                                          (*.example.com)
-                                        </span>
-                                      </div>
-                                      <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
-                                        <CheckCircle className="h-4 w-4" />
-                                        <span>Works without HTTP access</span>
-                                      </div>
-                                      <div className="flex items-center gap-2 text-yellow-700 dark:text-yellow-600">
-                                        <Info className="h-4 w-4" />
-                                        <span>
-                                          Requires manual DNS record creation
-                                        </span>
-                                      </div>
-                                    </div>
-                                  </div>
-                                </label>
-                              </Card>
-                              {choices.http01Note && (
-                                <p className="text-sm text-muted-foreground">
-                                  {choices.http01Note}
-                                </p>
-                              )}
-                              {covering.length === 0 &&
-                                !connectorsQuery.isLoading && (
-                                  <NoTunnelYet
-                                    domain={watchedValues.domain ?? ''}
-                                  />
+                                {choices.http01Note && (
+                                  <p className="text-sm text-muted-foreground">
+                                    {choices.http01Note}
+                                  </p>
                                 )}
-                            </RadioGroup>
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )
-                    }}
-                  />
-
-                  <div className="flex justify-between gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={handleBack}
-                    >
-                      Back
-                    </Button>
-                    <Button type="button" onClick={handleNext}>
-                      Next
-                    </Button>
-                  </div>
-                </div>
-              )}
-
-              {/* Step 3: Confirm */}
-              {step === 'confirm' && (
-                <div className="space-y-4">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
-                        <CheckCircle className="h-4 w-4 text-green-600" />
-                      </div>
-                      <span>Domain</span>
-                    </div>
-                    <div className="h-px flex-1 bg-border" />
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
-                        <CheckCircle className="h-4 w-4 text-green-600" />
-                      </div>
-                      <span>HTTPS</span>
-                    </div>
-                    <div className="h-px flex-1 bg-border" />
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
-                        3
-                      </div>
-                      <span className="font-medium">Confirm</span>
-                    </div>
-                  </div>
-
-                  {tunnel ? (
-                    <TunnelConfirm
-                      domain={watchedValues.domain ?? ''}
-                      tunnelName={tunnel.name}
-                      tunnelDomain={tunnel.domain}
-                      publishesAll={tunnel.auto_publish}
-                      wildcard={wildcardInput}
-                      tooDeep={tooDeep}
-                      projects={projectsQuery.data?.projects ?? []}
-                      environments={environmentsQuery.data ?? []}
-                      project={attachProject}
-                      environment={attachEnvironment}
-                      onProjectChange={(value) => {
-                        setAttachProject(value)
-                        setAttachEnvironment('')
+                                {covering.length === 0 &&
+                                  !connectorsQuery.isLoading && (
+                                    <NoTunnelYet
+                                      domain={watchedValues.domain ?? ''}
+                                    />
+                                  )}
+                              </RadioGroup>
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )
                       }}
-                      onEnvironmentChange={setAttachEnvironment}
                     />
-                  ) : (
-                    <>
-                      <div className="rounded-lg bg-muted p-4 space-y-3">
-                        <h3 className="font-semibold">
-                          Review your configuration
-                        </h3>
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm text-muted-foreground">
-                              Domain:
-                            </span>
-                            <span className="font-medium">
-                              {watchedValues.domain}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm text-muted-foreground">
-                              Challenge type:
-                            </span>
-                            <span className="font-medium">
-                              {watchedValues.challengeType === 'http-01'
-                                ? 'HTTP-01 (Automatic)'
-                                : 'DNS-01 (Manual)'}
-                            </span>
+
+                    <div className="flex justify-between gap-2 border-t pt-4">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={handleBack}
+                      >
+                        Back
+                      </Button>
+                      <Button type="button" onClick={handleNext}>
+                        Next
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Step 3: Confirm */}
+                {step === 'confirm' && (
+                  <div className="space-y-4">
+                    {tunnel ? (
+                      <TunnelConfirm
+                        domain={watchedValues.domain ?? ''}
+                        tunnelName={tunnel.name}
+                        tunnelDomain={tunnel.domain}
+                        publishesAll={tunnel.auto_publish}
+                        wildcard={wildcardInput}
+                        tooDeep={tooDeep}
+                        projects={projectsQuery.data?.projects ?? []}
+                        environments={environmentsQuery.data ?? []}
+                        project={attachProject}
+                        environment={attachEnvironment}
+                        onProjectChange={(value) => {
+                          setAttachProject(value)
+                          setAttachEnvironment('')
+                        }}
+                        onEnvironmentChange={setAttachEnvironment}
+                      />
+                    ) : (
+                      <>
+                        <div className="rounded-lg bg-muted p-4 space-y-3">
+                          <h3 className="font-semibold">
+                            Review your configuration
+                          </h3>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm text-muted-foreground">
+                                Domain:
+                              </span>
+                              <span className="font-medium">
+                                {watchedValues.domain}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm text-muted-foreground">
+                                Challenge type:
+                              </span>
+                              <span className="font-medium">
+                                {watchedValues.challengeType === 'http-01'
+                                  ? 'HTTP-01 (Automatic)'
+                                  : 'DNS-01 (Manual)'}
+                              </span>
+                            </div>
                           </div>
                         </div>
-                      </div>
 
-                      {watchedValues.challengeType === 'http-01' ? (
-                        <Alert>
-                          <Globe className="h-4 w-4" />
-                          <AlertDescription>
-                            <div className="space-y-2">
-                              <p className="font-medium">
-                                Next steps (HTTP-01):
-                              </p>
-                              <ol className="list-decimal list-inside space-y-1 text-sm">
-                                <li>
-                                  Point your domain&apos;s DNS A record to your
-                                  server IP
-                                </li>
-                                <li>
-                                  Ensure port 80 is accessible on your server
-                                </li>
-                                <li>
-                                  The system will automatically validate and
-                                  provision the certificate
-                                </li>
-                              </ol>
-                            </div>
-                          </AlertDescription>
-                        </Alert>
-                      ) : (
-                        <Alert>
-                          <Shield className="h-4 w-4" />
-                          <AlertDescription>
-                            <div className="space-y-2">
-                              <p className="font-medium">
-                                Next steps (DNS-01):
-                              </p>
-                              <ol className="list-decimal list-inside space-y-1 text-sm">
-                                <li>
-                                  After creation, you&apos;ll receive a DNS TXT
-                                  record to add
-                                </li>
-                                <li>
-                                  Add the TXT record to your domain&apos;s DNS
-                                  settings
-                                </li>
-                                <li>
-                                  Wait for DNS propagation (up to 24 hours)
-                                </li>
-                                <li>
-                                  Complete the DNS challenge to provision the
-                                  certificate
-                                </li>
-                              </ol>
-                            </div>
-                          </AlertDescription>
-                        </Alert>
-                      )}
-                    </>
-                  )}
+                        {watchedValues.challengeType === 'http-01' ? (
+                          <Alert>
+                            <Globe className="h-4 w-4" />
+                            <AlertDescription>
+                              <div className="space-y-2">
+                                <p className="font-medium">
+                                  Next steps (HTTP-01):
+                                </p>
+                                <ol className="list-decimal list-inside space-y-1 text-sm">
+                                  <li>
+                                    Point your domain&apos;s DNS A record to
+                                    your server IP
+                                  </li>
+                                  <li>
+                                    Ensure port 80 is accessible on your server
+                                  </li>
+                                  <li>
+                                    The system will automatically validate and
+                                    provision the certificate
+                                  </li>
+                                </ol>
+                              </div>
+                            </AlertDescription>
+                          </Alert>
+                        ) : (
+                          <Alert>
+                            <Shield className="h-4 w-4" />
+                            <AlertDescription>
+                              <div className="space-y-2">
+                                <p className="font-medium">
+                                  Next steps (DNS-01):
+                                </p>
+                                <ol className="list-decimal list-inside space-y-1 text-sm">
+                                  <li>
+                                    After creation, you&apos;ll receive a DNS
+                                    TXT record to add
+                                  </li>
+                                  <li>
+                                    Add the TXT record to your domain&apos;s DNS
+                                    settings
+                                  </li>
+                                  <li>
+                                    Wait for DNS propagation (up to 24 hours)
+                                  </li>
+                                  <li>
+                                    Complete the DNS challenge to provision the
+                                    certificate
+                                  </li>
+                                </ol>
+                              </div>
+                            </AlertDescription>
+                          </Alert>
+                        )}
+                      </>
+                    )}
 
-                  <div className="flex justify-between gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={handleBack}
-                    >
-                      Back
-                    </Button>
-                    <Button type="submit" disabled={submitting}>
-                      {tunnel
-                        ? submitting
-                          ? 'Adding…'
-                          : 'Add domain'
-                        : createDomain.isPending
-                          ? 'Creating domain...'
-                          : 'Create domain & start provisioning'}
-                    </Button>
+                    <div className="flex justify-between gap-2 border-t pt-4">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={handleBack}
+                      >
+                        Back
+                      </Button>
+                      <Button type="submit" disabled={submitting}>
+                        {tunnel
+                          ? submitting
+                            ? 'Adding…'
+                            : 'Add domain'
+                          : createDomain.isPending
+                            ? 'Creating domain...'
+                            : 'Create domain & start provisioning'}
+                      </Button>
+                    </div>
                   </div>
-                </div>
-              )}
-            </form>
-          </Form>
-        </div>
+                )}
+              </form>
+            </Form>
+          </div>
+        </Wizard>
       </div>
-    </div>
+    </PageContainer>
   )
 }
 

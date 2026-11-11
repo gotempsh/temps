@@ -50,6 +50,7 @@ export function Settings({
   const Container = embedded ? 'section' : PageContainer
   return (
     <Container
+      {...(!embedded ? { width: 'form' as const } : {})}
       className={cn(
         embedded &&
           'min-w-0 overflow-clip rounded-lg border bg-card text-card-foreground',

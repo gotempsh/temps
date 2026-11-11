@@ -18,7 +18,7 @@ import {
   type EmailProviderType,
 } from '@/components/ui/email-provider-logo'
 import { problemMessage } from '@/components/email/sharedUtils'
-import { PageHeader } from '@/components/layout/PageContainer'
+import { PageContainer, Wizard } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -45,7 +45,6 @@ import {
   AlertTriangle,
   ArrowLeft,
   ArrowRight,
-  Check,
   Download,
   Globe,
   Loader2,
@@ -172,66 +171,6 @@ const WIZARD_STEPS: Array<{ id: WizardStep; label: string }> = [
   { id: 'configure', label: 'Configure' },
   { id: 'review', label: 'Review' },
 ]
-
-const STEP_ORDER: WizardStep[] = ['choose-mode', 'configure', 'review']
-
-function WizardStepIndicator({ currentStep }: { currentStep: WizardStep }) {
-  const currentIndex = STEP_ORDER.indexOf(currentStep)
-
-  return (
-    <ol role="list" className="flex items-center justify-center gap-2 sm:gap-4">
-      {WIZARD_STEPS.map((step, index) => {
-        const stepIndex = STEP_ORDER.indexOf(step.id)
-        const isDone = stepIndex < currentIndex
-        const isActive = step.id === currentStep
-        const isLast = index === WIZARD_STEPS.length - 1
-        return (
-          <li key={step.id} className="flex items-center gap-2 sm:gap-4">
-            <div className="flex items-center gap-2">
-              <span
-                className={cn(
-                  'flex size-7 shrink-0 items-center justify-center rounded-full border text-xs font-medium tabular-nums transition-colors',
-                  isDone && 'border-emerald-500 bg-emerald-500 text-white',
-                  isActive &&
-                    !isDone &&
-                    'border-primary bg-primary text-primary-foreground',
-                  !isDone &&
-                    !isActive &&
-                    'border-muted-foreground/30 text-muted-foreground'
-                )}
-              >
-                {isDone ? (
-                  <Check className="size-4" strokeWidth={3} />
-                ) : (
-                  index + 1
-                )}
-              </span>
-              <span
-                className={cn(
-                  'hidden text-sm font-medium sm:inline',
-                  isDone || isActive
-                    ? 'text-foreground'
-                    : 'text-muted-foreground'
-                )}
-              >
-                {step.label}
-              </span>
-            </div>
-            {!isLast && (
-              <span
-                aria-hidden
-                className={cn(
-                  'h-px w-8 sm:w-12',
-                  isDone ? 'bg-emerald-500' : 'bg-border'
-                )}
-              />
-            )}
-          </li>
-        )
-      })}
-    </ol>
-  )
-}
 
 // ============================================================================
 // Step 1 — Choose mode cards
@@ -856,183 +795,162 @@ export function EmailDomainNew() {
         : false
 
   return (
-    <div className="flex-1 overflow-auto">
-      <div className="px-4 py-6 sm:px-6">
-        {/* Back link */}
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="mb-6 -ml-2 text-muted-foreground"
-          onClick={() => navigate('/email')}
-        >
-          <ArrowLeft className="mr-2 size-4" />
-          Back to domains
-        </Button>
-
-        {/* Title + step indicator */}
-        <div className="w-full space-y-8">
-          <PageHeader
-            title="Add email domain"
-            description="Register a sending domain with your email provider."
-          />
-
-          <WizardStepIndicator currentStep={currentStep} />
-
-          {/* Step content */}
-          <div>
-            {currentStep === 'choose-mode' && (
-              <div className="space-y-4">
-                <div>
-                  <h2 className="text-base font-semibold">
-                    How do you want to add this domain?
-                  </h2>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Choose whether you are registering a brand-new domain
-                    identity or bringing in one you already created in your
-                    provider console.
-                  </p>
-                </div>
-                <ChooseModeStep selected={mode} onSelect={setMode} />
+    <PageContainer width="form">
+      <Wizard
+        fullWidth
+        title="Add email domain"
+        currentStep={currentStep}
+        steps={WIZARD_STEPS}
+      >
+        {/* Step content */}
+        <div className="rounded-lg border bg-card p-4 sm:p-6">
+          {currentStep === 'choose-mode' && (
+            <div className="space-y-4">
+              <div>
+                <h2 className="text-base font-semibold">
+                  How do you want to add this domain?
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Choose whether you are registering a brand-new domain identity
+                  or bringing in one you already created in your provider
+                  console.
+                </p>
               </div>
-            )}
+              <ChooseModeStep selected={mode} onSelect={setMode} />
+            </div>
+          )}
 
-            {currentStep === 'configure' && mode && (
-              <div className="space-y-4">
-                <div>
-                  <h2 className="text-base font-semibold">
-                    {mode === 'create'
-                      ? 'Configure your new domain'
-                      : 'Configure the domain to import'}
-                  </h2>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {mode === 'create'
-                      ? 'Choose your provider and enter the domain you want to set up for sending.'
-                      : 'Enter the provider and exact domain name as it appears in your provider console.'}
-                  </p>
-                </div>
-                {isLoadingProviders ? (
-                  <Card>
-                    <CardContent className="pt-6 space-y-6">
-                      <div className="h-10 animate-pulse rounded-md bg-muted" />
-                      <div className="h-10 animate-pulse rounded-md bg-muted" />
-                    </CardContent>
-                  </Card>
-                ) : providers.length === 0 ? (
-                  <Card>
-                    <CardContent className="pt-6 flex flex-col items-center gap-3 py-10">
-                      <Globe className="size-8 text-muted-foreground" />
-                      <div className="text-center">
-                        <p className="font-medium">
-                          No email providers configured
-                        </p>
-                        <p className="mt-1 text-sm text-muted-foreground">
-                          You need to add a provider before setting up a domain.{' '}
-                          <button
-                            type="button"
-                            className="underline underline-offset-2 hover:text-foreground"
-                            onClick={() => navigate('/email/providers/new')}
-                          >
-                            Add a provider
-                          </button>
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
-                ) : (
-                  <ConfigureStep
-                    mode={mode}
-                    providers={providers}
-                    providerId={providerId}
-                    domain={domain}
-                    providerIdentityId={providerIdentityId}
-                    errors={step2Errors}
-                    onProviderChange={(id) => {
-                      const next = selectionAfterProviderChange(
-                        mode,
-                        providerId,
-                        id,
-                        { domain, providerIdentityId }
-                      )
-                      setDomain(next.domain)
-                      setProviderIdentityId(next.providerIdentityId)
-                      setProviderId(id)
-                      setStep2Errors((prev) => ({
-                        ...prev,
-                        provider_id: undefined,
-                      }))
-                    }}
-                    onDomainChange={(value) => {
-                      setDomain(value)
-                      setStep2Errors((prev) => ({ ...prev, domain: undefined }))
-                    }}
-                    onProviderIdentityIdChange={(value) => {
-                      setProviderIdentityId(value)
-                      setStep2Errors((prev) => ({
-                        ...prev,
-                        provider_identity_id: undefined,
-                      }))
-                    }}
-                    discoverableDomains={discoverableDomains}
-                    isLoadingDiscoverableDomains={isLoadingDiscoverableDomains}
-                  />
-                )}
+          {currentStep === 'configure' && mode && (
+            <div className="space-y-4">
+              <div>
+                <h2 className="text-base font-semibold">
+                  {mode === 'create'
+                    ? 'Configure your new domain'
+                    : 'Configure the domain to import'}
+                </h2>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {mode === 'create'
+                    ? 'Choose your provider and enter the domain you want to set up for sending.'
+                    : 'Enter the provider and exact domain name as it appears in your provider console.'}
+                </p>
               </div>
-            )}
-
-            {currentStep === 'review' && mode && (
-              <ReviewStep
-                mode={mode}
-                providers={providers}
-                providerId={providerId}
-                domain={domain}
-                providerIdentityId={providerIdentityId}
-                isPending={isPending}
-                onSubmit={handleSubmit}
-              />
-            )}
-          </div>
-
-          {/* Navigation buttons */}
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              {currentStep !== 'choose-mode' && (
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={handleBack}
-                  disabled={isPending}
-                >
-                  <ArrowLeft className="mr-2 size-4" />
-                  Back
-                </Button>
+              {isLoadingProviders ? (
+                <Card>
+                  <CardContent className="pt-6 space-y-6">
+                    <div className="h-10 animate-pulse rounded-md bg-muted" />
+                    <div className="h-10 animate-pulse rounded-md bg-muted" />
+                  </CardContent>
+                </Card>
+              ) : providers.length === 0 ? (
+                <Card>
+                  <CardContent className="pt-6 flex flex-col items-center gap-3 py-10">
+                    <Globe className="size-8 text-muted-foreground" />
+                    <div className="text-center">
+                      <p className="font-medium">
+                        No email providers configured
+                      </p>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        You need to add a provider before setting up a domain.{' '}
+                        <button
+                          type="button"
+                          className="underline underline-offset-2 hover:text-foreground"
+                          onClick={() => navigate('/email/providers/new')}
+                        >
+                          Add a provider
+                        </button>
+                      </p>
+                    </div>
+                  </CardContent>
+                </Card>
+              ) : (
+                <ConfigureStep
+                  mode={mode}
+                  providers={providers}
+                  providerId={providerId}
+                  domain={domain}
+                  providerIdentityId={providerIdentityId}
+                  errors={step2Errors}
+                  onProviderChange={(id) => {
+                    const next = selectionAfterProviderChange(
+                      mode,
+                      providerId,
+                      id,
+                      { domain, providerIdentityId }
+                    )
+                    setDomain(next.domain)
+                    setProviderIdentityId(next.providerIdentityId)
+                    setProviderId(id)
+                    setStep2Errors((prev) => ({
+                      ...prev,
+                      provider_id: undefined,
+                    }))
+                  }}
+                  onDomainChange={(value) => {
+                    setDomain(value)
+                    setStep2Errors((prev) => ({ ...prev, domain: undefined }))
+                  }}
+                  onProviderIdentityIdChange={(value) => {
+                    setProviderIdentityId(value)
+                    setStep2Errors((prev) => ({
+                      ...prev,
+                      provider_identity_id: undefined,
+                    }))
+                  }}
+                  discoverableDomains={discoverableDomains}
+                  isLoadingDiscoverableDomains={isLoadingDiscoverableDomains}
+                />
               )}
             </div>
+          )}
 
-            <div className="flex items-center gap-3">
+          {currentStep === 'review' && mode && (
+            <ReviewStep
+              mode={mode}
+              providers={providers}
+              providerId={providerId}
+              domain={domain}
+              providerIdentityId={providerIdentityId}
+              isPending={isPending}
+              onSubmit={handleSubmit}
+            />
+          )}
+        </div>
+
+        {/* Navigation buttons */}
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            {currentStep !== 'choose-mode' && (
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => navigate('/email')}
+                onClick={handleBack}
                 disabled={isPending}
               >
-                Cancel
+                <ArrowLeft className="mr-2 size-4" />
+                Back
               </Button>
+            )}
+          </div>
 
-              {currentStep !== 'review' && (
-                <Button
-                  type="button"
-                  onClick={handleNext}
-                  disabled={!canGoNext}
-                >
-                  Next
-                  <ArrowRight className="ml-2 size-4" />
-                </Button>
-              )}
-            </div>
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => navigate('/email')}
+              disabled={isPending}
+            >
+              Cancel
+            </Button>
+
+            {currentStep !== 'review' && (
+              <Button type="button" onClick={handleNext} disabled={!canGoNext}>
+                Next
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            )}
           </div>
         </div>
-      </div>
-    </div>
+      </Wizard>
+    </PageContainer>
   )
 }
