@@ -34,6 +34,10 @@ The same flow is available in three places:
   **Deploy a sample app in one click**, also on the first-run screen, is a different path: it runs a public sample image and does not use your files.
 </Note>
 
+<Note>
+  Dropping files needs durable storage on the Temps server. On a stateless control plane, uploaded source archives, static bundles and Docker image archives are unavailable and the drop zone is disabled. Push a prebuilt image to a registry and deploy it by image reference instead.
+</Note>
+
 ---
 
 ## What you can drop {{ anchor: true, id: 'what-you-can-drop' }}
@@ -63,7 +67,7 @@ What is left out depends on how the files arrive.
 
 The console lists what it skipped under **Left out of the upload**, with the reason for each.
 
-**A ZIP** is uploaded exactly as it is. Your browser does not open or filter it, and Temps stores the original archive on the server. The server inspects it, and a ZIP that contains `*.pem`, `*.key` or `credentials.json` is refused with the entry named. Those three names are the only secrets Temps looks for, so a `.env` file, an SSH key or a token in another file is not detected. The server skips the other entries in the table above when it builds, but they are still inside the archive you uploaded. Remove every secret from the folder before you zip it.
+**A ZIP** is uploaded exactly as it is. Your browser does not open or filter it, and Temps stores the original archive on the server. The server inspects it, and a ZIP that contains `*.pem`, `*.key` or `credentials.json` is refused with the entry named. A key inside `node_modules/` or `.git/` is skipped instead of refused, but it is still in the archive that is stored. Those three names are the only secrets Temps looks for, so a `.env` file, an SSH key or a token in another file is not detected. The server skips the other entries in the table above when it builds, but they are still inside the archive you uploaded. Remove every secret from the folder before you zip it.
 
 ---
 
@@ -85,10 +89,10 @@ What happens next depends on what was detected:
 | Anything else (a framework app, a `Dockerfile`, and so on) | Uploads the source and builds it on the server, then runs the result like any other deployment. | **Uploaded source** |
 
 <Note>
-  A ZIP that holds a plain static site is published as a static bundle without the left-out rules above: `node_modules/` and similar folders are not removed. Temps withholds files with sensitive names (such as `.env*`, `*.pem`, `*.key`, `id_rsa`, `credentials*` and `.git`) from what it serves, but anything else in the archive can be published. Remove anything you do not want public before you zip it.
+  A ZIP that holds a plain static site is published as a static bundle without the left-out rules above: `node_modules/` and similar folders are not removed. Temps does not serve files and folders whose names start with a dot (such as `.env` and `.git`), nor private keys and certificates (`*.pem`, `*.key`, `id_rsa`) or a short list of well-known credential files such as `credentials` and `credentials.json`. Anything else in the archive can be published, including a file like `credentials.yaml` or a config file that holds a token. Remove anything you do not want public before you zip it.
 </Note>
 
-If a service was created some other way, for example from Git or a Docker image, it accepts an uploaded source archive only when **Other sources** is turned on under **Settings > Build & deploy**. Static bundles and Docker images are always accepted.
+If a service was created some other way, for example from Git or a Docker image, it accepts an uploaded source archive only when **Other sources** is turned on under **Settings > Build & deploy**. Static bundles and Docker image archives do not need that setting.
 
 See [Projects](/docs/projects#service-sources) for all the ways a service can get its code.
 
