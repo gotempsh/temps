@@ -425,6 +425,8 @@ async fn change_and_audit(
     }
 }
 
+/// Audit-log a recorded change from `previous` to `recorded`. A failed write
+/// is logged; the change stands.
 async fn audit_mode_change(
     app_state: &AppState,
     id: i32,
@@ -487,6 +489,7 @@ pub async fn get_managed_ca_certificate(
     Ok(Json(ManagedCaCertificateResponse::from(ca)))
 }
 
+/// The server TLS routes of external services.
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route(

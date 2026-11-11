@@ -49,6 +49,7 @@ pub enum ServerTlsMode {
 }
 
 impl ServerTlsMode {
+    /// The mode as stored and as serialized: `off`, `available` or `required`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -387,6 +388,7 @@ impl PendingCreate {
 }
 
 impl HelperCleanup {
+    /// An armed cleanup for the helper created under `name`.
     fn new(docker: &bollard::Docker, name: &str) -> Self {
         Self {
             docker: docker.clone(),
@@ -397,6 +399,7 @@ impl HelperCleanup {
         }
     }
 
+    /// Docker answered the create: remove the helper by this ID from now on.
     fn created(&mut self, id: &str) {
         self.container = id.to_string();
         self.create_answered = true;
@@ -491,6 +494,9 @@ fn helper_container_name(volume: &str) -> String {
     format!("{volume}-tls-install-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// Write the pair into the volume through the created (never started)
+/// helper: resolve the engine user from the image's `/etc/passwd`, then
+/// upload the slot and the switched link in one archive.
 async fn install_through_helper(
     docker: &bollard::Docker,
     helper: &str,

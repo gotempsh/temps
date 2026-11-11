@@ -298,6 +298,7 @@ impl ClusterTlsApplyReport {
         self.failed.is_empty() && self.initializing.is_empty()
     }
 
+    /// The failed members as `member: reason`, separated by `; `.
     fn describe_failures(&self) -> String {
         self.failed
             .iter()
@@ -326,6 +327,7 @@ pub(crate) fn container_tls_state(
 }
 
 impl ExternalServiceManager {
+    /// The managed-TLS store over this manager's database and encryption.
     fn managed_tls(&self) -> ManagedTlsService {
         ManagedTlsService::new(self.db.clone(), self.encryption_service.clone())
     }
@@ -422,6 +424,8 @@ impl ExternalServiceManager {
         self.tls_status_for(&service, &parameters).await
     }
 
+    /// The TLS status of `service`: its setting, its certificate and what its
+    /// container or data nodes serve.
     async fn tls_status_for(
         &self,
         service: &external_services::Model,
@@ -741,6 +745,8 @@ impl ExternalServiceManager {
         }
     }
 
+    /// What a local standalone container serves, read from its labels and
+    /// command; [`ContainerTlsState::Unknown`] when it cannot be inspected.
     async fn inspect_container_tls(&self, container: &str) -> ContainerTlsState {
         let Ok(docker) = self.require_docker() else {
             return ContainerTlsState::Unknown;
@@ -814,6 +820,9 @@ impl ExternalServiceManager {
             })?
     }
 
+    /// The body of [`Self::set_service_tls_mode`], on its own task: record the
+    /// mode under the service's TLS lock, apply it to what runs, and roll back
+    /// on failure.
     async fn change_service_tls_mode(
         &self,
         service_id: i32,

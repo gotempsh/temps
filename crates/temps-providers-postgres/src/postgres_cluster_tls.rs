@@ -255,13 +255,6 @@ if [ -z "${APPLIED:-}" ]; then
   exit 5
 fi"#;
 
-/// The command that makes a running data node serve `target`. Run as root
-/// in the member (`docker exec` locally, the agent on a worker); for
-/// [`ClusterServerCertificate::Managed`] the exec environment carries
-/// [`CLUSTER_TLS_CERT_ENV`] and [`CLUSTER_TLS_KEY_ENV`]. Idempotent. On
-/// success it prints [`SERVED_FINGERPRINT_MARKER`] with the fingerprint now
-/// served; it exits [`NOT_INITIALIZED_EXIT_CODE`] on a member that is not
-/// an initialized data node yet, and non-zero with the reason otherwise.
 /// How long the apply script may run inside the data node before it and
 /// every process it started are killed. The control plane waits longer than
 /// this plus [`MEMBER_KILL_GRACE_SECS`], so when it gives up on a member the
@@ -287,6 +280,13 @@ fn bounded_bash(deadline_secs: u64, script: String) -> Vec<String> {
     ]
 }
 
+/// The command that makes a running data node serve `target`. Run as root
+/// in the member (`docker exec` locally, the agent on a worker); for
+/// [`ClusterServerCertificate::Managed`] the exec environment carries
+/// [`CLUSTER_TLS_CERT_ENV`] and [`CLUSTER_TLS_KEY_ENV`]. Idempotent. On
+/// success it prints [`SERVED_FINGERPRINT_MARKER`] with the fingerprint now
+/// served; it exits [`NOT_INITIALIZED_EXIT_CODE`] on a member that is not
+/// an initialized data node yet, and non-zero with the reason otherwise.
 pub fn server_tls_apply_command(target: ClusterServerCertificate) -> Vec<String> {
     let [slot_a, slot_b] = CLUSTER_TLS_SLOTS;
     let mut script = vec![

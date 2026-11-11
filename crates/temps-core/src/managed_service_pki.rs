@@ -282,6 +282,8 @@ pub fn normalize_subject_alt_names(values: &[String]) -> Vec<String> {
     out
 }
 
+/// One subject alternative name: an IP address when `value` parses as one,
+/// a DNS name otherwise.
 fn san_from_str(subject: &str, value: &str) -> Result<SanType, ManagedPkiError> {
     if let Ok(ip) = value.parse::<std::net::IpAddr>() {
         return Ok(SanType::IpAddress(ip));
@@ -316,6 +318,7 @@ fn validity_window(now: DateTime<Utc>, days: i64) -> (DateTime<Utc>, DateTime<Ut
     (start, start + Duration::days(days))
 }
 
+/// `at` as the `time` crate's timestamp, which rcgen takes for validity.
 fn to_offset(at: DateTime<Utc>) -> Result<time::OffsetDateTime, ManagedPkiError> {
     time::OffsetDateTime::from_unix_timestamp(at.timestamp()).map_err(|e| {
         ManagedPkiError::InvalidTimestamp {

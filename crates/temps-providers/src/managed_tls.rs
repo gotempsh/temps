@@ -285,6 +285,7 @@ pub struct ServiceTlsStatus {
 }
 
 impl ServiceTlsStatus {
+    /// The fingerprint of the certificate issued for this service, if any.
     fn issued_fingerprint(&self) -> Option<&str> {
         self.certificate
             .as_ref()
@@ -353,6 +354,8 @@ pub struct AuthorityCertificate {
     pub info: AuthorityInfo,
 }
 
+/// Map a database error to [`ManagedTlsError::Database`] with what was
+/// being done.
 fn db_error(context: impl Into<String>) -> impl FnOnce(sea_orm::DbErr) -> ManagedTlsError {
     let context = context.into();
     move |source| ManagedTlsError::Database { context, source }
@@ -390,6 +393,8 @@ pub struct ManagedTlsService {
 }
 
 impl ManagedTlsService {
+    /// A service over the given database and the encryption that protects
+    /// stored private keys.
     pub fn new(db: Arc<DatabaseConnection>, encryption: Arc<EncryptionService>) -> Self {
         Self { db, encryption }
     }
@@ -459,6 +464,7 @@ impl ManagedTlsService {
         self.decrypt_authority(record)
     }
 
+    /// The CA row with its private key decrypted.
     fn decrypt_authority(&self, record: authorities::Model) -> Result<AuthorityMaterial> {
         let key_pem = self
             .encryption
@@ -627,6 +633,7 @@ pub async fn set_mode_on<C: ConnectionTrait>(
     }
 }
 
+/// A stored mode, or [`ManagedTlsError::InvalidStoredMode`] naming the service.
 fn parse_mode(service_id: i32, value: &str) -> Result<ServerTlsMode> {
     value
         .parse()
@@ -636,6 +643,7 @@ fn parse_mode(service_id: i32, value: &str) -> Result<ServerTlsMode> {
         })
 }
 
+/// The subject alternative names stored with a service's certificate.
 fn stored_sans(row: &external_service_tls::Model) -> Result<Option<Vec<String>>> {
     row.subject_alt_names
         .as_deref()
@@ -648,6 +656,8 @@ fn stored_sans(row: &external_service_tls::Model) -> Result<Option<Vec<String>>>
         .transpose()
 }
 
+/// What a client may see of a service's issued certificate; `None` while
+/// none was issued.
 fn certificate_info(row: &external_service_tls::Model) -> Result<Option<IssuedCertificateInfo>> {
     let (Some(fingerprint), Some(not_before), Some(not_after), Some(authority_id)) = (
         row.fingerprint_sha256.clone(),
@@ -704,6 +714,7 @@ fn reusable_material(
     }))
 }
 
+/// Whether two SAN lists name the same hosts, ignoring order and case.
 fn same_names(a: &[String], b: &[String]) -> bool {
     let normalize = |names: &[String]| {
         let mut out: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
