@@ -129,19 +129,30 @@ async fn node_removal_releases_authorities_after_project_deletion() {
     )
     .await
     .unwrap();
+    // Project deletion preserves runtime provenance until the consumer or
+    // its worker is removed; node cleanup must still retire only its records.
     assert_eq!(
         count(
             &db,
             "SELECT count(*) AS n FROM sandbox_access_runtime_records"
         )
         .await,
-        0
+        2
     );
     assert_eq!(
         count(&db, "SELECT count(*) AS n FROM sandbox_access_authorities").await,
         3
     );
     NodeService::new(db.clone()).remove(node_id).await.unwrap();
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) AS n FROM sandbox_access_runtime_records WHERE sandbox_id=9901"
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(&db, "SELECT count(*) AS n FROM sandbox_access_runtime_records WHERE sandbox_id=9902 AND project_id=9901").await, 1);
     assert_eq!(
         count(&db, "SELECT count(*) AS n FROM sandbox_access_authorities").await,
         1

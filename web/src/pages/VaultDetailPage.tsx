@@ -242,12 +242,18 @@ function VaultDetail({ vaultId }: { vaultId: string }) {
                       <div className="flex min-w-0 items-center gap-3">
                         <ServiceProviderLogo service={r} />
                         <div className="min-w-0">
-                          <RecordLink
-                            className="font-medium break-words"
-                            to={`/access-services/${encodeURIComponent(r.id)}/edit?vault=${encodeURIComponent(vaultId)}`}
-                          >
-                            {r.name}
-                          </RecordLink>
+                          {canWrite ? (
+                            <RecordLink
+                              className="font-medium break-words"
+                              to={`/access-services/${encodeURIComponent(r.id)}/edit?vault=${encodeURIComponent(vaultId)}`}
+                            >
+                              {r.name}
+                            </RecordLink>
+                          ) : (
+                            <span className="font-medium break-words">
+                              {r.name}
+                            </span>
+                          )}
                           <p className="text-xs text-muted-foreground">
                             {serviceProviderName(r)} · v{r.version}
                           </p>

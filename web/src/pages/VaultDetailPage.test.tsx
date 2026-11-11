@@ -230,9 +230,13 @@ test('session pagination survives switching vault tabs without fetching hidden s
   }
 })
 
-test('vault services show provider logos and readers have no add-service navigation', () => {
+test('vault services show provider logos and readers have no service-editor navigation', () => {
   mount('services', false)
   expect(within(document.body).getAllByAltText('GitHub')).toBeTruthy()
+  expect(within(document.body).getByText('Repository API')).toBeTruthy()
+  expect(
+    within(document.body).queryByRole('link', { name: 'Repository API' })
+  ).toBeNull()
   const add = within(document.body).getByRole('button', {
     name: 'Add service',
   }) as HTMLButtonElement
