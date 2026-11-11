@@ -22,6 +22,7 @@ import {
   generalAccessCapabilityOptions,
   getCurrentUserOptions,
   getAccessVaultGeneralOptions,
+  getAccessVaultOptions,
   listAccessBundlesGeneralOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AccessServiceResponse, AccessVaultResponse } from '@/api/client'
@@ -560,108 +561,136 @@ test('bundle card opens read-only details and vault has no sandbox grant tab', a
   }
 })
 
-test('vault draft survives dismissal and refetch, and successful saves advance its version', async () => {
-  let saved = vault
-  const submissions: Array<{
-    name: string
-    service_ids: string[]
-    expected_version: number
-  }> = []
-  const api = mockApi({
-    'GET /access-services': () =>
-      jsonResponse({ items: [service], total: 1, page: 1, page_size: 20 }),
-    'GET /access-vaults/vault_test': () =>
-      jsonResponse({ vault: saved, services: [service] }),
-    'PUT /access-vaults/vault_test': async (request) => {
-      const body = (await request.json()) as (typeof submissions)[number]
-      submissions.push(body)
-      saved = {
-        ...saved,
-        name: body.name,
-        service_ids: body.service_ids,
-        version: saved.version + 1,
-      }
-      return jsonResponse(saved)
-    },
-  })
-  let client: QueryClient | undefined
-  const open = async () => {
-    await act(async () =>
-      fireEvent.click(
-        within(document.body).getByRole('button', { name: 'Edit vault' })
-      )
-    )
-    await waitFor(() =>
-      expect(within(document.body).getByRole('checkbox')).toBeTruthy()
-    )
-  }
-  try {
-    client = mount()
-    await open()
-    await act(async () => {
-      fireEvent.change(within(document.body).getByLabelText('Vault name'), {
-        target: { value: 'Staging draft' },
-      })
-      fireEvent.click(within(document.body).getByRole('checkbox'))
-    })
-    await act(async () =>
-      fireEvent.keyDown(within(document.body).getByRole('dialog'), {
-        key: 'Escape',
-        code: 'Escape',
-        keyCode: 27,
-      })
-    )
-    await waitFor(() =>
-      expect(within(document.body).queryByRole('dialog')).toBeNull()
-    )
-    await act(async () => {
-      client!.setQueryData(
-        getAccessVaultGeneralOptions({ path: { vault_id: vault.id } }).queryKey,
-        {
-          vault: { ...vault, name: 'Refetched name', version: 9 },
-          services: [service],
+test.each([false, true])(
+  'vault saves refresh the active detail and preserve drafts (legacy route: %s)',
+  async (legacy) => {
+    let saved = vault
+    const submissions: Array<{
+      name: string
+      service_ids: string[]
+      expected_version: number
+    }> = []
+    const api = mockApi({
+      'GET /access-services': () =>
+        jsonResponse({ items: [service], total: 1, page: 1, page_size: 20 }),
+      [legacy
+        ? 'GET /projects/7/access-vaults/vault_test'
+        : 'GET /access-vaults/vault_test']: () =>
+        jsonResponse({ vault: saved, services: [service] }),
+      'PUT /access-vaults/vault_test': async (request) => {
+        const body = (await request.json()) as (typeof submissions)[number]
+        submissions.push(body)
+        saved = {
+          ...saved,
+          name: body.name,
+          service_ids: body.service_ids,
+          version: saved.version + 1,
         }
-      )
+        return jsonResponse(saved)
+      },
     })
-    await open()
-    expect(
-      (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
-        .value
-    ).toBe('Staging draft')
-    expect(
-      within(document.body).getByRole('checkbox').getAttribute('data-state')
-    ).toBe('unchecked')
-    await act(async () =>
-      fireEvent.click(
-        within(document.body).getByRole('button', { name: 'Save vault' })
+    let client: QueryClient | undefined
+    const open = async () => {
+      await act(async () =>
+        fireEvent.click(
+          within(document.body).getByRole('button', { name: 'Edit vault' })
+        )
       )
-    )
-    await waitFor(() =>
-      expect(within(document.body).queryByRole('dialog')).toBeNull()
-    )
-    expect(submissions[0]).toEqual({
-      name: 'Staging draft',
-      service_ids: [],
-      expected_version: 3,
-    })
-    await open()
-    expect(
-      (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
-        .value
-    ).toBe('Staging draft')
-    await act(async () =>
-      fireEvent.click(
-        within(document.body).getByRole('button', { name: 'Save vault' })
+      await waitFor(() =>
+        expect(within(document.body).getByRole('checkbox')).toBeTruthy()
       )
-    )
-    await waitFor(() => expect(submissions.length).toBe(2))
-    expect(submissions[1].expected_version).toBe(4)
-  } finally {
-    await act(async () => cleanup())
-    client?.clear()
-    api.restore()
+    }
+    try {
+      client = mount(
+        'services',
+        true,
+        legacy ? '/vault/projects/7/vaults/vault_test' : undefined
+      )
+      await waitFor(() =>
+        expect(
+          (
+            within(document.body).getByRole('button', {
+              name: 'Edit vault',
+            }) as HTMLButtonElement
+          ).disabled
+        ).toBe(false)
+      )
+      await open()
+      await act(async () => {
+        fireEvent.change(within(document.body).getByLabelText('Vault name'), {
+          target: { value: 'Staging draft' },
+        })
+        fireEvent.click(within(document.body).getByRole('checkbox'))
+      })
+      await act(async () =>
+        fireEvent.keyDown(within(document.body).getByRole('dialog'), {
+          key: 'Escape',
+          code: 'Escape',
+          keyCode: 27,
+        })
+      )
+      await waitFor(() =>
+        expect(within(document.body).queryByRole('dialog')).toBeNull()
+      )
+      await act(async () => {
+        client!.setQueryData(
+          legacy
+            ? getAccessVaultOptions({
+                path: { project_id: 7, vault_id: vault.id },
+              }).queryKey
+            : getAccessVaultGeneralOptions({ path: { vault_id: vault.id } })
+                .queryKey,
+          {
+            vault: { ...vault, name: 'Refetched name', version: 9 },
+            services: [service],
+          }
+        )
+      })
+      await open()
+      expect(
+        (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
+          .value
+      ).toBe('Staging draft')
+      expect(
+        within(document.body).getByRole('checkbox').getAttribute('data-state')
+      ).toBe('unchecked')
+      await act(async () =>
+        fireEvent.click(
+          within(document.body).getByRole('button', { name: 'Save vault' })
+        )
+      )
+      await waitFor(() =>
+        expect(within(document.body).queryByRole('dialog')).toBeNull()
+      )
+      await waitFor(() =>
+        expect(
+          within(document.body).getByRole('heading', { name: 'Staging draft' })
+        ).toBeTruthy()
+      )
+      expect(submissions[0]).toEqual({
+        name: 'Staging draft',
+        service_ids: [],
+        expected_version: 3,
+      })
+      await open()
+      expect(
+        (within(document.body).getByLabelText('Vault name') as HTMLInputElement)
+          .value
+      ).toBe('Staging draft')
+      await act(async () =>
+        fireEvent.click(
+          within(document.body).getByRole('button', { name: 'Save vault' })
+        )
+      )
+      await waitFor(() => expect(submissions.length).toBe(2))
+      expect(submissions[1].expected_version).toBe(4)
+    } finally {
+      await act(async () => cleanup())
+      client?.clear()
+      api.restore()
+    }
   }
-})
+)
 
 test('clicking service row outside its name opens the service', async () => {
   const client = mount()

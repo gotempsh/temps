@@ -1228,6 +1228,9 @@ async fn approval_permissions_are_fenced_to_the_exact_reviewed_policy() {
                     db = db
                         .append_query_results([vec![project]])
                         .append_query_results([vec![access_vaults::Model {
+                            legacy_approval_before: None,
+                            legacy_service_ids: None,
+                            legacy_removed_service_ids: vec![],
                             retired_at: None,
                             id: "vault_test".into(),
                             project_id: Some(7),

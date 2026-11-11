@@ -647,6 +647,15 @@ async fn historical_declarations_release_capacity_but_reapproval_cannot_overfill
 
 #[tokio::test]
 async fn vault_membership_stops_existing_durable_approval_and_worker_binding() {
+    vault_approval_transition(false).await;
+}
+
+#[tokio::test]
+async fn upgrade_preserves_standalone_approval_until_original_link_is_revoked() {
+    vault_approval_transition(true).await;
+}
+
+async fn vault_approval_transition(upgrade: bool) {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
     {
@@ -805,11 +814,95 @@ async fn vault_membership_stops_existing_durable_approval_and_worker_binding() {
         .link_vault(&vault.id, Some(9751), None)
         .await
         .unwrap();
-    // Coverage alone is insufficient: the old approval never consented to a vault session.
-    let plan = planner.prepare(worker.identity().boot_id).await.unwrap();
-    assert!(plan.bindings.is_empty());
-    assert_eq!(plan.retire.len(), 1);
-    service.unlink_vault(&vault.id, &link.id).await.unwrap();
+    let link_id = if upgrade {
+        use temps_migrations::{
+            LegacyStandaloneVaultCoverageMigration, MigrationTrait, SchemaManager,
+        };
+        // Reproduce the pre-upgrade persisted state, then apply the real additive
+        // migration. The old version permitted membership alongside approval.
+        let manager = SchemaManager::new(db.as_ref());
+        LegacyStandaloneVaultCoverageMigration
+            .down(&manager)
+            .await
+            .unwrap();
+        db.execute_unprepared(&format!(
+            "UPDATE access_vaults SET project_id=9751 WHERE id='{}'; UPDATE access_vault_links SET id='link_legacy_{}' WHERE id='{}'",
+            vault.id, vault.id, link.id
+        )).await.unwrap();
+        LegacyStandaloneVaultCoverageMigration
+            .up(&manager)
+            .await
+            .unwrap();
+        assert_eq!(
+            planner
+                .prepare(worker.identity().boot_id)
+                .await
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+        // The same pre-upgrade grant is also eligible without a durable
+        // assignment: one-shot consent uses its immutable creation timestamp.
+        db.execute_unprepared(&format!(
+            "UPDATE sandbox_service_grants SET assignment_id=NULL WHERE id='{grant}'"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            planner
+                .prepare(worker.identity().boot_id)
+                .await
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+        db.execute_unprepared(&format!(
+            "UPDATE sandbox_service_grants SET assignment_id='{}' WHERE id='{grant}'",
+            approved.id
+        ))
+        .await
+        .unwrap();
+        // Reconcile without permanently revoking the saved approval.
+        assert!(service
+            .renew_assignment(&approved.id, 9751, 9751, observed.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(assignments::Entity::find_by_id(&approved.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none());
+        // Rotation keeps the original consent date, not the new grant's date.
+        let mut restarted = observed.clone();
+        restarted.incarnation = uuid::Uuid::new_v4();
+        assert!(service
+            .renew_assignment(&approved.id, 9751, 9751, restarted)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            planner
+                .prepare(worker.identity().boot_id)
+                .await
+                .unwrap()
+                .bindings
+                .len(),
+            1
+        );
+        format!("link_legacy_{}", vault.id)
+    } else {
+        // Post-upgrade membership requires fresh vault consent even with a link.
+        let plan = planner.prepare(worker.identity().boot_id).await.unwrap();
+        assert!(plan.bindings.is_empty());
+        assert_eq!(plan.retire.len(), 1);
+        link.id.clone()
+    };
+    service.unlink_vault(&vault.id, &link_id).await.unwrap();
     assert!(planner
         .prepare(worker.identity().boot_id)
         .await
@@ -849,7 +942,7 @@ async fn vault_membership_stops_existing_durable_approval_and_worker_binding() {
             .count(db.as_ref())
             .await
             .unwrap(),
-        1
+        if upgrade { 2 } else { 1 }
     );
     test.cleanup().await;
 }

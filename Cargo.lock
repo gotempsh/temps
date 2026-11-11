@@ -15800,6 +15800,7 @@ dependencies = [
  "temps-core",
  "temps-entities",
  "temps-git",
+ "temps-migrations",
  "temps-sandbox-providers",
  "temps-service-access-runtime",
  "temps-test-utils",

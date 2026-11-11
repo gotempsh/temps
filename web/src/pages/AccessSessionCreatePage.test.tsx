@@ -68,138 +68,148 @@ const bundle = {
   created_at: date,
   updated_at: date,
 }
-test('session approval binds reviewed policies and preserves consent identity on retry', async () => {
-  const bodies: unknown[] = []
-  const handler = async (request: Request) => {
-    const url = new URL(request.url)
-    const method = request.method
-    if (url.pathname.includes('/consumers/'))
-      return jsonResponse({
-        id: 'link_fixture',
-        vault_id: 'vault_test',
-        sandbox_id: 42,
-        project_id: null,
-        created_at: date,
-      })
-    if (method === 'POST') {
-      bodies.push(await request.json())
-      return jsonResponse({ detail: 'Policy changed. Review again.' }, 409)
+test.each([false, true])(
+  'session approval preserves consent identity on retry (legacy project route: %s)',
+  async (legacy) => {
+    const bodies: unknown[] = []
+    const handler = async (request: Request) => {
+      const url = new URL(request.url)
+      const method = request.method
+      if (url.pathname.includes('/consumers/'))
+        return jsonResponse({
+          id: 'link_fixture',
+          vault_id: 'vault_test',
+          sandbox_id: legacy ? null : 42,
+          project_id: legacy ? 7 : null,
+          created_at: date,
+        })
+      if (method === 'POST') {
+        bodies.push(await request.json())
+        return jsonResponse({ detail: 'Policy changed. Review again.' }, 409)
+      }
+      if (url.pathname.endsWith('/capability'))
+        return jsonResponse({
+          configured: true,
+          can_manage_requests: true,
+          can_manage_services: !legacy,
+        })
+      if (url.pathname.endsWith('/bundles'))
+        return jsonResponse({
+          items: [bundle],
+          total: 1,
+          page: 1,
+          page_size: 100,
+        })
+      if (url.pathname.endsWith('/access-vaults/vault_test'))
+        return jsonResponse({
+          vault: {
+            id: 'vault_test',
+            name: 'Work',
+            project_id: 7,
+            service_ids: ['svc_test'],
+            version: 1,
+          },
+          services: [service],
+        })
+      if (url.pathname.endsWith('/v1/sandboxes'))
+        return jsonResponse({
+          sandboxes: [
+            { id: 'sbx_ready', name: 'Ready sandbox', status: 'running' },
+            { id: 'sbx_stopped', name: 'Stopped sandbox', status: 'stopped' },
+          ],
+          pagination: { count: 2 },
+        })
+      return jsonResponse({ detail: 'Unexpected request' }, 500)
     }
-    if (url.pathname.endsWith('/capability'))
-      return jsonResponse({
-        configured: true,
-        can_manage_requests: true,
-        can_manage_services: true,
-      })
-    if (url.pathname.endsWith('/bundles'))
-      return jsonResponse({
-        items: [bundle],
-        total: 1,
-        page: 1,
-        page_size: 100,
-      })
-    if (url.pathname.endsWith('/access-vaults/vault_test'))
-      return jsonResponse({
-        vault: {
-          id: 'vault_test',
-          name: 'Work',
-          project_id: 7,
-          service_ids: ['svc_test'],
-          version: 1,
+    const readBase = legacy
+      ? '/projects/7/access-vaults/vault_test'
+      : '/access-vaults/vault_test'
+    const routeBase = legacy ? '/vault/projects/7/vaults' : '/vault/vaults'
+    const contextQuery = legacy ? '' : '?sandbox=sbx_ready'
+    const api = mockApi(
+      Object.fromEntries(
+        [
+          'POST /access-vaults/vault_test/sessions',
+          'GET /service-access/capability',
+          `GET ${readBase}/bundles`,
+          `GET ${readBase}`,
+          'GET /v1/sandboxes',
+          'GET /access-vaults/vault_test/consumers/sbx_ready',
+        ].map((path) => [path, handler])
+      )
+    )
+    try {
+      const client = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false },
+          mutations: { retry: false },
         },
-        services: [service],
       })
-    if (url.pathname.endsWith('/v1/sandboxes'))
-      return jsonResponse({
-        sandboxes: [
-          { id: 'sbx_ready', name: 'Ready sandbox', status: 'running' },
-          { id: 'sbx_stopped', name: 'Stopped sandbox', status: 'stopped' },
-        ],
-        pagination: { count: 2 },
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter
+            initialEntries={[
+              `${routeBase}/vault_test/bundles/bundle_test/sessions/new${contextQuery}`,
+            ]}
+          >
+            <BreadcrumbProvider>
+              <BreadcrumbLinks />
+              <Routes>
+                <Route
+                  path={`${legacy ? '/vault/projects/:projectId/vaults' : '/vault/vaults'}/:vaultId/bundles/:bundleId/sessions/new`}
+                  element={<AccessSessionCreatePage />}
+                />
+              </Routes>
+            </BreadcrumbProvider>
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const ui = within(document.body)
+      await waitFor(() =>
+        expect(ui.getByLabelText(/Ready sandbox/)).toBeTruthy()
+      )
+      await waitFor(() =>
+        expect(
+          within(ui.getByRole('navigation', { name: 'Breadcrumbs' }))
+            .getByRole('link', { name: 'Work' })
+            .getAttribute('href')
+        ).toBe(`${routeBase}/vault_test${contextQuery}`)
+      )
+      expect(
+        (ui.getByLabelText(/Stopped sandbox/) as HTMLInputElement).disabled
+      ).toBe(true)
+      fireEvent.click(ui.getByLabelText(/Ready sandbox/))
+      fireEvent.change(ui.getByLabelText('Session lifetime (seconds)'), {
+        target: { value: '120' },
       })
-    return jsonResponse({ detail: 'Unexpected request' }, 500)
-  }
-  const api = mockApi(
-    Object.fromEntries(
-      [
-        'POST /access-vaults/vault_test/sessions',
-        'GET /service-access/capability',
-        'GET /access-vaults/vault_test/bundles',
-        'GET /access-vaults/vault_test',
-        'GET /v1/sandboxes',
-        'GET /access-vaults/vault_test/consumers/sbx_ready',
-      ].map((path) => [path, handler])
-    )
-  )
-  try {
-    const client = new QueryClient({
-      defaultOptions: {
-        queries: { retry: false },
-        mutations: { retry: false },
-      },
-    })
-    render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter
-          initialEntries={[
-            '/vault/vaults/vault_test/bundles/bundle_test/sessions/new?sandbox=sbx_ready',
-          ]}
-        >
-          <BreadcrumbProvider>
-            <BreadcrumbLinks />
-            <Routes>
-              <Route
-                path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
-                element={<AccessSessionCreatePage />}
-              />
-            </Routes>
-          </BreadcrumbProvider>
-        </MemoryRouter>
-      </QueryClientProvider>
-    )
-    const ui = within(document.body)
-    await waitFor(() => expect(ui.getByLabelText(/Ready sandbox/)).toBeTruthy())
-    await waitFor(() =>
+      await waitFor(() =>
+        expect(
+          ui
+            .getByRole('button', { name: 'Approve session' })
+            .getAttribute('aria-disabled')
+        ).toBe('false')
+      )
+      fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
+      await waitFor(() => expect(bodies.length).toBe(1))
+      expect(bodies[0]).toMatchObject({
+        bundle_id: 'bundle_test',
+        bundle_version: 3,
+        consumer: { kind: 'sandbox', sandbox_id: 'sbx_ready' },
+        ttl_seconds: 120,
+        services: [{ service_id: 'svc_test', version: 2 }],
+      })
+      await waitFor(() =>
+        expect(ui.getByText('Could not issue session')).toBeTruthy()
+      )
       expect(
-        within(ui.getByRole('navigation', { name: 'Breadcrumbs' }))
-          .getByRole('link', { name: 'Work' })
-          .getAttribute('href')
-      ).toBe('/vault/vaults/vault_test?sandbox=sbx_ready')
-    )
-    expect(
-      (ui.getByLabelText(/Stopped sandbox/) as HTMLInputElement).disabled
-    ).toBe(true)
-    fireEvent.click(ui.getByLabelText(/Ready sandbox/))
-    fireEvent.change(ui.getByLabelText('Session lifetime (seconds)'), {
-      target: { value: '120' },
-    })
-    await waitFor(() =>
-      expect(
-        ui
-          .getByRole('button', { name: 'Approve session' })
-          .getAttribute('aria-disabled')
-      ).toBe('false')
-    )
-    fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
-    await waitFor(() => expect(bodies.length).toBe(1))
-    expect(bodies[0]).toMatchObject({
-      bundle_id: 'bundle_test',
-      bundle_version: 3,
-      consumer: { kind: 'sandbox', sandbox_id: 'sbx_ready' },
-      ttl_seconds: 120,
-      services: [{ service_id: 'svc_test', version: 2 }],
-    })
-    await waitFor(() =>
-      expect(ui.getByText('Could not issue session')).toBeTruthy()
-    )
-    expect(
-      (ui.getByLabelText('Session lifetime (seconds)') as HTMLInputElement)
-        .value
-    ).toBe('120')
-    fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
-    await waitFor(() => expect(bodies.length).toBe(2))
-    expect(bodies[1]).toEqual(bodies[0])
-  } finally {
-    api.restore()
+        (ui.getByLabelText('Session lifetime (seconds)') as HTMLInputElement)
+          .value
+      ).toBe('120')
+      fireEvent.click(ui.getByRole('button', { name: 'Approve session' }))
+      await waitFor(() => expect(bodies.length).toBe(2))
+      expect(bodies[1]).toEqual(bodies[0])
+    } finally {
+      api.restore()
+    }
   }
-})
+)

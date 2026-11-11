@@ -101,30 +101,47 @@ FROM due WHERE a.id=due.id RETURNING a.*
         if !service.enabled || service.version != row.service_version {
             return Ok(None);
         };
-        // A durable standalone approval does not become vault consent when its
-        // service is added to a vault. Stop both extension and grant rotation.
-        match self.require_standalone_service(&tx, &service.id).await {
-            Ok(()) => {}
-            Err(AccessError::VaultSessionRequired { .. }) => {
-                let next_version = row.version + 1;
-                let mut retired = row.into_active_model();
-                retired.version = Set(next_version);
-                retired.revoked_at = Set(Some(now));
-                retired.next_reconcile_at = Set(None);
-                retired.updated_at = Set(now);
-                retired.update(&tx).await.map_err(|e| {
-                    AccessError::database(
-                        "retire standalone approval after vault membership",
-                        project_id,
-                        e,
-                    )
-                })?;
-                tx.commit().await.map_err(|e| {
-                    AccessError::database("commit retired standalone approval", project_id, e)
-                })?;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
+        // Preserve pre-upgrade approval only while its original project links
+        // still cover it. New vault membership never becomes implicit consent.
+        let covered = tx
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT temps_standalone_vault_coverage($1,$2,$3) AS covered",
+                [
+                    service.id.clone().into(),
+                    project_id.into(),
+                    row.approved_at.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| AccessError::database("check renewal vault coverage", project_id, e))?
+            .ok_or_else(|| {
+                AccessError::resource_database(
+                    "read renewal vault coverage",
+                    id,
+                    sea_orm::DbErr::Custom("coverage query returned no row".into()),
+                )
+            })?
+            .try_get::<bool>("", "covered")
+            .map_err(|e| AccessError::database("decode renewal vault coverage", project_id, e))?;
+        if !covered {
+            let next_version = row.version + 1;
+            let mut retired = row.into_active_model();
+            retired.version = Set(next_version);
+            retired.revoked_at = Set(Some(now));
+            retired.next_reconcile_at = Set(None);
+            retired.updated_at = Set(now);
+            retired.update(&tx).await.map_err(|e| {
+                AccessError::database(
+                    "retire standalone approval after vault coverage loss",
+                    project_id,
+                    e,
+                )
+            })?;
+            tx.commit().await.map_err(|e| {
+                AccessError::database("commit retired standalone approval", project_id, e)
+            })?;
+            return Ok(None);
         }
         let sandbox = self
             .sandbox(

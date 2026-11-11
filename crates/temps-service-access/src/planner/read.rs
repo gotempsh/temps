@@ -103,7 +103,9 @@ impl PolicyPlanner {
                   AND d.revoked_at IS NULL AND (d.expires_at IS NULL OR d.expires_at>now()+interval '1 second')
                   AND d.grant_id=g.id))
               AND ((NOT EXISTS (SELECT 1 FROM access_sessions session WHERE session.grant_ids @> ARRAY[g.id])
-                AND NOT EXISTS (SELECT 1 FROM access_vaults vault WHERE vault.retired_at IS NULL AND vault.service_ids @> ARRAY[g.service_id])) OR EXISTS (
+                AND temps_standalone_vault_coverage(g.service_id, g.project_id,
+                  CASE WHEN g.assignment_id IS NULL THEN g.created_at ELSE
+                    (SELECT d.approved_at FROM sandbox_service_assignments d WHERE d.id=g.assignment_id) END)) OR EXISTS (
                 SELECT 1 FROM access_sessions session JOIN access_vault_links link ON link.id=COALESCE(session.link_id,CASE WHEN session.legacy_project_link THEN 'link_legacy_' || session.vault_id END)
                 WHERE session.grant_ids @> ARRAY[g.id] AND session.revoked_at IS NULL AND session.expires_at>now()
                   AND link.revoked_at IS NULL AND link.vault_id=session.vault_id

@@ -57,6 +57,11 @@ const INDEXES: &[(&str, &str, &str)] = &[
         "USING gin(service_ids)",
     ),
     (
+        "access_vaults_legacy_services",
+        "access_vaults",
+        "USING gin ((COALESCE(legacy_service_ids, service_ids))) WHERE legacy_approval_before IS NOT NULL",
+    ),
+    (
         "access_bundles_page",
         "access_bundles",
         "(vault_id,created_at DESC,id DESC) WHERE retired_at IS NULL",
@@ -91,7 +96,14 @@ where
     if !available {
         return Ok(());
     }
+    let legacy_available = sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='access_vaults' AND column_name='legacy_approval_before')")
+        .fetch_one(&mut *connection).await.map_err(|error| SchemaError::VaultIndex {
+            index: "access_vaults_legacy_services", operation: "check schema for", reason: error.to_string(),
+        })?;
     for &(name, table, definition) in INDEXES {
+        if name == "access_vaults_legacy_services" && !legacy_available {
+            continue;
+        }
         progress(MaintenanceProgress::IndexStarted { name });
         let started = std::time::Instant::now();
         build_index_with_retry(

@@ -26,6 +26,7 @@ import {
   generalAccessCapabilityOptions,
   getVaultEligibilityOptions,
   getAccessVaultGeneralOptions,
+  getAccessVaultOptions,
   listSandboxesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { accessBundleOptions } from '@/components/service-access/access-bundle-query'
@@ -43,19 +44,22 @@ type Snapshot = {
   services: AccessServiceResponse[]
 }
 export default function AccessSessionCreatePage() {
-  const { vaultId = '', bundleId = '' } = useParams()
+  const { vaultId = '', bundleId = '', projectId } = useParams()
   return (
     <SessionCreate
-      key={`${vaultId}:${bundleId}`}
+      key={`${projectId}:${vaultId}:${bundleId}`}
       vaultId={vaultId}
+      projectId={projectId === undefined ? undefined : Number(projectId)}
       bundleId={bundleId}
     />
   )
 }
 function SessionCreate({
+  projectId,
   vaultId,
   bundleId,
 }: {
+  projectId?: number
   vaultId: string
   bundleId: string
 }) {
@@ -64,21 +68,33 @@ function SessionCreate({
   const consumerQuery = sandboxId
     ? `?sandbox=${encodeURIComponent(sandboxId)}`
     : ''
-  const valid = !!vaultId && !!bundleId
-  const base = `/vault/vaults/${encodeURIComponent(vaultId)}`
+  const valid =
+    !!vaultId &&
+    !!bundleId &&
+    (projectId === undefined ||
+      (Number.isSafeInteger(projectId) && projectId > 0))
+  const base = `/vault${projectId === undefined ? '' : `/projects/${projectId}`}/vaults/${encodeURIComponent(vaultId)}`
   const back = `${base}/bundles/${encodeURIComponent(bundleId)}${consumerQuery}`
   const bundle = useQuery({
-    ...accessBundleOptions(vaultId, bundleId, sandboxId),
+    ...accessBundleOptions(vaultId, bundleId, sandboxId, projectId),
     enabled: valid,
   })
-  const vault = useQuery({
+  const generalVault = useQuery({
     ...getAccessVaultGeneralOptions({
       path: { vault_id: vaultId },
       query: sandboxId ? { sandbox_id: sandboxId } : undefined,
     }),
-    enabled: valid,
+    enabled: valid && projectId === undefined,
     refetchOnMount: 'always',
   })
+  const projectVault = useQuery({
+    ...getAccessVaultOptions({
+      path: { vault_id: vaultId, project_id: projectId ?? 0 },
+    }),
+    enabled: valid && projectId !== undefined,
+    refetchOnMount: 'always',
+  })
+  const vault = projectId === undefined ? generalVault : projectVault
   const capability = useQuery({
     ...generalAccessCapabilityOptions(),
     enabled: valid,

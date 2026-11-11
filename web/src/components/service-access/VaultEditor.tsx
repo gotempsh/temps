@@ -85,6 +85,8 @@ export function VaultEditor({
       void client.invalidateQueries({
         queryKey: [{ _id: 'listAccessVaultsGeneral' }],
       })
+      void client.invalidateQueries({ queryKey: [{ _id: 'getAccessVault' }] })
+      void client.invalidateQueries({ queryKey: [{ _id: 'listAccessVaults' }] })
       onClose()
     },
   })
