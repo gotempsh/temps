@@ -37,6 +37,14 @@ import { toast } from 'sonner'
  * stays out of the way when nothing is deployed yet (the first deployment
  * picks the variables up on its own).
  */
+/**
+ * An action that names an environment can be as long as the environment's
+ * name. The shared button never wraps, so on a narrow screen a long name would
+ * widen the page sideways; let the label wrap and the button grow instead.
+ */
+const WRAPPING_ACTION =
+  'h-auto min-w-0 max-w-full whitespace-normal py-2 text-left [overflow-wrap:anywhere]'
+
 export function ServiceLinkRedeployPrompt({
   project,
   change,
@@ -176,6 +184,7 @@ export function ServiceLinkRedeployPrompt({
                   key={environment.id}
                   size="sm"
                   variant={environment === firstTarget ? 'default' : 'outline'}
+                  className={WRAPPING_ACTION}
                   asChild
                 >
                   <Link to={uploadAgainPath(environment.id)}>
@@ -198,6 +207,7 @@ export function ServiceLinkRedeployPrompt({
                 key={environment.id}
                 size="sm"
                 variant={environment === firstTarget ? 'default' : 'outline'}
+                className={WRAPPING_ACTION}
                 disabled={redeployability.isPending}
                 onClick={() => reviewRedeploy(environment.id)}
               >

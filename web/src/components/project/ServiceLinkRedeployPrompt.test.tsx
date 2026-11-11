@@ -150,6 +150,9 @@ test('a Git project whose live deployments are uploaded archives is sent to the 
     name: /Upload source again for production/,
   })
   expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
+  // A long environment name wraps instead of widening the page.
+  expect(staging.className).toContain('whitespace-normal')
+  expect(staging.className).toContain('max-w-full')
   // Straight to the upload page, carrying the environment and every
   // environment still waiting, so the upload can carry on with them.
   expect(staging.getAttribute('href')).toBe(
