@@ -18,9 +18,13 @@
 //!   the request's `backup_uuid`, for the control plane to ask for instead
 //!   of starting another backup.
 //!
-//! One entry per service: its latest backup. Ended entries are dropped
-//! after [`RETENTION`], so the map is bounded by the services on this node.
-//! Nothing here is on a request hot path.
+//! The running backup of each service, which holds it, is kept apart from
+//! the outcomes of ended backups, which are kept by service and backup id:
+//! a backup that starts after another ended never hides that one's
+//! outcome from its caller. Ended outcomes are dropped after [`RETENTION`],
+//! and at most [`ENDED_PER_SERVICE`] are kept per service (the oldest go
+//! first), so both maps are bounded by the services on this node. Nothing
+//! here is on a request hot path.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -30,6 +34,10 @@ use temps_service_protocol::{PostgresWalgBackupProgress, PostgresWalgBackupResul
 
 /// How long an ended backup's outcome is kept for its caller to read.
 pub(crate) const RETENTION: Duration = Duration::from_secs(24 * 3600);
+
+/// How many ended outcomes are kept per service: far more than the backups
+/// a caller can still be waiting on, as a service runs one at a time.
+pub(crate) const ENDED_PER_SERVICE: usize = 16;
 
 /// The worker backups of this node.
 pub(crate) static WORKER_BACKUPS: LazyLock<BackupOutcomes> = LazyLock::new(BackupOutcomes::default);
@@ -45,11 +53,6 @@ enum Outcome {
     Ended(String),
 }
 
-struct Entry {
-    backup_uuid: String,
-    ended: Option<(Instant, Outcome)>,
-}
-
 /// A backup of the service is already running on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackupInFlight {
@@ -57,17 +60,33 @@ pub(crate) struct BackupInFlight {
     pub(crate) backup_uuid: String,
 }
 
+#[derive(Default)]
+struct State {
+    /// Service name → the id of its running backup.
+    running: HashMap<String, String>,
+    /// (service name, backup id) → when and how that backup ended.
+    ended: HashMap<(String, String), Ended>,
+    /// Orders ended outcomes, oldest first, as instants can tie.
+    next_seq: u64,
+}
+
+struct Ended {
+    at: Instant,
+    seq: u64,
+    outcome: Outcome,
+}
+
 /// Backups by service name; see the module documentation.
 #[derive(Default)]
 pub(crate) struct BackupOutcomes {
-    entries: Mutex<HashMap<String, Entry>>,
+    state: Mutex<State>,
 }
 
 impl BackupOutcomes {
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
-        // Every mutation is a single insert or field write: a panic while
-        // holding the lock leaves a valid map.
-        self.entries
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // Every mutation is a single insert, remove or retain: a panic while
+        // holding the lock leaves valid maps.
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -81,26 +100,19 @@ impl BackupOutcomes {
         service: &str,
         backup_uuid: &str,
     ) -> Result<BackupTracker, BackupInFlight> {
-        let mut entries = self.lock();
+        let mut state = self.lock();
         let now = Instant::now();
-        entries.retain(|_, entry| {
-            entry
-                .ended
-                .as_ref()
-                .is_none_or(|(at, _)| now.saturating_duration_since(*at) < RETENTION)
-        });
-        if let Some(running) = entries.get(service).filter(|entry| entry.ended.is_none()) {
+        state
+            .ended
+            .retain(|_, ended| now.saturating_duration_since(ended.at) < RETENTION);
+        if let Some(running) = state.running.get(service) {
             return Err(BackupInFlight {
-                backup_uuid: running.backup_uuid.clone(),
+                backup_uuid: running.clone(),
             });
         }
-        entries.insert(
-            service.to_string(),
-            Entry {
-                backup_uuid: backup_uuid.to_string(),
-                ended: None,
-            },
-        );
+        state
+            .running
+            .insert(service.to_string(), backup_uuid.to_string());
         Ok(BackupTracker {
             outcomes: self,
             service: service.to_string(),
@@ -116,22 +128,27 @@ impl BackupOutcomes {
         service: &str,
         backup_uuid: &str,
     ) -> PostgresWalgBackupProgress {
-        let entries = self.lock();
-        let Some(entry) = entries
+        let state = self.lock();
+        if state
+            .running
             .get(service)
-            .filter(|entry| entry.backup_uuid == backup_uuid)
-        else {
-            return PostgresWalgBackupProgress::Unknown;
-        };
-        match &entry.ended {
-            None => PostgresWalgBackupProgress::Running,
-            Some((_, Outcome::PostgresWalg(outcome))) => PostgresWalgBackupProgress::Finished {
+            .is_some_and(|running| running == backup_uuid)
+        {
+            return PostgresWalgBackupProgress::Running;
+        }
+        match state
+            .ended
+            .get(&(service.to_string(), backup_uuid.to_string()))
+            .map(|ended| &ended.outcome)
+        {
+            None => PostgresWalgBackupProgress::Unknown,
+            Some(Outcome::PostgresWalg(outcome)) => PostgresWalgBackupProgress::Finished {
                 outcome: outcome.clone(),
             },
-            Some((_, Outcome::Ended(reason))) => PostgresWalgBackupProgress::Ended {
+            Some(Outcome::Ended(reason)) => PostgresWalgBackupProgress::Ended {
                 reason: reason.clone(),
             },
-            Some((_, Outcome::Reported)) => PostgresWalgBackupProgress::Ended {
+            Some(Outcome::Reported) => PostgresWalgBackupProgress::Ended {
                 reason: format!(
                     "backup {backup_uuid} of service '{service}' was not a WAL-G base backup"
                 ),
@@ -140,13 +157,37 @@ impl BackupOutcomes {
     }
 
     fn end(&self, service: &str, backup_uuid: &str, outcome: Outcome) {
-        let mut entries = self.lock();
-        if let Some(entry) = entries
-            .get_mut(service)
-            .filter(|entry| entry.backup_uuid == backup_uuid && entry.ended.is_none())
+        let mut state = self.lock();
+        if state
+            .running
+            .get(service)
+            .is_none_or(|running| running != backup_uuid)
         {
-            entry.ended = Some((Instant::now(), outcome));
+            return;
         }
+        state.running.remove(service);
+        let mut kept: Vec<(u64, String)> = state
+            .ended
+            .iter()
+            .filter(|((name, _), _)| name == service)
+            .map(|((_, id), ended)| (ended.seq, id.clone()))
+            .collect();
+        if kept.len() >= ENDED_PER_SERVICE {
+            kept.sort();
+            for (_, id) in kept.iter().take(kept.len() + 1 - ENDED_PER_SERVICE) {
+                state.ended.remove(&(service.to_string(), id.clone()));
+            }
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        state.ended.insert(
+            (service.to_string(), backup_uuid.to_string()),
+            Ended {
+                at: Instant::now(),
+                seq,
+                outcome,
+            },
+        );
     }
 }
 
@@ -304,8 +345,11 @@ mod tests {
         ));
     }
 
+    /// The reported failure: backup A's request went unanswered and its
+    /// caller asks for its outcome, but backup B of the same service began
+    /// after A finished and before that ask. A's outcome must still be read.
     #[test]
-    fn a_later_backup_replaces_the_entry() {
+    fn a_finished_outcome_survives_the_next_backup_of_its_service() {
         let outcomes = outcomes();
         outcomes
             .begin("orders", "b-1")
@@ -314,11 +358,35 @@ mod tests {
         let _second = outcomes.begin("orders", "b-2").expect("second");
         assert_eq!(
             outcomes.walg_progress("orders", "b-1"),
-            PostgresWalgBackupProgress::Unknown
+            PostgresWalgBackupProgress::Finished {
+                outcome: completed()
+            }
         );
         assert_eq!(
             outcomes.walg_progress("orders", "b-2"),
             PostgresWalgBackupProgress::Running
         );
+    }
+
+    #[test]
+    fn at_most_the_latest_outcomes_of_a_service_are_kept() {
+        let outcomes = outcomes();
+        for n in 0..=ENDED_PER_SERVICE {
+            outcomes
+                .begin("orders", &format!("b-{n}"))
+                .expect("begin")
+                .finish_walg::<String>(&Ok(completed()));
+        }
+        assert_eq!(
+            outcomes.walg_progress("orders", "b-0"),
+            PostgresWalgBackupProgress::Unknown,
+            "the oldest went"
+        );
+        for n in 1..=ENDED_PER_SERVICE {
+            assert!(matches!(
+                outcomes.walg_progress("orders", &format!("b-{n}")),
+                PostgresWalgBackupProgress::Finished { .. }
+            ));
+        }
     }
 }
