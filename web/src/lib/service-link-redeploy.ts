@@ -153,6 +153,9 @@ export async function redeployDeployment(
   }
 }
 
+/** How long to wait for the live deployments before offering the action anyway. */
+const REDEPLOYABILITY_DEADLINE_MS = 4000
+
 /**
  * Whether the console can start a redeploy for at least one of `environments`.
  *
@@ -164,37 +167,51 @@ export async function redeployDeployment(
  * (or a manual or external one with nothing to rebuild from) has to be
  * uploaded again.
  *
- * When a deployment cannot be read, or there is nothing to decide, this says
- * yes: the redeploy itself reports why an environment was skipped, and
+ * It answers as soon as one environment is known to be redeployable, and gives
+ * up waiting after a few seconds. When a deployment cannot be read, there is
+ * nothing to decide, or the lookup is too slow, this says yes: the redeploy itself reports why an environment was skipped, and
  * withholding the action on a failed read would regress working projects.
  */
 export async function canRedeployAnyInPlace(
   projectId: number,
   projectSourceType: SourceType,
   environments: EnvironmentResponse[],
-  api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi
+  api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi,
+  deadlineMs = REDEPLOYABILITY_DEADLINE_MS
 ): Promise<boolean> {
   if (environments.length === 0) return true
-  const verdicts = await Promise.all(
-    environments.map(async (environment) => {
-      try {
-        const { data: deployment } = await api.getDeployment({
+  const controller = new AbortController()
+  return new Promise<boolean>((resolve) => {
+    let unredeployable = 0
+    const finish = (redeployable: boolean) => {
+      clearTimeout(timer)
+      // Stop reads that are still waiting: the answer is known.
+      controller.abort()
+      resolve(redeployable)
+    }
+    // A lookup that never answers must not hold back the confirmation that
+    // depends on it; without an answer the action is offered, as for a failed
+    // read.
+    const timer = setTimeout(() => finish(true), deadlineMs)
+    for (const environment of environments) {
+      void api
+        .getDeployment({
           path: {
             project_id: projectId,
             deployment_id: environment.current_deployment_id as number,
           },
+          signal: controller.signal,
           throwOnError: true,
         })
-        return (
-          deploymentRedeployPlan(deployment, projectSourceType).kind !==
-          'unsupported'
-        )
-      } catch {
-        return true
-      }
-    })
-  )
-  return verdicts.some(Boolean)
+        .then(({ data: deployment }) => {
+          const plan = deploymentRedeployPlan(deployment, projectSourceType)
+          if (plan.kind !== 'unsupported') return finish(true)
+          unredeployable += 1
+          if (unredeployable === environments.length) finish(false)
+        })
+        .catch(() => finish(true))
+    }
+  })
 }
 
 /**

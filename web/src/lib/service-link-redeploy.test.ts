@@ -294,6 +294,60 @@ describe('canRedeployAnyInPlace', () => {
     ).toBe(true)
   })
 
+  test('a stalled lookup does not hold back the answer', async () => {
+    const api = {
+      getDeployment: () => new Promise(() => {}),
+    } as unknown as Pick<RedeployApi, 'getDeployment'>
+    const started = Date.now()
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31)],
+        api,
+        30
+      )
+    ).toBe(true)
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
+  test('answers once one environment is redeployable, without waiting for the rest, and cancels them', async () => {
+    let cancelled = false
+    const api = {
+      getDeployment: ({
+        path,
+        signal,
+      }: {
+        path: { deployment_id: number }
+        signal?: AbortSignal
+      }) => {
+        if (path.deployment_id === 41) {
+          return Promise.resolve({
+            data: deployment(41, 4, {
+              metadata: { externalImageRef: 'app:2' },
+            }),
+          })
+        }
+        return new Promise((_, reject) => {
+          signal?.addEventListener('abort', () => {
+            cancelled = true
+            reject(new Error('aborted'))
+          })
+        })
+      },
+    } as unknown as Pick<RedeployApi, 'getDeployment'>
+    expect(
+      await canRedeployAnyInPlace(
+        7,
+        'uploaded_source',
+        [env(3, 'production', 31), env(4, 'staging', 41)],
+        api,
+        5000
+      )
+    ).toBe(true)
+    expect(cancelled).toBe(true)
+  })
+
   test('nothing to decide is not a reason to withhold it', async () => {
     expect(
       await canRedeployAnyInPlace(7, 'uploaded_source', [], apiFor({}))

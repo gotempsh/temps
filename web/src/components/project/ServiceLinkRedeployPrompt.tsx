@@ -19,7 +19,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Info, Loader2, RefreshCw, Upload, X } from 'lucide-react'
 import { Link } from 'react-router'
-import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
+import {
+  defaultDeployEnvironment,
+  projectUploadPath,
+} from '@/lib/project-deploy-action'
 import { useProjectDeploy } from './project-deploy-context'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -113,6 +116,12 @@ export function ServiceLinkRedeployPrompt({
     redeployable
   )
   const firstTarget = defaultDeployEnvironment(targets)
+  const uploadAgainPath = (environmentId: number | undefined) =>
+    projectUploadPath(
+      project.slug,
+      environmentId,
+      targets.length > 1 ? targets.map(({ id }) => id) : undefined
+    )
   const reviewRedeploy = (environmentId: number | undefined) => {
     deployDialog?.openDeploy({
       environmentId,
@@ -156,7 +165,34 @@ export function ServiceLinkRedeployPrompt({
             </p>
           ))}
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          {deployDialog && targets.length > 1 ? (
+          {!redeployable ? (
+            // Straight to the upload page, whatever the project's own source
+            // type is: the deploy dialog follows the project, not the running
+            // deployment, so for a Git project it would open the Git form.
+            // The upload page takes over the environments still to redeploy.
+            targets.length > 1 ? (
+              targets.map((environment) => (
+                <Button
+                  key={environment.id}
+                  size="sm"
+                  variant={environment === firstTarget ? 'default' : 'outline'}
+                  asChild
+                >
+                  <Link to={uploadAgainPath(environment.id)}>
+                    <Upload className="size-3.5" />
+                    Upload source again for {environment.name}
+                  </Link>
+                </Button>
+              ))
+            ) : (
+              <Button size="sm" asChild>
+                <Link to={uploadAgainPath(firstTarget?.id)}>
+                  <Upload className="size-3.5" />
+                  Upload source again
+                </Link>
+              </Button>
+            )
+          ) : deployDialog && targets.length > 1 ? (
             targets.map((environment) => (
               <Button
                 key={environment.id}
@@ -165,17 +201,11 @@ export function ServiceLinkRedeployPrompt({
                 disabled={redeployability.isPending}
                 onClick={() => reviewRedeploy(environment.id)}
               >
-                {redeployable ? (
-                  <RefreshCw className="size-3.5" />
-                ) : (
-                  <Upload className="size-3.5" />
-                )}
-                {redeployable
-                  ? `Redeploy ${environment.name}`
-                  : `Upload source again for ${environment.name}`}
+                <RefreshCw className="size-3.5" />
+                Redeploy {environment.name}
               </Button>
             ))
-          ) : redeployable || deployDialog ? (
+          ) : (
             <Button
               size="sm"
               onClick={() =>
@@ -191,14 +221,12 @@ export function ServiceLinkRedeployPrompt({
             >
               {redeploy.isPending ? (
                 <Loader2 className="size-3.5 animate-spin" />
-              ) : redeployable ? (
-                <RefreshCw className="size-3.5" />
               ) : (
-                <Upload className="size-3.5" />
+                <RefreshCw className="size-3.5" />
               )}
-              {redeployable ? 'Redeploy now' : 'Upload source again'}
+              Redeploy now
             </Button>
-          ) : null}
+          )}
           <Button size="sm" variant="outline" asChild>
             <Link to={`/projects/${project.slug}/deployments`}>
               View deployments

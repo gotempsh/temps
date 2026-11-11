@@ -39,6 +39,11 @@ const deploymentOf = (id: number, made: Made) => ({
   id,
   ...(made === 'git' ? { branch: 'main', commit_hash: 'abc123' } : {}),
   ...(made === 'image' ? { metadata: { externalImageRef: 'app:1' } } : {}),
+  // A deployment made from an uploaded archive says so itself, whatever the
+  // project's own source type is.
+  ...(made === 'archive'
+    ? { metadata: { deploymentSourceType: 'uploaded_source' } }
+    : {}),
 })
 
 /** Two deployed environments; records every request the prompt sends. */
@@ -123,7 +128,7 @@ test('on a project page, each environment gets its own deploy dialog, in turn', 
   expect(opened[1].onStarted).toBeUndefined()
 })
 
-test('every environment waiting goes with the deploy, so an upload can carry on with them', async () => {
+test('a Git project whose live deployments are uploaded archives is sent to the upload page, not the Git dialog', async () => {
   serveEnvironments('archive')
   const opened: OpenDeployOptions[] = []
   const view = renderPrompt(
@@ -134,28 +139,51 @@ test('every environment waiting goes with the deploy, so an upload can carry on 
         {children}
       </ProjectDeployContext.Provider>
     ),
-    'uploaded_source'
+    'git'
   )
 
   // An uploaded archive cannot be rebuilt, so the action says it is an upload.
-  fireEvent.click(await enabledButton(view, /Upload source again for staging/))
+  const staging = await view.findByRole('link', {
+    name: /Upload source again for staging/,
+  })
+  const production = view.getByRole('link', {
+    name: /Upload source again for production/,
+  })
   expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
-  expect(opened[0].environmentId).toBe(4)
-  expect(opened[0].pendingEnvironmentIds).toEqual([4, 3])
-
-  // Only the last environment left: nothing to carry on with.
-  act(() => opened[0].onStarted?.(4))
-  fireEvent.click(view.getByRole('button', { name: /Upload source again/ }))
-  expect(opened[1].pendingEnvironmentIds).toBeUndefined()
+  // Straight to the upload page, carrying the environment and every
+  // environment still waiting, so the upload can carry on with them.
+  expect(staging.getAttribute('href')).toBe(
+    '/projects/synthetic-api/drop?environment=4&pending=4&pending=3'
+  )
+  expect(production.getAttribute('href')).toBe(
+    '/projects/synthetic-api/drop?environment=3&pending=4&pending=3'
+  )
+  // The Git deploy dialog is never opened for it.
+  fireEvent.click(staging)
+  expect(opened).toEqual([])
 })
 
-test('outside a project page, an uploaded source gets no redeploy that would be declined', async () => {
+test('an uploaded-source project gets the same upload link', async () => {
+  serveEnvironments('archive')
+  const view = renderPrompt(undefined, 'uploaded_source')
+
+  const link = await view.findByRole('link', {
+    name: /Upload source again for staging/,
+  })
+  expect(link.getAttribute('href')).toBe(
+    '/projects/synthetic-api/drop?environment=4&pending=4&pending=3'
+  )
+})
+
+test('outside a project page, an uploaded source gets an upload link and no redeploy that would be declined', async () => {
   const api = serveEnvironments('archive')
   const view = renderPrompt(undefined, 'uploaded_source')
 
   await view.findByText(/Upload the source again to apply the change now/)
   expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
-  expect(view.queryByRole('button', { name: /Upload source again/ })).toBeNull()
+  expect(
+    view.getByRole('link', { name: /Upload source again for production/ })
+  ).toBeTruthy()
   // The links that remain still work.
   expect(view.getByRole('link', { name: 'View deployments' })).toBeTruthy()
   // Reading the live deployments decided this; nothing was started.
