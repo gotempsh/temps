@@ -633,12 +633,19 @@ impl TempsPlugin for BackupPlugin {
             // and are retried.
             match crate::services::active_restore_run_ids(db.as_ref()).await {
                 Ok(run_ids) if !run_ids.is_empty() => {
-                    let fence = crate::services::ManagerRestoreFence::new(
-                        context.require_service::<temps_providers::ExternalServiceManager>(),
+                    let manager =
+                        context.require_service::<temps_providers::ExternalServiceManager>();
+                    let fence = crate::services::ManagerRestoreFence::new(Arc::clone(&manager));
+                    // A worker restore keeps running on its node: it is
+                    // resumed from the node's outcome, not interrupted.
+                    let workers = crate::services::ManagerWorkerRestoreResume::new(
+                        db.clone(),
+                        Arc::clone(&encryption_service),
+                        manager,
                     );
                     let restore_db = db.clone();
                     tokio::spawn(async move {
-                        reconcile_restores_with_retry(restore_db, run_ids, fence).await;
+                        reconcile_restores_with_retry(restore_db, run_ids, fence, workers).await;
                     });
                 }
                 Ok(_) => {}
@@ -898,10 +905,25 @@ async fn reconcile_restores_with_retry(
     db: Arc<sea_orm::DatabaseConnection>,
     mut run_ids: Vec<i32>,
     fence: crate::services::ManagerRestoreFence,
+    workers: crate::services::ManagerWorkerRestoreResume,
 ) {
     for attempt in 1..=RESTORE_RECONCILE_MAX_ATTEMPTS {
-        match crate::services::reconcile_interrupted_restores(db.as_ref(), &run_ids, &fence).await {
+        match crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &run_ids,
+            &fence,
+            &workers,
+        )
+        .await
+        {
             Ok(report) => {
+                if !report.resumed.is_empty() {
+                    info!(
+                        resumed = ?report.resumed,
+                        "Worker restore runs left active by a restart are resumed from their \
+                         nodes' outcomes",
+                    );
+                }
                 if !report.interrupted.is_empty() {
                     info!(
                         interrupted = ?report.interrupted,

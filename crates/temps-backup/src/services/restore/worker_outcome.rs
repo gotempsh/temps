@@ -15,6 +15,14 @@
 //! `running` and its node is asked for the outcome until it reports one.
 //! Only then is the run settled: a completed restore patches the target's
 //! stored login to the restored one, as an answered one does.
+//!
+//! The same holds across a restart of this process: the node keeps
+//! restoring, so a worker restore run left active is not marked
+//! interrupted at startup (that would release the service and skip the
+//! reconcile). [`ManagerWorkerRestoreResume`] asks its node for the
+//! outcome recorded under the run's operation id and settles the run as a
+//! live one would; a node that is gone or never knew the restore fails it
+//! with what to check.
 
 use std::future::Future;
 use std::time::Duration;
@@ -122,6 +130,38 @@ impl WorkerRestoreRun<'_> {
         self.settle(outcome).await
     }
 
+    /// Settle a run left active by a restart while it was in `phase`, from
+    /// the outcome its node recorded, asking with `ask` as `wait` says.
+    pub(super) async fn resume_with<Ask, AskFut>(
+        &self,
+        wait: &OutcomeWait,
+        phase: &str,
+        ask: Ask,
+    ) -> Result<Option<i32>, RestoreError>
+    where
+        Ask: FnMut() -> AskFut,
+        AskFut: Future<Output = Result<WorkerRestoreProgress, ExternalServiceError>>,
+    {
+        info!(
+            run_id = self.run_id,
+            service_id = self.target_id,
+            node_id = self.node_id,
+            engine = self.engine.label(),
+            phase,
+            "resuming a worker restore after a restart; asking its node for the outcome"
+        );
+        let outcome = await_outcome(
+            wait,
+            Asking::AfterRestart { phase },
+            self.engine,
+            self.run_id,
+            self.node_id,
+            ask,
+        )
+        .await?;
+        self.settle(outcome).await
+    }
+
     /// What the run makes of its node's restore outcome: a completed restore
     /// patches the target's stored login to the restored one and enters
     /// verification; a refused or failed one fails the run.
@@ -163,6 +203,39 @@ impl WorkerRestoreRun<'_> {
 /// must be checked before it is restored again.
 async fn await_unanswered_restore<Ask, AskFut>(
     wait: &OutcomeWait,
+    engine: WorkerRestoreEngine,
+    run_id: i32,
+    node_id: i32,
+    ask: Ask,
+) -> Result<WorkerRestoreResult, RestoreError>
+where
+    Ask: FnMut() -> AskFut,
+    AskFut: Future<Output = Result<WorkerRestoreProgress, ExternalServiceError>>,
+{
+    await_outcome(wait, Asking::Unanswered, engine, run_id, node_id, ask).await
+}
+
+/// Why a restore's outcome is asked for, which says what a node with no
+/// record of it means.
+#[derive(Debug, Clone, Copy)]
+enum Asking<'a> {
+    /// The run's own request went unanswered.
+    Unanswered,
+    /// This process restarted while the run was in `phase`.
+    AfterRestart { phase: &'a str },
+}
+
+/// The phases a worker run enters just before it sends its restore to the
+/// node, and after: the node may have received it. Before them (preparing,
+/// or waiting for a busy node's slot) no request is in flight.
+fn request_may_have_been_sent(phase: &str) -> bool {
+    matches!(phase, "restore" | "recover" | "verify")
+}
+
+/// [`await_unanswered_restore`], for `asking`.
+async fn await_outcome<Ask, AskFut>(
+    wait: &OutcomeWait,
+    asking: Asking<'_>,
     engine: WorkerRestoreEngine,
     run_id: i32,
     node_id: i32,
@@ -212,13 +285,27 @@ where
                 })
             }
             Ok(WorkerRestoreProgress::Unknown) => {
-                return Err(RestoreError::ExternalService {
-                    reason: format!(
+                let reason = match asking {
+                    Asking::Unanswered => format!(
                         "restore run {run_id}: node {node_id} did not answer the {label} and has \
                          no record of it (its agent may have restarted). The database may have \
                          been changed; check it before restoring again"
                     ),
-                })
+                    Asking::AfterRestart { phase } if request_may_have_been_sent(phase) => {
+                        format!(
+                            "restore run {run_id}: Temps restarted during the {label} (phase \
+                             '{phase}'), and node {node_id} has no record of it: it never \
+                             received the request, or its agent restarted too. The database may \
+                             have been changed; check it before restoring again"
+                        )
+                    }
+                    Asking::AfterRestart { phase } => format!(
+                        "restore run {run_id}: Temps restarted in phase '{phase}', before the \
+                         {label} was sent to node {node_id}, which has no record of it. The \
+                         database was not changed; start the restore again"
+                    ),
+                };
+                return Err(RestoreError::ExternalService { reason });
             }
             Ok(WorkerRestoreProgress::Running { writes_began }) => {
                 unreachable_since = None;
@@ -241,12 +328,21 @@ where
                     "could not ask node for the outcome of an unanswered restore; retrying"
                 );
                 if since.elapsed() >= wait.unreachable_for {
+                    let what = match asking {
+                        Asking::Unanswered => {
+                            format!("node {node_id} did not answer the {label}, and")
+                        }
+                        Asking::AfterRestart { phase } => format!(
+                            "Temps restarted during the {label} (phase '{phase}'), and node \
+                             {node_id}"
+                        ),
+                    };
                     return Err(RestoreError::ExternalService {
                         reason: format!(
-                            "restore run {run_id}: node {node_id} did not answer the {label}, and \
-                             could not be asked for its outcome for {}s ({last_error}). The \
-                             restore may still be running there and the database may be \
-                             partially restored; check it before restoring again",
+                            "restore run {run_id}: {what} could not be asked for its outcome for \
+                             {}s ({last_error}). Check that the node is online. The restore may \
+                             still be running there and the database may be partially restored; \
+                             check it before restoring again",
                             wait.unreachable_for.as_secs()
                         ),
                     });
@@ -272,10 +368,177 @@ where
     }
 }
 
+/// The worker engine whose restore `run_restore_inner` sends to the node
+/// of `target` for a backup at `location`, the one whose outcome that node
+/// records; `None` for every other path (a job, the agent's generic restore,
+/// the control plane's own Docker).
+pub(super) fn worker_restore_engine(
+    target: &temps_entities::external_services::Model,
+    location: &str,
+) -> Option<WorkerRestoreEngine> {
+    if super::worker_walg::takes_walg_path(target, location) {
+        Some(WorkerRestoreEngine::PostgresWalg)
+    } else if super::worker_mariadb::takes_mariadb_path(target) {
+        Some(WorkerRestoreEngine::Mariadb)
+    } else if crate::engines::workload_job::takes_job_path(target) {
+        None
+    } else if super::worker_mongodb::takes_path(target) {
+        Some(WorkerRestoreEngine::Mongodb)
+    } else if super::worker_redis::takes_redis_path(target) {
+        Some(WorkerRestoreEngine::Redis)
+    } else {
+        None
+    }
+}
+
+/// A worker restore run left active by the previous process: its node
+/// records the restore's outcome under the run's operation id.
+pub(super) struct ResumedWorkerRestore {
+    run: temps_entities::restore_runs::Model,
+    target: temps_entities::external_services::Model,
+    backup: temps_entities::backups::Model,
+    engine: WorkerRestoreEngine,
+    node_id: i32,
+}
+
+impl ResumedWorkerRestore {
+    /// `run` as a worker restore to resume, or `None` when it took another
+    /// path (or cannot be told, which the local reconciliation handles as
+    /// before). Worker restores are in place: their target is `service`.
+    pub(super) async fn of(
+        db: &DatabaseConnection,
+        run: &temps_entities::restore_runs::Model,
+        service: Option<&temps_entities::external_services::Model>,
+    ) -> Option<Self> {
+        if run
+            .target_service_name
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty())
+        {
+            return None;
+        }
+        let target = service?.clone();
+        let node_id = crate::engines::workload_job::worker_node(&target)?;
+        let backup = match run_backup_model(db, run).await {
+            Ok(backup) => backup,
+            Err(e) => {
+                warn!(
+                    restore_run_id = run.id,
+                    service_id = target.id,
+                    "could not read the backup of restore run {} to tell whether its node \
+                     restores it: {e}",
+                    run.id
+                );
+                return None;
+            }
+        };
+        let engine = worker_restore_engine(&target, &backup.s3_location)?;
+        Some(Self {
+            run: run.clone(),
+            target,
+            backup,
+            engine,
+            node_id,
+        })
+    }
+
+    /// Settle the run from its node's recorded outcome, as the live run
+    /// would have: `origin` is the login the restored data answers to. A
+    /// node that stays unreachable, or has no record of the restore, fails
+    /// the run with what that means for the service and what to check.
+    pub(super) async fn settle_with<Ask, AskFut>(
+        &self,
+        db: &Arc<DatabaseConnection>,
+        enc: &Arc<temps_core::EncryptionService>,
+        origin: Option<&RestoredServiceCredentials>,
+        wait: &OutcomeWait,
+        ask: Ask,
+    ) -> Result<Option<i32>, RestoreError>
+    where
+        Ask: FnMut() -> AskFut,
+        AskFut: Future<Output = Result<WorkerRestoreProgress, ExternalServiceError>>,
+    {
+        WorkerRestoreRun {
+            db,
+            run_id: self.run.id,
+            node_id: self.node_id,
+            target_id: self.target.id,
+            engine: self.engine,
+            reconcile: origin.map(|origin| (enc, origin)),
+        }
+        .resume_with(wait, &self.run.phase, ask)
+        .await
+    }
+}
+
+/// Resumes worker restore runs left active by the previous process.
+pub struct ManagerWorkerRestoreResume {
+    db: Arc<DatabaseConnection>,
+    enc: Arc<temps_core::EncryptionService>,
+    mgr: Arc<ExternalServiceManager>,
+}
+
+impl ManagerWorkerRestoreResume {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        enc: Arc<temps_core::EncryptionService>,
+        mgr: Arc<ExternalServiceManager>,
+    ) -> Self {
+        Self { db, enc, mgr }
+    }
+}
+
+#[async_trait::async_trait]
+impl super::super::restore_reconcile::WorkerRestoreResume for ManagerWorkerRestoreResume {
+    async fn resume(
+        &self,
+        run: &temps_entities::restore_runs::Model,
+        service: Option<&temps_entities::external_services::Model>,
+    ) -> bool {
+        let Some(resumed) = ResumedWorkerRestore::of(self.db.as_ref(), run, service).await else {
+            return false;
+        };
+        let (db, enc, mgr) = (
+            Arc::clone(&self.db),
+            Arc::clone(&self.enc),
+            Arc::clone(&self.mgr),
+        );
+        // The run stays active, holding its service, until this settles it.
+        tokio::spawn(async move {
+            let run_id = resumed.run.id;
+            let origin = origin_credentials_to_reconcile(
+                db.as_ref(),
+                mgr.as_ref(),
+                &resumed.backup,
+                &resumed.target,
+            )
+            .await;
+            let operation_id = operation_id(run_id);
+            let result = resumed
+                .settle_with(&db, &enc, origin.as_ref(), &OUTCOME_WAIT, || {
+                    mgr.worker_restore_outcome(resumed.target.id, resumed.engine, &operation_id)
+                })
+                .await;
+            match persist_terminal_state(db.as_ref(), run_id, &result, TERMINAL_WRITE_RETRY).await {
+                Ok(()) => match &result {
+                    Ok(_) => info!("Restore run {run_id} resumed after a restart and completed"),
+                    Err(e) => {
+                        error!("Restore run {run_id} resumed after a restart and failed: {e}")
+                    }
+                },
+                Err(e) => error!(
+                    "Restore run {run_id} resumed after a restart and settled, but its terminal \
+                     state could not be recorded: {e}. It is resumed again at the next restart"
+                ),
+            }
+        });
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::EntityTrait;
 
     const PG: WorkerRestoreEngine = WorkerRestoreEngine::PostgresWalg;
 
@@ -808,5 +1071,315 @@ mod tests {
             .start_in_place()
             .await
             .expect("the service is free once the run failed");
+    }
+
+    // ---- A restart while a worker restore runs
+
+    fn service(
+        service_type: &str,
+        node_id: Option<i32>,
+    ) -> temps_entities::external_services::Model {
+        let now = Utc::now();
+        temps_entities::external_services::Model {
+            id: 11,
+            name: "orders".to_string(),
+            service_type: service_type.to_string(),
+            version: None,
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: None,
+            config: None,
+            node_id,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode:
+                temps_entities::external_service_workload_mode::ServiceWorkloadMode::Enforce,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        }
+    }
+
+    /// The runs resumed after a restart are exactly the ones the live
+    /// dispatch sends to a node's worker engine: never a job, a control-plane
+    /// restore or a cluster.
+    #[test]
+    fn only_a_worker_engine_restore_is_resumed_from_its_node() {
+        let walg = "s3://backups/external_services/postgres/orders/walg";
+        let dump = "s3://backups/external_services/postgres/orders/2026/dump.sql.gz";
+        assert_eq!(
+            worker_restore_engine(&service("postgres", Some(2)), walg),
+            Some(PG)
+        );
+        assert_eq!(
+            worker_restore_engine(&service("postgres", Some(2)), dump),
+            None
+        );
+        for (service_type, engine) in [
+            ("mariadb", WorkerRestoreEngine::Mariadb),
+            ("mongodb", WorkerRestoreEngine::Mongodb),
+            ("redis", WorkerRestoreEngine::Redis),
+        ] {
+            assert_eq!(
+                worker_restore_engine(&service(service_type, Some(2)), "k"),
+                Some(engine),
+                "{service_type}"
+            );
+            assert_eq!(
+                worker_restore_engine(&service(service_type, None), "k"),
+                None,
+                "{service_type} on the control plane"
+            );
+        }
+        let mut cluster = service("mongodb", Some(2));
+        cluster.topology = "cluster".to_string();
+        assert_eq!(worker_restore_engine(&cluster, "k"), None);
+    }
+
+    impl RunFixture {
+        /// Put the target service on a worker node, which exists.
+        async fn on_a_worker_node(&self) -> i32 {
+            use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+            let node = temps_entities::nodes::ActiveModel {
+                name: Set("worker-2".to_string()),
+                token_hash: Set("unused".to_string()),
+                token_encrypted: Set(None),
+                address: Set("https://127.0.0.1:1".to_string()),
+                private_address: Set("127.0.0.1".to_string()),
+                role: Set("worker".to_string()),
+                status: Set("online".to_string()),
+                labels: Set(serde_json::json!({})),
+                capacity: Set(serde_json::json!({})),
+                dns_resolver_consecutive_failures: Set(0),
+                build_limits: Set(None),
+                public_ingress_enabled: Set(false),
+                public_ingress_unsupported_reasons: Set(serde_json::json!([])),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .expect("insert node");
+            self.place_on(node.id).await;
+            node.id
+        }
+
+        async fn place_on(&self, node_id: i32) {
+            temps_entities::external_services::Entity::update_many()
+                .col_expr(
+                    temps_entities::external_services::Column::NodeId,
+                    sea_orm::sea_query::Expr::value(node_id),
+                )
+                .filter(temps_entities::external_services::Column::Id.eq(self.service_id))
+                .exec(self.db.as_ref())
+                .await
+                .expect("place the service on a node");
+        }
+
+        async fn target(&self) -> temps_entities::external_services::Model {
+            temps_entities::external_services::Entity::find_by_id(self.service_id)
+                .one(self.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        /// The run as the new process finds it at startup.
+        async fn found_at_startup(&self, run_id: i32) -> ResumedWorkerRestore {
+            let run = temps_entities::restore_runs::Entity::find_by_id(run_id)
+                .one(self.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            let target = self.target().await;
+            ResumedWorkerRestore::of(self.db.as_ref(), &run, Some(&target))
+                .await
+                .expect("a worker restore is resumed")
+        }
+
+        /// Settle `resumed` from the node's answers, in its own task like
+        /// the resumed restore's.
+        fn settle_resumed(
+            &self,
+            resumed: ResumedWorkerRestore,
+            origin: Option<RestoredServiceCredentials>,
+            progress: tokio::sync::watch::Receiver<WorkerRestoreProgress>,
+        ) -> tokio::task::JoinHandle<Result<Option<i32>, RestoreError>> {
+            let db = Arc::clone(&self.db);
+            let enc = Arc::clone(&self.enc);
+            tokio::spawn(async move {
+                resumed
+                    .settle_with(&db, &enc, origin.as_ref(), &FAST, || {
+                        std::future::ready(Ok(progress.borrow().clone()))
+                    })
+                    .await
+            })
+        }
+    }
+
+    /// Temps restarts while the node restores: the run is resumed, stays
+    /// `running` (a second restore is refused, the login untouched) while
+    /// the node still works, and the node's later success completes it with
+    /// the credential reconcile and the verify phase, as the live run would.
+    #[tokio::test]
+    async fn a_restart_mid_restore_resumes_and_settles_on_the_nodes_success() {
+        for (engine, service_type) in [(PG, "postgres"), (WorkerRestoreEngine::Mongodb, "mongodb")]
+        {
+            let Some(fixture) = run_fixture(service_type).await else {
+                return;
+            };
+            fixture.on_a_worker_node().await;
+            let run = fixture.start_in_place().await.expect("first restore");
+            let resumed = fixture.found_at_startup(run.id).await;
+            assert_eq!(resumed.engine, engine);
+
+            let (report, progress) =
+                tokio::sync::watch::channel(WorkerRestoreProgress::Running { writes_began: true });
+            let settling = fixture.settle_resumed(resumed, origin(service_type), progress);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!settling.is_finished(), "{engine:?}: waits for the node");
+            assert_eq!(fixture.run_status(run.id).await, "running", "{engine:?}");
+            assert!(
+                matches!(
+                    fixture.start_in_place().await,
+                    Err(RestoreError::RestoreAlreadyActive { restore_run_id, .. })
+                        if restore_run_id == run.id
+                ),
+                "{engine:?}: the service stays held"
+            );
+            assert_eq!(
+                fixture.stored_login().await,
+                serde_json::json!({"username": "orders_owner", "password": "target-password"}),
+                "{engine:?}"
+            );
+
+            report
+                .send(WorkerRestoreProgress::Finished {
+                    outcome: WorkerRestoreResult::Completed,
+                })
+                .unwrap();
+            let result = settling.await.unwrap();
+            assert!(result.is_ok(), "{engine:?}: {result:?}");
+            let phase = temps_entities::restore_runs::Entity::find_by_id(run.id)
+                .one(fixture.db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .phase;
+            assert_eq!(phase, "verify", "{engine:?}");
+            persist_terminal_state(fixture.db.as_ref(), run.id, &result, TERMINAL_WRITE_RETRY)
+                .await
+                .unwrap();
+            assert_eq!(fixture.run_status(run.id).await, "completed", "{engine:?}");
+            assert_eq!(
+                fixture.stored_login().await,
+                serde_json::json!({"username": "billing_owner", "password": "origin-password"}),
+                "{engine:?}: the credential reconcile ran"
+            );
+            fixture
+                .start_in_place()
+                .await
+                .expect("the service is free once the run completed");
+        }
+    }
+
+    /// The node has no record of the operation (its agent restarted, or the
+    /// request never reached it): the run fails at once with what that
+    /// means for the database, the login stays the target's and the service
+    /// is free again.
+    #[tokio::test]
+    async fn a_node_that_does_not_know_the_operation_fails_the_run_cleanly() {
+        let Some(fixture) = run_fixture("mariadb").await else {
+            return;
+        };
+        fixture.on_a_worker_node().await;
+        for (phase, expected) in [
+            (
+                "restore",
+                "may have been changed; check it before restoring again",
+            ),
+            ("prepare", "was not changed; start the restore again"),
+        ] {
+            let run = fixture.start_in_place().await.expect("restore");
+            temps_entities::restore_runs::Entity::update_many()
+                .col_expr(
+                    temps_entities::restore_runs::Column::Phase,
+                    sea_orm::sea_query::Expr::value(phase),
+                )
+                .filter(temps_entities::restore_runs::Column::Id.eq(run.id))
+                .exec(fixture.db.as_ref())
+                .await
+                .unwrap();
+            let resumed = fixture.found_at_startup(run.id).await;
+            let (_report, progress) = tokio::sync::watch::channel(WorkerRestoreProgress::Unknown);
+            let result = fixture
+                .settle_resumed(resumed, origin("mariadb"), progress)
+                .await
+                .unwrap();
+            let message = result
+                .as_ref()
+                .expect_err("unknown to the node")
+                .to_string();
+            assert!(message.contains("has no record of it"), "{message}");
+            assert!(message.contains(&format!("phase '{phase}'")), "{message}");
+            assert!(message.contains(expected), "{phase}: {message}");
+            persist_terminal_state(fixture.db.as_ref(), run.id, &result, TERMINAL_WRITE_RETRY)
+                .await
+                .unwrap();
+            assert_eq!(fixture.run_status(run.id).await, "failed");
+            assert_eq!(
+                fixture.stored_login().await,
+                serde_json::json!({"username": "orders_owner", "password": "target-password"})
+            );
+        }
+        fixture
+            .start_in_place()
+            .await
+            .expect("the service is free once the run failed");
+    }
+
+    /// The node does not come back after the restart: once it has been
+    /// unreachable past the limit the run fails, naming the node and what
+    /// to check, rather than staying active forever.
+    #[tokio::test]
+    async fn a_node_unreachable_after_a_restart_fails_with_what_to_check() {
+        let Some(fixture) = run_fixture("redis").await else {
+            return;
+        };
+        let node_id = fixture.on_a_worker_node().await;
+        let run = fixture.start_in_place().await.expect("restore");
+        let resumed = fixture.found_at_startup(run.id).await;
+        assert_eq!(resumed.engine, WorkerRestoreEngine::Redis);
+        let message = resumed
+            .settle_with(&fixture.db, &fixture.enc, None, &FAST, || {
+                std::future::ready(Err(unreachable()))
+            })
+            .await
+            .expect_err("the node never answers")
+            .to_string();
+        assert!(
+            message.contains(&format!(
+                "Temps restarted during the Redis restore (phase 'restore'), and node {node_id} \
+                 could not be asked for its outcome"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("Check that the node is online"),
+            "{message}"
+        );
+        assert!(message.contains("before restoring again"), "{message}");
     }
 }

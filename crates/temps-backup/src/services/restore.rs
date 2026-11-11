@@ -163,6 +163,7 @@ pub enum RestoreError {
 mod worker_mariadb;
 mod worker_mongodb;
 mod worker_outcome;
+pub use worker_outcome::ManagerWorkerRestoreResume;
 mod worker_redis;
 mod worker_walg;
 
@@ -2333,22 +2334,12 @@ fn restore_outcome_event(
     event.with("mode", mode).with_duration(elapsed)
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the restore task's owned dependencies, one per argument"
-)]
-async fn run_restore_inner(
-    db: Arc<DatabaseConnection>,
-    mgr: Arc<ExternalServiceManager>,
-    enc: Arc<temps_core::EncryptionService>,
-    plane: Arc<temps_workload_plane::PlaneSlot>,
-    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
-    run_id: i32,
-    mode: RestoreRequestMode,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Result<Option<i32>, RestoreError> {
-    let run = load_run_for_update(&db, run_id).await?;
-
+/// The backup `run` restores: its row, or for an orphan-backup restore
+/// (`source_backup_id == 0`) one synthesised from its `resume_token`.
+async fn run_backup_model(
+    db: &DatabaseConnection,
+    run: &temps_entities::restore_runs::Model,
+) -> Result<temps_entities::backups::Model, RestoreError> {
     // Resolve backup identity. `source_backup_id == 0` is the sentinel
     // for orphan-backup restores, where everything we need lives in
     // `resume_token` (backup_location + s3_source_id + engine_hint).
@@ -2366,9 +2357,9 @@ async fn run_restore_inner(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    let mut backup_model: temps_entities::backups::Model = if run.source_backup_id > 0 {
+    Ok(if run.source_backup_id > 0 {
         temps_entities::backups::Entity::find_by_id(run.source_backup_id)
-            .one(db.as_ref())
+            .one(db)
             .await?
             .ok_or(RestoreError::BackupNotFound {
                 backup_id: run.source_backup_id,
@@ -2402,7 +2393,26 @@ async fn run_restore_inner(
             expires_at: None,
             tags: "[]".to_string(),
         }
-    };
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's owned dependencies, one per argument"
+)]
+async fn run_restore_inner(
+    db: Arc<DatabaseConnection>,
+    mgr: Arc<ExternalServiceManager>,
+    enc: Arc<temps_core::EncryptionService>,
+    plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
+    run_id: i32,
+    mode: RestoreRequestMode,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<Option<i32>, RestoreError> {
+    let run = load_run_for_update(&db, run_id).await?;
+
+    let mut backup_model = run_backup_model(db.as_ref(), &run).await?;
 
     let s3_source = temps_entities::s3_sources::Entity::find_by_id(backup_model.s3_source_id)
         .one(db.as_ref())
@@ -2422,37 +2432,53 @@ async fn run_restore_inner(
                 service_id: run.source_service_id,
             })?;
 
-    // ADR-099: a WAL-G backup is restored into a PostgreSQL on a worker
-    // node by the control plane's own WAL-G restore, run by its agent.
-    if worker_walg::takes_walg_path(&target_service, &backup_model.s3_location) {
-        return worker_walg::run(
-            &db,
-            &enc,
-            &scoper,
-            &mgr,
-            run_id,
-            &backup_model,
-            &target_service,
-            &mode,
-        )
-        .await;
-    }
-    // ADR-099: a MariaDB on a worker node is restored by the control
-    // plane's own MariaDB restore, run by its agent.
-    if worker_mariadb::takes_mariadb_path(&target_service) {
-        return worker_mariadb::run(
-            WorkerRestoreDeps {
-                db: &db,
-                enc: &enc,
-                scoper: &scoper,
-                mgr: &mgr,
-            },
-            run_id,
-            &backup_model,
-            &target_service,
-            &mode,
-        )
-        .await;
+    // ADR-099: a PostgreSQL WAL-G, MariaDB, MongoDB or Redis restore into a
+    // service on a worker node is the control plane's own restore, run by
+    // its agent, which records the outcome under the run's operation id.
+    // The same choice decides, after a restart, which runs are resumed from
+    // their node (`worker_outcome::worker_restore_engine`).
+    use temps_providers::remote_service_client::WorkerRestoreEngine;
+    let worker_deps = WorkerRestoreDeps {
+        db: &db,
+        enc: &enc,
+        scoper: &scoper,
+        mgr: &mgr,
+    };
+    match worker_outcome::worker_restore_engine(&target_service, &backup_model.s3_location) {
+        Some(WorkerRestoreEngine::PostgresWalg) => {
+            return worker_walg::run(
+                &db,
+                &enc,
+                &scoper,
+                &mgr,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        Some(WorkerRestoreEngine::Mariadb) => {
+            return worker_mariadb::run(worker_deps, run_id, &backup_model, &target_service, &mode)
+                .await;
+        }
+        Some(WorkerRestoreEngine::Mongodb) => {
+            return worker_mongodb::run(worker_deps, run_id, &backup_model, &target_service, &mode)
+                .await;
+        }
+        Some(WorkerRestoreEngine::Redis) => {
+            return worker_redis::run(
+                &db,
+                &scoper,
+                &mgr,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        None => {}
     }
     // ADR-055 Phase 9: a database on a worker node is restored by a job on
     // its node. Every other target takes the path below, unchanged.
@@ -2463,37 +2489,6 @@ async fn run_restore_inner(
             &scoper,
             &mgr,
             &plane,
-            run_id,
-            &backup_model,
-            &target_service,
-            &mode,
-        )
-        .await;
-    }
-    // ADR-099: a MongoDB on a worker node is restored by the control
-    // plane's own MongoDB restore, run by its agent.
-    if worker_mongodb::takes_path(&target_service) {
-        return worker_mongodb::run(
-            WorkerRestoreDeps {
-                db: &db,
-                enc: &enc,
-                scoper: &scoper,
-                mgr: &mgr,
-            },
-            run_id,
-            &backup_model,
-            &target_service,
-            &mode,
-        )
-        .await;
-    }
-    // A Redis on a worker node is restored in place by the provider's own
-    // restore, run on its node by the agent.
-    if worker_redis::takes_redis_path(&target_service) {
-        return worker_redis::run(
-            &db,
-            &scoper,
-            &mgr,
             run_id,
             &backup_model,
             &target_service,
@@ -7205,10 +7200,14 @@ mod tests {
             fail: true,
             calls: Default::default(),
         };
-        let report =
-            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &failing)
-                .await
-                .expect("reconcile");
+        let report = crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &[active.id],
+            &failing,
+            &crate::services::restore_reconcile::NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile");
         assert_eq!(report.deferred, vec![active.id]);
         assert!(insert_restore_run(
             db.as_ref(),
@@ -7227,10 +7226,14 @@ mod tests {
             fail: false,
             calls: Default::default(),
         };
-        let report =
-            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &fence)
-                .await
-                .expect("reconcile");
+        let report = crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &[active.id],
+            &fence,
+            &crate::services::restore_reconcile::NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile");
         assert_eq!(report.interrupted, vec![active.id]);
         assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let interrupted = load_run_for_update(db.as_ref(), active.id)
@@ -7247,10 +7250,14 @@ mod tests {
         assert!(message.contains("may be partially restored"), "{message}");
 
         // Reconciling again (another restart) changes nothing.
-        let again =
-            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &fence)
-                .await
-                .expect("reconcile again");
+        let again = crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &[active.id],
+            &fence,
+            &crate::services::restore_reconcile::NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile again");
         assert_eq!(again, crate::services::RestoreReconcileReport::default());
         assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let unchanged = load_run_for_update(db.as_ref(), active.id)
