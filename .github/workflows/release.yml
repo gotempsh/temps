@@ -232,8 +232,10 @@ jobs:
     name: Build Linux AMD64
     needs: [build-web-assets, runtime-image-manifest]
     # Pinned to 22.04 (glibc 2.35) so the released binary runs on Ubuntu 22.04+/Debian 12+.
-    # ubuntu-latest currently resolves to 24.04 (glibc 2.39), which broke the binary on
-    # older-but-still-common distros with a "GLIBC_2.38/2.39 not found" error.
+    # Building on a newer image links against a newer glibc: 24.04 (glibc 2.39) broke the
+    # binary on older-but-still-common distros with a "GLIBC_2.38/2.39 not found" error,
+    # and ubuntu-latest moves to 26.04 in November 2026. Keep this pin when other jobs
+    # move to newer images.
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -499,9 +501,11 @@ jobs:
     # workspace's native deps (openssl via openssl-src, jemalloc via cc-rs)
     # build from source per-target rather than linking a host-arch system
     # lib, so there's no arch-mismatch risk at link time.
-    # macos-15, not macos-14: GitHub retired the macOS 14 image on 2026-11-02,
-    # and a job that asks for it is cancelled before it gets a runner.
-    runs-on: macos-15
+    # macos-26, the newest GA macOS image (Apple Silicon). Pin an explicit
+    # version rather than macos-latest so the Xcode/SDK only changes in a
+    # reviewed commit. GitHub retired macOS 14 on 2026-11-02, and a job that
+    # asks for a retired image is cancelled before it gets a runner.
+    runs-on: macos-26
     permissions:
       contents: read
     steps:
@@ -576,7 +580,7 @@ jobs:
   build-darwin-arm64:
     name: Build macOS ARM64
     needs: [build-web-assets, runtime-image-manifest]
-    runs-on: macos-15
+    runs-on: macos-26
     permissions:
       contents: read
     steps:
@@ -1179,7 +1183,7 @@ jobs:
             artifact: temps-linux-amd64
             tarball: temps-linux-amd64.tar.gz
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             artifact: temps-linux-arm64
             tarball: temps-linux-arm64.tar.gz
     steps:
