@@ -267,6 +267,16 @@ pub struct ServiceContainerRuntime {
     pub cpu_shares: Option<i64>,
     #[serde(default)]
     pub shm_size_bytes: Option<i64>,
+    /// A CPU cap in the older quota form (`docker update --cpu-quota`), in
+    /// microseconds per `cpu_period_us`; absent when not set. Reported so
+    /// the control plane reads a quota-only cap as the container's CPU limit
+    /// rather than as uncapped. An agent from before these fields omits them.
+    #[serde(default)]
+    pub cpu_quota_us: Option<i64>,
+    /// The period `cpu_quota_us` applies to; absent when Docker stores none
+    /// (the kernel's 100 ms default applies).
+    #[serde(default)]
+    pub cpu_period_us: Option<i64>,
 }
 
 impl ServiceContainerRuntime {
@@ -293,6 +303,8 @@ impl ServiceContainerRuntime {
             nano_cpus: positive(host_config.and_then(|config| config.nano_cpus)),
             cpu_shares: positive(host_config.and_then(|config| config.cpu_shares)),
             shm_size_bytes: positive(host_config.and_then(|config| config.shm_size)),
+            cpu_quota_us: positive(host_config.and_then(|config| config.cpu_quota)),
+            cpu_period_us: positive(host_config.and_then(|config| config.cpu_period)),
         }
     }
 }

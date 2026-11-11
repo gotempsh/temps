@@ -23,6 +23,20 @@ import {
   pgCacheHitRatioLabel,
   pgCacheHitRatioScopedLabel,
 } from '@/lib/pg-cache-hit'
+import {
+  CONTAINER_CPU_METRIC,
+  CONTAINER_CPU_METRIC_LABELS,
+  CONTAINER_CPU_TILE_HINT,
+  CONTAINER_CPU_TILE_LABEL,
+  CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
+  containerCpuAxisWidth,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  containerCpuTileText,
+  formatContainerCpuMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -214,12 +228,15 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
 // the service, sampled every ~30s by the health monitor. Engine-agnostic:
 // shown for every engine ahead of the engine-specific stats.
 const CONTAINER_STAT_METRICS = [
-  'container.cpu_percent',
+  CONTAINER_CPU_METRIC,
   'container.memory_used_bytes',
 ]
 
+// Alertable container metrics. CPU alerts threshold the share of the
+// container's limit: 80 on `container.cpu_percent` would mean 0.8 of one
+// core whatever the limit.
 const CONTAINER_METRICS = [
-  'container.cpu_percent',
+  CONTAINER_CPU_UTILIZATION_METRIC,
   'container.memory_used_bytes',
   'container.memory_percent',
 ]
@@ -231,7 +248,7 @@ const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
   mariadb: 'mariadb.connections',
   s3: 's3.bucket_count',
   rustfs: 'rustfs_cluster_capacity_used_bytes',
-  unsupported: 'container.cpu_percent',
+  unsupported: CONTAINER_CPU_METRIC,
 }
 
 const KNOWN_METRICS: Record<EngineKind, string[]> = {
@@ -365,6 +382,8 @@ function formatRelativeTime(iso: string): string {
 
 function formatMetricValue(name: string, value: number): string {
   if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
+  const cpu = formatContainerCpuMetric(name, value)
+  if (cpu !== null) return cpu
   if (MARIADB_FLAG_METRICS.has(name)) {
     const flag = formatFlagValue(value)
     if (flag !== null) return flag
@@ -390,8 +409,7 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
-  // Docker CLI convention: 100% == one core fully used.
-  'container.cpu_percent': 'CPU',
+  ...CONTAINER_CPU_METRIC_LABELS,
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
   [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
@@ -403,14 +421,29 @@ const METRIC_LABELS: Record<string, string> = {
 function statTileLabel(name: string): string {
   if (name === PG_CACHE_HIT_RATIO_METRIC)
     return pgCacheHitRatioScopedLabel('all')
+  if (name === CONTAINER_CPU_METRIC) return CONTAINER_CPU_TILE_LABEL
   return labelForMetric(name)
 }
 
-// The tooltip of a stat tile: what a per-database metric's value means.
+// The tooltip of a stat tile: what the value means and how fresh it is.
 function statTileHint(name: string): string | undefined {
   if (name === PG_CACHE_HIT_RATIO_METRIC)
     return pgCacheHitRatioDescription('all')
+  if (name === CONTAINER_CPU_METRIC) return CONTAINER_CPU_TILE_HINT
   return undefined
+}
+
+// A stat tile's text. CPU reads in cores against the container's limit, the
+// same way the resources card shows it.
+function statTileText(
+  name: string,
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
+): string {
+  if (name === CONTAINER_CPU_METRIC)
+    return containerCpuTileText(lookup, cluster)
+  const latest = metricTileValue(name, lookup)
+  return latest != null ? formatMetricValue(name, latest) : '—'
 }
 
 function labelForMetric(name: string): string {
@@ -452,7 +485,10 @@ function AddAlertRuleDialog({
   engine,
   onSuccess,
 }: AddAlertRuleDialogProps) {
-  const alertMetrics = [...CONTAINER_METRICS, ...KNOWN_METRICS[engine]]
+  const alertMetrics = alertableMetrics([
+    ...CONTAINER_METRICS,
+    ...KNOWN_METRICS[engine],
+  ])
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
@@ -865,6 +901,8 @@ type LiveMetricsProps = {
   /** Raw service type, named in the notice for engines without a collector. */
   serviceType: string
   latestMetrics: MetricLatest[]
+  /** The service runs as a cluster; see `containerCpuTileText`. */
+  cluster: boolean
 }
 
 // --chart-1 is oklch(0.59 0.2032 256.82) = #0070f3 in globals.css.
@@ -877,6 +915,7 @@ function LiveMetrics({
   engine,
   serviceType,
   latestMetrics,
+  cluster,
 }: LiveMetricsProps) {
   // Container CPU/memory first — resource saturation is the first thing an
   // operator checks — then the engine-specific headline stats.
@@ -905,18 +944,34 @@ function LiveMetrics({
 
   const firingCount = 0
 
-  // Range chart data
+  // Range chart data: the series behind the selected tile.
+  const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
   const rangeLabel = HOURS_TO_RANGE[rangeHours] ?? '1h'
   const { data: rangeData, isLoading: rangeLoading } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
       path: { id: serviceId },
-      query: { metric: selectedMetric, range: rangeLabel },
+      query: { metric: chartMetric, range: rangeLabel },
     }),
     staleTime: 15_000,
     refetchInterval: 30_000,
   })
+  // Before a cluster's busiest-member series starts, chart the members' CPU
+  // history instead of an empty range.
+  const historyMetric = containerCpuHistoryMetric(selectedMetric, chartMetric)
+  const { data: historyData, isLoading: historyLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? chartMetric, range: rangeLabel },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
 
-  const chartData = (rangeData ?? []).map((p) => ({
+  const chartPoints = historyMetric
+    ? withCpuHistory(rangeData ?? [], historyData ?? [])
+    : (rangeData ?? [])
+  const chartData = chartPoints.map((p) => ({
     time: new Date(p.time).getTime(),
     value: p.value,
   }))
@@ -950,9 +1005,10 @@ function LiveMetrics({
       <div className="@container">
         <div className="grid grid-cols-2 gap-2 @lg:grid-cols-3 @3xl:grid-cols-6">
           {statMetrics.map((name) => {
-            const latest = metricTileValue(
+            const text = statTileText(
               name,
-              (m) => latestByName.get(m)?.value
+              (m) => latestByName.get(m)?.value,
+              cluster
             )
             const isSelected = name === selectedMetric
             return (
@@ -973,7 +1029,7 @@ function LiveMetrics({
                   {statTileLabel(name)}
                 </span>
                 <span className="text-base font-semibold tabular-nums text-foreground">
-                  {latest != null ? formatMetricValue(name, latest) : '—'}
+                  {text}
                 </span>
               </button>
             )
@@ -985,7 +1041,7 @@ function LiveMetrics({
       <div className="space-y-2 overflow-visible">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm font-medium">
-            {labelForMetric(selectedMetric)}
+            {labelForMetric(chartMetric)}
           </span>
           <div className="flex gap-1">
             {RANGE_OPTIONS.map((opt) => (
@@ -1002,7 +1058,7 @@ function LiveMetrics({
           </div>
         </div>
         <div className="relative z-20 h-48 w-full overflow-visible">
-          {rangeLoading ? (
+          {rangeLoading || (historyMetric != null && historyLoading) ? (
             <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin mr-2" />
               Loading…
@@ -1033,16 +1089,17 @@ function LiveMetrics({
                   tickLine={false}
                   axisLine={false}
                   width={
-                    selectedMetric.endsWith('_ratio') ||
-                    selectedMetric.endsWith('_percent')
+                    containerCpuAxisWidth(chartMetric) ??
+                    (chartMetric.endsWith('_ratio') ||
+                    chartMetric.endsWith('_percent')
                       ? 56
-                      : selectedMetric.endsWith('_bytes')
+                      : chartMetric.endsWith('_bytes')
                         ? 60
-                        : 44
+                        : 44)
                   }
                   {...yAxisTickProps(
                     chartData.map((p) => p.value),
-                    { format: (v) => formatMetricValue(selectedMetric, v) }
+                    { format: (v) => formatMetricValue(chartMetric, v) }
                   )}
                 />
                 <Tooltip
@@ -1056,8 +1113,8 @@ function LiveMetrics({
                     formatChartTooltipLabel(Number(label))
                   }
                   formatter={(v) => [
-                    formatMetricValue(selectedMetric, Number(v)),
-                    labelForMetric(selectedMetric),
+                    formatMetricValue(chartMetric, Number(v)),
+                    labelForMetric(chartMetric),
                   ]}
                 />
                 <Line
@@ -1096,6 +1153,8 @@ export interface MonitoringCardProps {
   /** Called after monitoring is toggled on/off so the parent can refetch the
    *  service (which owns the `metricsEnabled` flag). */
   onMonitoringChange?: () => void
+  /** The service runs as a cluster (more than one container). */
+  cluster?: boolean
 }
 
 /**
@@ -1110,6 +1169,7 @@ export function MonitoringCard({
   dockerImage,
   metricsEnabled = false,
   onMonitoringChange,
+  cluster = false,
 }: MonitoringCardProps) {
   const queryClient = useQueryClient()
   const normalEngine = serviceMetricsEngine(engine, dockerImage)
@@ -1329,6 +1389,7 @@ export function MonitoringCard({
           engine={normalEngine}
           serviceType={engine}
           latestMetrics={latestMetrics}
+          cluster={cluster}
         />
       </CardContent>
     </Card>

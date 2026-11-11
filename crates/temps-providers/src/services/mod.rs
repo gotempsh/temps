@@ -20,6 +20,10 @@ mod cluster_state;
 mod cluster_topology;
 mod engine_selection;
 mod manager;
+pub use manager::{
+    cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
+    CPU_LIMIT_REFRESH,
+};
 mod schema;
 mod service_metadata;
 #[cfg(test)]
@@ -137,6 +141,10 @@ pub struct ExternalServiceManager {
     /// sources; the plugin replaces it with the process's shared one, which
     /// holds the Temps Cloud minter.
     worker_credentials: Arc<crate::worker_s3_scope::WorkerCredentialScoper>,
+    /// Bumped whenever Temps applies CPU/memory limits to a service's
+    /// containers, so pollers caching a container's CPU limit
+    /// (`stats_poll`) re-read it on their next tick. Shared by every clone.
+    cpu_limits_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ExternalServiceManager {
@@ -174,6 +182,7 @@ impl ExternalServiceManager {
             service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
             worker_credentials,
+            cpu_limits_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -200,6 +209,7 @@ impl ExternalServiceManager {
             service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
             worker_credentials,
+            cpu_limits_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

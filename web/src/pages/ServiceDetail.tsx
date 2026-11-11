@@ -1083,6 +1083,7 @@ export function ServiceDetail() {
                 }
                 metricsEnabled={service.service.metrics_enabled ?? false}
                 onMonitoringChange={() => refetch()}
+                cluster={service.service.topology === 'cluster'}
               />
             )}
 

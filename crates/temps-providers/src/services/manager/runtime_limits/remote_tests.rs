@@ -234,10 +234,9 @@ async fn a_local_service_without_docker_says_why() {
     assert!(reason.contains("no local Docker daemon"), "{reason}");
 }
 
-/// The health monitor's poller samples a worker's container once per tick
-/// through the agent, keeping the sample as the next tick's baseline.
-#[tokio::test]
-async fn the_poller_samples_a_worker_container_once_per_tick() {
+/// A fake agent answering one stats sample, and, when `runtime` is set,
+/// the container's runtime state; without it the agent predates that route.
+fn poller_agent(runtime: Option<serde_json::Value>) -> Router {
     let app = Router::new().route(
         "/agent/services/{name}/stats",
         get(
@@ -252,6 +251,30 @@ async fn the_poller_samples_a_worker_container_once_per_tick() {
             },
         ),
     );
+    match runtime {
+        Some(runtime) => {
+            app.route(
+                "/agent/services/{name}/runtime",
+                get(move |Path(_name): Path<String>| {
+                    let runtime = runtime.clone();
+                    async move {
+                        Json(serde_json::json!({"success": true, "data": runtime, "error": null}))
+                    }
+                }),
+            )
+        }
+        None => app,
+    }
+}
+
+/// One health-monitor tick of the worker's Postgres against a baseline of
+/// zeroed counters.
+async fn poll_worker_once(
+    app: Router,
+) -> (
+    Vec<super::super::PolledContainerStats>,
+    HashMap<String, super::super::ContainerStatsBaseline>,
+) {
     let service = worker_postgres();
     let db = Arc::new(
         sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -260,13 +283,48 @@ async fn the_poller_samples_a_worker_container_once_per_tick() {
             .into_connection(),
     );
     let manager = control_plane_manager_with_db(db);
-    let mut baselines = HashMap::from([("postgres-orders".to_string(), stats_at(0, 0))]);
-
-    let report = manager
+    let mut baselines = HashMap::from([(
+        "postgres-orders".to_string(),
+        super::super::ContainerStatsBaseline::from_sample_for_test(&stats_at(0, 0)),
+    )]);
+    let polled = manager
         .sample_service_stats(&service, &mut baselines)
         .await
         .expect("sample");
+    (polled, baselines)
+}
 
-    assert_eq!(report.members[0].cpu_percent, Some(50.0));
+/// The health monitor's poller samples a worker's container once per tick
+/// through the agent, keeping the sample as the next tick's baseline, and
+/// reads the container's CPU limit from the agent: a cap set as a quota
+/// alone counts, under the kernel's default 100 ms period.
+#[tokio::test]
+async fn the_poller_samples_a_worker_container_once_per_tick() {
+    let (polled, baselines) = poll_worker_once(poller_agent(Some(serde_json::json!({
+        "found": true,
+        "container_id": "c0ffee",
+        "cpu_quota_us": 50_000,
+    }))))
+    .await;
+
+    assert_eq!(polled[0].sample.cpu_percent, Some(50.0));
+    assert_eq!(
+        polled[0].cpu_limit,
+        Some(super::super::CpuLimit::Cores(0.5))
+    );
+    assert_eq!(polled[0].cpu_utilization_percent(), Some(100.0));
+    assert!(baselines.contains_key("postgres-orders"));
+}
+
+/// An agent that cannot report the container's runtime state still has its
+/// usage recorded; the limit, and so the share of it, stays unknown rather
+/// than being read as uncapped.
+#[tokio::test]
+async fn a_worker_whose_agent_reports_no_limit_still_records_usage() {
+    let (polled, baselines) = poll_worker_once(poller_agent(None)).await;
+
+    assert_eq!(polled[0].sample.cpu_percent, Some(50.0));
+    assert_eq!(polled[0].cpu_limit, None);
+    assert_eq!(polled[0].cpu_utilization_percent(), None);
     assert!(baselines.contains_key("postgres-orders"));
 }

@@ -24,7 +24,7 @@ pub(super) struct MemberContainer {
 
 impl MemberContainer {
     /// The worker whose agent must be asked, or `None` for this host.
-    fn worker(&self) -> Option<i32> {
+    pub(super) fn worker(&self) -> Option<i32> {
         self.node_id
             .filter(|node_id| *node_id != ExternalServiceManager::CONTROL_PLANE_NODE_ID)
     }
@@ -35,10 +35,10 @@ impl MemberContainer {
 /// A node whose client cannot be built keeps the reason, for every member on
 /// it.
 #[derive(Default)]
-struct WorkerClients(HashMap<i32, Result<RemoteServiceClient, String>>);
+pub(super) struct WorkerClients(HashMap<i32, Result<RemoteServiceClient, String>>);
 
 impl WorkerClients {
-    async fn get(
+    pub(super) async fn get(
         &mut self,
         manager: &ExternalServiceManager,
         node_id: i32,
@@ -92,7 +92,7 @@ fn unavailable_runtime(member: &MemberContainer, reason: String) -> ContainerRun
     runtime_info(member, ServiceContainerRuntime::default(), Some(reason))
 }
 
-fn empty_stats(
+pub(super) fn empty_stats(
     member: &MemberContainer,
     unavailable_reason: Option<String>,
 ) -> ContainerStatsSample {
@@ -109,12 +109,12 @@ fn empty_stats(
 }
 
 /// Why a local container cannot be observed on a server without Docker.
-fn no_local_docker_reason(error: &temps_core::DockerUnavailable) -> String {
+pub(super) fn no_local_docker_reason(error: &temps_core::DockerUnavailable) -> String {
     format!("this server has no local Docker daemon to read the container from: {error}")
 }
 
 /// What to tell the operator when a worker's agent predates `what`.
-fn agent_too_old(node: &str, node_id: i32, what: &str) -> String {
+pub(super) fn agent_too_old(node: &str, node_id: i32, what: &str) -> String {
     format!(
         "the agent on node {node} (id {node_id}) does not report {what}; update the agent on \
          node {node} to this release"
@@ -249,7 +249,7 @@ impl ExternalServiceManager {
     /// Take `samples` one-shot stats samples of a member container, oldest
     /// first: from this host's Docker, or through the agent of the worker
     /// that runs it. `Err` carries why nothing could be sampled.
-    async fn sample_member(
+    pub(super) async fn sample_member(
         &self,
         clients: &mut WorkerClients,
         member: &MemberContainer,
@@ -323,7 +323,7 @@ impl ExternalServiceManager {
                         member.role.clone(),
                         member.container_name.clone(),
                         second,
-                        Some(first),
+                        first.cpu_stats.as_ref(),
                     ),
                     [only] => compute_stats_sample(
                         member.role.clone(),
@@ -342,67 +342,6 @@ impl ExternalServiceManager {
         Ok(ServiceStatsReport {
             service_id: service.id,
             topology: service.topology,
-            members,
-        })
-    }
-
-    /// Sample stats for every container in this service against a
-    /// caller-held baseline map (`container_name` → previous raw sample).
-    ///
-    /// Designed for periodic pollers (e.g. the health monitor's 30s loop):
-    /// the poll interval itself provides the CPU delta window, so unlike
-    /// `get_service_stats` no artificial 1s sleep per container is needed.
-    /// The first tick for a container has no baseline, so `cpu_percent` is
-    /// `None` (memory is still reported) and the baseline is seeded for the
-    /// next tick. A container on a worker is sampled once by its agent.
-    ///
-    /// The baseline map is rewritten on every call: entries for containers
-    /// that no longer back the service are dropped, and entries whose
-    /// sample failed this tick (container stopped / agent unreachable) are
-    /// carried over unchanged — cumulative counters stay valid across a
-    /// longer window, and a restart in between reads back as a counter
-    /// reset which `cpu_percent_from_delta` already rejects.
-    pub async fn sample_service_stats(
-        &self,
-        service: &external_services::Model,
-        baselines: &mut HashMap<String, bollard::models::ContainerStatsResponse>,
-    ) -> Result<ServiceStatsReport, ExternalServiceError> {
-        let containers = self.resolve_member_containers(service).await?;
-
-        let mut clients = WorkerClients::default();
-        let mut members = Vec::with_capacity(containers.len());
-        let mut next_baselines = HashMap::with_capacity(containers.len());
-
-        for member in &containers {
-            let name = &member.container_name;
-            let sampled = self.sample_member(&mut clients, member, 1).await;
-            match sampled.map(|samples| samples.into_iter().next()) {
-                Ok(Some(current)) => {
-                    let previous = baselines.get(name);
-                    members.push(compute_stats_sample(
-                        member.role.clone(),
-                        name.clone(),
-                        &current,
-                        previous,
-                    ));
-                    next_baselines.insert(name.clone(), current);
-                }
-                failed => {
-                    // Keep the old baseline (if any) so a later success
-                    // still has a valid delta window.
-                    if let Some(prev) = baselines.remove(name) {
-                        next_baselines.insert(name.clone(), prev);
-                    }
-                    members.push(empty_stats(member, failed.err()));
-                }
-            }
-        }
-
-        *baselines = next_baselines;
-
-        Ok(ServiceStatsReport {
-            service_id: service.id,
-            topology: service.topology.clone(),
             members,
         })
     }
@@ -571,12 +510,21 @@ impl ExternalServiceManager {
                         // role, etc.) slots in cleanly.
                         let body = build_container_update_body(limits);
                         match docker.update_container(&container_name, body).await {
-                            Ok(()) => ResourceLimitApplyResult {
-                                role,
-                                container_name,
-                                outcome: if is_running { "applied" } else { "stopped" }.to_string(),
-                                error: None,
-                            },
+                            Ok(()) => {
+                                // The health monitor caches each container's
+                                // CPU limit: make it read this one on its next
+                                // tick. Done per member, before the next await,
+                                // so a caller dropped mid-loop cannot leave an
+                                // applied cap behind a stale cached one.
+                                self.note_cpu_limits_changed();
+                                ResourceLimitApplyResult {
+                                    role,
+                                    container_name,
+                                    outcome: if is_running { "applied" } else { "stopped" }
+                                        .to_string(),
+                                    error: None,
+                                }
+                            }
                             Err(e) => {
                                 // Most common failure: setting memory
                                 // below current usage (Docker rejects).
@@ -1073,20 +1021,21 @@ fn memory_usage_excluding_cache(mem: &bollard::models::ContainerMemoryStats) -> 
     }
 }
 
-/// Project two consecutive stats responses onto `ContainerStatsSample`.
-/// `previous` is `None` when only a single sample is available — in that
-/// case CPU is reported as `None` since the delta formula needs two
-/// samples; memory is still computed from the latest sample.
-fn compute_stats_sample(
+/// Project a stats response onto `ContainerStatsSample`, with CPU as the
+/// rate since `previous_cpu`: the CPU counters of an earlier sample of the
+/// same container. `previous_cpu` is `None` when only a single sample is
+/// available; CPU is then `None`, since the response's own `precpu_stats` is
+/// zeroed on a one-shot read. Memory comes from `current` alone.
+pub(super) fn compute_stats_sample(
     role: String,
     container_name: String,
     current: &bollard::models::ContainerStatsResponse,
-    previous: Option<&bollard::models::ContainerStatsResponse>,
+    previous_cpu: Option<&bollard::models::ContainerCpuStats>,
 ) -> ContainerStatsSample {
     let cur_cpu = current.cpu_stats.as_ref();
     let online_cpus = cur_cpu.and_then(|c| c.online_cpus);
 
-    let cpu_percent = match (cur_cpu, previous.and_then(|p| p.cpu_stats.as_ref())) {
+    let cpu_percent = match (cur_cpu, previous_cpu) {
         (Some(c), Some(p)) => cpu_percent_from_delta(c, p),
         _ => None,
     };
@@ -1463,7 +1412,12 @@ mod tests {
         let earlier = stats_response_at(0, 0, 2);
         let later = stats_response_at(1_000_000_000, 4_000_000_000, 2);
 
-        let sample = compute_stats_sample("primary".into(), "test".into(), &later, Some(&earlier));
+        let sample = compute_stats_sample(
+            "primary".into(),
+            "test".into(),
+            &later,
+            earlier.cpu_stats.as_ref(),
+        );
         assert_eq!(sample.cpu_percent, Some(50.0));
         assert_eq!(sample.online_cpus, Some(2));
     }
@@ -1476,8 +1430,59 @@ mod tests {
         let earlier = stats_response_at(0, 0, 2);
         let later = stats_response_at(1_000_000_000, 4_000_000_000, 2);
 
-        let sample = compute_stats_sample("primary".into(), "test".into(), &earlier, Some(&later));
+        let sample = compute_stats_sample(
+            "primary".into(),
+            "test".into(),
+            &earlier,
+            later.cpu_stats.as_ref(),
+        );
         assert_eq!(sample.cpu_percent, None);
+    }
+
+    /// The runtime limits are what the edit dialog sends back, so a quota
+    /// set by hand is not reported as `nano_cpus`: saving a memory change
+    /// would send it as `NanoCpus`, which Docker rejects on a container with
+    /// a quota, failing the whole update. The quota is still reported on its
+    /// own, for the health monitor to read as the container's CPU limit.
+    #[test]
+    fn runtime_limits_report_nano_cpus_but_not_a_hand_set_quota() {
+        let member = MemberContainer {
+            role: "standalone".to_string(),
+            container_name: "postgres-shop".to_string(),
+            node_id: None,
+        };
+        let limits_of = |host_config: bollard::models::HostConfig| {
+            let info = bollard::models::ContainerInspectResponse {
+                host_config: Some(host_config),
+                ..Default::default()
+            };
+            let runtime = ServiceContainerRuntime::from_inspect(&info);
+            (
+                runtime_info(&member, runtime.clone(), None).resource_limits,
+                runtime,
+            )
+        };
+
+        let (limits, _) = limits_of(bollard::models::HostConfig {
+            nano_cpus: Some(2_000_000_000),
+            memory: Some(512 * 1024 * 1024),
+            ..Default::default()
+        });
+        assert_eq!(limits.nano_cpus, Some(2_000_000_000));
+        assert_eq!(limits.memory_mb, Some(512));
+
+        let (limits, runtime) = limits_of(bollard::models::HostConfig {
+            nano_cpus: Some(0),
+            cpu_quota: Some(50_000),
+            cpu_period: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(limits.nano_cpus, None);
+        assert_eq!(runtime.cpu_quota_us, Some(50_000));
+        assert_eq!(runtime.cpu_period_us, None);
+
+        let update = build_container_update_body(&limits);
+        assert_eq!(update.nano_cpus, Some(0));
     }
 
     // ── End container stats helpers ──────────────────────────────────────────
