@@ -30,6 +30,7 @@ import {
   CONTAINER_CPU_TILE_LABEL,
   CONTAINER_CPU_UTILIZATION_METRIC,
   alertableMetrics,
+  containerCpuAxisWidth,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from '@/lib/container-cpu'
@@ -1060,14 +1061,13 @@ function LiveMetrics({
                   tickLine={false}
                   axisLine={false}
                   width={
-                    selectedMetric === CONTAINER_CPU_METRIC
-                      ? 64
-                      : selectedMetric.endsWith('_ratio') ||
-                          selectedMetric.endsWith('_percent')
-                        ? 56
-                        : selectedMetric.endsWith('_bytes')
-                          ? 60
-                          : 44
+                    containerCpuAxisWidth(selectedMetric) ??
+                    (selectedMetric.endsWith('_ratio') ||
+                    selectedMetric.endsWith('_percent')
+                      ? 56
+                      : selectedMetric.endsWith('_bytes')
+                        ? 60
+                        : 44)
                   }
                   {...yAxisTickProps(
                     chartData.map((p) => p.value),

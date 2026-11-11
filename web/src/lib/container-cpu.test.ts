@@ -8,6 +8,7 @@ import {
   CONTAINER_CPU_METRIC_LABELS,
   CONTAINER_CPU_UTILIZATION_METRIC,
   alertableMetrics,
+  containerCpuAxisWidth,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from './container-cpu'
@@ -113,4 +114,23 @@ test('an uncapped limit (recorded as 0) reads without a denominator', () => {
   expect(formatContainerCpuMetric(CONTAINER_CPU_LIMIT_METRIC, 0)).toBe(
     'unlimited'
   )
+})
+
+describe('containerCpuAxisWidth', () => {
+  test('leaves room for the widest cores tick at the 10px axis font', () => {
+    const width = containerCpuAxisWidth(CONTAINER_CPU_METRIC)
+    // "0.050 cores": 11 characters, at most ~5px each at 10px, plus the
+    // 8px tick offset. The 52px `_percent` width clipped these.
+    expect(width).toBeDefined()
+    expect(width ?? 0).toBeGreaterThanOrEqual(
+      formatContainerCpuMetric(CONTAINER_CPU_METRIC, 5)!.length * 5 + 8
+    )
+  })
+
+  test('other metrics keep their own width', () => {
+    expect(
+      containerCpuAxisWidth(CONTAINER_CPU_UTILIZATION_METRIC)
+    ).toBeUndefined()
+    expect(containerCpuAxisWidth('pg.connections')).toBeUndefined()
+  })
 })

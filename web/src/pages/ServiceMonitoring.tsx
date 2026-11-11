@@ -90,6 +90,7 @@ import {
   CONTAINER_CPU_TILE_LABEL,
   CONTAINER_CPU_UTILIZATION_METRIC,
   alertableMetrics,
+  containerCpuAxisWidth,
   containerCpuTileText,
   formatContainerCpuMetric,
 } from '@/lib/container-cpu'
@@ -814,12 +815,13 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           tickLine={false}
           axisLine={false}
           width={
-            metricName.endsWith('_ratio') || metricName.endsWith('_percent')
+            containerCpuAxisWidth(metricName) ??
+            (metricName.endsWith('_ratio') || metricName.endsWith('_percent')
               ? 52
               : metricName.endsWith('_bytes') ||
                   metricName.endsWith('_bytes_total')
                 ? 70
-                : 44
+                : 44)
           }
           {...yAxisTickProps(
             chartData.map((p) => p.value),

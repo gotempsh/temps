@@ -47,8 +47,16 @@ impl CpuLimit {
         if let Some(nano) = host_config.nano_cpus.filter(|&n| n > 0) {
             return Self::Cores(nano as f64 / 1_000_000_000.0);
         }
-        match (host_config.cpu_quota, host_config.cpu_period) {
-            (Some(quota), Some(period)) if quota > 0 && period > 0 => {
+        // A quota set without a period (`docker update --cpu-quota` alone)
+        // is stored with `CpuPeriod: 0`, and the kernel applies its default
+        // 100 ms period to it.
+        const DEFAULT_CPU_PERIOD_US: i64 = 100_000;
+        match host_config.cpu_quota {
+            Some(quota) if quota > 0 => {
+                let period = host_config
+                    .cpu_period
+                    .filter(|&p| p > 0)
+                    .unwrap_or(DEFAULT_CPU_PERIOD_US);
                 Self::Cores(quota as f64 / period as f64)
             }
             _ => Self::Unlimited,
@@ -578,6 +586,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(CpuLimit::from_host_config(&quota), CpuLimit::Cores(1.5));
+
+        // `docker update --cpu-quota 50000` alone: the kernel's default
+        // 100 ms period applies, so this is half a core, not uncapped.
+        let quota_only = HostConfig {
+            nano_cpus: Some(0),
+            cpu_quota: Some(50_000),
+            cpu_period: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            CpuLimit::from_host_config(&quota_only),
+            CpuLimit::Cores(0.5)
+        );
+        let quota_no_period_field = HostConfig {
+            cpu_quota: Some(200_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            CpuLimit::from_host_config(&quota_no_period_field),
+            CpuLimit::Cores(2.0)
+        );
 
         let none = HostConfig {
             nano_cpus: Some(0),

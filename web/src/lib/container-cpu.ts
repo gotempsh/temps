@@ -51,6 +51,16 @@ export function alertableMetrics(metrics: string[]): string[] {
   return [CONTAINER_CPU_UTILIZATION_METRIC, ...rest]
 }
 
+/**
+ * Y-axis width (px) for a chart of `name`, when it is a container CPU metric
+ * read in cores. Its ticks ("0.050 cores", "12.40 cores") are about twice as
+ * long as the "68.1%" a `_percent` width was sized for, and clip at 10px
+ * text in a 52px axis. `undefined` for any other metric.
+ */
+export function containerCpuAxisWidth(name: string): number | undefined {
+  return name === CONTAINER_CPU_METRIC ? 64 : undefined
+}
+
 /** The CPU tile's text, e.g. "0.68 / 6 cores", from the latest values. */
 export function containerCpuTileText(
   lookup: (metric: string) => number | undefined
