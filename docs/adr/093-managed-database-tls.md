@@ -232,10 +232,11 @@ one instance can be in different modes.
   or rolls back, so a mode change checks what the restarted container serves:
   if it is not the new mode, the previous one is recorded again and the change
   fails (409) instead of reporting success.
-- A mode change, and each cluster pass a caller awaits, runs on a task of its
-  own. A request dropped mid-change does not release the service's TLS lock
-  while a data node's exec, which Docker never kills, still runs, and does not
-  stop a standalone change between its recreate and its rollback.
+- A mode change with its audit entry, and each cluster pass a caller awaits
+  with its follow-up retry, runs on a task of its own. A request dropped
+  mid-change does not release the service's TLS lock while a data node's exec,
+  which Docker never kills, still runs, does not stop a standalone change
+  between its recreate and its rollback, and does not leave a change unaudited.
 - A cluster is converged on its setting at every point where the cluster code
   already converges authentication:
   - control-plane start, which also renews a certificate inside its renewal

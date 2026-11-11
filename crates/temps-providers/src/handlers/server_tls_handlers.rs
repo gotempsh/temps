@@ -363,11 +363,41 @@ pub async fn update_service_tls(
         temps_auth::Permission::ExternalServicesWrite,
     )
     .await?;
+    let context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+    // The change and its audit entry run on one task, which this handler
+    // only awaits: a client that hangs up mid-change still leaves the
+    // change finished and audited, never applied without a record.
+    let mode = request.mode;
+    let change = tokio::spawn(change_and_audit(app_state, id, mode, context));
+    let (previous, status) = change
+        .await
+        .map_err(|error| ServerTlsError::ChangeAborted {
+            service_id: id,
+            mode,
+            reason: error.to_string(),
+        })??;
+
+    Ok(Json(UpdateServiceTlsResponse {
+        previous_mode: previous,
+        tls: status.into(),
+    }))
+}
+
+/// Change the mode, then audit-log the change when the mode moved.
+async fn change_and_audit(
+    app_state: Arc<AppState>,
+    id: i32,
+    mode: ServerTlsMode,
+    context: AuditContext,
+) -> Result<(ServerTlsMode, ServiceTlsStatus), ServerTlsError> {
     let (previous, status) = app_state
         .external_service_manager
-        .set_service_tls_mode(id, request.mode)
+        .set_service_tls_mode(id, mode)
         .await?;
-
     if previous != status.mode {
         let service = app_state.external_service_manager.get_service(id).await;
         let (name, service_type) = match service {
@@ -375,11 +405,7 @@ pub async fn update_service_tls(
             Err(_) => (String::new(), String::new()),
         };
         let audit = ExternalServiceTlsModeChangedAudit {
-            context: AuditContext {
-                user_id: auth.user_id(),
-                ip_address: Some(metadata.ip_address.clone()),
-                user_agent: metadata.user_agent.clone(),
-            },
+            context,
             service_id: id,
             name,
             service_type,
@@ -399,11 +425,7 @@ pub async fn update_service_tls(
             "Server TLS mode of external service changed"
         );
     }
-
-    Ok(Json(UpdateServiceTlsResponse {
-        previous_mode: previous,
-        tls: status.into(),
-    }))
+    Ok((previous, status))
 }
 
 #[utoipa::path(
@@ -863,6 +885,53 @@ mod tests {
         assert_eq!(body["new_mode"], "available");
         assert_eq!(body["name"], "orders");
         assert_eq!(body["context"]["user_id"], 42);
+    }
+
+    /// A client that hangs up mid-change still leaves the change audited.
+    #[tokio::test]
+    async fn a_change_whose_request_is_dropped_is_still_audited() {
+        let audit = RecordingAuditLogger::default();
+        let svc = service("postgres", "stopped");
+        let db = owned(MockDatabase::new(DatabaseBackend::Postgres), &svc)
+            .append_query_results([vec![svc.clone()]])
+            .append_query_results([vec![svc.clone()]])
+            .append_query_results([Vec::<postgres_major_upgrades::Model>::new()])
+            .append_query_results([Vec::<external_service_tls::Model>::new()])
+            .append_query_results([Vec::<managed_service_certificate_authorities::Model>::new()])
+            .append_query_results([Vec::<external_service_tls::Model>::new()])
+            .append_query_results([vec![tls_row("available")]])
+            .append_query_results([vec![tls_row("available")]])
+            .append_query_results([Vec::<managed_service_certificate_authorities::Model>::new()])
+            .append_query_results([vec![svc.clone()]]);
+        let app = state(db, audit.clone());
+        let request = update_service_tls(
+            RequireAuth(auth(temps_auth::Role::Admin)),
+            State(app),
+            Path(7),
+            Extension(metadata()),
+            Json(UpdateServiceTlsRequest {
+                mode: ServerTlsMode::Available,
+            }),
+        );
+        // One poll runs the checks and starts the change; the change
+        // itself only runs once this (single-threaded) test yields.
+        let mut request = Box::pin(request);
+        assert!(
+            futures::poll!(request.as_mut()).is_pending(),
+            "the handler waits for its change"
+        );
+        drop(request);
+
+        let mut recorded = Vec::new();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            recorded = audit.operations.lock().unwrap().clone();
+            if !recorded.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "EXTERNAL_SERVICE_TLS_MODE_CHANGED");
     }
 
     fn member_row(

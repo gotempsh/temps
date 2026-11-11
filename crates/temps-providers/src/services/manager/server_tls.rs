@@ -612,20 +612,21 @@ impl ExternalServiceManager {
         // On a task of its own, like a mode change: a caller dropped
         // mid-pass must not release the TLS lock while a data node's exec
         // still runs.
+        // The follow-up is scheduled from that task too, so a dropped
+        // caller does not lose the retry either.
         let manager = self.clone();
         let pass = tokio::spawn(async move {
-            manager
+            if !manager
                 .converge_cluster_server_tls(service_id, trigger)
                 .await
-        });
-        match pass.await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                warn!(service_id, trigger, error = %error, "Cluster server TLS pass did not finish");
+            {
+                manager.spawn_cluster_tls_follow_up(service_id, trigger);
             }
+        });
+        if let Err(error) = pass.await {
+            warn!(service_id, trigger, error = %error, "Cluster server TLS pass did not finish");
+            self.spawn_cluster_tls_follow_up(service_id, trigger);
         }
-        self.spawn_cluster_tls_follow_up(service_id, trigger);
     }
 
     /// [`Self::reconcile_cluster_server_tls`] for each of `service_ids`, one
@@ -1276,6 +1277,62 @@ mod tests {
         assert!(
             !log.is_empty(),
             "the dropped request's change never ran: it was cancelled with the request"
+        );
+    }
+
+    /// A pass whose caller is dropped still schedules its bounded retry when
+    /// it does not converge (here: the cluster cannot be read).
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_caller_does_not_lose_the_follow_up() {
+        let mut mock = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres);
+        for _ in 0..=FOLLOW_UP_ATTEMPTS {
+            mock = mock.append_query_errors([sea_orm::DbErr::Custom("connection reset".into())]);
+        }
+        let db = Arc::new(mock.into_connection());
+        let manager = ExternalServiceManager::new_with_handle(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "server-tls-follow-up-test",
+            )),
+            Arc::new(temps_core::DockerHandle::disabled(
+                "control-plane",
+                "server TLS follow-up test",
+            )),
+            true,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        );
+        {
+            let mut pass = Box::pin(manager.reconcile_cluster_server_tls(7, "test"));
+            assert!(
+                futures::poll!(pass.as_mut()).is_pending(),
+                "the caller waits for its pass"
+            );
+            // The caller goes away before the pass has run.
+        }
+        drop(manager);
+        // Paused time: the follow-up's sleeps pass at once. Its task holds
+        // the last other handles on the database until it gives up.
+        let mut db = db;
+        let mut owned = None;
+        for _ in 0..1000 {
+            match Arc::try_unwrap(db) {
+                Ok(connection) => {
+                    owned = Some(connection);
+                    break;
+                }
+                Err(shared) => {
+                    db = shared;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        let log = owned
+            .expect("the pass and its follow-up finished")
+            .into_transaction_log();
+        assert!(
+            log.len() > 1,
+            "only the first pass ran ({} queries): its follow-up was lost with the caller",
+            log.len()
         );
     }
 
