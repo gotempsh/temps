@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use tracing::warn;
 use utoipa::ToSchema;
 
 /// `ServiceConfig.parameters` key carrying the effective [`ServerTlsMode`].
@@ -253,13 +254,18 @@ const MAX_PASSWD_BYTES: usize = 256 * 1024;
 /// A helper container that mounts the volume is created and never started:
 /// Docker's archive API reads the image's `/etc/passwd` and writes the files
 /// through it, and keeps the uid/gid/mode of the uploaded tar headers. The
-/// helper is removed on every path. Existing files are replaced.
+/// helper is removed on every path, including this future being dropped
+/// (a cancelled backup or request): a left-over helper would keep the
+/// service's volume referenced forever. Existing files are replaced.
 pub async fn install_tls_directory(
     docker: &bollard::Docker,
     target: TlsInstallTarget<'_>,
     material: &ServerTlsMaterial,
 ) -> Result<(), TlsInstallError> {
     let helper = helper_container_name(target.volume);
+    // Armed before the create request: a create dropped mid-flight may
+    // still finish in the daemon, under this name only this call uses.
+    let mut cleanup = HelperCleanup::new(docker, &helper);
     let created = docker
         .create_container(
             Some(
@@ -298,9 +304,57 @@ pub async fn install_tls_directory(
             })
         }
     };
+    cleanup.created(&helper_id);
     let result = install_through_helper(docker, &helper_id, target, material).await;
-    remove_helper(docker, &helper_id).await;
+    cleanup.remove_now().await;
     result
+}
+
+/// Removes the install helper when [`install_tls_directory`] returns or is
+/// dropped. On drop the removal runs on its own task, since a dropped
+/// future cannot await.
+struct HelperCleanup {
+    docker: bollard::Docker,
+    /// The helper's ID once Docker returned it, its unique name before.
+    container: String,
+    armed: bool,
+}
+
+impl HelperCleanup {
+    fn new(docker: &bollard::Docker, name: &str) -> Self {
+        Self {
+            docker: docker.clone(),
+            container: name.to_string(),
+            armed: true,
+        }
+    }
+
+    fn created(&mut self, id: &str) {
+        self.container = id.to_string();
+    }
+
+    async fn remove_now(&mut self) {
+        self.armed = false;
+        remove_helper(&self.docker, &self.container).await;
+    }
+}
+
+impl Drop for HelperCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                container = %self.container,
+                "TLS install helper left behind: no runtime to remove it on"
+            );
+            return;
+        };
+        let docker = self.docker.clone();
+        let container = std::mem::take(&mut self.container);
+        runtime.spawn(async move { remove_helper(&docker, &container).await });
+    }
 }
 
 /// A name no other container has: a fixed name could belong to an
@@ -388,16 +442,28 @@ async fn read_small_file(
 }
 
 /// Remove the helper this module created, by the ID Docker returned for it.
-async fn remove_helper(docker: &bollard::Docker, helper_id: &str) {
-    let _ = docker
+async fn remove_helper(docker: &bollard::Docker, helper: &str) {
+    match docker
         .remove_container(
-            helper_id,
+            helper,
             Some(bollard::query_parameters::RemoveContainerOptions {
                 force: true,
                 ..Default::default()
             }),
         )
-        .await;
+        .await
+    {
+        // Gone already, or a dropped create that never reached the daemon.
+        Ok(())
+        | Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {}
+        Err(e) => warn!(
+            container = helper,
+            error = %e,
+            "Could not remove the TLS install helper container; remove it by hand"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -511,5 +577,91 @@ mod tests {
             "PostgreSQL refuses a group/world-readable key"
         );
         assert!(seen[2].2.contains("PRIVATE KEY"));
+    }
+
+    /// A dropped install (a cancelled backup or request) still removes its
+    /// helper, by ID once Docker returned one and by its unique name before,
+    /// and never touches another container.
+    #[tokio::test]
+    async fn a_dropped_install_removes_its_helper() {
+        use crate::externalsvc::recreate_guard::test_support::{docker_or_skip, ensure_image};
+        let Some(docker) = docker_or_skip("a_dropped_install_removes_its_helper").await else {
+            return;
+        };
+        ensure_image(&docker, "alpine:3.22").await;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let create = |name: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&name)
+                                .build(),
+                        ),
+                        bollard::models::ContainerCreateBody {
+                            image: Some("alpine:3.22".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create test container")
+                    .id
+            }
+        };
+        let exists = |name: String| {
+            let docker = docker.clone();
+            async move {
+                docker
+                    .inspect_container(
+                        &name,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                    .is_ok()
+            }
+        };
+        let gone_soon = |name: String| async move {
+            for _ in 0..50 {
+                if !exists(name.clone()).await {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            false
+        };
+
+        let by_id = format!("tls-cleanup-test-{run}-id");
+        let id = create(by_id.clone()).await;
+        let mut cleanup = HelperCleanup::new(&docker, &by_id);
+        cleanup.created(&id);
+        drop(cleanup);
+        assert!(
+            gone_soon(by_id).await,
+            "a created helper is removed on drop"
+        );
+
+        // Dropped before Docker answered the create: removed by name.
+        let by_name = format!("tls-cleanup-test-{run}-name");
+        drop(HelperCleanup::new(&docker, &by_name));
+        create(by_name.clone()).await;
+        // That drop ran before this container existed; one dropped after
+        // a create that did finish removes it.
+        drop(HelperCleanup::new(&docker, &by_name));
+        assert!(gone_soon(by_name).await, "a helper is removed by its name");
+
+        // A finished install disarms it: nothing else is removed later.
+        let bystander = format!("tls-cleanup-test-{run}-bystander");
+        create(bystander.clone()).await;
+        let mut cleanup = HelperCleanup::new(&docker, &format!("tls-cleanup-test-{run}-absent"));
+        cleanup.remove_now().await;
+        drop(cleanup);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            exists(bystander.clone()).await,
+            "only its own helper is removed"
+        );
+        remove_helper(&docker, &bystander).await;
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Callout, Status } from '@temps-sdk/ds'
 import { Download, Loader2, Lock } from 'lucide-react'
@@ -20,7 +20,6 @@ import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
@@ -34,6 +33,7 @@ import {
   containerTlsLine,
   memberTlsLabel,
   tlsModeOptions,
+  tlsRefetchInterval,
   tlsVerdict,
   VERIFY_FULL_EXAMPLE,
 } from '@/lib/service-tls'
@@ -250,20 +250,42 @@ const TITLE = 'Connection encryption (TLS)'
 export function ServiceTlsCard({
   serviceId,
   serviceName,
+  serviceStatus,
 }: {
   serviceId: number
   serviceName: string
+  /** The service's lifecycle status; a change re-reads what TLS it serves. */
+  serviceStatus?: string
 }) {
   const queryClient = useQueryClient()
   const [confirmMode, setConfirmMode] = useState<ServerTlsMode | null>(null)
   const queryKey = getServiceTlsQueryKey({ path: { id: serviceId } })
-  const statusQuery = useQuery(
-    getServiceTlsOptions({ path: { id: serviceId } })
-  )
+  // When the database last started, stopped or changed TLS: the status is
+  // re-read while it settles, for a bounded time after that.
+  const [changedAt, setChangedAt] = useState(() => Date.now())
+  const statusQuery = useQuery({
+    ...getServiceTlsOptions({ path: { id: serviceId } }),
+    refetchInterval: (query) =>
+      tlsRefetchInterval(
+        query.state.data,
+        serviceStatus,
+        Date.now() - changedAt
+      ),
+  })
+  const seenStatus = useRef(serviceStatus)
+  useEffect(() => {
+    if (seenStatus.current === serviceStatus) return
+    seenStatus.current = serviceStatus
+    setChangedAt(Date.now())
+    void queryClient.invalidateQueries({
+      queryKey: getServiceTlsQueryKey({ path: { id: serviceId } }),
+    })
+  }, [serviceStatus, serviceId, queryClient])
 
   const update = useMutation({
     ...updateServiceTlsMutation(),
     onSuccess: (result) => {
+      setChangedAt(Date.now())
       queryClient.setQueryData(queryKey, result.tls)
       void queryClient.invalidateQueries({ queryKey })
       toast.success(
@@ -315,10 +337,6 @@ export function ServiceTlsCard({
           <Lock className="h-4 w-4" />
           {TITLE}
         </CardTitle>
-        <CardDescription>
-          Encrypt connections to this database with a certificate Temps issues
-          and renews.
-        </CardDescription>
       </CardHeader>
       <CardContent>
         <ConfirmDialog

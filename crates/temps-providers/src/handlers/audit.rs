@@ -358,8 +358,8 @@ pub struct ExternalServiceTlsModeChangedAudit {
     pub service_id: i32,
     pub name: String,
     pub service_type: String,
-    pub previous_mode: String,
-    pub new_mode: String,
+    pub previous_mode: temps_providers_core::externalsvc::server_tls::ServerTlsMode,
+    pub new_mode: temps_providers_core::externalsvc::server_tls::ServerTlsMode,
 }
 
 impl AuditOperation for ExternalServiceTlsModeChangedAudit {

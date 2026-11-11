@@ -1323,6 +1323,7 @@ export function ServiceDetail() {
               <ServiceTlsCard
                 serviceId={service.service.id}
                 serviceName={service.service.name}
+                serviceStatus={service.service.status}
               />
             )}
 

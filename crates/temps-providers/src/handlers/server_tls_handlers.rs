@@ -359,8 +359,8 @@ pub async fn update_service_tls(
             service_id: id,
             name,
             service_type,
-            previous_mode: previous.to_string(),
-            new_mode: status.mode.to_string(),
+            previous_mode: previous,
+            new_mode: status.mode,
         };
         if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
             error!(

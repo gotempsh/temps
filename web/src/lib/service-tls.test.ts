@@ -8,7 +8,10 @@ import {
   confirmCopy,
   containerTlsLine,
   memberTlsLabel,
+  TLS_SETTLE_POLL_MS,
+  TLS_SETTLE_WINDOW_MS,
   tlsModeOptions,
+  tlsRefetchInterval,
   tlsVerdict,
 } from './service-tls'
 
@@ -78,6 +81,71 @@ describe('tlsVerdict', () => {
     expect(tlsVerdict({ ...offStatus, supported: false }).label).toBe(
       'Not supported'
     )
+  })
+})
+
+describe('unknown TLS', () => {
+  it('is never shown as healthy', () => {
+    expect(tlsVerdict({ ...availableStatus, active: null })).toEqual({
+      tone: 'idle',
+      label: 'Unknown',
+    })
+    // A stopped cluster: its data nodes could not be checked.
+    const stoppedCluster = {
+      ...clusterStatus,
+      active: null,
+      members: clusterStatus.members.map((m) => ({
+        ...m,
+        status: 'stopped',
+        active: null,
+      })),
+    }
+    expect(tlsVerdict(stoppedCluster).label).toBe('Unknown')
+    expect(tlsVerdict({ ...clusterStatus, members: [] }).label).toBe('Unknown')
+    // One node unknown is enough.
+    expect(
+      tlsVerdict({
+        ...clusterStatus,
+        members: [clusterStatus.members[0], { ...managedNode, active: null }],
+      }).label
+    ).toBe('Unknown')
+    // A cluster whose nodes all serve it is healthy, though its own
+    // `active` is never set.
+    expect(tlsVerdict({ ...clusterStatus, active: null })).toEqual({
+      tone: 'ok',
+      label: 'Available',
+    })
+  })
+})
+
+describe('tlsRefetchInterval', () => {
+  const settling = {
+    ...clusterStatus,
+    members: [clusterStatus.members[0], { ...managedNode, pending: true }],
+  }
+  it('re-reads a running database whose TLS is still settling', () => {
+    expect(tlsRefetchInterval(settling, 'running', 0)).toBe(TLS_SETTLE_POLL_MS)
+    expect(
+      tlsRefetchInterval({ ...availableStatus, active: null }, 'starting', 0)
+    ).toBe(TLS_SETTLE_POLL_MS)
+    expect(
+      tlsRefetchInterval(
+        { ...availableStatus, pending_restart: true },
+        'running',
+        1_000
+      )
+    ).toBe(TLS_SETTLE_POLL_MS)
+  })
+  it('stops once settled, stopped, or long after the change', () => {
+    expect(tlsRefetchInterval(availableStatus, 'running', 0)).toBe(false)
+    expect(tlsRefetchInterval(settling, 'stopped', 0)).toBe(false)
+    expect(
+      tlsRefetchInterval(settling, 'running', TLS_SETTLE_WINDOW_MS + 1)
+    ).toBe(false)
+    expect(tlsRefetchInterval(undefined, 'running', 0)).toBe(false)
+    expect(
+      tlsRefetchInterval({ ...settling, supported: false }, 'running', 0)
+    ).toBe(false)
   })
 })
 

@@ -44,6 +44,48 @@ const _: () = assert!(
     MEMBER_INSPECT_TIMEOUT.as_secs() > MEMBER_STATUS_DEADLINE_SECS + MEMBER_KILL_GRACE_SECS
 );
 
+/// Put a standalone database back on its previous TLS mode after applying
+/// a new one failed: record the previous mode again, then run the service's
+/// initialisation again so the container serves it (and runs, if the failed
+/// attempt had stopped it). Returns what happened, for the error.
+async fn standalone_rollback<R, RE, F, Fut, FE>(record_previous: R, reapply: F) -> String
+where
+    R: std::future::Future<Output = Result<ServerTlsMode, RE>>,
+    RE: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), FE>>,
+    FE: std::fmt::Display,
+{
+    if let Err(error) = record_previous.await {
+        return format!(
+            "it could not be recorded again ({error}), so the database was left as the \
+             failed attempt left it; the TLS status shows what it serves"
+        );
+    }
+    match reapply().await {
+        Ok(()) => "the database serves it again".to_string(),
+        Err(error) => format!(
+            "it is recorded, but putting the database back on it failed too ({error}); \
+             the TLS status shows what it serves and its next start applies it"
+        ),
+    }
+}
+
+/// When a pass may treat a failed apply on a member as finished. A local
+/// exec whose output stream failed returns at once while its script may
+/// still run (Docker never kills it), so the pass holds the service's TLS
+/// lock until that script's own deadline and kill grace have passed: a
+/// rollback or the next change must not race it on the same certificate
+/// files and settings. A worker's agent already holds each container until
+/// its exec has stopped, so a remote failure is final when it returns.
+fn member_apply_fence(
+    started: tokio::time::Instant,
+    member_is_local: bool,
+) -> Option<tokio::time::Instant> {
+    member_is_local
+        .then(|| started + Duration::from_secs(MEMBER_APPLY_DEADLINE_SECS + MEMBER_KILL_GRACE_SECS))
+}
+
 /// Upper bound for reading the certificate one data node serves (the script
 /// dies at [`MEMBER_STATUS_DEADLINE_SECS`] inside the node).
 const MEMBER_INSPECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -465,6 +507,7 @@ impl ExternalServiceManager {
                     .push((name, format!("the member is {}", member.status)));
                 continue;
             }
+            let started = tokio::time::Instant::now();
             let exec = self.exec_in_member_with_env(
                 member,
                 server_tls_apply_command(target),
@@ -476,7 +519,19 @@ impl ExternalServiceManager {
                     name,
                     format!("no result within {}s", MEMBER_APPLY_TIMEOUT.as_secs()),
                 )),
-                Ok(Err(error)) => report.failed.push((name, error.to_string())),
+                Ok(Err(error)) => {
+                    if let Some(fence) = member_apply_fence(started, member.node_id.is_none()) {
+                        warn!(
+                            service_id = service.id,
+                            member = %name,
+                            error = %error,
+                            "TLS apply on a data node failed before it reported a result; \
+                             waiting for its script's deadline before another TLS change"
+                        );
+                        tokio::time::sleep_until(fence).await;
+                    }
+                    report.failed.push((name, error.to_string()))
+                }
                 Ok(Ok((0, _, _))) => report.applied.push(name),
                 Ok(Ok((NOT_INITIALIZED_EXIT_CODE, _, _))) => report.initializing.push(name),
                 Ok(Ok((code, _, stderr))) => report
@@ -502,6 +557,24 @@ impl ExternalServiceManager {
             return;
         }
         self.spawn_cluster_tls_follow_up(service_id, trigger);
+    }
+
+    /// [`Self::reconcile_cluster_server_tls`] for each of `service_ids`, one
+    /// after another on a task of its own, for callers that must not wait.
+    /// Returns the task, which callers may drop.
+    pub(super) fn spawn_cluster_server_tls_reconcile(
+        &self,
+        service_ids: Vec<i32>,
+        trigger: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            for service_id in service_ids {
+                manager
+                    .reconcile_cluster_server_tls(service_id, trigger)
+                    .await;
+            }
+        })
     }
 
     /// The bounded background retry of [`Self::reconcile_cluster_server_tls`].
@@ -676,7 +749,11 @@ impl ExternalServiceManager {
                 self.apply_cluster_mode_change(&service, mode, previous, &held)
                     .await?;
             }
-        } else if service.status != "stopped" {
+        } else if service.status == "running" {
+            // Only a running service is re-initialized. One still being
+            // created, starting or stopped only records the mode, which its
+            // initialization or next start applies: initializing it here
+            // would race the creation or start in progress.
             if let Err(error) = self.initialize_service(service_id).await {
                 warn!(
                     service_id,
@@ -685,17 +762,19 @@ impl ExternalServiceManager {
                     error = %error,
                     "Applying the server TLS mode failed; restoring the previous mode"
                 );
-                if let Err(restore_error) = tls.set_mode(service_id, previous).await {
-                    warn!(
-                        service_id,
-                        error = %restore_error,
-                        "Failed to restore the previous server TLS mode"
-                    );
-                }
+                // The failure may come after the container was already
+                // replaced (a later status write), or after the original was
+                // stopped: put the database itself back, not only the row.
+                let rollback = standalone_rollback(tls.set_mode(service_id, previous), || {
+                    self.initialize_service(service_id)
+                })
+                .await;
+                warn!(service_id, previous = %previous, rollback = %rollback, "Server TLS mode rollback");
                 return Err(ServerTlsError::Apply {
                     service_id,
                     mode,
                     previous,
+                    rollback,
                     source: Box::new(error),
                 });
             }
@@ -813,6 +892,63 @@ mod tests {
         model.id = 7;
         model.slug = Some("orders".into());
         model
+    }
+
+    #[tokio::test]
+    async fn a_failed_standalone_change_puts_the_database_back() {
+        let reapplied = std::sync::atomic::AtomicBool::new(false);
+        let outcome = standalone_rollback(
+            async { Ok::<_, String>(ServerTlsMode::Available) },
+            || async {
+                reapplied.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+        assert!(reapplied.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(outcome, "the database serves it again");
+
+        let outcome = standalone_rollback(
+            async { Ok::<_, String>(ServerTlsMode::Available) },
+            || async { Err::<(), _>("container 'postgres-orders' did not start".to_string()) },
+        )
+        .await;
+        assert!(outcome.contains("putting the database back on it failed too"));
+        assert!(outcome.contains("container 'postgres-orders' did not start"));
+
+        // Without the previous mode recorded, re-initialising would apply the
+        // failed one again: it is not attempted.
+        let reapplied = std::sync::atomic::AtomicBool::new(false);
+        let outcome = standalone_rollback(
+            async { Err::<ServerTlsMode, _>("connection reset".to_string()) },
+            || async {
+                reapplied.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, String>(())
+            },
+        )
+        .await;
+        assert!(!reapplied.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(outcome.contains("could not be recorded again (connection reset)"));
+    }
+
+    #[test]
+    fn a_failed_local_apply_is_final_only_once_its_script_is_dead() {
+        let started = tokio::time::Instant::now();
+        let fence = member_apply_fence(started, true).expect("a local member is fenced");
+        assert!(
+            fence - started
+                >= Duration::from_secs(MEMBER_APPLY_DEADLINE_SECS + MEMBER_KILL_GRACE_SECS),
+            "the fence outlasts the script's deadline and kill grace"
+        );
+        assert!(
+            fence - started < MEMBER_APPLY_TIMEOUT,
+            "and stays within the pass's own bound for one member"
+        );
+        assert_eq!(
+            member_apply_fence(started, false),
+            None,
+            "a worker's agent holds the container until its exec stopped"
+        );
     }
 
     #[tokio::test]

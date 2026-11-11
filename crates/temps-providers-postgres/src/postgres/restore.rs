@@ -927,9 +927,15 @@ impl PostgresService {
             // ADR 093: restore rebuilds from stored parameters, which never
             // say what TLS should be; keep what the container served. Its
             // certificate lives outside PGDATA and survives the swap.
+            // A failure to read it stops the restore before the container
+            // is removed, rather than bringing it back without TLS.
             let kept_tls = if postgres_config.server_tls_mode.is_none() {
                 self.installed_server_tls(&self.docker, &container_name)
                     .await
+                    .map_err(|error| PostgresArchiveVerificationError {
+                        service_name: self.name.clone(),
+                        reason: error.to_string(),
+                    })?
             } else {
                 None
             };

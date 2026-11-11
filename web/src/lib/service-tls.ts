@@ -74,11 +74,54 @@ export function tlsVerdict(status: ServiceTlsStatusResponse): {
       : { tone: 'warn', label: 'Not on every node' }
   }
   if (status.mode === 'off') return { tone: 'idle', label: 'Off' }
-  if (status.active === false) return { tone: 'warn', label: 'Not active' }
+  // A cluster reports per data node; its own `active` is never set.
+  const served = status.change_restarts_database
+    ? [status.active]
+    : status.members.map((m) => m.active)
+  if (
+    served.length === 0 ||
+    served.some((a) => a === null || a === undefined)
+  ) {
+    // Stopped, unreachable or not inspected: never shown as healthy.
+    return { tone: 'idle', label: 'Unknown' }
+  }
+  if (served.includes(false)) return { tone: 'warn', label: 'Not active' }
   return {
     tone: 'ok',
     label: status.mode === 'required' ? 'Required' : 'Available',
   }
+}
+
+/** How often the TLS status is re-read while it is still settling. */
+export const TLS_SETTLE_POLL_MS = 10_000
+
+/**
+ * How long after a lifecycle or TLS change the status keeps being re-read.
+ * Covers the server's background retries for data nodes still being
+ * created (40 attempts, 15 s apart).
+ */
+export const TLS_SETTLE_WINDOW_MS = 11 * 60_000
+
+/**
+ * Whether to re-read the TLS status, for TanStack Query's
+ * `refetchInterval`: only while the database runs (or is starting), what it
+ * serves is not yet what was asked for or not yet known, and the change is
+ * recent. Reading the status inspects every data node, so it never polls
+ * without end.
+ */
+export function tlsRefetchInterval(
+  status: ServiceTlsStatusResponse | undefined,
+  serviceStatus: string | undefined,
+  msSinceChange: number
+): number | false {
+  if (!status || !status.supported) return false
+  if (serviceStatus !== 'running' && serviceStatus !== 'starting') return false
+  if (msSinceChange > TLS_SETTLE_WINDOW_MS) return false
+  const unsettled =
+    status.pending_restart ||
+    tlsVerdict(status).label === 'Unknown' ||
+    status.members.some((m) => m.pending)
+  return unsettled ? TLS_SETTLE_POLL_MS : false
 }
 
 /** Plain-language state of a cluster's data nodes against the setting. */

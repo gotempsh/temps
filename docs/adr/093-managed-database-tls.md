@@ -101,7 +101,9 @@ Either can be rotated without touching the other.
 - **Delivery into the service's volume**: a helper container that mounts the
   data volume is *created and never started*. Each install names its helper
   uniquely and removes only the container it created, by ID, so it can never
-  touch an operator's container or a concurrent install's helper. Docker's archive API reads the
+  touch an operator's container or a concurrent install's helper. A guard
+  removes it on every path, including the install being cancelled (a dropped
+  backup or request), so no helper keeps the volume referenced. Docker's archive API reads the
   image's own `/etc/passwd` to resolve the engine user's uid/gid (999 in the
   Debian PostgreSQL images, other values elsewhere), then uploads a tar whose
   headers set owner and mode: directory `0700`, certificate `0644`, key `0600`.
@@ -116,9 +118,15 @@ Either can be rotated without touching the other.
 - Missing keys mean "not said", never `off`. Engine paths that rebuild a
   container from the stored parameters, such as a backup recreating it to turn
   WAL archiving on, or an in-place restore removing and recreating it, keep
-  the TLS the replaced container served. Its certificate stays on the data
-  volume outside PGDATA, which both reuse. Start-time drift repair leaves such
-  a container's TLS alone.
+  the TLS the replaced container served. The recreate guard reads it from the
+  original inside the container's replacement turn, so a TLS change that
+  replaced the container meanwhile is what is kept, and a failure to inspect
+  the original aborts the replacement rather than guessing "no TLS". Its
+  certificate stays on the data volume outside PGDATA, which both reuse.
+  Start-time drift repair leaves such a container's TLS alone.
+- The certificate fingerprint label is carried through a database's workload
+  spec (`workload_mode = enforce`), so an enforced container is not seen as
+  drifted and recreated at every start.
 - A major upgrade starts the new server with the service's certificate
   installed in the new data volume, so clients that require TLS keep
   connecting.
@@ -165,7 +173,10 @@ node agent's exec on a worker. The steps:
 Each script runs under `timeout` inside the member, which kills its whole
 process group before the control plane stops waiting. A Docker exec cannot be
 killed from outside, so when the control plane gives up on a member, nothing
-is left running there. A mode change holds a per-service lock from reading the
+is left running there. A local exec whose output stream fails returns while
+its script may still run, so the pass holds the lock until that script's
+deadline has passed; a worker's agent already holds each container until its
+exec has stopped. A mode change holds a per-service lock from reading the
 current mode through its rollback, and every apply pass takes the same lock and
 reads the setting under it, so no older change or pass lands after a newer one.
 
@@ -199,9 +210,12 @@ one instance can be in different modes.
   path a parameter update takes (stop, init, start with drift repair). The
   container is recreated through the recreate guard, so **it restarts the
   database**. A running cluster's data nodes switch certificates in place with
-  no restart. A stopped service only records the mode; its next start applies
-  it. If applying fails, the previous mode is restored (and re-applied to the
-  cluster members that had switched) so the record keeps describing what runs.
+  no restart. A service that is not running (stopped, still being created or
+  starting) only records the mode; its initialization or next start applies
+  it, and re-initializing it meanwhile would race that. If applying fails, the previous mode is recorded again and re-applied to
+  what runs: a standalone service is re-initialized on it (the failure may come
+  after its container was already replaced, or after it was stopped), a cluster's
+  members that had switched switch back. The error says whether that succeeded.
 - A cluster is converged on its setting at every point where the cluster code
   already converges authentication:
   - control-plane start, which also renews a certificate inside its renewal
@@ -209,6 +223,9 @@ one instance can be in different modes.
   - the end of cluster creation;
   - after a member is added;
   - after a cluster Start.
+
+  Each pass runs on its own task: it never fails the caller, and it neither
+  holds a Start response nor delays the start-up watchdog for stuck members.
 
   This is best-effort. A data node that is stopped, unreachable or still taking
   its first base backup is listed as pending in the status and retried at the

@@ -1707,7 +1707,7 @@ async fn test_available_tls_accepts_verified_tls_and_plaintext() {
         // An in-place restore removes the container itself and creates a new
         // one from stored parameters: it reads the TLS first and keeps it.
         let container = postgres_container_name(&name);
-        let kept = service.installed_server_tls(&docker, &container).await;
+        let kept = service.installed_server_tls(&docker, &container).await?;
         assert_eq!(
             kept,
             Some(InstalledServerTls {

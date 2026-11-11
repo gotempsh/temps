@@ -62,9 +62,6 @@ impl ExternalServiceManager {
                          roles; it keeps its previous authentication until the next start"
                     );
                 }
-                // Also renews a managed certificate nearing expiry.
-                self.reconcile_cluster_server_tls(svc.id, "control plane start")
-                    .await;
             }
         }
 
@@ -72,6 +69,13 @@ impl ExternalServiceManager {
         // failed/stuck members appear as `failed` immediately to the
         // UI, instead of hanging in `creating` forever.
         self.fail_abandoned_provisioning_rows().await;
+
+        // Converge every cluster on its TLS setting (and renew a managed
+        // certificate nearing expiry) last, on its own task: one apply can
+        // take up to two minutes per data node, which must delay neither the
+        // watchdog above nor start-up.
+        let ids: Vec<i32> = candidates.iter().map(|svc| svc.id).collect();
+        self.spawn_cluster_server_tls_reconcile(ids, "control plane start");
     }
 
     /// One-shot scan at startup: any `service_members` row whose
@@ -551,11 +555,12 @@ impl ExternalServiceManager {
         // Data nodes keep their certificate across restarts; this applies a
         // mode changed while the cluster was stopped, a renewal, or a member
         // that missed an earlier change.
+        // On its own task: it never fails the Start, and waiting for every
+        // data node to switch would hold the Start response for minutes.
         if matches!(action, ClusterLifecycleAction::Start)
             && outcome.as_ref().is_ok_and(|report| !report.done.is_empty())
         {
-            self.reconcile_cluster_server_tls(service_id, "cluster start")
-                .await;
+            self.spawn_cluster_server_tls_reconcile(vec![service_id], "cluster start");
         }
 
         let report = outcome?;

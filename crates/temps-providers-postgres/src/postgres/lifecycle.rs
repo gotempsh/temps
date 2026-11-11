@@ -264,22 +264,13 @@ impl PostgresService {
         }
         let container_name = self.get_container_name();
         let replacement = self.replacement_storage(config)?;
-        // ADR 093: a config that does not say what TLS should be (built from
-        // stored parameters, e.g. by a backup enabling WAL archiving) keeps
-        // what the container being replaced serves. Its certificate stays on
-        // the data volume the guard requires the replacement to mount.
-        let kept_tls = if config.server_tls_mode.is_none() {
-            self.installed_server_tls(docker, &container_name).await
-        } else {
-            None
-        };
         // Pull while the original still serves: a pull failure must not
         // cost any downtime.
         info!("Pulling PostgreSQL image {}", config.docker_image);
         crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
             .map_err(|e| EngineError::failed(&self.name, e))?;
-        let report = crate::externalsvc::recreate_guard::recreate_preserving_data(
+        let report = crate::externalsvc::recreate_guard::recreate_preserving_data_from(
             crate::externalsvc::recreate_guard::RecreateRequest {
                 docker,
                 engine: crate::externalsvc::recreate_guard::ManagedEngine::Postgres,
@@ -288,7 +279,20 @@ impl PostgresService {
                 replacement,
                 operation,
             },
-            || {
+            |original| async move {
+                // ADR 093: a config that does not say what TLS should be
+                // (built from stored parameters, e.g. by a backup enabling
+                // WAL archiving) keeps what the container being replaced
+                // serves. Read inside the guard's turn, so a TLS change that
+                // replaced the container meanwhile is what is kept, and its
+                // certificate stays on the data volume the guard requires
+                // the replacement to mount.
+                let kept_tls = match original {
+                    Some(original) if config.server_tls_mode.is_none() => {
+                        self.installed_server_tls(docker, &original.id).await?
+                    }
+                    _ => None,
+                };
                 self.create_fresh_container(
                     docker,
                     config,
@@ -296,6 +300,7 @@ impl PostgresService {
                     enable_archiving,
                     kept_tls.as_ref(),
                 )
+                .await
             },
         )
         .await?;
@@ -303,37 +308,38 @@ impl PostgresService {
     }
 
     /// The TLS a managed container serves, read from how it was created.
-    /// `None` when it serves none, or when it cannot be inspected (logged):
-    /// the replacement then starts without TLS and the TLS status reports it.
+    /// `Ok(None)` when it serves none or no longer exists. Any other failure
+    /// to inspect it is an error: guessing "no TLS" would replace a container
+    /// that serves TLS with one that does not.
     pub(super) async fn installed_server_tls(
         &self,
         docker: &Docker,
-        container_name: &str,
-    ) -> Option<InstalledServerTls> {
+        container: &str,
+    ) -> Result<Option<InstalledServerTls>> {
         match docker
             .inspect_container(
-                container_name,
+                container,
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
         {
             Ok(info) => {
                 let config = info.config.unwrap_or_default();
-                installed_server_tls(
+                Ok(installed_server_tls(
                     config.cmd.as_deref().unwrap_or_default(),
                     config.labels.as_ref(),
-                )
+                ))
             }
-            Err(e) => {
-                warn!(
-                    service = %self.name,
-                    container = container_name,
-                    error = %e,
-                    "Could not read the server TLS of PostgreSQL container before \
-                     replacing it; the replacement starts without TLS"
-                );
-                None
-            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(EngineError::failed(
+                &self.name,
+                format!(
+                    "could not read the server TLS of PostgreSQL container '{container}' \
+                     before replacing it, so it was not replaced: {e}"
+                ),
+            )),
         }
     }
 

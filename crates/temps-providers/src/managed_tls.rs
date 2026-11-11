@@ -88,12 +88,14 @@ pub enum ServerTlsError {
     NoAuthority { service_id: i32 },
     #[error(
         "Failed to apply server TLS mode '{mode}' to external service {service_id}; \
-         the previous mode '{previous}' was kept: {source}"
+         restoring the previous mode '{previous}': {rollback}. The failure: {source}"
     )]
     Apply {
         service_id: i32,
         mode: ServerTlsMode,
         previous: ServerTlsMode,
+        /// What became of the database: whether it serves `previous` again.
+        rollback: String,
         #[source]
         source: Box<ExternalServiceError>,
     },
