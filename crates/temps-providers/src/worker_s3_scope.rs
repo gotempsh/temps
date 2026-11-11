@@ -621,11 +621,13 @@ impl WorkerCredentialScoper {
                     source.id,
                     grant.node_id
                 );
+                // The source's credential as it is: a temporary one only
+                // authenticates with its session token.
                 Ok(ScopedWorkerDestination {
                     destination: WorkerS3Destination {
                         access_key_id,
                         secret_access_key,
-                        session_token: None,
+                        session_token: source_token,
                         ..base
                     },
                     scope: WorkerCredentialScope::Full { reason },
@@ -1180,9 +1182,59 @@ mod tests {
             .unwrap();
         assert_eq!(full.destination.access_key_id, "source-key");
         assert!(matches!(full.scope, WorkerCredentialScope::Full { .. }));
+        assert_eq!(
+            full.destination.session_token, None,
+            "a long-lived credential has no session token"
+        );
         let warning = full.warning("offsite", 2).unwrap();
         assert!(warning.contains("full credential"), "{warning}");
         assert!(warning.contains("node 2"), "{warning}");
+    }
+
+    /// A source whose own credential is temporary cannot mint a scoped one,
+    /// on any kind of endpoint. Allowed to fall back, it sends that
+    /// credential whole: the session token included, without which the
+    /// key and secret do not authenticate.
+    #[tokio::test]
+    async fn a_temporary_source_credential_keeps_its_session_token_through_the_fallback() {
+        let encryption = encryption();
+        let scoper = WorkerCredentialScoper::new(encryption.clone());
+        for endpoint in [
+            None,
+            Some("https://s3.eu-west-1.amazonaws.com"),
+            Some("https://abc.r2.cloudflarestorage.com"),
+        ] {
+            let mut temporary = source(endpoint, "base");
+            temporary.access_key_id = encryption.encrypt_string("ASIA-temporary-key").unwrap();
+            temporary.secret_key = encryption.encrypt_string("temporary-secret").unwrap();
+            temporary.session_token = Some(encryption.encrypt_string("source-session").unwrap());
+
+            let error = scoper
+                .destination(&temporary, grant("base/external_services/redis/c/"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, WorkerCredentialError::Unscopable { .. }),
+                "{endpoint:?}: {error}"
+            );
+
+            temporary.worker_credentials = s3_sources::WORKER_CREDENTIALS_ALLOW_FULL.to_string();
+            let full = scoper
+                .destination(&temporary, grant("base/external_services/redis/c/"))
+                .await
+                .unwrap();
+            assert!(
+                matches!(full.scope, WorkerCredentialScope::Full { .. }),
+                "{endpoint:?}"
+            );
+            assert_eq!(full.destination.access_key_id, "ASIA-temporary-key");
+            assert_eq!(full.destination.secret_access_key, "temporary-secret");
+            assert_eq!(
+                full.destination.session_token.as_deref(),
+                Some("source-session"),
+                "{endpoint:?}"
+            );
+        }
     }
 
     #[tokio::test]
