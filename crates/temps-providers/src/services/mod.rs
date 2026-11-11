@@ -19,6 +19,10 @@ use temps_core::EncryptionService;
 mod cluster_state;
 mod cluster_topology;
 mod manager;
+pub use manager::{
+    cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
+    CPU_LIMIT_REFRESH,
+};
 mod schema;
 #[cfg(test)]
 mod test_support;

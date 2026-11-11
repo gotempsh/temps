@@ -260,8 +260,9 @@ function EditLimitsButton({ onClick }: { onClick: () => void }) {
 // ---------------------------------------------------------------------------
 // CPU meter: inline value + thin bar. Value reads as cores used (and "/ cap"
 // when a CPU cap is configured) so a 2-core-pinned container says "2.00 / 2
-// cores" rather than the raw "200%" Docker reports. The bar fills against
-// the cap when set, otherwise against host cores.
+// cores" rather than the raw "200%" Docker reports — the same reading as the
+// Monitoring card's CPU tile, which averages over a longer window. The bar
+// fills against the cap when set, otherwise against host cores.
 // ---------------------------------------------------------------------------
 function CpuMeter({
   sample,
@@ -294,6 +295,8 @@ function CpuMeter({
     <Meter
       icon={<Cpu className="size-3.5" />}
       label="CPU"
+      hint="live"
+      title={CPU_METER_TITLE}
       value={
         hostCpuPercent != null ? formatCpuUsage(hostCpuPercent, capCores) : '—'
       }
@@ -302,6 +305,11 @@ function CpuMeter({
     />
   )
 }
+
+const CPU_METER_TITLE =
+  'Cores used over a one-second sample, refreshed every 5 seconds. The ' +
+  "Monitoring card's CPU tile averages since the previous health check " +
+  '(about 30 seconds), so short bursts show here first.'
 
 function MemoryMeter({
   sample,
@@ -351,6 +359,7 @@ function Meter({
   barPercent,
   tone = 'normal',
   hint,
+  title,
 }: {
   icon: React.ReactNode
   label: string
@@ -358,6 +367,7 @@ function Meter({
   barPercent: number
   tone?: 'normal' | 'warn' | 'danger'
   hint?: string
+  title?: string
 }) {
   const barClass =
     tone === 'danger'
@@ -368,7 +378,10 @@ function Meter({
   return (
     <div className="min-w-0">
       <div className="flex items-baseline justify-between gap-2">
-        <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+        <div
+          className="flex items-center gap-1 text-xs font-medium text-muted-foreground"
+          title={title}
+        >
           <span className="text-muted-foreground">{icon}</span>
           {label}
           {hint && (

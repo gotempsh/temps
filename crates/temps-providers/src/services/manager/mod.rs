@@ -22,3 +22,9 @@ mod project_links;
 mod readiness;
 mod remote;
 mod runtime_limits;
+mod stats_poll;
+
+pub use stats_poll::{
+    cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
+    CPU_LIMIT_REFRESH,
+};

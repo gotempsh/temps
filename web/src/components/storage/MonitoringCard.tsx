@@ -23,6 +23,15 @@ import {
   pgCacheHitRatioLabel,
   pgCacheHitRatioScopedLabel,
 } from '@/lib/pg-cache-hit'
+import {
+  CONTAINER_CPU_METRIC,
+  CONTAINER_CPU_METRIC_LABELS,
+  CONTAINER_CPU_TILE_HINT,
+  CONTAINER_CPU_TILE_LABEL,
+  CONTAINER_CPU_UTILIZATION_METRIC,
+  containerCpuTileText,
+  formatContainerCpuMetric,
+} from '@/lib/container-cpu'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -214,12 +223,15 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
 // the service, sampled every ~30s by the health monitor. Engine-agnostic:
 // shown for every engine ahead of the engine-specific stats.
 const CONTAINER_STAT_METRICS = [
-  'container.cpu_percent',
+  CONTAINER_CPU_METRIC,
   'container.memory_used_bytes',
 ]
 
+// Alertable container metrics. CPU alerts threshold the share of the
+// container's limit: 80 on `container.cpu_percent` would mean 0.8 of one
+// core whatever the limit.
 const CONTAINER_METRICS = [
-  'container.cpu_percent',
+  CONTAINER_CPU_UTILIZATION_METRIC,
   'container.memory_used_bytes',
   'container.memory_percent',
 ]
@@ -231,7 +243,7 @@ const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
   mariadb: 'mariadb.connections',
   s3: 's3.bucket_count',
   rustfs: 'rustfs_cluster_capacity_used_bytes',
-  unsupported: 'container.cpu_percent',
+  unsupported: CONTAINER_CPU_METRIC,
 }
 
 const KNOWN_METRICS: Record<EngineKind, string[]> = {
@@ -365,6 +377,8 @@ function formatRelativeTime(iso: string): string {
 
 function formatMetricValue(name: string, value: number): string {
   if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
+  const cpu = formatContainerCpuMetric(name, value)
+  if (cpu !== null) return cpu
   if (MARIADB_FLAG_METRICS.has(name)) {
     const flag = formatFlagValue(value)
     if (flag !== null) return flag
@@ -390,8 +404,7 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
-  // Docker CLI convention: 100% == one core fully used.
-  'container.cpu_percent': 'CPU',
+  ...CONTAINER_CPU_METRIC_LABELS,
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
   [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
@@ -403,14 +416,27 @@ const METRIC_LABELS: Record<string, string> = {
 function statTileLabel(name: string): string {
   if (name === PG_CACHE_HIT_RATIO_METRIC)
     return pgCacheHitRatioScopedLabel('all')
+  if (name === CONTAINER_CPU_METRIC) return CONTAINER_CPU_TILE_LABEL
   return labelForMetric(name)
 }
 
-// The tooltip of a stat tile: what a per-database metric's value means.
+// The tooltip of a stat tile: what the value means and how fresh it is.
 function statTileHint(name: string): string | undefined {
   if (name === PG_CACHE_HIT_RATIO_METRIC)
     return pgCacheHitRatioDescription('all')
+  if (name === CONTAINER_CPU_METRIC) return CONTAINER_CPU_TILE_HINT
   return undefined
+}
+
+// A stat tile's text. CPU reads in cores against the container's limit, the
+// same way the resources card shows it.
+function statTileText(
+  name: string,
+  lookup: (metric: string) => number | undefined
+): string {
+  if (name === CONTAINER_CPU_METRIC) return containerCpuTileText(lookup)
+  const latest = metricTileValue(name, lookup)
+  return latest != null ? formatMetricValue(name, latest) : '—'
 }
 
 function labelForMetric(name: string): string {
@@ -950,10 +976,7 @@ function LiveMetrics({
       <div className="@container">
         <div className="grid grid-cols-2 gap-2 @lg:grid-cols-3 @3xl:grid-cols-6">
           {statMetrics.map((name) => {
-            const latest = metricTileValue(
-              name,
-              (m) => latestByName.get(m)?.value
-            )
+            const text = statTileText(name, (m) => latestByName.get(m)?.value)
             const isSelected = name === selectedMetric
             return (
               <button
@@ -973,7 +996,7 @@ function LiveMetrics({
                   {statTileLabel(name)}
                 </span>
                 <span className="text-base font-semibold tabular-nums text-foreground">
-                  {latest != null ? formatMetricValue(name, latest) : '—'}
+                  {text}
                 </span>
               </button>
             )
@@ -1033,12 +1056,14 @@ function LiveMetrics({
                   tickLine={false}
                   axisLine={false}
                   width={
-                    selectedMetric.endsWith('_ratio') ||
-                    selectedMetric.endsWith('_percent')
-                      ? 56
-                      : selectedMetric.endsWith('_bytes')
-                        ? 60
-                        : 44
+                    selectedMetric === CONTAINER_CPU_METRIC
+                      ? 64
+                      : selectedMetric.endsWith('_ratio') ||
+                          selectedMetric.endsWith('_percent')
+                        ? 56
+                        : selectedMetric.endsWith('_bytes')
+                          ? 60
+                          : 44
                   }
                   {...yAxisTickProps(
                     chartData.map((p) => p.value),

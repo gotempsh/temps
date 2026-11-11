@@ -53,6 +53,8 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
+import { CONTAINER_CPU_METRIC } from '@/lib/container-cpu'
+import { formatCpuUsage } from '@/lib/cpu-format'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
@@ -192,9 +194,9 @@ function ServiceRow({
         <>
           <ResourceSparkline
             serviceId={service.id}
-            metric="container.cpu_percent"
+            metric={CONTAINER_CPU_METRIC}
             label="CPU"
-            format={(v) => `${v.toFixed(1)}%`}
+            format={(v) => formatCpuUsage(v, null)}
           />
           <ResourceSparkline
             serviceId={service.id}

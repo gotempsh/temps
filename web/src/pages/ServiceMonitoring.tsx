@@ -84,6 +84,15 @@ import {
 } from '@/lib/service-alert-comparator'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 import {
+  CONTAINER_CPU_METRIC,
+  CONTAINER_CPU_METRIC_LABELS,
+  CONTAINER_CPU_TILE_HINT,
+  CONTAINER_CPU_TILE_LABEL,
+  CONTAINER_CPU_UTILIZATION_METRIC,
+  containerCpuTileText,
+  formatContainerCpuMetric,
+} from '@/lib/container-cpu'
+import {
   PG_CACHE_HIT_RATIO_METRIC,
   formatPgCacheHitRatio,
   metricTileValue,
@@ -371,7 +380,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
 const RESOURCES_GROUP: MetricGroup = {
   title: 'Resources',
   metrics: [
-    'container.cpu_percent',
+    CONTAINER_CPU_METRIC,
+    CONTAINER_CPU_UTILIZATION_METRIC,
     'container.memory_used_bytes',
     'container.memory_percent',
   ],
@@ -471,7 +481,8 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'rustfs_s3_operations_total',
   ],
   unsupported: [
-    'container.cpu_percent',
+    CONTAINER_CPU_METRIC,
+    CONTAINER_CPU_UTILIZATION_METRIC,
     'container.memory_used_bytes',
     'container.memory_percent',
   ],
@@ -498,6 +509,8 @@ function formatRelativeTime(iso: string): string {
 
 function formatMetricValue(name: string, value: number): string {
   if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
+  const cpu = formatContainerCpuMetric(name, value)
+  if (cpu !== null) return cpu
   if (MARIADB_FLAG_METRICS.has(name)) {
     const flag = formatFlagValue(value)
     if (flag !== null) return flag
@@ -523,9 +536,9 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
-  // Container resources (all engines) — sampled from docker stats. CPU uses
-  // the docker CLI convention: 100% == one core fully used.
-  'container.cpu_percent': 'CPU',
+  // Container resources (all engines) — sampled from docker stats. CPU reads
+  // in cores (stored as Docker's 100% == one core) and as % of the limit.
+  ...CONTAINER_CPU_METRIC_LABELS,
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
   // Postgres connections — "Total" is the headline (client backends only;
@@ -637,6 +650,9 @@ type MetricTileProps = {
   /** Databases the value covers, named in the label of a per-database
    *  metric such as the cache hit ratio. */
   scope?: PgCacheHitScope
+  /** Text to show instead of the formatted `value`, for a tile that reads
+   *  more than one metric (CPU used against the CPU limit). */
+  display?: string
 }
 
 /** The label and tooltip of a tile, naming its scope where it matters. */
@@ -650,7 +666,19 @@ function metricTileText(
       hint: pgCacheHitRatioDescription(scope),
     }
   }
+  if (name === CONTAINER_CPU_METRIC) {
+    return { label: CONTAINER_CPU_TILE_LABEL, hint: CONTAINER_CPU_TILE_HINT }
+  }
   return { label: labelForMetric(name) }
+}
+
+/** A tile's text when it reads more than its own metric. */
+function metricTileDisplay(
+  name: string,
+  lookup: (metric: string) => number | undefined
+): string | undefined {
+  if (name === CONTAINER_CPU_METRIC) return containerCpuTileText(lookup)
+  return undefined
 }
 
 /** One metric's latest value, clickable to chart it. */
@@ -662,6 +690,7 @@ export function MetricTile({
   alert,
   size = 'group',
   scope,
+  display,
 }: MetricTileProps) {
   const isHero = size === 'hero'
   const { label, hint } = metricTileText(name, scope)
@@ -699,7 +728,7 @@ export function MetricTile({
           isHero ? 'text-2xl' : 'text-lg',
         ].join(' ')}
       >
-        {value != null ? formatMetricValue(name, value) : '—'}
+        {display ?? (value != null ? formatMetricValue(name, value) : '—')}
       </dd>
     </>
   )
@@ -1433,6 +1462,7 @@ function MonitoringDashboard({
               key={name}
               name={name}
               value={metricTileValue(name, (m) => latestByName.get(m))}
+              display={metricTileDisplay(name, (m) => latestByName.get(m))}
               selected={selectedMetric === name}
               onClick={() => setSelectedMetric(name)}
               alert={firingBySeverity.get(name)}
@@ -1491,6 +1521,7 @@ function MonitoringDashboard({
                 key={name}
                 name={name}
                 value={metricTileValue(name, (m) => latestByName.get(m))}
+                display={metricTileDisplay(name, (m) => latestByName.get(m))}
                 selected={selectedMetric === name}
                 onClick={() => setSelectedMetric(name)}
                 alert={firingBySeverity.get(name)}

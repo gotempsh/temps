@@ -17,7 +17,9 @@ use crate::continuous_archive;
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
 use crate::externalsvc::{HealthProbeStatus, S3Credentials};
-use crate::services::ExternalServiceManager;
+use crate::services::{
+    ContainerStatsBaseline, CpuLimit, ExternalServiceManager, PolledContainerStats,
+};
 use chrono::Utc;
 use futures::{stream, StreamExt};
 use sea_orm::{
@@ -118,15 +120,15 @@ pub struct ExternalServiceHealthMonitor {
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
     /// Optional metrics store. When set, container CPU/memory samples for
     /// running services with `metrics_enabled` are written to it on every
-    /// health tick (`container.cpu_percent`, `container.memory_used_bytes`,
-    /// `container.memory_percent` with `source_kind = database`).
+    /// health tick (see `container_metric_points`, `source_kind = database`).
     metrics_store: Option<Arc<dyn MetricsStore>>,
-    /// Previous raw docker-stats sample per service (`service_id` →
-    /// `container_name` → sample). The 30s poll interval is the CPU delta
-    /// window; the first tick per container seeds the baseline and emits
-    /// memory only.
-    stats_baselines:
-        Arc<Mutex<HashMap<i32, HashMap<String, bollard::models::ContainerStatsResponse>>>>,
+    /// Previous docker-stats tick per service (`service_id` →
+    /// `container_name` → CPU counters and cached CPU limit). The poll
+    /// interval is the CPU rate window; the first tick per container seeds
+    /// the baseline and emits memory only. Holds entries only for services
+    /// that are sampled (`samples_container_metrics`), and per service only
+    /// for its current containers.
+    stats_baselines: Arc<Mutex<HashMap<i32, HashMap<String, ContainerStatsBaseline>>>>,
 }
 
 impl ExternalServiceHealthMonitor {
@@ -201,7 +203,16 @@ impl ExternalServiceHealthMonitor {
 
         debug!("Health-checking {} external service(s)", services.len());
 
-        let service_ids: Vec<i32> = services.iter().map(|s| s.id).collect();
+        // Services whose container stats are sampled this cycle. Baselines of
+        // every other service (deleted, stopped, metrics off, moved to a
+        // remote node) are dropped below, so the map stays bounded by the
+        // sampled containers and a stopped service restarts from a fresh
+        // baseline instead of one from before it stopped.
+        let sampled_ids: std::collections::HashSet<i32> = services
+            .iter()
+            .filter(|s| samples_container_metrics(s))
+            .map(|s| s.id)
+            .collect();
 
         const MAX_CONCURRENT_HEALTH_CHECKS: usize = 8;
         stream::iter(services)
@@ -215,11 +226,9 @@ impl ExternalServiceHealthMonitor {
             })
             .await;
 
-        // Drop stats baselines for services that no longer exist so the map
-        // doesn't grow forever as services are created and deleted.
         {
             let mut baselines = self.stats_baselines.lock().await;
-            baselines.retain(|id, _| service_ids.contains(id));
+            baselines.retain(|id, _| sampled_ids.contains(id));
         }
 
         Ok(())
@@ -394,7 +403,7 @@ impl ExternalServiceHealthMonitor {
         //    store. Gated on the same per-service `metrics_enabled` flag the
         //    engine-metrics scraper uses. Failures are logged and swallowed —
         //    metrics must never disrupt health monitoring.
-        if service.status == "running" && service.node_id.is_none() && service.metrics_enabled {
+        if samples_container_metrics(service) {
             if let Some(store) = self.metrics_store.clone() {
                 self.record_container_metrics(&store, service).await;
             }
@@ -438,77 +447,46 @@ impl ExternalServiceHealthMonitor {
     }
 
     /// Sample container stats for one service and write the resulting
-    /// CPU/memory points to the metrics store.
+    /// CPU/memory points (`container_metric_points`) to the metrics store.
     ///
-    /// Written points (all `Gauge`, `source_kind = database`,
-    /// `source_id = external_services.id`):
-    /// - `container.cpu_percent` — docker-CLI formula, 100% == one core.
-    ///   Absent on the first tick per container (no delta baseline yet).
-    /// - `container.memory_used_bytes` — RSS excluding page cache.
-    /// - `container.memory_percent` — usage relative to the container's
-    ///   memory limit (host RAM when no limit is set — same semantics as
-    ///   the live stats endpoint).
-    ///
-    /// Cluster members are distinguished by the `role` / `container_name`
-    /// labels. Containers whose sample failed (stopped, remote node) emit
-    /// no points rather than zeros.
+    /// Containers whose sample failed (stopped, remote node) emit no points
+    /// rather than zeros.
     async fn record_container_metrics(
         &self,
         store: &Arc<dyn MetricsStore>,
         service: &external_services::Model,
     ) {
-        let report = {
-            let mut baselines = self.stats_baselines.lock().await;
-            let service_baselines = baselines.entry(service.id).or_default();
-            match self
-                .manager
-                .sample_service_stats(service, service_baselines)
-                .await
-            {
-                Ok(report) => report,
-                Err(e) => {
-                    debug!(
-                        service_id = service.id,
-                        service = %service.name,
-                        "Container stats sampling failed: {}", e
-                    );
-                    return;
-                }
+        // Take this service's baselines out of the shared map so the lock is
+        // not held across the Docker calls; checks of other services run
+        // concurrently and sample their own containers meanwhile.
+        let mut service_baselines = self
+            .stats_baselines
+            .lock()
+            .await
+            .remove(&service.id)
+            .unwrap_or_default();
+        let sampled = self
+            .manager
+            .sample_service_stats(service, &mut service_baselines)
+            .await;
+        self.stats_baselines
+            .lock()
+            .await
+            .insert(service.id, service_baselines);
+
+        let members = match sampled {
+            Ok(members) => members,
+            Err(e) => {
+                debug!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "Container stats sampling failed: {}", e
+                );
+                return;
             }
         };
 
-        let now = Utc::now();
-        let mut points = Vec::with_capacity(report.members.len() * 3);
-
-        for member in &report.members {
-            let mut labels = HashMap::new();
-            labels.insert("role".to_string(), member.role.clone());
-            labels.insert("container_name".to_string(), member.container_name.clone());
-
-            let make_point = |name: &str, value: f64| MetricPoint {
-                time: now,
-                source_kind: SourceKind::Database,
-                source_id: service.id,
-                name: name.to_string(),
-                value,
-                kind: MetricKind::Gauge,
-                engine: Some(service.service_type.clone()),
-                environment: None,
-                node_id: service.node_id,
-                labels: labels.clone(),
-            };
-
-            if let Some(cpu) = member.cpu_percent {
-                points.push(make_point("container.cpu_percent", cpu));
-            }
-            if let Some(mem) = member.memory_usage_bytes {
-                points.push(make_point("container.memory_used_bytes", mem as f64));
-            }
-            if let Some(mem_pct) = member.memory_percent {
-                points.push(make_point("container.memory_percent", mem_pct));
-            }
-        }
-
+        let points = container_metric_points(service, &members, Utc::now());
         if points.is_empty() {
             return;
         }
@@ -1125,6 +1103,76 @@ enum LifecycleProbe {
     Down,
 }
 
+/// Whether the health loop samples this service's container stats: a
+/// running service on the local Docker host with metrics enabled (the same
+/// per-service flag the engine-metrics scraper uses).
+fn samples_container_metrics(service: &external_services::Model) -> bool {
+    service.status == "running" && service.node_id.is_none() && service.metrics_enabled
+}
+
+/// The metric points for one tick of a service's containers. All `Gauge`,
+/// `source_kind = database`, `source_id = external_services.id`, one series
+/// per container (`role` / `container_name` labels):
+/// - `container.cpu_percent`: cores used × 100 (Docker's convention, 100 ==
+///   one core), averaged since the previous tick. Absent on the first tick
+///   per container (no rate baseline yet).
+/// - `container.cpu_utilization_percent`: the same usage as a percentage of
+///   the cores the container may use, its CPU limit or else every host core
+///   (100 == saturated). What CPU alert rules threshold. Absent while the
+///   limit is unknown.
+/// - `container.cpu_limit_cores`: the applied CPU limit, when capped, so a
+///   tile can read "used / limit cores".
+/// - `container.memory_used_bytes`: RSS excluding page cache.
+/// - `container.memory_percent`: usage relative to the container's memory
+///   limit (host RAM when no limit is set, as on the live stats endpoint).
+///
+/// The names and meanings match what deployment containers record.
+fn container_metric_points(
+    service: &external_services::Model,
+    members: &[PolledContainerStats],
+    now: chrono::DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    let mut points = Vec::with_capacity(members.len() * 5);
+
+    for member in members {
+        let sample = &member.sample;
+        let mut labels = HashMap::new();
+        labels.insert("role".to_string(), sample.role.clone());
+        labels.insert("container_name".to_string(), sample.container_name.clone());
+
+        let make_point = |name: &str, value: f64| MetricPoint {
+            time: now,
+            source_kind: SourceKind::Database,
+            source_id: service.id,
+            name: name.to_string(),
+            value,
+            kind: MetricKind::Gauge,
+            engine: Some(service.service_type.clone()),
+            environment: None,
+            node_id: service.node_id,
+            labels: labels.clone(),
+        };
+
+        if let Some(cpu) = sample.cpu_percent {
+            points.push(make_point("container.cpu_percent", cpu));
+        }
+        if let Some(utilization) = member.cpu_utilization_percent() {
+            points.push(make_point("container.cpu_utilization_percent", utilization));
+        }
+        if let Some(cores) = member.cpu_limit.and_then(CpuLimit::cores) {
+            points.push(make_point("container.cpu_limit_cores", cores));
+        }
+        if let Some(mem) = sample.memory_usage_bytes {
+            points.push(make_point("container.memory_used_bytes", mem as f64));
+        }
+        if let Some(mem_pct) = sample.memory_percent {
+            points.push(make_point("container.memory_percent", mem_pct));
+        }
+    }
+
+    points
+}
+
 fn lifecycle_probe(status: &str) -> LifecycleProbe {
     match status {
         "running" => LifecycleProbe::Probe,
@@ -1146,6 +1194,152 @@ mod tests {
         assert_eq!(HealthProbeStatus::Operational.as_str(), "operational");
         assert_eq!(HealthProbeStatus::Degraded.as_str(), "degraded");
         assert_eq!(HealthProbeStatus::Down.as_str(), "down");
+    }
+
+    fn running_service() -> external_services::Model {
+        let now = Utc::now();
+        external_services::Model {
+            id: 7,
+            name: "metrics-svc".to_string(),
+            service_type: "postgres".to_string(),
+            topology: "standalone".to_string(),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            node_id: None,
+            version: None,
+            slug: None,
+            config: None,
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: true,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        }
+    }
+
+    fn polled(cpu_percent: Option<f64>, cpu_limit: Option<CpuLimit>) -> PolledContainerStats {
+        PolledContainerStats {
+            sample: crate::services::ContainerStatsSample {
+                role: "primary".to_string(),
+                container_name: "service-postgres".to_string(),
+                cpu_percent,
+                memory_usage_bytes: Some(8_870_000_000),
+                memory_limit_bytes: Some(34_359_738_368),
+                memory_percent: Some(25.8),
+                online_cpus: Some(16),
+            },
+            cpu_limit,
+        }
+    }
+
+    fn point_value(points: &[MetricPoint], name: &str) -> Option<f64> {
+        points.iter().find(|p| p.name == name).map(|p| p.value)
+    }
+
+    /// A capped container records cores used (Docker's 100 == one core), the
+    /// share of its limit and the limit itself, from one tick, so the tile
+    /// can read "0.68 / 6 cores" and alerts threshold the share of the limit.
+    #[test]
+    fn capped_container_records_cores_utilization_and_limit() {
+        let points = container_metric_points(
+            &running_service(),
+            &[polled(Some(68.1), Some(CpuLimit::Cores(6.0)))],
+            Utc::now(),
+        );
+
+        assert_eq!(point_value(&points, "container.cpu_percent"), Some(68.1));
+        let utilization = point_value(&points, "container.cpu_utilization_percent")
+            .expect("utilization is recorded");
+        assert!((utilization - 11.35).abs() < 1e-9, "{utilization}");
+        assert_eq!(point_value(&points, "container.cpu_limit_cores"), Some(6.0));
+        assert_eq!(
+            point_value(&points, "container.memory_used_bytes"),
+            Some(8_870_000_000.0)
+        );
+        for point in &points {
+            assert!(matches!(point.source_kind, SourceKind::Database));
+            assert_eq!(point.source_id, 7);
+            // No new label keys: one series per container, as before.
+            let mut keys: Vec<&str> = point.labels.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["container_name", "role"]);
+        }
+    }
+
+    /// Uncapped, utilization is against the host's cores and no limit is
+    /// recorded.
+    #[test]
+    fn uncapped_container_records_no_limit() {
+        let points = container_metric_points(
+            &running_service(),
+            &[polled(Some(80.0), Some(CpuLimit::Unlimited))],
+            Utc::now(),
+        );
+
+        assert_eq!(
+            point_value(&points, "container.cpu_utilization_percent"),
+            Some(5.0)
+        );
+        assert_eq!(point_value(&points, "container.cpu_limit_cores"), None);
+    }
+
+    /// The first tick (no rate yet) and an unknown limit record no CPU
+    /// utilization, never a zero or a host-relative guess; memory still is.
+    #[test]
+    fn first_tick_and_unknown_limit_record_no_cpu_utilization() {
+        let first = container_metric_points(
+            &running_service(),
+            &[polled(None, Some(CpuLimit::Cores(6.0)))],
+            Utc::now(),
+        );
+        assert_eq!(point_value(&first, "container.cpu_percent"), None);
+        assert_eq!(
+            point_value(&first, "container.cpu_utilization_percent"),
+            None
+        );
+        assert!(point_value(&first, "container.memory_used_bytes").is_some());
+
+        let unknown =
+            container_metric_points(&running_service(), &[polled(Some(68.1), None)], Utc::now());
+        assert_eq!(point_value(&unknown, "container.cpu_percent"), Some(68.1));
+        assert_eq!(
+            point_value(&unknown, "container.cpu_utilization_percent"),
+            None
+        );
+        assert_eq!(point_value(&unknown, "container.cpu_limit_cores"), None);
+    }
+
+    /// Only running local services with metrics on are sampled; every other
+    /// service's baselines are pruned each cycle.
+    #[test]
+    fn only_running_local_services_with_metrics_are_sampled() {
+        assert!(samples_container_metrics(&running_service()));
+        let stopped = external_services::Model {
+            status: "stopped".to_string(),
+            ..running_service()
+        };
+        let remote = external_services::Model {
+            node_id: Some(3),
+            ..running_service()
+        };
+        let metrics_off = external_services::Model {
+            metrics_enabled: false,
+            ..running_service()
+        };
+        for service in [stopped, remote, metrics_off] {
+            assert!(!samples_container_metrics(&service));
+        }
     }
 
     #[test]
