@@ -35,17 +35,23 @@ runs 18).
 
 - With Docker, nothing changes: the sidecar container, matched to the
   server's major version, takes the dump.
-- Without Docker, the engine runs the server's own `pg_dump` and
-  `pg_dumpall` with the sidecar's arguments, and streams both outputs into
-  the same `backup.sql.gz` (globals first, then the database) through a
-  bounded channel and a blocking gzip writer. Memory stays at a few hundred
-  KiB whatever the database size; the password travels in `PGPASSWORD`,
-  never on the command line; cancellation kills the tool.
+- Without Docker, the engine runs `pg_dumpall --globals-only` and
+  `pg_dump` as host processes with the sidecar's arguments
+  (`engines::control_plane_host`, shared with the Docker-unreachable
+  fallback that landed in #1863), and writes the same `backup.sql.gz`
+  (globals first, then the database). The dump goes to a private (0600)
+  attempt-scoped file and is then compressed in fixed-size chunks, so
+  memory stays constant whatever the database size; the password travels
+  in `PGPASSWORD`, never on the command line; cancellation kills the tools
+  and stops the compression; an empty dump is refused rather than uploaded.
+- "Without Docker" means either a server started with no Docker at all (it
+  goes straight to the host tools) or one whose daemon does not answer.
+  A daemon that answers always takes the sidecar path.
 - Before anything else, including the S3 checks, the engine checks that
-  both tools run and report the same major version, at least the
-  database's. Otherwise the backup fails permanently with what it found and
-  what to install ("Install the PostgreSQL 18 client tools ... or run the
-  control plane on a host with Docker").
+  `pg_dump` and `pg_dumpall` are on `PATH`, run, and are each at least the
+  database's major version. Otherwise the backup fails with the tool it
+  found missing or too old and what to install ("Install the PostgreSQL 18
+  client tools ... or make the Docker daemon reachable").
 - The startup log on a server without Docker probes the tools once and says
   what control-plane backups will do: run with the PostgreSQL N client, or
   fail and why.

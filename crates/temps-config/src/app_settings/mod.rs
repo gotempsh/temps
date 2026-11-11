@@ -1879,6 +1879,17 @@ pub enum MetricsStoreKind {
     ClickHouse,
 }
 
+/// Longest accepted `monitoring.scrape_interval_secs`.
+///
+/// Windowed metrics are computed from the deltas between scrapes: the
+/// Postgres cache hit ratio covers the last 15 minutes
+/// (`temps_metrics::cache_hit_window::CACHE_HIT_WINDOW`) and only counts
+/// scrape intervals that lie entirely inside that window. Five minutes keeps
+/// at least two whole intervals in it. A longer interval would leave the
+/// window empty on every scrape, so the ratio and its alarm would silently
+/// stop.
+pub const MAX_SCRAPE_INTERVAL_SECS: u64 = 300;
+
 /// Global metrics observability configuration.
 ///
 /// Controls whether the MetricsScraper and AlertEvaluator background tasks
@@ -1896,8 +1907,12 @@ pub struct MonitoringSettings {
     pub store: MetricsStoreKind,
 
     /// How often the MetricsScraper collects data from all sources, in seconds.
-    /// Minimum effective value is 10 s; values below that are clamped at runtime.
-    #[schema(minimum = 10, example = 30)]
+    /// Saving accepts 15 to 300 s: windowed metrics such as the Postgres
+    /// cache hit ratio need several scrapes in their 15 minutes. A value
+    /// above 300 s stored before that limit is kept
+    /// when a save leaves it unchanged, and the MetricsScraper clamps it to
+    /// 300 s at runtime, as it clamps anything below 10 s to 10 s.
+    #[schema(minimum = 15, example = 30)]
     pub scrape_interval_secs: u64,
 
     /// How many days of raw (30 s resolution) metric data to keep.

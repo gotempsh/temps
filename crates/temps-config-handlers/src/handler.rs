@@ -3173,6 +3173,34 @@ fn validate_sandbox_backend(backend: Option<&str>) -> Result<(), Problem> {
         .build())
 }
 
+/// Rejects a scrape interval above `temps_config::MAX_SCRAPE_INTERVAL_SECS`
+/// when the save changes it.
+///
+/// A value stored before the maximum existed is left alone: PUT merges stored
+/// fields into the document, so rejecting it would make every unrelated save
+/// fail over a field the client never touched. The scraper clamps such a value
+/// at runtime and warns.
+fn validate_scrape_interval_maximum(
+    monitoring: &MonitoringSettings,
+    stored: &MonitoringSettings,
+) -> Result<(), Problem> {
+    let requested = monitoring.scrape_interval_secs;
+    if requested <= temps_config::MAX_SCRAPE_INTERVAL_SECS
+        || requested == stored.scrape_interval_secs
+    {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+        .detail(format!(
+            "monitoring.scrape_interval_secs is {}, above the maximum of {} \
+             seconds: windowed metrics such as the Postgres cache hit ratio \
+             (last 15 minutes) need at least two scrapes inside their window",
+            requested,
+            temps_config::MAX_SCRAPE_INTERVAL_SECS
+        ))
+        .build())
+}
+
 fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), Problem> {
     if monitoring.scrape_interval_secs < 15 {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -3801,6 +3829,7 @@ async fn update_settings(
     validate_sandbox_limits(&settings.agent_sandbox)?;
 
     validate_monitoring_settings(&settings.monitoring)?;
+    validate_scrape_interval_maximum(&settings.monitoring, &stored_settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
     validate_ai_workspace_file_limits(&settings.ai_workspace_file_limits)?;
     validate_request_timeouts(&settings.request_timeouts)?;
@@ -6513,6 +6542,81 @@ mod tests {
             error.body.get("detail").and_then(|value| value.as_str()),
             Some("monitoring.clickhouse_url is not a valid URL")
         );
+    }
+
+    #[test]
+    fn monitoring_validation_bounds_the_scrape_interval() {
+        let stored = MonitoringSettings::default();
+        for secs in [15, temps_config::MAX_SCRAPE_INTERVAL_SECS] {
+            let monitoring = MonitoringSettings {
+                scrape_interval_secs: secs,
+                ..Default::default()
+            };
+            assert!(validate_monitoring_settings(&monitoring).is_ok(), "{secs}");
+            assert!(
+                validate_scrape_interval_maximum(&monitoring, &stored).is_ok(),
+                "{secs}"
+            );
+        }
+
+        // 15 minutes would leave the cache hit ratio's window empty forever.
+        let monitoring = MonitoringSettings {
+            scrape_interval_secs: 900,
+            ..Default::default()
+        };
+        let error = validate_scrape_interval_maximum(&monitoring, &stored)
+            .expect_err("a scrape interval above the maximum must be rejected");
+        let detail = error
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("is 900"), "{detail}");
+        assert!(detail.contains("maximum of 300 seconds"), "{detail}");
+        assert!(detail.contains("cache hit ratio"), "{detail}");
+    }
+
+    #[test]
+    fn the_documented_scrape_interval_minimum_is_the_one_saves_accept() {
+        // Generated clients validate against the schema: advertising a lower
+        // minimum than the save accepts turns those values into a 400.
+        let schema = serde_json::to_value(<MonitoringSettings as utoipa::PartialSchema>::schema())
+            .expect("the schema serializes");
+        let minimum = schema["properties"]["scrape_interval_secs"]["minimum"]
+            .as_u64()
+            .expect("scrape_interval_secs documents a minimum");
+        let at = |secs| MonitoringSettings {
+            scrape_interval_secs: secs,
+            ..Default::default()
+        };
+        assert!(validate_monitoring_settings(&at(minimum)).is_ok());
+        assert!(validate_monitoring_settings(&at(minimum - 1)).is_err());
+    }
+
+    #[test]
+    fn a_stored_scrape_interval_above_the_maximum_does_not_block_other_saves() {
+        // Stored before the maximum existed; the save merges it back unchanged.
+        let stored = MonitoringSettings {
+            scrape_interval_secs: 600,
+            ..Default::default()
+        };
+        let unchanged = stored.clone();
+        assert!(validate_monitoring_settings(&unchanged).is_ok());
+        assert!(validate_scrape_interval_maximum(&unchanged, &stored).is_ok());
+
+        // Changing it to another out-of-range value is still refused.
+        let longer = MonitoringSettings {
+            scrape_interval_secs: 900,
+            ..Default::default()
+        };
+        assert!(validate_scrape_interval_maximum(&longer, &stored).is_err());
+
+        // Bringing it back in range is accepted.
+        let fixed = MonitoringSettings {
+            scrape_interval_secs: 60,
+            ..Default::default()
+        };
+        assert!(validate_scrape_interval_maximum(&fixed, &stored).is_ok());
     }
 
     #[test]

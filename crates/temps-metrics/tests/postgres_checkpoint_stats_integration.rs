@@ -124,6 +124,26 @@ async fn collect_on_pg17_returns_checkpoint_metrics_without_error() {
             found.unwrap().value
         );
     }
+    assert_reports_stats_reset_per_database(&points);
+}
+
+/// The cache hit window drops the interval spanning a `pg_stat_reset()`, so
+/// every database's block counters come with its `stats_reset` time.
+fn assert_reports_stats_reset_per_database(points: &[temps_metrics::store::MetricPoint]) {
+    use temps_metrics::cache_hit_window::{PG_BLKS_HIT, PG_DATABASE_LABEL, PG_STATS_RESET};
+    let databases: Vec<&String> = points
+        .iter()
+        .filter(|p| p.name == PG_BLKS_HIT)
+        .filter_map(|p| p.labels.get(PG_DATABASE_LABEL))
+        .collect();
+    assert!(!databases.is_empty(), "no per-database block counters");
+    for db in databases {
+        let reset = points
+            .iter()
+            .find(|p| p.name == PG_STATS_RESET && p.labels.get(PG_DATABASE_LABEL) == Some(db))
+            .unwrap_or_else(|| panic!("no {PG_STATS_RESET} for database {db}"));
+        assert!(reset.value >= 0.0, "{db}: {}", reset.value);
+    }
 }
 
 /// Pre-PG17 fallback path: `pg_stat_checkpointer` doesn't exist, so the
@@ -152,4 +172,5 @@ async fn collect_on_pg16_falls_back_to_bgwriter_checkpoint_columns() {
             points.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
     }
+    assert_reports_stats_reset_per_database(&points);
 }

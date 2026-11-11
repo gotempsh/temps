@@ -14,11 +14,13 @@
 //!    under `<data_dir>/backups/tmp` (see `dump_capture`); the sidecar is
 //!    removed on every path.
 //!
-//!    On a server without Docker (a microVM control plane) the same two
-//!    commands run from this server's PostgreSQL client instead, streamed
-//!    into the same `.sql.gz` (see `local_pg_dump`, ADR-100). A missing or
-//!    too-old client fails the backup before anything else, naming the
-//!    version to install.
+//!    When the Docker daemon does not answer (a hosted plane without one),
+//!    the same two commands run as host processes instead, using the
+//!    `pg_dumpall`/`pg_dump` on `PATH` if their major is at least the
+//!    server's (see [`super::control_plane_host`]). A reachable daemon always
+//!    takes the sidecar path, so installs with Docker are unaffected. A
+//!    server started without Docker at all (a microVM control plane,
+//!    ADR-100) goes straight to the host tools.
 //! 3. Upload the resulting `.sql.gz` to S3 (single-part or multipart).
 //! 4. Write a `metadata.json` companion object.
 //!
@@ -47,9 +49,13 @@ use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
 use tracing::{info, warn};
 
+use super::control_plane_host::{
+    run_host_dump, select_dump_runner, DumpRunner, DumpToolProbe, HostDumpRequest,
+    LocalDumpToolProbe, PG_DUMP, PG_DUMPALL,
+};
 use super::dump_capture::{capture_dump, CaptureRequest, DumpAttempt, DumpCaptureError};
-use super::local_pg_dump::{self, LocalDumpArgs, LocalPgClient};
 use super::oneshot::OneShotSpec;
+use super::pg_client_tools::{self, HostToolProbe};
 use super::v2_common;
 use crate::execution::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
@@ -114,12 +120,19 @@ pub struct ControlPlaneDeps {
     pub docker: Option<bollard::Docker>,
 }
 
-/// How this attempt takes the dump.
-enum DumpRoute {
-    /// The `postgres:<major>` sidecar, through this server's Docker.
-    Sidecar(bollard::Docker),
-    /// This server's own `pg_dump` and `pg_dumpall` (no Docker here).
-    Local(LocalPgClient),
+/// The probe for a server started without Docker (ADR-100): no daemon to
+/// try, so the dump goes straight to this host's PostgreSQL client tools.
+struct NoDockerProbe;
+
+#[async_trait]
+impl DumpToolProbe for NoDockerProbe {
+    async fn docker(&self) -> Result<(), String> {
+        Err("this server runs without Docker".to_string())
+    }
+
+    async fn host_tool(&self, program: &'static str) -> HostToolProbe {
+        pg_client_tools::probe_host_tool(program).await
+    }
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -153,16 +166,12 @@ impl BackupEngine for ControlPlaneEngine {
         // version-compatible, and settle how the dump runs before any other
         // work: without Docker and without a usable client nothing below can
         // succeed, so say so now.
-        let pg_tag = detect_postgres_version(&deps).await;
-        let major = pg_tag.trim_start_matches("pg");
-        let server_major: u32 = major.parse().unwrap_or(DEFAULT_PG_MAJOR);
-        let route = match &deps.docker {
-            Some(docker) => DumpRoute::Sidecar(docker.clone()),
-            None => DumpRoute::Local(local_pg_dump::require_client(
-                local_pg_dump::probe().await,
-                server_major,
-                backup_id,
-            )?),
+        let server_major = detect_postgres_major(&deps).await;
+        // Docker whenever its daemon answers; host client tools only when it
+        // does not, or when this server was started without Docker at all.
+        let runner = match &deps.docker {
+            Some(_) => select_dump_runner(&LocalDumpToolProbe, server_major).await?,
+            None => select_dump_runner(&NoDockerProbe, server_major).await?,
         };
         let (s3_source, s3_client) = v2_common::load_and_build_s3_client(
             deps.db.as_ref(),
@@ -188,7 +197,10 @@ impl BackupEngine for ControlPlaneEngine {
         let target =
             ControlPlaneTarget::from_database_url(&deps.config_service.get_database_url())?;
 
-        let image_tag = format!("postgres:{}", major);
+        let image_tag = format!("postgres:{}", server_major);
+        if runner == DumpRunner::Docker {
+            super::image_pull::ensure_image_pulled_v2(&image_tag, ENGINE_KEY).await?;
+        }
 
         // ── Attempt-scoped working dir + container command ───────────────────
         //
@@ -211,9 +223,9 @@ impl BackupEngine for ControlPlaneEngine {
             patterns = excluded.patterns.len(),
             "ControlPlaneEngine: dumping schema-only for high-volume tables",
         );
-        let file_size = match route {
-            DumpRoute::Sidecar(docker) => {
-                super::image_pull::ensure_image_pulled_v2(&image_tag, ENGINE_KEY).await?;
+
+        let file_size = match &runner {
+            DumpRunner::Docker => {
                 let spec = control_plane_dump_spec(
                     &attempt,
                     backup_id,
@@ -221,6 +233,16 @@ impl BackupEngine for ControlPlaneEngine {
                     &target,
                     &excluded.patterns,
                 );
+
+                let docker = match &deps.docker {
+                    Some(docker) => docker.clone(),
+                    None => bollard::Docker::connect_with_local_defaults().map_err(|e| {
+                        BackupError::Failed {
+                            reason: format!("failed to connect to Docker: {}", e),
+                        }
+                    })?,
+                };
+
                 capture_dump(
                     &docker,
                     CaptureRequest {
@@ -237,25 +259,31 @@ impl BackupEngine for ControlPlaneEngine {
                 )
                 .await?
             }
-            DumpRoute::Local(client) => {
+            DumpRunner::Host {
+                pg_dump,
+                pg_dumpall,
+            } => {
                 info!(
                     backup_id,
-                    client_major = client.major,
                     server_major,
-                    "ControlPlaneEngine: no Docker here, dumping with the local PostgreSQL client",
+                    pg_dump = %pg_dump.binary.display(),
+                    pg_dump_major = pg_dump.major,
+                    pg_dumpall = %pg_dumpall.binary.display(),
+                    pg_dumpall_major = pg_dumpall.major,
+                    "ControlPlaneEngine: Docker is not reachable, dumping with the host's \
+                     PostgreSQL client tools",
                 );
-                local_pg_dump::dump_to_gzip(
-                    &client,
-                    &LocalDumpArgs {
-                        host: &target.host,
-                        port: target.port,
-                        username: &target.username,
-                        database: &target.database,
-                        password: &target.password,
+                run_host_dump(
+                    HostDumpRequest {
+                        pg_dump,
+                        pg_dumpall,
+                        target: &target,
                         exclude_patterns: &excluded.patterns,
+                        sql_path: attempt.host_path(SIDECAR_DUMP_SQL),
+                        gz_path: host_dump_path.clone(),
+                        stderr_path: attempt.host_path(SIDECAR_STDERR),
+                        workdir: attempt.workdir_guard(),
                     },
-                    &host_dump_path,
-                    backup_id,
                     &ctx.cancel,
                 )
                 .await?
@@ -341,19 +369,57 @@ impl BackupEngine for ControlPlaneEngine {
 /// What control-plane backups will do on a server without Docker, for the
 /// startup log: probes this server's PostgreSQL client once.
 pub(crate) async fn no_docker_summary() -> String {
-    local_pg_dump::no_docker_summary(&local_pg_dump::probe().await)
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    for tool in [PG_DUMP, PG_DUMPALL] {
+        match NoDockerProbe.host_tool(tool).await {
+            HostToolProbe::Found(t) => found.push(format!("{tool} {}", t.major)),
+            HostToolProbe::Unusable { binary, reason } => problems.push(format!(
+                "`{tool}` at {} is not usable: {reason}",
+                binary.display()
+            )),
+            HostToolProbe::Missing => problems.push(format!("there is no `{tool}` on PATH")),
+        }
+    }
+    if problems.is_empty() {
+        format!(
+            "control_plane backups run with this server's PostgreSQL client ({}), which must \
+             be at least the database's major version",
+            found.join(", ")
+        )
+    } else {
+        format!(
+            "control_plane backups will fail: there is no Docker to run the dump image and {}; \
+             install the PostgreSQL client tools of the database's major version on this server",
+            problems.join(" and ")
+        )
+    }
 }
 
 // ── Local helpers ────────────────────────────────────────────────────────────
 
 /// Where the control-plane dump connects, parsed from `DATABASE_URL`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ControlPlaneTarget {
-    host: String,
-    port: u16,
-    database: String,
-    username: String,
-    password: String,
+///
+/// `Debug` is hand-written so the password never reaches a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ControlPlaneTarget {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) database: String,
+    pub(crate) username: String,
+    pub(crate) password: String,
+}
+
+impl std::fmt::Debug for ControlPlaneTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneTarget")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 impl ControlPlaneTarget {
@@ -563,9 +629,10 @@ pub async fn resolve_excluded_data(db: &DatabaseConnection) -> Result<ExcludedDa
 const DEFAULT_PG_MAJOR: u32 = 18;
 
 /// Detect the PostgreSQL major version via `current_setting('server_version')`.
-/// Falls back to `"pg18"` if detection fails — pg_dumpall is
-/// backwards-compatible so the worst case is a slightly-wrong sidecar tag.
-async fn detect_postgres_version(deps: &ControlPlaneDeps) -> String {
+/// Falls back to `18` if detection fails — pg_dumpall is
+/// backwards-compatible so the worst case is a slightly-wrong sidecar tag
+/// (or, without Docker, requiring host client tools of major 18).
+async fn detect_postgres_major(deps: &ControlPlaneDeps) -> u32 {
     use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 
     #[derive(FromQueryResult)]
@@ -582,18 +649,17 @@ async fn detect_postgres_version(deps: &ControlPlaneDeps) -> String {
     .await;
 
     match row {
-        Ok(Some(r)) => {
-            let major: u32 = r
-                .server_version
-                .split('.')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(18);
-            format!("pg{}", major)
-        }
+        Ok(Some(r)) => r
+            .server_version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_PG_MAJOR),
         Ok(None) | Err(_) => {
-            warn!("ControlPlaneEngine: could not detect PG version, defaulting to pg18");
-            "pg18".to_string()
+            warn!(
+                "ControlPlaneEngine: could not detect PG version, defaulting to pg{DEFAULT_PG_MAJOR}"
+            );
+            DEFAULT_PG_MAJOR
         }
     }
 }
@@ -1304,6 +1370,127 @@ mod dump_tests {
         let host_dir = attempt.host_dir().to_path_buf();
         drop(attempt);
         assert!(!host_dir.exists(), "attempt dir not cleaned up");
+    }
+
+    /// The fallback a plane without Docker takes: the host's own
+    /// `pg_dumpall` + `pg_dump` against a real server. The server still runs
+    /// in Docker here; only the client tools are the host's. Skips when the
+    /// host has no PostgreSQL 18+ client tools on PATH.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_plane_dump_with_host_client_tools_round_trips() {
+        use super::super::control_plane_host::{
+            run_host_dump, DumpToolProbe, HostDumpRequest, LocalDumpToolProbe, PG_DUMP, PG_DUMPALL,
+        };
+        use super::super::pg_client_tools::HostToolProbe;
+
+        let test = "control_plane_dump_with_host_client_tools_round_trips";
+        let mut tools = Vec::new();
+        for program in [PG_DUMP, PG_DUMPALL] {
+            match LocalDumpToolProbe.host_tool(program).await {
+                HostToolProbe::Found(tool) if tool.major >= 18 => tools.push(tool),
+                other => {
+                    println!("No PostgreSQL 18+ {program} on PATH ({other:?}), skipping {test}");
+                    return;
+                }
+            }
+        }
+        let (pg_dump, pg_dumpall) = (tools.remove(0), tools.remove(0));
+        let Some(docker) = docker_or_skip(test).await else {
+            return;
+        };
+        let run_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+        let cp = seeded_control_plane(&docker, &run_id).await;
+
+        let backup_dir = tempfile::tempdir().expect("backup tmpdir");
+        let attempt = DumpAttempt::new_in(
+            backup_dir.path(),
+            CONTROL_PLANE_TOOL,
+            ENGINE_KEY,
+            &format!("host-{run_id}"),
+        )
+        .expect("attempt");
+        let target = target("127.0.0.1", cp.port, TEST_PASSWORD);
+        let excludes = vec!["public.proxy_logs".to_string()];
+        let host_path = attempt.host_path(SIDECAR_DUMP_GZ);
+
+        let size = run_host_dump(
+            HostDumpRequest {
+                pg_dump: &pg_dump,
+                pg_dumpall: &pg_dumpall,
+                target: &target,
+                exclude_patterns: &excludes,
+                sql_path: attempt.host_path(SIDECAR_DUMP_SQL),
+                gz_path: host_path.clone(),
+                stderr_path: attempt.host_path(SIDECAR_STDERR),
+                workdir: attempt.workdir_guard(),
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect("host dump of the control-plane database");
+
+        assert!(size > 0);
+        assert_eq!(std::fs::metadata(&host_path).expect("dump").len(), size);
+        assert!(!attempt.host_path(SIDECAR_DUMP_SQL).exists());
+        let sql = gunzip_to_string(&host_path);
+        assert!(
+            sql.contains("CREATE ROLE temps_test_reader"),
+            "globals missing"
+        );
+        assert!(sql.contains("kept-project-row"), "kept table data missing");
+        assert!(sql.contains("CREATE TABLE public.proxy_logs"));
+        assert!(
+            !sql.contains("/excluded-telemetry-row"),
+            "excluded table data must not be dumped"
+        );
+        let globals = sql
+            .find("PostgreSQL database cluster dump")
+            .expect("pg_dumpall header");
+        let database = sql
+            .find("CREATE TABLE public.projects")
+            .expect("pg_dump body");
+        assert!(globals < database, "globals must come first");
+
+        // A wrong password fails with the tool's own error, not a hang.
+        let wrong = target_with_password(&target, "not-the-password");
+        let retry = DumpAttempt::new_in(
+            backup_dir.path(),
+            CONTROL_PLANE_TOOL,
+            ENGINE_KEY,
+            &format!("host-bad-{run_id}"),
+        )
+        .expect("attempt");
+        let error = run_host_dump(
+            HostDumpRequest {
+                pg_dump: &pg_dump,
+                pg_dumpall: &pg_dumpall,
+                target: &wrong,
+                exclude_patterns: &[],
+                sql_path: retry.host_path(SIDECAR_DUMP_SQL),
+                gz_path: retry.host_path(SIDECAR_DUMP_GZ),
+                stderr_path: retry.host_path(SIDECAR_STDERR),
+                workdir: retry.workdir_guard(),
+            },
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("wrong password");
+        let message = error.to_string();
+        assert!(message.contains("pg_dumpall"), "{message}");
+        // pg_dumpall's own wording; it omits the libpq detail on a failed
+        // password.
+        assert!(
+            message.contains("could not connect to database \"temps\""),
+            "{message}"
+        );
+        assert!(!message.contains("not-the-password"), "{message}");
+    }
+
+    fn target_with_password(base: &ControlPlaneTarget, password: &str) -> ControlPlaneTarget {
+        ControlPlaneTarget {
+            password: password.to_string(),
+            ..base.clone()
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

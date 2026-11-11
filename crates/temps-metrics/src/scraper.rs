@@ -22,7 +22,9 @@
 //!    in-memory `last_scalar_values` map.  Counter resets are detected when
 //!    the current raw value is less than the previous one — in that case the
 //!    raw value is used as the delta directly.
-//! 6. Calls [`MetricsStore::write_batch`].  A write failure is logged as a
+//! 6. Replaces the Postgres block counters with the windowed cache hit ratio
+//!    ([`crate::cache_hit_window`]).
+//! 7. Calls [`MetricsStore::write_batch`].  A write failure is logged as a
 //!    warning but never propagates — the scraper loop continues regardless.
 //!
 //! # Counter baseline
@@ -45,6 +47,7 @@ use temps_config::ConfigService;
 use temps_core::EncryptionService;
 use temps_entities::{external_services, nodes};
 
+use crate::cache_hit_window::CacheHitWindows;
 use crate::collector::mariadb::MariaDbCollector;
 use crate::collector::mongodb::MongoCollector;
 use crate::collector::postgres::PostgresCollector;
@@ -88,6 +91,16 @@ type ClusterPrimaries = Arc<StdMutex<HashMap<i32, String>>>;
 /// Minimum scrape interval enforced at runtime regardless of configuration.
 const MIN_INTERVAL_SECS: u64 = 10;
 
+/// The scrape interval the loop actually uses for a configured value, and
+/// whether it differs from it. Settings saved through the API are already
+/// within bounds; a value stored before the maximum existed is capped at
+/// [`temps_config::MAX_SCRAPE_INTERVAL_SECS`] so windowed metrics (the
+/// Postgres cache hit ratio) keep whole scrape intervals inside their window.
+fn effective_interval_secs(configured: u64) -> (u64, bool) {
+    let effective = configured.clamp(MIN_INTERVAL_SECS, temps_config::MAX_SCRAPE_INTERVAL_SECS);
+    (effective, effective != configured)
+}
+
 /// Timeout given to each per-service collector task.
 const COLLECTOR_TIMEOUT_SECS: u64 = 5;
 
@@ -103,6 +116,10 @@ const MAX_CONCURRENT_COLLECTORS: usize = 20;
 /// plus one unlabelled instance-wide aggregate; without it they would share a
 /// baseline and produce garbage deltas.
 type CounterBaselines = Arc<RwLock<HashMap<(i32, String, String), f64>>>;
+
+/// Trailing cache-hit windows of every Postgres series; see
+/// [`crate::cache_hit_window`]. Each critical section is one map update.
+type CacheHitState = Arc<StdMutex<CacheHitWindows>>;
 
 /// Background metrics scraper.
 ///
@@ -127,6 +144,8 @@ pub struct MetricsScraper {
     cluster_primary: Option<Arc<dyn ClusterPrimaryConnector>>,
     /// Which member supplied each cluster's counter baselines.
     cluster_primaries: ClusterPrimaries,
+    /// Windowed Postgres cache hit ratio state.
+    cache_hit: CacheHitState,
 }
 
 impl MetricsScraper {
@@ -155,6 +174,7 @@ impl MetricsScraper {
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             cluster_primary: None,
             cluster_primaries: Arc::new(StdMutex::new(HashMap::new())),
+            cache_hit: Arc::new(StdMutex::new(CacheHitWindows::default())),
         }
     }
 
@@ -176,19 +196,39 @@ impl MetricsScraper {
             // Re-read interval each cycle — live settings changes take effect
             // without a binary restart.
             let interval_secs = match self.config_service.get_settings().await {
-                Ok(settings) => settings
-                    .monitoring
-                    .scrape_interval_secs
-                    .max(MIN_INTERVAL_SECS),
+                Ok(settings) => {
+                    let configured = settings.monitoring.scrape_interval_secs;
+                    let (effective, adjusted) = effective_interval_secs(configured);
+                    if adjusted && configured > effective {
+                        warn!(
+                            configured_secs = configured,
+                            effective_secs = effective,
+                            "MetricsScraper: monitoring.scrape_interval_secs is above the \
+                             maximum; scraping every {effective}s so the Postgres cache hit \
+                             ratio (last 15 minutes) keeps whole scrapes in its window. Save \
+                             the monitoring settings with an interval of at most {effective}s \
+                             to clear this warning"
+                        );
+                    }
+                    effective
+                }
                 Err(e) => {
                     warn!("MetricsScraper: failed to read settings, using default 30s: {e}");
                     30
                 }
             };
+            lock_unpoisoned(&self.cache_hit)
+                .set_scrape_interval(chrono::Duration::seconds(interval_secs as i64));
 
+            let cycle_started = std::time::Instant::now();
             if let Err(e) = self.run_cycle().await {
                 error!("MetricsScraper: cycle failed: {e}");
             }
+            // The sleep starts after the cycle, so sources are scraped every
+            // interval plus this: the cache hit window must expect it.
+            let cycle = chrono::Duration::from_std(cycle_started.elapsed())
+                .unwrap_or_else(|_| chrono::Duration::zero());
+            lock_unpoisoned(&self.cache_hit).record_cycle(chrono::Utc::now(), cycle);
 
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
@@ -214,6 +254,7 @@ impl MetricsScraper {
             // Consider only clearing entries for services that have been absent for
             // longer than one retention window, or persisting baselines to a DB table.
             self.last_scalar_values.write().await.clear();
+            lock_unpoisoned(&self.cache_hit).retain_sources(&HashSet::new());
             return Ok(());
         }
 
@@ -257,6 +298,7 @@ impl MetricsScraper {
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
+            let cache_hit = Arc::clone(&self.cache_hit);
             let in_flight = Arc::clone(&self.in_flight);
             // `sem` is local to this cycle and never closed; if that ever
             // changes, end the cycle instead of panicking the scraper.
@@ -312,11 +354,14 @@ impl MetricsScraper {
                         // than diffing them against the old primary's.
                         if primary_changed(&cluster_primaries, service_id, &member) {
                             reset_baselines(&last_values, service_id).await;
+                            lock_unpoisoned(&cache_hit).reset_source(service_id);
                         }
                         if raw_points.is_empty() {
                             return Err(());
                         }
-                        return Ok(apply_delta(&last_values, service_id, raw_points).await);
+                        return Ok(
+                            finish_points(&last_values, &cache_hit, service_id, raw_points).await,
+                        );
                     }
 
                     // Build a connection string from the encrypted service config.
@@ -394,9 +439,7 @@ impl MetricsScraper {
                         return Err(());
                     }
 
-                    // Apply delta computation for counter metrics.
-                    let points = apply_delta(&last_values, service_id, raw_points).await;
-                    Ok(points)
+                    Ok(finish_points(&last_values, &cache_hit, service_id, raw_points).await)
                 }
                 .await;
 
@@ -428,6 +471,7 @@ impl MetricsScraper {
             guard.retain(|(sid, _, _), _| active_ids.contains(sid));
         }
         lock_unpoisoned(&self.cluster_primaries).retain(|sid, _| active_ids.contains(sid));
+        lock_unpoisoned(&self.cache_hit).retain_sources(&active_ids);
 
         Ok(())
     }
@@ -648,7 +692,7 @@ async fn collect_with_timeout<C: Collector>(
 /// and lose their delta baseline. Sorting the pairs makes the key stable. An
 /// empty label set yields `""`, distinguishing instance-wide aggregates from
 /// per-label series of the same metric name.
-fn labels_key(labels: &HashMap<String, String>) -> String {
+pub(crate) fn labels_key(labels: &HashMap<String, String>) -> String {
     if labels.is_empty() {
         return String::new();
     }
@@ -659,6 +703,20 @@ fn labels_key(labels: &HashMap<String, String>) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Turn one service's raw collector points into what is persisted: counter
+/// deltas ([`apply_delta`]), then the Postgres block counters folded into the
+/// windowed cache hit ratio ([`CacheHitWindows::derive`]).
+async fn finish_points(
+    last_values: &CounterBaselines,
+    cache_hit: &CacheHitState,
+    source_id: i32,
+    raw_points: Vec<MetricPoint>,
+) -> Vec<MetricPoint> {
+    let points = apply_delta(last_values, source_id, raw_points).await;
+    let mut windows = lock_unpoisoned(cache_hit);
+    windows.derive(source_id, points)
 }
 
 /// Compute counter deltas and update `last_scalar_values`.
@@ -1157,6 +1215,439 @@ mod tests {
             node_id: None,
             labels: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn effective_interval_keeps_the_configured_value_within_bounds() {
+        assert_eq!(effective_interval_secs(30), (30, false));
+        assert_eq!(effective_interval_secs(1), (MIN_INTERVAL_SECS, true));
+        assert_eq!(
+            effective_interval_secs(900),
+            (temps_config::MAX_SCRAPE_INTERVAL_SECS, true)
+        );
+        assert_eq!(
+            effective_interval_secs(temps_config::MAX_SCRAPE_INTERVAL_SECS),
+            (temps_config::MAX_SCRAPE_INTERVAL_SECS, false)
+        );
+    }
+
+    /// Scraping at the maximum interval, plus a slow cycle on top, must still
+    /// leave whole intervals in the cache hit window: a ratio is served.
+    #[tokio::test]
+    async fn the_maximum_scrape_interval_still_serves_a_cache_hit_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // The loop sleeps the interval after each cycle, so scrapes are the
+        // interval plus the cycle's duration apart.
+        let gap_secs = temps_config::MAX_SCRAPE_INTERVAL_SECS as i64 + 30;
+        let start = chrono::DateTime::<chrono::Utc>::from_timestamp(1_760_000_000, 0).unwrap();
+        let mut counters = (0.0, 0.0);
+        let mut last = Vec::new();
+        for scrape in 0..6 {
+            counters.0 += 9_900.0;
+            counters.1 += 100.0;
+            let mut points = pg_blocks(0, counters.0, counters.1);
+            for p in &mut points {
+                p.time = start + chrono::Duration::seconds(scrape * gap_secs);
+            }
+            last = finish_points(&baselines, &windows, 7, points).await;
+        }
+        let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+        assert!(served(&last, "pg.cache_blocks_accessed_15m").unwrap() >= 20_000.0);
+    }
+
+    // ── windowed Postgres cache hit ratio ──────────────────────────────────
+
+    /// One Postgres scrape's raw, lifetime `blks_hit` / `blks_read` counters
+    /// for each `(database, hit, read)`, as the collector reports them.
+    fn pg_scrape(minute: i64, databases: &[(&str, f64, f64)]) -> Vec<MetricPoint> {
+        let time = chrono::DateTime::<chrono::Utc>::from_timestamp(1_760_000_000, 0).unwrap()
+            + chrono::Duration::minutes(minute);
+        let mut points = Vec::new();
+        for (db, hit, read) in databases {
+            for (name, value) in [
+                (crate::cache_hit_window::PG_BLKS_HIT, *hit),
+                (crate::cache_hit_window::PG_BLKS_READ, *read),
+            ] {
+                points.push(MetricPoint {
+                    time,
+                    source_kind: SourceKind::Database,
+                    source_id: 7,
+                    name: name.to_string(),
+                    value,
+                    kind: MetricKind::Counter,
+                    engine: Some("postgres".to_string()),
+                    environment: None,
+                    node_id: None,
+                    labels: HashMap::from([("datname".to_string(), db.to_string())]),
+                });
+            }
+        }
+        points
+    }
+
+    fn pg_blocks(minute: i64, hit: f64, read: f64) -> Vec<MetricPoint> {
+        pg_scrape(minute, &[("app", hit, read)])
+    }
+
+    /// [`pg_blocks`] plus the database's `stats_reset` time, as the
+    /// collector reports it.
+    fn pg_blocks_since(minute: i64, hit: f64, read: f64, stats_reset: f64) -> Vec<MetricPoint> {
+        let mut points = pg_blocks(minute, hit, read);
+        let mut reset = points[0].clone();
+        reset.name = crate::cache_hit_window::PG_STATS_RESET.to_string();
+        reset.value = stats_reset;
+        reset.kind = MetricKind::Gauge;
+        points.push(reset);
+        points
+    }
+
+    /// The instance-wide value of `name`, the one the tiles and alarm read.
+    fn served(points: &[MetricPoint], name: &str) -> Option<f64> {
+        points
+            .iter()
+            .find(|p| p.name == name && p.labels.is_empty())
+            .map(|p| p.value)
+    }
+
+    /// The scrape-to-store pipeline over minutes `minutes`, each scrape adding
+    /// `hit`/`read` blocks to the running counters. Returns the last scrape's
+    /// persisted points.
+    async fn scrape_minutes(
+        baselines: &CounterBaselines,
+        windows: &CacheHitState,
+        counters: &mut (f64, f64),
+        minutes: std::ops::Range<i64>,
+        (hit, read): (f64, f64),
+    ) -> Vec<MetricPoint> {
+        let mut last = Vec::new();
+        for minute in minutes {
+            counters.0 += hit;
+            counters.1 += read;
+            last = finish_points(
+                baselines,
+                windows,
+                7,
+                pg_blocks(minute, counters.0, counters.1),
+            )
+            .await;
+            if let Some(ratio) = served(&last, "pg.cache_hit_ratio") {
+                assert!((0.0..=1.0).contains(&ratio), "minute {minute}: {ratio}");
+            }
+        }
+        last
+    }
+
+    /// Regression for a reported case: after a bulk load the lifetime ratio
+    /// sat near 30%. The operator raised `shared_buffers` and restarted
+    /// Postgres, after which the database served 99% of block reads from
+    /// cache, but the console (and the "Low cache hit ratio" alarm) kept
+    /// reading the lifetime counters and stayed near 30%.
+    #[tokio::test]
+    async fn cache_hit_ratio_follows_the_recent_workload_across_a_stats_reset() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+
+        // Lifetime history: 30M hits, 70M reads (a 30% ratio).
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        // The first scrape only records baselines; nothing is served yet.
+        let first = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+        assert!(first.is_empty(), "{first:?}");
+
+        // The bulk load keeps missing: 30% over the window.
+        let during_load =
+            scrape_minutes(&baselines, &windows, &mut counters, 1..20, (300.0, 700.0)).await;
+        let ratio = served(&during_load, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.3).abs() < 1e-9, "{ratio}");
+
+        // Restart that resets the statistics: the counters start again from
+        // zero. The scrape after it must not see a negative delta.
+        counters = (0.0, 0.0);
+        let after_restart = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            20..21,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&after_restart, "pg.cache_hit_ratio").unwrap();
+        assert!(
+            ratio > 0.3,
+            "the reset interval counts as fresh accesses: {ratio}"
+        );
+
+        // Fifteen minutes of the tuned workload: the window holds only it.
+        let tuned = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            21..36,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&tuned, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+        assert_eq!(
+            served(&tuned, "pg.cache_blocks_accessed_15m"),
+            Some(15.0 * 10_000.0)
+        );
+        // Only the derived gauges are persisted, never the raw block counters.
+        let names: HashSet<&str> = tuned.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(tuned.len(), 4, "per-database and instance-wide gauges");
+        assert_eq!(
+            names,
+            HashSet::from(["pg.cache_hit_ratio", "pg.cache_blocks_accessed_15m"])
+        );
+    }
+
+    /// Dropping a database takes its row out of `pg_stat_database`, so a
+    /// counter summed over databases goes backwards. The instance-wide window
+    /// must not read that as a reset and fill up with the remaining
+    /// databases' lifetime totals.
+    #[tokio::test]
+    async fn dropping_a_database_does_not_inject_lifetime_history() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // Lifetime: the app database 30M hits / 70M reads, a scratch
+        // database with a large history of reads.
+        let (mut app, mut scratch) = ((30_000_000.0, 70_000_000.0), (1_000.0, 5_000_000.0));
+        for minute in 0..16 {
+            app.0 += 9_900.0;
+            app.1 += 100.0;
+            scratch.1 += 10.0;
+            finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_scrape(
+                    minute,
+                    &[("app", app.0, app.1), ("scratch", scratch.0, scratch.1)],
+                ),
+            )
+            .await;
+        }
+
+        // The scratch database is dropped.
+        app.0 += 9_900.0;
+        app.1 += 100.0;
+        let after_drop = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_scrape(16, &[("app", app.0, app.1)]),
+        )
+        .await;
+
+        let ratio = served(&after_drop, "pg.cache_hit_ratio").unwrap();
+        assert!(ratio > 0.98, "the live workload still dominates: {ratio}");
+        let accessed = served(&after_drop, "pg.cache_blocks_accessed_15m").unwrap();
+        assert!(
+            accessed < 200_000.0,
+            "no lifetime totals in the window: {accessed}"
+        );
+    }
+
+    /// `pg_stat_reset()` between two scrapes: hits fall below their old
+    /// value but reads, already past theirs, look as if they kept growing.
+    /// The interval mixing both sides of the reset must not count.
+    #[tokio::test]
+    async fn a_stats_reset_that_only_one_counter_shows_does_not_skew_the_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let scrape = |minute, hit, read, reset| {
+            finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, hit, read, reset),
+            )
+        };
+        scrape(0, 1_000_000.0, 5_000.0, 0.0).await;
+        scrape(1, 2_000_000.0, 9_000.0, 0.0).await;
+        // Reset, then 9,900 hits and 10,100 reads before the next scrape.
+        // Hits fall below their old value, so the delta step sees that reset;
+        // reads (10,100) are above theirs (9,000), so it reports a delta of
+        // 1,100 and only `stats_reset` reveals the reset.
+        scrape(2, 9_900.0, 10_100.0, 600.0).await;
+        let mut last = Vec::new();
+        for minute in 3..=16 {
+            let since = (minute - 2) as f64 * 10_000.0;
+            last = scrape(minute, 9_900.0 + since, 10_100.0 + since, 600.0).await;
+        }
+
+        // At minute 16 the window holds minutes 2 to 16. Minute 2's skewed
+        // 9,900 / 1,100 is left out; minutes 3 to 16 are 10,000 / 10,000 each,
+        // 280,000 accesses over 14 minutes, reported for the whole 15.
+        assert_eq!(served(&last, "pg.cache_hit_ratio"), Some(0.5));
+        assert_eq!(
+            served(&last, "pg.cache_blocks_accessed_15m"),
+            Some(300_000.0)
+        );
+        assert!(
+            last.iter().all(|p| p.name != "pg.stats_reset"),
+            "never persisted"
+        );
+    }
+
+    /// The same reset right after the scrape that set the baselines (a Temps
+    /// restart, a failover, a new database): that scrape only records the
+    /// reset time, and the next interval is still recognised as mixed. No
+    /// scrape ever serves a ratio that counts it.
+    #[tokio::test]
+    async fn a_stats_reset_right_after_the_baseline_scrape_does_not_skew_the_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let first = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks_since(0, 1_000_000.0, 10_000.0, 0.0),
+        )
+        .await;
+        assert!(first.is_empty(), "baselines only: {first:?}");
+        // Reset, then 9,900 hits and 10,100 reads; 10,000 / 10,000 a minute
+        // from then on.
+        let mut served_ratios = Vec::new();
+        for minute in 1..=17 {
+            let since = (minute - 1) as f64 * 10_000.0;
+            let out = finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, 9_900.0 + since, 10_100.0 + since, 600.0),
+            )
+            .await;
+            served_ratios.extend(served(&out, "pg.cache_hit_ratio"));
+        }
+        assert!(!served_ratios.is_empty());
+        assert!(
+            served_ratios.iter().all(|ratio| *ratio == 0.5),
+            "{served_ratios:?}"
+        );
+    }
+
+    /// After a Temps restart the windows refill from empty. Their first
+    /// minutes are not 15 minutes of traffic: nothing is served until the
+    /// window is whole, so the store's latest values stay those of the last
+    /// whole window.
+    #[tokio::test]
+    async fn a_restart_serves_nothing_until_the_window_is_whole() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // 200 block accesses per second at a 70% hit ratio.
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        let mut last = Vec::new();
+        for minute in 0..=15 {
+            counters.0 += 8_400.0;
+            counters.1 += 3_600.0;
+            last = finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, counters.0, counters.1, 0.0),
+            )
+            .await;
+            if minute < 15 {
+                assert_eq!(served(&last, "pg.cache_hit_ratio"), None, "{minute}");
+                assert_eq!(
+                    served(&last, "pg.cache_blocks_accessed_15m"),
+                    None,
+                    "{minute}"
+                );
+            }
+        }
+        let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.7).abs() < 1e-9, "{ratio}");
+        assert_eq!(
+            served(&last, "pg.cache_blocks_accessed_15m"),
+            Some(15.0 * 12_000.0)
+        );
+    }
+
+    /// Failed scrapes keep the counter baselines, so the first good scrape
+    /// after an outage carries the whole outage's block accesses. They must
+    /// not be served as the last 15 minutes.
+    #[tokio::test]
+    async fn a_scrape_outage_is_not_served_as_the_last_15_minutes() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+        scrape_minutes(&baselines, &windows, &mut counters, 1..5, (9_900.0, 100.0)).await;
+
+        // Minutes 5..45: every scrape fails (nothing reaches finish_points)
+        // while a cold bulk load runs.
+        counters.0 += 40.0 * 300.0;
+        counters.1 += 40.0 * 700.0;
+        let after_outage = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(45, counters.0, counters.1),
+        )
+        .await;
+        assert_eq!(served(&after_outage, "pg.cache_hit_ratio"), None);
+        assert_eq!(served(&after_outage, "pg.cache_blocks_accessed_15m"), None);
+
+        // The window refills from minute 45 and serves again once whole.
+        let refilling = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            46..47,
+            (9_900.0, 100.0),
+        )
+        .await;
+        assert_eq!(served(&refilling, "pg.cache_hit_ratio"), None);
+        let next = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            47..61,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&next, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+    }
+
+    /// PostgreSQL 15+ keeps its statistics across a clean restart, so the
+    /// lifetime counters never reset and their ratio barely moves. The window
+    /// must follow the workload anyway.
+    #[tokio::test]
+    async fn cache_hit_ratio_follows_the_recent_workload_without_a_stats_reset() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+
+        let tuned =
+            scrape_minutes(&baselines, &windows, &mut counters, 1..30, (9_900.0, 100.0)).await;
+
+        let lifetime = counters.0 / (counters.0 + counters.1);
+        assert!(lifetime < 0.31, "lifetime ratio stays near 30%: {lifetime}");
+        let ratio = served(&tuned, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
     }
 
     /// A poisoned primary map must not report "changed" forever (which

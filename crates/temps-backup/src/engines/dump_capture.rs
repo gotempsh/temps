@@ -35,6 +35,7 @@
 //! bind mount) cannot collide with a new one.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::execution::engine_v2::BackupError;
 use bollard::Docker;
@@ -227,12 +228,25 @@ impl From<DumpCaptureError> for BackupError {
 ///
 /// Dropping the attempt deletes its host directory and everything in it,
 /// and nothing else: files from earlier attempts, other backups or older
-/// binaries are never touched.
+/// binaries are never touched. A [`WorkdirGuard`] taken from the attempt
+/// postpones that deletion until the guard drops too.
 #[derive(Debug)]
 pub struct DumpAttempt {
     backup_uuid: String,
     attempt_id: String,
-    host_dir: tempfile::TempDir,
+    host_dir: Arc<tempfile::TempDir>,
+}
+
+/// Shared ownership of a [`DumpAttempt`]'s host directory.
+///
+/// Held by blocking work that writes into the directory (which keeps running
+/// after the future that started it is dropped), so the directory is
+/// deleted only once both the attempt and that work are done with it, never
+/// underneath open files.
+#[derive(Debug, Clone)]
+pub struct WorkdirGuard {
+    /// Never read: holding it is the point.
+    _dir: Arc<tempfile::TempDir>,
 }
 
 impl DumpAttempt {
@@ -269,7 +283,7 @@ impl DumpAttempt {
         Ok(Self {
             backup_uuid: backup_uuid.to_string(),
             attempt_id,
-            host_dir,
+            host_dir: Arc::new(host_dir),
         })
     }
 
@@ -298,6 +312,19 @@ impl DumpAttempt {
     /// This attempt's host working directory.
     pub fn host_dir(&self) -> &Path {
         self.host_dir.path()
+    }
+
+    /// Keep this attempt's host directory alive while the guard lives.
+    pub fn workdir_guard(&self) -> WorkdirGuard {
+        WorkdirGuard {
+            _dir: Arc::clone(&self.host_dir),
+        }
+    }
+
+    /// Whether a [`WorkdirGuard`] of this attempt is still alive.
+    #[cfg(test)]
+    pub(crate) fn workdir_shared(&self) -> bool {
+        Arc::strong_count(&self.host_dir) > 1
     }
 
     /// Path of `file_name` inside [`Self::host_dir`].
@@ -470,6 +497,25 @@ mod tests {
     use super::*;
 
     // ── Attempt scoping ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_workdir_guard_keeps_the_directory_until_it_drops_too() {
+        let parent = tempfile::tempdir().expect("parent");
+        let attempt =
+            DumpAttempt::new_in(parent.path(), "PostgreSQL", "test", "b-uuid").expect("attempt");
+        let dir = attempt.host_dir().to_path_buf();
+        std::fs::write(attempt.host_path("dump"), b"in use").expect("write");
+        let guard = attempt.workdir_guard();
+        assert!(attempt.workdir_shared());
+
+        // Blocking work still holds files in the directory.
+        drop(attempt);
+        assert!(dir.exists(), "deleted underneath a live guard");
+        assert_eq!(std::fs::read(dir.join("dump")).expect("kept"), b"in use");
+
+        drop(guard);
+        assert!(!dir.exists(), "the last holder deletes the directory");
+    }
 
     #[test]
     fn two_attempts_of_one_backup_never_share_names_or_paths() {

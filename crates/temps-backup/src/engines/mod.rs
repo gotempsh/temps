@@ -9,6 +9,7 @@
 //!
 //! ## Phase 1 engines
 //! - [`control_plane`]: Control-plane (Temps server's own PostgreSQL database).
+//!   Without Docker it dumps with host client tools ([`control_plane_host`]).
 //!
 //! ## Phase 2–4 engines (external services)
 //! - [`redis`]: Redis via BGSAVE or WAL-G.
@@ -29,14 +30,15 @@
 //! 3. Instantiate and register in `plugin.rs` (`BackupPlugin::register_services`).
 
 pub mod control_plane;
+pub mod control_plane_host;
 pub mod dispatch;
 pub mod dump_capture;
 pub mod image_pull;
-mod local_pg_dump;
 pub mod mariadb_dump;
 pub mod mariadb_physical;
 pub mod mongodb;
 pub mod oneshot;
+pub mod pg_client_tools;
 pub mod postgres_cluster;
 pub mod postgres_pgdump;
 pub mod postgres_walg;
