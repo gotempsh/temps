@@ -4,6 +4,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { TriggerBackupDialog } from './TriggerBackupDialog'
@@ -11,18 +12,16 @@ import { TriggerBackupDialog } from './TriggerBackupDialog'
 installBrowserWindow()
 afterEach(cleanup)
 
-function renderDialog() {
+function renderDialog(
+  client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  })
+) {
   return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({
-          defaultOptions: {
-            queries: { retry: false },
-            mutations: { retry: false },
-          },
-        })
-      }
-    >
+    <QueryClientProvider client={client}>
       <TriggerBackupDialog
         open
         onOpenChange={() => {}}
@@ -61,13 +60,21 @@ test('a role refused the destination list can still back up to the default one',
       )
     },
   })
-  const view = renderDialog()
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  })
+  const view = renderDialog(client)
 
   // A neutral note, not an error that says to ask an administrator.
   await view.findByText(/Your role cannot choose a backup destination/)
   expect(view.queryByText(/Could not load backup destinations/)).toBeNull()
   expect(view.queryByRole('button', { name: /Retry/ })).toBeNull()
   expect(view.queryByText('Storage destination')).toBeNull()
+  // The shell's own "access denied" banner must not repeat it.
+  expect(collectRouteQueryFailures(client)).toEqual([])
 
   const start = view.getByRole('button', {
     name: 'Start backup',

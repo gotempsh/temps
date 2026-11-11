@@ -36,6 +36,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { announceOperation } from '@/components/operations/operations-tray-store'
 import { AlertTriangle, HardDrive, Loader2, Star } from 'lucide-react'
 import { useEffect } from 'react'
@@ -86,6 +87,9 @@ export function TriggerBackupDialog({
     ...listS3SourcesOptions(),
     enabled: open,
     retry: shouldRetryDestinationRead,
+    // The dialog explains a failed read itself (a neutral note for a refusal,
+    // an alert with Retry otherwise), so the shell must not report it too.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
   })
 
   // Loading, failed read, failed refresh over cached data, empty, or ready.

@@ -19,6 +19,7 @@ import {
   listS3Sources,
   listSourceBackups,
 } from '@/api/client/sdk.gen'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { queryOptions } from '@tanstack/react-query'
 import { shouldRetryRead, toQueryError } from './restore-state'
 
@@ -67,8 +68,13 @@ export function restoreCapabilitiesQuery(serviceId: number) {
 export function restoreSourcesQuery() {
   return queryOptions({
     queryKey: listS3SourcesQueryKey(),
+    // A role that may not list sources is refused, and the page then falls back
+    // to the database's own backups, so the refusal is not a failure of the
+    // page. A real failure is explained by the page itself ("Could not load
+    // storage sources"), so the shell must not report it a second time.
     queryFn: ({ signal }) =>
       requireData(listS3Sources({ signal, throwOnError: false })),
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
     retry: (count, error) => shouldRetryRead(count, error),
   })
 }
