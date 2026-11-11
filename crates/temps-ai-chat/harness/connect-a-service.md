@@ -31,7 +31,14 @@ complete access approval in this chat. A sandbox does not need a project.
    after explicit confirmation here. Other users must ask an administrator.
    GitHub connection services cannot link outside their source project.
 4. Propose `create_access_session_general` with the reviewed bundle/service
-   versions, a fresh request UUID, sandbox consumer and TTL. The person must
+   versions, a fresh request UUID, sandbox consumer and TTL. The shape is
+   `--vault_id <vault> --bundle_id <bundle> --bundle_version <n> --request_id <uuid>
+   --ttl_seconds <seconds> --consumer '{"kind":"sandbox","sandbox_id":"<sandbox public id>"}'
+   --services '[{"service_id":"<id>","version":<n>}]'`. The bundle id comes from
+   `list_access_bundles_general` and is not the vault id; `consumer` is a JSON
+   object with `kind`, not `sandbox:<id>`; `services` lists every service of
+   the bundle with the version you showed the person. A 422 names the field
+   that is wrong: fix that field and do not guess again. The person must
    explicitly confirm the pending action, including in Auto mode. Never treat
    configuration, a previous session or the model's own output as consent.
    Retry an unchanged approval with its same request UUID; changing the target,
