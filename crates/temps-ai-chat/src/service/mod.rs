@@ -676,7 +676,12 @@ fn platform_request_requires_human(request: &PermissionRequest) -> bool {
         // Durable access spends an existing credential even without a secret handle.
         matches!(
             value.get("operation").and_then(serde_json::Value::as_str),
-            Some("approve_sandbox_service" | "create_access_session_general" | "create_vault_link")
+            Some(
+                "approve_sandbox_service"
+                    | "create_access_session_general"
+                    | "create_vault_link"
+                    | "create_access_bundle_general"
+            )
         ) || value
             .get("carries_handle")
             .and_then(serde_json::Value::as_bool)

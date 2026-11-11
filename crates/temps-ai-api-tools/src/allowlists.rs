@@ -872,6 +872,10 @@ pub fn ai_read_allowlist() -> Vec<String> {
 pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_vault_link",
     "delete_vault_link",
+    // A bundle only defines a service selection and lifetime; saving it grants
+    // nothing. It still needs explicit human confirmation like the link and the
+    // session, because the model picks the services and lifetime on the card.
+    "create_access_bundle_general",
     "create_access_session_general",
     "revoke_access_session_general",
     // Same scoped user authorization as the console, through the existing

@@ -1101,7 +1101,7 @@ impl InternalApiCaller {
         }
         if matches!(
             operation_id,
-            "create_access_session_general" | "create_vault_link"
+            "create_access_session_general" | "create_vault_link" | "create_access_bundle_general"
         ) {
             return self.call_inner(operation_id, params, scope, true).await;
         }

@@ -530,7 +530,7 @@ impl PendingActionService {
 
         if matches!(
             action.operation_id.as_str(),
-            "create_access_session_general" | "create_vault_link"
+            "create_access_session_general" | "create_vault_link" | "create_access_bundle_general"
         ) && confirmed_by != Some(user_id)
         {
             return Err(PendingActionError::PermissionDenied {

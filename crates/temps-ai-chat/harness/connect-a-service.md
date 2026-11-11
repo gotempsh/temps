@@ -24,10 +24,14 @@ complete access approval in this chat. A sandbox does not need a project.
    and `get_access_vault_general` with its sandbox ID query parameter to inspect masked policy
    versions. Follow pagination; do not assume the first page is the whole list.
    A session needs a bundle that contains the service. When
-   `list_access_bundles_general` returns none for the vault, stop: say so and
-   send the person to `/vault/vaults/<vault id>/bundles/new` to create one
-   (pick the service and a lifetime; saving a bundle grants nothing), then
-   continue when they say it exists. Never use the vault id as the bundle id.
+   `list_access_bundles_general` returns none for the vault, say so and propose
+   `create_access_bundle_general --vault_id <vault> --name <short name>
+   --service_ids '["<service id>"]' --ttl_seconds <seconds>`. Use the lifetime
+   the service allows (never above its maximum) and only the services the task
+   needs. An instance administrator confirms it here; saving a bundle grants
+   nothing. Other users send the administrator to
+   `/vault/vaults/<vault id>/bundles/new`. Then continue with the new bundle's
+   `id` and `version` from the result. Never use the vault id as the bundle id.
    Also check that the service allows the method and path the task needs: a
    service limited to GET cannot `POST /v1/search`, so say that and point to
    the service's edit page instead of requesting a session that cannot help.

@@ -474,6 +474,7 @@ mod tests {
             "list_access_bundles_general",
             "get_access_vault_general",
             "create_vault_link",
+            "create_access_bundle_general",
             "create_access_session_general",
             "get_access_session_general",
             "revoke_access_session_general",
