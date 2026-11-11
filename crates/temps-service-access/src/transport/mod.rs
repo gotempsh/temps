@@ -197,6 +197,10 @@ impl WorkerTransport {
             })?
     }
     fn provider_error(id: &str, operation: &'static str, source: AgentError) -> TransportError {
+        // The API response stays masked; the operator-only log carries the
+        // provider's reason (for example a sandbox image without the proxy
+        // mount) so the cause is findable without a debugger.
+        tracing::error!(sandbox_id = %id, operation, error = %source, "Sandbox provider failed a service access operation");
         TransportError::Provider {
             sandbox_id: id.into(),
             operation,
