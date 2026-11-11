@@ -341,11 +341,12 @@ pub async fn install_tls_directory(
     let helper_id = match created {
         Ok(response) => response.id,
         Err(e) => {
+            cleanup.create_failed(&e);
             return Err(TlsInstallError::CreateHelper {
                 service: target.service_name.to_string(),
                 volume: target.volume.to_string(),
                 reason: e.to_string(),
-            })
+            });
         }
     };
     cleanup.created(&helper_id);
@@ -362,6 +363,27 @@ struct HelperCleanup {
     /// The helper's ID once Docker returned it, its unique name before.
     container: String,
     armed: bool,
+    /// Whether Docker answered the create. Until it has, the daemon may
+    /// still be creating the helper: a removal by name that finds nothing
+    /// is retried for [`PendingCreate`]'s window, not taken as done.
+    create_answered: bool,
+    pending_create: PendingCreate,
+}
+
+/// How long a drop before the create's answer keeps trying to remove the
+/// helper by name: long enough for a create already sent to finish in a
+/// loaded daemon (it pulls nothing), bounded so the task always ends.
+#[derive(Debug, Clone, Copy)]
+struct PendingCreate {
+    attempts: u32,
+    delay: std::time::Duration,
+}
+
+impl PendingCreate {
+    const DEFAULT: Self = Self {
+        attempts: 24,
+        delay: std::time::Duration::from_secs(5),
+    };
 }
 
 impl HelperCleanup {
@@ -370,11 +392,28 @@ impl HelperCleanup {
             docker: docker.clone(),
             container: name.to_string(),
             armed: true,
+            create_answered: false,
+            pending_create: PendingCreate::DEFAULT,
         }
     }
 
     fn created(&mut self, id: &str) {
         self.container = id.to_string();
+        self.create_answered = true;
+    }
+
+    /// The create failed. When the daemon itself answered, nothing was
+    /// created and there is nothing to remove; a transport failure (a
+    /// timeout, a reset) may have left the create running, so the cleanup
+    /// stays armed and keeps looking for it by name.
+    fn create_failed(&mut self, error: &bollard::errors::Error) {
+        if matches!(
+            error,
+            bollard::errors::Error::DockerResponseServerError { .. }
+        ) {
+            self.create_answered = true;
+            self.armed = false;
+        }
     }
 
     /// Remove the helper now. Disarmed only once the removal returned: if
@@ -399,8 +438,51 @@ impl Drop for HelperCleanup {
         };
         let docker = self.docker.clone();
         let container = std::mem::take(&mut self.container);
-        runtime.spawn(async move { remove_helper(&docker, &container).await });
+        if self.create_answered {
+            runtime.spawn(async move { remove_helper(&docker, &container).await });
+        } else {
+            let pending = self.pending_create;
+            runtime.spawn(async move { remove_pending_helper(&docker, &container, pending).await });
+        }
     }
+}
+
+/// Remove a helper whose create was sent but never answered, by its unique
+/// name: retried while nothing by that name exists yet, until it is
+/// removed or the window ends.
+async fn remove_pending_helper(docker: &bollard::Docker, name: &str, pending: PendingCreate) {
+    for attempt in 1..=pending.attempts {
+        match docker
+            .remove_container(
+                name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => return,
+            // Not created (yet), or still being created (a conflict).
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404 | 409,
+                ..
+            }) => {}
+            Err(e) => warn!(
+                container = name,
+                attempt,
+                error = %e,
+                "Could not remove the TLS install helper container; retrying"
+            ),
+        }
+        tokio::time::sleep(pending.delay).await;
+    }
+    warn!(
+        container = name,
+        attempts = pending.attempts,
+        "Stopped looking for the TLS install helper by name without removing one; \
+         if a container by this name exists, remove it by hand"
+    );
 }
 
 /// A name no other container has: a fixed name could belong to an
@@ -937,14 +1019,30 @@ mod tests {
             "a created helper is removed on drop"
         );
 
-        // Dropped before Docker answered the create: removed by name.
+        // Dropped before Docker answered the create, which the daemon only
+        // finishes afterwards: still removed, by name, once it exists.
         let by_name = format!("tls-cleanup-test-{run}-name");
-        drop(HelperCleanup::new(&docker, &by_name));
+        let mut cleanup = HelperCleanup::new(&docker, &by_name);
+        cleanup.pending_create = PendingCreate {
+            attempts: 50,
+            delay: std::time::Duration::from_millis(100),
+        };
+        drop(cleanup);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         create(by_name.clone()).await;
-        // That drop ran before this container existed; one dropped after
-        // a create that did finish removes it.
-        drop(HelperCleanup::new(&docker, &by_name));
-        assert!(gone_soon(by_name).await, "a helper is removed by its name");
+        assert!(
+            gone_soon(by_name).await,
+            "a helper created after its install was dropped is removed by its name"
+        );
+
+        // A create the daemon refused created nothing: nothing to remove.
+        let mut cleanup = HelperCleanup::new(&docker, &format!("tls-cleanup-test-{run}-refused"));
+        cleanup.create_failed(&bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such image".into(),
+        });
+        assert!(!cleanup.armed);
+        drop(cleanup);
 
         // A finished install disarms it: nothing else is removed later.
         let bystander = format!("tls-cleanup-test-{run}-bystander");
