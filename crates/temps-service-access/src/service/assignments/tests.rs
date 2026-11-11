@@ -665,6 +665,16 @@ async fn legacy_vault_retirement_fences_prepared_policy() {
     vault_approval_transition(true, "retire", false).await;
 }
 
+#[tokio::test]
+async fn legacy_membership_removal_fences_prepared_policy() {
+    vault_approval_transition(true, "remove", true).await;
+}
+
+#[tokio::test]
+async fn adding_standalone_service_to_existing_vault_fences_prepared_policy() {
+    vault_approval_transition(false, "add", false).await;
+}
+
 async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: bool) {
     if !temps_test_utils::external_database_configured()
         && !temps_test_utils::docker_available().await
@@ -794,32 +804,69 @@ async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: b
         None,
         Arc::new(crate::github::NoGithub),
     );
-    assert_eq!(
-        planner
-            .prepare(worker.identity().boot_id)
+    let before_membership = planner.prepare(worker.identity().boot_id).await.unwrap();
+    assert_eq!(before_membership.bindings.len(), 1);
+    if upgrade {
+        use temps_migrations::{MigrationTrait, SchemaManager, VaultMembershipFenceMigration};
+        VaultMembershipFenceMigration
+            .down(&SchemaManager::new(db.as_ref()))
             .await
-            .unwrap()
-            .bindings
-            .len(),
-        1
-    );
+            .unwrap();
+    }
     let before = grants::Entity::find_by_id(&grant)
         .one(db.as_ref())
         .await
         .unwrap()
         .unwrap();
-    let vault = service
+    let mut vault = service
         .save_vault(
             None,
             None,
             crate::vault_types::SaveAccessVault {
                 name: "Scoped vault".into(),
-                service_ids: vec![svc.id.clone()],
+                service_ids: if revoke_mode == "add" {
+                    vec![]
+                } else {
+                    vec![svc.id.clone()]
+                },
                 expected_version: None,
             },
         )
         .await
         .unwrap();
+    if revoke_mode == "add" {
+        vault = service
+            .save_vault(
+                None,
+                Some(vault.id.clone()),
+                crate::vault_types::SaveAccessVault {
+                    name: vault.name.clone(),
+                    service_ids: vec![svc.id.clone()],
+                    expected_version: Some(vault.version),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    if !upgrade {
+        let store = crate::authority::AuthorityStore::new(
+            db.clone(),
+            crate::service::tests::encryption(),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+        assert!(
+            store
+                .issue(
+                    before_membership.node_id,
+                    &before_membership.worker,
+                    before_membership.expected_revision,
+                    before_membership.bindings
+                )
+                .await
+                .is_err(),
+            "new vault membership must fence an already prepared standalone policy"
+        );
+    }
     let link = service
         .link_vault(&vault.id, Some(9751), None)
         .await
@@ -827,7 +874,7 @@ async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: b
     let link_id = if upgrade {
         use temps_migrations::{
             LegacyStandaloneVaultCoverageMigration, LegacyVaultRevocationFenceMigration,
-            MigrationTrait, SchemaManager,
+            MigrationTrait, SchemaManager, VaultMembershipFenceMigration,
         };
         // Reproduce the pre-upgrade persisted state, then apply the real additive
         // migration. The old version permitted membership alongside approval.
@@ -916,6 +963,20 @@ async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: b
             .up(&manager)
             .await
             .unwrap();
+        VaultMembershipFenceMigration.up(&manager).await.unwrap();
+        // An unchanged selection must retain pre-upgrade consent and its revision.
+        service
+            .save_vault(
+                None,
+                Some(vault.id.clone()),
+                crate::vault_types::SaveAccessVault {
+                    name: vault.name.clone(),
+                    service_ids: vec![svc.id.clone()],
+                    expected_version: Some(vault.version),
+                },
+            )
+            .await
+            .unwrap();
         format!("link_legacy_{}", vault.id)
     } else {
         // Post-upgrade membership requires fresh vault consent even with a link.
@@ -936,6 +997,20 @@ async fn vault_approval_transition(upgrade: bool, revoke_mode: &str, one_shot: b
         assert_eq!(stale.bindings.len(), 1);
     }
     match revoke_mode {
+        "remove" => {
+            service
+                .save_vault(
+                    None,
+                    Some(vault.id.clone()),
+                    crate::vault_types::SaveAccessVault {
+                        name: vault.name.clone(),
+                        service_ids: vec![],
+                        expected_version: Some(vault.version + 1),
+                    },
+                )
+                .await
+                .unwrap();
+        }
         "delete" => {
             db.execute_unprepared(&format!(
                 "DELETE FROM access_vault_links WHERE id='{link_id}'"

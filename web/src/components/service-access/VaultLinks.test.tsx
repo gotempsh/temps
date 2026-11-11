@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { MemoryRouter, useLocation, useNavigate } from 'react-router'
+import {
+  Link,
+  MemoryRouter,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+} from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, expect, test } from 'bun:test'
 import {
@@ -425,6 +432,109 @@ test.each(['invalid', '-1', '2.5', '99'])(
           '/vault/vaults/vault_fixture?tab=links'
         )
     } finally {
+      cleanup()
+      client.clear()
+      api.restore()
+    }
+  }
+)
+
+test.each(['link', 'back'])(
+  'pending unlink cannot navigate after leaving via %s',
+  async (navigation) => {
+    let finishDelete: (response: Response) => void = () => {}
+    const pendingDelete = new Promise<Response>((resolve) => {
+      finishDelete = resolve
+    })
+    const api = mockApi({
+      'GET /access-vaults/vault_fixture/links': () =>
+        jsonResponse({
+          items: [
+            {
+              id: 'link_fixture',
+              vault_id: 'vault_fixture',
+              project_id: 7,
+              sandbox_id: null,
+              consumer_name: 'Fixture consumer',
+              created_at: '2026-01-01T00:00:00Z',
+            },
+          ],
+          total: 21,
+          page: 2,
+          page_size: 20,
+        }),
+      'DELETE /access-vaults/vault_fixture/links/link_fixture': () =>
+        pendingDelete,
+    })
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    })
+    const sessionKey = [{ _id: 'listAccessSessionsGeneral' }]
+    client.setQueryData(sessionKey, [])
+    try {
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter
+            initialEntries={[
+              '/elsewhere',
+              '/vault/vaults/vault_fixture?tab=links&links_page=2',
+            ]}
+          >
+            <UrlProbe />
+            <Link to="/elsewhere">Leave vault</Link>
+            <Routes>
+              <Route
+                path="/vault/vaults/:vaultId"
+                element={<VaultLinks vaultId="vault_fixture" />}
+              />
+              <Route path="/elsewhere" element={<h1>Another task</h1>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const ui = within(document.body)
+      fireEvent.click(await ui.findByRole('button', { name: 'Unlink' }))
+      fireEvent.click(
+        within(ui.getByRole('alertdialog')).getByRole('button', {
+          name: 'Unlink and revoke access',
+        })
+      )
+      await waitFor(() =>
+        expect(
+          api.called(
+            'DELETE',
+            '/access-vaults/vault_fixture/links/link_fixture'
+          )
+        ).toBe(true)
+      )
+      fireEvent.click(
+        navigation === 'back'
+          ? ui.getByRole('button', { name: 'Back', hidden: true })
+          : ui.getByRole('link', { name: 'Leave vault', hidden: true })
+      )
+      await waitFor(() =>
+        expect(ui.getByRole('heading', { name: 'Another task' })).toBeTruthy()
+      )
+      expect(ui.queryByRole('table')).toBeNull()
+      finishDelete(new Response(null, { status: 204 }))
+      await waitFor(() =>
+        expect(client.getMutationCache().getAll()[0]?.state.status).toBe(
+          'success'
+        )
+      )
+      expect(ui.getByLabelText('URL').textContent).toBe('/elsewhere')
+      expect(client.getQueryState(sessionKey)?.isInvalidated).toBe(true)
+      expect(
+        client
+          .getQueryCache()
+          .findAll({ queryKey: [{ _id: 'listVaultLinks' }] })
+          .every((query) => query.state.isInvalidated)
+      ).toBe(true)
+    } finally {
+      finishDelete(new Response(null, { status: 204 }))
       cleanup()
       client.clear()
       api.restore()

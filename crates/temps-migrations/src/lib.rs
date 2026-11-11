@@ -31,6 +31,7 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
 pub use migration::m20261107_000003_unique_custom_domain_hostname::Migration as UniqueCustomDomainHostnameMigration;
 pub use migration::m20261111_000001_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
 pub use migration::m20261111_000002_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
+pub use migration::m20261111_000003_vault_membership_fence::Migration as VaultMembershipFenceMigration;
 pub use migration::Migrator;
 
 pub use migration::m20261022_000001_dns_name_claims::{

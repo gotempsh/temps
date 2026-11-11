@@ -115,11 +115,7 @@ export function VaultLinks({
         path: { vault_id: vaultId, link_id: link.id },
         throwOnError: true,
       }),
-    onSuccess: () => {
-      setPage(1)
-      refresh()
-      setRemoving(undefined)
-    },
+    onSuccess: refresh,
   })
   return (
     <section className="space-y-3" aria-label="Linked to">
@@ -279,7 +275,10 @@ export function VaultLinks({
           </>
         }
         onConfirm={() => {
-          if (removing) remove.mutate(removing)
+          if (removing)
+            remove.mutate(removing, {
+              onSuccess: () => setRemoving(undefined),
+            })
         }}
       />
     </section>
