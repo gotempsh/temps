@@ -103,7 +103,10 @@ Either can be rotated without touching the other.
   uniquely and removes only the container it created, by ID, so it can never
   touch an operator's container or a concurrent install's helper. A guard
   removes it on every path, including the install being cancelled (a dropped
-  backup or request), so no helper keeps the volume referenced. If the
+  backup or request), so no helper keeps the volume referenced. It is
+  removed with its anonymous volumes: an image that declares a volume below
+  the mount (`/var/lib/postgresql/data` in the PostgreSQL images) gives every
+  helper one, and Docker's removal never touches the named data volume. If the
   cancellation comes before Docker answered the create, the guard keeps
   retrying the removal by the helper's unique name for a bounded window,
   because the daemon may finish that create afterwards. Docker's archive API reads the
@@ -253,9 +256,11 @@ one instance can be in different modes.
 - A standalone service's initialization and start hold the same per-service
   TLS lock as a mode change. Neither can rewrite the certificate directory or
   recreate the container while a change or its rollback does. A container
-  recreate that re-initializes the service (a new `/dev/shm` size) takes that
-  lock before the container's own recreate lock, in the order a mode change
-  takes them. A cluster's start releases it: its data nodes take it in their
+  recreate that re-initializes the service (a new `/dev/shm` size), and a
+  forced recreate that applies a CMD-baked setting (enabling
+  `pg_stat_statements`), take that lock before reading the mode they recreate
+  with and before the container's own recreate lock, in the order a mode
+  change takes them. A cluster's start releases it: its data nodes take it in their
   own TLS pass.
 - A mode change with its audit entry, and each cluster pass a caller awaits
   with its follow-up retry, runs on a task of its own. A request dropped
