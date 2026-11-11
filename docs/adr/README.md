@@ -111,15 +111,16 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [090](./090-macos-workers.md) | macOS Workers | Accepted |  |
 | [091](./091-change-worker-labels-after-join.md) | Changing a Worker's Labels After It Joined | Accepted |  |
 | [092](./092-plugin-ai-tools.md) | Plugin AI tools are marked API operations | Accepted |  |
-| [093](./093-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [099](./099-worker-backups-run-the-local-engines.md) |
+| [093](./093-managed-database-tls.md) | Server-Side TLS for Managed Databases | Proposed |  |
 | [094](./094-cloud-console-session-revocation.md) | Temps Cloud console sessions end when Cloud revokes the user | Accepted |  |
 | [095](./095-internal-dns-observability.md) | Internal DNS observability: resolver health, records, query log, traffic and alerts | Proposed | amended by [097](./097-internal-dns-canary-corrections.md); amended by [098](./098-internal-proxy-own-port.md) |
 | [096](./096-worker-health-for-environments-without-ingress.md) | Worker health for environments without ingress | Accepted | amends [068](./068-environment-addresses-without-a-public-preview-domain.md) |
 | [097](./097-internal-dns-canary-corrections.md) | Internal DNS canary corrections | Accepted | amends [011](./011-internal-dns-ha-databases.md); amends [024](./024-control-plane-dns-resolver.md); amends [095](./095-internal-dns-observability.md) |
 | [098](./098-internal-proxy-own-port.md) | The worker's internal proxy listens on its own port, and containers' port 80 is redirected to it | Proposed | amends [095](./095-internal-dns-observability.md) |
-| [099](./099-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [093](./093-scoped-s3-credentials-for-worker-jobs.md) |
+| [099](./099-worker-backups-run-the-local-engines.md) | Backups of a worker's services run the local engines through its agent | Proposed | amends [055](./055-workload-plane-and-runtime-drivers.md); amended by [102](./102-scoped-s3-credentials-for-worker-jobs.md) |
 | [100](./100-control-plane-backup-without-docker.md) | The control-plane backup dumps with the local PostgreSQL client when there is no Docker | Accepted |  |
 | [101](./101-internal-access-grants.md) | Internal access grants let another project call a project's `*.temps.local` routes | Proposed |  |
+| [102](./102-scoped-s3-credentials-for-worker-jobs.md) | A worker receives S3 credentials scoped to the job, never the source's own | Proposed | amends [099](./099-worker-backups-run-the-local-engines.md) |
 
 ## Supporting documents
 

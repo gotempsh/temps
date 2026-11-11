@@ -842,7 +842,7 @@ async fn test_update_s3_source_keeps_credentials_sent_back_masked() {
 // Bug 4: list_source_backups must include pending/failed rows without s3_location
 // -------------------------------------------------------------------------
 
-/// ADR-093: an operator can allow full credentials on a source that cannot
+/// ADR-102: an operator can allow full credentials on a source that cannot
 /// scope them, and nothing else changes: no probe, no credential rewrite.
 #[tokio::test]
 async fn update_s3_source_sets_only_the_worker_credentials_policy() {

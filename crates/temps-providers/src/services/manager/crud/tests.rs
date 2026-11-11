@@ -2437,7 +2437,7 @@ async fn create_cluster_with_too_many_members_writes_nothing() {
 /// start wrapping a placeholder ID.
 #[test]
 fn a_refused_parameter_is_reported_under_the_new_services_id() {
-    let error = ExternalServiceManager::initialization_failure(
+    let error = ExternalServiceManager::creation_failure(
         10,
         ExternalServiceError::ParameterValidationFailed {
             service_id: 0,
@@ -2456,7 +2456,7 @@ fn a_refused_parameter_is_reported_under_the_new_services_id() {
         "Parameter validation failed for service 10: managed S3 backend 'garage' cannot be created on a worker node"
     );
 
-    let conflict = ExternalServiceManager::initialization_failure(
+    let conflict = ExternalServiceManager::creation_failure(
         10,
         ExternalServiceError::ServiceResourceConflict {
             name: "orders".to_string(),
@@ -2471,7 +2471,7 @@ fn a_refused_parameter_is_reported_under_the_new_services_id() {
         "{conflict:?}"
     );
 
-    let failed = ExternalServiceManager::initialization_failure(
+    let failed = ExternalServiceManager::creation_failure(
         10,
         ExternalServiceError::InternalError {
             reason: "agent unreachable".to_string(),

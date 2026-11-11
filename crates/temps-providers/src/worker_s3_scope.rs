@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The only S3 credential a worker node ever receives (ADR-093).
+//! The only S3 credential a worker node ever receives (ADR-102).
 //!
 //! A backup or restore of a service on a worker node runs on that node, by its
 //! agent, and needs to reach the S3 source. It never receives the source's

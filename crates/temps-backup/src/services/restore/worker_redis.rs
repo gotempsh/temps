@@ -126,7 +126,7 @@ pub(super) async fn run(
     // control plane; the target keeps its own bookkeeping, as there.
     let origin = backup_origin_service_id(db.as_ref(), backup).await;
     let keep_bookkeeping = keeps_target_bookkeeping(origin, target.id);
-    // The node can read this one backup and nothing else (ADR-093): the
+    // The node can read this one backup and nothing else (ADR-102): the
     // WAL-G repository a stream backup is fetched from, or the snapshot's own
     // directory.
     let source =

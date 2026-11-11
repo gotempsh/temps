@@ -80,7 +80,7 @@ impl TempsPlugin for ProvidersPlugin {
             {
                 external_service_manager = external_service_manager.with_cluster_dns_slot(slot);
             }
-            // ADR-093: the one place a worker's S3 credential is derived,
+            // ADR-102: the one place a worker's S3 credential is derived,
             // shared by the manager and the backup engines. The Cloud
             // plugin's minter is handed over at initialisation.
             let worker_credentials = Arc::new(crate::worker_s3_scope::WorkerCredentialScoper::new(
@@ -114,7 +114,7 @@ impl TempsPlugin for ProvidersPlugin {
             );
             context.register_service(env_vars_provider);
 
-            // ADR-093: a worker PostgreSQL archives with a short-lived
+            // ADR-102: a worker PostgreSQL archives with a short-lived
             // credential scoped to its own repository; keep it fresh. Runs on
             // every profile: a control plane without local workloads is
             // exactly the one whose databases are on workers.
@@ -264,7 +264,7 @@ impl TempsPlugin for ProvidersPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            // ADR-093: a managed source's worker credentials are minted by
+            // ADR-102: a managed source's worker credentials are minted by
             // Temps Cloud. `get_service`: a build without the Cloud plugin
             // has no managed source, and refuses one with the reason.
             let worker_credentials =
@@ -348,12 +348,15 @@ impl TempsPlugin for ProvidersPlugin {
         let data_import_routes =
             crate::handlers::data_import_handlers::configure_routes().with_state(app_state.clone());
         let workload_routes =
-            crate::handlers::workload_handlers::configure_routes().with_state(app_state);
+            crate::handlers::workload_handlers::configure_routes().with_state(app_state.clone());
+        let server_tls_routes =
+            crate::handlers::server_tls_handlers::configure_routes().with_state(app_state);
 
         let router = providers_routes
             .merge(pg_stat_routes)
             .merge(data_import_routes)
-            .merge(workload_routes);
+            .merge(workload_routes)
+            .merge(server_tls_routes);
         Some(PluginRoutes::new(router))
     }
 
@@ -366,9 +369,11 @@ impl TempsPlugin for ProvidersPlugin {
         let data_import = <DataImportApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::workload_handlers::WorkloadModeApiDoc;
         let workload = <WorkloadModeApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::server_tls_handlers::ServerTlsApiDoc;
+        let server_tls = <ServerTlsApiDoc as OpenApiTrait>::openapi();
         Some(merge_openapi_schemas(
             base,
-            vec![pg_stat, data_import, workload],
+            vec![pg_stat, data_import, workload, server_tls],
         ))
     }
 }

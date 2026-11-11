@@ -50,7 +50,7 @@ pub struct PostgresWalgDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
-    /// Derives a worker's S3 credential (ADR-093).
+    /// Derives a worker's S3 credential (ADR-102).
     pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
@@ -307,7 +307,7 @@ async fn backup_on_worker(
     // The base backup writes this credential into `walg.env`, where
     // `archive_command` keeps using it: it is the archiving credential,
     // limited to the service's own WAL-G repository and refreshed by the
-    // control plane (ADR-093).
+    // control plane (ADR-102).
     let mint = || {
         super::worker_agent::scoped_destination(
             &deps.worker_credentials,

@@ -723,7 +723,7 @@ const WALG_S3_KEY: &str = "walgproofkey";
 const WALG_BUCKET_PATH: &str = "fleet";
 
 /// What the control plane sends the agent for a job on `prefixes` of
-/// `full`'s bucket (ADR-093): a credential the bucket's own STS (RustFS's
+/// `full`'s bucket (ADR-102): a credential the bucket's own STS (RustFS's
 /// `AssumeRole`) mints for those prefixes alone, through the control plane's
 /// own `WorkerCredentialScoper`. A proof that passes with it shows the
 /// engine's grant is enough; one with the full key would not.
@@ -3443,7 +3443,7 @@ fn redis_destination(endpoint: String) -> temps_service_protocol::WorkerS3Destin
     }
 }
 
-/// What the control plane sends for one Redis job (ADR-093): a credential
+/// What the control plane sends for one Redis job (ADR-102): a credential
 /// RustFS mints for `prefix` alone, through the port this process reaches,
 /// handed to the node with the endpoint it reaches the bucket at.
 async fn redis_scoped(
@@ -3625,7 +3625,7 @@ async fn a_worker_redis_is_backed_up_and_restored_by_the_control_plane_engine_th
 
     // ── 1. Back up, both ways ────────────────────────────────────────────
     // Every request carries what the control plane sends: a credential
-    // scoped to the job's own prefix (ADR-093), never the bucket's key.
+    // scoped to the job's own prefix (ADR-102), never the bucket's key.
     use temps_core::ScopedS3Access::{Read, Write};
     cli(&["SET", "proof", "before-backup"]).await;
     cli(&["SET", "_temps:redis_db_mapping:shop", "1"]).await;
@@ -4342,7 +4342,7 @@ impl MariadbFixture {
         }
     }
 
-    /// What the control plane sends for one MariaDB job (ADR-093): a
+    /// What the control plane sends for one MariaDB job (ADR-102): a
     /// credential RustFS mints for `prefixes` alone.
     async fn scoped(
         &self,
@@ -4399,7 +4399,7 @@ impl MariadbFixture {
 ///    running, unchanged.
 /// 7. A logical dump is streamed to S3 and restored in place.
 ///
-/// Every request carries what the control plane now sends (ADR-093): a
+/// Every request carries what the control plane now sends (ADR-102): a
 /// credential RustFS mints for that job's prefixes alone, write for the
 /// base, the binary logs and the dump, read for a restore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

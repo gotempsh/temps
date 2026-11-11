@@ -567,7 +567,7 @@ pub struct RestoreService {
     /// Phase 9); an empty slot refuses them with the reason.
     workload_plane: Arc<temps_workload_plane::PlaneSlot>,
     /// Derives the S3 credential a restore on a worker node receives
-    /// (ADR-093).
+    /// (ADR-102).
     worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
@@ -3820,7 +3820,7 @@ fn agent_restore_supported(
 
 /// What a worker engine's restore takes from the restore service: the
 /// database, the encryption service (the restored login is patched into
-/// the target's stored configuration), the credential scoper (ADR-093) and
+/// the target's stored configuration), the credential scoper (ADR-102) and
 /// the manager that reaches the node's agent.
 pub(super) struct WorkerRestoreDeps<'a> {
     pub db: &'a Arc<DatabaseConnection>,
@@ -3829,7 +3829,7 @@ pub(super) struct WorkerRestoreDeps<'a> {
     pub mgr: &'a Arc<ExternalServiceManager>,
 }
 
-/// The S3 source a restore on worker `node_id` receives (ADR-093): a
+/// The S3 source a restore on worker `node_id` receives (ADR-102): a
 /// read-only credential for `backup`'s own location (its WAL-G repository,
 /// or its object's directory) and for `extra_prefixes` (a point-in-time
 /// recovery's binary logs), never the source's own. A location outside the
@@ -3935,7 +3935,7 @@ async fn run_agent_restore(
         .unwrap_or(&backup.s3_location)
         .trim_start_matches('/')
         .to_string();
-    // The worker can read this one backup and nothing else (ADR-093).
+    // The worker can read this one backup and nothing else (ADR-102).
     let read_prefix = match worker_agent::worker_service_kind(&target.service_type) {
         Some(worker_agent::WorkerServiceKind::Storage) => {
             temps_providers::worker_s3_scope::as_prefix(&location)

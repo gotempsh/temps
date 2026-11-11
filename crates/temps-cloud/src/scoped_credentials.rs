@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Job-scoped credentials for the managed backup source (ADR-093).
+//! Job-scoped credentials for the managed backup source (ADR-102).
 //!
 //! A worker node never receives the managed source's bucket token. For each
 //! worker job the control plane asks Cloud, with its instance token, for a

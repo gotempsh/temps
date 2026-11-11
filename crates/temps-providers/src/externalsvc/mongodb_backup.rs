@@ -14,7 +14,7 @@
 //!    worker's service the control plane makes the same check through the
 //!    agent first and sends its choice ([`MongodbBackupMode`]) with a
 //!    credential scoped to that one repository or archive directory
-//!    (ADR-093, ADR-099); the node takes exactly that backup.
+//!    (ADR-102, ADR-099); the node takes exactly that backup.
 //! 3. With WAL-G, `wal-g backup-push` in the container streams `mongodump
 //!    --archive` into the service's WAL-G repository.
 //! 4. Without it, a pinned `mongodump --archive --gzip` helper on the

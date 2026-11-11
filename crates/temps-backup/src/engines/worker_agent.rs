@@ -10,7 +10,7 @@
 //! node's agent to run the bucket mirror on that node, straight into the S3
 //! source (`temps_providers::externalsvc::worker_data`). The request is
 //! sealed to the node and carries a credential scoped to this backup's own
-//! prefix (ADR-093), never the source's. Nothing about the service changes;
+//! prefix (ADR-102), never the source's. Nothing about the service changes;
 //! it is not stopped or restarted.
 //!
 //! The objects are the local engine's (a bucket mirror under
@@ -121,7 +121,7 @@ pub fn backup_scope_prefix(key: &str, kind: WorkerServiceKind) -> String {
     }
 }
 
-/// The prefix a worker restore reading `location` is granted (ADR-093): a
+/// The prefix a worker restore reading `location` is granted (ADR-102): a
 /// WAL-G repository `s3://<bucket>/<prefix>` as that prefix, an object key as
 /// its own directory. `None` for a repository outside `bucket`, or a location
 /// with no directory, which would be the whole bucket. The scoper refuses
@@ -158,7 +158,7 @@ pub fn within_one_service(prefix: &str, bucket_path: &str) -> bool {
     })
 }
 
-/// The S3 destination a worker job receives (ADR-093): a credential the
+/// The S3 destination a worker job receives (ADR-102): a credential the
 /// control plane derives for `grant` (the job's prefixes, read or write, a
 /// lifetime), never the source's own unless the source allows it and cannot
 /// scope. Refuses an endpoint on this host's loopback, which the node cannot
@@ -211,7 +211,7 @@ pub struct WorkerAgentDeps {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// Reaches the service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
-    /// Derives the job's S3 credential (ADR-093).
+    /// Derives the job's S3 credential (ADR-102).
     pub worker_credentials: Arc<WorkerCredentialScoper>,
 }
 

@@ -26,7 +26,7 @@
 //! choice included, is this plane half, the same for both. Redis is never
 //! stopped by a backup.
 //!
-//! A worker never receives the S3 source's own credential (ADR-093): the
+//! A worker never receives the S3 source's own credential (ADR-102): the
 //! plane makes the engine choice, so it scopes the credential it sends to
 //! that backup alone, the service's WAL-G repository for a stream, or the
 //! one directory of the RDB snapshot's key, which the plane chose.
@@ -60,7 +60,7 @@ pub struct RedisDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker Redis's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
-    /// Derives a worker backup's S3 credential (ADR-093).
+    /// Derives a worker backup's S3 credential (ADR-102).
     pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
@@ -438,7 +438,7 @@ fn local_destination(
 }
 
 /// The S3 source as worker `node_id` receives it for one backup: a
-/// credential that can write `prefix` and nothing else (ADR-093). Refuses an
+/// credential that can write `prefix` and nothing else (ADR-102). Refuses an
 /// endpoint on this host's loopback, which the node cannot reach.
 async fn worker_destination(
     deps: &RedisDeps,

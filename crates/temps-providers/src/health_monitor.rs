@@ -177,7 +177,7 @@ pub struct ExternalServiceHealthMonitor {
     /// archiving so it only fires once per service's `binlog_archive_interval`.
     last_binlog_archive: Arc<Mutex<HashMap<i32, Instant>>>,
     /// The scoped credential each worker MariaDB ships its binary logs with
-    /// (ADR-093), keyed by service id: reused across archive runs and minted
+    /// (ADR-102), keyed by service id: reused across archive runs and minted
     /// again every [`ARCHIVE_CREDENTIAL_REFRESH_INTERVAL`], when the service
     /// moves to another node or source, or after a run that failed.
     ///
@@ -1071,7 +1071,7 @@ impl ExternalServiceHealthMonitor {
     /// Ship the closed binary logs of `service`, a MariaDB on worker
     /// `node_id`, to `s3_source` with the control plane's archiver run by the
     /// node's agent, under a credential scoped to the service's `binlog/`
-    /// prefix (ADR-093), never the source's own. Returns how many segments
+    /// prefix (ADR-102), never the source's own. Returns how many segments
     /// were shipped.
     async fn archive_worker_mariadb_binlogs(
         &self,

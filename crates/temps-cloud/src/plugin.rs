@@ -100,7 +100,7 @@ impl TempsPlugin for CloudPlugin {
                 encryption.clone(),
                 self.allow_loopback_development,
             ));
-            // ADR-093: worker jobs get credentials Cloud scopes for them.
+            // ADR-102: worker jobs get credentials Cloud scopes for them.
             let scoped_credentials: Arc<dyn temps_core::ManagedBackupScopedCredentials> =
                 Arc::new(crate::CloudScopedCredentialMinter::new(link.clone()));
             context.register_service(scoped_credentials);

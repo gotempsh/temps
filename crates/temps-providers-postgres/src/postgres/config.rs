@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::externalsvc::port_util::find_available_port;
+use crate::externalsvc::server_tls::{ServerTlsMaterial, ServerTlsMode};
 use crate::externalsvc::ServiceConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,22 @@ pub struct PostgresInputConfig {
     #[serde(default, deserialize_with = "deserialize_optional_non_empty")]
     #[schemars(skip)]
     pub container_name: Option<String>,
+
+    /// Server-side TLS mode (ADR 093). Injected by the control plane from the
+    /// service's TLS record when it (re)creates the container; never part of
+    /// the create form and never stored in the parameter blob. Absent means
+    /// "not said" (a path that rebuilds from stored parameters, such as a
+    /// backup enabling WAL archiving), never `off`: a replacement container
+    /// then keeps the TLS the one it replaces serves.
+    #[serde(default, rename = "server_tls_mode")]
+    #[schemars(skip)]
+    pub server_tls_mode: Option<ServerTlsMode>,
+
+    /// Certificate and key to install when `server_tls_mode` offers TLS.
+    /// Transient, injected alongside `server_tls_mode`.
+    #[serde(default, rename = "server_tls_material")]
+    #[schemars(skip)]
+    pub server_tls_material: Option<ServerTlsMaterial>,
 }
 
 /// Internal runtime configuration for PostgreSQL service
@@ -123,9 +140,50 @@ pub struct PostgresConfig {
     /// `PostgresInputConfig::container_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_name: Option<String>,
+    /// See `PostgresInputConfig::server_tls_mode`. Never serialized: the
+    /// serialized config is what `init()` persists as inferred parameters,
+    /// and the TLS record, not the parameter blob, is the source of truth.
+    #[serde(default, skip_serializing)]
+    pub server_tls_mode: Option<ServerTlsMode>,
+    /// See `PostgresInputConfig::server_tls_material`. Never serialized, so
+    /// the key can never be written back into stored parameters.
+    #[serde(default, skip_serializing)]
+    pub server_tls_material: Option<ServerTlsMaterial>,
 }
 
 impl PostgresConfig {
+    /// The material to install, when this container should offer TLS: the
+    /// mode asks for it, the control plane supplied it, and Temps manages the
+    /// container (an imported container is never reconfigured).
+    pub(crate) fn effective_server_tls(&self) -> Option<&ServerTlsMaterial> {
+        if !self.server_tls_mode.is_some_and(ServerTlsMode::offers_tls)
+            || self.container_name.is_some()
+        {
+            return None;
+        }
+        self.server_tls_material.as_ref()
+    }
+
+    /// What a container built from this config should look like with respect
+    /// to TLS, or `None` when that cannot be decided: TLS is asked for but no
+    /// material was supplied (a lifecycle path that does not carry it), so the
+    /// running container must be left as it is rather than stripped of TLS.
+    pub(crate) fn desired_server_tls(&self) -> Option<DesiredServerTls> {
+        if self.container_name.is_some() {
+            return None;
+        }
+        // Not said: nothing to compare the running container against.
+        let mode = self.server_tls_mode?;
+        if !mode.offers_tls() {
+            return Some(DesiredServerTls::Off);
+        }
+        self.server_tls_material
+            .as_ref()
+            .map(|material| DesiredServerTls::On {
+                fingerprint_sha256: material.fingerprint_sha256.clone(),
+            })
+    }
+
     /// A new managed service must never inherit an imported workload's
     /// physical container identity. Its own name identifies its new resources.
     pub(super) fn for_managed_clone(mut self) -> Self {
@@ -152,8 +210,17 @@ impl From<PostgresInputConfig> for PostgresConfig {
                 .docker_image
                 .unwrap_or_else(|| "gotempsh/postgres-walg:18-bookworm".to_string()),
             container_name: input.container_name,
+            server_tls_mode: input.server_tls_mode,
+            server_tls_material: input.server_tls_material,
         }
     }
+}
+
+/// The TLS state a PostgreSQL container should be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DesiredServerTls {
+    Off,
+    On { fingerprint_sha256: String },
 }
 
 /// Treats a blank string the same as an absent value — see
@@ -698,6 +765,8 @@ mod tests {
             ssl_mode: default_ssl_mode(),
             docker_image: None,
             container_name: None,
+            server_tls_mode: None,
+            server_tls_material: None,
         };
 
         let runtime_config: PostgresConfig = config.into();
@@ -725,6 +794,8 @@ mod tests {
             ssl_mode: Some("disable".to_string()),
             docker_image: Some("timescale/timescaledb-ha:pg18".to_string()),
             container_name: None,
+            server_tls_mode: None,
+            server_tls_material: None,
         };
 
         let runtime_config: PostgresConfig = config.into();

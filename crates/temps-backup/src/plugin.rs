@@ -249,7 +249,7 @@ impl TempsPlugin for BackupPlugin {
                 .get_service::<temps_workload_plane::PlaneSlot>()
                 .unwrap_or_else(|| Arc::new(temps_workload_plane::PlaneSlot::new()));
 
-            // ADR-093: the one place a worker job's S3 credential is derived,
+            // ADR-102: the one place a worker job's S3 credential is derived,
             // registered by the providers plugin.
             let worker_credentials = context
                 .require_service::<temps_providers::worker_s3_scope::WorkerCredentialScoper>(

@@ -20,6 +20,7 @@ pub mod env_vars_provider_impl;
 pub mod externalsvc;
 pub mod health_monitor;
 pub mod managed_names;
+pub mod managed_tls;
 mod node_alert_rule_service;
 pub mod node_runtime;
 pub mod parameter_strategies;

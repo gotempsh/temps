@@ -206,7 +206,7 @@ pub(super) async fn run(
         });
     }
     let bucket_path = s3_source.bucket_path;
-    // A read-only credential for the backup's own location (ADR-093) and,
+    // A read-only credential for the backup's own location (ADR-102) and,
     // for a point-in-time recovery, the binary logs the replay reads: the
     // same prefix the node derives from the backup's layout, so another
     // service's base replays that service's logs and nothing else.

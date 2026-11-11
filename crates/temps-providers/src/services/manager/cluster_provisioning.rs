@@ -948,6 +948,11 @@ impl ExternalServiceManager {
         // is already running for this service_id (idempotent retry).
         self.spawn_role_reconciler(service_id, service_name).await;
 
+        // New clusters default to managed TLS (ADR 093): swap every data
+        // node's self-signed certificate for the managed one.
+        self.reconcile_cluster_server_tls(service_id, "cluster created")
+            .await;
+
         info!("Cluster service {} initialized successfully", service_id);
         Ok(())
     }

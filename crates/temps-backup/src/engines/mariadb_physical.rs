@@ -58,7 +58,7 @@ pub struct MariadbPhysicalDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
-    /// Derives the per-job credential a worker's agent receives (ADR-093).
+    /// Derives the per-job credential a worker's agent receives (ADR-102).
     pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
@@ -334,7 +334,7 @@ async fn physical_backup_on_worker(
     bucket_path: &str,
     backup_uuid: &str,
 ) -> Result<Option<MariadbBinlogCoordinate>, BackupError> {
-    // A credential for the service's WAL-G repository only (ADR-093), the
+    // A credential for the service's WAL-G repository only (ADR-102), the
     // one prefix `wal-g backup-push` writes.
     let mint = || {
         super::worker_agent::scoped_destination(

@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-093: A worker receives S3 credentials scoped to the job, never the source's own
+# ADR-102: A worker receives S3 credentials scoped to the job, never the source's own
 
 **Status:** Proposed
 **Date:** 2026-11-08

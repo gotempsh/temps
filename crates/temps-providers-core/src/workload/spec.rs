@@ -287,6 +287,27 @@ pub struct DatabaseProcess {
     /// `(named volume, container path)`.
     pub volumes: Vec<(String, String)>,
     pub host: DatabaseHostSettings,
+    /// The engine's labels a replacement must keep ([`CARRIED_LABELS`]).
+    pub labels: BTreeMap<String, String>,
+}
+
+/// Labels an engine sets on its container that describe what the
+/// container serves rather than who owns it, so its spec carries them
+/// through to the container it creates. ADR 093: without the server TLS
+/// fingerprint every start would see certificate drift and recreate the
+/// database again.
+pub const CARRIED_LABELS: &[&str] = &[crate::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL];
+
+/// The [`CARRIED_LABELS`] among `labels`.
+fn carried_labels(
+    labels: Option<&std::collections::HashMap<String, String>>,
+) -> BTreeMap<String, String> {
+    labels
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| CARRIED_LABELS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 impl fmt::Debug for DatabaseProcess {
@@ -300,6 +321,7 @@ impl fmt::Debug for DatabaseProcess {
             .field("host_port", &self.host_port)
             .field("volumes", &self.volumes)
             .field("host", &self.host)
+            .field("labels", &self.labels)
             .finish()
     }
 }
@@ -429,6 +451,7 @@ impl DatabaseProcess {
             host_port,
             volumes,
             host,
+            labels: BTreeMap::new(),
         }
     }
 
@@ -482,16 +505,19 @@ impl DatabaseProcess {
                 volumes.push((source.clone(), target.clone()));
             }
         }
-        Ok(Self::assemble(
-            engine,
-            image,
-            body.env.iter().flatten().map(|e| split_env(e)),
-            body.cmd.clone(),
-            container_port,
-            host_port,
-            volumes,
-            DatabaseHostSettings::from_host_config(host),
-        ))
+        Ok(Self {
+            labels: carried_labels(body.labels.as_ref()),
+            ..Self::assemble(
+                engine,
+                image,
+                body.env.iter().flatten().map(|e| split_env(e)),
+                body.cmd.clone(),
+                container_port,
+                host_port,
+                volumes,
+                DatabaseHostSettings::from_host_config(host),
+            )
+        })
     }
 
     /// The process an existing container runs. `image_env` and `image_cmd`
@@ -541,16 +567,19 @@ impl DatabaseProcess {
             .cmd
             .clone()
             .filter(|cmd| image_cmd != Some(cmd.as_slice()));
-        Ok(Self::assemble(
-            engine,
-            image,
-            env,
-            command,
-            container_port,
-            host_port,
-            volumes,
-            DatabaseHostSettings::from_host_config(host),
-        ))
+        Ok(Self {
+            labels: carried_labels(config.labels.as_ref()),
+            ..Self::assemble(
+                engine,
+                image,
+                env,
+                command,
+                container_port,
+                host_port,
+                volumes,
+                DatabaseHostSettings::from_host_config(host),
+            )
+        })
     }
 
     /// The process of the agent request a worker database is created with.
@@ -700,7 +729,11 @@ pub fn database_workload_spec(
             restart: RestartPolicy::Always,
         },
         security: None,
-        labels: database_labels(identity),
+        labels: {
+            let mut labels = database_labels(identity);
+            labels.extend(process.labels.clone());
+            labels
+        },
     }
 }
 
@@ -1154,6 +1187,74 @@ mod tests {
             plan.keep_restart_policy(&existing(unset));
             assert_eq!(restart_of(&plan), Some(RestartPolicyNameEnum::ALWAYS));
         }
+    }
+
+    /// ADR 093: an enforced create rebuilds the container from its spec, so
+    /// the spec must carry the TLS fingerprint the engine labels it with, or
+    /// every start sees certificate drift and recreates the database.
+    #[test]
+    fn the_server_tls_fingerprint_survives_an_enforced_create() {
+        let fingerprint = crate::externalsvc::server_tls::SERVER_TLS_FINGERPRINT_LABEL;
+        let request = ContainerCreateBody {
+            image: Some("postgres:18-alpine".into()),
+            env: Some(vec!["POSTGRES_USER=app".into()]),
+            cmd: Some(vec!["postgres".into(), "-c".into(), "ssl=on".into()]),
+            exposed_ports: Some(vec!["5432/tcp".into()]),
+            labels: Some(HashMap::from([
+                (fingerprint.to_string(), "ab12".to_string()),
+                ("com.example.unrelated".to_string(), "x".to_string()),
+            ])),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec!["postgres-orders_data:/var/lib/postgresql".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let process =
+            DatabaseProcess::from_create_body(DatabaseEngine::Postgres, &request).unwrap();
+        assert_eq!(
+            process.labels,
+            BTreeMap::from([(fingerprint.to_string(), "ab12".to_string())]),
+            "only the carried labels, never an arbitrary one"
+        );
+        let plan = DatabaseWorkloadPlan::admit(
+            &identity(DatabaseEngine::Postgres, "postgres-orders", None),
+            &process,
+        )
+        .unwrap();
+        assert_eq!(plan.spec.labels[fingerprint], "ab12");
+        let values = process.secret_values();
+        let body = database_create_body(
+            &plan,
+            SecretValues::Resolved(&values),
+            &NodeAttachment {
+                host_ip: "127.0.0.1".into(),
+                network: Some("temps-app-network".into()),
+                dns: None,
+            },
+        )
+        .unwrap();
+        let labels = body.labels.as_ref().unwrap();
+        assert_eq!(labels[fingerprint], "ab12");
+        assert!(!labels.contains_key("com.example.unrelated"));
+        assert_eq!(labels["temps.service_type"], "postgres");
+
+        // The container it creates reads back with the same label, so the
+        // shadow comparison sees no extra Temps label on it.
+        let inspect = ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                image: body.image.clone(),
+                env: body.env.clone(),
+                cmd: body.cmd.clone(),
+                labels: body.labels.clone(),
+                exposed_ports: Some(vec!["5432/tcp".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let read_back =
+            DatabaseProcess::from_inspect(DatabaseEngine::Postgres, &inspect, &[], None).unwrap();
+        assert_eq!(read_back.labels, process.labels);
     }
 
     #[test]

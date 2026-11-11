@@ -73,7 +73,7 @@ pub struct Model {
     /// recursively write a backup into itself.
     pub backing_service_id: Option<i32>,
     /// Whether a worker node may receive this source's own credential when
-    /// the source cannot mint a job-scoped one (ADR-093):
+    /// the source cannot mint a job-scoped one (ADR-102):
     /// [`WORKER_CREDENTIALS_SCOPED`] (the default, refuse) or
     /// [`WORKER_CREDENTIALS_ALLOW_FULL`].
     #[sea_orm(default_value = "scoped")]

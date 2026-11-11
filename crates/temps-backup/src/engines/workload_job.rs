@@ -1072,7 +1072,7 @@ pub fn pg_target(
 }
 
 /// The S3 source `s3_source_id` as a job on a worker node receives it: a
-/// credential derived for `grant` (ADR-093), never the source's own unless
+/// credential derived for `grant` (ADR-102), never the source's own unless
 /// the source allows it and cannot scope. Refused when the job could not
 /// reach the source.
 pub async fn s3_target(
@@ -1383,7 +1383,7 @@ pub struct PostgresWorkloadJobDeps {
     pub encryption_service: Arc<temps_core::EncryptionService>,
     /// The workload plane, bound once `temps serve` starts it.
     pub plane: Arc<PlaneSlot>,
-    /// Derives the job's S3 credential (ADR-093).
+    /// Derives the job's S3 credential (ADR-102).
     pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 

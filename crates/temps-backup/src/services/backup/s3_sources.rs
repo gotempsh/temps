@@ -197,7 +197,7 @@ impl BackupService {
         .map_err(|error| BackupError::Internal {
             message: format!("Failed to create S3 source '{}': {}", request.name, error),
         })?;
-        // ADR-093: `scoped` is the column's default; only the operator's
+        // ADR-102: `scoped` is the column's default; only the operator's
         // explicit choice widens it, in the same transaction.
         let source = match request.worker_credentials {
             Some(policy @ crate::handlers::backup_handler::WorkerCredentialsPolicy::AllowFull) => {

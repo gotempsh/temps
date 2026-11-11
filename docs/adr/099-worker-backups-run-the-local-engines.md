@@ -138,7 +138,7 @@ in place for as long as they are retained.
 
 ### Scoped credentials per engine
 
-No worker job receives the S3 source's own credential (ADR-093). The
+No worker job receives the S3 source's own credential (ADR-102). The
 control plane already decides everything that fixes which objects a job
 touches (the engine, through the same tool check as a local service, and
 the key or repository), so each request carries a credential the source's
@@ -205,7 +205,7 @@ control plane. What remains, by design:
   objects of the same service. Only bucket versioning or object lock
   protects against a compromised node doing that.
 
-This refines ADR-093's table for these engines. A WAL-G stream writes the
+This refines ADR-102's table for these engines. A WAL-G stream writes the
 service's repository, as PostgreSQL's does, not a per-backup directory,
 because WAL-G lays out its own keys. Binary-log shipping is an
 archive-class grant of its own.
@@ -225,7 +225,7 @@ back to the old dump silently.
 - The agent gains a few sealed, fixed operations and keeps no caller-chosen
   command execution.
 - The worker never receives the S3 source's own credential: every request
-  carries one scoped to that job's prefixes ([ADR-093](./093-scoped-s3-credentials-for-worker-jobs.md);
+  carries one scoped to that job's prefixes ([ADR-102](./102-scoped-s3-credentials-for-worker-jobs.md);
   per engine under "Scoped credentials per engine" above), and nothing on a
   worker can delete a backup.
 - Each step ships with a Docker proof that runs the node half through the

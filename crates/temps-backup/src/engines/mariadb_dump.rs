@@ -44,7 +44,7 @@ pub struct MariadbDumpDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
-    /// Derives the per-job credential a worker's agent receives (ADR-093).
+    /// Derives the per-job credential a worker's agent receives (ADR-102).
     pub worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
@@ -207,7 +207,7 @@ async fn dump_on_worker(
     bucket_path: &str,
     key: &str,
 ) -> Result<u64, BackupError> {
-    // A credential for the dump's own directory only (ADR-093): the node
+    // A credential for the dump's own directory only (ADR-102): the node
     // writes the one key the control plane chose, which it also validates.
     let mint = || {
         super::worker_agent::scoped_destination(

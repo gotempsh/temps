@@ -627,7 +627,7 @@ mod tests {
             (Method::DELETE, "/api/internal/nodes/8"),
             (Method::POST, "/api/internal/nodes/8/drain"),
             (Method::GET, "/api/settings"),
-            // ADR-093: a node never fetches a source's own S3 credential.
+            // ADR-102: a node never fetches a source's own S3 credential.
             (Method::GET, "/api/internal/nodes/7/s3-credentials/2"),
             // Dotted and encoded escapes from an allowed prefix.
             (Method::POST, "/api/internal/nodes/7/../8/drain"),
@@ -807,7 +807,7 @@ mod tests {
             assert!(is_node_route(allowed), "{allowed}");
         }
         for denied in [
-            // ADR-093: removed; a worker only receives scoped credentials.
+            // ADR-102: removed; a worker only receives scoped credentials.
             "/api/internal/nodes/7/s3-credentials/2",
             "/api/internal/nodes",
             "/api/internal/nodes/7",

@@ -981,6 +981,25 @@ where
     Fut: Future<Output = Result<(), E>>,
     E: fmt::Display,
 {
+    recreate_preserving_data_from(request, |_| create()).await
+}
+
+/// [`recreate_preserving_data`] whose `create` step is told which container
+/// it replaces: the original as the guard inspected it inside this
+/// container's recreate turn (`None` when there was none), so a create step
+/// that carries state over from it (ADR 093: the TLS it served) reads that
+/// state under the same lock as the replacement, never a stale copy. The
+/// original is set aside but still exists, under its `id`, while `create`
+/// runs.
+pub async fn recreate_preserving_data_from<F, Fut, E>(
+    request: RecreateRequest<'_>,
+    create: F,
+) -> Result<RecreateReport, RecreateGuardError>
+where
+    F: FnOnce(Option<ContainerSnapshot>) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: fmt::Display,
+{
     let name = request.container_name.to_string();
     let reentrant = HELD_RECREATES
         .try_with(|held| held.borrow().contains(&name))
@@ -1159,7 +1178,7 @@ async fn recreate_locked<F, Fut, E>(
     turn: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<RecreateReport, RecreateGuardError>
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce(Option<ContainerSnapshot>) -> Fut,
     Fut: Future<Output = Result<(), E>>,
     E: fmt::Display,
 {
@@ -1183,7 +1202,7 @@ where
     .await?
     else {
         // Nothing to replace: a create can only add a container.
-        create()
+        create(None)
             .await
             .map_err(|e| RecreateGuardError::ReplacementFailed {
                 engine,
@@ -1261,7 +1280,7 @@ where
         });
     }
 
-    if let Err(e) = create().await {
+    if let Err(e) = create(Some(old.clone())).await {
         let rollback = roll_back(docker, &old, &aside_name, &storage.volume).await;
         pending.disarm();
         return Err(RecreateGuardError::ReplacementFailed {

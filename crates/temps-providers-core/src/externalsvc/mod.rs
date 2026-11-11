@@ -48,6 +48,7 @@ pub mod restore_helper;
 pub mod restore_image;
 pub mod restore_staging;
 pub mod s3_util;
+pub mod server_tls;
 
 // Test utilities for backup and restore testing
 #[allow(

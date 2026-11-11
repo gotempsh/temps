@@ -13,6 +13,7 @@
 pub mod dump_filter;
 pub mod postgres;
 pub mod postgres_cluster;
+pub mod postgres_cluster_tls;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod query;

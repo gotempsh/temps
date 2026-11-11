@@ -822,7 +822,7 @@ impl std::fmt::Debug for ManagedBackupCapability {
     }
 }
 
-/// `POST /v1/backups/managed/scoped-credentials` (ADR-093): a credential for
+/// `POST /v1/backups/managed/scoped-credentials` (ADR-102): a credential for
 /// one worker job, minted by Cloud from the tenant's token and limited to
 /// `prefixes` of the managed bucket, to `access`, and to `ttl_seconds`.
 /// Cloud refuses a prefix outside the tenant's `bucket_path`, and a `write`

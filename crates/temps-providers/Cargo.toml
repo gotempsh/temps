@@ -77,6 +77,8 @@ testcontainers = { workspace = true }
 flate2 = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 temps-migrations = { path = "../temps-migrations" }
+# Router-level 401 tests (`ServiceExt::oneshot`).
+tower = { workspace = true }
 
 [lints]
 workspace = true

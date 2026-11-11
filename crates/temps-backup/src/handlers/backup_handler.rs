@@ -296,7 +296,7 @@ pub struct CreateS3SourceRequest {
     pub worker_credentials: Option<WorkerCredentialsPolicy>,
 }
 
-/// What a worker node may receive from an S3 source (ADR-093).
+/// What a worker node may receive from an S3 source (ADR-102).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerCredentialsPolicy {
@@ -671,7 +671,7 @@ pub struct S3SourceResponse {
     /// rather than entered by an operator. Managed sources cannot be edited
     /// or deleted from this API; disconnect Temps Cloud to remove one.
     pub managed_by_cloud: bool,
-    /// What a worker node receives from this source (ADR-093).
+    /// What a worker node receives from this source (ADR-102).
     pub worker_credentials: WorkerCredentialsPolicy,
     pub created_at: i64,
     pub updated_at: i64,
@@ -3566,7 +3566,7 @@ async fn list_backup_alerts(
 mod tests {
     use super::*;
 
-    /// ADR-093: the worker credentials policy is a snake_case enum on the
+    /// ADR-102: the worker credentials policy is a snake_case enum on the
     /// wire, absent means unchanged, the stored column reads back safely, and
     /// allowing full credentials is audited with its value.
     #[test]

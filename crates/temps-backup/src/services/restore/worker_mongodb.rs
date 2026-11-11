@@ -128,7 +128,7 @@ pub(super) async fn run(
     // configuration is patched to it afterwards, as on the control plane.
     let origin_credentials = origin_credentials_to_reconcile(db, mgr, backup, target).await;
     let origin_password = origin_credentials.as_ref().and_then(|c| c.password.clone());
-    // The node can read this one backup and nothing else (ADR-093): the
+    // The node can read this one backup and nothing else (ADR-102): the
     // WAL-G repository a stream backup is fetched from, or the archive's own
     // directory.
     let destination =

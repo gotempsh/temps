@@ -565,7 +565,7 @@ pub async fn postgres_walg_archive(
 /// `POST /agent/services/postgres/walg-credentials`: replace the credential
 /// a PostgreSQL service's continuous archiving reads (`walg.env`) with the
 /// request's, scoped by the control plane to the service's own WAL-G
-/// repository (ADR-093). Nothing else changes: no restart, no setting.
+/// repository (ADR-102). Nothing else changes: no restart, no setting.
 /// Outcomes come back as 200 with `refreshed`, `refused` (archiving is not
 /// set up here; nothing was written) or `failed`.
 #[utoipa::path(
@@ -1638,7 +1638,7 @@ mod tests {
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}");
         }
         // The control plane names the backup its credential was scoped to
-        // (ADR-099, ADR-093): a request without one, or with a kind the node
+        // (ADR-099, ADR-102): a request without one, or with a kind the node
         // does not know, is refused before anything runs.
         for mode in [
             serde_json::Value::Null,

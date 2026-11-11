@@ -1000,7 +1000,7 @@ impl PostgresService {
     /// repository, and change nothing else: no `ALTER SYSTEM`, no reload, no
     /// restart (`archive_command` reads the file on every segment). A worker's
     /// archiving credential is short-lived and the control plane refreshes it
-    /// this way (ADR-093).
+    /// this way (ADR-102).
     ///
     /// Returns `false`, writing nothing, when archiving is not set up here
     /// (no `walg.env` on the volume): a refresh never turns archiving on.

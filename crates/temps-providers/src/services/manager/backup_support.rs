@@ -408,7 +408,7 @@ impl ExternalServiceManager {
                 // A worker's container is on its node: its agent runs the
                 // same re-point there, with the node's recreate, holding a
                 // credential for the service's own WAL-G repository only
-                // (ADR-093).
+                // (ADR-102).
                 let scoped = self
                     .worker_credentials
                     .destination(

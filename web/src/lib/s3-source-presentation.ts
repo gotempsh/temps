@@ -18,7 +18,7 @@ export interface WorkerCredentialsPresentation {
 }
 
 /**
- * What worker nodes receive for a source's backups and restores (ADR-093).
+ * What worker nodes receive for a source's backups and restores (ADR-102).
  * A Temps Cloud managed source is always scoped: Cloud mints every worker
  * job's credential and its own token never leaves the control plane.
  */

@@ -586,7 +586,7 @@ pub enum PostgresWalgArchiveResult {
 
 /// `POST /agent/services/postgres/walg-credentials`: replace the credential
 /// continuous archiving reads from `walg.env` with a fresh one for the same
-/// WAL-G repository (ADR-093). A worker's archiving credential is scoped to
+/// WAL-G repository (ADR-102). A worker's archiving credential is scoped to
 /// the service's repository and short-lived, so the control plane refreshes
 /// it on an interval. Nothing else changes: no `ALTER SYSTEM`, no restart;
 /// refused when archiving is not set up on the node. No command comes from
@@ -791,7 +791,7 @@ pub enum WorkerRestoreProgress {
 /// streaming `mongodump --archive` into the service's WAL-G repository, or a
 /// pinned `mongodump --archive --gzip` helper writing one archive object at
 /// the key the control plane chose. `destination` is a credential scoped to
-/// exactly that repository or that archive's directory (ADR-093), so the node
+/// exactly that repository or that archive's directory (ADR-102), so the node
 /// cannot pick another.
 ///
 /// Names no command, image, host or path: the container follows from the
@@ -940,7 +940,7 @@ pub enum MongodbRestoreResult {
 /// Names no command, image, host or path: the container follows from the
 /// service's name, the WAL-G prefix from the bucket, `bucket_path` and the
 /// service's name, the stream commands are fixed in the engine.
-/// `destination` is a credential scoped to that one repository (ADR-093).
+/// `destination` is a credential scoped to that one repository (ADR-102).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RedisWalgBackupRequest {
@@ -973,7 +973,7 @@ pub enum RedisWalgBackupResult {
 /// or restarts Redis. `key` must be a `dump.rdb.gz` object under the
 /// service's own `external_services/redis/<service>/` prefix, and
 /// `destination` is a credential scoped to `key`'s directory alone
-/// (ADR-093): the control plane chose the key, date included.
+/// (ADR-102): the control plane chose the key, date included.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RedisRdbBackupRequest {
@@ -1003,7 +1003,7 @@ pub enum RedisRdbBackupResult {
 /// container is stopped and replaces the data only once it was fetched
 /// whole; on any failure the original data is started again as it was.
 /// `source` is a read-only credential for that one repository or the
-/// snapshot's directory (ADR-093).
+/// snapshot's directory (ADR-102).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RedisRestoreRequest {

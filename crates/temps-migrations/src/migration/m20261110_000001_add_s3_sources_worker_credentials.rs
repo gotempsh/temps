@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Whether a worker node may receive an S3 source's own credential when the
-//! source cannot mint a scoped one (ADR-093).
+//! source cannot mint a scoped one (ADR-102).
 //!
 //! A worker job (a backup or restore of a service on a worker node) gets a
 //! credential the control plane derives for it: limited to the job's key

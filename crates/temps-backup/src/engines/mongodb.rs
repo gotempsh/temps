@@ -20,7 +20,7 @@
 //! agent runs it with the node's Docker (ADR-099). So the engine choice, the
 //! commands, the layout and every artifact are the same for both.
 //!
-//! A worker never receives the S3 source's own credential (ADR-093). The
+//! A worker never receives the S3 source's own credential (ADR-102). The
 //! control plane asks the node whether the image has WAL-G (the check the
 //! node half makes locally), then picks the backup itself: a WAL-G stream
 //! into the service's repository, or an archive at a key it chooses, date
@@ -54,7 +54,7 @@ pub struct MongodbDeps {
     pub docker: Option<bollard::Docker>,
     /// Reaches a worker service's node through its agent.
     pub manager: Arc<temps_providers::ExternalServiceManager>,
-    /// Derives a worker backup's S3 credential (ADR-093).
+    /// Derives a worker backup's S3 credential (ADR-102).
     pub worker_credentials: Arc<WorkerCredentialScoper>,
 }
 

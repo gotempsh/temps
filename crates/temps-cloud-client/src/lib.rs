@@ -434,7 +434,7 @@ impl CloudClient {
     }
 
     /// Mint a credential for one worker job, scoped to prefixes of the
-    /// managed bucket (ADR-093). A Cloud without the route answers 404 or
+    /// managed bucket (ADR-102). A Cloud without the route answers 404 or
     /// 405, reported as [`CloudError::RouteUnavailable`].
     pub async fn managed_backup_scoped_credentials(
         &self,

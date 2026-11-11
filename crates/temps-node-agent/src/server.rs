@@ -318,7 +318,7 @@ pub fn build_router(
 
 /// The agent's backup and in-place restore routes of a worker's services:
 /// the control plane's own engines run on this node (ADR-099). Every body is
-/// sealed, because it carries a credential (one scoped to the job, ADR-093).
+/// sealed, because it carries a credential (one scoped to the job, ADR-102).
 fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState>> {
     router
         .route(

@@ -17,6 +17,7 @@
 use bollard::models::{ContainerCreateBody, HostConfig};
 use tracing::{error, info, warn};
 
+use super::lifecycle::{installed_server_tls, InstalledServerTls};
 use super::node_recreate::{NodeArchiveMode, NodeContainerPlan};
 use super::*;
 use crate::externalsvc::{ExternalService, ServiceConfig, ServiceResourceLimits};
@@ -84,6 +85,11 @@ pub(super) enum SwapRecreate {
         /// The original's `archive_mode`, from its command.
         original_archiving: bool,
         original: Box<PostgresConfig>,
+        /// The TLS the original served (ADR 093). Stored parameters never
+        /// say what TLS should be, so a container rebuilt from them, the
+        /// restored one or the original put back, serves this again. Its
+        /// certificate lives outside PGDATA and survives the swap.
+        kept_tls: Option<InstalledServerTls>,
     },
     /// A worker's container, rebuilt from its own inspected specification.
     Node {
@@ -171,10 +177,20 @@ impl PostgresService {
                 .as_ref()
                 .and_then(|config| config.cmd.clone())
                 .unwrap_or_default();
+            // Read from the same inspection, before anything is changed: a
+            // container that cannot be inspected already stopped the restore.
+            let kept_tls = installed_server_tls(
+                &command,
+                inspect
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.labels.as_ref()),
+            );
             SwapRecreate::Managed {
                 limits: ServiceResourceLimits::from_parameters(&service_config.parameters),
                 original_archiving: postgres_cmd_pins_archive_mode_on(&command),
                 original: Box::new(live_config.clone()),
+                kept_tls,
             }
         };
         Ok((recreate, binds))
@@ -414,7 +430,9 @@ impl PostgresService {
                 })?;
                 self.force_recreate(restored.clone()).await?;
             }
-            SwapRecreate::Managed { limits, .. } => {
+            SwapRecreate::Managed {
+                limits, kept_tls, ..
+            } => {
                 // Restore orchestration does not persist a replacement host
                 // port. Recreate at the registered endpoint, retaining PGDATA
                 // if that endpoint cannot bind, instead of silently changing
@@ -426,8 +444,14 @@ impl PostgresService {
                         reason: format!("invalid restored service resource limits: {reason}"),
                     })?;
                 self.remove_restore_target(container_name).await?;
-                self.create_container_once(&self.docker, postgres_config, limits, false)
-                    .await?;
+                self.create_container_once_keeping_tls(
+                    &self.docker,
+                    postgres_config,
+                    limits,
+                    false,
+                    kept_tls.as_ref(),
+                )
+                .await?;
             }
             SwapRecreate::Node { node, restored, .. } => {
                 self.remove_restore_target(container_name).await?;
@@ -576,10 +600,17 @@ impl PostgresService {
                 limits,
                 original_archiving,
                 original,
+                kept_tls,
             } => match self.remove_restore_target(container_name).await {
                 Ok(()) => {
-                    self.create_container_once(&self.docker, original, limits, *original_archiving)
-                        .await
+                    self.create_container_once_keeping_tls(
+                        &self.docker,
+                        original,
+                        limits,
+                        *original_archiving,
+                        kept_tls.as_ref(),
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             },

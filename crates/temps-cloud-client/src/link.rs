@@ -1416,7 +1416,7 @@ impl CloudLink {
             .await
     }
 
-    /// A worker job's scoped credential for the managed bucket (ADR-093).
+    /// A worker job's scoped credential for the managed bucket (ADR-102).
     pub async fn managed_backup_scoped_credentials(
         &self,
         request: &temps_cloud_protocol::ManagedBackupScopedCredentialsRequest,

@@ -540,7 +540,7 @@ impl RemoteServiceClient {
     }
 
     /// Refresh the credential a worker PostgreSQL's continuous archiving
-    /// reads (ADR-093). Travels sealed; an agent without the route is told
+    /// reads (ADR-102). Travels sealed; an agent without the route is told
     /// to update.
     pub async fn postgres_walg_credentials(
         &self,

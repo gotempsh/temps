@@ -322,7 +322,7 @@ pub(super) async fn run(
             reason: format!("restore run {run_id}: {e}"),
         })?;
     // The worker can read the backup's WAL-G repository (its base backups
-    // and the WAL recovery replays) and nothing else (ADR-093).
+    // and the WAL recovery replays) and nothing else (ADR-102).
     let Some(repository) = temps_providers::worker_s3_scope::s3_url_prefix(
         &backup.s3_location,
         &s3_source.bucket_name,

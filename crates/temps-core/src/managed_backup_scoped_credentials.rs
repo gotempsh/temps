@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The seam between the Cloud link and the worker credential scoper (ADR-093).
+//! The seam between the Cloud link and the worker credential scoper (ADR-102).
 //!
 //! A worker node never receives a Temps Cloud managed source's own bucket
 //! token: it receives a credential Cloud mints for one job, limited to the

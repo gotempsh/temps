@@ -766,7 +766,7 @@ impl ExternalServiceManager {
 
     /// Give the continuous archiving of PostgreSQL service `service_id`, on a
     /// worker node, a fresh credential for its own WAL-G repository in the
-    /// S3 source it is pinned to (ADR-093). Rewrites `walg.env` on the node
+    /// S3 source it is pinned to (ADR-102). Rewrites `walg.env` on the node
     /// and nothing else. `NotNeeded`: the service does not archive on a
     /// worker (not pinned, not PostgreSQL, or archiving not set up there).
     /// `CloudNotConnected`: a managed source whose credential can't be minted
@@ -1073,7 +1073,7 @@ impl ExternalServiceManager {
 
     /// Back up MongoDB service `service_id`, which runs on a worker node, with
     /// the control plane's own engine on that node (ADR-099): the backup
-    /// `mode` names, with `destination` scoped to it (ADR-093). Credentials
+    /// `mode` names, with `destination` scoped to it (ADR-102). Credentials
     /// travel sealed.
     pub async fn mongodb_backup_worker(
         &self,
@@ -1350,7 +1350,7 @@ impl ExternalServiceManager {
     }
 
     /// The credential worker `node_id` ships the binary logs of MariaDB
-    /// `service` with (ADR-093): an archive-class grant on the service's
+    /// `service` with (ADR-102): an archive-class grant on the service's
     /// `binlog/` prefix in `s3_source` and nothing else, the only prefix the
     /// archiver reads and writes. It lives
     /// [`ARCHIVE_CREDENTIAL_LIFETIME`](crate::worker_s3_scope::ARCHIVE_CREDENTIAL_LIFETIME)

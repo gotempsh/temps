@@ -590,7 +590,7 @@ pub async fn walg_archive_on_node(
 
 /// The agent's side of `POST /agent/services/postgres/walg-credentials`:
 /// rewrite `walg.env` with the request's credential for the service's own
-/// WAL-G repository, and nothing else (ADR-093).
+/// WAL-G repository, and nothing else (ADR-102).
 pub async fn walg_credentials_on_node(
     request: PostgresWalgCredentialsRequest,
     docker: Arc<Docker>,
