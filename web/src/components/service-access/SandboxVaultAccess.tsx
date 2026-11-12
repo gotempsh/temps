@@ -4,9 +4,13 @@ import { Link } from 'react-router'
 import { Button } from '@temps-sdk/ui'
 import { SandboxServices } from './SandboxServices'
 import { AccessSessionsList } from './AccessSessionsList'
+import { SandboxServiceAccess } from './SandboxServiceAccess'
 import { Callout } from '@temps-sdk/ds'
 
-/** Service approvals and legacy fixed sessions scoped to this sandbox. */
+/**
+ * Service approvals, time-limited access requests and legacy fixed sessions
+ * scoped to this sandbox. Services themselves are edited in Vault.
+ */
 export function SandboxVaultAccess({
   projectId,
   sandboxId,
@@ -31,6 +35,18 @@ export function SandboxVaultAccess({
             projectId={projectId}
             sandboxId={sandboxId}
           />
+          <details>
+            <summary className="cursor-pointer text-sm">
+              Time-limited access requests
+            </summary>
+            <div className="pt-3">
+              <SandboxServiceAccess
+                projectId={projectId}
+                sandboxId={sandboxId}
+                manageServices={false}
+              />
+            </div>
+          </details>
           <details>
             <summary className="cursor-pointer text-sm">
               Previous fixed sessions
