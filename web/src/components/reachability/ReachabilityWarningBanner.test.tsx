@@ -132,7 +132,18 @@ function mockServer(
       })
     }) as typeof fetch,
   })
-  return { calls, restore: () => client.setConfig(previous) }
+  // setConfig merges, so restoring `previous` alone keeps this fetch when the
+  // original config had none, and later test files that mock globalThis.fetch
+  // would reach this fake server. Name both keys so they are reset too.
+  return {
+    calls,
+    restore: () =>
+      client.setConfig({
+        ...previous,
+        baseUrl: previous.baseUrl,
+        fetch: previous.fetch,
+      }),
+  }
 }
 const tunnelOption = (extra: Record<string, unknown> = {}) => ({
   kind: 'existing_tunnel',
