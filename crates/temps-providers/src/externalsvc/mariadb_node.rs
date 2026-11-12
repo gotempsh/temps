@@ -41,7 +41,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::mariadb::{MariaDbConfig, MariaDbInPlaceRestore, MariaDbService};
-use super::postgres_walg_backup::{run_walg_exec, walg_identity_env, WalgBaseBackupError};
+use super::postgres_walg_backup::{
+    refuse_overlapping_backup_push, run_walg_exec, walg_identity_env, WalgBaseBackupError,
+};
 use super::worker_data::MultipartUpload;
 use super::{EngineError, S3Credentials, ServiceConfig, ServiceType};
 
@@ -227,6 +229,14 @@ pub async fn physical_backup(
     service_name: &str,
     cancel: &CancellationToken,
 ) -> Result<Option<MariadbBinlogCoordinate>, MariadbNodeError> {
+    refuse_overlapping_backup_push(
+        docker,
+        backup.service_id,
+        &backup.container_name,
+        "MariaDB",
+        cancel,
+    )
+    .await?;
     let prefix = walg_prefix(&backup.s3.bucket_name, &backup.s3.bucket_path, service_name);
     let mut env = backup_push_env(
         &prefix,
@@ -1079,5 +1089,55 @@ mod tests {
                 "{parameters}: {error}"
             );
         }
+    }
+}
+
+/// Against a real Docker daemon. Skips without Docker.
+#[cfg(test)]
+#[cfg(feature = "docker-tests")]
+mod docker_tests {
+    use super::*;
+    use crate::externalsvc::postgres_walg_backup::docker_tests::{
+        container, docker_or_skip, let_the_push_start, remove, unreachable_s3, SURVIVING_PUSH,
+    };
+
+    /// As for PostgreSQL: a retry after the agent restarted, or after the
+    /// deadline, must not start a second `backup-push` (a second
+    /// `mariadb-backup` stream) while the first one still runs.
+    #[tokio::test]
+    async fn a_surviving_backup_push_is_not_overlapped() {
+        let Some(docker) = docker_or_skip().await else {
+            return;
+        };
+        let name = container(&docker, SURVIVING_PUSH).await;
+        let_the_push_start().await;
+        let result = physical_backup(
+            &docker,
+            &MariadbPhysicalBackup {
+                service_id: 43,
+                container_name: name.clone(),
+                root_password: "root-secret".to_string(),
+                s3: unreachable_s3(),
+                backup_uuid: "b-2".to_string(),
+            },
+            "shop",
+            &CancellationToken::new(),
+        )
+        .await;
+        remove(&docker, &name).await;
+        let error = result.expect_err("a second backup-push must not start");
+        assert!(
+            matches!(
+                &error,
+                MariadbNodeError::Exec(WalgBaseBackupError::BackupPushRunning {
+                    service_id: 43,
+                    container,
+                }) if container == &name
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("still running"), "{error}");
+        assert!(!error.is_refusal(), "a retry can succeed once it ends");
+        assert!(!error.is_cancelled());
     }
 }
