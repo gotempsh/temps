@@ -175,6 +175,23 @@ fn timings_of(health: &HealthConfig) -> Option<HealthcheckTimings> {
     })
 }
 
+/// Whether recreating the container would change its healthcheck: the
+/// running one differs from what this daemon would store for `effective`.
+/// Unknown (no running container, no configurable check, or a daemon whose
+/// start-interval support could not be read) is never pending.
+fn pending_recreate(
+    running: Option<&HealthcheckTimings>,
+    effective: Option<HealthcheckTimings>,
+    support: Option<StartIntervalSupport>,
+) -> bool {
+    match (running, effective, support) {
+        (Some(running), Some(effective), Some(support)) => {
+            !healthcheck::matches_running(running, effective, support)
+        }
+        _ => false,
+    }
+}
+
 /// Where a service's container is, as far as its healthcheck is concerned.
 struct HealthcheckTarget {
     engine: Option<ManagedEngine>,
@@ -352,12 +369,11 @@ impl ExternalServiceManager {
             None => None,
         };
         let effective = checked.as_ref().map(|c| c.resolved);
-        let pending_recreate = match (&running, &effective, support) {
-            (Some(running), Some(effective), Some(support)) => {
-                !healthcheck::matches_running(running, effective.timings, support)
-            }
-            _ => false,
-        };
+        let pending_recreate = pending_recreate(
+            running.as_ref(),
+            effective.as_ref().map(|e| e.timings),
+            support,
+        );
         Ok(ServiceHealthcheck {
             service_id,
             service_name: service.name,
@@ -661,6 +677,126 @@ mod tests {
         };
         assert_eq!(timings_of(&old).map(|t| t.start_interval_secs), Some(0));
         assert_eq!(timings_of(&HealthConfig::default()), None);
+    }
+
+    /// What a daemon stores for the healthcheck Temps creates a container
+    /// with, read back the way `get_service_healthcheck` reads it.
+    fn stored_by(
+        support: StartIntervalSupport,
+        effective: &HealthcheckTimings,
+    ) -> HealthcheckTimings {
+        let sent = healthcheck::effective_timings(*effective, support);
+        let mut health = healthcheck::health_config("true", &sent);
+        if support == StartIntervalSupport::Unsupported {
+            // API < 1.44 has no StartInterval: it is dropped, not stored.
+            health.start_interval = None;
+        }
+        timings_of(&health).expect("a created healthcheck reads back")
+    }
+
+    #[test]
+    fn a_just_applied_container_is_not_pending_on_any_daemon() {
+        for engine in [
+            ManagedEngine::Postgres,
+            ManagedEngine::Redis,
+            ManagedEngine::MongoDb,
+            ManagedEngine::MariaDb,
+            ManagedEngine::Rustfs,
+            ManagedEngine::Minio,
+        ] {
+            let effective = HealthcheckTimings::builtin(engine);
+            for support in [
+                StartIntervalSupport::Supported,
+                StartIntervalSupport::Unsupported,
+            ] {
+                let running = stored_by(support, &effective);
+                assert!(
+                    !pending_recreate(Some(&running), Some(effective), Some(support)),
+                    "{engine:?} on {support:?}: running {running:?}, effective {effective:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_container_from_before_a_change_is_pending_on_any_daemon() {
+        let effective = HealthcheckTimings::builtin(ManagedEngine::Redis);
+        let changed = HealthcheckTimings {
+            timeout_secs: 10,
+            retries: 5,
+            ..effective
+        };
+        for support in [
+            StartIntervalSupport::Supported,
+            StartIntervalSupport::Unsupported,
+        ] {
+            let running = stored_by(support, &effective);
+            assert!(pending_recreate(
+                Some(&running),
+                Some(changed),
+                Some(support)
+            ));
+        }
+        // An old daemon only ever runs the start interval, so a new interval
+        // would not change its container: recreating it is not pending.
+        let slower = HealthcheckTimings {
+            interval_secs: 120,
+            ..effective
+        };
+        let old = StartIntervalSupport::Unsupported;
+        assert!(!pending_recreate(
+            Some(&stored_by(old, &effective)),
+            Some(slower),
+            Some(old)
+        ));
+        let modern = StartIntervalSupport::Supported;
+        assert!(pending_recreate(
+            Some(&stored_by(modern, &effective)),
+            Some(slower),
+            Some(modern)
+        ));
+        // The every-second check of a container created before #1877.
+        let legacy = HealthConfig {
+            start_interval: None,
+            start_period: None,
+            ..healthcheck::health_config(
+                "true",
+                &HealthcheckTimings {
+                    interval_secs: 1,
+                    start_interval_secs: 1,
+                    start_period_secs: 0,
+                    timeout_secs: 3,
+                    retries: 30,
+                },
+            )
+        };
+        let legacy = timings_of(&legacy).expect("reads back");
+        assert!(pending_recreate(
+            Some(&legacy),
+            Some(effective),
+            Some(StartIntervalSupport::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn unknown_is_never_pending() {
+        let effective = HealthcheckTimings::builtin(ManagedEngine::Redis);
+        let different = HealthcheckTimings {
+            interval_secs: 1,
+            ..effective
+        };
+        // The daemon's version could not be read.
+        assert!(!pending_recreate(Some(&different), Some(effective), None));
+        assert!(!pending_recreate(
+            None,
+            Some(effective),
+            Some(StartIntervalSupport::Supported)
+        ));
+        assert!(!pending_recreate(
+            Some(&different),
+            None,
+            Some(StartIntervalSupport::Supported)
+        ));
     }
 
     #[test]
