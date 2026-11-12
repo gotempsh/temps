@@ -718,6 +718,52 @@ fn a_guessed_data_dir_is_flagged_when_an_installed_server_exists() {
 }
 
 #[test]
+fn a_guessed_data_dir_never_softens_a_secret_error_of_the_servers_environment() {
+    let home = tempfile::tempdir().unwrap();
+    let (mut service, data_dir) = installer_layout(home.path());
+    // Both halves of the auth secret: serve refuses to start whatever its
+    // data directory is.
+    service
+        .environment
+        .insert(temps_config::AUTH_SECRET_ENV.to_string(), "a".repeat(64));
+    service.environment.insert(
+        temps_config::AUTH_SECRET_FILE_ENV.to_string(),
+        "/run/secrets/auth".to_string(),
+    );
+    let doctor = DoctorCommand {
+        database_url: None,
+        data_dir: None,
+        scope: None,
+    };
+    let mut report = DiagnosticReport::new();
+    doctor.check_data_dir(
+        &data_dir,
+        "test",
+        true,
+        Some(&service),
+        SecretsEnvironment::of_service(Some(&service)),
+        &mut report,
+    );
+    assert!(
+        report.checks.iter().any(|(label, result)| label == "Auth secret"
+            && matches!(result, CheckResult::Fail(_))),
+        "{:?}",
+        report.checks
+    );
+    assert_eq!(report.fail_count, 1, "{:?}", report.checks);
+    // The key still comes from the guessed directory: not the server's.
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|(label, result)| label == "Encryption key"
+                && !matches!(result, CheckResult::Pass(_) | CheckResult::Fail(_))),
+        "{:?}",
+        report.checks
+    );
+}
+
+#[test]
 fn geolite_says_when_the_servers_working_directory_is_unknown() {
     let data = tempfile::tempdir().unwrap();
     for (working_directory, mentions_unknown) in [(None, true), (Some(data.path()), false)] {

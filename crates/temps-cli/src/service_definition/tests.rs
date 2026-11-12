@@ -636,6 +636,32 @@ fn an_unreadable_environment_file_leaves_what_it_may_set_unknown() {
     assert!(error.contains("$DB, $DIR"), "{error}");
     assert!(definition.data_dir.is_err());
 
+    // The file may also supply the subcommand: whether the unit runs
+    // `serve` at all is unknown, so its URL is too, never "none".
+    write(
+        &unit,
+        &format!(
+            "[Service]\nEnvironment=TEMPS_DATABASE_URL={URL}\nEnvironmentFile={}\n\
+             ExecStart=/usr/bin/temps $ARGS\n",
+            env_file.display()
+        ),
+    );
+    let definition = found(probe(&systemd_at(&unit)));
+    let error = definition.database_url.as_ref().unwrap_err();
+    assert!(
+        error.contains("$ARGS") && error.contains("temps.env"),
+        "{error}"
+    );
+    assert!(definition.data_dir.is_err());
+    assert!(
+        !definition
+            .problems
+            .iter()
+            .any(|p| p.contains("temps serve")),
+        "{:?}",
+        definition.problems
+    );
+
     write(
         &unit,
         &format!(

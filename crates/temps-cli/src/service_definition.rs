@@ -670,25 +670,27 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
             .collect::<Vec<_>>()
     });
     let serve_arguments = arguments.as_deref().filter(|args| runs_serve(args));
+    let environment_gap = (!environment_gaps.is_empty()).then(|| environment_gaps.join("; "));
+    // ExecStart= expands variables, and the unreadable file, which systemd
+    // applies after Environment=, may set or override any of them, even to
+    // turn a command that does not look like `serve` into one.
+    let arguments_unknown = arguments.is_some() && !referenced.is_empty();
     let not_serve = arguments.is_some() && serve_arguments.is_none();
-    if not_serve {
+    if not_serve && !(arguments_unknown && environment_gap.is_some()) {
         problems.push("ExecStart= does not run `temps serve`".to_string());
     }
 
-    let environment_gap = (!environment_gaps.is_empty()).then(|| environment_gaps.join("; "));
     let (database_url, data_dir) = match &environment_gap {
-        // The unit runs something else: its environment is not a server's.
-        _ if not_serve => (Ok(None), Err(NOT_SERVE.to_string())),
-        // ExecStart= expands variables, and the unreadable file, which
-        // systemd applies after Environment=, may set or override any of them.
-        Some(gap) if serve_arguments.is_some() && !referenced.is_empty() => {
+        Some(gap) if arguments_unknown => {
             let reason = format!(
-                "ExecStart= uses ${} and {gap}; that file may set them, so what `temps serve` \
-                 runs with is unknown",
+                "ExecStart= uses ${} and {gap}; that file may set them, so what the service \
+                 runs is unknown",
                 referenced.join(", $")
             );
             (Err(reason.clone()), Err(reason))
         }
+        // The unit runs something else: its environment is not a server's.
+        _ if not_serve => (Ok(None), Err(NOT_SERVE.to_string())),
         _ => (
             serve_database_url(
                 serve_arguments,

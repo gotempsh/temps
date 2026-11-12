@@ -87,15 +87,19 @@ impl DiagnosticReport {
         self.checks.push((label.into(), result));
     }
 
-    /// Downgrade the checks from index `start` on, which ran against a
-    /// guessed `dir`: a pass there does not show the server's own files are
-    /// fine (Info), and a failure may not be the server's (Warn).
-    fn mark_unverified_since(&mut self, start: usize, dir: &Path) {
+    /// Downgrade the checks from index `start` on that ran against a
+    /// guessed `dir` (all but the `independent` labels): a pass there does
+    /// not show the server's own files are fine (Info), and a failure may
+    /// not be the server's (Warn).
+    fn mark_unverified_since(&mut self, start: usize, dir: &Path, independent: &[&str]) {
         let note = format!(
             "for {}, not confirmed to be the server's data directory",
             dir.display()
         );
-        for (_, result) in self.checks.iter_mut().skip(start) {
+        for (label, result) in self.checks.iter_mut().skip(start) {
+            if independent.contains(&label.as_str()) {
+                continue;
+            }
             *result = match std::mem::replace(result, CheckResult::Info(String::new())) {
                 CheckResult::Pass(message) => {
                     self.pass_count -= 1;
@@ -395,9 +399,10 @@ impl DoctorCommand {
             );
         }
         let first = report.checks.len();
+        let independent = checks_independent_of_the_data_dir(&secrets_env);
         self.check_data_dir_files(data_dir, unverified, service, secrets_env, report);
         if unverified {
-            report.mark_unverified_since(first, data_dir);
+            report.mark_unverified_since(first, data_dir, &independent);
         }
     }
 
@@ -1458,6 +1463,31 @@ pub(super) fn default_data_dir(home: &Path) -> PathBuf {
     } else {
         root
     }
+}
+
+/// The data-directory checks whose result does not depend on which data
+/// directory is checked: the environment's own secret errors, and a secret
+/// the environment injects (or must, when stateless), which serve never
+/// reads from the data directory.
+fn checks_independent_of_the_data_dir(secrets_env: &SecretsEnvironment<'_>) -> Vec<&'static str> {
+    use temps_config::{
+        AUTH_SECRET_ENV, AUTH_SECRET_FILE_ENV, ENCRYPTION_KEY_ENV, ENCRYPTION_KEY_FILE_ENV,
+        STATELESS_ENV,
+    };
+    let stateless = secrets_env
+        .get(STATELESS_ENV)
+        .is_some_and(|value| value != "false");
+    let injected = |value: &str, file: &str| {
+        stateless || secrets_env.get(value).is_some() || secrets_env.get(file).is_some()
+    };
+    let mut independent = vec!["Secrets"];
+    if injected(ENCRYPTION_KEY_ENV, ENCRYPTION_KEY_FILE_ENV) {
+        independent.push("Encryption key");
+    }
+    if injected(AUTH_SECRET_ENV, AUTH_SECRET_FILE_ENV) {
+        independent.push("Auth secret");
+    }
+    independent
 }
 
 /// The data directory doctor checks.
