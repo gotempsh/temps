@@ -37,12 +37,14 @@ const STATE_LABEL: Record<ArchivingState, string> = {
   archiving: 'Archiving',
   failing: 'Failing',
   waiting: 'No WAL archived yet',
+  discarding: 'Not storing WAL: archive_command does nothing',
 }
 
 const STATE_CLASS: Record<ArchivingState, string> = {
-  archiving: 'text-emerald-600 dark:text-emerald-400',
+  archiving: 'text-emerald-700 dark:text-emerald-400',
   failing: 'text-destructive',
   waiting: 'text-muted-foreground',
+  discarding: 'text-amber-700 dark:text-amber-400',
 }
 
 interface Props {

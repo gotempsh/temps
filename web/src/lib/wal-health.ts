@@ -50,7 +50,8 @@ export function notCheckedFromProblem(
   if (!reason) return null
   return {
     reason,
-    checked_at: typeof record.checked_at === 'string' ? record.checked_at : null,
+    checked_at:
+      typeof record.checked_at === 'string' ? record.checked_at : null,
   }
 }
 
@@ -94,16 +95,22 @@ export function formatBytes(bytes: number): string {
   return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[unit]}`
 }
 
-export type ArchivingState = 'archiving' | 'failing' | 'waiting'
+export type ArchivingState = 'archiving' | 'failing' | 'waiting' | 'discarding'
 
 /** Stall threshold, the server's `ARCHIVE_STALL_SECS`. */
 export const ARCHIVE_STALL_SECS = 300
 
 /**
+ * Discarding when `archive_command` is empty or a no-op such as
+ * `/bin/true`: PostgreSQL counts every segment as archived and recycles it,
+ * so `pg_stat_archiver` reads as healthy while nothing is stored (the
+ * server reports this as the `archive_mode_without_command` warning).
  * Failing when the last failure is newer than the last success, or when a
  * segment has waited five minutes (WAL-G retrying without failing yet).
  */
 export function archivingState(snapshot: PostgresWalHealth): ArchivingState {
+  if (snapshot.warnings.some((w) => w.kind === 'archive_mode_without_command'))
+    return 'discarding'
   const failedAt = snapshot.archiver_last_failed_at
   const archivedAt = snapshot.archiver_last_archived_at
   if (

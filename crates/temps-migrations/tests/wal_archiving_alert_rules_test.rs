@@ -163,10 +163,42 @@ async fn existing_postgres_services_with_metrics_get_the_archiving_alarms() -> a
         "the operator's own rule on a metric is kept as it is"
     );
 
+    // The operator disables one seeded rule on one service and downgrades
+    // the other on another: both are theirs now.
+    let disabled = insert_service(&txn, "disabled-db", "postgres", true).await?;
+    let downgraded = insert_service(&txn, "downgraded-db", "postgres", true).await?;
+    SeedPostgresWalArchivingAlertRulesMigration
+        .up(&manager)
+        .await?;
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE monitoring_alert_rules SET enabled = false
+         WHERE service_id = $1 AND metric_name = 'pg.archiver_failing'",
+        [disabled.into()],
+    ))
+    .await?;
+    txn.execute(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE monitoring_alert_rules SET severity = 'warning'
+         WHERE service_id = $1 AND metric_name = 'pg.wal_dir_to_max_wal_size_ratio'",
+        [downgraded.into()],
+    ))
+    .await?;
+
     SeedPostgresWalArchivingAlertRulesMigration
         .down(&manager)
         .await?;
     assert!(archiving_rules(&txn, watched).await?.is_empty());
+    assert_eq!(
+        archiving_rules(&txn, disabled).await?,
+        vec![("pg.archiver_failing".to_string(), 0.5, 600)],
+        "a rule the operator disabled is theirs and stays"
+    );
+    assert_eq!(
+        archiving_rules(&txn, downgraded).await?,
+        vec![("pg.wal_dir_to_max_wal_size_ratio".to_string(), 4.0, 900)],
+        "a rule whose severity the operator changed is theirs and stays"
+    );
     assert_eq!(
         archiving_rules(&txn, tuned).await?,
         vec![("pg.archiver_failing".to_string(), 0.0, 60)],

@@ -56,6 +56,19 @@ describe('archivingState', () => {
     ).toBe('failing')
   })
 
+  test('a no-op archive_command is not archiving, whatever the counters say', () => {
+    const noop: PostgresWalHealth = {
+      ...snapshot,
+      archive_command: '/bin/true',
+      archiver_last_archived_at: '2026-01-01T01:00:00Z',
+      warnings: [{ kind: 'archive_mode_without_command' }],
+    }
+    expect(archivingState(noop)).toBe('discarding')
+    const html = render({ snapshot: noop })
+    expect(html).toContain('Not storing WAL: archive_command does nothing')
+    expect(html).not.toContain('>Archiving<')
+  })
+
   test('a success after the last failure is archiving again', () => {
     expect(
       archivingState({
@@ -147,7 +160,7 @@ describe('WalArchivingStatusView', () => {
         scheme: 'http',
         force_path_style: true,
         path_style_reason: 'forced: the endpoint is an IP address',
-        message: 'WAL-G wrote, read back and deleted a probe object',
+        message: 'WAL-G wrote a probe object to the archive target',
         live_settings_drift:
           "The running container's walg.env sends WAL to 10.0.0.5:9000 (no scheme, so WAL-G uses https) instead of http://10.0.0.5:9000. Restart the service.",
         checked_at: '2026-01-01T02:00:00Z',

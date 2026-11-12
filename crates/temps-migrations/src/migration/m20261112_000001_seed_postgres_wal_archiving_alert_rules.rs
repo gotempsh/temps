@@ -43,6 +43,8 @@ pub(crate) const UNSEED_SQL: &str = r#"
 DELETE FROM monitoring_alert_rules
 WHERE service_id IS NOT NULL
   AND deployment_id IS NULL
+  AND severity = 'critical'
+  AND enabled = true
   AND ((name = 'WAL archiving failing' AND metric_name = 'pg.archiver_failing'
         AND threshold = 0.5 AND comparator = '>' AND for_duration_secs = 600)
     OR (name = 'WAL backlog: pg_wal above 4x max_wal_size'
@@ -65,7 +67,9 @@ impl MigrationTrait for Migration {
     }
 
     /// Remove the rules this migration added and the operator left as they
-    /// were; an edited rule is the operator's and stays.
+    /// were; a rule edited in any field the API lets the operator change
+    /// (threshold, comparator, duration, severity, enabled) is the
+    /// operator's and stays.
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .get_connection()
