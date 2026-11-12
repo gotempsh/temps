@@ -24,9 +24,16 @@ import {
   getEnvironmentsOptions,
   getProjectOptions,
   getProjectsHealthOptions,
+  getProjectsHealthQueryKey,
   getProjectsOptions,
+  getProjectsQueryKey,
   getTimeBucketStatsOptions,
+  getTimeBucketStatsQueryKey,
+  nodeMetricsGetClusterRangeQueryKey,
+  nodeMetricsGetRangeQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   NodeReportingNotice,
   NodeScopeSelect,
@@ -75,8 +82,8 @@ import {
   type ProxyRangeValue,
   type ResolvedProxyWindow,
 } from '@/lib/proxy-metrics-window'
-import { useQueries, useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { keepPreviousData, useQueries, useQuery } from '@tanstack/react-query'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { DateRange } from 'react-day-picker'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
@@ -425,6 +432,8 @@ function proxySeriesQuery(
           }
     ),
     staleTime: 15_000,
+    // Refresh moves a preset window: keep the chart on screen meanwhile.
+    placeholderData: keepPreviousData,
     // A refused read (a role without settings:read) is neither retried nor
     // polled again: the answer cannot change until the role does.
     refetchInterval: refetchUnlessRefused(30_000),
@@ -433,15 +442,19 @@ function proxySeriesQuery(
   }
 }
 
-/** Memoized window bounds for the selected range (stable query keys). */
+/**
+ * Memoized window bounds for the selected range (stable query keys). A new
+ * `moves` (Refresh) resolves a preset again from now.
+ */
 function useResolvedWindow(
   range: ProxyRangeValue,
-  custom: DateRange | undefined
+  custom: DateRange | undefined,
+  moves: number
 ) {
-  return useMemo(
-    () => resolveProxyWindow(range, custom, new Date()),
-    [range, custom]
-  )
+  return useMemo(() => {
+    void moves
+    return resolveProxyWindow(range, custom, new Date())
+  }, [range, custom, moves])
 }
 
 /**
@@ -462,6 +475,7 @@ function useBucketStats(window: ResolvedProxyWindow, filter: ProxyFilter) {
     enabled: filter.projectId != null,
     staleTime: 15_000,
     refetchInterval: 30_000,
+    placeholderData: keepPreviousData,
   })
 }
 
@@ -1154,6 +1168,7 @@ function TrafficByProject({
     enabled: visible && projects.length > 0,
     staleTime: 30_000,
     refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
   })
 
   const health = healthQ.data?.projects ?? {}
@@ -1322,7 +1337,8 @@ export default function ProxyMetrics() {
     projectId: null,
     environmentId: null,
   })
-  const resolved = useResolvedWindow(range, customRange)
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const resolved = useResolvedWindow(range, customRange, windowMoves)
   const isFiltered = filter.projectId != null
   const tooWide = proxyWindowTooWide(resolved, isFiltered)
   const maxDays = isFiltered
@@ -1349,6 +1365,18 @@ export default function ProxyMetrics() {
           description="Hot-path traffic and latency metrics for the Temps proxy"
           actions={
             <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              <RefreshButton
+                queryKeys={[
+                  queryKeyPrefix(nodeMetricsGetClusterRangeQueryKey),
+                  queryKeyPrefix(nodeMetricsGetRangeQueryKey),
+                  queryKeyPrefix(getTimeBucketStatsQueryKey),
+                  queryKeyPrefix(getProjectsHealthQueryKey),
+                  queryKeyPrefix(getProjectsQueryKey, {
+                    query: { per_page: TRAFFIC_PAGE_SIZE },
+                  }),
+                ]}
+                onRefresh={moveWindow}
+              />
               {/* Per-project views read the control plane's request logs,
                   so the node choice only applies to the unfiltered view. */}
               {!isFiltered && canReadNodeMetrics && (

@@ -37,6 +37,8 @@ import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
 import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { workerIngressWay } from '@/lib/worker-ingress'
 import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
@@ -84,6 +86,7 @@ import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
+  adminListNodesQueryKey,
   adminDrainStatusOptions,
   adminGetNodeOptions,
   adminListNodeContainersOptions,
@@ -1874,6 +1877,14 @@ export function NodesPage() {
               nodes run the Temps agent and receive containers from the control
               plane.
             </>
+          }
+          actions={
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(adminListNodesQueryKey),
+                allTunnelsOptions().queryKey,
+              ]}
+            />
           }
         />
         <Card>

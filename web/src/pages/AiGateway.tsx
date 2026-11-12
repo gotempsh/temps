@@ -4,6 +4,7 @@ import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
+  queryGenaiTracesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   GenAiSpanDetail,
@@ -23,6 +24,8 @@ import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
 import { DateTimeRange } from '@/components/ui/date-time-range'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
 import {
@@ -35,6 +38,7 @@ import {
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
+  keepPreviousData,
   useMutation,
   useMutationState,
   useQuery,
@@ -853,6 +857,7 @@ type TimeRange = { label: string; hours: number }
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
   (value: DateTimeRangeValue) => void,
+  () => void,
 ] {
   const [selection, setSelection] = useState(() => ({
     range: { label: '1d', hours: 24 },
@@ -868,6 +873,13 @@ function useTimeRangeSelection(): [
         },
         endMs: Date.parse(value.to),
       }),
+    // Refresh: a preset ("last 24 hours") ends now again; a custom range stays.
+    () =>
+      setSelection((current) =>
+        current.range.label === 'custom'
+          ? current
+          : { ...current, endMs: Date.now() }
+      ),
   ]
 }
 
@@ -972,7 +984,8 @@ function LogCostCell({
 }
 
 export function UsageAnalytics() {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -987,6 +1000,7 @@ export function UsageAnalytics() {
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
+    placeholderData: keepPreviousData,
   })
 
   const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
@@ -1005,6 +1019,7 @@ export function UsageAnalytics() {
           bucket: timeParams.bucket,
         })
       ),
+    placeholderData: keepPreviousData,
   })
 
   const { data: byProvider } = useQuery({
@@ -1016,6 +1031,7 @@ export function UsageAnalytics() {
           to: timeParams.to,
         })
       ),
+    placeholderData: keepPreviousData,
   })
 
   const { data: topModels } = useQuery({
@@ -1028,6 +1044,7 @@ export function UsageAnalytics() {
           limit: '10',
         })
       ),
+    placeholderData: keepPreviousData,
   })
 
   // Recent Requests: pagination + filters. `pageSize` is user-configurable up
@@ -1163,7 +1180,8 @@ export function UsageAnalytics() {
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Usage analytics</h3>
-        <div className="flex gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton queryKeys={[['aiUsage']]} onRefresh={moveToNow} />
           <AiTimeRange
             range={timeRange}
             endMs={endMs}
@@ -3381,7 +3399,8 @@ export function AgentActivity() {
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
   const [selectedTraceBounds, setSelectedTraceBounds] =
@@ -3414,6 +3433,12 @@ export function AgentActivity() {
       },
     }),
     enabled: !!projectId,
+    // Keep the list on screen while a moved window loads, but never show
+    // another service's traces under the newly picked one.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[0].query?.project_id === projectId
+        ? previous
+        : undefined,
   })
 
   const {
@@ -3477,7 +3502,15 @@ export function AgentActivity() {
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3721,7 +3754,8 @@ export function ProjectAgentActivity({
   projectId: number
   projectSlug: string
 }) {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3765,6 +3799,7 @@ export function ProjectAgentActivity({
       },
     }),
     enabled: !!projectId,
+    placeholderData: keepPreviousData,
   })
 
   const {
@@ -3806,7 +3841,15 @@ export function ProjectAgentActivity({
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}

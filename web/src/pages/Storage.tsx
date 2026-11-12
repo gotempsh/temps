@@ -5,6 +5,7 @@ import {
   getServiceRuntimeOptions,
   getServiceStatsOptions,
   listServicesOptions,
+  listServicesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ExternalServiceInfo } from '@/api/client/types.gen'
 import {
@@ -23,6 +24,8 @@ import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredB
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Card } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
@@ -169,14 +172,26 @@ export function Storage() {
               : undefined
           }
           actions={
-            activeTab === 'external' && services?.length ? (
+            activeTab === 'external' ? (
               <>
-                <ImportServiceButton onSuccess={() => refetch()} />
-                <CreateServiceButton
-                  onSuccess={() => refetch()}
-                  open={isCreateDropdownOpen}
-                  onOpenChange={setIsCreateDropdownOpen}
+                {/* The list and its health dots; each row's CPU and memory
+                    keep their own 10 s poll. */}
+                <RefreshButton
+                  queryKeys={[
+                    queryKeyPrefix(listServicesQueryKey),
+                    ['service-health-batch'],
+                  ]}
                 />
+                {services?.length ? (
+                  <>
+                    <ImportServiceButton onSuccess={() => refetch()} />
+                    <CreateServiceButton
+                      onSuccess={() => refetch()}
+                      open={isCreateDropdownOpen}
+                      onOpenChange={setIsCreateDropdownOpen}
+                    />
+                  </>
+                ) : null}
               </>
             ) : undefined
           }

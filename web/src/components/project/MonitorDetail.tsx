@@ -7,10 +7,15 @@ import { MonitorPathForm } from './MonitorPathForm'
 import { ProjectResponse, StatusBucket } from '@/api/client'
 import {
   getBucketedStatusOptions,
+  getBucketedStatusQueryKey,
   getCurrentMonitorStatusOptions,
+  getCurrentMonitorStatusQueryKey,
   getMonitorOptions,
+  getMonitorQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -27,7 +32,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import {
   Activity,
   AlertCircle,
@@ -35,7 +40,7 @@ import {
   Clock,
   TrendingUp,
 } from 'lucide-react'
-import { useMemo, useState, useRef } from 'react'
+import { useMemo, useReducer, useState, useRef } from 'react'
 import { Link, useParams } from 'react-router'
 import { reachabilityPath } from '@/lib/reachability-page'
 import { format, subDays } from 'date-fns'
@@ -193,8 +198,11 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
   const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined)
   const [hoveredBucket, setHoveredBucket] = useState<number | null>(null)
 
+  // Refresh moves a preset window ("Last 24 hours") to now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
   // Memoize start and end dates to prevent unnecessary refetches
   const { startDate, endDate } = useMemo(() => {
+    void windowMoves
     const now = new Date()
     if (activeFilter === 'custom' && dateRange) {
       return {
@@ -237,7 +245,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         }
       }
     }
-  }, [activeFilter, dateRange])
+  }, [activeFilter, dateRange, windowMoves])
 
   // Resolution is derived from the selected range — no standalone selector,
   // so there are no invalid (range × granularity) combinations.
@@ -274,6 +282,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         end_time: endDate ? endDate.toISOString() : undefined,
       },
     }),
+    placeholderData: keepPreviousData,
   })
 
   const {
@@ -294,6 +303,8 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     }),
     enabled: !!monitorId && !!startDate && !!endDate,
     refetchInterval: 30000, // Refresh every 30 seconds
+    // Refresh moves the window: keep the timeline on screen meanwhile.
+    placeholderData: keepPreviousData,
   })
   // Calculate uptime stats from status data (filtered by date range)
   const uptimePercentage = currentMonitorStatus?.uptime_percentage ?? null
@@ -387,9 +398,23 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             </p>
           </div>
         </div>
-        <Badge variant={monitor.is_active ? 'default' : 'secondary'}>
-          {monitor.is_active ? 'Active' : 'Inactive'}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <RefreshButton
+            queryKeys={[
+              getMonitorQueryKey({ path: { monitor_id: monitor.id } }),
+              queryKeyPrefix(getCurrentMonitorStatusQueryKey, {
+                path: { monitor_id: monitor.id },
+              }),
+              queryKeyPrefix(getBucketedStatusQueryKey, {
+                path: { monitor_id: monitor.id },
+              }),
+            ]}
+            onRefresh={moveWindow}
+          />
+          <Badge variant={monitor.is_active ? 'default' : 'secondary'}>
+            {monitor.is_active ? 'Active' : 'Inactive'}
+          </Badge>
+        </div>
       </div>
 
       {/* Date Range Filter */}

@@ -10,17 +10,29 @@ import type {
 } from '@/api/client'
 import {
   containerMetricsGetHistoryOptions,
+  containerMetricsGetHistoryQueryKey,
   getApiRoutesOptions,
+  getApiRoutesQueryKey,
   getApiTimeseriesOptions,
+  getApiTimeseriesQueryKey,
   getEnvironmentsOptions,
   getErrorDashboardStatsOptions,
+  getErrorDashboardStatsQueryKey,
   getHourlyVisitsOptions,
+  getHourlyVisitsQueryKey,
+  getProjectDeploymentsQueryKey,
   getUniqueCountsOptions,
+  getUniqueCountsQueryKey,
   hasAnalyticsEventsOptions,
+  hasAnalyticsEventsQueryKey,
   listContainerHistoryOptions,
+  listContainerHistoryQueryKey,
   listErrorGroupsOptions,
+  listErrorGroupsQueryKey,
   queryTraceSummariesOptions,
+  queryTraceSummariesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
@@ -30,14 +42,16 @@ import { ClusterDnsStaleBanner } from '@/components/settings/ClusterDnsCoverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
 import { buildProjectAnalyticsCountRequest } from '@/lib/project-analytics-summary'
-import { useQueries, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQueries, useQuery } from '@tanstack/react-query'
 import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useReducer } from 'react'
 import { Link } from 'react-router'
 import { formatAxisNumber } from '@/lib/chart-axis-ticks'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
@@ -55,13 +69,15 @@ export function ProjectOverview({
   lastDeployment,
   environmentId,
 }: ProjectOverviewProps) {
-  const { startDate, endDate } = useMemo(
-    () => ({
+  // The last 24 hours, moved to now by Refresh.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const { startDate, endDate } = useMemo(() => {
+    void windowMoves
+    return {
       startDate: subDays(new Date(), 1),
       endDate: new Date(),
-    }),
-    []
-  )
+    }
+  }, [windowMoves])
 
   const analyticsCapabilityQuery = useQuery({
     ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
@@ -74,6 +90,7 @@ export function ProjectOverview({
   }
 
   const visitorsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -85,6 +102,7 @@ export function ProjectOverview({
   })
 
   const pageViewsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -96,6 +114,7 @@ export function ProjectOverview({
   })
 
   const returningVisitorsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -107,6 +126,7 @@ export function ProjectOverview({
   })
 
   const hourlyVisitorsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
       query: { ...analyticsWindow, aggregation_level: 'visitors' },
@@ -119,6 +139,7 @@ export function ProjectOverview({
     isPending: isLoadingErrors,
     isError: hasErrorStatsError,
   } = useQuery({
+    placeholderData: keepPreviousData,
     ...getErrorDashboardStatsOptions({
       query: {
         start_time: startDate.toISOString(),
@@ -131,6 +152,7 @@ export function ProjectOverview({
   })
 
   const apiTrafficQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getApiTimeseriesOptions({
       path: { project_id: project.id },
       query: {
@@ -142,6 +164,7 @@ export function ProjectOverview({
   })
 
   const apiRoutesQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...getApiRoutesOptions({
       path: { project_id: project.id },
       query: {
@@ -155,6 +178,7 @@ export function ProjectOverview({
   })
 
   const recentErrorsQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...listErrorGroupsOptions({
       path: { project_id: project.id },
       query: {
@@ -170,6 +194,7 @@ export function ProjectOverview({
   })
 
   const tracesQuery = useQuery({
+    placeholderData: keepPreviousData,
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
@@ -212,6 +237,28 @@ export function ProjectOverview({
 
   return (
     <>
+      <PageHeader
+        title="Overview"
+        actions={
+          <RefreshButton
+            // Every query the cards show; only those on screen refetch.
+            queryKeys={[
+              queryKeyPrefix(getProjectDeploymentsQueryKey),
+              queryKeyPrefix(hasAnalyticsEventsQueryKey),
+              queryKeyPrefix(getUniqueCountsQueryKey),
+              queryKeyPrefix(getHourlyVisitsQueryKey),
+              queryKeyPrefix(getErrorDashboardStatsQueryKey),
+              queryKeyPrefix(getApiTimeseriesQueryKey),
+              queryKeyPrefix(getApiRoutesQueryKey),
+              queryKeyPrefix(listErrorGroupsQueryKey),
+              queryKeyPrefix(queryTraceSummariesQueryKey),
+              queryKeyPrefix(listContainerHistoryQueryKey),
+              queryKeyPrefix(containerMetricsGetHistoryQueryKey),
+            ]}
+            onRefresh={moveWindow}
+          />
+        }
+      />
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
       <ClusterDnsStaleBanner projectId={project.id} />
       <div className="@container/overview">

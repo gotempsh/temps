@@ -10,6 +10,7 @@ import {
   disableBackupScheduleMutation,
   enableBackupScheduleMutation,
   getBackupScheduleOptions,
+  getBackupScheduleQueryKey,
   getS3SourceOptions,
   listScheduleServicesOptions,
   listScheduleServicesQueryKey,
@@ -44,6 +45,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -595,6 +597,13 @@ export function ScheduleDetail() {
         facts={facts}
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                getBackupScheduleQueryKey({ path: { id: scheduleId! } }),
+                ['schedule-runs', scheduleId],
+                listScheduleServicesQueryKey({ path: { id: scheduleId! } }),
+              ]}
+            />
             {backAction}
             <Button
               variant="default"

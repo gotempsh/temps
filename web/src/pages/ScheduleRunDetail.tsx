@@ -34,6 +34,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -67,7 +68,6 @@ import {
   DatabaseBackup,
   Loader2,
   MoreHorizontal,
-  RefreshCw,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -139,7 +139,6 @@ export function ScheduleRunDetail() {
     data: jobs,
     isPending: isJobsPending,
     isError: isJobsError,
-    isFetching: isJobsFetching,
     error: jobsError,
   } = useQuery({
     ...jobsQueryOptions,
@@ -355,6 +354,7 @@ export function ScheduleRunDetail() {
           </div>
 
           <div className="flex items-center gap-2 sm:shrink-0">
+            <RefreshButton queryKeys={[jobsQueryOptions.queryKey]} />
             {/* Cancel run — only when at least one child is still live.
                 Refreshing while cancelling is fine, the mutation invalidates
                 the jobs query on success. */}
@@ -376,32 +376,6 @@ export function ScheduleRunDetail() {
                 <span className="max-sm:sr-only">Cancel run</span>
               </Button>
             )}
-
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  className="shrink-0"
-                  onClick={() => {
-                    void queryClient.invalidateQueries({
-                      queryKey: jobsQueryOptions.queryKey,
-                    })
-                  }}
-                  disabled={isJobsFetching}
-                  aria-label="Refresh run"
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${isJobsFetching ? 'animate-spin' : ''}`}
-                  />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">
-                {aggregateState === 'running' || aggregateState === 'pending'
-                  ? 'Refresh (auto-refreshing every 5s)'
-                  : 'Refresh'}
-              </TooltipContent>
-            </Tooltip>
           </div>
         </div>
 

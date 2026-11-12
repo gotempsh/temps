@@ -9,8 +9,11 @@ import {
   enableBackupScheduleMutation,
   getBackupOptions,
   getS3SourceOptions,
+  getS3SourceQueryKey,
   listBackupSchedulesOptions,
+  listBackupSchedulesQueryKey,
   listSourceBackupsOptions,
+  listSourceBackupsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   BackupScheduleResponse,
@@ -33,6 +36,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -495,6 +500,13 @@ export function S3SourceDetail() {
       title={source.name}
       actions={
         <>
+          <RefreshButton
+            queryKeys={[
+              getS3SourceQueryKey({ path: { id: sourceId! } }),
+              listSourceBackupsQueryKey({ path: { id: sourceId! } }),
+              queryKeyPrefix(listBackupSchedulesQueryKey),
+            ]}
+          />
           {backAction}
           <Button
             variant="outline"

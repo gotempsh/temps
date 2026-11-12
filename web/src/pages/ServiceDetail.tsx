@@ -11,9 +11,11 @@ import {
   getClusterHealthQueryKey,
   getProjectsOptions,
   getServiceOptions,
+  getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
   listServiceProjectsOptions,
+  listServiceProjectsQueryKey,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -90,6 +92,7 @@ import {
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
@@ -778,6 +781,16 @@ export function ServiceDetail() {
         facts={facts}
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                getServiceQueryKey({ path: { id: service.service.id } }),
+                listServiceProjectsQueryKey({
+                  path: { id: service.service.id },
+                }),
+                ['pg-upgrades', id],
+                externalServiceBackupsQueryKey(service.service.id),
+              ]}
+            />
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the

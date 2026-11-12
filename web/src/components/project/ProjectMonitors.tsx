@@ -4,13 +4,19 @@
 import { PageHeader } from '@/components/layout/PageContainer'
 import {
   listMonitorsOptions,
+  listMonitorsQueryKey,
   getProjectRuntimeHealthOptions,
+  getProjectRuntimeHealthQueryKey,
   createMonitorMutation,
   deleteMonitorMutation,
   getBucketedStatusOptions,
+  getBucketedStatusQueryKey,
   getEnvironmentsOptions,
   getCurrentMonitorStatusOptions,
+  getCurrentMonitorStatusQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   ProjectResponse,
   MonitorResponse,
@@ -457,6 +463,18 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         description="Whether this service is up, and how fast it answers."
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(listMonitorsQueryKey, {
+                  path: { project_id: project.id },
+                }),
+                getProjectRuntimeHealthQueryKey({
+                  path: { project_id: project.id },
+                }),
+                queryKeyPrefix(getBucketedStatusQueryKey),
+                queryKeyPrefix(getCurrentMonitorStatusQueryKey),
+              ]}
+            />
             <Button variant="outline" asChild>
               <Link to="/status-pages">
                 <Globe className="size-4 sm:mr-2" />

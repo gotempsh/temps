@@ -14,7 +14,11 @@ import {
   RecordLink,
 } from '@temps-sdk/ds'
 import type { CronInfo, ProjectResponse } from '@/api/client'
-import { getEnvironmentCronsOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getEnvironmentCronsOptions,
+  getEnvironmentCronsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { CodeBlock } from '@/components/ui/code-block'
 import {
   Dialog,
@@ -108,10 +112,9 @@ function HowToAddDialog({
 export function CronJobs({ project }: { project: ProjectResponse }) {
   const bar = useProjectEnvironment()
   const environment = bar.selection.environment
+  const cronsPath = { project_id: project.id, env_id: environment?.id ?? 0 }
   const crons = useQuery({
-    ...getEnvironmentCronsOptions({
-      path: { project_id: project.id, env_id: environment?.id ?? 0 },
-    }),
+    ...getEnvironmentCronsOptions({ path: cronsPath }),
     enabled: environment !== undefined,
   })
   const rows = crons.data ?? []
@@ -133,11 +136,21 @@ export function CronJobs({ project }: { project: ProjectResponse }) {
           </>
         }
         actions={
-          empty ? undefined : (
-            <Button variant="outline" onClick={() => setShowInstructions(true)}>
-              <FileCode className="size-4" />
-              How to add a job
-            </Button>
+          environment === undefined ? undefined : (
+            <>
+              <RefreshButton
+                queryKeys={[getEnvironmentCronsQueryKey({ path: cronsPath })]}
+              />
+              {empty ? null : (
+                <Button
+                  variant="outline"
+                  onClick={() => setShowInstructions(true)}
+                >
+                  <FileCode className="size-4" />
+                  How to add a job
+                </Button>
+              )}
+            </>
           )
         }
       />
