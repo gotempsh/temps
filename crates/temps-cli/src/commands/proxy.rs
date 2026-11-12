@@ -461,6 +461,9 @@ impl ProxyCommand {
             Arc::new(std::sync::RwLock::new(None)),
             None,
             config_service.clone(),
+            // ADR-104: split mode is not served. The console process deploys
+            // the containers and never points them at this resolver.
+            None,
         );
 
         info!(

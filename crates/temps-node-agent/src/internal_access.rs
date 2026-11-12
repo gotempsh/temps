@@ -26,7 +26,7 @@ pub(crate) const CROSS_PROJECT_DENIED: &str =
 
 /// Why a caller was refused, for the log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DenyReason {
+pub enum DenyReason {
     /// The route carries no project (a legacy or malformed snapshot).
     RouteWithoutProject,
     /// No container owns the source address, or the snapshot does not know
@@ -40,7 +40,7 @@ pub(crate) enum DenyReason {
 }
 
 impl DenyReason {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             DenyReason::RouteWithoutProject => "route_without_project",
             DenyReason::UnknownCaller => "unknown_caller",
@@ -52,7 +52,7 @@ impl DenyReason {
 
 /// The outcome for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AccessDecision {
+pub enum AccessDecision {
     SameProject {
         caller_project_id: i32,
     },
@@ -80,7 +80,10 @@ impl AccessDecision {
 /// The in-memory decision: no I/O. Same project first, then grants, each
 /// over the caller's identities in a fixed order so the budget a request is
 /// charged to does not depend on hash order.
-pub(crate) fn decide(
+///
+/// Public so the control plane, which serves its own containers with this
+/// proxy (ADR-104), tests its routes against the same decision.
+pub fn decide(
     route: &RouteEntry,
     identities: Option<&HashSet<WorkloadIdentity>>,
 ) -> AccessDecision {

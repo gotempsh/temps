@@ -345,11 +345,24 @@ pub fn internal_proxy_state(capacity: &serde_json::Value) -> InternalProxyState 
     }
 }
 
-/// Why the internal-proxy alarm should be open on a worker, if it should:
+/// Why the internal-proxy alarm should be open on a node, if it should:
 /// cluster DNS on (else no name points there), the node active, and the
 /// proxy reported not listening on two evaluations in a row, so a bind
 /// retry in progress pages nobody.
 pub fn internal_proxy_alert(
+    cluster_dns_enabled: bool,
+    node_status: &str,
+    proxy: &InternalProxyState,
+    down_streak: u32,
+) -> Option<String> {
+    internal_proxy_alert_for(false, cluster_dns_enabled, node_status, proxy, down_streak)
+}
+
+/// [`internal_proxy_alert`], worded for the node it is about. The control
+/// plane withdraws its containers' names while its proxy is down (ADR-104
+/// D3), so there the calls fail because the names are gone.
+pub fn internal_proxy_alert_for(
+    is_control_plane: bool,
     cluster_dns_enabled: bool,
     node_status: &str,
     proxy: &InternalProxyState,
@@ -361,11 +374,21 @@ pub fn internal_proxy_alert(
     if proxy.listening != Some(false) || down_streak < 2 {
         return None;
     }
+    let error = proxy.error.as_deref().unwrap_or("no error reported");
+    if is_control_plane {
+        let address = proxy
+            .address
+            .as_deref()
+            .unwrap_or("its app network gateway");
+        return Some(format!(
+            "Internal routing is down on the control plane: its containers' `*.temps.local` \
+             names are withdrawn until its internal proxy can serve {address}: {error}"
+        ));
+    }
     let address = proxy.address.as_deref().unwrap_or("its bridge address");
     Some(format!(
         "Internal routing is down: `*.temps.local` names resolve on this node but nothing serves \
-         the HTTP calls to them on {address}: {}",
-        proxy.error.as_deref().unwrap_or("no error reported")
+         the HTTP calls to them on {address}: {error}"
     ))
 }
 
@@ -378,18 +401,38 @@ pub struct DnsNode {
     pub node_status: String,
     /// The heartbeat's view of the resolver, for an agent too old to report.
     pub heartbeat_running: Option<bool>,
-    /// `None` for the control plane, whose main proxy routes internal HTTP.
+    /// How the node serves HTTP calls to `*.temps.local`. For the control
+    /// plane, what it stored with its DNS report (ADR-104 D4); `None` when it
+    /// reported nothing, so the console falls back to "main proxy".
     pub internal_proxy: Option<InternalProxyState>,
 }
 
+/// The control plane's internal routing, from node 0's DNS report: the same
+/// document a worker sends as `capacity.internal_proxy`, stored on its own
+/// (ADR-104 D4). `None` when the control plane does not serve local
+/// containers itself (cluster DNS off, its resolver down, or a release older
+/// than ADR-104).
+pub fn control_plane_proxy_state(
+    report: Option<&dns_resolver_reports::Model>,
+) -> Option<InternalProxyState> {
+    let document = report?.internal_proxy.as_ref()?;
+    document
+        .is_object()
+        .then(|| internal_proxy_state(&serde_json::json!({ "internal_proxy": document })))
+}
+
 /// The control plane, then each worker in `workers` (node 0 rows skipped).
-pub fn dns_nodes(control_plane_name: &str, workers: Vec<nodes::Model>) -> Vec<DnsNode> {
+pub fn dns_nodes(
+    control_plane_name: &str,
+    control_plane_proxy: Option<InternalProxyState>,
+    workers: Vec<nodes::Model>,
+) -> Vec<DnsNode> {
     let mut rows = vec![DnsNode {
         node_id: CONTROL_PLANE_NODE_ID,
         node_name: control_plane_name.to_string(),
         node_status: "active".to_string(),
         heartbeat_running: None,
-        internal_proxy: None,
+        internal_proxy: control_plane_proxy,
     }];
     rows.extend(workers.into_iter().filter(|n| n.id > 0).map(|n| DnsNode {
         internal_proxy: Some(internal_proxy_state(&n.capacity)),
@@ -922,6 +965,7 @@ impl ClusterDnsService {
                 reason: e.to_string(),
             }
         })?;
+        let note = join_notes(control_plane_gateway_note(&answer, address.ip()), note);
         Ok(TestResolution {
             node_id,
             name: shown_name,
@@ -931,6 +975,31 @@ impl ClusterDnsService {
             note,
             internal_access: None,
         })
+    }
+}
+
+/// Where an internal name answered by the control plane points, when it
+/// points at the control plane itself (ADR-104 D3): with no worker nodes,
+/// `<environment>.<project>.temps.local` resolves to the app network's
+/// gateway, where the control plane's internal proxy serves the call.
+pub fn control_plane_gateway_note(answer: &ResolveAnswer, gateway: IpAddr) -> Option<String> {
+    let gateway_text = gateway.to_string();
+    let points_here = answer.authoritative
+        && answer
+            .answers
+            .iter()
+            .any(|record| record.record_type == "A" && record.data == gateway_text);
+    points_here.then(|| {
+        format!(
+            "This name points at the control plane's app network gateway ({gateway_text}): with no worker nodes, the control plane's internal proxy serves HTTP calls to it on port 80, routes them by Host and applies internal access."
+        )
+    })
+}
+
+fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
     }
 }
 
@@ -1118,7 +1187,11 @@ impl ClusterDnsCollector {
             }
         }
 
-        let nodes = dns_nodes("control plane", workers);
+        let nodes = dns_nodes(
+            "control plane",
+            control_plane_proxy_state(reports.get(&CONTROL_PLANE_NODE_ID)),
+            workers,
+        );
         let interval = i64::try_from(interval_secs).unwrap_or(i64::MAX);
         let seen: HashSet<i32> = nodes.iter().map(|n| n.node_id).collect();
         state.down_streak.retain(|id, _| seen.contains(id));
@@ -1181,7 +1254,13 @@ impl ClusterDnsCollector {
                 } else {
                     0
                 };
-                let reason = internal_proxy_alert(enabled, &status, &proxy, *streak);
+                let reason = internal_proxy_alert_for(
+                    node_id == CONTROL_PLANE_NODE_ID,
+                    enabled,
+                    &status,
+                    &proxy,
+                    *streak,
+                );
                 self.apply(node_id, &node_name, AlarmType::DnsInternalProxyDown, reason)
                     .await;
             }
@@ -1446,9 +1525,98 @@ mod tests {
             last_error: None,
             query_cursor: Some(9),
             dropped_log_entries: 0,
+            internal_proxy: None,
             created_at: at,
             updated_at: at,
         }
+    }
+
+    #[test]
+    fn a_name_on_the_control_plane_gateway_says_what_serves_it() {
+        let gateway: IpAddr = "172.20.0.1".parse().unwrap();
+        let answer = |authoritative: bool, data: &str| ResolveAnswer {
+            rcode: "NOERROR".into(),
+            outcome: temps_node_dns::observe::QueryOutcome::Noerror,
+            authoritative,
+            answers: vec![temps_node_dns::resolve::ResolvedRecord {
+                name: "production.api.temps.local".into(),
+                record_type: "A".into(),
+                ttl: 5,
+                data: data.into(),
+            }],
+            latency_us: 100,
+        };
+        let note = control_plane_gateway_note(&answer(true, "172.20.0.1"), gateway)
+            .expect("points at the gateway");
+        assert!(note.contains("172.20.0.1"), "{note}");
+        assert!(note.contains("internal access"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "one sentence, no wrapped whitespace: {note}"
+        );
+        // A worker's bridge, or an upstream answer, is not the control plane.
+        assert_eq!(
+            control_plane_gateway_note(&answer(true, "10.205.0.1"), gateway),
+            None
+        );
+        assert_eq!(
+            control_plane_gateway_note(&answer(false, "172.20.0.1"), gateway),
+            None
+        );
+        assert_eq!(
+            join_notes(Some("a".into()), Some("b".into())).as_deref(),
+            Some("a b")
+        );
+        assert_eq!(join_notes(None, Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(join_notes(None, None), None);
+    }
+
+    #[test]
+    fn the_control_plane_row_carries_its_stored_internal_routing() {
+        let now = Utc::now();
+        let mut cp = report("ok", now);
+        cp.node_id = CONTROL_PLANE_NODE_ID;
+        // Not reported: the console shows the main proxy, as before ADR-104.
+        assert_eq!(control_plane_proxy_state(Some(&cp)), None);
+        assert_eq!(control_plane_proxy_state(None), None);
+        assert_eq!(dns_nodes("cp", None, Vec::new())[0].internal_proxy, None);
+
+        cp.internal_proxy = Some(serde_json::json!({
+            "address": "172.20.0.1:80",
+            "listening": true,
+            "mode": "redirect",
+            "proxy_address": "172.20.0.1:591",
+            "redirect": "installed",
+        }));
+        let state = control_plane_proxy_state(Some(&cp)).expect("reported");
+        assert_eq!(state.listening, Some(true));
+        assert_eq!(state.address.as_deref(), Some("172.20.0.1:80"));
+        assert_eq!(state.mode, Some(InternalRoutingMode::Redirect));
+        assert_eq!(state.redirect, Some(InternalRedirectState::Installed));
+        let rows = dns_nodes("cp", Some(state.clone()), Vec::new());
+        assert_eq!(rows[0].node_id, CONTROL_PLANE_NODE_ID);
+        assert_eq!(rows[0].internal_proxy, Some(state));
+
+        // A port held by something else reads as down, and alarms like a
+        // worker's once it persists.
+        cp.internal_proxy = Some(serde_json::json!({
+            "address": "172.20.0.1:80",
+            "listening": false,
+            "mode": "down",
+            "error": "172.20.0.1:591 is in use by another program",
+        }));
+        let down = control_plane_proxy_state(Some(&cp)).expect("reported");
+        let reason = internal_proxy_alert_for(true, true, "active", &down, 2).expect("alarm");
+        assert!(reason.contains("172.20.0.1:80"), "{reason}");
+        assert!(reason.contains("withdrawn"), "{reason}");
+        assert_eq!(
+            internal_proxy_alert_for(true, true, "active", &down, 1),
+            None
+        );
+
+        // Anything but an object is unknown, not "down".
+        cp.internal_proxy = Some(serde_json::json!("yes"));
+        assert_eq!(control_plane_proxy_state(Some(&cp)), None);
     }
 
     fn health(

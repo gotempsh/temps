@@ -119,6 +119,20 @@ pub fn heartbeat_value() -> Option<serde_json::Value> {
         .and_then(InternalRoutingStatus::heartbeat_value)
 }
 
+/// The last pass's outcome, for a process that reports it some other way
+/// than the heartbeat: the control plane stores it with node 0's DNS report
+/// (ADR-104 D4). `None` until the first pass.
+pub fn current_status() -> Option<InternalRoutingStatus> {
+    STATUS.read().clone()
+}
+
+/// Forget the last outcome, when the process stops supervising (the control
+/// plane, once cluster DNS is turned off), so nothing reports a listener that
+/// no longer exists.
+pub fn clear_status() {
+    *STATUS.write() = None;
+}
+
 fn record_status(status: InternalRoutingStatus) {
     *STATUS.write() = Some(status);
 }

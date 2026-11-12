@@ -69,10 +69,15 @@ impl ControlPlaneDnsReporter {
     }
 
     /// Store a report if the interval has passed since the last one.
+    ///
+    /// `internal_proxy` is how the control plane serves `*.temps.local` HTTP
+    /// calls to its own containers (ADR-104 D4), in the heartbeat document's
+    /// shape; `None` while it does not run the proxy.
     pub async fn maybe_report(
         &mut self,
         resolver: Option<&ControlPlaneResolver>,
         bootstrap_error: Option<&str>,
+        internal_proxy: Option<serde_json::Value>,
     ) {
         if self
             .last
@@ -96,10 +101,23 @@ impl ControlPlaneDnsReporter {
                 points = summary.points_written,
                 "Stored the control-plane DNS resolver report"
             ),
-            Err(error) => warn!(
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Could not store the control-plane DNS resolver report; the next interval retries"
+                );
+                return;
+            }
+        }
+        if let Err(error) = self
+            .service
+            .record_control_plane_internal_proxy(internal_proxy)
+            .await
+        {
+            warn!(
                 error = %error,
-                "Could not store the control-plane DNS resolver report; the next interval retries"
-            ),
+                "Could not store the control plane's internal routing state; the next interval retries"
+            );
         }
     }
 }

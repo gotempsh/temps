@@ -29,8 +29,8 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::handlers::types::NodeAdminState;
 use crate::services::cluster_dns::{
-    dns_nodes, resolver_health, ClusterDnsError, DnsNode, HealthInput, InternalProxyState,
-    InternalRedirectState, InternalRoutingMode, ResolverHealth, TestResolution,
+    control_plane_proxy_state, dns_nodes, resolver_health, ClusterDnsError, DnsNode, HealthInput,
+    InternalProxyState, InternalRedirectState, InternalRoutingMode, ResolverHealth, TestResolution,
 };
 
 const CONTROL_PLANE_NAME: &str = "control plane";
@@ -183,7 +183,11 @@ pub async fn list_dns_resolvers(
     let now = Utc::now();
     let interval_i64 = i64::try_from(interval).unwrap_or(i64::MAX);
 
-    let rows = dns_nodes(CONTROL_PLANE_NAME, nodes);
+    let rows = dns_nodes(
+        CONTROL_PLANE_NAME,
+        control_plane_proxy_state(reports.get(&CONTROL_PLANE_NODE_ID)),
+        nodes,
+    );
     let resolvers = rows
         .into_iter()
         .map(

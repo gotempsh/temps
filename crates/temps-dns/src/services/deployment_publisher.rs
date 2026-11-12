@@ -75,11 +75,107 @@ const INTERNAL_PROXY_PORT: i32 = 80;
 pub struct DeploymentDnsPublisher {
     db: Arc<DatabaseConnection>,
     registry: Arc<DnsRegistry>,
+    /// The control plane's app-network gateway while its resolver serves
+    /// there (ADR-104 D3), shared with the deployer. `None` for a publisher
+    /// that never points names at the control plane.
+    control_plane_gateway: Option<temps_node_dns::OverlayDnsSlot>,
+}
+
+/// Where one environment's name points: a node's bridge gateway, or the
+/// control plane's app-network gateway (`node_id` `None`, ADR-104 D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameTarget {
+    pub node_id: Option<i32>,
+    pub ip: String,
+}
+
+/// The addresses every environment's name points at (ADR-104 D3): every
+/// worker's bridge gateway, as before; with no worker bridge known, the
+/// control plane's app-network gateway while its resolver serves there, so a
+/// single-server install's own containers reach the control plane's internal
+/// proxy. IPv6 gateways are skipped: the internal names are A records.
+pub fn name_targets(
+    worker_bridges: Vec<(i32, String)>,
+    control_plane_gateway: Option<std::net::IpAddr>,
+) -> Vec<NameTarget> {
+    if !worker_bridges.is_empty() {
+        return worker_bridges
+            .into_iter()
+            .map(|(node_id, ip)| NameTarget {
+                node_id: Some(node_id),
+                ip,
+            })
+            .collect();
+    }
+    control_plane_gateway
+        .filter(std::net::IpAddr::is_ipv4)
+        .map(|gateway| NameTarget {
+            node_id: None,
+            ip: gateway.to_string(),
+        })
+        .into_iter()
+        .collect()
 }
 
 impl DeploymentDnsPublisher {
     pub fn new(db: Arc<DatabaseConnection>, registry: Arc<DnsRegistry>) -> Self {
-        Self { db, registry }
+        Self {
+            db,
+            registry,
+            control_plane_gateway: None,
+        }
+    }
+
+    /// Point names at the control plane when no worker can serve them
+    /// (ADR-104 D3). `slot` holds the gateway while the control plane's
+    /// resolver serves on it, which is when its internal proxy runs there too.
+    pub fn with_control_plane_gateway(mut self, slot: temps_node_dns::OverlayDnsSlot) -> Self {
+        self.control_plane_gateway = Some(slot);
+        self
+    }
+
+    fn current_control_plane_gateway(&self) -> Option<std::net::IpAddr> {
+        let slot = self.control_plane_gateway.as_ref()?;
+        match slot.read() {
+            Ok(gateway) => *gateway,
+            Err(_) => {
+                warn!(
+                    "the control plane's DNS gateway slot is poisoned; not publishing names at it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Remove every environment record that points at the control plane
+    /// (`node_id IS NULL`), once its gateway no longer serves them: cluster
+    /// DNS was turned off, or its resolver stopped. Workers' records are left
+    /// as they are.
+    async fn withdraw_control_plane_names(&self) -> Result<usize, DnsRegistryError> {
+        let owners: Vec<i64> = temps_entities::service_endpoints::Entity::find()
+            .select_only()
+            .column(temps_entities::service_endpoints::Column::OwnerId)
+            .filter(
+                temps_entities::service_endpoints::Column::OwnerKind
+                    .eq(OwnerKind::Environment.as_str()),
+            )
+            .filter(temps_entities::service_endpoints::Column::NodeId.is_null())
+            .distinct()
+            .into_tuple::<i64>()
+            .all(self.db.as_ref())
+            .await?;
+        for owner_id in &owners {
+            self.registry
+                .replace_endpoints_for_owner(OwnerKind::Environment, *owner_id, &[])
+                .await?;
+        }
+        if !owners.is_empty() {
+            info!(
+                environments = owners.len(),
+                "withdrew internal names that pointed at the control plane's gateway"
+            );
+        }
+        Ok(owners.len())
     }
 
     /// Publish the full deployment-FQDN set. Walks every environment
@@ -97,12 +193,18 @@ impl DeploymentDnsPublisher {
     /// and skipped — one bad row (or a name another owner holds) doesn't
     /// poison the rest.
     pub async fn reconcile_all(&self) -> Result<usize, DnsRegistryError> {
-        let bridge_ips = self.collect_bridge_gateway_ips().await?;
+        let bridge_ips = name_targets(
+            self.collect_bridge_gateway_ips().await?,
+            self.current_control_plane_gateway(),
+        );
         if bridge_ips.is_empty() {
-            // No nodes have a usable compute_cidr yet. Nothing to
-            // advertise; the registry stays empty for these owners.
-            // Don't error — happens on a fresh cluster before the
-            // first agent has registered its CIDR.
+            // No node has a usable compute_cidr yet and the control plane
+            // does not serve the names either. Nothing to advertise; don't
+            // error, it is a fresh cluster or cluster DNS is off. Names that
+            // pointed at the control plane go: nothing answers them there.
+            if self.control_plane_gateway.is_some() {
+                self.withdraw_control_plane_names().await?;
+            }
             debug!("no node bridge gateway IPs known; skipping deployment DNS publish");
             return Ok(0);
         }
@@ -245,25 +347,34 @@ impl DeploymentDnsPublisher {
     /// Nodes without a `compute_cidr` (not yet provisioned) are
     /// skipped silently; they'll appear once their agent registers.
     async fn collect_bridge_gateway_ips(&self) -> Result<Vec<(i32, String)>, DnsRegistryError> {
-        let nodes = nodes::Entity::find().all(self.db.as_ref()).await?;
-        let mut out = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let Some(cidr) = node.compute_cidr.as_deref() else {
-                continue;
-            };
-            match bridge_gateway_from_cidr(cidr) {
-                Some(ip) => out.push((node.id, ip)),
-                None => {
-                    warn!(
-                        node_id = node.id,
-                        cidr = %cidr,
-                        "could not derive bridge gateway from compute_cidr"
-                    );
-                }
+        Ok(worker_bridge_gateways(self.db.as_ref()).await?)
+    }
+}
+
+/// Every worker's bridge gateway, from its `compute_cidr`: where the names
+/// point while any is known. Empty on a single-server install, which is
+/// when the control plane serves its own containers' names (ADR-104 D1, D3).
+pub async fn worker_bridge_gateways<C: sea_orm::ConnectionTrait>(
+    db: &C,
+) -> Result<Vec<(i32, String)>, sea_orm::DbErr> {
+    let nodes = nodes::Entity::find().all(db).await?;
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(cidr) = node.compute_cidr.as_deref() else {
+            continue;
+        };
+        match bridge_gateway_from_cidr(cidr) {
+            Some(ip) => out.push((node.id, ip)),
+            None => {
+                warn!(
+                    node_id = node.id,
+                    cidr = %cidr,
+                    "could not derive bridge gateway from compute_cidr"
+                );
             }
         }
-        Ok(out)
     }
+    Ok(out)
 }
 
 /// The multi-A record set for one environment's stable name: one record
@@ -271,19 +382,19 @@ impl DeploymentDnsPublisher {
 fn environment_drafts(
     environment_id: i32,
     fqdn: &str,
-    bridge_ips: &[(i32, String)],
+    targets: &[NameTarget],
 ) -> Vec<EndpointDraft> {
-    bridge_ips
+    targets
         .iter()
-        .map(|(node_id, ip)| EndpointDraft {
+        .map(|target| EndpointDraft {
             fqdn: fqdn.to_string(),
             record_type: RecordType::A,
-            target_ip: Some(ip.clone()),
+            target_ip: Some(target.ip.clone()),
             target_port: Some(INTERNAL_PROXY_PORT),
             ttl: DEPLOYMENT_TTL_SECS,
             owner_kind: OwnerKind::Environment,
             owner_id: environment_id as i64,
-            node_id: Some(*node_id),
+            node_id: target.node_id,
         })
         .collect()
 }
@@ -336,5 +447,80 @@ mod tests {
         assert_eq!(bridge_gateway_from_cidr("172.20.1.0"), None);
         assert_eq!(bridge_gateway_from_cidr("garbage/24"), None);
         assert_eq!(bridge_gateway_from_cidr("999.0.0.0/24"), None);
+    }
+
+    fn gateway() -> Option<std::net::IpAddr> {
+        Some("172.20.0.1".parse().unwrap())
+    }
+
+    #[test]
+    fn workers_bridges_win_over_the_control_plane_gateway() {
+        // A cluster with workers keeps pointing names at their bridges, as
+        // before ADR-104, even while the control plane's resolver serves.
+        let targets = name_targets(
+            vec![(3, "10.205.0.1".into()), (4, "10.206.0.1".into())],
+            gateway(),
+        );
+        assert_eq!(
+            targets,
+            vec![
+                NameTarget {
+                    node_id: Some(3),
+                    ip: "10.205.0.1".into()
+                },
+                NameTarget {
+                    node_id: Some(4),
+                    ip: "10.206.0.1".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_server_install_points_names_at_its_gateway() {
+        assert_eq!(
+            name_targets(Vec::new(), gateway()),
+            vec![NameTarget {
+                node_id: None,
+                ip: "172.20.0.1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_is_published_when_nothing_serves_the_names() {
+        // Cluster DNS off, or the control plane's resolver down.
+        assert!(name_targets(Vec::new(), None).is_empty());
+        // The names are A records; an IPv6 gateway cannot carry them.
+        assert!(name_targets(Vec::new(), Some("fd00::1".parse().unwrap())).is_empty());
+    }
+
+    #[test]
+    fn a_control_plane_record_has_no_node() {
+        let drafts = environment_drafts(
+            12,
+            "production.api.temps.local",
+            &name_targets(Vec::new(), gateway()),
+        );
+        assert_eq!(drafts.len(), 1);
+        let draft = &drafts[0];
+        assert_eq!(draft.fqdn, "production.api.temps.local");
+        assert_eq!(draft.target_ip.as_deref(), Some("172.20.0.1"));
+        assert_eq!(draft.target_port, Some(INTERNAL_PROXY_PORT));
+        assert_eq!(draft.owner_id, 12);
+        assert_eq!(draft.node_id, None);
+    }
+
+    #[test]
+    fn the_gateway_slot_is_read_at_publish_time() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let slot: temps_node_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+        let publisher = DeploymentDnsPublisher::new(db.clone(), Arc::new(DnsRegistry::new(db)))
+            .with_control_plane_gateway(slot.clone());
+        assert_eq!(publisher.current_control_plane_gateway(), None);
+        *slot.write().unwrap() = gateway();
+        assert_eq!(publisher.current_control_plane_gateway(), gateway());
     }
 }

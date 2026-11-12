@@ -552,6 +552,30 @@ impl DnsObservabilityService {
         Ok(aged + capped)
     }
 
+    /// Store how the control plane serves `*.temps.local` HTTP calls to its
+    /// own containers (ADR-104 D4) on node 0's report row, which
+    /// [`Self::ingest`] wrote just before. `None` clears it: the control
+    /// plane does not run the proxy (cluster DNS is off).
+    pub async fn record_control_plane_internal_proxy(
+        &self,
+        internal_proxy: Option<serde_json::Value>,
+    ) -> Result<(), DnsObservabilityError> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE dns_resolver_reports SET internal_proxy = $1 WHERE node_id = $2",
+                [
+                    Value::Json(internal_proxy.map(Box::new)),
+                    Value::from(super::CONTROL_PLANE_NODE_ID),
+                ],
+            ))
+            .await
+            .map_err(DnsObservabilityError::db(
+                "storing the control plane's internal routing state",
+            ))?;
+        Ok(())
+    }
+
     /// Forget a removed node's report row.
     pub async fn forget_node(&self, node_id: i32) -> Result<(), DnsObservabilityError> {
         dns_resolver_reports::Entity::delete_by_id(node_id)
@@ -588,6 +612,7 @@ fn base_row(
             last_sync_age_secs: Set(None),
             last_error: Set(None),
             query_cursor: Set(None),
+            internal_proxy: Set(None),
             ..Default::default()
         },
     }
