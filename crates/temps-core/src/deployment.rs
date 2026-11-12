@@ -140,11 +140,17 @@ pub struct ProjectImagePlan {
     pub project_id: i32,
     /// The project's built images that no other project references.
     pub images: Vec<ProjectImage>,
-    /// Runtimes that may hold them: `None` is this host, `Some(id)` a worker
-    /// node that built them or ran the project's containers.
+    /// Runtimes that may hold them and can be reached: `None` is this host,
+    /// `Some(id)` a worker node (active, draining or drained) that built them
+    /// or ran the project's containers.
     pub nodes: Vec<Option<i32>>,
-    /// References kept because a deployment or build of another project
-    /// names the same tag or image ID.
+    /// Worker nodes that may hold them but are not reachable now (offline,
+    /// pending): not contacted, so a down node cannot hold the deletion
+    /// open. Their copies stay labelled for the nightly sweep, which covers
+    /// the node once it is reachable again.
+    pub offline_nodes: Vec<i32>,
+    /// References kept because a deployment of another project names the
+    /// same tag or image ID.
     pub shared: Vec<String>,
 }
 

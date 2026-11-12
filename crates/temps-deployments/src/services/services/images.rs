@@ -76,7 +76,10 @@ pub(super) fn partition_shared(
 
 /// The removal requests for `plan`: each recorded tag, expecting its
 /// recorded ID, guarded by this install's owner label so an image another
-/// install built is never removed on this install's records.
+/// install built is never removed on this install's records. An unlabelled
+/// image (built before the labels) is kept as well when the runtime shows
+/// another install's images: a copied database records the original
+/// install's tags and IDs, and an unlabelled image there may be theirs.
 pub(super) fn removal_requests(
     plan: &ProjectImagePlan,
     owner: Option<String>,
@@ -84,6 +87,7 @@ pub(super) fn removal_requests(
     let guard = temps_deployer::OwnerGuard {
         label: image_ownership::IMAGE_INSTANCE_LABEL.to_string(),
         owner,
+        keep_unlabelled_when_shared: true,
     };
     plan.images
         .iter()
@@ -221,11 +225,13 @@ impl DeploymentService {
         // Runtimes that may hold the images: the nodes that built them and
         // the nodes that ran the project's containers, if they still exist.
         // This host is always asked; it answers "absent" when it has none.
+        // Only reachable nodes are contacted: a down node would hold the
+        // delete response open until the removal deadline.
         let node_rows = db
             .query_all(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
-                SELECT DISTINCT n.id AS node_id
+                SELECT DISTINCT n.id AS node_id, n.status = ANY($2::text[]) AS reachable
                 FROM (
                     SELECT dc.node_id
                     FROM deployment_containers dc
@@ -254,18 +260,32 @@ impl DeploymentService {
                 JOIN nodes n ON n.id = holders.node_id
                 ORDER BY n.id
                 "#,
-                [project_id.into()],
+                [
+                    project_id.into(),
+                    SWEPT_NODE_STATUSES
+                        .iter()
+                        .map(|status| status.to_string())
+                        .collect::<Vec<String>>()
+                        .into(),
+                ],
             ))
             .await?;
         let mut nodes = vec![None];
+        let mut offline_nodes = Vec::new();
         for row in node_rows {
-            nodes.push(Some(row.try_get::<i32>("", "node_id")?));
+            let node_id = row.try_get::<i32>("", "node_id")?;
+            if row.try_get::<bool>("", "reachable")? {
+                nodes.push(Some(node_id));
+            } else {
+                offline_nodes.push(node_id);
+            }
         }
 
         Ok(ProjectImagePlan {
             project_id,
             images,
             nodes,
+            offline_nodes,
             shared,
         })
     }
@@ -413,6 +433,15 @@ impl temps_core::ProjectImageCleaner for DeploymentService {
         if plan.images.is_empty() {
             return report;
         }
+        for node_id in &plan.offline_nodes {
+            warn!(
+                project_id = plan.project_id,
+                node_id,
+                images = plan.images.len(),
+                "Worker node is not reachable; a deleted project's images stay on it until the nightly sweep reaches it"
+            );
+        }
+        report.unreachable_runtimes += plan.offline_nodes.len() as u64;
         // The deadline covers everything after the row delete, reading the
         // owner ID included, so a stalled database or data directory cannot
         // hold the delete response and its audit entry open.
@@ -631,6 +660,7 @@ mod tests {
             project_id: 7,
             images: vec![image("app-1:latest", Some(ID))],
             nodes: vec![None],
+            offline_nodes: Vec::new(),
             shared: Vec::new(),
         };
         let requests = removal_requests(&plan, Some("install-a.marker".to_string()));
@@ -638,6 +668,10 @@ mod tests {
         let guard = requests[0].owner_guard.as_ref().expect("guarded");
         assert_eq!(guard.label, image_ownership::IMAGE_INSTANCE_LABEL);
         assert_eq!(guard.owner.as_deref(), Some("install-a.marker"));
+        assert!(
+            guard.keep_unlabelled_when_shared,
+            "an unlabelled image on a host another install shares may be theirs"
+        );
         assert_eq!(requests[0].expected_image_id.as_deref(), Some(ID));
         // Without an owner ID the guard still applies: labelled images are
         // all someone else's.
@@ -958,6 +992,104 @@ mod tests {
         Ok(())
     }
 
+    /// Only reachable nodes are contacted at deletion: a builder node that is
+    /// offline is left out of the plan's runtimes (and reported), so a down
+    /// node cannot hold the delete response open. Against a real database;
+    /// skips without Postgres.
+    #[tokio::test]
+    async fn offline_builder_nodes_are_not_contacted_at_deletion(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Database unavailable, skipping: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        for (id, status) in [(3, "active"), (4, "offline"), (5, "drained")] {
+            nodes::ActiveModel::from(node_row(id, status))
+                .insert(db.as_ref())
+                .await?;
+        }
+        let (project, environment) = insert_project(db.as_ref(), "built-on-workers").await?;
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("built-on-workers-1".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("build_image".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Build Container Image".to_string()),
+            log_id: Set("built-on-workers".to_string()),
+            status: Set(JobStatus::Success),
+            outputs: Set(Some(serde_json::json!({
+                "image_tag": "built-on-workers-1:latest",
+                "image_id": "sha256:ee",
+                "builder_node_ids_by_platform": {
+                    "linux/amd64": 3,
+                    "linux/arm64": 4,
+                    "linux/riscv64": 5
+                }
+            }))),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let runtime: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".to_string(),
+                "unused".to_string(),
+                "unused".to_string(),
+            )
+            .expect("create remote deployer"),
+        );
+        let service = super::super::tests::create_cleanup_service_for_test(db.clone(), runtime);
+
+        let plan = service.plan_project_image_cleanup(project.id).await?;
+
+        assert_eq!(plan.nodes, vec![None, Some(3), Some(5)], "{plan:?}");
+        assert_eq!(plan.offline_nodes, vec![4], "{plan:?}");
+        Ok(())
+    }
+
+    /// An offline node in the plan is counted as unreachable without being
+    /// contacted.
+    #[tokio::test]
+    async fn offline_nodes_count_as_unreachable_without_being_asked() {
+        let runtime: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".to_string(),
+                "unused".to_string(),
+                "unused".to_string(),
+            )
+            .expect("create remote deployer"),
+        );
+        let db = Arc::new(sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = super::super::tests::create_cleanup_service_for_test(db, runtime);
+        let plan = ProjectImagePlan {
+            project_id: 7,
+            images: vec![image("app-1:latest", Some(ID))],
+            nodes: Vec::new(),
+            offline_nodes: vec![4, 6],
+            shared: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let report = service.remove_project_images(&plan).await;
+        assert_eq!(report.unreachable_runtimes, 2);
+        assert_eq!(report.removed + report.failed, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     /// A multi-platform build's per-platform images are planned with their
     /// own IDs, and one another project's build also produced is skipped.
     /// Against a real database; skips without Postgres.
@@ -1036,17 +1168,17 @@ mod tests {
         )
         .insert(db.as_ref())
         .await?;
-        // Another project's identical build produced the riscv64 image.
-        let other_deployment = record_build(
+        // Another project deploys the riscv64 image (a promotion of that
+        // platform's tag).
+        record_build(
             db.as_ref(),
             &other,
             &other_env,
             "other-1",
-            "other-1:latest",
+            "multi-arch-1:latest-riscv64",
             Some("sha256:dd"),
         )
         .await?;
-        let _ = other_deployment;
 
         let runtime: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
             temps_deployer::remote::RemoteNodeDeployer::new(
@@ -1091,6 +1223,7 @@ mod tests {
             project_id: 7,
             images: vec![image("app-1:latest", Some(ID)), image("app-2:latest", None)],
             nodes: vec![None],
+            offline_nodes: Vec::new(),
             shared: vec!["app-3:latest".to_string()],
         };
 

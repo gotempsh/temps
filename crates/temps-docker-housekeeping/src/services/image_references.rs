@@ -1,16 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Which image tags and IDs a project still names.
+//! Which image tags and IDs another project still names.
 //!
 //! An image a project built can be named by another project too: a
-//! promotion or rollback that deploys it, an image deployed by ID, or an
-//! identical build that produced the same image ID under its own tag. Both
-//! the deletion-time cleanup and the nightly orphan sweep must keep such an
-//! image, so they ask the same question here, in one query for the whole
-//! set of candidates: deployments' `image_name`, and the tags and IDs every
-//! `BuildImageJob` recorded, including each platform of a multi-platform
-//! build.
+//! promotion or rollback that deploys it by tag, or an image deployed by ID.
+//! Both the deletion-time cleanup and the nightly orphan sweep must keep such
+//! an image, so they ask the same question here, in one query for the whole
+//! set of candidates, against `deployments.image_name`, which is indexed
+//! (`idx_deployments_image_name`, built after boot): the cost grows with the
+//! number of candidates, not with the size of the database.
+//!
+//! Build records (`deployment_jobs.outputs`) are not searched: they are
+//! unindexed JSON, and what they could add is already covered on the
+//! daemon. An identical build in another project produces the same image
+//! under that project's own tag, and an image carrying a tag the caller did
+//! not ask to remove is always kept (`ImageRemovalStatus::OtherTags`).
 
 use std::collections::HashSet;
 
@@ -55,8 +60,9 @@ pub fn names_image_id(named: &HashSet<String>, image_id: &str) -> bool {
 }
 
 /// The members of `candidates` (tags or image IDs, as recorded) that a
-/// deployment or build of any project other than `excluding_project` names.
-/// `None` checks every project, for images whose own project is gone.
+/// deployment of any project other than `excluding_project` names as its
+/// image. `None` checks every project, for images whose own project is
+/// gone.
 pub async fn referenced_images<C: ConnectionTrait>(
     db: &C,
     candidates: &[String],
@@ -69,42 +75,10 @@ pub async fn referenced_images<C: ConnectionTrait>(
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"
-            WITH builds AS (
-                SELECT dj.outputs
-                FROM deployment_jobs dj
-                JOIN deployments d ON d.id = dj.deployment_id
-                WHERE dj.job_type = 'BuildImageJob'
-                  AND ($2::int IS NULL OR d.project_id <> $2)
-            )
-            SELECT DISTINCT reference FROM (
-                SELECT d.image_name AS reference
-                FROM deployments d
-                WHERE ($2::int IS NULL OR d.project_id <> $2)
-                  AND d.image_name = ANY($1::text[])
-                UNION ALL
-                SELECT b.outputs ->> 'image_tag' FROM builds b
-                WHERE b.outputs ->> 'image_tag' = ANY($1::text[])
-                UNION ALL
-                SELECT b.outputs ->> 'image_id' FROM builds b
-                WHERE b.outputs ->> 'image_id' = ANY($1::text[])
-                UNION ALL
-                SELECT per_platform.value
-                FROM builds b
-                CROSS JOIN LATERAL json_each_text(
-                    CASE WHEN json_typeof(b.outputs -> 'image_tags_by_platform') = 'object'
-                         THEN b.outputs -> 'image_tags_by_platform' ELSE '{}'::json END
-                ) AS per_platform
-                WHERE per_platform.value = ANY($1::text[])
-                UNION ALL
-                SELECT per_platform.value
-                FROM builds b
-                CROSS JOIN LATERAL json_each_text(
-                    CASE WHEN json_typeof(b.outputs -> 'image_ids_by_platform') = 'object'
-                         THEN b.outputs -> 'image_ids_by_platform' ELSE '{}'::json END
-                ) AS per_platform
-                WHERE per_platform.value = ANY($1::text[])
-            ) refs
-            WHERE reference IS NOT NULL
+            SELECT DISTINCT d.image_name AS reference
+            FROM deployments d
+            WHERE d.image_name = ANY($1::text[])
+              AND ($2::int IS NULL OR d.project_id <> $2)
             "#,
             [candidates.to_vec().into(), excluding_project.into()],
         ))
@@ -268,15 +242,15 @@ mod tests {
             candidates.extend(tag_spellings(tag));
         }
         candidates.extend(["sha256:aa", "sha256:bb", "sha256:cc"].map(str::to_string));
+        // The other project also deploys an image by its ID.
+        deploy(ids[1], "other-2", "sha256:cc")
+            .insert(db.as_ref())
+            .await?;
         let found = referenced_images(db.as_ref(), &candidates, Some(ids[0].0)).await?;
-        let expected: HashSet<String> = [
-            "Promoted-App",
-            "sha256:bb",
-            "other-1:latest-arm64",
-            "sha256:cc",
-        ]
-        .map(str::to_string)
-        .into();
+        // Deployments of the other project only: the owner's own deployment
+        // is excluded, and build records are not searched (an identical
+        // build's image carries another tag and is kept on the daemon).
+        let expected: HashSet<String> = ["Promoted-App", "sha256:cc"].map(str::to_string).into();
         assert_eq!(found, expected);
         // The bare name protects the image under its explicit spelling, and
         // the tag's case is kept as written.
@@ -284,7 +258,11 @@ mod tests {
         assert!(!names_tag(&found, "promoted-app:latest"));
 
         let everyone = referenced_images(db.as_ref(), &candidates, None).await?;
-        assert!(everyone.contains("owner-1:latest") && everyone.contains("sha256:aa"));
+        assert!(everyone.contains("owner-1:latest") && everyone.contains("sha256:cc"));
+        assert!(
+            !everyone.contains("sha256:aa"),
+            "a build record is no reference"
+        );
         assert!(!everyone.contains("nobody:latest"));
         Ok(())
     }

@@ -307,9 +307,12 @@ async fn existing_project_ids<C: ConnectionTrait>(
 /// the build's, is an operator's retag, so the image is theirs. An image
 /// built without that label is kept too: its one tag proves nothing.
 fn removal_request(image: &OwnedImage, owner: &str) -> Option<ImageRemovalRequest> {
+    // The sweep only lists images labelled with this owner: no unlabelled
+    // image ever reaches it.
     let guard = OwnerGuard {
         label: IMAGE_INSTANCE_LABEL.to_string(),
         owner: Some(owner.to_string()),
+        keep_unlabelled_when_shared: false,
     };
     let request = match image.tags.as_slice() {
         [] => Some(ImageRemovalRequest::new(

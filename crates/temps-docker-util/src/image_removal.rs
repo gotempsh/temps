@@ -64,15 +64,24 @@ pub struct ImageRemovalRequest {
 }
 
 /// Who may remove a labelled image: the image is kept when it carries
-/// `label` with a value other than `owner`. An image without the label is
-/// not judged by it (it predates ownership labels); `owner: None` means the
-/// caller has no owner ID, so every image carrying the label is someone
-/// else's.
+/// `label` with a value other than `owner`; `owner: None` means the caller
+/// has no owner ID, so every image carrying the label is someone else's.
+///
+/// An image without the label predates ownership labels and proves nothing
+/// either way. With `keep_unlabelled_when_shared`, it is kept when the
+/// daemon shows another owner is present (any image carrying `label` with
+/// another value): on a host shared with another Temps install, an unlabelled
+/// image may well be that install's. On a host nobody else labels, it is
+/// judged by the caller's records, as before the labels existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerGuard {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Optional on the wire: an agent that predates it removes unlabelled
+    /// images on the caller's records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_unlabelled_when_shared: bool,
 }
 
 impl ImageRemovalRequest {
@@ -113,6 +122,9 @@ pub enum ImageRemovalStatus {
     /// The image is labelled as built by another owner (another Temps
     /// install sharing this Docker host).
     ForeignOwner { image_id: String, owner: String },
+    /// The image carries no owner label, and the daemon shows another owner
+    /// is present, so it may be that owner's image.
+    UnlabelledOnSharedHost { image_id: String },
     /// The image also carries tags the caller did not ask to remove, so
     /// someone else still names it.
     OtherTags {
@@ -142,6 +154,7 @@ impl ImageRemovalStatus {
             Self::InUse { .. }
                 | Self::Replaced { .. }
                 | Self::ForeignOwner { .. }
+                | Self::UnlabelledOnSharedHost { .. }
                 | Self::OtherTags { .. }
                 | Self::Refused { .. }
         )
@@ -170,6 +183,10 @@ impl ImageRemovalStatus {
             )),
             Self::ForeignOwner { image_id, owner } => Some(format!(
                 "image {image_id} was built by another owner ({owner})"
+            )),
+            Self::UnlabelledOnSharedHost { image_id } => Some(format!(
+                "image {image_id} carries no owner label and another owner's images share this \
+                 host, so it may be theirs"
             )),
             Self::OtherTags {
                 image_id,
@@ -215,6 +232,16 @@ pub enum RemovalDecision {
 
 /// Whether `request` may be removed, given what its reference names now.
 pub fn decide(request: &ImageRemovalRequest, image: &InspectedImage) -> RemovalDecision {
+    decide_on_host(request, image, false)
+}
+
+/// [`decide`], knowing whether the daemon shows another owner of images
+/// labelled like the request's guard (`shared_host`).
+pub fn decide_on_host(
+    request: &ImageRemovalRequest,
+    image: &InspectedImage,
+    shared_host: bool,
+) -> RemovalDecision {
     let image_id = normalize_image_id(&image.image_id);
     if let Some(expected) = request.expected_image_id.as_deref() {
         let expected = normalize_image_id(expected);
@@ -226,13 +253,19 @@ pub fn decide(request: &ImageRemovalRequest, image: &InspectedImage) -> RemovalD
         }
     }
     if let Some(guard) = &request.owner_guard {
-        if let Some(labelled) = image.labels.get(&guard.label) {
-            if guard.owner.as_deref() != Some(labelled.as_str()) {
+        match image.labels.get(&guard.label) {
+            Some(labelled) if guard.owner.as_deref() != Some(labelled.as_str()) => {
                 return RemovalDecision::Keep(ImageRemovalStatus::ForeignOwner {
                     image_id,
                     owner: labelled.clone(),
                 });
             }
+            None if guard.keep_unlabelled_when_shared && shared_host => {
+                return RemovalDecision::Keep(ImageRemovalStatus::UnlabelledOnSharedHost {
+                    image_id,
+                });
+            }
+            _ => {}
         }
     }
     let requested = normalize_reference(&request.reference);
@@ -480,9 +513,28 @@ pub async fn remove_unused_images(
             max: MAX_IMAGE_REMOVAL_BATCH,
         });
     }
+    // Whether another owner's images share this daemon, once per guard in
+    // the batch (in practice one).
+    let mut shared_hosts: HashMap<(String, Option<String>), bool> = HashMap::new();
+    for guard in requests
+        .iter()
+        .filter_map(|request| request.owner_guard.as_ref())
+        .filter(|guard| guard.keep_unlabelled_when_shared)
+    {
+        let key = (guard.label.clone(), guard.owner.clone());
+        if let std::collections::hash_map::Entry::Vacant(slot) = shared_hosts.entry(key) {
+            slot.insert(another_owner_present(docker, &guard.label, guard.owner.as_deref()).await);
+        }
+    }
     let mut outcomes = Vec::with_capacity(requests.len());
     for request in requests {
-        let status = remove_one(docker, request).await;
+        let shared_host = request
+            .owner_guard
+            .as_ref()
+            .and_then(|guard| shared_hosts.get(&(guard.label.clone(), guard.owner.clone())))
+            .copied()
+            .unwrap_or(false);
+        let status = remove_one(docker, request, shared_host).await;
         outcomes.push(ImageRemovalOutcome {
             reference: request.reference.clone(),
             status,
@@ -491,7 +543,33 @@ pub async fn remove_unused_images(
     Ok(outcomes)
 }
 
-async fn remove_one(docker: &Docker, request: &ImageRemovalRequest) -> ImageRemovalStatus {
+/// Whether the daemon holds any image carrying `label` with a value other
+/// than `owner`. A listing that fails counts as yes: unlabelled images are
+/// then kept, the safe direction.
+pub async fn another_owner_present(docker: &Docker, label: &str, owner: Option<&str>) -> bool {
+    let listed = docker
+        .list_images(Some(bollard::query_parameters::ListImagesOptions {
+            all: false,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![label.to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await;
+    match listed {
+        Ok(images) => images
+            .iter()
+            .any(|image| image.labels.get(label).map(String::as_str) != owner),
+        Err(_) => true,
+    }
+}
+
+async fn remove_one(
+    docker: &Docker,
+    request: &ImageRemovalRequest,
+    shared_host: bool,
+) -> ImageRemovalStatus {
     let image = match inspect_reference(docker, &request.reference).await {
         Ok(Some(image)) => image,
         Ok(None) => return ImageRemovalStatus::Absent,
@@ -501,7 +579,7 @@ async fn remove_one(docker: &Docker, request: &ImageRemovalRequest) -> ImageRemo
             }
         }
     };
-    let image_id = match decide(request, &image) {
+    let image_id = match decide_on_host(request, &image, shared_host) {
         RemovalDecision::Keep(status) => return status,
         RemovalDecision::Remove { image_id } => image_id,
     };
@@ -576,7 +654,46 @@ mod tests {
         OwnerGuard {
             label: OWNER_LABEL.to_string(),
             owner: owner.map(str::to_string),
+            keep_unlabelled_when_shared: false,
         }
+    }
+
+    /// On a host another install also labels images on, an unlabelled image
+    /// may be that install's (built before the labels): kept. On a host
+    /// nobody else labels, it is judged by the caller's records.
+    #[test]
+    fn an_unlabelled_image_is_kept_only_when_another_owner_shares_the_host() {
+        let request = ImageRemovalRequest::new("app-1:latest", Some(APP.to_string()))
+            .with_owner_guard(OwnerGuard {
+                keep_unlabelled_when_shared: true,
+                ..guard(Some("staging.marker"))
+            });
+        let unlabelled = inspected(APP, &["app-1:latest"]);
+        assert_eq!(
+            decide_on_host(&request, &unlabelled, true),
+            RemovalDecision::Keep(ImageRemovalStatus::UnlabelledOnSharedHost {
+                image_id: APP.to_string()
+            })
+        );
+        assert!(matches!(
+            decide_on_host(&request, &unlabelled, false),
+            RemovalDecision::Remove { .. }
+        ));
+        // This owner's own labelled image is removed even on a shared host.
+        let mut ours = inspected(APP, &["app-1:latest"]);
+        ours.labels
+            .insert(OWNER_LABEL.to_string(), "staging.marker".to_string());
+        assert!(matches!(
+            decide_on_host(&request, &ours, true),
+            RemovalDecision::Remove { .. }
+        ));
+        // Without the flag (an older caller), the host does not matter.
+        let plain = ImageRemovalRequest::new("app-1:latest", Some(APP.to_string()))
+            .with_owner_guard(guard(Some("staging.marker")));
+        assert!(matches!(
+            decide_on_host(&plain, &unlabelled, true),
+            RemovalDecision::Remove { .. }
+        ));
     }
 
     /// Another install sharing the host built the image: it is theirs,
@@ -1118,5 +1235,87 @@ mod tests {
             let is_held = image.tags.contains(&held);
             assert_eq!(image.in_use_by.is_some(), is_held, "{image:?}");
         }
+    }
+
+    /// Against a real daemon: an unlabelled image is kept while another
+    /// owner's labelled image shares the daemon, and removed once it no
+    /// longer does. Uses its own label key, so nothing else on the host
+    /// affects it. Skips when Docker is unavailable.
+    #[tokio::test]
+    async fn unlabelled_images_are_kept_while_another_owner_shares_the_daemon() {
+        use crate::pull::{pull_image, PullSpec};
+
+        let Some(docker) = crate::test_support::docker_or_skip(
+            "unlabelled_images_are_kept_while_another_owner_shares_the_daemon",
+        )
+        .await
+        else {
+            return;
+        };
+        if let Err(error) =
+            pull_image(&docker, PullSpec::new(crate::test_support::TEST_IMAGE)).await
+        {
+            println!("Could not pull the test image, skipping: {error}");
+            return;
+        }
+        let label = format!("sh.temps.test.owner.{}", uuid::Uuid::new_v4().simple());
+        let theirs = format!(
+            "{}:latest",
+            crate::test_support::unique_name("shared-theirs")
+        );
+        let unlabelled = format!(
+            "{}:latest",
+            crate::test_support::unique_name("shared-unlabelled")
+        );
+        let request =
+            ImageRemovalRequest::new(unlabelled.clone(), None).with_owner_guard(OwnerGuard {
+                label: label.clone(),
+                owner: Some("this-install".to_string()),
+                keep_unlabelled_when_shared: true,
+            });
+
+        let prepared = async {
+            build_labelled_unique_image(&docker, &theirs, &label, "another-install").await?;
+            build_unique_image(&docker, &unlabelled).await?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+        .await;
+        let while_shared = if prepared.is_ok() {
+            Some(remove_unused_images(&docker, std::slice::from_ref(&request)).await)
+        } else {
+            None
+        };
+        let kept = docker.inspect_image(&unlabelled).await.is_ok();
+        force_remove_image(&docker, &theirs).await;
+        let once_alone = if prepared.is_ok() {
+            Some(remove_unused_images(&docker, std::slice::from_ref(&request)).await)
+        } else {
+            None
+        };
+        let removed = docker.inspect_image(&unlabelled).await.is_err();
+        force_remove_image(&docker, &unlabelled).await;
+
+        if let Err(error) = prepared {
+            panic!("preparing the shared-host test failed: {error}");
+        }
+        let while_shared = while_shared.expect("ran").expect("within the batch limit");
+        assert!(
+            matches!(
+                while_shared[0].status,
+                ImageRemovalStatus::UnlabelledOnSharedHost { .. }
+            ),
+            "{:?}",
+            while_shared[0]
+        );
+        assert!(
+            kept,
+            "an unlabelled image stays while another owner shares the daemon"
+        );
+        let once_alone = once_alone.expect("ran").expect("within the batch limit");
+        assert!(once_alone[0].status.is_removed(), "{:?}", once_alone[0]);
+        assert!(
+            removed,
+            "with no other owner present it is judged on the records"
+        );
     }
 }
