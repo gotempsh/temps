@@ -46,7 +46,13 @@ export function Pages({
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
   // Fetch page paths
-  const { data, isLoading, error, refetch } = useWindowQuery({
+  const {
+    data,
+    isLoading,
+    error,
+    refetch,
+    isPlaceholderData: isPreviousWindow,
+  } = useWindowQuery({
     ...getPagePathsOptions({
       query: {
         project_id: project.id,
@@ -100,7 +106,8 @@ export function Pages({
   )
 
   const aiContext = useMemo<AiInsightContext | undefined>(() => {
-    if (!pagePaths?.length) return undefined
+    // The previous window's pages while a moved one loads: not for the AI.
+    if (!pagePaths?.length || isPreviousWindow) return undefined
     return {
       surface: 'top pages',
       rangeStart: startDate?.toISOString(),
@@ -114,7 +121,7 @@ export function Pages({
         })),
       },
     }
-  }, [pagePaths, startDate, endDate])
+  }, [pagePaths, isPreviousWindow, startDate, endDate])
 
   if (error) {
     return (
@@ -140,6 +147,7 @@ export function Pages({
           insights={insights}
           isLoading={isLoading}
           aiContext={aiContext}
+          aiPending={isPreviousWindow}
           project={{ id: project.id, slug: project.slug, name: project.name }}
         />
       )}

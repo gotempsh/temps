@@ -98,6 +98,14 @@ export function OverviewInsights({
     hourlyQuery.isLoading ||
     channelsQuery.isLoading ||
     countriesQuery.isLoading
+  // While a moved window loads, some of these still hold the previous
+  // window's data; the AI must not get a mix of two windows under one label.
+  const isPreviousWindow =
+    visitorsQuery.isPlaceholderData ||
+    sessionsQuery.isPlaceholderData ||
+    hourlyQuery.isPlaceholderData ||
+    channelsQuery.isPlaceholderData ||
+    countriesQuery.isPlaceholderData
 
   const channelRows = useMemo(
     () =>
@@ -150,7 +158,8 @@ export function OverviewInsights({
   ])
 
   const aiContext = useMemo<AiInsightContext | undefined>(() => {
-    if (isLoading || (visitorsQuery.data?.count ?? 0) === 0) return undefined
+    if (isLoading || isPreviousWindow) return undefined
+    if ((visitorsQuery.data?.count ?? 0) === 0) return undefined
 
     // Compact the hourly series into per-day totals so the prompt stays small.
     const dailyVisitors: Record<string, number> = {}
@@ -173,6 +182,7 @@ export function OverviewInsights({
     }
   }, [
     isLoading,
+    isPreviousWindow,
     visitorsQuery.data,
     sessionsQuery.data,
     hourlyQuery.data,
@@ -187,6 +197,7 @@ export function OverviewInsights({
       insights={insights}
       isLoading={isLoading}
       aiContext={aiContext}
+      aiPending={isPreviousWindow}
       project={{ id: project.id, slug: project.slug, name: project.name }}
     />
   )
