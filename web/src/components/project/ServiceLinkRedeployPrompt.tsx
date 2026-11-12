@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ProjectResponse } from '@/api/client'
+import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getProjectDeploymentsQueryKey,
@@ -66,11 +66,13 @@ export function ServiceLinkRedeployPrompt({
     enabled: change != null,
   })
   const redeploy = useMutation({
-    mutationFn: () =>
+    // Only the environments still waiting: one already started through the
+    // deploy dialog must not be redeployed a second time from its old source.
+    mutationFn: (waiting: EnvironmentResponse[]) =>
       redeployCurrentDeployments(
         project.id,
         project.source_type,
-        environments.data ?? [],
+        waiting,
         undefined,
         completed.current
       ),
@@ -121,6 +123,9 @@ export function ServiceLinkRedeployPrompt({
   // the upload instead of promising a redeploy that would be declined.
   const availability = redeployability.data ?? 'redeploy'
   const redeployable = availability !== 'upload'
+  // Held back while each environment's source is looked up; the spinner says
+  // why the action is not available yet.
+  const checking = environments.isSuccess && redeployability.isPending
   // Deployments with no source (manual, external) cannot be rebuilt or
   // uploaded. The deploy dialog would offer the project's default source
   // instead of saying so, so these go straight to the redeploy, which reports
@@ -216,10 +221,15 @@ export function ServiceLinkRedeployPrompt({
                 size="sm"
                 variant={environment === firstTarget ? 'default' : 'outline'}
                 className={WRAPPING_ACTION}
-                disabled={redeployability.isPending}
+                disabled={checking}
+                aria-busy={checking}
                 onClick={() => reviewRedeploy(environment.id)}
               >
-                <RefreshCw className="size-3.5" />
+                {checking ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-3.5" />
+                )}
                 Redeploy {environment.name}
               </Button>
             ))
@@ -229,15 +239,14 @@ export function ServiceLinkRedeployPrompt({
               onClick={() =>
                 useDeployDialog
                   ? reviewRedeploy(firstTarget?.id)
-                  : redeploy.mutate()
+                  : redeploy.mutate(targets)
               }
               disabled={
-                redeploy.isPending ||
-                !environments.isSuccess ||
-                redeployability.isPending
+                redeploy.isPending || !environments.isSuccess || checking
               }
+              aria-busy={redeploy.isPending || checking}
             >
-              {redeploy.isPending ? (
+              {redeploy.isPending || checking ? (
                 <Loader2 className="size-3.5 animate-spin" />
               ) : (
                 <RefreshCw className="size-3.5" />

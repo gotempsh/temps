@@ -163,17 +163,18 @@ const REDEPLOYABILITY_DEADLINE_MS = 4000
  *   told, see below).
  * - `upload`: every one was made from an uploaded archive, which the console
  *   cannot rebuild, so the source has to be uploaded again.
- * - `no-source`: every one is a manual or external deployment, which has
- *   nothing to rebuild from and nothing to upload. The redeploy itself says
- *   so; sending the user to an upload, or to a new-deployment dialog, would
- *   hide that.
+ * - `no-source`: none can be rebuilt in place and at least one is a manual or
+ *   external deployment, which has nothing to rebuild from and nothing to
+ *   upload. The redeploy itself says so, for each environment on its own
+ *   (an uploaded archive among them is told to upload again); sending the user
+ *   to an upload, or to a new-deployment dialog for the project's default
+ *   source, would hide that.
  *
  * Decided from each environment's current deployment, the way the redeploy
  * itself decides ({@link deploymentRedeployPlan}), not from the project's
  * source type: a project's type is its primary source, not a restriction, so a
  * manual project can run an image or a Git ref, and a Git project can hold an
- * uploaded archive. A mix of the two unredeployable kinds stays `redeploy`,
- * and the redeploy reports each environment on its own.
+ * uploaded archive.
  *
  * It answers as soon as one environment is known to be redeployable, and gives
  * up waiting after a few seconds. When a deployment cannot be read, there is
@@ -221,9 +222,7 @@ export async function redeployAvailability(
           if (plan.sourceType === 'uploaded_source') uploads += 1
           else withoutSource += 1
           if (uploads + withoutSource < environments.length) return
-          if (withoutSource === 0) finish('upload')
-          else if (uploads === 0) finish('no-source')
-          else finish('redeploy')
+          finish(withoutSource === 0 ? 'upload' : 'no-source')
         })
         .catch(() => finish('redeploy'))
     }

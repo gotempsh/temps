@@ -247,12 +247,15 @@ describe('redeployAvailability', () => {
     expect(await redeployAvailability(7, 'git', two, api)).toBe('upload')
   })
 
+  // Neither can be rebuilt in place, so offering a deploy dialog for the
+  // project's default source would deploy something else; the redeploy
+  // reports each environment instead.
   test('a mix of archive and no-source deployments is left to the redeploy to report', async () => {
     const api = apiFor({
       31: made(31, 3, 'uploaded_source'),
       41: made(41, 4, 'manual'),
     })
-    expect(await redeployAvailability(7, 'git', two, api)).toBe('redeploy')
+    expect(await redeployAvailability(7, 'git', two, api)).toBe('no-source')
   })
 
   test('one redeployable deployment is enough', async () => {
