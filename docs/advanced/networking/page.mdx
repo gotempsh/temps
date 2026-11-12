@@ -23,6 +23,21 @@ Application containers and managed services (PostgreSQL, Redis, MongoDB, S3 stor
 
 With worker nodes, containers on different hosts communicate over a WireGuard mesh. See [Multi-node](/docs/multi-node).
 
+### Internal addresses (`*.temps.local`)
+
+With **Enable cluster DNS** turned on (**Settings > DNS**), every environment gets an internal address, `<environment>.<project>.temps.local`, that other containers can call over plain HTTP on port 80 (`curl http://production.api.temps.local`). The name resolves to an internal proxy on the caller's own host, which routes the call by `Host` to the environment's containers:
+
+| Install | The name resolves to | Served by |
+|---|---|---|
+| With worker nodes | each worker's bridge address | that worker's agent |
+| Single server (no worker nodes) | the gateway of `temps-app-network`, e.g. `172.20.0.1` | the control plane |
+
+On a single server, the control plane listens on port 591 of the app network's gateway and redirects containers' port-80 calls there, as a worker does on its bridge. It never listens on any other address. The **DNS** page shows the control plane's internal routing state and address, and **Test resolution** says where a name points.
+
+A container may call the addresses of its own project. Calls from another project get a `403` until the owning project allows them under **Settings > Protection > Internal access** (or an environment's **Internal access** card). The caller is identified by its container, not by anything it sends.
+
+The internal proxy needs `nft` (nftables) on the host for the port-80 redirect. Without it, it serves port 80 of the gateway directly, which fails when another program, such as the Temps proxy bound to `0.0.0.0:80`, already holds that port. Until the internal proxy can serve, the names are withdrawn rather than left pointing at that program, and the **DNS** page shows internal routing as down, with the reason. The control plane serves its own containers only in `temps serve`. A split install that runs `temps proxy` separately does not.
+
 ## Flat Hostnames for Wildcard-TLS Providers
 
 Temps generates preview hostnames from the platform preview domain — for
