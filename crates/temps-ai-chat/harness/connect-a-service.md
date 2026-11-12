@@ -1,6 +1,6 @@
 ---
 name: connect-a-service
-description: Use an outside API the user saved in a Vault (Notion, Slack, Anthropic and similar) from a sandbox, or connect a managed database to an app
+description: Start here whenever the user asks to read from, write to or try an outside API or product (Notion, Slack, Anthropic, Stripe and similar), before any project list; the key is a Vault service a sandbox uses without seeing it, and none configured means sending them to /vault. Also connects a managed database to an app
 contexts: assistant, project
 ---
 

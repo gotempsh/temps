@@ -189,12 +189,21 @@ mod tests {
             .seed(None, "assistant_x")
             .await
             .expect("assistant ids are seeded");
-        assert!(seed
+        // The routing comes from the playbook index, not task guidance in
+        // the Rust prompt: the connect-a-service entry says when to start.
+        assert!(!seed
             .system
             .contains("## Outside services the user connected"));
-        assert!(seed.system.contains("`list_access_services_general`"));
-        assert!(seed.system.contains("`connect-a-service`"));
-        assert!(seed.system.contains("`/vault`"));
+        let playbooks = crate::harness::applicable(ASSISTANT_CONTEXT_TYPE, &[]);
+        let index = crate::harness::index_section(&playbooks)
+            .expect("the assistant's turns carry a playbook index");
+        let entry = index
+            .lines()
+            .find(|line| line.starts_with("- `connect-a-service`:"))
+            .expect("the assistant's playbook index lists connect-a-service");
+        assert!(entry.contains("outside API or product"));
+        assert!(entry.contains("before any project list"));
+        assert!(entry.contains("/vault"));
         assert!(seed
             .system
             .contains("a goal that is not about projects does not start with the project list"));
