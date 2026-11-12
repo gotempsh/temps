@@ -13,7 +13,11 @@ import {
   getProjectDeploymentsOptions,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { aggregateApiTraffic, getApiSummary } from '@/api/client'
+import {
+  aggregateApiTraffic,
+  getApiSummary,
+  getApiTimeseries,
+} from '@/api/client'
 import type {
   ProjectResponse,
   TrafficAggregationRequest,
@@ -321,6 +325,18 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   )
   const startIso = startDate?.toISOString()
   const endIso = endDate?.toISOString()
+  // The window a requested summary describes, fixed when it is asked for.
+  // Refresh moves the range to now; the summary stays on screen for the
+  // window it was made for instead of clearing and asking the AI again.
+  // Generating it again summarizes the current window.
+  const [summaryWindow, setSummaryWindow] = React.useState<{
+    startIso?: string
+    endIso?: string
+  }>({})
+  const requestSummary = React.useCallback(() => {
+    setSummaryWindow({ startIso, endIso })
+    setSummaryRequested(true)
+  }, [startIso, endIso])
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -357,9 +373,9 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         return id === 'getApiSummary'
       },
     })
-    setSummaryRequested(true)
+    requestSummary()
     setSummaryRefreshNonce((value) => value + 1)
-  }, [queryClient])
+  }, [queryClient, requestSummary])
 
   const enabled = !!startIso && !!endIso
   const pageSize = 20
@@ -535,12 +551,40 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   // Stable first-page context for the summary. These legacy response shapes
   // differ from the visible generic aggregates, so defer both scans until the
   // user explicitly asks to spend AI credits.
+  const summaryTimeseriesRequest = {
+    path: { project_id: project.id },
+    query: {
+      start_date: summaryWindow.startIso ?? '',
+      end_date: summaryWindow.endIso ?? '',
+      environment_id: selectedEnvironment,
+    },
+  }
+  const summaryTimeseriesQuery = useQuery({
+    // A key of its own, outside the page's Refresh, so the summary's context
+    // stays on its window. It starts from the chart's copy when that is the
+    // same window, so asking for a summary does not fetch it twice.
+    queryKey: ['api-traffic-summary-context', summaryTimeseriesRequest],
+    queryFn: async ({ signal }) => {
+      const { data } = await getApiTimeseries({
+        ...summaryTimeseriesRequest,
+        signal,
+        throwOnError: true,
+      })
+      return data
+    },
+    initialData: () =>
+      queryClient.getQueryData(
+        getApiTimeseriesOptions(summaryTimeseriesRequest).queryKey
+      ),
+    staleTime: Infinity,
+    enabled: enabled && summaryRequested,
+  })
   const summaryRoutesQuery = useQuery({
     ...getApiRoutesOptions({
       path: { project_id: project.id },
       query: {
-        start_date: startIso ?? '',
-        end_date: endIso ?? '',
+        start_date: summaryWindow.startIso ?? '',
+        end_date: summaryWindow.endIso ?? '',
         environment_id: selectedEnvironment,
         limit: pageSize,
         offset: 0,
@@ -552,8 +596,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     ...getApiCallersOptions({
       path: { project_id: project.id },
       query: {
-        start_date: startIso ?? '',
-        end_date: endIso ?? '',
+        start_date: summaryWindow.startIso ?? '',
+        end_date: summaryWindow.endIso ?? '',
         environment_id: selectedEnvironment,
         limit: pageSize,
         offset: 0,
@@ -567,11 +611,11 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const summaryDataReady =
     enabled &&
     summaryRequested &&
-    !timeseriesQuery.isPending &&
+    !summaryTimeseriesQuery.isPending &&
     !summaryRoutesQuery.isPending &&
     !summaryCallersQuery.isPending
   const summaryPrompt = React.useMemo(() => {
-    const timeseries = timeseriesQuery.data
+    const timeseries = summaryTimeseriesQuery.data
     const routes = summaryRoutesQuery.data
     const callers = summaryCallersQuery.data
     if (!summaryDataReady || !timeseries || !routes || !callers) return null
@@ -588,7 +632,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     return [
       'You are a concise API traffic analyst. Return only JSON matching the schema. Focus on anomalies, high error rates, and latency outliers. Never include raw IP addresses.',
       JSON.stringify({
-        period: { start: startIso, end: endIso },
+        period: { start: summaryWindow.startIso, end: summaryWindow.endIso },
         overall: {
           requests: timeseries.total_requests,
           errors: timeseries.total_errors,
@@ -617,20 +661,19 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     ].join('\n\n')
   }, [
     summaryCallersQuery.data,
-    endIso,
     summaryRoutesQuery.data,
-    startIso,
+    summaryWindow,
     summaryDataReady,
-    timeseriesQuery.data,
+    summaryTimeseriesQuery.data,
   ])
   const summaryCacheKey = React.useMemo(() => {
     return apiTrafficSummaryCacheKey({
       environmentId: selectedEnvironment,
       filter: dateFilter.quickFilter,
-      startIso,
-      endIso,
+      startIso: summaryWindow.startIso,
+      endIso: summaryWindow.endIso,
     })
-  }, [dateFilter.quickFilter, endIso, selectedEnvironment, startIso])
+  }, [dateFilter.quickFilter, selectedEnvironment, summaryWindow])
   const summaryRequestEnabled = shouldRequestApiTrafficSummary({
     requested: summaryRequested,
     dataReady: summaryDataReady,
@@ -652,8 +695,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const cliSummaryRequest = {
     path: { project_id: project.id },
     query: {
-      start_date: startIso ?? '',
-      end_date: endIso ?? '',
+      start_date: summaryWindow.startIso ?? '',
+      end_date: summaryWindow.endIso ?? '',
       environment_id: selectedEnvironment,
     },
   }
@@ -686,7 +729,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   })
   const summaryIsPending =
     (summaryRequested &&
-      (timeseriesQuery.isPending ||
+      (summaryTimeseriesQuery.isPending ||
         summaryRoutesQuery.isPending ||
         summaryCallersQuery.isPending)) ||
     structuredSummary.isPending ||
@@ -837,7 +880,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             variant={summaryRequested ? 'secondary' : 'outline'}
             size="sm"
             className="size-9 p-0"
-            onClick={() => setSummaryRequested(true)}
+            onClick={requestSummary}
             disabled={summaryIsPending}
             aria-label="Generate AI traffic summary"
             title="Generate AI traffic summary"
@@ -865,7 +908,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
           requested={summaryRequested}
           canGenerate={summaryCanGenerate}
           isPending={summaryIsPending}
-          onGenerate={() => setSummaryRequested(true)}
+          onGenerate={requestSummary}
           onRefresh={handleSummaryRefresh}
           onInvestigate={investigateWithAi}
         />
