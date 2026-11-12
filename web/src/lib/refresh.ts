@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { hashKey, type QueryKey } from '@tanstack/react-query'
+import { hashKey, type Query, type QueryKey } from '@tanstack/react-query'
 
 type KeyScope<Options> = {
   [Key in keyof Options]?: Options[Key] extends object
@@ -119,4 +119,26 @@ export function keepPreviousWindow(queryKey: QueryKey) {
     movedForward(windowOf(previousQuery.queryKey), currentWindow)
       ? previous
       : undefined
+}
+
+/**
+ * The query for the last window that loaded before `queryKey`'s window: the
+ * same selection, a window `queryKey` moved forward from, with data. When a
+ * moved window fails before it loads, the page keeps showing this one.
+ */
+export function previousWindowQuery(
+  queries: readonly Query[],
+  queryKey: QueryKey
+): Query | undefined {
+  const current = hashKey(withoutWindow(queryKey) as QueryKey)
+  const currentWindow = windowOf(queryKey)
+  let latest: Query | undefined
+  for (const query of queries) {
+    if (query.state.data === undefined) continue
+    if (hashKey(withoutWindow(query.queryKey) as QueryKey) !== current) continue
+    if (!movedForward(windowOf(query.queryKey), currentWindow)) continue
+    if (!latest || query.state.dataUpdatedAt > latest.state.dataUpdatedAt)
+      latest = query
+  }
+  return latest
 }

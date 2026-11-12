@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { installBrowserWindow } from '@/test/dom'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { useWindowQuery } from './useWindowQuery'
 
 installBrowserWindow()
@@ -13,17 +14,27 @@ afterEach(cleanup)
 
 function deferred() {
   let resolve!: (value: string) => void
-  const promise = new Promise<string>((res) => (resolve = res))
-  return { promise, resolve }
+  let reject!: (error: unknown) => void
+  const promise = new Promise<string>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
-function renderBreakdown() {
+function renderBreakdown(
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+) {
   const answers: Array<ReturnType<typeof deferred>> = []
   function Breakdown() {
-    const [end, setEnd] = useState(1)
+    const [start, setStart] = useState(0)
+    const [end, setEnd] = useState(10)
     const [level, setLevel] = useState('country')
     const query = useWindowQuery({
-      queryKey: ['breakdown', { end_date: end, group_by: level }],
+      queryKey: [
+        'breakdown',
+        { start_date: start, end_date: end, group_by: level },
+      ],
       queryFn: () => {
         const answer = deferred()
         answers.push(answer)
@@ -32,22 +43,29 @@ function renderBreakdown() {
     })
     return (
       <>
-        <button type="button" onClick={() => setEnd((n) => n + 1)}>
+        <button
+          type="button"
+          onClick={() => {
+            setStart((n) => n + 1)
+            setEnd((n) => n + 1)
+          }}
+        >
           Move window
+        </button>
+        <button type="button" onClick={() => setStart(-20)}>
+          Pick a wider range
         </button>
         <button type="button" onClick={() => setLevel('region')}>
           Drill down
         </button>
-        <p>{query.isPending ? 'loading' : query.data}</p>
+        <p>
+          {query.isPending ? 'loading' : query.isError ? 'failed' : query.data}
+        </p>
       </>
     )
   }
   render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <Breakdown />
     </QueryClientProvider>
   )
@@ -78,4 +96,37 @@ test('a drill-down shows loading, never the previous level under the new one', a
   expect(screen.queryByText('countries')).toBeNull()
   await act(async () => answers[1].resolve('regions'))
   await screen.findByText('regions')
+})
+
+test('a moved window that fails keeps the last loaded rows, with nothing for the shell to report', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const answers = renderBreakdown(client)
+  await act(async () => answers[0].resolve('countries'))
+  await screen.findByText('countries')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Move window' }))
+  await act(async () =>
+    answers[1].reject({ status: 500, title: 'Internal Server Error' })
+  )
+
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 5)))
+  expect(screen.getByText('countries')).toBeTruthy()
+  expect(screen.queryByText('failed')).toBeNull()
+  expect(collectRouteQueryFailures(client)).toEqual([])
+})
+
+test('another range that fails shows the error, not the previous range', async () => {
+  const answers = renderBreakdown()
+  await act(async () => answers[0].resolve('countries'))
+  await screen.findByText('countries')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Pick a wider range' }))
+  await act(async () =>
+    answers[1].reject({ status: 500, title: 'Internal Server Error' })
+  )
+
+  await screen.findByText('failed')
+  expect(screen.queryByText('countries')).toBeNull()
 })
