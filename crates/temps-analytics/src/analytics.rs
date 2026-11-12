@@ -271,6 +271,25 @@ const PAGE_VISITORS_SESSION_LOOKBACK_HOURS: i64 = 24;
 /// an existence check, since it puts time on page at the 1800s clamp.
 const PAGE_VISITORS_SESSION_LOOKAHEAD_MINUTES: i64 = 30;
 
+/// How far before a visitor's `first_seen` (or a session's `started_at`) its
+/// rows may be timestamped. Events are stamped with the server clock at ingest
+/// after the visitor row exists, and a request log only carries a session id
+/// once the proxy has upserted that session, so the only gap is batch-writer
+/// delay and clock skew between proxy nodes and the control plane; a day is
+/// far beyond both. Used as a lower time bound so TimescaleDB skips chunks
+/// (including compressed ones, which cannot use the visitor or session index)
+/// that cannot hold the rows.
+const ANALYTICS_ROW_CLOCK_SLACK_HOURS: i32 = 24;
+
+/// `ts` minus [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`], saturated at the minimum
+/// timestamp.
+fn earliest_row_time(ts: UtcDateTime) -> UtcDateTime {
+    ts.checked_sub_signed(chrono::Duration::hours(i64::from(
+        ANALYTICS_ROW_CLOCK_SLACK_HOURS,
+    )))
+    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+}
+
 /// `get_page_path_visitors`' query: one page of page views with their
 /// session-flow details.
 ///
@@ -446,6 +465,444 @@ const PAGE_PATH_VISITORS_SQL: &str = r#"
             LEFT JOIN ip_geolocations g ON g.id = tv.ip_geolocation_id
             ORDER BY tv.viewed_at DESC, tv.event_id DESC
             "#;
+
+/// `get_visitor_sessions_by_id`' query. Parameters: `$1` visitor id, `$2`
+/// limit, `$3` the visitor's project, `$4` [`earliest_row_time`] of its
+/// `first_seen`, `$5` [`ANALYTICS_ROW_CLOCK_SLACK_HOURS`].
+///
+/// One pass over the visitor's events, aggregated per raw
+/// events.session_id; request_sessions is then resolved once per
+/// distinct raw id (not once per event), and the raw groups that map to
+/// the same request_sessions row are combined. The scan is bounded by
+/// project (compressed chunks are segmented by project_id) and by the
+/// visitor's first_seen (see ANALYTICS_ROW_CLOCK_SLACK_HOURS).
+///
+/// Raw ids come in two formats: the bare UUID (new events, after the
+/// session-cookie normalisation fix) and the legacy v2|uuid|ts format
+/// stored by older versions of the analytics ingest path.
+/// `split_part(raw_session_id, '|', 2)` extracts the UUID segment from
+/// `v2|<uuid>|<ts>`; the LIKE guard avoids a false match on empty
+/// strings when the id has no '|' delimiters. An exact match wins.
+///
+/// Proxy request count for each listed session: proxy_logs is the live
+/// request-log table (request_logs is defined in the schema but never
+/// written). Counted after LIMIT, so at most $2 sessions. Only browser
+/// documents attach a session to a request, and each also moves the
+/// session's last_accessed_at, so a session's request logs lie within
+/// `[started_at, last_accessed_at]` up to the batch-writer delay; the
+/// bound (widened by ANALYTICS_ROW_CLOCK_SLACK_HOURS) lets TimescaleDB
+/// skip every other chunk. A NULL session_id matches nothing and
+/// yields 0. The project_id guard is defense-in-depth (session ids are
+/// globally unique PKs already); the IS NULL arm keeps proxy rows
+/// written before project attribution.
+const VISITOR_SESSIONS_SQL: &str = r#"            WITH raw_sessions AS (
+                SELECT
+                    e.session_id AS raw_session_id,
+                    MIN(e.timestamp) AS started_at,
+                    MAX(e.timestamp) AS ended_at,
+                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') AS page_views,
+                    COUNT(*) AS events_count,
+                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp ASC))[1] AS entry_path,
+                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp DESC))[1] AS exit_path,
+                    MIN(e.referrer) AS referrer,
+                    COUNT(*) FILTER (
+                        WHERE e.event_type NOT IN ('page_view', 'page_leave')
+                          AND e.event_type NOT LIKE '%\_viewed' ESCAPE '\'
+                    ) AS interactions
+                FROM events e
+                WHERE e.visitor_id = $1
+                  AND e.project_id = $3
+                  AND e.session_id IS NOT NULL
+                  AND e.timestamp >= $4
+                GROUP BY e.session_id
+            ),
+            resolved AS (
+                SELECT
+                    raw.*,
+                    COALESCE(rs_exact.id, rs_v2.id) AS session_id,
+                    COALESCE(rs_exact.started_at, rs_v2.started_at) AS rs_started_at,
+                    COALESCE(rs_exact.last_accessed_at, rs_v2.last_accessed_at) AS rs_last_accessed_at
+                FROM raw_sessions raw
+                LEFT JOIN LATERAL (
+                    SELECT rs.id, rs.started_at, rs.last_accessed_at
+                    FROM request_sessions rs
+                    WHERE rs.session_id = raw.raw_session_id
+                    LIMIT 1
+                ) rs_exact ON true
+                LEFT JOIN LATERAL (
+                    SELECT rs.id, rs.started_at, rs.last_accessed_at
+                    FROM request_sessions rs
+                    WHERE rs_exact.id IS NULL
+                      AND raw.raw_session_id LIKE 'v2|%'
+                      AND rs.session_id = split_part(raw.raw_session_id, '|', 2)
+                    LIMIT 1
+                ) rs_v2 ON true
+            ),
+            session_stats AS (
+                SELECT
+                    session_id,
+                    MIN(started_at) AS started_at,
+                    MAX(ended_at) AS ended_at,
+                    EXTRACT(EPOCH FROM (MAX(ended_at) - MIN(started_at))) AS duration_seconds,
+                    SUM(page_views)::bigint AS page_views,
+                    SUM(events_count)::bigint AS events_count,
+                    (ARRAY_AGG(entry_path ORDER BY started_at ASC))[1] AS entry_path,
+                    (ARRAY_AGG(exit_path ORDER BY ended_at DESC))[1] AS exit_path,
+                    MIN(referrer) AS referrer,
+                    SUM(page_views) <= 1 AS is_bounced,
+                    (
+                        EXTRACT(EPOCH FROM (MAX(ended_at) - MIN(started_at))) >= 10
+                        OR SUM(interactions) > 0
+                    ) AS is_engaged,
+                    MIN(rs_started_at) AS rs_started_at,
+                    MAX(rs_last_accessed_at) AS rs_last_accessed_at
+                FROM resolved
+                GROUP BY session_id
+            ),
+            limited AS MATERIALIZED (
+                SELECT
+                    session_id,
+                    started_at,
+                    ended_at,
+                    COALESCE(duration_seconds, 0)::bigint AS duration_seconds,
+                    page_views,
+                    events_count,
+                    entry_path,
+                    exit_path,
+                    referrer,
+                    is_bounced,
+                    is_engaged,
+                    rs_started_at,
+                    rs_last_accessed_at,
+                    COUNT(*) OVER() AS total_sessions
+                FROM session_stats
+                -- Events whose session has no request_sessions row (yet) are
+                -- neither listed nor counted.
+                WHERE session_id IS NOT NULL
+                ORDER BY started_at DESC
+                LIMIT $2
+            )
+            SELECT
+                l.session_id,
+                l.started_at,
+                l.ended_at,
+                l.duration_seconds,
+                l.page_views,
+                l.events_count,
+                l.entry_path,
+                l.exit_path,
+                l.referrer,
+                l.is_bounced,
+                l.is_engaged,
+                l.total_sessions,
+                (SELECT COUNT(*) FROM proxy_logs pl
+                 WHERE pl.session_id = l.session_id
+                   AND (pl.project_id IS NULL OR pl.project_id = $3)
+                   AND pl.timestamp >= l.rs_started_at - make_interval(hours => $5)
+                   AND pl.timestamp <= l.rs_last_accessed_at + make_interval(hours => $5)) AS requests_count
+            FROM limited l
+            ORDER BY l.started_at DESC
+"#;
+
+/// `get_visitor_journey`'s session list (step 1). Parameters: `$1` visitor
+/// id, `$2` project, `$3` session limit, `$4` [`earliest_row_time`] of the
+/// visitor's `first_seen`.
+///
+/// Sessions with traffic source context, newest first. Aggregated per raw
+/// events.session_id in one pass, then resolved against request_sessions
+/// once per distinct raw id (see [`VISITOR_SESSIONS_SQL`]), bounded by the
+/// visitor's first_seen.
+const VISITOR_JOURNEY_SESSIONS_SQL: &str = r#"            WITH raw_sessions AS (
+                SELECT
+                    e.session_id AS raw_session_id,
+                    MIN(e.timestamp) AS started_at,
+                    MAX(e.timestamp) AS ended_at,
+                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') AS page_views,
+                    COUNT(*) AS events_count,
+                    MIN(e.timestamp) FILTER (WHERE e.event_type = 'page_view') AS first_page_view_at,
+                    MAX(e.timestamp) FILTER (WHERE e.event_type = 'page_view') AS last_page_view_at,
+                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp ASC)  FILTER (WHERE e.event_type = 'page_view'))[1] AS entry_path,
+                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp DESC) FILTER (WHERE e.event_type = 'page_view'))[1] AS exit_path,
+                    COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave', 'heartbeat', 'web_vitals')) AS interactions
+                FROM events e
+                WHERE e.visitor_id = $1
+                  AND e.project_id = $2
+                  AND e.session_id IS NOT NULL
+                  AND e.timestamp >= $4
+                GROUP BY e.session_id
+            ),
+            resolved AS (
+                SELECT raw.*, COALESCE(rs_exact.id, rs_v2.id) AS session_id
+                FROM raw_sessions raw
+                LEFT JOIN LATERAL (
+                    SELECT rs.id
+                    FROM request_sessions rs
+                    WHERE rs.session_id = raw.raw_session_id
+                    LIMIT 1
+                ) rs_exact ON true
+                LEFT JOIN LATERAL (
+                    SELECT rs.id
+                    FROM request_sessions rs
+                    WHERE rs_exact.id IS NULL
+                      AND raw.raw_session_id LIKE 'v2|%'
+                      AND rs.session_id = split_part(raw.raw_session_id, '|', 2)
+                    LIMIT 1
+                ) rs_v2 ON true
+            ),
+            session_data AS (
+                SELECT
+                    r.session_id,
+                    MIN(r.started_at) AS started_at,
+                    MAX(r.ended_at) AS ended_at,
+                    EXTRACT(EPOCH FROM (MAX(r.ended_at) - MIN(r.started_at)))::bigint AS duration_seconds,
+                    SUM(r.page_views)::bigint AS page_views,
+                    SUM(r.events_count)::bigint AS events_count,
+                    (ARRAY_AGG(r.entry_path ORDER BY r.first_page_view_at ASC) FILTER (WHERE r.first_page_view_at IS NOT NULL))[1] AS entry_path,
+                    (ARRAY_AGG(r.exit_path ORDER BY r.last_page_view_at DESC) FILTER (WHERE r.last_page_view_at IS NOT NULL))[1] AS exit_path,
+                    SUM(r.page_views) <= 1 AS is_bounced,
+                    SUM(r.interactions) > 0 AS is_engaged
+                FROM resolved r
+                WHERE r.session_id IS NOT NULL
+                GROUP BY r.session_id
+            )
+            SELECT
+                sd.session_id,
+                sd.started_at,
+                sd.ended_at,
+                COALESCE(sd.duration_seconds, 0) AS duration_seconds,
+                sd.page_views,
+                sd.events_count,
+                sd.entry_path,
+                sd.exit_path,
+                rs.referrer,
+                rs.referrer_hostname,
+                rs.channel,
+                rs.utm_source,
+                rs.utm_medium,
+                rs.utm_campaign,
+                sd.is_bounced,
+                sd.is_engaged,
+                COUNT(*) OVER() AS total_sessions
+            FROM session_data sd
+            JOIN request_sessions rs ON rs.id = sd.session_id
+            ORDER BY sd.started_at DESC
+            LIMIT $3
+"#;
+
+/// `get_visitor_journey`'s events (step 2): every event of the selected
+/// sessions with its computed time_on_page. Parameters: `$1` visitor id, `$2`
+/// project, `$3`/`$4` the sessions' first and last event times, then one
+/// placeholder per session id from `$5`.
+///
+/// Materialize all session events in a CTE, then find each page_view's
+/// next events with window functions over the session ordered by time
+/// (O(n log n); self-joins of the CTE were O(n^2) in a session's
+/// events), preserving the exact 3-priority logic:
+///   Priority 1: next page_leave for same session+page within 30 min
+///   Priority 2: next page_view in same session (any page)
+///   Priority 3: the session's own last_accessed_at (covers the exit
+///     page, which has no next event), clamped to [1, 1800] seconds
+fn visitor_journey_events_sql(session_count: usize) -> String {
+    let in_clause = (0..session_count)
+        .map(|i| format!("${}", i + 5))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"
+        WITH selected_sessions AS MATERIALIZED (
+            SELECT id, session_id, last_accessed_at
+            FROM request_sessions
+            WHERE id IN ({in_clause})
+        ),
+        all_session_events AS MATERIALIZED (
+            -- Materialize ALL events for these sessions into a small CTE
+            SELECT
+                e.id,
+                e.event_type,
+                COALESCE(e.event_name, e.event_type) as event_name,
+                e.timestamp as occurred_at,
+                e.page_path,
+                e.page_title,
+                e.referrer,
+                e.scroll_depth,
+                e.session_id,
+                COALESCE(e.props, e.event_data::jsonb, '{{}}'::jsonb) as event_data,
+                COALESCE(s_exact.id, s_v2.id) as rs_id,
+                COALESCE(s_exact.last_accessed_at, s_v2.last_accessed_at)
+                    as session_last_accessed_at
+            FROM events e
+            -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
+            -- events.session_id (see VISITOR_SESSIONS_SQL):
+            -- two hash lookups into the <= limit_sessions selected rows,
+            -- an exact match first.
+            LEFT JOIN selected_sessions s_exact ON s_exact.session_id = e.session_id
+            LEFT JOIN selected_sessions s_v2
+                ON s_exact.id IS NULL
+                AND e.session_id LIKE 'v2|%'
+                AND s_v2.session_id = split_part(e.session_id, '|', 2)
+            WHERE e.visitor_id = $1
+              AND e.project_id = $2
+              -- The selected sessions' own first and last event times
+              -- (step 1), so only the chunks they span are read.
+              AND e.timestamp >= $3
+              AND e.timestamp <= $4
+              AND COALESCE(s_exact.id, s_v2.id) IS NOT NULL
+        ),
+        -- Earliest page_leave on the same page and earliest page_view
+        -- strictly after each event in the same request session (rs_id, so
+        -- a session written under both id formats is one timeline, as for
+        -- the entry/exit flags): a running MIN over the rows already seen
+        -- in descending time order, excluding same-timestamp peers.
+        -- The frame head stays at the partition start, so PostgreSQL
+        -- accumulates each in a single pass.
+        next_events AS (
+            SELECT
+                ase.*,
+                MIN(ase.occurred_at) FILTER (WHERE ase.event_type = 'page_leave') OVER (
+                    PARTITION BY ase.rs_id, ase.page_path
+                    ORDER BY ase.occurred_at DESC
+                    RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
+                ) as next_page_leave_any_ts,
+                MIN(ase.occurred_at) FILTER (WHERE ase.event_type = 'page_view') OVER (
+                    PARTITION BY ase.rs_id
+                    ORDER BY ase.occurred_at DESC
+                    RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
+                ) as next_page_view_ts
+            FROM all_session_events ase
+        )
+        SELECT
+            ase.id,
+            ase.event_type,
+            ase.event_name,
+            ase.occurred_at,
+            ase.page_path,
+            ase.page_title,
+            ase.referrer,
+            CASE
+                WHEN ase.event_type = 'page_view' THEN
+                    -- Priority 3 falls back to the session's own last-activity
+                    -- timestamp (not a fixed guess) so the exit page of a
+                    -- session -- which by definition has no next event to
+                    -- diff against -- still gets a real duration instead of
+                    -- NULL. Clamped to [1, 1800] so bounces still render a
+                    -- nonzero value and stale/anomalous gaps don't inflate it.
+                    LEAST(1800, GREATEST(1, EXTRACT(EPOCH FROM (
+                        COALESCE(
+                            -- Priority 1 only counts within 30 min.
+                            CASE
+                                WHEN ase.next_page_leave_any_ts
+                                    <= ase.occurred_at + INTERVAL '30 minutes'
+                                THEN ase.next_page_leave_any_ts
+                            END,
+                            ase.next_page_view_ts,
+                            ase.session_last_accessed_at,
+                            ase.occurred_at + INTERVAL '1 second'
+                        ) - ase.occurred_at
+                    ))::int))
+                ELSE NULL
+            END as computed_time_on_page,
+            ase.scroll_depth,
+            ase.event_data,
+            ase.rs_id
+        FROM next_events ase
+        WHERE ase.event_type NOT IN ('heartbeat', 'web_vitals', 'page_leave')
+        ORDER BY ase.rs_id, ase.occurred_at ASC
+        "#,
+        in_clause = in_clause
+    )
+}
+
+/// `get_session_events`' two queries: one page of events and the total.
+struct SessionEventsQueries {
+    page_sql: String,
+    page_values: Vec<sea_orm::Value>,
+    count_sql: String,
+    count_values: Vec<sea_orm::Value>,
+}
+
+/// Builds [`SessionEventsQueries`] for `session`'s events in `project_id`,
+/// optionally narrowed to an environment and a `(start, end)` range, ordered
+/// by time (`"asc"`, otherwise descending).
+///
+/// The session's events cannot predate its request_sessions row by more than
+/// the clock slack, so the lower bound lets TimescaleDB skip every older chunk
+/// (compressed chunks cannot use the session index). Only the requested page
+/// is read, in index order: no window over the whole session, so a session
+/// with millions of events costs O(offset + limit) in the page query. The
+/// total is a separate count over the same filter.
+fn session_events_queries(
+    session: &request_sessions::Model,
+    project_id: i32,
+    environment_id: Option<i32>,
+    (start_date, end_date): (Option<UtcDateTime>, Option<UtcDateTime>),
+    limit: i32,
+    offset: i32,
+    sort_order: Option<&str>,
+) -> SessionEventsQueries {
+    let mut where_conditions = vec![
+        "session_id = $1".to_string(),
+        "project_id = $2".to_string(),
+        "timestamp >= $3".to_string(),
+    ];
+    let mut values: Vec<sea_orm::Value> = vec![
+        session.session_id.clone().into(),
+        project_id.into(),
+        earliest_row_time(session.started_at).into(),
+    ];
+    let mut param_index = 4;
+
+    if let Some(env_id) = environment_id {
+        where_conditions.push(format!("environment_id = ${}", param_index));
+        values.push(env_id.into());
+        param_index += 1;
+    }
+
+    if let Some(start) = start_date {
+        where_conditions.push(format!("timestamp >= ${}", param_index));
+        values.push(start.into());
+        param_index += 1;
+    }
+
+    if let Some(end) = end_date {
+        where_conditions.push(format!("timestamp <= ${}", param_index));
+        values.push(end.into());
+        param_index += 1;
+    }
+
+    let order = match sort_order {
+        Some("asc") => "ASC",
+        _ => "DESC",
+    };
+    let where_clause = where_conditions.join(" AND ");
+    let page_sql = format!(
+        r#"
+        SELECT
+            COALESCE(event_name, event_type) as event_name,
+            timestamp as occurred_at,
+            COALESCE(props, event_data::jsonb, '{{}}'::jsonb) as event_data,
+            page_path as request_path,
+            request_query
+        FROM events
+        WHERE {where_clause}
+        ORDER BY timestamp {order}, id {order}
+        LIMIT ${limit_param} OFFSET ${offset_param}
+        "#,
+        limit_param = param_index,
+        offset_param = param_index + 1
+    );
+    let count_sql = format!("SELECT COUNT(*) as total_count FROM events WHERE {where_clause}");
+
+    let count_values = values.clone();
+    values.push(i64::from(limit).into());
+    values.push(i64::from(offset).into());
+
+    SessionEventsQueries {
+        page_sql,
+        page_values: values,
+        count_sql,
+        count_values,
+    }
+}
 
 /// The session-event bounds `[$8, $9]` of [`PAGE_PATH_VISITORS_SQL`]: the
 /// window widened by the lookback and lookahead. Passed as plain timestamps
@@ -1542,89 +1999,10 @@ impl Analytics for AnalyticsService {
             return Ok(None);
         };
 
-        let sql_query = r#"
-            WITH session_stats AS (
-                SELECT
-                    rs.id as session_id,
-                    MIN(e.timestamp) as started_at,
-                    MAX(e.timestamp) as ended_at,
-                    EXTRACT(EPOCH FROM (MAX(e.timestamp) - MIN(e.timestamp))) as duration_seconds,
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') as page_views,
-                    COUNT(*) as events_count,
-                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp ASC))[1]                        as entry_path,
-                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp DESC))[1]                       as exit_path,
-                    MIN(e.referrer) as referrer,
-                    -- A bounce is a session with at most one page view.
-                    -- Computed from the pageview count: events.is_bounce is
-                    -- never populated by the ingest path.
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') <= 1 as is_bounced,
-                    -- A session is engaged if the visitor spent real attention:
-                    -- at least 10s of measured wall-clock time, OR fired a
-                    -- genuine interaction event. Auto-fired view events
-                    -- (page_view, page_leave, *_viewed) do not count — they
-                    -- trigger from intersection observers for bots too.
-                    (
-                        EXTRACT(EPOCH FROM (MAX(e.timestamp) - MIN(e.timestamp))) >= 10
-                        OR COUNT(*) FILTER (
-                            WHERE e.event_type NOT IN ('page_view', 'page_leave')
-                              AND e.event_type NOT LIKE '%\_viewed' ESCAPE '\'
-                        ) > 0
-                    ) as is_engaged
-                FROM events e
-                -- Tolerate both the bare-UUID format (new events, after the
-                -- session-cookie normalisation fix) and the legacy v2|uuid|ts
-                -- format stored by older versions of the analytics ingest path.
-                -- split_part(e.session_id, '|', 2) extracts the UUID segment
-                -- from 'v2|<uuid>|<ts>'; the LIKE guard avoids a false match
-                -- on empty strings when e.session_id has no '|' delimiters.
-                LEFT JOIN request_sessions rs ON (
-                    rs.session_id = e.session_id
-                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
-                )
-                WHERE e.visitor_id = $1 AND e.session_id IS NOT NULL
-                GROUP BY rs.id
-            )
-            SELECT
-                limited.*,
-                -- Proxy request count for the session. proxy_logs is the live
-                -- request-log table (request_logs is defined in the schema but
-                -- never written). Counted after LIMIT via
-                -- idx_proxy_logs_session_id so this does at most $2 index
-                -- lookups; a NULL session_id matches nothing and yields 0.
-                -- The project_id guard is defense-in-depth (session ids are
-                -- globally unique PKs already); the IS NULL arm keeps proxy
-                -- rows written before project attribution.
-                (SELECT COUNT(*) FROM proxy_logs pl
-                 WHERE pl.session_id = limited.session_id
-                   AND (pl.project_id IS NULL OR pl.project_id = $3)) as requests_count
-            FROM (
-                SELECT
-                    session_id,
-                    started_at,
-                    ended_at,
-                    COALESCE(duration_seconds, 0)::bigint as duration_seconds,
-                    page_views,
-                    events_count,
-                    entry_path,
-                    exit_path,
-                    referrer,
-                    is_bounced,
-                    is_engaged,
-                    COUNT(*) OVER() as total_sessions
-                FROM session_stats
-                ORDER BY started_at DESC
-                LIMIT $2
-            ) limited
-            ORDER BY limited.started_at DESC
-            "#;
-
         #[derive(FromQueryResult)]
         struct SessionResult {
-            // Nullable because the query uses LEFT JOIN request_sessions: when no
-            // matching row exists yet (proxy async flush hasn't landed), rs.id comes
-            // back NULL. Decoding NULL into a non-optional i32 causes a hard
-            // type-decode error that kills the whole request. We filter these out
-            // below so SessionSummary.session_id remains non-optional.
+            // The query drops sessions without a request_sessions row; kept
+            // nullable so a NULL can never fail the decode of the whole page.
             session_id: Option<i32>,
             started_at: UtcDateTime,
             ended_at: Option<UtcDateTime>,
@@ -1642,37 +2020,24 @@ impl Analytics for AnalyticsService {
 
         let results = SessionResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sql_query,
+            VISITOR_SESSIONS_SQL,
             vec![
                 visitor_id.into(),
                 (limit_val as i64).into(),
                 visitor.project_id.into(),
+                earliest_row_time(visitor.first_seen).into(),
+                ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
             ],
         ))
         .all(self.db.as_ref())
         .await?;
 
-        // The window-function total (pre-LIMIT, pre-filter) is the correct
-        // pagination baseline. Subtract the count of NULL-session groups so the
-        // displayed total never exceeds the visible list.
-        let raw_total = results.first().map(|r| r.total_sessions).unwrap_or(0);
-        let mut null_count = 0i64;
-
+        let total_sessions = results.first().map(|r| r.total_sessions).unwrap_or(0);
         let sessions = results
             .into_iter()
             .filter_map(|r| {
-                let sid = match r.session_id {
-                    Some(id) => id,
-                    None => {
-                        // No request_sessions row for this e.session_id yet
-                        // (timing race or prior proxy error). Drop this group
-                        // from the visible list and deduct it from the total.
-                        null_count += 1;
-                        return None;
-                    }
-                };
                 Some(crate::types::responses::SessionSummary {
-                    session_id: sid,
+                    session_id: r.session_id?,
                     started_at: r.started_at,
                     ended_at: r.ended_at,
                     duration_seconds: r.duration_seconds,
@@ -1687,8 +2052,6 @@ impl Analytics for AnalyticsService {
                 })
             })
             .collect();
-
-        let total_sessions = raw_total.saturating_sub(null_count);
 
         Ok(Some(VisitorSessionsResponse {
             visitor_id: visitor.visitor_id,
@@ -1709,69 +2072,13 @@ impl Analytics for AnalyticsService {
             .one(self.db.as_ref())
             .await?;
 
-        if visitor.is_none() {
+        let Some(visitor) = visitor else {
             return Ok(None);
-        }
+        };
 
         let limit_sessions = limit_sessions.unwrap_or(50).min(100) as i64;
 
-        // Step 1: Get sessions with traffic source context (newest first)
-        let sessions_sql = r#"
-            WITH session_data AS (
-                SELECT
-                    rs.id as session_id,
-                    MIN(e.timestamp) as started_at,
-                    MAX(e.timestamp) as ended_at,
-                    EXTRACT(EPOCH FROM (MAX(e.timestamp) - MIN(e.timestamp)))::bigint as duration_seconds,
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') as page_views,
-                    COUNT(*) as events_count,
-                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp ASC)  FILTER (WHERE e.event_type = 'page_view'))[1] as entry_path,
-                    (ARRAY_AGG(e.page_path ORDER BY e.timestamp DESC) FILTER (WHERE e.event_type = 'page_view'))[1] as exit_path,
-                    rs.referrer,
-                    rs.referrer_hostname,
-                    rs.channel,
-                    rs.utm_source,
-                    rs.utm_medium,
-                    rs.utm_campaign,
-                    -- A bounce is a session with at most one page view;
-                    -- events.is_bounce is never populated by the ingest path.
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') <= 1 as is_bounced,
-                    COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave', 'heartbeat', 'web_vitals')) > 0 as is_engaged
-                FROM events e
-                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
-                -- events.session_id (see get_visitor_sessions_by_id comment).
-                JOIN request_sessions rs ON (
-                    rs.session_id = e.session_id
-                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
-                )
-                WHERE e.visitor_id = $1
-                  AND e.project_id = $2
-                  AND e.session_id IS NOT NULL
-                GROUP BY rs.id, rs.referrer, rs.referrer_hostname, rs.channel,
-                         rs.utm_source, rs.utm_medium, rs.utm_campaign
-            )
-            SELECT
-                session_id,
-                started_at,
-                ended_at,
-                COALESCE(duration_seconds, 0) as duration_seconds,
-                page_views,
-                events_count,
-                entry_path,
-                exit_path,
-                referrer,
-                referrer_hostname,
-                channel,
-                utm_source,
-                utm_medium,
-                utm_campaign,
-                is_bounced,
-                is_engaged,
-                COUNT(*) OVER() as total_sessions
-            FROM session_data
-            ORDER BY started_at DESC
-            LIMIT $3
-        "#;
+        // Step 1: sessions with traffic source context, newest first.
 
         #[derive(FromQueryResult)]
         struct JourneySessionRow {
@@ -1796,8 +2103,13 @@ impl Analytics for AnalyticsService {
 
         let session_rows = JourneySessionRow::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sessions_sql,
-            vec![visitor_id.into(), project_id.into(), limit_sessions.into()],
+            VISITOR_JOURNEY_SESSIONS_SQL,
+            vec![
+                visitor_id.into(),
+                project_id.into(),
+                limit_sessions.into(),
+                earliest_row_time(visitor.first_seen).into(),
+            ],
         ))
         .all(self.db.as_ref())
         .await?;
@@ -1816,111 +2128,7 @@ impl Analytics for AnalyticsService {
         // Step 2: Collect all session IDs, then fetch events for all sessions in one query
         let session_ids: Vec<i32> = session_rows.iter().map(|r| r.session_id).collect();
 
-        // Build the session_id placeholders for IN clause
-        let session_id_placeholders: Vec<String> = session_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", i + 3))
-            .collect();
-        let in_clause = session_id_placeholders.join(", ");
-
-        // Build events query with computed time_on_page.
-        // Materialize all session events in a CTE, then find each page_view's
-        // next events with window functions over the session ordered by time
-        // (O(n log n); self-joins of the CTE were O(n^2) in a session's
-        // events), preserving the exact 3-priority logic:
-        //   Priority 1: next page_leave for same session+page within 30 min
-        //   Priority 2: next page_view in same session (any page)
-        //   Priority 3: the session's own last_accessed_at (covers the exit
-        //     page, which has no next event), clamped to [1, 1800] seconds
-        let events_sql = format!(
-            r#"
-            WITH all_session_events AS MATERIALIZED (
-                -- Materialize ALL events for these sessions into a small CTE
-                SELECT
-                    e.id,
-                    e.event_type,
-                    COALESCE(e.event_name, e.event_type) as event_name,
-                    e.timestamp as occurred_at,
-                    e.page_path,
-                    e.page_title,
-                    e.referrer,
-                    e.scroll_depth,
-                    e.session_id,
-                    COALESCE(e.props, e.event_data::jsonb, '{{}}'::jsonb) as event_data,
-                    rs.id as rs_id,
-                    rs.last_accessed_at as session_last_accessed_at
-                FROM events e
-                -- Tolerate both bare-UUID and legacy v2|uuid|ts formats in
-                -- events.session_id (see get_visitor_sessions_by_id comment).
-                JOIN request_sessions rs ON (
-                    rs.session_id = e.session_id
-                    OR (e.session_id LIKE 'v2|%' AND rs.session_id = split_part(e.session_id, '|', 2))
-                )
-                WHERE e.visitor_id = $1
-                  AND e.project_id = $2
-                  AND rs.id IN ({in_clause})
-            ),
-            -- Earliest page_leave on the same page and earliest page_view
-            -- strictly after each event: a running MIN over the rows already
-            -- seen in descending time order, excluding same-timestamp peers.
-            -- The frame head stays at the partition start, so PostgreSQL
-            -- accumulates each in a single pass.
-            next_events AS (
-                SELECT
-                    ase.*,
-                    MIN(ase.occurred_at) FILTER (WHERE ase.event_type = 'page_leave') OVER (
-                        PARTITION BY ase.session_id, ase.page_path
-                        ORDER BY ase.occurred_at DESC
-                        RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
-                    ) as next_page_leave_any_ts,
-                    MIN(ase.occurred_at) FILTER (WHERE ase.event_type = 'page_view') OVER (
-                        PARTITION BY ase.session_id
-                        ORDER BY ase.occurred_at DESC
-                        RANGE BETWEEN UNBOUNDED PRECEDING AND '1 microsecond' PRECEDING
-                    ) as next_page_view_ts
-                FROM all_session_events ase
-            )
-            SELECT
-                ase.id,
-                ase.event_type,
-                ase.event_name,
-                ase.occurred_at,
-                ase.page_path,
-                ase.page_title,
-                ase.referrer,
-                CASE
-                    WHEN ase.event_type = 'page_view' THEN
-                        -- Priority 3 falls back to the session's own last-activity
-                        -- timestamp (not a fixed guess) so the exit page of a
-                        -- session -- which by definition has no next event to
-                        -- diff against -- still gets a real duration instead of
-                        -- NULL. Clamped to [1, 1800] so bounces still render a
-                        -- nonzero value and stale/anomalous gaps don't inflate it.
-                        LEAST(1800, GREATEST(1, EXTRACT(EPOCH FROM (
-                            COALESCE(
-                                -- Priority 1 only counts within 30 min.
-                                CASE
-                                    WHEN ase.next_page_leave_any_ts
-                                        <= ase.occurred_at + INTERVAL '30 minutes'
-                                    THEN ase.next_page_leave_any_ts
-                                END,
-                                ase.next_page_view_ts,
-                                ase.session_last_accessed_at,
-                                ase.occurred_at + INTERVAL '1 second'
-                            ) - ase.occurred_at
-                        ))::int))
-                    ELSE NULL
-                END as computed_time_on_page,
-                ase.scroll_depth,
-                ase.event_data,
-                ase.rs_id
-            FROM next_events ase
-            WHERE ase.event_type NOT IN ('heartbeat', 'web_vitals', 'page_leave')
-            ORDER BY ase.rs_id, ase.occurred_at ASC
-            "#,
-            in_clause = in_clause
-        );
+        let events_sql = visitor_journey_events_sql(session_ids.len());
 
         #[derive(FromQueryResult)]
         struct JourneyEventRow {
@@ -1937,7 +2145,19 @@ impl Analytics for AnalyticsService {
             rs_id: i32,
         }
 
-        let mut event_values: Vec<sea_orm::Value> = vec![visitor_id.into(), project_id.into()];
+        // Every event of the selected sessions lies within their first and
+        // last event times, which step 1 computed from the same rows.
+        let events_from = session_rows.iter().map(|r| r.started_at).min();
+        let events_to = session_rows
+            .iter()
+            .map(|r| r.ended_at.unwrap_or(r.started_at))
+            .max();
+        let mut event_values: Vec<sea_orm::Value> = vec![
+            visitor_id.into(),
+            project_id.into(),
+            events_from.into(),
+            events_to.into(),
+        ];
         for id in &session_ids {
             event_values.push((*id).into());
         }
@@ -2176,87 +2396,36 @@ impl Analytics for AnalyticsService {
                 AnalyticsError::SessionNotFound(format!("Session not found for id: {}", session_id))
             })?;
 
-        // Build WHERE conditions with parameterized queries
-        let mut where_conditions =
-            vec!["session_id = $1".to_string(), "project_id = $2".to_string()];
-        let mut values: Vec<sea_orm::Value> =
-            vec![request_session.session_id.into(), project_id.into()];
-        let mut param_index = 3;
-
-        if let Some(env_id) = environment_id {
-            where_conditions.push(format!("environment_id = ${}", param_index));
-            values.push(env_id.into());
-            param_index += 1;
-        }
-
-        if let Some(start) = start_date {
-            where_conditions.push(format!("timestamp >= ${}", param_index));
-            values.push(start.into());
-            param_index += 1;
-        }
-
-        if let Some(end) = end_date {
-            where_conditions.push(format!("timestamp <= ${}", param_index));
-            values.push(end.into());
-            param_index += 1;
-        }
-
         let limit_val = limit.unwrap_or(100).min(1000);
         let offset_val = offset.unwrap_or(0);
-        let order = match sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
-
-        let where_clause = where_conditions.join(" AND ");
-        let sql_query = format!(
-            r#"
-            WITH event_data AS (
-                SELECT
-                    ROW_NUMBER() OVER (ORDER BY timestamp {}) as id,
-                    COALESCE(event_name, event_type) as event_name,
-                    timestamp as occurred_at,
-                    COALESCE(props, event_data::jsonb, '{{}}'::jsonb) as event_data,
-                    page_path as request_path,
-                    request_query,
-                    COUNT(*) OVER() as total_count
-                FROM events
-                WHERE {}
-                ORDER BY timestamp {}
-                LIMIT ${} OFFSET ${}
-            )
-            SELECT * FROM event_data
-            "#,
-            order,
-            where_clause,
-            order,
-            param_index,
-            param_index + 1
+        let queries = session_events_queries(
+            &request_session,
+            project_id,
+            environment_id,
+            (start_date, end_date),
+            limit_val,
+            offset_val,
+            sort_order.as_deref(),
         );
-
-        // Add LIMIT and OFFSET as parameters
-        values.push((limit_val as i64).into());
-        values.push((offset_val as i64).into());
 
         #[derive(FromQueryResult)]
         struct EventResult {
-            id: i64,
             event_name: String,
             occurred_at: UtcDateTime,
             event_data: serde_json::Value,
             request_path: String,
             request_query: Option<String>,
-            total_count: i64,
         }
 
         let results = EventResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sql_query,
-            values,
+            queries.page_sql,
+            queries.page_values,
         ))
         .all(self.db.as_ref())
         .await?;
 
+        // An empty page reports a total of 0, as it always has.
         if results.is_empty() {
             return Ok(Some(SessionEventsResponse {
                 session_id,
@@ -2267,12 +2436,29 @@ impl Analytics for AnalyticsService {
             }));
         }
 
-        let total_count = results.first().map(|r| r.total_count).unwrap_or(0);
+        #[derive(FromQueryResult)]
+        struct CountResult {
+            total_count: i64,
+        }
 
+        let total_count = CountResult::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            queries.count_sql,
+            queries.count_values,
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .map(|r| r.total_count)
+        .unwrap_or(0);
+
+        // `id` is the event's 1-based position in the requested order.
         let events = results
             .into_iter()
-            .map(|r| crate::types::responses::SessionEvent {
-                id: r.id as i32,
+            .enumerate()
+            .map(|(index, r)| crate::types::responses::SessionEvent {
+                id: offset_val
+                    .saturating_add(i32::try_from(index).unwrap_or(i32::MAX))
+                    .saturating_add(1),
                 event_name: r.event_name,
                 occurred_at: r.occurred_at,
                 event_data: r.event_data,
@@ -7261,6 +7447,624 @@ mod tests {
                 ("/win/r".to_string(), Some(45)),
                 ("/win/s".to_string(), Some(60)),
             ]
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Every table or chunk an `EXPLAIN (ANALYZE, FORMAT JSON)` plan node
+    /// actually read. Nodes TimescaleDB pruned at run time stay in the plan
+    /// but never execute, so they are left out.
+    fn scanned_relations(node: &serde_json::Value, out: &mut Vec<String>) {
+        let executed = node
+            .get("Actual Loops")
+            .and_then(|v| v.as_f64())
+            .is_some_and(|loops| loops > 0.0);
+        if !executed {
+            return;
+        }
+        if let Some(name) = node.get("Relation Name").and_then(|v| v.as_str()) {
+            out.push(name.to_string());
+        }
+        if let Some(plans) = node.get("Plans").and_then(|v| v.as_array()) {
+            for plan in plans {
+                scanned_relations(plan, out);
+            }
+        }
+    }
+
+    /// Runs `EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON)` on `sql` and returns
+    /// the root plan node with the relations it read.
+    async fn explain_analyze(
+        db: &sea_orm::DatabaseConnection,
+        sql: &str,
+        values: Vec<sea_orm::Value>,
+    ) -> anyhow::Result<(serde_json::Value, Vec<String>)> {
+        use sea_orm::ConnectionTrait;
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!("EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) {sql}"),
+                values,
+            ))
+            .await?
+            .expect("EXPLAIN returns one row");
+        let plan: serde_json::Value = row.try_get("", "QUERY PLAN")?;
+        let root = plan[0]["Plan"].clone();
+        let mut relations = Vec::new();
+        scanned_relations(&root, &mut relations);
+        Ok((root, relations))
+    }
+
+    /// The TimescaleDB chunks of `hypertable` whose time range holds `ts`
+    /// (one per space partition that has rows).
+    async fn chunks_holding(
+        db: &sea_orm::DatabaseConnection,
+        hypertable: &str,
+        ts: UtcDateTime,
+    ) -> anyhow::Result<Vec<String>> {
+        use sea_orm::ConnectionTrait;
+        let rows = db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT chunk_name FROM timescaledb_information.chunks \
+                 WHERE hypertable_name = $1 AND range_start <= $2 AND range_end > $2",
+                vec![hypertable.into(), ts.into()],
+            ))
+            .await?;
+        let chunks = rows
+            .iter()
+            .map(|row| row.try_get::<String>("", "chunk_name"))
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(!chunks.is_empty(), "no {hypertable} chunk holds {ts}");
+        Ok(chunks)
+    }
+
+    /// Whether the plan read any of `chunks`.
+    fn reads_any(read: &[String], chunks: &[String]) -> bool {
+        chunks.iter().any(|chunk| read.contains(chunk))
+    }
+
+    async fn insert_visitor(
+        db: &sea_orm::DatabaseConnection,
+        scope: &SeededScope,
+        guid: &str,
+        first_seen: UtcDateTime,
+    ) -> anyhow::Result<i32> {
+        use sea_orm::{ActiveModelTrait, Set};
+        let row = visitor::ActiveModel {
+            visitor_id: Set(guid.to_string()),
+            project_id: Set(scope.project_id),
+            environment_id: Set(scope.environment_id),
+            first_seen: Set(first_seen),
+            last_seen: Set(first_seen),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        Ok(row.id)
+    }
+
+    async fn insert_proxy_log(
+        db: &sea_orm::DatabaseConnection,
+        project_id: i32,
+        session_id: i32,
+        timestamp: UtcDateTime,
+    ) -> anyhow::Result<()> {
+        use sea_orm::ConnectionTrait;
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO proxy_logs (timestamp, method, path, host, status_code, \
+             request_source, is_system_request, routing_status, request_id, \
+             created_date, project_id, session_id) \
+             VALUES ($1, 'GET', '/', 'example.com', 200, 'proxy', false, 'routed', \
+             gen_random_uuid()::text, $1::date, $2, $3)",
+            vec![timestamp.into(), project_id.into(), session_id.into()],
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// The visitor session list and journey aggregate a visitor's sessions
+    /// (bare and legacy v2 session ids, also mixed within one session),
+    /// leave out sessions with no request_sessions row, and count each
+    /// session's proxy requests -- while reading only the chunks from the
+    /// visitor's first_seen on (events) and the listed sessions' lifetimes
+    /// (proxy_logs). Without those bounds every chunk of the project's
+    /// history was read for a single visitor.
+    #[tokio::test]
+    async fn test_visitor_sessions_and_journey_read_only_the_visitors_time_range(
+    ) -> anyhow::Result<()> {
+        let Some((service, db, _container)) =
+            analytics_service_or_skip("test_visitor_sessions_time_range").await
+        else {
+            return Ok(());
+        };
+        let db = db.as_ref();
+        let scope = seeded_scope(db).await?;
+        let project_id = scope.project_id;
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-03-10T12:00:00Z")?
+            .with_timezone(&chrono::Utc);
+        let min = |m: i64| t0 + chrono::Duration::minutes(m);
+        let day = |d: i64| chrono::Duration::days(d);
+
+        // Another visitor's history, two months before this visitor existed:
+        // its event and request-log chunks must never be read.
+        let long_ago = t0 - day(60);
+        let other_visitor = insert_visitor(db, &scope, "earlier-visitor", long_ago).await?;
+        let old_session =
+            insert_request_session(db, "old-session", long_ago, long_ago, Some(other_visitor))
+                .await?;
+        FlowSeeder {
+            db,
+            project_id,
+            environment_id: Some(scope.environment_id),
+            visitor_id: Some(other_visitor),
+        }
+        .event("old-session", "page_view", "/old", long_ago)
+        .await?;
+        insert_proxy_log(db, project_id, old_session, long_ago).await?;
+
+        let visitor_id = insert_visitor(db, &scope, "listed-visitor", t0).await?;
+        let seed = FlowSeeder {
+            db,
+            project_id,
+            environment_id: Some(scope.environment_id),
+            visitor_id: Some(visitor_id),
+        };
+
+        // A: bare session id, three page views, a click and a page_leave,
+        // three proxy requests.
+        let a = insert_request_session(db, "sess-a", min(1), min(20), Some(visitor_id)).await?;
+        seed.event("sess-a", "page_view", "/a1", min(1)).await?;
+        seed.event("sess-a", "signup_click", "/a1", min(2)).await?;
+        seed.event("sess-a", "page_view", "/a2", min(5)).await?;
+        seed.event("sess-a", "page_leave", "/a2", min(6)).await?;
+        seed.event("sess-a", "page_view", "/a3", min(10)).await?;
+        for m in [1, 5, 10] {
+            insert_proxy_log(db, project_id, a, min(m)).await?;
+        }
+        // C: events whose session never reached request_sessions.
+        seed.event("sess-c-orphan", "page_view", "/c", t0 + day(1))
+            .await?;
+        // B: legacy v2 id only, a single page view and one proxy request.
+        let b_start = t0 + day(2);
+        let b = insert_request_session(
+            db,
+            "sess-b",
+            b_start,
+            b_start + chrono::Duration::minutes(5),
+            Some(visitor_id),
+        )
+        .await?;
+        seed.event(
+            "v2|sess-b|1700000000",
+            "page_view",
+            "/b1",
+            b_start + chrono::Duration::minutes(1),
+        )
+        .await?;
+        insert_proxy_log(db, project_id, b, b_start + chrono::Duration::minutes(1)).await?;
+        // D: one session written under both id formats.
+        let d_start = t0 + day(3);
+        let d = insert_request_session(
+            db,
+            "sess-d",
+            d_start,
+            d_start + chrono::Duration::minutes(5),
+            Some(visitor_id),
+        )
+        .await?;
+        seed.event("v2|sess-d|1700000000", "page_view", "/d1", d_start)
+            .await?;
+        seed.event(
+            "sess-d",
+            "page_view",
+            "/d2",
+            d_start + chrono::Duration::seconds(30),
+        )
+        .await?;
+
+        // -- get_visitor_sessions_by_id --
+        let listed = service
+            .get_visitor_sessions_by_id(visitor_id, None)
+            .await?
+            .expect("the visitor exists");
+        assert_eq!(listed.visitor_id, "listed-visitor");
+        assert_eq!(
+            listed.total_sessions, 3,
+            "the session without a request_sessions row is not counted"
+        );
+        let summary: Vec<_> = listed
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.session_id,
+                    s.page_views,
+                    s.events_count,
+                    s.requests_count,
+                    s.entry_path.clone(),
+                    s.exit_path.clone(),
+                    s.duration_seconds,
+                    s.is_bounced,
+                    s.is_engaged,
+                )
+            })
+            .collect();
+        let path = |p: &str| Some(p.to_string());
+        assert_eq!(
+            summary,
+            vec![
+                (d, 2, 2, 0, path("/d1"), path("/d2"), 30, false, true),
+                (b, 1, 1, 1, path("/b1"), path("/b1"), 0, true, false),
+                (a, 3, 5, 3, path("/a1"), path("/a3"), 540, false, true),
+            ],
+            "newest first; v2 and bare ids of one session are combined"
+        );
+        let first_two = service
+            .get_visitor_sessions_by_id(visitor_id, Some(2))
+            .await?
+            .expect("the visitor exists");
+        assert_eq!(
+            first_two
+                .sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![d, b]
+        );
+        assert_eq!(first_two.total_sessions, 3);
+
+        // -- get_visitor_journey --
+        let journey = service
+            .get_visitor_journey(visitor_id, project_id, None)
+            .await?
+            .expect("the visitor exists");
+        assert_eq!(journey.total_sessions, 3);
+        assert_eq!(
+            journey.total_events, 7,
+            "page_leave rows are folded into time on page"
+        );
+        let sessions: Vec<_> = journey
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.session_id,
+                    s.page_views,
+                    s.entry_path.clone(),
+                    s.exit_path.clone(),
+                    s.is_bounced,
+                    s.is_engaged,
+                    s.events
+                        .iter()
+                        .map(|e| (e.event_type.clone(), e.page_path.clone(), e.time_on_page))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let pv = |p: &str, seconds: i32| ("page_view".to_string(), path(p), Some(seconds));
+        assert_eq!(
+            sessions,
+            vec![
+                (
+                    d,
+                    2,
+                    path("/d1"),
+                    path("/d2"),
+                    false,
+                    false,
+                    vec![pv("/d1", 30), pv("/d2", 270)]
+                ),
+                (
+                    b,
+                    1,
+                    path("/b1"),
+                    path("/b1"),
+                    true,
+                    false,
+                    vec![pv("/b1", 240)]
+                ),
+                (
+                    a,
+                    3,
+                    path("/a1"),
+                    path("/a3"),
+                    false,
+                    true,
+                    vec![
+                        pv("/a1", 240),
+                        ("signup_click".to_string(), path("/a1"), None),
+                        pv("/a2", 60),
+                        pv("/a3", 600),
+                    ]
+                ),
+            ]
+        );
+        let latest = service
+            .get_visitor_journey(visitor_id, project_id, Some(1))
+            .await?
+            .expect("the visitor exists");
+        assert_eq!(latest.total_sessions, 3);
+        assert_eq!(
+            latest
+                .sessions
+                .iter()
+                .map(|s| s.session_id)
+                .collect::<Vec<_>>(),
+            vec![d]
+        );
+
+        // -- the plans only read the visitor's own time range --
+        let old_events = chunks_holding(db, "events", long_ago).await?;
+        let old_proxy_logs = chunks_holding(db, "proxy_logs", long_ago).await?;
+        let recent_events = chunks_holding(db, "events", min(1)).await?;
+        let recent_proxy_logs = chunks_holding(db, "proxy_logs", min(1)).await?;
+        let bound = earliest_row_time(t0);
+
+        let (_, read) = explain_analyze(
+            db,
+            VISITOR_SESSIONS_SQL,
+            vec![
+                visitor_id.into(),
+                100i64.into(),
+                project_id.into(),
+                bound.into(),
+                ANALYTICS_ROW_CLOCK_SLACK_HOURS.into(),
+            ],
+        )
+        .await?;
+        assert!(
+            reads_any(&read, &recent_events) && reads_any(&read, &recent_proxy_logs),
+            "visitor sessions must read the visitor's chunks: {read:?}"
+        );
+        assert!(
+            !reads_any(&read, &old_events) && !reads_any(&read, &old_proxy_logs),
+            "visitor sessions read a chunk from before the visitor existed: {read:?}"
+        );
+
+        let (_, read) = explain_analyze(
+            db,
+            VISITOR_JOURNEY_SESSIONS_SQL,
+            vec![
+                visitor_id.into(),
+                project_id.into(),
+                50i64.into(),
+                bound.into(),
+            ],
+        )
+        .await?;
+        assert!(reads_any(&read, &recent_events), "{read:?}");
+        assert!(
+            !reads_any(&read, &old_events),
+            "the journey's session list read a chunk from before the visitor existed: {read:?}"
+        );
+
+        let (_, read) = explain_analyze(
+            db,
+            &visitor_journey_events_sql(3),
+            vec![
+                visitor_id.into(),
+                project_id.into(),
+                min(1).into(),
+                (d_start + chrono::Duration::seconds(30)).into(),
+                d.into(),
+                b.into(),
+                a.into(),
+            ],
+        )
+        .await?;
+        assert!(reads_any(&read, &recent_events), "{read:?}");
+        assert!(
+            !reads_any(&read, &old_events),
+            "the journey's events read a chunk outside its sessions: {read:?}"
+        );
+
+        cleanup_test_analytics!(db);
+        Ok(())
+    }
+
+    /// Session events read only the requested page (not every event of the
+    /// session through a window over all of them) and only chunks from the
+    /// session's start on, while ids, order, filters and the total are kept.
+    #[tokio::test]
+    async fn test_get_session_events_reads_only_the_requested_page() -> anyhow::Result<()> {
+        use sea_orm::ConnectionTrait;
+
+        let Some((service, db, _container)) =
+            analytics_service_or_skip("test_session_events_page").await
+        else {
+            return Ok(());
+        };
+        let db = db.as_ref();
+        let scope = seeded_scope(db).await?;
+        let (project_id, env_id) = (scope.project_id, scope.environment_id);
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-03-10T12:00:00Z")?
+            .with_timezone(&chrono::Utc);
+        let sec = |s: i64| t0 + chrono::Duration::seconds(s);
+        let seed = FlowSeeder {
+            db,
+            project_id,
+            environment_id: Some(env_id),
+            visitor_id: None,
+        };
+
+        // Another session's event two months earlier.
+        let long_ago = t0 - chrono::Duration::days(60);
+        seed.event("earlier-session", "page_view", "/old", long_ago)
+            .await?;
+
+        // A busy session: one event a second for five and a half hours.
+        const SESSION_EVENTS: i64 = 20_000;
+        let session =
+            insert_request_session(db, "busy-session", t0, sec(SESSION_EVENTS), None).await?;
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO events (project_id, environment_id, session_id, event_type, \
+             page_path, hostname, pathname, href, timestamp, is_entry, is_exit, \
+             is_bounce, is_crawler) \
+             SELECT $1, $2, 'busy-session', \
+                    CASE WHEN i % 2 = 0 THEN 'page_view' ELSE 'scroll' END, \
+                    '/p' || i, 'example.com', '/p' || i, 'https://example.com/p' || i, \
+                    $3::timestamptz + make_interval(secs => i), false, false, false, false \
+             FROM generate_series(0, $4 - 1) AS i",
+            vec![
+                project_id.into(),
+                env_id.into(),
+                t0.into(),
+                SESSION_EVENTS.into(),
+            ],
+        ))
+        .await?;
+        db.execute_unprepared("ANALYZE events").await?;
+        // Outside the environment filter.
+        for i in 0..5 {
+            seed.insert(
+                "busy-session",
+                "page_view",
+                "/other-env",
+                sec(i),
+                None,
+                false,
+            )
+            .await?;
+        }
+
+        let page = |r: &crate::types::responses::SessionEventsResponse| {
+            r.events
+                .iter()
+                .map(|e| (e.id, e.occurred_at, e.request_path.clone()))
+                .collect::<Vec<_>>()
+        };
+        let newest = service
+            .get_session_events(
+                session,
+                project_id,
+                Some(env_id),
+                None,
+                None,
+                Some(3),
+                None,
+                None,
+            )
+            .await?
+            .expect("the session exists");
+        assert_eq!(newest.total_count, SESSION_EVENTS);
+        assert_eq!((newest.offset, newest.limit), (0, 3));
+        assert_eq!(
+            page(&newest),
+            vec![
+                (1, sec(19_999), "/p19999".to_string()),
+                (2, sec(19_998), "/p19998".to_string()),
+                (3, sec(19_997), "/p19997".to_string()),
+            ],
+            "descending by default, ids are 1-based positions"
+        );
+
+        let last = service
+            .get_session_events(
+                session,
+                project_id,
+                Some(env_id),
+                None,
+                None,
+                Some(3),
+                Some(19_997),
+                Some("asc".to_string()),
+            )
+            .await?
+            .expect("the session exists");
+        assert_eq!(last.total_count, SESSION_EVENTS);
+        assert_eq!(
+            page(&last),
+            vec![
+                (19_998, sec(19_997), "/p19997".to_string()),
+                (19_999, sec(19_998), "/p19998".to_string()),
+                (20_000, sec(19_999), "/p19999".to_string()),
+            ]
+        );
+
+        let past_the_end = service
+            .get_session_events(
+                session,
+                project_id,
+                Some(env_id),
+                None,
+                None,
+                Some(3),
+                Some(20_000),
+                None,
+            )
+            .await?
+            .expect("the session exists");
+        assert!(past_the_end.events.is_empty());
+        assert_eq!(past_the_end.total_count, 0, "an empty page reports 0");
+
+        let all_environments = service
+            .get_session_events(session, project_id, None, None, None, Some(1), None, None)
+            .await?
+            .expect("the session exists");
+        assert_eq!(all_environments.total_count, SESSION_EVENTS + 5);
+
+        let ranged = service
+            .get_session_events(
+                session,
+                project_id,
+                Some(env_id),
+                Some(sec(100)),
+                Some(sec(199)),
+                Some(1),
+                None,
+                Some("asc".to_string()),
+            )
+            .await?
+            .expect("the session exists");
+        assert_eq!(ranged.total_count, 100);
+        assert_eq!(page(&ranged), vec![(1, sec(100), "/p100".to_string())]);
+
+        let missing = service
+            .get_session_events(i32::MAX, project_id, None, None, None, None, None, None)
+            .await;
+        assert!(
+            matches!(missing, Err(AnalyticsError::SessionNotFound(ref m)) if m.contains(&i32::MAX.to_string())),
+            "unknown session ids are reported with the id: {missing:?}"
+        );
+
+        // -- plans --
+        let request_session = request_sessions::Entity::find_by_id(session)
+            .one(db)
+            .await?
+            .expect("the session exists");
+        let queries = session_events_queries(
+            &request_session,
+            project_id,
+            Some(env_id),
+            (None, None),
+            10,
+            0,
+            None,
+        );
+        let old_chunks = chunks_holding(db, "events", long_ago).await?;
+        let session_chunks = chunks_holding(db, "events", t0).await?;
+
+        let (plan, read) = explain_analyze(db, &queries.page_sql, queries.page_values).await?;
+        let max_rows = max_rows_handled(&plan);
+        assert!(
+            max_rows <= 20.0,
+            "the page query handled {max_rows} rows for a page of 10 out of {SESSION_EVENTS}"
+        );
+        assert!(reads_any(&read, &session_chunks), "{read:?}");
+        assert!(
+            !reads_any(&read, &old_chunks),
+            "the page query read a chunk from before the session: {read:?}"
+        );
+        let (_, read) = explain_analyze(db, &queries.count_sql, queries.count_values).await?;
+        assert!(reads_any(&read, &session_chunks), "{read:?}");
+        assert!(
+            !reads_any(&read, &old_chunks),
+            "the count read a chunk from before the session: {read:?}"
         );
 
         cleanup_test_analytics!(db);
