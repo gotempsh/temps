@@ -275,6 +275,19 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         crate::database_url_source::UrlDiscovery::InstalledService,
     )?;
     database.announce_discovery();
+    // The data directory and the server's encryption key before any change
+    // is made, so a missing one fails with nothing half-applied.
+    let data_dir = match cmd
+        .data_dir
+        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
+    {
+        Some(dir) => dir,
+        None => crate::server_secrets::service_data_dir(&database)?
+            .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
+            .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?,
+    };
+
+    let encryption_key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let db = temps_schema::establish_connection(database.url())
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
@@ -350,16 +363,6 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         );
     }
 
-    let data_dir = match cmd
-        .data_dir
-        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
-    {
-        Some(dir) => dir,
-        None => crate::server_secrets::service_data_dir(&database)?
-            .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
-            .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?,
-    };
-
     let docker = Arc::new(
         bollard::Docker::connect_with_defaults()
             .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
@@ -375,7 +378,6 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     )
     .await
     .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
-    let encryption_key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let encryption = Arc::new(
         temps_core::EncryptionService::new(&encryption_key)
             .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,

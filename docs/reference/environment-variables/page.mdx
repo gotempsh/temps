@@ -151,6 +151,13 @@ agent `~/Library/LaunchAgents/dev.temps.temps.plist`, and say which file they
 used. With the server's database, a command that needs the encryption key reads
 it the way the server does (the service's `TEMPS_ENCRYPTION_KEY` /
 `TEMPS_ENCRYPTION_KEY_FILE`, else its data directory) and never creates one.
+If this shell sets any of `TEMPS_STATELESS`, `TEMPS_AUTH_SECRET`,
+`TEMPS_AUTH_SECRET_FILE`, `TEMPS_ENCRYPTION_KEY` or `TEMPS_ENCRYPTION_KEY_FILE`,
+the shell's settings replace all of the service's secret settings (to test an
+injected secret), and the command and `temps doctor` say so. When the service's
+own URL cannot be read (for example a root-only `EnvironmentFile=` read without
+sudo), these commands cannot tell whether the database is the server's, so they
+ask for `--data-dir` and never create a key.
 `temps serve`, `temps proxy`, `temps setup` and `temps backup restore` never
 fall back: they use only their own configuration. When no source supplies a
 URL, the error lists every place that was checked.

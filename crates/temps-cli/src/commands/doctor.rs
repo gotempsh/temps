@@ -391,7 +391,11 @@ impl DoctorCommand {
                 report.add("Encryption key", result.clone());
                 report.add("Auth secret", result);
             }
-            SecretsEnvironment::Shell | SecretsEnvironment::Empty => {}
+            SecretsEnvironment::Shell(_) => report.add(
+                "Secrets source",
+                CheckResult::Info(format!("Checked as {}", secrets_env.describe())),
+            ),
+            SecretsEnvironment::Empty => {}
         }
         if !matches!(secrets_env, SecretsEnvironment::Unknown { .. }) {
             self.check_secrets(data_dir, &secrets_env, report);
@@ -1371,7 +1375,8 @@ fn resolve_doctor_data_dir(
         },
         None => match ignored_probes(probes).next() {
             Some((path, _)) => format!(
-                "the installed service {} could not be used (see Installed service); pass                  --data-dir",
+                "the installed service {} could not be used (see Installed service); pass \
+                 --data-dir",
                 path.display()
             ),
             None => "no --data-dir, TEMPS_DATA_DIR or installed service".to_string(),
@@ -2321,7 +2326,7 @@ mod tests {
         )
         .unwrap();
         let unit = home.join("temps.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             format!(
                 "[Service]\nWorkingDirectory={h}/.temps\n\
@@ -2400,13 +2405,19 @@ mod tests {
             source.contains("temps.service") && source.contains("could not be used"),
             "{source}"
         );
+        assert!(source.contains("; pass --data-dir"), "{source}");
+        assert!(!source.contains("  "), "a run of spaces in {source:?}");
     }
 
     #[test]
     fn a_service_without_a_known_data_dir_says_so() {
         let home = tempfile::tempdir().unwrap();
         let unit = home.path().join("temps.service");
-        std::fs::write(&unit, "[Service]\nExecStart=/usr/bin/temps serve\n").unwrap();
+        crate::service_definition::test_support::write_trusted(
+            &unit,
+            "[Service]\nUser=temps-test-no-such-user\nExecStart=/usr/bin/temps serve\n",
+        )
+        .unwrap();
         let service = match service_definition::probe(&ServiceLocations {
             systemd_unit: Some(unit),
             launchd_agent: None,
@@ -2430,14 +2441,18 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (_, data_dir) = installer_layout(home.path());
         let env_file = home.path().join("temps.env");
-        std::fs::write(&env_file, "TEMPS_ENCRYPTION_KEY=elsewhere\n").unwrap();
+        crate::service_definition::test_support::write_trusted(
+            &env_file,
+            "TEMPS_ENCRYPTION_KEY=elsewhere\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&env_file).is_ok() {
             // Running as root: every file is readable.
             return;
         }
         let unit = home.path().join("temps.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             format!(
                 "[Service]\nEnvironmentFile={}\nExecStart=/usr/bin/temps serve --data-dir={}\n",

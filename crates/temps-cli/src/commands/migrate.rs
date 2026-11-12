@@ -1245,7 +1245,7 @@ mod tests {
 
     fn installer_unit(home: &std::path::Path) -> crate::service_definition::ServiceLocations {
         let unit = home.join("temps.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             format!(
                 "[Service]\nExecStart={h}/.temps/bin/temps serve \\\n  \

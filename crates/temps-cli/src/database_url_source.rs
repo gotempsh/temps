@@ -506,7 +506,11 @@ mod tests {
     #[test]
     fn explicit_env_url_wins_over_every_file_source() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(DATABASE_URL_CREDENTIAL), "postgres://cred").unwrap();
+        crate::service_definition::test_support::write_trusted(
+            dir.path().join(DATABASE_URL_CREDENTIAL),
+            "postgres://cred",
+        )
+        .unwrap();
         let source = select_source(
             Some(&os("postgres://env")),
             Some(&os("/etc/temps/database-url")),
@@ -518,7 +522,11 @@ mod tests {
     #[test]
     fn url_file_wins_over_the_systemd_credential() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(DATABASE_URL_CREDENTIAL), "postgres://cred").unwrap();
+        crate::service_definition::test_support::write_trusted(
+            dir.path().join(DATABASE_URL_CREDENTIAL),
+            "postgres://cred",
+        )
+        .unwrap();
         let source = select_source(
             None,
             Some(&os("/etc/temps/database-url")),
@@ -540,7 +548,7 @@ mod tests {
             "a credentials directory without our credential must be ignored"
         );
         let cred = dir.path().join(DATABASE_URL_CREDENTIAL);
-        std::fs::write(&cred, "postgres://cred").unwrap();
+        crate::service_definition::test_support::write_trusted(&cred, "postgres://cred").unwrap();
         assert_eq!(
             select_source(None, None, Some(&credentials_dir)),
             DatabaseUrlSource::SystemdCredential(cred)
@@ -559,7 +567,11 @@ mod tests {
     fn url_file_content_is_trimmed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("database-url");
-        std::fs::write(&path, "postgres://u:p@db:5432/temps\n").unwrap();
+        crate::service_definition::test_support::write_trusted(
+            &path,
+            "postgres://u:p@db:5432/temps\n",
+        )
+        .unwrap();
         assert_eq!(
             read_url_file(&path, DATABASE_URL_FILE_ENV).unwrap(),
             "postgres://u:p@db:5432/temps"
@@ -575,7 +587,7 @@ mod tests {
         assert!(err.to_string().contains(&missing.display().to_string()));
 
         let empty = dir.path().join("empty");
-        std::fs::write(&empty, "  \n").unwrap();
+        crate::service_definition::test_support::write_trusted(&empty, "  \n").unwrap();
         let err = read_url_file(&empty, DATABASE_URL_FILE_ENV).unwrap_err();
         assert!(matches!(err, DatabaseUrlFileError::Empty { .. }));
         assert!(err.to_string().contains("empty"));
@@ -631,7 +643,7 @@ mod tests {
     /// The installer's unit: the URL and data directory as `serve` flags.
     fn installer_unit(dir: &Path, database_url: &str) -> ServiceLocations {
         let unit = dir.join("temps.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             format!(
                 "[Service]\nWorkingDirectory={home}/.temps\n\
@@ -749,13 +761,13 @@ mod tests {
     fn the_installers_environment_file_supplies_the_url() {
         let dir = tempfile::tempdir().unwrap();
         let env_file = dir.path().join("temps.env");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &env_file,
             format!("TEMPS_DATABASE_URL={}\n", url("env-file-db")),
         )
         .unwrap();
         let unit = dir.path().join("temps.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             format!(
                 "[Service]\nEnvironmentFile={}\nExecStart=/usr/local/bin/temps serve\n",
@@ -833,7 +845,7 @@ mod tests {
     fn an_unreadable_environment_file_is_reported_with_its_path() {
         let dir = tempfile::tempdir().unwrap();
         let unit = dir.path().join("temps.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             "[Service]\nEnvironment=TEMPS_DATABASE_URL_FILE=/nonexistent/temps/database-url\n\
              ExecStart=/usr/local/bin/temps serve\n",
@@ -934,7 +946,7 @@ mod tests {
         // A unit that carries a URL but does not run `serve`: the reason is
         // reported, the URL is not.
         let unit = dir.path().join("proxy.service");
-        std::fs::write(
+        crate::service_definition::test_support::write_trusted(
             &unit,
             format!(
                 "[Service]\nExecStart=/usr/local/bin/temps proxy --database-url={}\n",

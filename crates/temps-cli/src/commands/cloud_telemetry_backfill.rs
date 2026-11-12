@@ -168,6 +168,9 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
             None => resolve_data_dir(None)?,
         },
     };
+    // Before anything is written (migrations, the checkpoint), so a missing
+    // key fails with nothing changed.
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let database_url = database.url();
 
     let bootstrap_stateless = temps_config::bootstrap_stateless_requested()?;
@@ -201,7 +204,6 @@ async fn run_async(args: CloudTelemetryBackfillArgs) -> anyhow::Result<()> {
         temps_schema::ensure_no_unprotected_upgrade(db.as_ref()).await?;
         temps_schema::run_migrations(db.as_ref()).await?;
     }
-    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
     let link = load_cloud_link(&data_dir, &key, db.clone(), database_url, stateless).await?;
     let compression = temps_config::stored_clickhouse_compression(db.as_ref()).await;
     let source = build_source(&args, db.clone(), compression)?;

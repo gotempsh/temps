@@ -389,6 +389,7 @@ struct SystemdService {
     environment_files: Vec<String>,
     load_credentials: Vec<String>,
     working_directory: Option<String>,
+    user: Option<String>,
 }
 
 /// Apply the unit and its drop-ins in order, as systemd does: a later
@@ -418,6 +419,10 @@ fn parse_systemd_service(sources: &[(PathBuf, String)]) -> SystemdService {
                 }
                 "WorkingDirectory" => {
                     service.working_directory = (!value.is_empty()).then_some(value);
+                    continue;
+                }
+                "User" => {
+                    service.user = (!value.is_empty()).then_some(value);
                     continue;
                 }
                 "Environment" => &mut service.environment,
@@ -537,23 +542,45 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
         }
     }
 
+    // systemd sets HOME for a service with User= (Environment= can override
+    // it). Without User= the server runs as root with no HOME, and
+    // `dirs::home_dir` falls back to root's account.
+    let user = service.user.as_deref().map(specifiers);
+    if let Some(user) = &user {
+        if !environment.contains_key("HOME") {
+            if let Some(home) = account_home(user) {
+                environment.insert("HOME".to_string(), home.display().to_string());
+            }
+        }
+    }
+    let home = match environment.get("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => Ok(PathBuf::from(home)),
+        None => match &user {
+            Some(user) => Err(format!(
+                "the home directory of its User={user} could not be found"
+            )),
+            None => account_home("0")
+                .ok_or_else(|| "root's home directory could not be found".to_string()),
+        },
+    };
+
     let cwd = match service.working_directory.as_deref().map(specifiers) {
         None => Ok(PathBuf::from("/")),
         Some(dir) => {
             let dir = dir.strip_prefix('-').unwrap_or(&dir);
-            expand_home(dir, environment.get("HOME").map(String::as_str)).ok_or_else(|| {
+            expand_home(dir, home.as_deref().ok()).ok_or_else(|| {
                 format!("the service's WorkingDirectory={dir} could not be resolved")
             })
         }
     };
     let file_gaps = resolve_file_variables(&mut environment, &cwd);
 
-    let mut unset = Vec::new();
+    let mut referenced = Vec::new();
     let arguments = service.exec_start.as_deref().map(|exec_start| {
         let exec_start = exec_start.trim_start_matches(['@', '-', ':', '+', '!']);
         split_words(&specifiers(exec_start))
             .into_iter()
-            .map(|word| expand_variables(&word, &environment, &mut unset))
+            .map(|word| expand_variables(&word, &environment, &mut referenced))
             .collect::<Vec<_>>()
     });
     let serve_arguments = arguments.as_deref().filter(|args| runs_serve(args));
@@ -563,11 +590,13 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
 
     let environment_gap = (!environment_gaps.is_empty()).then(|| environment_gaps.join("; "));
     let (database_url, data_dir) = match &environment_gap {
-        // ExecStart= expands a variable an unreadable file may set.
-        Some(gap) if serve_arguments.is_some() && !unset.is_empty() => {
+        // ExecStart= expands variables, and the unreadable file, which
+        // systemd applies after Environment=, may set or override any of them.
+        Some(gap) if serve_arguments.is_some() && !referenced.is_empty() => {
             let reason = format!(
-                "ExecStart= uses ${} and {gap}, so what `temps serve` runs with is unknown",
-                unset.join(", $")
+                "ExecStart= uses ${} and {gap}; that file may set them, so what `temps serve` \
+                 runs with is unknown",
+                referenced.join(", $")
             );
             (Err(reason.clone()), Err(reason))
         }
@@ -584,7 +613,7 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
                 serve_arguments,
                 &environment,
                 environment_gap.as_deref(),
-                environment.get("HOME").map(PathBuf::from),
+                home,
                 &cwd,
             ),
         ),
@@ -601,6 +630,58 @@ fn systemd_definition(unit: &Path, sources: &[(PathBuf, String)]) -> ServiceDefi
         environment_gaps,
         problems,
     }
+}
+
+/// The home directory of the account `user` (a name or a numeric uid), as
+/// the server's `dirs::home_dir` finds it when HOME is unset.
+#[cfg(unix)]
+fn account_home(user: &str) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: `passwd` is plain old data; all-zero is a valid value that
+    // getpw*_r overwrites.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let status = match user.parse::<libc::uid_t>() {
+        // SAFETY: every pointer is valid for the call and `buffer.len()` is
+        // the buffer's real size.
+        Ok(uid) => unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut result,
+            )
+        },
+        Err(_) => {
+            let name = CString::new(user).ok()?;
+            // SAFETY: as above; `name` is NUL-terminated and outlives the call.
+            unsafe {
+                libc::getpwnam_r(
+                    name.as_ptr(),
+                    &mut entry,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut result,
+                )
+            }
+        }
+    };
+    if status != 0 || result.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: getpw*_r succeeded, so `pw_dir` points at a NUL-terminated
+    // string inside `buffer`, which is still alive.
+    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+    let dir = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+    dir.is_absolute().then_some(dir)
+}
+
+#[cfg(not(unix))]
+fn account_home(_user: &str) -> Option<PathBuf> {
+    None
 }
 
 /// `%d` for `unit`: `/run/credentials/<unit name>`.
@@ -725,7 +806,7 @@ fn serve_data_dir(
     arguments: Option<&[String]>,
     environment: &BTreeMap<String, String>,
     environment_gap: Option<&str>,
-    home: Option<PathBuf>,
+    home: Result<PathBuf, String>,
     cwd: &Result<PathBuf, String>,
 ) -> Result<(PathBuf, DataDirLocation), String> {
     let (dir, location) =
@@ -737,12 +818,16 @@ fn serve_data_dir(
             ));
         } else if let Some(dir) = environment.get(DATA_DIR_ENV).filter(|dir| !dir.is_empty()) {
             (PathBuf::from(dir), DataDirLocation::Environment)
-        } else if let Some(home) = home {
-            (home.join(".temps"), DataDirLocation::HomeDefault)
         } else {
-            return Err(format!(
-                "it sets no --data-dir, {DATA_DIR_ENV} or HOME, so the data directory is unknown"
-            ));
+            match home {
+                Ok(home) => (home.join(".temps"), DataDirLocation::HomeDefault),
+                Err(reason) => {
+                    return Err(format!(
+                        "it sets no --data-dir or {DATA_DIR_ENV}, and {reason}, so the data \
+                         directory is unknown"
+                    ))
+                }
+            }
         };
     let dir = absolute_in(dir, cwd).map_err(|reason| format!("its data directory {reason}"))?;
     Ok((dir, location))
@@ -791,12 +876,12 @@ fn resolve_specifiers(value: &str, credentials_dir: &Path) -> String {
 }
 
 /// `~` or `~/x` against `home`; anything else unchanged when absolute.
-fn expand_home(dir: &str, home: Option<&str>) -> Option<PathBuf> {
+fn expand_home(dir: &str, home: Option<&Path>) -> Option<PathBuf> {
     if dir == "~" {
-        return home.map(PathBuf::from);
+        return home.map(Path::to_path_buf);
     }
     if let Some(rest) = dir.strip_prefix("~/") {
-        return home.map(|home| Path::new(home).join(rest));
+        return home.map(|home| home.join(rest));
     }
     let dir = PathBuf::from(dir);
     dir.is_absolute().then_some(dir)
@@ -836,21 +921,19 @@ fn split_words(value: &str) -> Vec<String> {
 }
 
 /// `${NAME}` and `$NAME` from the service environment; `$$` is a literal `$`.
-/// An unset variable expands to nothing, as in systemd, and is added to
-/// `unset`.
+/// An unset variable expands to nothing, as in systemd. Every name used is
+/// added to `referenced`.
 fn expand_variables(
     word: &str,
     environment: &BTreeMap<String, String>,
-    unset: &mut Vec<String>,
+    referenced: &mut Vec<String>,
 ) -> String {
-    let mut lookup = |name: String| match environment.get(&name) {
-        Some(value) => value.clone(),
-        None => {
-            if !unset.contains(&name) {
-                unset.push(name);
-            }
-            String::new()
+    let mut lookup = |name: String| {
+        let value = environment.get(&name).cloned().unwrap_or_default();
+        if !referenced.contains(&name) {
+            referenced.push(name);
         }
+        value
     };
     let mut out = String::with_capacity(word.len());
     let mut chars = word.chars().peekable();
@@ -940,13 +1023,11 @@ fn launchd_definition(agent: &Path, contents: &str, home: Option<&Path>) -> Serv
         problems.push("ProgramArguments does not run `temps serve`".to_string());
     }
     let database_url = serve_database_url(serve_arguments, &environment, None, &[], None, &cwd);
-    let data_dir = serve_data_dir(
-        serve_arguments,
-        &environment,
-        None,
-        environment.get("HOME").map(PathBuf::from),
-        &cwd,
-    );
+    let home = environment
+        .get("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "the agent's HOME is unknown".to_string());
+    let data_dir = serve_data_dir(serve_arguments, &environment, None, home, &cwd);
     ServiceDefinition {
         path: agent.to_path_buf(),
         kind: ServiceKind::Launchd,
@@ -1018,6 +1099,32 @@ fn unescape_xml(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Fixtures for tests that probe a service definition.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// `std::fs::write`, creating the parent directories, with mode 0644
+    /// whatever the umask: under umask 002 a plain write is group-writable,
+    /// and the probe rightly ignores it.
+    pub(crate) fn write_trusted(
+        path: impl AsRef<Path>,
+        contents: impl AsRef<[u8]>,
+    ) -> std::io::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,18 +1144,8 @@ mod tests {
         )
     }
 
-    /// Written 0644 whatever the umask, since group-writable files are not
-    /// trusted.
     fn write(path: &Path, contents: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        test_support::write_trusted(path, contents).unwrap();
     }
 
     /// Make `path` unreadable; `false` when this user reads it anyway (root).
@@ -1288,6 +1385,61 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_home_comes_from_user_as_systemd_and_the_server_find_it() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("temps.service");
+        let Some(root_home) = account_home("0") else {
+            return;
+        };
+
+        // User= sets HOME, which ExecStart= can use.
+        write(
+            &unit,
+            "[Service]\nUser=root\nExecStart=/usr/bin/temps serve --data-dir=$HOME/data\n",
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(
+            definition.env("HOME"),
+            Some(&*root_home.display().to_string())
+        );
+        assert_eq!(
+            definition.data_dir,
+            Ok((root_home.join("data"), DataDirLocation::CommandLine))
+        );
+
+        // No User=: the server runs as root and finds root's home.
+        write(&unit, "[Service]\nExecStart=/usr/bin/temps serve\n");
+        let definition = found(probe(&systemd_at(&unit)));
+        assert_eq!(definition.env("HOME"), None);
+        assert_eq!(
+            definition.data_dir,
+            Ok((root_home.join(".temps"), DataDirLocation::HomeDefault))
+        );
+
+        // Environment=HOME wins over User='s home.
+        write(
+            &unit,
+            "[Service]\nUser=root\nEnvironment=HOME=/home/svc\nExecStart=/usr/bin/temps serve\n",
+        );
+        assert_eq!(
+            found(probe(&systemd_at(&unit))).data_dir,
+            Ok((
+                PathBuf::from("/home/svc/.temps"),
+                DataDirLocation::HomeDefault
+            ))
+        );
+
+        // An account that does not exist leaves it unknown, and says why.
+        write(
+            &unit,
+            "[Service]\nUser=temps-test-no-such-user\nExecStart=/usr/bin/temps serve\n",
+        );
+        let error = found(probe(&systemd_at(&unit))).data_dir.unwrap_err();
+        assert!(error.contains("User=temps-test-no-such-user"), "{error}");
+    }
+
     #[test]
     fn a_missing_unit_is_absent() {
         let root = tempfile::tempdir().unwrap();
@@ -1413,7 +1565,7 @@ mod tests {
         // A WorkingDirectory= that cannot be resolved leaves them unknown.
         write(
             &unit,
-            "[Service]\nWorkingDirectory=~\n\
+            "[Service]\nUser=temps-test-no-such-user\nWorkingDirectory=~\n\
              Environment=TEMPS_AUTH_SECRET_FILE=secrets/auth \
              TEMPS_DATABASE_URL_FILE=database-url\n\
              ExecStart=/usr/bin/temps serve --data-dir data\n",
@@ -1469,7 +1621,21 @@ mod tests {
             Ok((PathBuf::from("/srv/data"), DataDirLocation::CommandLine))
         );
 
-        // ...unless they expand a variable the file may set.
+        // ...unless they expand a variable: the file, applied after
+        // Environment=, may override even one Environment= sets.
+        write(
+            &unit,
+            &format!(
+                "[Service]\nEnvironment=DB={URL} DIR=/srv/data\nEnvironmentFile={}\n\
+                 ExecStart=/usr/bin/temps serve --database-url=${{DB}} --data-dir=${{DIR}}\n",
+                env_file.display()
+            ),
+        );
+        let definition = found(probe(&systemd_at(&unit)));
+        let error = definition.database_url.as_ref().unwrap_err();
+        assert!(error.contains("$DB, $DIR"), "{error}");
+        assert!(definition.data_dir.is_err());
+
         write(
             &unit,
             &format!(
