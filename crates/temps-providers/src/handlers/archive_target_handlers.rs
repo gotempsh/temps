@@ -91,6 +91,9 @@ impl From<ArchiveTargetTestError> for Problem {
                     .with_title("Not a PostgreSQL Service")
                     .with_detail(error.to_string())
             }
+            ArchiveTargetTestError::Cluster { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("No Continuous Archiving On Clusters")
+                .with_detail(error.to_string()),
             ArchiveTargetTestError::NotConfigured { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("WAL Archiving Not Configured")
@@ -619,6 +622,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cluster_is_refused_before_any_container_is_touched() {
+        let audit = RecordingAuditLogger::default();
+        let mut cluster = service("postgres");
+        cluster.topology = "cluster".to_string();
+        // Even with a pinned source, the check never reaches the source,
+        // Docker or a container.
+        cluster.continuous_archive_s3_source_id = Some(3);
+        let app = state(owned_then_loaded(&cluster), audit.clone());
+        let (status, body) = body_json(
+            test_wal_archive_target(
+                RequireAuth(auth(temps_auth::Role::Admin)),
+                State(app),
+                Path(7),
+                Extension(metadata()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["title"], "No Continuous Archiving On Clusters");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("service 7 is a cluster"));
+        assert!(audit.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_non_postgres_service_is_a_bad_request() {
         let app = state(
             owned_then_loaded(&service("redis")),
@@ -650,6 +681,10 @@ mod tests {
                     service_id: 7,
                     node_id: 2,
                 },
+                StatusCode::CONFLICT,
+            ),
+            (
+                ArchiveTargetTestError::Cluster { service_id: 7 },
                 StatusCode::CONFLICT,
             ),
             (

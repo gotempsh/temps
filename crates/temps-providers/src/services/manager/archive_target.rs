@@ -44,6 +44,8 @@ pub enum ArchiveTargetTestError {
         service_id: i32,
         service_type: String,
     },
+    #[error("PostgreSQL service {service_id} is a cluster; its backups push base backups only, without continuous WAL archiving, so there is no archive target to test")]
+    Cluster { service_id: i32 },
     #[error("PostgreSQL service {service_id} has no WAL archive target yet; run a backup of it to turn continuous archiving on")]
     NotConfigured { service_id: i32 },
     #[error("WAL archive target of PostgreSQL service {service_id} is S3 source {s3_source_id}, which no longer exists")]
@@ -89,6 +91,12 @@ impl ExternalServiceManager {
                 service_id,
                 service_type: service.service_type.clone(),
             });
+        }
+        // A cluster's members are `postgres-{name}-{ordinal}`, never the
+        // standalone container this check runs in, and its backups do not
+        // set up continuous archiving at all.
+        if service.topology == "cluster" {
+            return Err(ArchiveTargetTestError::Cluster { service_id });
         }
         if let crate::services::cluster_topology::ServiceExecutionRoute::Remote(node_id) =
             crate::services::cluster_topology::service_execution_route(service.node_id)
