@@ -36,14 +36,15 @@ function visitor(id: number) {
 
 function renderSegment() {
   const offsets: string[] = []
+  const matching = { count: 60 }
   mockApi({
     'GET /analytics/visitors': (request) => {
       const offset = Number(new URL(request.url).searchParams.get('offset'))
       offsets.push(String(offset))
       return jsonResponse({
-        visitors: [visitor(offset + 1)],
-        total_count: 60,
-        filtered_count: 60,
+        visitors: offset < matching.count ? [visitor(offset + 1)] : [],
+        total_count: matching.count,
+        filtered_count: matching.count,
       })
     },
   })
@@ -70,6 +71,7 @@ function renderSegment() {
   const view = render(wrap(segment('2026-01-02T00:00:00Z', '24h')))
   return {
     offsets,
+    matching,
     show: (end: string, rangeScope: string) =>
       view.rerender(wrap(segment(end, rangeScope))),
   }
@@ -97,4 +99,23 @@ test('picking another range goes back to the first page', async () => {
   show('2026-01-02T00:05:00Z', '7d')
 
   await waitFor(() => expect(last(offsets)).toBe('0'))
+})
+
+test('a refresh with fewer visitors moves back to a page that exists', async () => {
+  const { offsets, matching, show } = renderSegment()
+  await screen.findByText(/1–1 of 60/)
+  fireEvent.click(screen.getByRole('button', { name: 'Next' }))
+  await waitFor(() => expect(last(offsets)).toBe('25'))
+
+  matching.count = 0
+  show('2026-01-02T00:05:00Z', '24h')
+  await waitFor(() => expect(last(offsets)).toBe('0'))
+  await screen.findByText(
+    'No visitors match this segment in the selected period.'
+  )
+
+  matching.count = 3
+  show('2026-01-02T00:10:00Z', '24h')
+  await screen.findByText(/1–1 of 3/)
+  expect(last(offsets)).toBe('0')
 })

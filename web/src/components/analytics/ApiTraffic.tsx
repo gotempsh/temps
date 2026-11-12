@@ -87,6 +87,7 @@ import {
   nextTrafficSort,
   trafficTableQueryKey,
   trafficPageCount,
+  trafficPageInRange,
   trafficQueryNeedsCompatibilityRetry,
   type TrafficSort,
 } from '@/lib/api-traffic-sort'
@@ -547,6 +548,13 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     enabled: enabled && detail !== null,
     retry: retryUnlessClientError,
   })
+  // A refreshed window with fewer pages: go to its last page, not an empty one.
+  const routePageInRange = trafficPageInRange(routePage, routesQuery.data)
+  if (routePageInRange !== routePage) setRoutePage(routePageInRange)
+  const callerPageInRange = trafficPageInRange(callerPage, callersQuery.data)
+  if (callerPageInRange !== callerPage) setCallerPage(callerPageInRange)
+  const detailPageInRange = trafficPageInRange(detailPage, detailQuery.data)
+  if (detailPageInRange !== detailPage) setDetailPage(detailPageInRange)
 
   // Stable first-page context for the summary. These legacy response shapes
   // differ from the visible generic aggregates, so defer both scans until the

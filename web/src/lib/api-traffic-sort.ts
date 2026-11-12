@@ -33,6 +33,20 @@ export function trafficPageCount(total: number, pageSize: number): number {
   return Math.max(1, Math.ceil(total / pageSize))
 }
 
+/**
+ * The page a table should be on once it has answered: the same page while it
+ * still has rows, else its last one. Refresh keeps the page, and a moved
+ * window can have fewer pages; an empty page past the end has no pagination
+ * to get back with.
+ */
+export function trafficPageInRange(
+  page: number,
+  answer: { rows: readonly unknown[]; total_pages: number } | undefined
+): number {
+  if (!answer || page === 0 || answer.rows.length > 0) return page
+  return Math.max(0, Math.min(page, answer.total_pages - 1))
+}
+
 export function trafficQueryNeedsCompatibilityRetry(
   body: TrafficAggregationRequest,
   error: unknown

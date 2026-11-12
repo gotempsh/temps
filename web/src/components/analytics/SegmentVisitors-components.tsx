@@ -106,7 +106,7 @@ export function SegmentVisitors({
     segmentQuery[filterParam] = value
   }
 
-  const { data, isLoading, error } = useWindowQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getVisitorsOptions({
       query: {
         project_id: project.id,
@@ -126,6 +126,9 @@ export function SegmentVisitors({
   const visitors = data?.visitors ?? []
   const totalCount = data?.filtered_count ?? data?.total_count ?? 0
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
+  // Refresh keeps the page; if the moved window has fewer visitors, go to its
+  // last page rather than an empty one with no way back.
+  if (data && !isPlaceholderData && page > totalPages) setPage(totalPages)
 
   if (!filterParam) {
     return (

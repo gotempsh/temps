@@ -12,6 +12,7 @@ import {
 import {
   nextTrafficSort,
   trafficPageCount,
+  trafficPageInRange,
   trafficQueryNeedsCompatibilityRetry,
   trafficTableQueryKey,
 } from '@/lib/api-traffic-sort'
@@ -227,5 +228,26 @@ describe('API traffic tables on Refresh', () => {
         )
       ).toBeUndefined()
     }
+  })
+})
+
+describe('API traffic pages after Refresh', () => {
+  const answer = (rows: number, totalPages: number) => ({
+    rows: Array.from({ length: rows }, (_, i) => i),
+    total_pages: totalPages,
+  })
+
+  test('keeps a page that still has rows', () => {
+    expect(trafficPageInRange(2, answer(20, 5))).toBe(2)
+    expect(trafficPageInRange(2, undefined)).toBe(2)
+  })
+
+  test('moves an empty page past the end to the last page', () => {
+    expect(trafficPageInRange(4, answer(0, 2))).toBe(1)
+  })
+
+  test('goes back to the first page when nothing is left', () => {
+    expect(trafficPageInRange(3, answer(0, 0))).toBe(0)
+    expect(trafficPageInRange(0, answer(0, 0))).toBe(0)
   })
 })
