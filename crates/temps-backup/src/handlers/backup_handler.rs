@@ -2953,9 +2953,11 @@ async fn get_backup(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    // The UUID, or the number a run returned (`backup_id` of an external
+    // service's run): both name the same backup.
     let scoped_backup = app_state
         .backup_service
-        .backup_with_access_scope_by_uuid(&id)
+        .backup_with_access_scope_by_reference(&id)
         .await?;
     require_backup_access(
         &app_state,

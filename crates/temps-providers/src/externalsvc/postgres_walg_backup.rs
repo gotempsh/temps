@@ -361,24 +361,9 @@ pub async fn walg_base_backup(
         postgres = postgres.on_node(node);
     }
 
-    // Before anything is changed: a `backup-push` survives the task that
-    // started it (stopped at its deadline, or its agent restarted), which
-    // also loses the in-memory record that would refuse this one.
-    match probe_backup_push(&docker, &container_name, cancel).await? {
-        BackupPushProbe::Idle => {}
-        BackupPushProbe::Running => {
-            return Err(WalgBaseBackupError::BackupPushRunning {
-                service_id,
-                container: container_name,
-            })
-        }
-        BackupPushProbe::Unavailable => warn!(
-            service_id,
-            container = %container_name,
-            "Cannot tell whether a wal-g backup-push already runs in the container (no tr or \
-             grep in it); starting the base backup"
-        ),
-    }
+    // Before anything is changed.
+    refuse_overlapping_backup_push(&docker, service_id, &container_name, "PostgreSQL", cancel)
+        .await?;
 
     if !allow_restart {
         match postgres
@@ -506,6 +491,40 @@ impl BackupPushProbe {
             "idle" => Some(Self::Idle),
             "unavailable" => Some(Self::Unavailable),
             _ => None,
+        }
+    }
+}
+
+/// Refuse to start a `wal-g backup-push` in `container_name` while another
+/// one still runs there. A `backup-push` survives the task that started it
+/// (stopped at its deadline, or its agent restarted), which also loses the
+/// in-memory record that would refuse the next; a retry would then push a
+/// second backup of the same database beside the first. Every WAL-G engine
+/// (PostgreSQL, MongoDB, MariaDB, Redis) calls this before it changes or
+/// starts anything. A container without `tr` and `grep` cannot tell, and
+/// the backup goes ahead with a warning.
+pub async fn refuse_overlapping_backup_push(
+    docker: &Docker,
+    service_id: i32,
+    container_name: &str,
+    engine: &'static str,
+    cancel: &CancellationToken,
+) -> Result<(), WalgBaseBackupError> {
+    match probe_backup_push(docker, container_name, cancel).await? {
+        BackupPushProbe::Idle => Ok(()),
+        BackupPushProbe::Running => Err(WalgBaseBackupError::BackupPushRunning {
+            service_id,
+            container: container_name.to_string(),
+        }),
+        BackupPushProbe::Unavailable => {
+            warn!(
+                service_id,
+                container = %container_name,
+                engine,
+                "Cannot tell whether a wal-g backup-push already runs in the container (no tr or \
+                 grep in it); starting the backup"
+            );
+            Ok(())
         }
     }
 }
@@ -1014,10 +1033,11 @@ mod tests {
     }
 }
 
-/// Against a real Docker daemon. Skips without Docker.
+/// Against a real Docker daemon. Skips without Docker. The fixtures are
+/// shared with the other WAL-G engines' guard tests.
 #[cfg(test)]
 #[cfg(feature = "docker-tests")]
-mod docker_tests {
+pub(crate) mod docker_tests {
     use super::*;
     use bollard::models::ContainerCreateBody;
     use bollard::query_parameters::{
@@ -1027,7 +1047,7 @@ mod docker_tests {
 
     const IMAGE: &str = "postgres:18-alpine";
 
-    async fn docker_or_skip() -> Option<Arc<Docker>> {
+    pub(crate) async fn docker_or_skip() -> Option<Arc<Docker>> {
         let docker = Docker::connect_with_local_defaults().ok()?;
         if docker.ping().await.is_err() {
             eprintln!("Docker unavailable, skipping");
@@ -1047,9 +1067,15 @@ mod docker_tests {
         Some(Arc::new(docker))
     }
 
-    /// A started container running `script`, removed on drop of the test.
-    async fn container(docker: &Docker, script: &str) -> String {
-        let name = format!("walg-probe-{:08x}", rand::random::<u32>());
+    /// A started container running `script`. Its name is this process's
+    /// and random, so parallel runs never meet; the test removes it with
+    /// [`remove`] before asserting.
+    pub(crate) async fn container(docker: &Docker, script: &str) -> String {
+        let name = format!(
+            "temps-test-walg-probe-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        );
         docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::new().name(&name).build()),
@@ -1072,7 +1098,7 @@ mod docker_tests {
         name
     }
 
-    async fn remove(docker: &Docker, name: &str) {
+    pub(crate) async fn remove(docker: &Docker, name: &str) {
         let _ = docker
             .remove_container(
                 name,
@@ -1088,10 +1114,32 @@ mod docker_tests {
 
     /// A `wal-g backup-push` of an earlier attempt, still uploading: the
     /// agent's task that ran it stopped at its deadline, or the agent
-    /// restarted, but the process kept running in the container.
-    const SURVIVING_PUSH: &str = "printf '#!/bin/sh\\nsleep 600\\n' > /tmp/wal-g; \
-         chmod +x /tmp/wal-g; /tmp/wal-g backup-push /var/lib/postgresql/data & \
+    /// restarted, but the process kept running in the container. The fake
+    /// `wal-g` is on the `PATH`, where an engine's own WAL-G check finds it.
+    pub(crate) const SURVIVING_PUSH: &str =
+        "printf '#!/bin/sh\\nsleep 600\\n' > /usr/local/bin/wal-g; \
+         chmod +x /usr/local/bin/wal-g; wal-g backup-push /var/lib/postgresql/data & \
          exec sleep 600";
+
+    /// An S3 source nothing listens at: a guard that let a backup through
+    /// would fail on it, never upload.
+    pub(crate) fn unreachable_s3() -> S3Credentials {
+        S3Credentials {
+            access_key_id: "AKID".to_string(),
+            secret_key: "SECRET".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            bucket_name: "backups".to_string(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        }
+    }
+
+    /// Long enough for [`SURVIVING_PUSH`]'s process to be in the table.
+    pub(crate) async fn let_the_push_start() {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 
     fn request(container_name: &str) -> WalgBaseBackup {
         WalgBaseBackup {
@@ -1103,16 +1151,7 @@ mod docker_tests {
                 version: None,
                 parameters: serde_json::json!({}),
             },
-            s3: S3Credentials {
-                access_key_id: "AKID".to_string(),
-                secret_key: "SECRET".to_string(),
-                session_token: None,
-                region: "us-east-1".to_string(),
-                endpoint: Some("http://127.0.0.1:1".to_string()),
-                bucket_name: "backups".to_string(),
-                bucket_path: String::new(),
-                force_path_style: true,
-            },
+            s3: unreachable_s3(),
             backup_uuid: "b-2".to_string(),
             allow_restart: true,
         }
@@ -1126,7 +1165,7 @@ mod docker_tests {
             return;
         };
         let name = container(&docker, SURVIVING_PUSH).await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let_the_push_start().await;
         let result = walg_base_backup(
             Arc::clone(&docker),
             request(&name),
@@ -1167,7 +1206,7 @@ mod docker_tests {
             return;
         };
         let name = container(&docker, SURVIVING_PUSH).await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let_the_push_start().await;
         let probe = probe_backup_push(&docker, &name, &CancellationToken::new()).await;
         remove(&docker, &name).await;
         assert_eq!(probe.expect("probe"), BackupPushProbe::Running);
