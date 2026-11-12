@@ -371,13 +371,8 @@ impl DoctorCommand {
             );
         }
 
-        if !data_dir.exists() {
-            report.add(
-                "Directory",
-                CheckResult::Fail(
-                    "Data directory does not exist. Run `temps setup` first.".to_string(),
-                ),
-            );
+        if let Some(result) = data_dir_absence(data_dir, unverified, service.is_some()) {
+            report.add("Directory", result);
             return;
         }
 
@@ -1704,6 +1699,36 @@ fn geolite_result(data_dir: &Path, working_directory: Option<&Path>) -> CheckRes
 
 /// `temps serve` creates `<data dir>/logs` every time it starts and refuses
 /// to start when it cannot.
+/// Why `data_dir` cannot be checked, when it cannot: missing, or not
+/// visible to this user (`Path::exists` says "missing" for both). With an
+/// installed server a missing directory is not a setup step: `temps serve`
+/// creates it on its first start, and a guessed one says nothing.
+fn data_dir_absence(data_dir: &Path, unverified: bool, has_service: bool) -> Option<CheckResult> {
+    let error = std::fs::metadata(data_dir).err()?;
+    let dir = data_dir.display();
+    if error.kind() != std::io::ErrorKind::NotFound {
+        return Some(CheckResult::Warn(format!(
+            "{dir} cannot be inspected by this user ({error}), so whether it exists and what it \
+             holds is unknown. Run doctor with sudo or as the service's user"
+        )));
+    }
+    Some(if unverified {
+        CheckResult::Warn(format!(
+            "{dir} does not exist, but it is only this user's default: the installed server's \
+             data directory is unknown (see above). Run doctor with sudo or as the service's \
+             user, or pass --data-dir"
+        ))
+    } else if has_service {
+        CheckResult::Warn(format!(
+            "{dir} does not exist yet. `temps serve` creates it when it first starts with this \
+             data directory, so the installed server has not started yet, or it uses a \
+             different one (pass --data-dir)"
+        ))
+    } else {
+        CheckResult::Fail("Data directory does not exist. Run `temps setup` first.".to_string())
+    })
+}
+
 fn logs_dir_result(data_dir: &Path) -> CheckResult {
     let logs = data_dir.join(temps_config::PIPELINE_LOGS_DIR_NAME);
     if logs.is_dir() {

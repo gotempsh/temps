@@ -838,6 +838,58 @@ fn a_lost_encryption_key_on_an_initialized_dir_fails() {
 }
 
 #[test]
+fn a_missing_data_dir_is_not_a_setup_step_when_a_server_is_installed() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("missing");
+    // An existing directory needs no explanation.
+    assert!(data_dir_absence(root.path(), false, true).is_none());
+
+    // The installed server's own directory: serve creates it.
+    let result = data_dir_absence(&missing, false, true);
+    assert!(
+        matches!(&result, Some(CheckResult::Warn(message))
+            if message.contains("creates it when it first starts")
+                && !message.contains("temps setup")),
+        "{result:?}"
+    );
+    // A guess while the server's is unknown says nothing about the server.
+    let result = data_dir_absence(&missing, true, true);
+    assert!(
+        matches!(&result, Some(CheckResult::Warn(message))
+            if message.contains("only this user's default") && !message.contains("temps setup")),
+        "{result:?}"
+    );
+    // Nothing installed: setting up is the next step.
+    assert!(matches!(
+        data_dir_absence(&missing, false, false),
+        Some(CheckResult::Fail(message)) if message.contains("temps setup")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_data_dir_this_user_cannot_see_is_not_reported_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("private");
+    std::fs::create_dir_all(parent.join("data")).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::metadata(parent.join("data")).is_ok();
+    let result = data_dir_absence(&parent.join("data"), false, true);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        // Running as root: every directory is visible.
+        return;
+    }
+    assert!(
+        matches!(&result, Some(CheckResult::Warn(message))
+            if message.contains("cannot be inspected by this user")
+                && !message.contains("does not exist")),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn the_logs_directory_matches_what_serve_creates_at_startup() {
     let dir = tempfile::tempdir().unwrap();
     let CheckResult::Warn(message) = logs_dir_result(dir.path()) else {
