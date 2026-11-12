@@ -239,6 +239,52 @@ async fn run_post_migration_maintenance(
         }
     }
 
+    // Audit events written before vault attribution existed, in committed
+    // batches. Vault audit pages use the slower read-time enumeration until it
+    // completes; an interrupted or skipped run resumes at the next start.
+    match race_maintenance(
+        temps_schema::run_vault_audit_backfill(db),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        MaintenanceRace::Completed(Ok(summary)) => {
+            if summary.batches > 0 {
+                info!(
+                    batches = summary.batches,
+                    attributed = summary.attributed,
+                    "Attributed pre-migration audit events to their access vaults"
+                );
+                if !use_json {
+                    println!(
+                        "  {} Attributed {} audit events to their access vaults",
+                        "✓".green(),
+                        summary.attributed
+                    );
+                }
+            }
+        }
+        MaintenanceRace::Completed(Err(error)) => {
+            info!("Vault audit attribution skipped/failed (the server resumes it at startup): {error}");
+            if !use_json {
+                println!(
+                    "  {} {}",
+                    "!".yellow(),
+                    format!("Vault audit attribution skipped: {error} (the server resumes it at startup)")
+                        .yellow()
+                );
+            }
+        }
+        MaintenanceRace::Interrupted => {
+            return Err(interrupted_maintenance_error(
+                database_url,
+                current_pid(),
+                "vault audit attribution",
+            )
+            .await)
+        }
+    }
+
     Ok(())
 }
 

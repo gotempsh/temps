@@ -950,6 +950,38 @@ impl ServeCommand {
                 }
             });
 
+            // Pre-migration audit events are attributed to their vaults in
+            // committed batches. Vault audit pages keep the slower read-time
+            // enumeration until it completes, so it is retried until then.
+            let attribution_db = db.clone();
+            rt.spawn(async move {
+                let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+                loop {
+                    match temps_schema::run_vault_audit_backfill(attribution_db.as_ref()).await {
+                        Ok(summary) => {
+                            if summary.batches > 0 {
+                                tracing::info!(
+                                    batches = summary.batches,
+                                    attributed = summary.attributed,
+                                    "Attributed pre-migration audit events to their access vaults"
+                                );
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                retry_in = ?retry_delay,
+                                error = %e,
+                                "Vault audit attribution backfill failed; vault audit pages \
+                                 use the read-time enumeration until it completes"
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
+                    }
+                }
+            });
+
             let backfill_db = db.clone();
             rt.spawn(async move {
                 if let Err(e) =

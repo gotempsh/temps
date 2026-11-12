@@ -27,8 +27,8 @@ pub use maintenance::{
     detach_telemetry_foreign_keys, reconcile_otel_trace_summaries,
     remaining_telemetry_foreign_keys, run_post_migration_backfill,
     run_post_migration_backfill_streaming, run_post_migration_indexes,
-    run_post_migration_indexes_streaming, MaintenanceProgress, TelemetryForeignKey,
-    DETACH_TELEMETRY_FOREIGN_KEYS_STEP,
+    run_post_migration_indexes_streaming, run_vault_audit_backfill, MaintenanceProgress,
+    TelemetryForeignKey, VaultAuditBackfillSummary, DETACH_TELEMETRY_FOREIGN_KEYS_STEP,
 };
 pub use migrations::{
     defined_migration_count, ensure_no_unprotected_upgrade, establish_connection,

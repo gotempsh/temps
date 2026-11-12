@@ -17,6 +17,8 @@ pub use sea_orm_migration::prelude::*;
 
 mod general_vault_backfill;
 pub use general_vault_backfill::backfill_legacy_vault_links;
+mod vault_audit_backfill;
+pub use vault_audit_backfill::{backfill_vault_audit_attribution, VaultAuditBackfillSummary};
 mod migration;
 #[cfg(test)]
 mod migration_order;

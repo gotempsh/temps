@@ -7,6 +7,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use temps_core::{AuditError, AuditLogger, AuditOperation, AuditResult, UtcDateTime};
 use temps_database::DbConnection;
@@ -14,6 +15,7 @@ use temps_entities::{audit_logs, ip_geolocations, users};
 use temps_geo::IpAddressService;
 use tracing::warn;
 
+#[derive(Debug, Clone, Copy)]
 pub struct AuditLogFilter<'a> {
     pub action: Option<&'a str>,
     pub resource_id: Option<&'a str>,
@@ -24,15 +26,52 @@ pub struct AuditLogFilter<'a> {
     pub offset: i32,
 }
 
+/// How a resource's audit page finds the events of a vault's children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceReadPlan {
+    /// Through `access_vault_audit_events`, filled when each event is written
+    /// (`m20261112_000012_vault_audit_attribution`): three bounded index walks,
+    /// whatever the vault's history.
+    Attributed,
+    /// By enumerating the children at read time: one probe per session,
+    /// bundle, link, service and service version. Only while pre-migration
+    /// events are still being attributed, so none is missing meanwhile.
+    Enumerated,
+}
+
 // Every branch applies the filters and keeps only its newest `offset + limit`
-// rows, walking a `(payload key, audit_date DESC, id DESC)` index so it stops
-// at the page boundary instead of enumerating the resource's whole history.
-// Child resources (sessions, bundles, links, services, service scopes) are
-// probed one key at a time through LATERAL, so each key also contributes at
-// most `offset + limit` rows. The outer query merges those bounded candidates.
-// The `audit_logs_*_recent` indexes serve those orderings; OFFSET 0 on the LATERAL
-// subqueries keeps the planner from flattening them back into an unbounded join.
-const RESOURCE_IDS_SQL: &str = r"WITH candidates AS (
+// rows, walking a `(key, audit_date DESC, id DESC)` index so it stops at the
+// page boundary instead of reading the resource's whole history. The events
+// that name the resource in their own payload come from the `audit_logs_*_recent`
+// expression indexes; those of the vault's sessions, bundles, links, services
+// and service versions come from `access_vault_audit_events_recent`, where they
+// were attributed when written. The outer query merges at most three pages.
+const ATTRIBUTED_RESOURCE_IDS_SQL: &str = r"WITH candidates AS (
+ (SELECT id, audit_date FROM audit_logs WHERE temps_audit_json(data)->>'resource_id' = $1
+  AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
+  AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
+  ORDER BY audit_date DESC, id DESC LIMIT ($6::bigint + $7::bigint))
+ UNION
+ (SELECT id, audit_date FROM audit_logs WHERE temps_audit_json(data)->>'vault_id' = $1
+  AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
+  AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
+  ORDER BY audit_date DESC, id DESC LIMIT ($6::bigint + $7::bigint))
+ UNION
+ (SELECT event.audit_log_id AS id, event.audit_date FROM access_vault_audit_events event
+  JOIN audit_logs log ON log.id = event.audit_log_id
+  WHERE event.vault_id = $1
+  AND ($2::text IS NULL OR log.operation_type LIKE $2) AND ($3::integer IS NULL OR log.user_id=$3)
+  AND ($4::timestamptz IS NULL OR event.audit_date >= $4) AND ($5::timestamptz IS NULL OR event.audit_date <= $5)
+  ORDER BY event.audit_date DESC, event.audit_log_id DESC LIMIT ($6::bigint + $7::bigint))
+)
+SELECT id FROM candidates ORDER BY audit_date DESC, id DESC LIMIT $6 OFFSET $7";
+
+// The read-time enumeration the attribution replaces, kept for the upgrade
+// window. Child resources are probed one key at a time through LATERAL, so
+// each key contributes at most `offset + limit` rows, but the number of keys
+// grows with the vault's history. OFFSET 0 on the LATERAL subqueries keeps the
+// planner from flattening them back into an unbounded join.
+const ENUMERATED_RESOURCE_IDS_SQL: &str = r"WITH candidates AS (
  (SELECT id, audit_date FROM audit_logs WHERE temps_audit_json(data)->>'resource_id' = $1
   AND ($2::text IS NULL OR operation_type LIKE $2) AND ($3::integer IS NULL OR user_id=$3)
   AND ($4::timestamptz IS NULL OR audit_date >= $4) AND ($5::timestamptz IS NULL OR audit_date <= $5)
@@ -74,10 +113,27 @@ struct AuditId {
     id: i32,
 }
 
-fn resource_ids_statement(resource_id: &str, filter: &AuditLogFilter<'_>) -> Statement {
+/// Whether every pre-migration event is attributed: the backfill deletes its
+/// cursor row when it is done, and nothing recreates it.
+const ATTRIBUTION_READY_SQL: &str =
+    "SELECT NOT EXISTS (SELECT 1 FROM access_vault_audit_backfill) AS ready";
+
+#[derive(FromQueryResult)]
+struct AttributionReady {
+    ready: bool,
+}
+
+fn resource_ids_statement(
+    resource_id: &str,
+    filter: &AuditLogFilter<'_>,
+    plan: ResourceReadPlan,
+) -> Statement {
     Statement::from_sql_and_values(
         DatabaseBackend::Postgres,
-        RESOURCE_IDS_SQL,
+        match plan {
+            ResourceReadPlan::Attributed => ATTRIBUTED_RESOURCE_IDS_SQL,
+            ResourceReadPlan::Enumerated => ENUMERATED_RESOURCE_IDS_SQL,
+        },
         [
             resource_id.into(),
             filter.action.map(|action| format!("%{action}%")).into(),
@@ -145,11 +201,39 @@ pub struct AuditLogWithDetails {
 pub struct AuditService {
     db: Arc<DbConnection>,
     ip_service: Arc<IpAddressService>,
+    /// Set once the vault audit backfill is seen complete; it never reverts,
+    /// so later reads skip the check.
+    attribution_ready: AtomicBool,
 }
 
 impl AuditService {
     pub fn new(db: Arc<DbConnection>, ip_service: Arc<IpAddressService>) -> Self {
-        Self { db, ip_service }
+        Self {
+            db,
+            ip_service,
+            attribution_ready: AtomicBool::new(false),
+        }
+    }
+
+    /// Which query serves a resource page: the attributed one once every
+    /// pre-migration event is attributed, the enumeration until then.
+    async fn resource_read_plan(&self) -> Result<ResourceReadPlan, DbErr> {
+        if self.attribution_ready.load(Ordering::Acquire) {
+            return Ok(ResourceReadPlan::Attributed);
+        }
+        let ready = AttributionReady::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            ATTRIBUTION_READY_SQL,
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .is_some_and(|row| row.ready);
+        if ready {
+            self.attribution_ready.store(true, Ordering::Release);
+            Ok(ResourceReadPlan::Attributed)
+        } else {
+            Ok(ResourceReadPlan::Enumerated)
+        }
     }
 
     pub async fn create_audit_log_typed<T: AuditOperation + ?Sized>(
@@ -282,17 +366,20 @@ WHERE id IN (SELECT id FROM expired)
         // enrich that bounded page with JOINs. This keeps both query count and
         // decoded row memory bounded independently of unrelated audit history.
         let ids = if let Some(resource_id) = filter.resource_id {
-            let ids = AuditId::find_by_statement(resource_ids_statement(resource_id, &filter))
-                .all(self.db.as_ref())
-                .await
-                .map_err(|source| AuditQueryError::Read {
-                    resource_id: Some(resource_id.into()),
-                    operation: filter.action.map(str::to_owned),
-                    user_id: filter.user_id,
-                    limit: filter.limit,
-                    offset: filter.offset,
-                    source,
-                })?;
+            let read_error = |source| AuditQueryError::Read {
+                resource_id: Some(resource_id.into()),
+                operation: filter.action.map(str::to_owned),
+                user_id: filter.user_id,
+                limit: filter.limit,
+                offset: filter.offset,
+                source,
+            };
+            let plan = self.resource_read_plan().await.map_err(read_error)?;
+            let ids =
+                AuditId::find_by_statement(resource_ids_statement(resource_id, &filter, plan))
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(read_error)?;
             if ids.is_empty() {
                 return Ok(Vec::new());
             }
@@ -454,6 +541,10 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([
                     vec![std::collections::BTreeMap::from([(
+                        "ready".into(),
+                        Value::Bool(Some(true)),
+                    )])],
+                    vec![std::collections::BTreeMap::from([(
                         "id".into(),
                         Value::Int(Some(7)),
                     )])],
@@ -481,9 +572,13 @@ mod tests {
             .is_empty());
         drop(service);
         let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
-        assert_eq!(transactions.len(), 2);
-        let statement = &transactions[0].statements()[0];
-        let details = &transactions[1].statements()[0];
+        assert_eq!(transactions.len(), 3);
+        let readiness = &transactions[0].statements()[0];
+        let statement = &transactions[1].statements()[0];
+        let details = &transactions[2].statements()[0];
+        assert!(readiness.sql.contains("access_vault_audit_backfill"));
+        assert!(statement.sql.contains("access_vault_audit_events"));
+        assert!(!statement.sql.contains("access_sessions"));
         assert!(statement.sql.contains("temps_audit_json(data)"));
         assert!(statement.sql.contains("->>'resource_id'"));
         assert!(details.sql.contains("LEFT JOIN \"users\""));
@@ -497,6 +592,59 @@ mod tests {
             .0
             .contains(&Value::from("vault_fixture")));
         assert!(!statement.sql.contains("vault_fixture"));
+    }
+
+    /// Pages enumerate the vault's children while the backfill is pending,
+    /// switch to the attribution table once it is done, and stop checking.
+    #[tokio::test]
+    async fn resource_reads_enumerate_children_until_the_backfill_completes() {
+        let ready = |value: bool| {
+            vec![std::collections::BTreeMap::from([(
+                "ready".to_owned(),
+                Value::Bool(Some(value)),
+            )])]
+        };
+        let none = Vec::<std::collections::BTreeMap<String, Value>>::new;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([ready(false), none(), ready(true), none(), none()])
+                .into_connection(),
+        );
+        let geoip = Arc::new(GeoIpService::Mock(MockGeoIpService::new()));
+        let service = AuditService::new(
+            db.clone(),
+            Arc::new(IpAddressService::new(db.clone(), geoip)),
+        );
+        for _ in 0..3 {
+            assert!(service
+                .filter_audit_logs(AuditLogFilter {
+                    action: None,
+                    resource_id: Some("vault_fixture"),
+                    user_id: None,
+                    from: None,
+                    to: None,
+                    limit: 20,
+                    offset: 0,
+                })
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        drop(service);
+        let sql: Vec<String> = Arc::try_unwrap(db)
+            .unwrap()
+            .into_transaction_log()
+            .iter()
+            .map(|transaction| transaction.statements()[0].sql.clone())
+            .collect();
+        assert_eq!(sql.len(), 5, "{sql:#?}");
+        assert!(sql[0].contains("access_vault_audit_backfill"));
+        assert!(sql[1].contains("access_sessions"));
+        assert!(sql[2].contains("access_vault_audit_backfill"));
+        assert!(sql[3].contains("access_vault_audit_events"));
+        assert!(!sql[3].contains("access_sessions"));
+        // Ready is remembered: the third page skips the check.
+        assert!(sql[4].contains("access_vault_audit_events"));
     }
 
     #[tokio::test]
@@ -529,6 +677,7 @@ mod tests {
                 limit: 20,
                 offset: 0,
             },
+            ResourceReadPlan::Attributed,
         );
         statement.sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", statement.sql);
         let row = db.query_one(statement).await.unwrap().unwrap();
@@ -593,6 +742,7 @@ mod tests {
                 limit: 20,
                 offset: 0,
             },
+            ResourceReadPlan::Attributed,
         );
         statement.sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", statement.sql);
         let row = db.query_one(statement).await.unwrap().unwrap();
@@ -610,8 +760,8 @@ mod tests {
                 .map_or(0.0, |children| children.iter().map(examined).sum())
         }
         assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(20.0));
-        // 12,000 events match; each of the four candidate branches may read only
-        // one page worth of its newest rows.
+        // 12,000 events match; each of the three candidate branches may read
+        // only one page worth of its newest rows.
         assert!(
             examined(&plan[0]["Plan"]) < 400.0,
             "first page examined the vault's whole matching history: {plan}"
@@ -630,6 +780,7 @@ mod tests {
                 limit: 100,
                 offset: 100,
             },
+            ResourceReadPlan::Attributed,
         ))
         .all(db.as_ref())
         .await
@@ -637,6 +788,407 @@ mod tests {
         assert_eq!(deep.len(), 100);
         let unique: std::collections::BTreeSet<i32> = deep.iter().map(|row| row.id).collect();
         assert_eq!(unique.len(), 100);
+        test.cleanup().await;
+    }
+
+    /// A project with a sandbox, a service and a vault that sessions can use.
+    const VAULT_FIXTURE_SQL: &str = r#"
+INSERT INTO users(id,name,email) VALUES(9931,'Fixture','audit-fixture@example.com');
+INSERT INTO projects(id,name,repo_name,repo_owner,directory,main_branch,preset,slug,created_at,updated_at) VALUES(9931,'Fixture','repo','owner','/','main','nodejs','audit-vault-fixture',now(),now());
+INSERT INTO sandboxes(id,public_id,name,user_id,project_id,status,backend) VALUES(9931,'sbx_audit_fixture','Fixture',9931,9931,'running','docker');
+INSERT INTO sandbox_access_services(id,project_id,name,policy,max_ttl_seconds,enabled,credential_encrypted) VALUES
+ ('svc_one',9931,'One','{}',60,true,'encrypted-fixture'),('svc_two',9931,'Two','{}',60,true,'encrypted-fixture');
+INSERT INTO access_vaults(id,project_id,name,service_ids) VALUES('vault_a',9931,'A',ARRAY['svc_one','svc_two']),('vault_b',9931,'B','{}');
+INSERT INTO access_bundles(id,project_id,vault_id,name,service_ids,ttl_seconds) VALUES('bundle_a',9931,'vault_a','A',ARRAY['svc_one'],60);
+INSERT INTO sandbox_service_grants(id,project_id,service_id,sandbox_id,service_version,policy_snapshot,created_by,expires_at) VALUES('grant_a',9931,'svc_one',9931,1,'{}',9931,now()+interval '1 hour');
+"#;
+
+    /// `count` sessions of `vault_a`, named `session_a_<n>`.
+    fn sessions_sql(count: u32) -> String {
+        format!(
+            "INSERT INTO access_sessions(id,project_id,vault_id,bundle_id,bundle_name,bundle_version,consumer_kind,consumer_id,sandbox_id,created_by,consent,grant_ids,created_at,expires_at) \
+             SELECT 'session_a_' || n,9931,'vault_a','bundle_a','A',1,'sandbox','sbx_audit_fixture',9931,9931,'{{\"immutable\":\"consent\"}}',ARRAY['grant_a'],now(),now()+interval '1 hour' \
+             FROM generate_series(1,{count}) n"
+        )
+    }
+
+    /// Writes `sql` as pre-migration history: no attribution trigger, and a
+    /// backfill cursor covering every row written so far.
+    async fn write_legacy_history(db: &sea_orm::DatabaseConnection, sql: &str) {
+        db.execute_unprepared(&format!(
+            "ALTER TABLE audit_logs DISABLE TRIGGER access_vault_audit_on_log; {sql}; \
+             ALTER TABLE audit_logs ENABLE TRIGGER access_vault_audit_on_log; \
+             INSERT INTO access_vault_audit_backfill(upper_id) SELECT max(id) FROM audit_logs \
+             ON CONFLICT (singleton) DO UPDATE SET upper_id = excluded.upper_id"
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn page_ids(
+        db: &sea_orm::DatabaseConnection,
+        vault_id: &str,
+        filter: &AuditLogFilter<'_>,
+        plan: ResourceReadPlan,
+    ) -> Vec<i32> {
+        AuditId::find_by_statement(resource_ids_statement(vault_id, filter, plan))
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    async fn explain(
+        db: &sea_orm::DatabaseConnection,
+        filter: &AuditLogFilter<'_>,
+        plan: ResourceReadPlan,
+    ) -> serde_json::Value {
+        let mut statement = resource_ids_statement("vault_a", filter, plan);
+        statement.sql = format!("EXPLAIN (ANALYZE, FORMAT JSON) {}", statement.sql);
+        let row = db.query_one(statement).await.unwrap().unwrap();
+        let plan: serde_json::Value = row.try_get("", "QUERY PLAN").unwrap();
+        plan[0]["Plan"].clone()
+    }
+
+    fn plan_nodes(node: &serde_json::Value) -> Vec<&serde_json::Value> {
+        let mut nodes = vec![node];
+        for child in node["Plans"].as_array().into_iter().flatten() {
+            nodes.extend(plan_nodes(child));
+        }
+        nodes
+    }
+
+    /// Rows read from audit and attribution tables, over every loop.
+    fn rows_examined(plan: &serde_json::Value) -> f64 {
+        plan_nodes(plan)
+            .into_iter()
+            .filter(|node| {
+                matches!(
+                    node["Relation Name"].as_str(),
+                    Some("audit_logs" | "access_vault_audit_events")
+                )
+            })
+            .map(|node| {
+                (node["Actual Rows"].as_f64().unwrap_or(0.0)
+                    + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0))
+                    * node["Actual Loops"].as_f64().unwrap_or(0.0)
+            })
+            .sum()
+    }
+
+    /// Largest number of times one `audit_logs` probe ran.
+    fn max_audit_probe_loops(plan: &serde_json::Value) -> f64 {
+        plan_nodes(plan)
+            .into_iter()
+            .filter(|node| node["Relation Name"] == "audit_logs")
+            .filter_map(|node| node["Actual Loops"].as_f64())
+            .fold(0.0, f64::max)
+    }
+
+    fn relations(plan: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        plan_nodes(plan)
+            .into_iter()
+            .filter_map(|node| node["Relation Name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// One line per plan node, for the test output.
+    fn plan_shape(node: &serde_json::Value, depth: usize, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "{:indent$}{} {} {} loops={} rows={}",
+            "",
+            node["Node Type"].as_str().unwrap_or("?"),
+            node["Relation Name"].as_str().unwrap_or(""),
+            node["Index Name"].as_str().unwrap_or(""),
+            node["Actual Loops"],
+            node["Actual Rows"],
+            indent = depth * 2
+        );
+        for child in node["Plans"].as_array().into_iter().flatten() {
+            plan_shape(child, depth + 1, out);
+        }
+    }
+
+    /// A vault with thousands of sessions and service versions: the read-time
+    /// enumeration probes `audit_logs` once per key, the attributed read does
+    /// not, and both return the same page.
+    #[tokio::test]
+    async fn vault_page_work_does_not_grow_with_sessions_or_service_versions() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping vault audit key-count bound: database unavailable");
+            return;
+        }
+        const KEYS: u32 = 2_000;
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        temps_schema::run_post_migration_indexes(db.as_ref())
+            .await
+            .unwrap();
+        db.execute_unprepared(VAULT_FIXTURE_SQL).await.unwrap();
+        db.execute_unprepared(&format!(
+            "{}; INSERT INTO access_service_audit_scopes SELECT 'svc_one:' || n,'vault_a' FROM generate_series(1,{KEYS}) n",
+            sessions_sql(KEYS)
+        ))
+        .await
+        .unwrap();
+        // Two events per session and per service version, all older than the
+        // page, plus unrelated history.
+        write_legacy_history(
+            db.as_ref(),
+            &format!(
+                "INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) \
+                 SELECT 'fixture','REVOKE_ACCESS_SESSION',jsonb_build_object('resource_id','session_a_' || (n % {KEYS} + 1))::text,now()-n*interval '1 second',now() FROM generate_series(1,{events}) n; \
+                 INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) \
+                 SELECT 'fixture','UPDATE_ACCESS_SERVICE',jsonb_build_object('resource_id','svc_one','service_scope_key','svc_one:' || (n % {KEYS} + 1))::text,now()-n*interval '1 second',now() FROM generate_series(1,{events}) n; \
+                 INSERT INTO audit_logs(user_agent,operation_type,data,audit_date,created_at) \
+                 SELECT 'fixture','UPDATE_ACCESS_SERVICE',jsonb_build_object('resource_id','svc_unrelated_' || n)::text,now(),now() FROM generate_series(1,20000) n",
+                events = KEYS * 2
+            ),
+        )
+        .await;
+        db.execute_unprepared(
+            "ANALYZE audit_logs; ANALYZE access_sessions; ANALYZE access_service_audit_scopes",
+        )
+        .await
+        .unwrap();
+        let first = AuditLogFilter {
+            action: None,
+            resource_id: Some("vault_a"),
+            user_id: None,
+            from: None,
+            to: None,
+            limit: 20,
+            offset: 0,
+        };
+        let deep = AuditLogFilter {
+            limit: 100,
+            offset: 100,
+            ..first
+        };
+
+        let before = explain(db.as_ref(), &first, ResourceReadPlan::Enumerated).await;
+        let mut shape = String::new();
+        plan_shape(&before, 0, &mut shape);
+        eprintln!("enumerated first page:\n{shape}");
+        assert!(
+            max_audit_probe_loops(&before) >= f64::from(KEYS),
+            "the enumeration should probe once per key: {before}"
+        );
+        let expected_first =
+            page_ids(db.as_ref(), "vault_a", &first, ResourceReadPlan::Enumerated).await;
+        let expected_deep =
+            page_ids(db.as_ref(), "vault_a", &deep, ResourceReadPlan::Enumerated).await;
+        assert_eq!(expected_first.len(), 20);
+        assert_eq!(expected_deep.len(), 100);
+
+        let summary = temps_schema::run_vault_audit_backfill(db.as_ref())
+            .await
+            .unwrap();
+        assert!(summary.complete);
+        assert_eq!(summary.attributed, i64::from(KEYS) * 4);
+        db.execute_unprepared("ANALYZE access_vault_audit_events")
+            .await
+            .unwrap();
+
+        for (filter, expected) in [(&first, &expected_first), (&deep, &expected_deep)] {
+            let after = explain(db.as_ref(), filter, ResourceReadPlan::Attributed).await;
+            let mut shape = String::new();
+            plan_shape(&after, 0, &mut shape);
+            eprintln!(
+                "attributed page (limit {}, offset {}):\n{shape}",
+                filter.limit, filter.offset
+            );
+            let window = f64::from(filter.limit + filter.offset);
+            // Three branches, each at most one window of its newest rows,
+            // plus the audit row each attributed candidate joins.
+            assert!(
+                rows_examined(&after) <= 4.0 * window + 10.0,
+                "attributed read examined more than its window: {after}"
+            );
+            assert!(max_audit_probe_loops(&after) <= window + 1.0, "{after}");
+            let touched = relations(&after);
+            for child in [
+                "access_sessions",
+                "access_service_audit_scopes",
+                "access_bundles",
+                "access_vault_links",
+                "access_vault_service_history",
+                "access_vaults",
+            ] {
+                assert!(
+                    !touched.contains(child),
+                    "attributed read touched {child}: {after}"
+                );
+            }
+            assert!(after
+                .to_string()
+                .contains("access_vault_audit_events_recent"));
+            assert_eq!(
+                &page_ids(db.as_ref(), "vault_a", filter, ResourceReadPlan::Attributed).await,
+                expected
+            );
+        }
+        test.cleanup().await;
+    }
+
+    /// Every vault, filter and page returns the same events through the
+    /// attribution table, after the backfill, as through the enumeration;
+    /// including membership that changes before and after the backfill, and
+    /// services that leave a vault.
+    #[tokio::test]
+    async fn backfilled_attribution_returns_the_enumerated_events() {
+        if !temps_test_utils::external_database_configured()
+            && !temps_test_utils::docker_available().await
+        {
+            eprintln!("Skipping vault audit backfill equivalence: database unavailable");
+            return;
+        }
+        let mut test = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let db = test.connection_arc();
+        db.execute_unprepared(VAULT_FIXTURE_SQL).await.unwrap();
+        db.execute_unprepared(&format!(
+            "{}; INSERT INTO access_service_audit_scopes VALUES('svc_one:1','vault_a'),('svc_one:2','vault_a'),('svc_two:1','vault_a')",
+            sessions_sql(3)
+        ))
+        .await
+        .unwrap();
+        write_legacy_history(
+            db.as_ref(),
+            r#"INSERT INTO audit_logs(user_id,user_agent,operation_type,data,audit_date,created_at) VALUES
+ (9931,'fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_a"}',now()-interval '40 minutes',now()),
+ (NULL,'fixture','UPDATE_ACCESS_VAULT','{"resource_id":"vault_b"}',now()-interval '39 minutes',now()),
+ (9931,'fixture','REVOKE_ACCESS_SESSION','{"resource_id":"session_a_1","vault_id":"vault_a"}',now()-interval '38 minutes',now()),
+ (NULL,'fixture','REVOKE_ACCESS_VAULT_LINK','{"resource_id":"link_gone","vault_id":"vault_b"}',now()-interval '37 minutes',now()),
+ (9931,'fixture','CREATE_ACCESS_SERVICE','{"resource_id":"svc_one","service_scope_key":"svc_one:1"}',now()-interval '36 minutes',now()),
+ (NULL,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_one","service_scope_key":"svc_one:2"}',now()-interval '35 minutes',now()),
+ (9931,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_two","service_scope_key":"svc_two:1"}',now()-interval '34 minutes',now()),
+ (NULL,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_one"}',now()-interval '33 minutes',now()),
+ (9931,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_one"}',now()-interval '32 minutes',now()),
+ (NULL,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_two"}',now()-interval '31 minutes',now()),
+ (9931,'fixture','CREATE_ACCESS_BUNDLE','{"resource_id":"bundle_a"}',now()-interval '30 minutes',now()),
+ (NULL,'fixture','CREATE_ACCESS_SESSION','{"resource_id":"session_a_1"}',now()-interval '20 minutes',now()),
+ (9931,'fixture','CREATE_ACCESS_SESSION','{"resource_id":"session_a_2"}',now()-interval '19 minutes',now()),
+ (NULL,'fixture','UPDATE_ACCESS_SESSION','{"resource_id":"session_a_2","vault_id":"vault_other"}',now()-interval '18 minutes',now()),
+ (9931,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_other"}',now()-interval '17 minutes',now()),
+ (NULL,'fixture','UPDATE_ACCESS_VAULT','not JSON',now()-interval '16 minutes',now()),
+ (9931,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_two"}',now()-interval '15 minutes',now())"#,
+        )
+        .await;
+        // Membership that changed after the history was written but before the
+        // backfill: a link captured svc_one's first version for vault_b, and
+        // svc_two moved from vault_a to vault_b.
+        db.execute_unprepared(
+            "INSERT INTO access_service_audit_scopes VALUES('svc_one:1','vault_b');
+             UPDATE access_vaults SET service_ids=ARRAY['svc_one'] WHERE id='vault_a';
+             UPDATE access_vaults SET service_ids=ARRAY['svc_two'] WHERE id='vault_b';",
+        )
+        .await
+        .unwrap();
+
+        let now = chrono::Utc::now();
+        let base = AuditLogFilter {
+            action: None,
+            resource_id: None,
+            user_id: None,
+            from: None,
+            to: None,
+            limit: 100,
+            offset: 0,
+        };
+        let filters = [
+            base,
+            AuditLogFilter {
+                action: Some("SERVICE"),
+                ..base
+            },
+            AuditLogFilter {
+                user_id: Some(9931),
+                ..base
+            },
+            AuditLogFilter {
+                from: Some(now - chrono::Duration::minutes(35) - chrono::Duration::seconds(30)),
+                to: Some(now - chrono::Duration::minutes(18) - chrono::Duration::seconds(30)),
+                ..base
+            },
+            AuditLogFilter { limit: 3, ..base },
+            AuditLogFilter {
+                limit: 3,
+                offset: 3,
+                ..base
+            },
+            AuditLogFilter {
+                limit: 3,
+                offset: 9,
+                ..base
+            },
+        ];
+        async fn pages(
+            db: &sea_orm::DatabaseConnection,
+            filters: &[AuditLogFilter<'_>],
+            plan: ResourceReadPlan,
+        ) -> Vec<Vec<i32>> {
+            let mut pages = Vec::new();
+            for vault_id in ["vault_a", "vault_b"] {
+                for filter in filters {
+                    let filter = AuditLogFilter {
+                        resource_id: Some(vault_id),
+                        ..*filter
+                    };
+                    pages.push(page_ids(db, vault_id, &filter, plan).await);
+                }
+            }
+            pages
+        }
+
+        let enumerated = pages(db.as_ref(), &filters, ResourceReadPlan::Enumerated).await;
+        // vault_a: own, named, three scoped, svc_one x2, svc_two x2 (it held
+        // svc_two), bundle, two sessions. vault_b: own, named, svc_one:1,
+        // svc_two x2.
+        assert_eq!(enumerated[0].len(), 12);
+        assert_eq!(enumerated[filters.len()].len(), 5);
+        let summary = temps_schema::run_vault_audit_backfill(db.as_ref())
+            .await
+            .unwrap();
+        assert!(summary.complete && summary.batches > 0);
+        assert_eq!(
+            pages(db.as_ref(), &filters, ResourceReadPlan::Attributed).await,
+            enumerated
+        );
+
+        // After the backfill: live events, a later link for svc_two's version,
+        // svc_one joining vault_b, and vault_a retiring svc_one.
+        db.execute_unprepared(
+            r#"INSERT INTO audit_logs(user_id,user_agent,operation_type,data,audit_date,created_at) VALUES
+ (9931,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_two"}',now()-interval '10 minutes',now()),
+ (NULL,'fixture','REVOKE_ACCESS_SESSION','{"resource_id":"session_a_3"}',now()-interval '9 minutes',now()),
+ (9931,'fixture','UPDATE_ACCESS_SERVICE','{"resource_id":"svc_one","service_scope_key":"svc_one:3"}',now()-interval '8 minutes',now());
+ INSERT INTO access_service_audit_scopes VALUES('svc_two:1','vault_b'),('svc_one:3','vault_a');
+ UPDATE access_vaults SET service_ids=ARRAY['svc_two','svc_one'] WHERE id='vault_b';
+ UPDATE access_vaults SET service_ids='{}' WHERE id='vault_a';
+ INSERT INTO audit_logs(user_id,user_agent,operation_type,data,audit_date,created_at) VALUES
+ (NULL,'fixture','DELETE_ACCESS_SERVICE','{"resource_id":"svc_one"}',now()-interval '7 minutes',now());"#,
+        )
+        .await
+        .unwrap();
+        let enumerated = pages(db.as_ref(), &filters, ResourceReadPlan::Enumerated).await;
+        // vault_a: + svc_two, session_a_3, svc_one:3 and svc_one's deletion.
+        // vault_b: + svc_two, svc_two:1, and svc_one's three unscoped events.
+        assert_eq!(enumerated[0].len(), 16);
+        assert_eq!(enumerated[filters.len()].len(), 10);
+        assert_eq!(
+            pages(db.as_ref(), &filters, ResourceReadPlan::Attributed).await,
+            enumerated
+        );
         test.cleanup().await;
     }
 

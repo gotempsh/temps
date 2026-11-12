@@ -238,6 +238,11 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([
+                    // Vault audit attribution is complete.
+                    vec![std::collections::BTreeMap::from([(
+                        "ready".to_owned(),
+                        sea_orm::Value::Bool(Some(true)),
+                    )])],
                     Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
                 ])
                 .into_connection(),

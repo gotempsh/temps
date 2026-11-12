@@ -14,7 +14,10 @@ use tracing::debug;
 
 mod access_vault_indexes;
 mod audit_scope_indexes;
+mod vault_audit_backfill;
+
 pub(crate) use access_vault_indexes::prepare_consumer_constraints;
+pub use vault_audit_backfill::{run_vault_audit_backfill, VaultAuditBackfillSummary};
 
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
 

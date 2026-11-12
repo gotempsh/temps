@@ -25,6 +25,11 @@ pub enum SchemaError {
         operation: &'static str,
         reason: String,
     },
+    #[error("Failed to attribute pre-migration audit events to their access vaults: {source}")]
+    VaultAuditBackfill {
+        #[source]
+        source: sea_orm::DbErr,
+    },
     #[error(transparent)]
     LockSlotsExhausted(Box<LockSlotsExhausted>),
 
@@ -44,9 +49,9 @@ impl From<SchemaError> for ServiceError {
     /// [`ServiceError::Configuration`] with the full advice as its message.
     fn from(error: SchemaError) -> Self {
         match error {
-            error @ (SchemaError::VaultIndex { .. } | SchemaError::VaultConstraint { .. }) => {
-                ServiceError::Database(error.to_string())
-            }
+            error @ (SchemaError::VaultIndex { .. }
+            | SchemaError::VaultConstraint { .. }
+            | SchemaError::VaultAuditBackfill { .. }) => ServiceError::Database(error.to_string()),
             // A server setting the operator has to change.
             SchemaError::LockSlotsExhausted(error) => ServiceError::Configuration {
                 message: error.to_string(),
