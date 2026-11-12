@@ -118,3 +118,77 @@ for (const kind of ['project', 'sandbox'] as const) {
     }
   })
 }
+
+test('a failed membership check pauses linking and retries instead of showing every consumer as unlinked', async () => {
+  let membershipCalls = 0
+  const api = mockApi({
+    'GET /access-vaults/vault_fixture/links': () => {
+      membershipCalls += 1
+      if (membershipCalls === 1) {
+        return jsonResponse({ detail: 'membership lookup failed' }, 500)
+      }
+      return jsonResponse({
+        items: [
+          {
+            id: 'link_7',
+            vault_id: 'vault_fixture',
+            project_id: 7,
+            sandbox_id: null,
+            consumer_name: 'Already linked',
+            created_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        total: 1,
+        page: 1,
+        page_size: 100,
+      })
+    },
+    'GET /projects': () =>
+      jsonResponse({
+        projects: [
+          { id: 7, name: 'Already linked', source_type: 'external' },
+          { id: 8, name: 'Not yet linked', source_type: 'external' },
+        ],
+        total: 2,
+      }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  try {
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <VaultConsumerPicker
+            kind="project"
+            linkAction
+            vaultId="vault_fixture"
+            onSelect={() => {}}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const ui = within(document.body)
+    await ui.findByText('Could not check which projects are already linked')
+    for (const name of ['Link Already linked', 'Link Not yet linked']) {
+      const button = ui.getByRole('button', { name }) as HTMLButtonElement
+      expect(button.disabled).toBe(true)
+    }
+    fireEvent.click(ui.getByRole('button', { name: 'Retry' }))
+    const linked = (await ui.findByRole('button', {
+      name: 'Linked Already linked',
+    })) as HTMLButtonElement
+    expect(linked.disabled).toBe(true)
+    const link = ui.getByRole('button', {
+      name: 'Link Not yet linked',
+    }) as HTMLButtonElement
+    expect(link.disabled).toBe(false)
+    expect(
+      ui.queryByText('Could not check which projects are already linked')
+    ).toBeNull()
+  } finally {
+    cleanup()
+    client.clear()
+    api.restore()
+  }
+})

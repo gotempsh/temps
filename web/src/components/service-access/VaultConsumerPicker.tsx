@@ -81,8 +81,22 @@ export function VaultConsumerPicker({
     }
   )
   const membershipPending = linkAction && !!vaultId && membership.isPending
+  // Without the membership answer a linked consumer would read "Link", so
+  // every link action waits until the lookup succeeds.
+  const membershipFailed = linkAction && !!vaultId && membership.isError
   return (
     <div className="space-y-3">
+      {membershipFailed && !query.isError && (
+        <Callout
+          tone="error"
+          title={`Could not check which ${plural} are already linked`}
+        >
+          <p>Linking is paused until this check succeeds.</p>
+          <Button type="button" onClick={() => void membership.refetch()}>
+            Retry
+          </Button>
+        </Callout>
+      )}
       {query.isError ? (
         <Callout tone="error" title={`Could not load ${plural}`}>
           <Button type="button" onClick={() => void query.refetch()}>
@@ -149,7 +163,10 @@ export function VaultConsumerPicker({
                 variant="outline"
                 size="sm"
                 disabled={
-                  pending || membershipPending || linkedIds.includes(row.id)
+                  pending ||
+                  membershipPending ||
+                  membershipFailed ||
+                  linkedIds.includes(row.id)
                 }
                 aria-label={`${linkedIds.includes(row.id) ? 'Linked' : 'Link'} ${row.name}`}
                 onClick={() => onSelect(row.id)}
