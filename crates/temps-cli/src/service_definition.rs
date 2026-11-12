@@ -400,13 +400,11 @@ fn read_drop_ins(unit: &Path, roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)
                     ))
                 }
             };
-            for path in entries.flatten().map(|entry| entry.path()) {
-                if path.extension().is_some_and(|ext| ext == "conf") {
-                    if let Some(name) = path.file_name() {
-                        chosen.entry(name.to_os_string()).or_insert(path);
-                    }
-                }
-            }
+            choose_drop_ins(
+                &dir,
+                entries.map(|entry| entry.map(|entry| entry.path())),
+                &mut chosen,
+            )?;
         }
     }
     let mut drop_ins = Vec::new();
@@ -423,6 +421,30 @@ fn read_drop_ins(unit: &Path, roots: &[PathBuf]) -> Result<Vec<(PathBuf, String)
         }
     }
     Ok(drop_ins)
+}
+
+/// Add the `.conf` files listed in `dir` to `chosen`, keeping a name already
+/// chosen from a higher-priority directory. An entry that cannot be listed
+/// fails the whole unit: the drop-in it hides may set what the server uses.
+fn choose_drop_ins(
+    dir: &Path,
+    entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    chosen: &mut BTreeMap<std::ffi::OsString, PathBuf>,
+) -> Result<(), String> {
+    for entry in entries {
+        let path = entry.map_err(|error| {
+            format!(
+                "its drop-in directory {} cannot be listed: {error}",
+                dir.display()
+            )
+        })?;
+        if path.extension().is_some_and(|ext| ext == "conf") {
+            if let Some(name) = path.file_name() {
+                chosen.entry(name.to_os_string()).or_insert(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `[Service]` settings that decide what `serve` runs with.

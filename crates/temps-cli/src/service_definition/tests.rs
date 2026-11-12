@@ -655,6 +655,53 @@ fn drop_ins_merge_across_load_paths_as_systemd_does() {
 }
 
 #[test]
+fn a_drop_in_entry_that_cannot_be_listed_fails_the_unit() {
+    let dir = Path::new("/etc/systemd/system/temps.service.d");
+    let mut chosen = BTreeMap::new();
+    let error = choose_drop_ins(
+        dir,
+        [
+            Ok(dir.join("10-dir.conf")),
+            Err(std::io::Error::other("injected entry failure")),
+            Ok(dir.join("20-db.conf")),
+        ]
+        .into_iter(),
+        &mut chosen,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("temps.service.d cannot be listed")
+            && error.contains("injected entry failure"),
+        "{error}"
+    );
+
+    // Readable entries are chosen as before: `.conf` only, the first name wins.
+    let mut chosen = BTreeMap::new();
+    chosen.insert(
+        "10-dir.conf".into(),
+        PathBuf::from("/run/higher/10-dir.conf"),
+    );
+    choose_drop_ins(
+        dir,
+        [
+            Ok(dir.join("10-dir.conf")),
+            Ok(dir.join("README")),
+            Ok(dir.join("20-db.conf")),
+        ]
+        .into_iter(),
+        &mut chosen,
+    )
+    .unwrap();
+    assert_eq!(
+        chosen.into_values().collect::<Vec<_>>(),
+        vec![
+            PathBuf::from("/run/higher/10-dir.conf"),
+            dir.join("20-db.conf")
+        ]
+    );
+}
+
+#[test]
 fn unset_environment_removes_what_the_server_does_not_get() {
     let root = tempfile::tempdir().unwrap();
     let url_file = root.path().join("database-url");
