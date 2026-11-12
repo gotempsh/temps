@@ -42,7 +42,7 @@ pub use exec::{
 };
 pub use image_removal::{
     list_labelled_images, remove_unused_images, ImageRemovalOutcome, ImageRemovalRequest,
-    ImageRemovalStatus, LabelledImage, LabelledImages,
+    ImageRemovalStatus, LabelledImage, LabelledImages, ListCursor, OwnerGuard,
 };
 pub use network::{ensure_bridge_network, NetworkEnsured};
 pub use pull::{pull_image, pull_image_with_progress, PullSpec, PullTimeouts};

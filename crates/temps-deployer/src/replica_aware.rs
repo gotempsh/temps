@@ -190,8 +190,12 @@ impl ContainerDeployer for ReplicaAwareDeployer {
         self.local.remove_unused_images(requests).await
     }
 
-    async fn list_owned_images(&self, owner: &str) -> Result<crate::LabelledImages, DeployerError> {
-        self.local.list_owned_images(owner).await
+    async fn list_owned_images(
+        &self,
+        owner: &str,
+        after: Option<&crate::ListCursor>,
+    ) -> Result<crate::LabelledImages, DeployerError> {
+        self.local.list_owned_images(owner, after).await
     }
 }
 

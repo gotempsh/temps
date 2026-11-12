@@ -2211,7 +2211,7 @@ pub async fn list_owned_images(
     }
     match state
         .container_deployer
-        .list_owned_images(&request.owner)
+        .list_owned_images(&request.owner, request.after.as_ref())
         .await
     {
         Ok(listing) => {

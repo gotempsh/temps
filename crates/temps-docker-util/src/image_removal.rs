@@ -56,6 +56,23 @@ pub struct ImageRemovalRequest {
     /// is not the one the caller meant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_image_id: Option<String>,
+    /// Keep the image if it was labelled as built by someone other than the
+    /// caller (see [`OwnerGuard`]). Optional on the wire: an agent that
+    /// predates it removes without this check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_guard: Option<OwnerGuard>,
+}
+
+/// Who may remove a labelled image: the image is kept when it carries
+/// `label` with a value other than `owner`. An image without the label is
+/// not judged by it (it predates ownership labels); `owner: None` means the
+/// caller has no owner ID, so every image carrying the label is someone
+/// else's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerGuard {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl ImageRemovalRequest {
@@ -63,7 +80,14 @@ impl ImageRemovalRequest {
         Self {
             reference: reference.into(),
             expected_image_id,
+            owner_guard: None,
         }
+    }
+
+    /// The same request, keeping images another owner labelled.
+    pub fn with_owner_guard(mut self, guard: OwnerGuard) -> Self {
+        self.owner_guard = Some(guard);
+        self
     }
 }
 
@@ -86,6 +110,9 @@ pub enum ImageRemovalStatus {
         expected_image_id: String,
         found_image_id: String,
     },
+    /// The image is labelled as built by another owner (another Temps
+    /// install sharing this Docker host).
+    ForeignOwner { image_id: String, owner: String },
     /// The image also carries tags the caller did not ask to remove, so
     /// someone else still names it.
     OtherTags {
@@ -114,6 +141,7 @@ impl ImageRemovalStatus {
             self,
             Self::InUse { .. }
                 | Self::Replaced { .. }
+                | Self::ForeignOwner { .. }
                 | Self::OtherTags { .. }
                 | Self::Refused { .. }
         )
@@ -139,6 +167,9 @@ impl ImageRemovalStatus {
                 found_image_id,
             } => Some(format!(
                 "reference now names image {found_image_id}, not the recorded {expected_image_id}"
+            )),
+            Self::ForeignOwner { image_id, owner } => Some(format!(
+                "image {image_id} was built by another owner ({owner})"
             )),
             Self::OtherTags {
                 image_id,
@@ -169,6 +200,7 @@ pub struct ImageRemovalOutcome {
 pub struct InspectedImage {
     pub image_id: String,
     pub tags: Vec<String>,
+    pub labels: HashMap<String, String>,
 }
 
 /// What [`decide`] concluded for one request, before the container check.
@@ -191,6 +223,16 @@ pub fn decide(request: &ImageRemovalRequest, image: &InspectedImage) -> RemovalD
                 expected_image_id: expected,
                 found_image_id: image_id,
             });
+        }
+    }
+    if let Some(guard) = &request.owner_guard {
+        if let Some(labelled) = image.labels.get(&guard.label) {
+            if guard.owner.as_deref() != Some(labelled.as_str()) {
+                return RemovalDecision::Keep(ImageRemovalStatus::ForeignOwner {
+                    image_id,
+                    owner: labelled.clone(),
+                });
+            }
         }
     }
     let requested = normalize_reference(&request.reference);
@@ -256,6 +298,10 @@ pub async fn inspect_reference(
         Ok(image) => Ok(Some(InspectedImage {
             image_id: image.id.unwrap_or_default(),
             tags: image.repo_tags.unwrap_or_default(),
+            labels: image
+                .config
+                .and_then(|config| config.labels)
+                .unwrap_or_default(),
         })),
         Err(DockerError::DockerResponseServerError {
             status_code: 404, ..
@@ -307,26 +353,71 @@ pub struct LabelledImage {
     pub in_use_by: Option<String>,
 }
 
+/// Where a listing left off: the last image it returned, in its
+/// `(created, image_id)` order. The next listing starts after it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListCursor {
+    pub created: i64,
+    pub image_id: String,
+}
+
 /// What [`list_labelled_images`] found.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LabelledImages {
-    /// At most [`MAX_LABELLED_IMAGES`], oldest first.
+    /// At most [`MAX_LABELLED_IMAGES`], oldest first, all after the cursor
+    /// the listing was given.
     pub images: Vec<LabelledImage>,
-    /// Matching images beyond the limit, left for a later listing.
+    /// Matching images after the last one returned, left for a later listing.
     #[serde(default)]
     pub unlisted: usize,
+    /// Where to start the next listing so it reaches them, when there are
+    /// any. `None` once a listing reached the newest image: start over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<ListCursor>,
 }
 
-/// Every image labelled `key=value`, oldest first and bounded by
-/// [`MAX_LABELLED_IMAGES`], keeping only its labels under `keep_prefix`.
-/// With `check_usage`, each kept image is also checked for a container
-/// created from it (one query per image).
+/// Keep, oldest first, at most `max` of `images` after `after`, and say where
+/// the next page starts. A listing that always kept the same oldest window
+/// would never reach newer images when the oldest ones all stay; paging
+/// through with the cursor reaches every image in turn.
+pub fn page_labelled_images(
+    mut images: Vec<LabelledImage>,
+    after: Option<&ListCursor>,
+    max: usize,
+) -> LabelledImages {
+    let position = |image: &LabelledImage| (image.created, image.image_id.clone());
+    if let Some(after) = after {
+        let start = (after.created, after.image_id.clone());
+        images.retain(|image| position(image) > start);
+    }
+    images.sort_by_key(position);
+    let unlisted = images.len().saturating_sub(max);
+    images.truncate(max);
+    let next = (unlisted > 0)
+        .then(|| images.last())
+        .flatten()
+        .map(|last| ListCursor {
+            created: last.created,
+            image_id: last.image_id.clone(),
+        });
+    LabelledImages {
+        images,
+        unlisted,
+        next,
+    }
+}
+
+/// Images labelled `key=value` after `after`, oldest first and bounded by
+/// [`MAX_LABELLED_IMAGES`] (see [`page_labelled_images`]), keeping only their
+/// labels under `keep_prefix`. With `check_usage`, each kept image is also
+/// checked for a container created from it (one query per image).
 pub async fn list_labelled_images(
     docker: &Docker,
     key: &str,
     value: &str,
     keep_prefix: &str,
     check_usage: bool,
+    after: Option<&ListCursor>,
 ) -> Result<LabelledImages, DockerUtilError> {
     let images = docker
         .list_images(Some(bollard::query_parameters::ListImagesOptions {
@@ -342,7 +433,7 @@ pub async fn list_labelled_images(
             operation: "list labelled images",
             source,
         })?;
-    let mut images: Vec<LabelledImage> = images
+    let images: Vec<LabelledImage> = images
         .into_iter()
         .map(|image| LabelledImage {
             image_id: image.id,
@@ -360,22 +451,16 @@ pub async fn list_labelled_images(
             in_use_by: None,
         })
         .collect();
-    images.sort_by(|a, b| {
-        a.created
-            .cmp(&b.created)
-            .then_with(|| a.image_id.cmp(&b.image_id))
-    });
-    let unlisted = images.len().saturating_sub(MAX_LABELLED_IMAGES);
-    images.truncate(MAX_LABELLED_IMAGES);
+    let mut page = page_labelled_images(images, after, MAX_LABELLED_IMAGES);
     if check_usage {
-        for image in &mut images {
+        for image in &mut page.images {
             image.in_use_by = match container_using_image(docker, &image.image_id).await {
                 Ok(holder) => holder,
                 Err(error) => Some(format!("<usage could not be checked: {error}>")),
             };
         }
     }
-    Ok(LabelledImages { images, unlisted })
+    Ok(page)
 }
 
 /// Remove each requested image that no container uses and nothing else
@@ -481,7 +566,115 @@ mod tests {
         InspectedImage {
             image_id: id.to_string(),
             tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            labels: HashMap::new(),
         }
+    }
+
+    const OWNER_LABEL: &str = "sh.temps.image.instance";
+
+    fn guard(owner: Option<&str>) -> OwnerGuard {
+        OwnerGuard {
+            label: OWNER_LABEL.to_string(),
+            owner: owner.map(str::to_string),
+        }
+    }
+
+    /// Another install sharing the host built the image: it is theirs,
+    /// whatever this caller's records say.
+    #[test]
+    fn an_image_another_owner_labelled_is_kept() {
+        let mut image = inspected(APP, &["app-1:latest"]);
+        image
+            .labels
+            .insert(OWNER_LABEL.to_string(), "production.marker".to_string());
+        let request = ImageRemovalRequest::new("app-1:latest", Some(APP.to_string()))
+            .with_owner_guard(guard(Some("staging.marker")));
+        assert_eq!(
+            decide(&request, &image),
+            RemovalDecision::Keep(ImageRemovalStatus::ForeignOwner {
+                image_id: APP.to_string(),
+                owner: "production.marker".to_string(),
+            })
+        );
+        // A caller with no owner ID owns no labelled image at all.
+        let request = ImageRemovalRequest::new("app-1:latest", None).with_owner_guard(guard(None));
+        assert!(matches!(
+            decide(&request, &image),
+            RemovalDecision::Keep(ImageRemovalStatus::ForeignOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn an_image_this_owner_labelled_or_never_labelled_is_judged_as_before() {
+        let mut ours = inspected(APP, &["app-1:latest"]);
+        ours.labels
+            .insert(OWNER_LABEL.to_string(), "staging.marker".to_string());
+        let request = ImageRemovalRequest::new("app-1:latest", Some(APP.to_string()))
+            .with_owner_guard(guard(Some("staging.marker")));
+        assert!(matches!(
+            decide(&request, &ours),
+            RemovalDecision::Remove { .. }
+        ));
+        // Built before ownership labels: the caller's records decide.
+        assert!(matches!(
+            decide(&request, &inspected(APP, &["app-1:latest"])),
+            RemovalDecision::Remove { .. }
+        ));
+    }
+
+    fn listed(id: &str, created: i64) -> LabelledImage {
+        LabelledImage {
+            image_id: id.to_string(),
+            tags: Vec::new(),
+            labels: HashMap::new(),
+            created,
+            in_use_by: None,
+        }
+    }
+
+    /// Paging reaches every image: a window that always started at the
+    /// oldest would never get past old images that all stay.
+    #[test]
+    fn paging_reaches_every_image_and_then_starts_over() {
+        let images = vec![
+            listed("c", 3),
+            listed("a", 1),
+            listed("b", 1),
+            listed("d", 4),
+            listed("e", 5),
+        ];
+        let ids = |page: &LabelledImages| -> Vec<String> {
+            page.images.iter().map(|i| i.image_id.clone()).collect()
+        };
+        let first = page_labelled_images(images.clone(), None, 2);
+        assert_eq!(ids(&first), ["a", "b"]);
+        assert_eq!(first.unlisted, 3);
+        let second = page_labelled_images(images.clone(), first.next.as_ref(), 2);
+        assert_eq!(ids(&second), ["c", "d"]);
+        let third = page_labelled_images(images.clone(), second.next.as_ref(), 2);
+        assert_eq!(ids(&third), ["e"]);
+        assert_eq!(third.unlisted, 0);
+        assert_eq!(third.next, None, "the end of the list starts over");
+        // Images sharing a timestamp are not skipped at a page boundary.
+        let after_a = ListCursor {
+            created: 1,
+            image_id: "a".into(),
+        };
+        let tied = page_labelled_images(images, Some(&after_a), 1);
+        assert_eq!(ids(&tied), ["b"]);
+    }
+
+    #[test]
+    fn a_request_without_a_guard_round_trips_for_older_agents() {
+        let json = serde_json::to_value(ImageRemovalRequest::new("app-1:latest", None))
+            .expect("serialize");
+        assert!(json.get("owner_guard").is_none(), "{json}");
+        let guarded: ImageRemovalRequest = serde_json::from_value(serde_json::json!({
+            "reference": "app-1:latest",
+            "owner_guard": { "label": OWNER_LABEL, "owner": "a.b" }
+        }))
+        .expect("deserialize");
+        assert_eq!(guarded.owner_guard, Some(guard(Some("a.b"))));
     }
 
     #[test]
@@ -601,11 +794,21 @@ mod tests {
         docker: &Docker,
         tag: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        build_labelled_unique_image(docker, tag, "sh.temps.test.unused", "x").await
+    }
+
+    /// [`build_unique_image`] with one extra label baked into the image.
+    async fn build_labelled_unique_image(
+        docker: &Docker,
+        tag: &str,
+        label: &str,
+        value: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         use bollard::query_parameters::BuildImageOptionsBuilder;
         use futures::StreamExt as _;
 
         let dockerfile = format!(
-            "FROM {}\nLABEL sh.temps.test.nonce={}\n",
+            "FROM {}\nLABEL sh.temps.test.nonce={}\nLABEL {label}={value}\n",
             crate::test_support::TEST_IMAGE,
             uuid::Uuid::new_v4()
         );
@@ -672,10 +875,17 @@ mod tests {
             "{}:latest",
             crate::test_support::unique_name("img-retagged")
         );
+        let foreign = format!("{}:latest", crate::test_support::unique_name("img-foreign"));
         let retag = format!("{}:keep", crate::test_support::unique_name("img-retag"));
         let holder = crate::test_support::unique_name("img-holder");
 
         let mut built = true;
+        if let Err(error) =
+            build_labelled_unique_image(&docker, &foreign, OWNER_LABEL, "another-install").await
+        {
+            println!("Could not build test image {foreign}, skipping: {error}");
+            built = false;
+        }
         for tag in [&unused, &in_use, &unrelated, &retagged] {
             if let Err(error) = build_unique_image(&docker, tag).await {
                 println!("Could not build test image {tag}, skipping: {error}");
@@ -724,6 +934,8 @@ mod tests {
                         ImageRemovalRequest::new(in_use.clone(), None),
                         ImageRemovalRequest::new(missing.clone(), None),
                         ImageRemovalRequest::new(retagged.clone(), None),
+                        ImageRemovalRequest::new(foreign.clone(), None)
+                            .with_owner_guard(guard(Some("this-install"))),
                     ],
                 )
                 .await,
@@ -735,10 +947,11 @@ mod tests {
         let in_use_left = docker.inspect_image(&in_use).await.is_ok();
         let unrelated_left = docker.inspect_image(&unrelated).await.is_ok();
         let retagged_left = docker.inspect_image(&retagged).await.is_ok();
+        let foreign_left = docker.inspect_image(&foreign).await.is_ok();
 
         // Clean up only what this test created, before asserting.
         crate::test_support::remove_container(&docker, &holder).await;
-        for tag in [&unused, &in_use, &unrelated, &retagged, &retag] {
+        for tag in [&unused, &in_use, &unrelated, &retagged, &retag, &foreign] {
             force_remove_image(&docker, tag).await;
         }
 
@@ -763,6 +976,12 @@ mod tests {
             outcomes[3]
         );
         assert!(retagged_left, "an image someone else also tagged must stay");
+        assert!(
+            matches!(outcomes[4].status, ImageRemovalStatus::ForeignOwner { .. }),
+            "{:?}",
+            outcomes[4]
+        );
+        assert!(foreign_left, "an image another install labelled must stay");
         assert!(!unused_left, "the unused image must be gone");
         assert!(
             in_use_left,
@@ -860,8 +1079,15 @@ mod tests {
         }
         let listed = if prepared.is_ok() {
             Some(
-                list_labelled_images(&docker, "sh.temps.test.owner", &owner, "sh.temps.", true)
-                    .await,
+                list_labelled_images(
+                    &docker,
+                    "sh.temps.test.owner",
+                    &owner,
+                    "sh.temps.",
+                    true,
+                    None,
+                )
+                .await,
             )
         } else {
             None

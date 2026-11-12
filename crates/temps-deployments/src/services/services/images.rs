@@ -31,10 +31,10 @@ use temps_core::{
     ProjectImage, ProjectImageCleanupError, ProjectImageCleanupReport, ProjectImagePlan,
 };
 use temps_deployer::{ImageRemovalRequest, ImageRemovalStatus, MAX_IMAGE_REMOVAL_BATCH};
-use temps_docker_housekeeping::services::image_references;
 use temps_docker_housekeeping::services::orphaned_images::{
     OrphanSweepError, OwnedImageDaemon, WorkerImageDaemon, WorkerImageDaemons,
 };
+use temps_docker_housekeeping::services::{image_ownership, image_references};
 
 /// Most built images one project deletion reads. Newest first: an old image
 /// is the likeliest to have been removed by retention already. A project with
@@ -72,6 +72,26 @@ pub(super) fn partition_shared(
         }
     }
     (keep, shared)
+}
+
+/// The removal requests for `plan`: each recorded tag, expecting its
+/// recorded ID, guarded by this install's owner label so an image another
+/// install built is never removed on this install's records.
+pub(super) fn removal_requests(
+    plan: &ProjectImagePlan,
+    owner: Option<String>,
+) -> Vec<ImageRemovalRequest> {
+    let guard = temps_deployer::OwnerGuard {
+        label: image_ownership::IMAGE_INSTANCE_LABEL.to_string(),
+        owner,
+    };
+    plan.images
+        .iter()
+        .map(|image| {
+            ImageRemovalRequest::new(image.reference.clone(), image.image_id.clone())
+                .with_owner_guard(guard.clone())
+        })
+        .collect()
 }
 
 impl DeploymentService {
@@ -360,11 +380,27 @@ impl temps_core::ProjectImageCleaner for DeploymentService {
         if plan.images.is_empty() {
             return report;
         }
-        let requests: Vec<ImageRemovalRequest> = plan
-            .images
-            .iter()
-            .map(|image| ImageRemovalRequest::new(image.reference.clone(), image.image_id.clone()))
-            .collect();
+        // This install's owner ID: an image another install sharing the host
+        // labelled is theirs, even when a copied database records it as
+        // ours. Without the ID, every labelled image counts as someone
+        // else's, so only images that predate the labels are removed.
+        let owner = match image_ownership::load_image_owner_id(
+            self.db.as_ref(),
+            &self.config_service.data_dir(),
+        )
+        .await
+        {
+            Ok(owner) => owner,
+            Err(error) => {
+                warn!(
+                    project_id = plan.project_id,
+                    %error,
+                    "Could not read this install's image owner ID; keeping every labelled image of the deleted project"
+                );
+                None
+            }
+        };
+        let requests = removal_requests(plan, owner);
         let deadline = tokio::time::Instant::now() + TOTAL_REMOVAL_DEADLINE;
         for node_id in &plan.nodes {
             if tokio::time::Instant::now() >= deadline {
@@ -412,27 +448,28 @@ impl OwnedImageDaemon for RemoteImageDaemon {
     async fn list_instance_images(
         &self,
         owner: &str,
-    ) -> Result<
-        Vec<temps_docker_housekeeping::services::orphaned_images::OwnedImage>,
-        OrphanSweepError,
-    > {
-        let listing =
-            temps_deployer::ContainerDeployer::list_owned_images(self.remote.as_ref(), owner)
-                .await
-                .map_err(|error| OrphanSweepError::Worker {
-                    node: self.node_name.clone(),
-                    operation: "listing this install's images",
-                    source: Box::new(error),
-                })?;
+        after: Option<&temps_deployer::ListCursor>,
+    ) -> Result<temps_deployer::LabelledImages, OrphanSweepError> {
+        let listing = temps_deployer::ContainerDeployer::list_owned_images(
+            self.remote.as_ref(),
+            owner,
+            after,
+        )
+        .await
+        .map_err(|error| OrphanSweepError::Worker {
+            node: self.node_name.clone(),
+            operation: "listing this install's images",
+            source: Box::new(error),
+        })?;
         if listing.unlisted > 0 {
-            warn!(
+            info!(
                 node = %self.node_name,
                 listed = listing.images.len(),
                 unlisted = listing.unlisted,
-                "More of this install's images on the node than one sweep lists; the newest wait for a later run"
+                "More of this install's images on the node than one sweep lists; the next run continues after these"
             );
         }
-        Ok(listing.images)
+        Ok(listing)
     }
 
     async fn container_using_image(
@@ -530,6 +567,31 @@ mod tests {
         let (keep, kept_shared) = partition_shared(images, &shared);
         assert_eq!(keep, vec![image("app-3:latest", Some("sha256:cd"))]);
         assert_eq!(kept_shared, vec!["app-1:latest", "app-2:latest"]);
+    }
+
+    /// Every request carries this install's owner check, so a copied
+    /// database cannot remove another install's labelled images.
+    #[test]
+    fn removal_requests_keep_images_another_install_labelled() {
+        let plan = ProjectImagePlan {
+            project_id: 7,
+            images: vec![image("app-1:latest", Some(ID))],
+            nodes: vec![None],
+            shared: Vec::new(),
+        };
+        let requests = removal_requests(&plan, Some("install-a.marker".to_string()));
+        assert_eq!(requests.len(), 1);
+        let guard = requests[0].owner_guard.as_ref().expect("guarded");
+        assert_eq!(guard.label, image_ownership::IMAGE_INSTANCE_LABEL);
+        assert_eq!(guard.owner.as_deref(), Some("install-a.marker"));
+        assert_eq!(requests[0].expected_image_id.as_deref(), Some(ID));
+        // Without an owner ID the guard still applies: labelled images are
+        // all someone else's.
+        let unknown = removal_requests(&plan, None);
+        assert_eq!(
+            unknown[0].owner_guard.as_ref().map(|g| g.owner.clone()),
+            Some(None)
+        );
     }
 
     #[test]
@@ -1081,9 +1143,10 @@ mod tests {
             ),
         };
         let images = daemon
-            .list_instance_images("install-a.marker-b")
+            .list_instance_images("install-a.marker-b", None)
             .await
-            .expect("listing");
+            .expect("listing")
+            .images;
         server.await.expect("mock agent");
         assert_eq!(images.len(), 1);
         assert_eq!(
@@ -1111,7 +1174,7 @@ mod tests {
             ),
         };
         let error = daemon
-            .list_instance_images("install-a.marker-b")
+            .list_instance_images("install-a.marker-b", None)
             .await
             .expect_err("nothing answers");
         assert!(error.to_string().contains("worker-9"), "{error}");

@@ -1362,7 +1362,11 @@ impl ContainerDeployer for DockerRuntime {
             })
     }
 
-    async fn list_owned_images(&self, owner: &str) -> Result<crate::LabelledImages, DeployerError> {
+    async fn list_owned_images(
+        &self,
+        owner: &str,
+        after: Option<&crate::ListCursor>,
+    ) -> Result<crate::LabelledImages, DeployerError> {
         let docker = self.require_docker()?;
         temps_docker_util::list_labelled_images(
             &docker,
@@ -1370,6 +1374,7 @@ impl ContainerDeployer for DockerRuntime {
             owner,
             crate::build_protocol::IMAGE_LABEL_PREFIX,
             true,
+            after,
         )
         .await
         .map_err(|error| DeployerError::ImageRemoval {

@@ -557,6 +557,11 @@ const REMOVE_IMAGES_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct ListOwnedImagesRequest {
     /// The value of the install's [`crate::IMAGE_OWNER_LABEL`].
     pub owner: String,
+    /// Where the previous page ended. Optional on the wire: an agent that
+    /// predates it always starts at the oldest image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub after: Option<crate::ListCursor>,
 }
 
 /// Path of the agent's owned-image listing endpoint.
@@ -1693,11 +1698,16 @@ impl ContainerDeployer for RemoteNodeDeployer {
         Ok(outcomes)
     }
 
-    async fn list_owned_images(&self, owner: &str) -> Result<crate::LabelledImages, DeployerError> {
+    async fn list_owned_images(
+        &self,
+        owner: &str,
+        after: Option<&crate::ListCursor>,
+    ) -> Result<crate::LabelledImages, DeployerError> {
         self.agent_image_call(
             LIST_OWNED_IMAGES_PATH,
             &ListOwnedImagesRequest {
                 owner: owner.to_string(),
+                after: after.cloned(),
             },
             MAX_OWNED_IMAGES_RESPONSE_BYTES,
             "listing images",
@@ -3752,7 +3762,13 @@ mod tests {
         )
         .await;
         let listed = test_remote(address)
-            .list_owned_images("install-a.marker-b")
+            .list_owned_images(
+                "install-a.marker-b",
+                Some(&crate::ListCursor {
+                    created: 9,
+                    image_id: "sha256:99".to_string(),
+                }),
+            )
             .await
             .expect("the agent's listing");
         let request = server.await.expect("mock agent task");
@@ -3763,6 +3779,10 @@ mod tests {
         );
         assert!(
             request.contains(r#""owner":"install-a.marker-b""#),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""after":{"created":9,"image_id":"sha256:99"}"#),
             "{request}"
         );
         assert_eq!(listed.unlisted, 2);

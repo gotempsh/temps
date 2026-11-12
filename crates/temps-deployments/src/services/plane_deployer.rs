@@ -1266,8 +1266,9 @@ impl ContainerDeployer for PlaneContainerDeployer {
     async fn list_owned_images(
         &self,
         owner: &str,
+        after: Option<&temps_deployer::ListCursor>,
     ) -> Result<temps_deployer::LabelledImages, DeployerError> {
-        self.local.list_owned_images(owner).await
+        self.local.list_owned_images(owner, after).await
     }
 }
 

@@ -72,7 +72,8 @@ pub enum ImageOwnershipError {
 
     #[error(
         "The install's image ownership marker {path} does not hold an ID (expected 1-64 \
-         hexadecimal digits or '-'); remove the file to have a new one created"
+         hexadecimal digits or '-'). Removing it makes images built so far unrecognisable \
+         to housekeeping (they are then kept, not removed)"
     )]
     MarkerInvalid { path: PathBuf },
 }
@@ -88,58 +89,131 @@ fn is_valid_marker(marker: &str) -> bool {
 /// This install's half of the owner ID, read from its data directory, and
 /// created there first when `create` is set. `None` when it does not exist
 /// and `create` is not set.
+///
+/// Creation is serialized by an exclusive lock on [`INSTALL_MARKER_LOCK_FILE`]
+/// (an advisory file lock, so it covers every process using the data
+/// directory, and every task of this one). Under the lock the marker is read
+/// again and only published when there still is none (or only an empty one,
+/// which no image can carry): every racing creator gets the one published
+/// marker. It is written and synced to a private temporary file first and
+/// then put in place, so a reader without the lock, or a crash at any point,
+/// sees either no marker or a complete one.
 pub async fn install_marker(
     data_dir: &Path,
     create: bool,
 ) -> Result<Option<String>, ImageOwnershipError> {
+    let path = data_dir.join(INSTALL_MARKER_FILE);
+    let found = match tokio::fs::read(&path).await {
+        Ok(bytes) => parse_marker(&path, &bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MarkerFile::Missing,
+        Err(source) => {
+            return Err(ImageOwnershipError::Marker {
+                operation: "read",
+                path,
+                source,
+            })
+        }
+    };
+    match found {
+        MarkerFile::Valid(marker) => Ok(Some(marker)),
+        MarkerFile::Missing | MarkerFile::Empty if !create => Ok(None),
+        MarkerFile::Missing | MarkerFile::Empty => {
+            let data_dir = data_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || create_marker_locked(&data_dir))
+                .await
+                .map_err(|error| ImageOwnershipError::Marker {
+                    operation: "create",
+                    path,
+                    source: std::io::Error::other(error.to_string()),
+                })?
+                .map(Some)
+        }
+    }
+}
+
+/// The file whose lock serializes creating the marker. Left in place.
+pub const INSTALL_MARKER_LOCK_FILE: &str = "image-ownership.id.lock";
+
+/// What the marker file holds.
+enum MarkerFile {
+    Missing,
+    Empty,
+    Valid(String),
+}
+
+fn parse_marker(path: &Path, bytes: &[u8]) -> Result<MarkerFile, ImageOwnershipError> {
+    // A marker is a UUID; anything larger is not one.
+    let invalid = || ImageOwnershipError::MarkerInvalid {
+        path: path.to_path_buf(),
+    };
+    if bytes.len() > 256 {
+        return Err(invalid());
+    }
+    let marker = std::str::from_utf8(bytes).map_err(|_| invalid())?.trim();
+    if marker.is_empty() {
+        Ok(MarkerFile::Empty)
+    } else if is_valid_marker(marker) {
+        Ok(MarkerFile::Valid(marker.to_string()))
+    } else {
+        Err(invalid())
+    }
+}
+
+/// Create the marker under the creation lock, unless another creator did
+/// first. Blocking: runs on the blocking pool.
+fn create_marker_locked(data_dir: &Path) -> Result<String, ImageOwnershipError> {
     let path = data_dir.join(INSTALL_MARKER_FILE);
     let marker_error = |operation, source| ImageOwnershipError::Marker {
         operation,
         path: path.clone(),
         source,
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            // A marker is a UUID; anything larger is not one.
-            let text = std::str::from_utf8(&bytes[..bytes.len().min(256)]).unwrap_or("");
-            let marker = text.trim();
-            if bytes.len() > 256 || !is_valid_marker(marker) {
-                return Err(ImageOwnershipError::MarkerInvalid { path: path.clone() });
-            }
-            Ok(Some(marker.to_string()))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            tokio::fs::create_dir_all(data_dir)
-                .await
-                .map_err(|source| marker_error("create the directory of", source))?;
-            let marker = uuid::Uuid::new_v4().to_string();
-            // `create_new`: two processes racing on one data directory keep
-            // the first marker; the loser reads it back.
-            let created = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .await;
-            match created {
-                Ok(mut file) => {
-                    use tokio::io::AsyncWriteExt as _;
-                    file.write_all(marker.as_bytes())
-                        .await
-                        .map_err(|source| marker_error("write", source))?;
-                    file.sync_all()
-                        .await
-                        .map_err(|source| marker_error("sync", source))?;
-                    Ok(Some(marker))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Box::pin(install_marker(data_dir, false)).await
-                }
-                Err(error) => Err(marker_error("create", error)),
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(marker_error("read", error)),
+    std::fs::create_dir_all(data_dir)
+        .map_err(|source| marker_error("create the directory of", source))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data_dir.join(INSTALL_MARKER_LOCK_FILE))
+        .map_err(|source| marker_error("open the creation lock of", source))?;
+    lock.lock()
+        .map_err(|source| marker_error("lock the creation of", source))?;
+    // Under the lock: another creator may have published meanwhile.
+    let existing = match std::fs::read(&path) {
+        Ok(bytes) => parse_marker(&path, &bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => MarkerFile::Missing,
+        Err(source) => return Err(marker_error("read", source)),
+    };
+    if let MarkerFile::Valid(marker) = existing {
+        return Ok(marker);
     }
+    let marker = uuid::Uuid::new_v4().to_string();
+    let staged = data_dir.join(format!(
+        ".{INSTALL_MARKER_FILE}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|source| marker_error("stage", source))?;
+        file.write_all(marker.as_bytes())
+            .map_err(|source| marker_error("write", source))?;
+        file.sync_all()
+            .map_err(|source| marker_error("sync", source))?;
+        // Holding the lock, nobody else publishes: replacing a missing or
+        // empty marker is safe either way, and rename puts it in place
+        // whole.
+        std::fs::rename(&staged, &path).map_err(|source| marker_error("publish", source))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written?;
+    drop(lock);
+    Ok(marker)
 }
 
 /// This install's owner ID for image labels, both halves created on first
@@ -306,6 +380,84 @@ mod tests {
             install_marker(dir.path(), false).await.expect("read back"),
             Some(created)
         );
+    }
+
+    /// Racing creators all get the same, complete marker: none ever reads a
+    /// half-created file.
+    #[tokio::test]
+    async fn concurrent_creators_all_get_the_one_published_marker() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let dir = dir.path().to_path_buf();
+                tokio::spawn(async move { install_marker(&dir, true).await })
+            })
+            .collect();
+        let mut markers = std::collections::HashSet::new();
+        for task in tasks {
+            let marker = task
+                .await
+                .expect("task")
+                .expect("no creator sees a partial marker")
+                .expect("a marker");
+            markers.insert(marker);
+        }
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != INSTALL_MARKER_FILE && name != INSTALL_MARKER_LOCK_FILE)
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staged files are cleaned up: {leftovers:?}"
+        );
+    }
+
+    /// Racing creators over an empty marker also all get one marker: the
+    /// replacement happens once, under the creation lock.
+    #[tokio::test]
+    async fn concurrent_creators_replacing_an_empty_marker_agree() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join(INSTALL_MARKER_FILE), "").expect("write");
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let dir = dir.path().to_path_buf();
+                tokio::spawn(async move { install_marker(&dir, true).await })
+            })
+            .collect();
+        let mut markers = std::collections::HashSet::new();
+        for task in tasks {
+            markers.insert(
+                task.await
+                    .expect("task")
+                    .expect("no error")
+                    .expect("a marker"),
+            );
+        }
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        let on_disk = std::fs::read_to_string(dir.path().join(INSTALL_MARKER_FILE)).expect("read");
+        assert!(
+            markers.contains(&on_disk),
+            "every creator returned the marker on disk"
+        );
+    }
+
+    /// An empty marker (a crash before it was written) holds no ID that any
+    /// image could carry: it is replaced rather than failing every build.
+    #[tokio::test]
+    async fn an_empty_marker_left_by_a_crash_is_replaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(INSTALL_MARKER_FILE);
+        std::fs::write(&path, "").expect("write");
+        assert_eq!(install_marker(dir.path(), false).await.expect("read"), None);
+        let marker = install_marker(dir.path(), true)
+            .await
+            .expect("replaced")
+            .expect("a marker");
+        assert!(is_valid_marker(&marker));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), marker);
     }
 
     /// A damaged marker is never replaced silently: replacing it would make
