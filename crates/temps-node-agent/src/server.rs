@@ -199,6 +199,10 @@ pub fn build_router(
             temps_deployer::remote::REMOVE_IMAGES_PATH,
             post(handlers::remove_images),
         )
+        .route(
+            temps_deployer::remote::LIST_OWNED_IMAGES_PATH,
+            post(handlers::list_owned_images),
+        )
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
         .route("/agent/services", post(service_handlers::create_service))
@@ -2509,6 +2513,35 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status().as_u16(), 500);
         assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
+
+        let listing = temps_deployer::remote::LIST_OWNED_IMAGES_PATH;
+        let owner = br#"{"owner":"install-a.marker-b"}"#.to_vec();
+        for token in [None, Some("wrong")] {
+            let response = app
+                .clone()
+                .oneshot(post_json(listing, token, owner.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 401, "{token:?}");
+        }
+        // A filter value is checked before it reaches Docker.
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                listing,
+                Some("secret"),
+                br#"{"owner":"x\" OR label=anything"}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        let response = app
+            .clone()
+            .oneshot(post_json(listing, Some("secret"), owner))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 500);
+        assert!(AgentApiDoc::openapi().paths.paths.contains_key(listing));
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["default"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 temps-test-utils = { path = "../temps-test-utils" }
 tower = { workspace = true }
 

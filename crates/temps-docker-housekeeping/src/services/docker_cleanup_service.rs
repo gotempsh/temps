@@ -570,12 +570,9 @@ pub struct DockerCleanupService {
     /// who disabled retention, followed by a transient settings-read error,
     /// must not have deletions silently resume under the stale boot policy.
     last_known_image_retention: std::sync::Mutex<(bool, i64)>,
-    /// Lists and removes the images this install labelled, for the sweep of
-    /// images whose project no longer exists (`orphaned_images`).
-    owned_image_daemon: Arc<dyn super::orphaned_images::OwnedImageDaemon>,
-    /// Most orphaned project images one nightly run removes (default: 200);
-    /// the rest wait for the next night.
-    max_orphaned_images_per_run: usize,
+    /// The sweep of images whose project no longer exists, on this host
+    /// and on reachable worker nodes (`orphaned_images`).
+    orphan_sweeper: super::orphaned_images::OrphanImageSweeper,
 }
 
 impl DockerCleanupService {
@@ -584,6 +581,7 @@ impl DockerCleanupService {
         db: Arc<temps_database::DbConnection>,
         file_store: Arc<dyn temps_file_store::FileStore>,
     ) -> Self {
+        let db_for_sweeper = db.clone();
         Self {
             docker_client,
             db,
@@ -602,21 +600,17 @@ impl DockerCleanupService {
             image_retention_enabled: true,
             config_service: None,
             last_known_image_retention: std::sync::Mutex::new((true, 336)),
-            owned_image_daemon: Arc::new(DefaultDockerClient),
-            max_orphaned_images_per_run: 200,
+            orphan_sweeper: super::orphaned_images::OrphanImageSweeper::new(db_for_sweeper),
         }
     }
 
-    pub fn with_owned_image_daemon(
+    /// How images of deleted projects are swept (this host, worker nodes,
+    /// the data directory holding the install's owner ID).
+    pub fn with_orphan_sweeper(
         mut self,
-        daemon: Arc<dyn super::orphaned_images::OwnedImageDaemon>,
+        sweeper: super::orphaned_images::OrphanImageSweeper,
     ) -> Self {
-        self.owned_image_daemon = daemon;
-        self
-    }
-
-    pub fn with_max_orphaned_images_per_run(mut self, count: usize) -> Self {
-        self.max_orphaned_images_per_run = count;
+        self.orphan_sweeper = sweeper;
         self
     }
 
@@ -1020,30 +1014,21 @@ impl DockerCleanupService {
             );
             return;
         }
-        match super::orphaned_images::sweep_orphaned_project_images(
-            self.db.as_ref(),
-            self.owned_image_daemon.as_ref(),
-            self.max_orphaned_images_per_run,
-        )
-        .await
-        {
-            Ok(report) if report.orphaned == 0 => debug!(
-                labelled = report.labelled,
-                "No images of deleted projects to remove"
-            ),
-            Ok(report) => info!(
-                labelled = report.labelled,
-                orphaned = report.orphaned,
-                removed = report.removed,
-                kept = report.kept,
-                failed = report.failed,
-                deferred = report.deferred,
-                "Swept images built for deleted projects"
-            ),
-            Err(error) => error!(
-                %error,
-                "Could not sweep images built for deleted projects; nothing was removed, retrying next run"
-            ),
+        self.orphan_sweeper.run().await;
+    }
+
+    /// Nightly sweep of images of deleted projects only, for a process that
+    /// runs no workloads itself (`--profile control-plane`): it has no local
+    /// Docker to clean, but its worker nodes do.
+    pub async fn start_orphan_sweep_scheduler(&self) {
+        info!(
+            "Image sweep scheduler started for worker nodes (hour: {}:00 UTC)",
+            self.cleanup_hour
+        );
+        loop {
+            sleep(Duration::from_secs(self.seconds_until_next_cleanup())).await;
+            self.remove_orphaned_project_images().await;
+            sleep(Duration::from_secs(60)).await;
         }
     }
 

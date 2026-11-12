@@ -3,20 +3,39 @@
 
 //! Which images this install built, and for which project and deployment.
 //!
-//! Every image the deployment pipeline builds carries three labels under
-//! `sh.temps.image.`: this install's ID, the project and the deployment. The
-//! project and deployment IDs are local to one database; the install ID is
-//! what makes them meaningful on a Docker host another Temps install may
-//! share. Housekeeping only ever acts on images labelled with this install's
-//! ID (see `orphaned_images`), so another install's images are never touched.
+//! Every image the deployment pipeline builds carries labels under
+//! `sh.temps.image.`: this install's owner ID, the project, the deployment
+//! and the tag the build gave it. The project and deployment IDs are local
+//! to one database; the owner ID is what makes them meaningful on a Docker
+//! host another Temps install may share. Housekeeping only ever acts on
+//! images labelled with this install's owner ID (see `orphaned_images`), so
+//! another install's images are never touched.
+//!
+//! The owner ID is `<database ID>.<data directory ID>`:
+//!
+//! - the **database ID** (`image_ownership_identity`) survives a restart, an
+//!   upgrade and a move of the install;
+//! - the **data directory ID** (a file in `TEMPS_DATA_DIR`) is not copied
+//!   when a database is restored into another install, so a staging install
+//!   started from production's database on the same Docker host gets a
+//!   different owner ID and neither sweep can remove the other's images.
+//!
+//! Losing either half (a new data directory, a database restored without
+//! the row) only makes earlier images unrecognisable: they are then left on
+//! disk, never removed wrongly.
 //!
 //! The labels are their own namespace, not `sh.temps.*` at large: a container
 //! inherits its image's labels, and a container's `sh.temps.project_id` is
 //! Temps' container configuration, which an image must never set.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+/// The file in the install's data directory holding its half of the owner
+/// ID.
+pub const INSTALL_MARKER_FILE: &str = "image-ownership.id";
 
 /// The install that built the image (`image_ownership_identity.instance_id`).
 pub const IMAGE_INSTANCE_LABEL: &str = "sh.temps.image.instance";
@@ -42,6 +61,114 @@ pub enum ImageOwnershipError {
         "The image ownership instance ID could not be created: no row in image_ownership_identity after inserting one"
     )]
     Missing,
+
+    #[error("Failed to {operation} the install's image ownership marker {path}: {source}")]
+    Marker {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "The install's image ownership marker {path} does not hold an ID (expected 1-64 \
+         hexadecimal digits or '-'); remove the file to have a new one created"
+    )]
+    MarkerInvalid { path: PathBuf },
+}
+
+fn is_valid_marker(marker: &str) -> bool {
+    !marker.is_empty()
+        && marker.len() <= 64
+        && marker
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+/// This install's half of the owner ID, read from its data directory, and
+/// created there first when `create` is set. `None` when it does not exist
+/// and `create` is not set.
+pub async fn install_marker(
+    data_dir: &Path,
+    create: bool,
+) -> Result<Option<String>, ImageOwnershipError> {
+    let path = data_dir.join(INSTALL_MARKER_FILE);
+    let marker_error = |operation, source| ImageOwnershipError::Marker {
+        operation,
+        path: path.clone(),
+        source,
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            // A marker is a UUID; anything larger is not one.
+            let text = std::str::from_utf8(&bytes[..bytes.len().min(256)]).unwrap_or("");
+            let marker = text.trim();
+            if bytes.len() > 256 || !is_valid_marker(marker) {
+                return Err(ImageOwnershipError::MarkerInvalid { path: path.clone() });
+            }
+            Ok(Some(marker.to_string()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            tokio::fs::create_dir_all(data_dir)
+                .await
+                .map_err(|source| marker_error("create the directory of", source))?;
+            let marker = uuid::Uuid::new_v4().to_string();
+            // `create_new`: two processes racing on one data directory keep
+            // the first marker; the loser reads it back.
+            let created = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await;
+            match created {
+                Ok(mut file) => {
+                    use tokio::io::AsyncWriteExt as _;
+                    file.write_all(marker.as_bytes())
+                        .await
+                        .map_err(|source| marker_error("write", source))?;
+                    file.sync_all()
+                        .await
+                        .map_err(|source| marker_error("sync", source))?;
+                    Ok(Some(marker))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Box::pin(install_marker(data_dir, false)).await
+                }
+                Err(error) => Err(marker_error("create", error)),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(marker_error("read", error)),
+    }
+}
+
+/// This install's owner ID for image labels, both halves created on first
+/// use.
+pub async fn ensure_image_owner_id<C: ConnectionTrait>(
+    db: &C,
+    data_dir: &Path,
+) -> Result<String, ImageOwnershipError> {
+    let database = ensure_image_instance_id(db).await?;
+    let marker = install_marker(data_dir, true).await?.ok_or_else(|| {
+        ImageOwnershipError::MarkerInvalid {
+            path: data_dir.join(INSTALL_MARKER_FILE),
+        }
+    })?;
+    Ok(format!("{database}.{marker}"))
+}
+
+/// This install's owner ID, or `None` if either half does not exist yet:
+/// then no image can carry it, and there is nothing of ours to find.
+pub async fn load_image_owner_id<C: ConnectionTrait>(
+    db: &C,
+    data_dir: &Path,
+) -> Result<Option<String>, ImageOwnershipError> {
+    let Some(database) = load_image_instance_id(db).await? else {
+        return Ok(None);
+    };
+    Ok(install_marker(data_dir, false)
+        .await?
+        .map(|marker| format!("{database}.{marker}")))
 }
 
 /// This install's image ownership ID, or `None` if no build has created it
@@ -93,7 +220,7 @@ pub async fn ensure_image_instance_id<C: ConnectionTrait>(
 }
 
 /// The labels for an image built for `deployment_id` of `project_id` by the
-/// install `instance_id`.
+/// install whose owner ID is `instance_id`.
 pub fn image_ownership_labels(
     instance_id: &str,
     project_id: i32,
@@ -160,6 +287,86 @@ mod tests {
         assert_eq!(labelled_project_id(&labels), None);
         labels.insert(IMAGE_PROJECT_LABEL.to_string(), "0".to_string());
         assert_eq!(labelled_project_id(&labels), None);
+    }
+
+    #[tokio::test]
+    async fn the_install_marker_is_created_once_and_read_back() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(install_marker(dir.path(), false).await.expect("read"), None);
+        let created = install_marker(dir.path(), true)
+            .await
+            .expect("create")
+            .expect("a marker");
+        assert!(is_valid_marker(&created), "{created}");
+        assert_eq!(
+            install_marker(dir.path(), true).await.expect("read back"),
+            Some(created.clone())
+        );
+        assert_eq!(
+            install_marker(dir.path(), false).await.expect("read back"),
+            Some(created)
+        );
+    }
+
+    /// A damaged marker is never replaced silently: replacing it would make
+    /// every image built so far unrecognisable without saying why.
+    #[tokio::test]
+    async fn a_damaged_marker_is_refused_not_replaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(INSTALL_MARKER_FILE);
+        std::fs::write(&path, "not a marker!").expect("write");
+        assert!(matches!(
+            install_marker(dir.path(), true).await,
+            Err(ImageOwnershipError::MarkerInvalid { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("kept"),
+            "not a marker!"
+        );
+    }
+
+    /// Against a real database: a database copied into a second install
+    /// (another data directory) yields another owner ID, while the same
+    /// install always yields the same one. Skips without Postgres.
+    #[tokio::test]
+    async fn a_copied_database_in_another_install_gets_another_owner_id(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping owner ID test: {error}");
+                return Ok(());
+            }
+        };
+        let db = test_db.connection_arc();
+        let production = tempfile::tempdir()?;
+        let staging = tempfile::tempdir()?;
+        assert_eq!(
+            load_image_owner_id(db.as_ref(), production.path()).await?,
+            None
+        );
+        let original = ensure_image_owner_id(db.as_ref(), production.path()).await?;
+        assert_eq!(
+            ensure_image_owner_id(db.as_ref(), production.path()).await?,
+            original
+        );
+        assert_eq!(
+            load_image_owner_id(db.as_ref(), production.path()).await?,
+            Some(original.clone())
+        );
+        // Same database row, another data directory: not the same owner.
+        assert_eq!(
+            load_image_owner_id(db.as_ref(), staging.path()).await?,
+            None
+        );
+        let copy = ensure_image_owner_id(db.as_ref(), staging.path()).await?;
+        assert_ne!(copy, original);
+        assert_eq!(
+            copy.split('.').next(),
+            original.split('.').next(),
+            "both halves are shown: {copy} / {original}"
+        );
+        Ok(())
     }
 
     /// Against a real database: the ID is absent until first use, created

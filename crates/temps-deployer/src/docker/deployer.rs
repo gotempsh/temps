@@ -1361,6 +1361,22 @@ impl ContainerDeployer for DockerRuntime {
                 reason: error.to_string(),
             })
     }
+
+    async fn list_owned_images(&self, owner: &str) -> Result<crate::LabelledImages, DeployerError> {
+        let docker = self.require_docker()?;
+        temps_docker_util::list_labelled_images(
+            &docker,
+            crate::IMAGE_OWNER_LABEL,
+            owner,
+            crate::build_protocol::IMAGE_LABEL_PREFIX,
+            true,
+        )
+        .await
+        .map_err(|error| DeployerError::ImageRemoval {
+            location: "the local Docker daemon".to_string(),
+            reason: error.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]

@@ -25,8 +25,14 @@ use temps_core::UtcDateTime;
 use thiserror::Error;
 
 pub use temps_docker_util::image_removal::{
-    ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus, MAX_IMAGE_REMOVAL_BATCH,
+    ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus, LabelledImage, LabelledImages,
+    MAX_IMAGE_REMOVAL_BATCH, MAX_LABELLED_IMAGES,
 };
+
+/// The image label naming the Temps install that built an image (see
+/// `temps_docker_housekeeping::services::image_ownership`). The only label a
+/// node lists images by: [`ContainerDeployer::list_owned_images`].
+pub const IMAGE_OWNER_LABEL: &str = "sh.temps.image.instance";
 
 /// Backpressure-aware byte stream used when importing an OCI image.
 ///
@@ -1364,6 +1370,18 @@ pub trait ContainerDeployer: Send + Sync {
         Err(DeployerError::ImageRemoval {
             location: "this container runtime".to_string(),
             reason: "it does not support removing images".to_string(),
+        })
+    }
+
+    /// The images on this runtime that the Temps install `owner` built
+    /// (labelled [`IMAGE_OWNER_LABEL`]`=owner`), oldest first and bounded by
+    /// [`MAX_LABELLED_IMAGES`], each with a container created from it if
+    /// there is one. Only labels under the image ownership prefix are kept.
+    /// This default says the runtime cannot list images.
+    async fn list_owned_images(&self, _owner: &str) -> Result<LabelledImages, DeployerError> {
+        Err(DeployerError::ImageRemoval {
+            location: "this container runtime".to_string(),
+            reason: "it does not support listing images".to_string(),
         })
     }
 }

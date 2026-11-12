@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `image_ownership_identity`: the random, install-scoped ID Temps stamps on
-//! every image it builds (`sh.temps.instance`), next to the project and
-//! deployment that built it.
+//! every image it builds (`sh.temps.image.instance`, joined with an ID kept
+//! in the install's data directory), next to the project and deployment that
+//! built it.
 //!
 //! Project and deployment IDs are local to one database, so on a Docker host
 //! shared with another Temps install (a staging instance, a developer's
@@ -14,7 +15,10 @@
 //!
 //! A single-row table, like `dns_instance_identity` (ADR-031), and kept
 //! separate from it: that ID is published in DNS ownership markers and is
-//! scoped to DNS. The row is created lazily on the first build, not here: a
+//! scoped to DNS. A database copied into another install keeps this row, so
+//! the label also carries a second ID from the install's data directory,
+//! which a copied database does not bring along: the two installs then never
+//! recognise each other's images. The row is created lazily on the first build, not here: a
 //! migration must not generate per-install random state. Images built before
 //! this table existed carry no install label and are never touched by the
 //! orphan sweep. `down` drops the table; images labelled with the old ID are

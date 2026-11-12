@@ -287,6 +287,97 @@ pub async fn container_using_image(
         .map(|container| container.id.unwrap_or_else(|| "<unknown>".to_string())))
 }
 
+/// Most labelled images one listing keeps, oldest first. Docker cannot page
+/// an image listing, so this bounds what a caller holds, not what the daemon
+/// sends; the rest are counted in [`LabelledImages::unlisted`].
+pub const MAX_LABELLED_IMAGES: usize = 1000;
+
+/// An image carrying the label a listing asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelledImage {
+    pub image_id: String,
+    pub tags: Vec<String>,
+    /// Only the labels under the prefix the listing kept.
+    pub labels: HashMap<String, String>,
+    /// Seconds since the epoch, as the daemon reports it.
+    pub created: i64,
+    /// A container created from the image, when the listing checked usage.
+    /// A check that failed is reported here too, so the image is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_use_by: Option<String>,
+}
+
+/// What [`list_labelled_images`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelledImages {
+    /// At most [`MAX_LABELLED_IMAGES`], oldest first.
+    pub images: Vec<LabelledImage>,
+    /// Matching images beyond the limit, left for a later listing.
+    #[serde(default)]
+    pub unlisted: usize,
+}
+
+/// Every image labelled `key=value`, oldest first and bounded by
+/// [`MAX_LABELLED_IMAGES`], keeping only its labels under `keep_prefix`.
+/// With `check_usage`, each kept image is also checked for a container
+/// created from it (one query per image).
+pub async fn list_labelled_images(
+    docker: &Docker,
+    key: &str,
+    value: &str,
+    keep_prefix: &str,
+    check_usage: bool,
+) -> Result<LabelledImages, DockerUtilError> {
+    let images = docker
+        .list_images(Some(bollard::query_parameters::ListImagesOptions {
+            all: false,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec![format!("{key}={value}")],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .map_err(|source| DockerUtilError::ImageInventory {
+            operation: "list labelled images",
+            source,
+        })?;
+    let mut images: Vec<LabelledImage> = images
+        .into_iter()
+        .map(|image| LabelledImage {
+            image_id: image.id,
+            tags: image
+                .repo_tags
+                .into_iter()
+                .filter(|tag| tag != "<none>:<none>")
+                .collect(),
+            labels: image
+                .labels
+                .into_iter()
+                .filter(|(label, _)| label.starts_with(keep_prefix))
+                .collect(),
+            created: image.created,
+            in_use_by: None,
+        })
+        .collect();
+    images.sort_by(|a, b| {
+        a.created
+            .cmp(&b.created)
+            .then_with(|| a.image_id.cmp(&b.image_id))
+    });
+    let unlisted = images.len().saturating_sub(MAX_LABELLED_IMAGES);
+    images.truncate(MAX_LABELLED_IMAGES);
+    if check_usage {
+        for image in &mut images {
+            image.in_use_by = match container_using_image(docker, &image.image_id).await {
+                Ok(holder) => holder,
+                Err(error) => Some(format!("<usage could not be checked: {error}>")),
+            };
+        }
+    }
+    Ok(LabelledImages { images, unlisted })
+}
+
 /// Remove each requested image that no container uses and nothing else
 /// names, returning one outcome per request in request order.
 ///
@@ -678,5 +769,128 @@ mod tests {
             "an image a container was created from must stay"
         );
         assert!(unrelated_left, "an image nobody asked about must stay");
+    }
+
+    /// Against a real daemon: only images with the label are listed, with
+    /// their labels under the kept prefix only, oldest first, and usage is
+    /// reported when asked. Skips when Docker is unavailable.
+    #[tokio::test]
+    async fn lists_only_labelled_images_with_their_usage_on_a_real_daemon() {
+        use crate::pull::{pull_image, PullSpec};
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{BuildImageOptionsBuilder, CreateContainerOptionsBuilder};
+        use futures::StreamExt as _;
+
+        let Some(docker) = crate::test_support::docker_or_skip(
+            "lists_only_labelled_images_with_their_usage_on_a_real_daemon",
+        )
+        .await
+        else {
+            return;
+        };
+        if let Err(error) =
+            pull_image(&docker, PullSpec::new(crate::test_support::TEST_IMAGE)).await
+        {
+            println!("Could not pull the test image, skipping: {error}");
+            return;
+        }
+        let owner = uuid::Uuid::new_v4().to_string();
+        let free = format!("{}:latest", crate::test_support::unique_name("lbl-free"));
+        let held = format!("{}:latest", crate::test_support::unique_name("lbl-held"));
+        let other = format!("{}:latest", crate::test_support::unique_name("lbl-other"));
+        let holder = crate::test_support::unique_name("lbl-holder");
+        let build = |tag: String, owner: String| {
+            let docker = docker.clone();
+            async move {
+                let dockerfile = format!(
+                    "FROM {}\nLABEL sh.temps.test.nonce={}\n",
+                    crate::test_support::TEST_IMAGE,
+                    uuid::Uuid::new_v4()
+                );
+                let mut header = tar::Header::new_gnu();
+                header.set_size(dockerfile.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                let mut archive = tar::Builder::new(Vec::new());
+                archive.append_data(&mut header, "Dockerfile", dockerfile.as_bytes())?;
+                let context = archive.into_inner()?;
+                let labels = HashMap::from([
+                    ("sh.temps.test.owner".to_string(), owner),
+                    ("unrelated.label".to_string(), "x".to_string()),
+                ]);
+                let mut stream = docker.build_image(
+                    BuildImageOptionsBuilder::default()
+                        .t(&tag)
+                        .labels(&labels)
+                        .rm(true)
+                        .build(),
+                    None,
+                    Some(bollard::body_full(bytes::Bytes::from(context))),
+                );
+                while let Some(step) = stream.next().await {
+                    step?;
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            }
+        };
+        let mut prepared: Result<(), String> = Ok(());
+        for (tag, image_owner) in [
+            (free.clone(), owner.clone()),
+            (held.clone(), owner.clone()),
+            (other.clone(), "someone-else".to_string()),
+        ] {
+            if let Err(error) = build(tag.clone(), image_owner).await {
+                prepared = Err(format!("build {tag}: {error}"));
+                break;
+            }
+        }
+        if prepared.is_ok() {
+            prepared = docker
+                .create_container(
+                    Some(CreateContainerOptionsBuilder::new().name(&holder).build()),
+                    ContainerCreateBody {
+                        image: Some(held.clone()),
+                        cmd: Some(vec!["true".to_string()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("create holder: {error}"));
+        }
+        let listed = if prepared.is_ok() {
+            Some(
+                list_labelled_images(&docker, "sh.temps.test.owner", &owner, "sh.temps.", true)
+                    .await,
+            )
+        } else {
+            None
+        };
+
+        crate::test_support::remove_container(&docker, &holder).await;
+        for tag in [&free, &held, &other] {
+            force_remove_image(&docker, tag).await;
+        }
+
+        if let Err(reason) = prepared {
+            panic!("preparing the listing test failed: {reason}");
+        }
+        let listed = listed.expect("listed").expect("the listing succeeds");
+        assert_eq!(listed.unlisted, 0);
+        let tags: Vec<&str> = listed
+            .images
+            .iter()
+            .flat_map(|image| image.tags.iter().map(String::as_str))
+            .collect();
+        assert_eq!(tags.len(), 2, "{listed:?}");
+        assert!(tags.contains(&free.as_str()) && tags.contains(&held.as_str()));
+        for image in &listed.images {
+            assert!(
+                image.labels.keys().all(|key| key.starts_with("sh.temps.")),
+                "only kept labels: {image:?}"
+            );
+            let is_held = image.tags.contains(&held);
+            assert_eq!(image.in_use_by.is_some(), is_held, "{image:?}");
+        }
     }
 }

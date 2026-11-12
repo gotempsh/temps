@@ -189,6 +189,10 @@ impl ContainerDeployer for ReplicaAwareDeployer {
     ) -> Result<Vec<crate::ImageRemovalOutcome>, DeployerError> {
         self.local.remove_unused_images(requests).await
     }
+
+    async fn list_owned_images(&self, owner: &str) -> Result<crate::LabelledImages, DeployerError> {
+        self.local.list_owned_images(owner).await
+    }
 }
 
 #[cfg(test)]

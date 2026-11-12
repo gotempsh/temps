@@ -423,6 +423,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         list_containers,
         image_exists,
         remove_images,
+        list_owned_images,
         import_image,
         pull_image,
         crate::build_handler::build_image,
@@ -512,6 +513,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         AgentExecResponse,
         PullImageRequest,
         temps_deployer::remote::RemoveImagesRequest,
+        temps_deployer::remote::ListOwnedImagesRequest,
         PullImageResponse,
         RegistryCredentials,
         NodeHealthReport,
@@ -2160,6 +2162,68 @@ pub async fn remove_images(
                 %error,
                 "Could not remove images on request of the control plane"
             );
+            error_response(container_error_status(&error), error.to_string()).into_response()
+        }
+    }
+}
+
+/// Whether `owner` is a plausible image ownership label value: the
+/// control plane sends `<uuid>.<uuid>`.
+fn is_valid_image_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 128
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+}
+
+/// The images on this node's daemon that one Temps install built, so its
+/// control plane can sweep the ones whose project it deleted.
+///
+/// Lists only images labelled with that install's ownership ID, oldest first
+/// and bounded by [`temps_deployer::MAX_LABELLED_IMAGES`], keeping only
+/// their `sh.temps.image.*` labels, each with a container created from it if
+/// any. Removal goes through `POST /agent/images/remove`, which checks again.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/owned",
+    request_body = temps_deployer::remote::ListOwnedImagesRequest,
+    responses(
+        (status = 200, description = "This install's images on the node, oldest first, with any container using each"),
+        (status = 400, description = "The owner is not a valid image ownership ID"),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 503, description = "Docker unavailable on this node"),
+        (status = 500, description = "The node's images could not be listed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_owned_images(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<temps_deployer::remote::ListOwnedImagesRequest>,
+) -> impl IntoResponse {
+    if !is_valid_image_owner(&request.owner) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "The image owner must be 1-128 ASCII letters, digits, '-', '.' or '_'".to_string(),
+        )
+        .into_response();
+    }
+    match state
+        .container_deployer
+        .list_owned_images(&request.owner)
+        .await
+    {
+        Ok(listing) => {
+            tracing::debug!(
+                listed = listing.images.len(),
+                unlisted = listing.unlisted,
+                "Listed this install's images on request of the control plane"
+            );
+            AgentResponse::ok(listing).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Could not list images on request of the control plane");
             error_response(container_error_status(&error), error.to_string()).into_response()
         }
     }

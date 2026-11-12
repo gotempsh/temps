@@ -41,7 +41,8 @@ pub use exec::{
     RingBuffer, StreamErrorPolicy,
 };
 pub use image_removal::{
-    remove_unused_images, ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus,
+    list_labelled_images, remove_unused_images, ImageRemovalOutcome, ImageRemovalRequest,
+    ImageRemovalStatus, LabelledImage, LabelledImages,
 };
 pub use network::{ensure_bridge_network, NetworkEnsured};
 pub use pull::{pull_image, pull_image_with_progress, PullSpec, PullTimeouts};

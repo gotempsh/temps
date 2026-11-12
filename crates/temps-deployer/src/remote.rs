@@ -551,6 +551,25 @@ pub const REMOVE_IMAGES_PATH: &str = "/agent/images/remove";
 /// timeout only leaves the images for the node's housekeeping.
 const REMOVE_IMAGES_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Wire body for `POST /agent/images/owned`: list the images on the node
+/// that the Temps install `owner` built.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ListOwnedImagesRequest {
+    /// The value of the install's [`crate::IMAGE_OWNER_LABEL`].
+    pub owner: String,
+}
+
+/// Path of the agent's owned-image listing endpoint.
+pub const LIST_OWNED_IMAGES_PATH: &str = "/agent/images/owned";
+
+/// Largest image-removal answer read from a node: 500 outcomes of a few
+/// hundred bytes each, with room to spare.
+const MAX_REMOVE_IMAGES_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Largest owned-image listing read from a node:
+/// [`crate::MAX_LABELLED_IMAGES`] entries of at most a few kilobytes each.
+const MAX_OWNED_IMAGES_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Response envelope from the agent API.
 #[derive(Deserialize)]
 struct AgentResponse<T> {
@@ -1177,6 +1196,55 @@ impl RemoteNodeDeployer {
         Ok(())
     }
 
+    /// POST `body` to one of the agent's image endpoints and read its answer,
+    /// bounded to `limit` bytes. An agent that predates the endpoint answers
+    /// with the router's bare 404/405: a typed error saying to upgrade it.
+    async fn agent_image_call<B: Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        limit: usize,
+        what: &str,
+    ) -> Result<T, DeployerError> {
+        let location = format!("node {}", self.node_name);
+        let fail = |reason: String| DeployerError::ImageRemoval {
+            location: location.clone(),
+            reason,
+        };
+        let url = format!("{}{}", self.agent_url, path);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(REMOVE_IMAGES_TIMEOUT)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| fail(format!("failed to reach the agent at {url}: {error}")))?;
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(fail(format!(
+                "its agent does not support {what} (HTTP {status}); upgrade the worker \
+                 agent, or manage the images on that host"
+            )));
+        }
+        let envelope: AgentResponse<T> = bounded_json(response, &format!("{what} at {url}"), limit)
+            .await
+            .map_err(|error| fail(format!("{error} (HTTP {status})")))?;
+        if !envelope.success {
+            return Err(fail(format!(
+                "the agent answered HTTP {status}: {}",
+                envelope.error.unwrap_or_default()
+            )));
+        }
+        envelope
+            .data
+            .ok_or_else(|| fail(format!("the agent at {url} returned success but no data")))
+    }
+
     /// Get the node name this deployer targets.
     pub fn node_name(&self) -> &str {
         &self.node_name
@@ -1602,60 +1670,39 @@ impl ContainerDeployer for RemoteNodeDeployer {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let location = format!("node {}", self.node_name);
-        let fail = |reason: String| DeployerError::ImageRemoval {
-            location: location.clone(),
-            reason,
-        };
-        let url = format!("{}{}", self.agent_url, REMOVE_IMAGES_PATH);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .timeout(REMOVE_IMAGES_TIMEOUT)
-            .json(&RemoveImagesRequest {
-                images: requests.to_vec(),
-            })
-            .send()
-            .await
-            .map_err(|error| fail(format!("failed to reach the agent at {url}: {error}")))?;
-        let status = response.status();
-        // An agent that predates the endpoint answers with the router's bare
-        // 404/405, not an agent envelope.
-        if matches!(
-            status,
-            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-        ) {
-            return Err(fail(format!(
-                "its agent does not support removing images (HTTP {status}); upgrade the \
-                 worker agent, or remove the images on that host"
-            )));
-        }
-        let body: AgentResponse<Vec<crate::ImageRemovalOutcome>> =
-            response.json().await.map_err(|error| {
-                fail(format!(
-                    "invalid response from the agent at {url} (HTTP {status}): {error}"
-                ))
-            })?;
-        if !body.success {
-            return Err(fail(format!(
-                "the agent answered HTTP {status}: {}",
-                body.error.unwrap_or_default()
-            )));
-        }
-        let outcomes = body.data.ok_or_else(|| {
-            fail(format!(
-                "the agent at {url} returned success but no outcomes"
-            ))
-        })?;
+        let outcomes: Vec<crate::ImageRemovalOutcome> = self
+            .agent_image_call(
+                REMOVE_IMAGES_PATH,
+                &RemoveImagesRequest {
+                    images: requests.to_vec(),
+                },
+                MAX_REMOVE_IMAGES_RESPONSE_BYTES,
+                "removing images",
+            )
+            .await?;
         if outcomes.len() != requests.len() {
-            return Err(fail(format!(
-                "the agent returned {} outcomes for {} images",
-                outcomes.len(),
-                requests.len()
-            )));
+            return Err(DeployerError::ImageRemoval {
+                location: format!("node {}", self.node_name),
+                reason: format!(
+                    "the agent returned {} outcomes for {} images",
+                    outcomes.len(),
+                    requests.len()
+                ),
+            });
         }
         Ok(outcomes)
+    }
+
+    async fn list_owned_images(&self, owner: &str) -> Result<crate::LabelledImages, DeployerError> {
+        self.agent_image_call(
+            LIST_OWNED_IMAGES_PATH,
+            &ListOwnedImagesRequest {
+                owner: owner.to_string(),
+            },
+            MAX_OWNED_IMAGES_RESPONSE_BYTES,
+            "listing images",
+        )
+        .await
     }
 }
 
@@ -3695,6 +3742,52 @@ mod tests {
         );
         assert!(outcomes[0].status.is_removed());
         assert_eq!(outcomes[1].status, crate::ImageRemovalStatus::Absent);
+    }
+
+    #[tokio::test]
+    async fn list_owned_images_asks_for_this_owner_and_returns_the_listing() {
+        let (address, server) = one_shot_agent(
+            "200 OK",
+            r#"{"success":true,"data":{"images":[{"image_id":"sha256:aa","tags":["app-1:latest"],"labels":{"sh.temps.image.project_id":"7"},"created":10,"in_use_by":"c0ffee"}],"unlisted":2},"error":null}"#,
+        )
+        .await;
+        let listed = test_remote(address)
+            .list_owned_images("install-a.marker-b")
+            .await
+            .expect("the agent's listing");
+        let request = server.await.expect("mock agent task");
+
+        assert!(
+            request.starts_with("POST /agent/images/owned "),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""owner":"install-a.marker-b""#),
+            "{request}"
+        );
+        assert_eq!(listed.unlisted, 2);
+        assert_eq!(listed.images[0].in_use_by.as_deref(), Some("c0ffee"));
+    }
+
+    /// A node cannot make the control plane buffer an arbitrary answer.
+    #[tokio::test]
+    async fn an_oversized_agent_answer_is_refused_before_it_is_parsed() {
+        let huge: &'static str = Box::leak(
+            format!(
+                r#"{{"success":true,"data":[{{"reference":"{}","status":"absent"}}],"error":null}}"#,
+                "x".repeat(MAX_REMOVE_IMAGES_RESPONSE_BYTES + 1)
+            )
+            .into_boxed_str(),
+        );
+        let (address, server) = one_shot_agent("200 OK", huge).await;
+        let result = test_remote(address)
+            .remove_unused_images(&[crate::ImageRemovalRequest::new("app-1:latest", None)])
+            .await;
+        server.abort();
+        assert!(
+            matches!(result, Err(DeployerError::ImageRemoval { .. })),
+            "{result:?}"
+        );
     }
 
     /// An agent from before the endpoint answers with the router's bare 404:

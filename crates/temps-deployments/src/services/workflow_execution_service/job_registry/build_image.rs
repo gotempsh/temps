@@ -22,11 +22,12 @@ use tracing::{debug, info, warn};
 /// cannot be read or created.
 async fn build_image_labels<C: sea_orm::ConnectionTrait>(
     db: &C,
+    data_dir: &std::path::Path,
     project_id: i32,
     deployment_id: i32,
 ) -> std::collections::HashMap<String, String> {
     use temps_docker_housekeeping::services::image_ownership;
-    match image_ownership::ensure_image_instance_id(db).await {
+    match image_ownership::ensure_image_owner_id(db, data_dir).await {
         Ok(instance_id) => {
             image_ownership::image_ownership_labels(&instance_id, project_id, deployment_id)
         }
@@ -113,7 +114,13 @@ impl FromJobRecord for BuildImageJob {
         // unlabelled: retention then only finds it through the deployment
         // rows, as before, and the orphan sweep never touches it.
         builder = builder.image_labels(
-            build_image_labels(service.db.as_ref(), deployment.project_id, deployment.id).await,
+            build_image_labels(
+                service.db.as_ref(),
+                &service.config_service.data_dir(),
+                deployment.project_id,
+                deployment.id,
+            )
+            .await,
         );
 
         // Unseal build args from job_config. The planner derives build
@@ -618,8 +625,20 @@ mod tests {
                 Value::from("install-a".to_string()),
             )])]])
             .into_connection();
-        let labels = build_image_labels(&db, 7, 42).await;
-        assert_eq!(labels[IMAGE_INSTANCE_LABEL], "install-a");
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let labels = build_image_labels(&db, data_dir.path(), 7, 42).await;
+        let marker = std::fs::read_to_string(
+            data_dir
+                .path()
+                .join(temps_docker_housekeeping::services::image_ownership::INSTALL_MARKER_FILE),
+        )
+        .expect("the marker is created with the first build");
+        assert_eq!(labels[IMAGE_INSTANCE_LABEL], format!("install-a.{marker}"));
+        assert_eq!(
+            IMAGE_INSTANCE_LABEL,
+            temps_deployer::IMAGE_OWNER_LABEL,
+            "a worker lists images by the label builds set"
+        );
         assert_eq!(labels[IMAGE_PROJECT_LABEL], "7");
         assert_eq!(labels[IMAGE_DEPLOYMENT_LABEL], "42");
         assert!(
@@ -635,6 +654,10 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
             .into_connection();
-        assert!(build_image_labels(&db, 7, 42).await.is_empty());
+        assert!(
+            build_image_labels(&db, std::path::Path::new("/nonexistent"), 7, 42)
+                .await
+                .is_empty()
+        );
     }
 }

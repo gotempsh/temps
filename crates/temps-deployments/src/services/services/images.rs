@@ -32,6 +32,9 @@ use temps_core::{
 };
 use temps_deployer::{ImageRemovalRequest, ImageRemovalStatus, MAX_IMAGE_REMOVAL_BATCH};
 use temps_docker_housekeeping::services::image_references;
+use temps_docker_housekeeping::services::orphaned_images::{
+    OrphanSweepError, OwnedImageDaemon, WorkerImageDaemon, WorkerImageDaemons,
+};
 
 /// Most built images one project deletion reads. Newest first: an old image
 /// is the likeliest to have been removed by retention already. A project with
@@ -389,6 +392,105 @@ impl temps_core::ProjectImageCleaner for DeploymentService {
             }
         }
         report
+    }
+}
+
+/// A worker node's Docker daemon, reached through its agent, for the
+/// nightly sweep of images whose project no longer exists. The node itself
+/// checks usage while listing and again before each removal.
+struct RemoteImageDaemon {
+    node_name: String,
+    remote: Arc<temps_deployer::remote::RemoteNodeDeployer>,
+}
+
+#[async_trait::async_trait]
+impl OwnedImageDaemon for RemoteImageDaemon {
+    async fn list_instance_images(
+        &self,
+        owner: &str,
+    ) -> Result<
+        Vec<temps_docker_housekeeping::services::orphaned_images::OwnedImage>,
+        OrphanSweepError,
+    > {
+        let listing =
+            temps_deployer::ContainerDeployer::list_owned_images(self.remote.as_ref(), owner)
+                .await
+                .map_err(|error| OrphanSweepError::Worker {
+                    node: self.node_name.clone(),
+                    operation: "listing this install's images",
+                    source: Box::new(error),
+                })?;
+        if listing.unlisted > 0 {
+            warn!(
+                node = %self.node_name,
+                listed = listing.images.len(),
+                unlisted = listing.unlisted,
+                "More of this install's images on the node than one sweep lists; the newest wait for a later run"
+            );
+        }
+        Ok(listing.images)
+    }
+
+    async fn container_using_image(
+        &self,
+        image: &temps_docker_housekeeping::services::orphaned_images::OwnedImage,
+    ) -> Result<Option<String>, OrphanSweepError> {
+        // Reported by the node with the listing.
+        Ok(image.in_use_by.clone())
+    }
+
+    async fn remove_unused_images(
+        &self,
+        requests: &[ImageRemovalRequest],
+    ) -> Result<Vec<temps_deployer::ImageRemovalOutcome>, OrphanSweepError> {
+        temps_deployer::ContainerDeployer::remove_unused_images(self.remote.as_ref(), requests)
+            .await
+            .map_err(|error| OrphanSweepError::Worker {
+                node: self.node_name.clone(),
+                operation: "removing images",
+                source: Box::new(error),
+            })
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkerImageDaemons for DeploymentService {
+    /// Active and draining nodes, reached the way container cleanup reaches
+    /// them. A node that cannot be reached is left out and logged; its
+    /// images are swept on a later night.
+    async fn worker_image_daemons(&self) -> Result<Vec<WorkerImageDaemon>, OrphanSweepError> {
+        let candidates: Vec<(i32, String)> = nodes::Entity::find()
+            .filter(nodes::Column::Status.is_in(["active", "draining"]))
+            .select_only()
+            .column(nodes::Column::Id)
+            .column(nodes::Column::Name)
+            .order_by_asc(nodes::Column::Id)
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await
+            .map_err(|error| OrphanSweepError::Workers {
+                source: Box::new(error),
+            })?;
+        let mut daemons = Vec::with_capacity(candidates.len());
+        for (node_id, node_name) in candidates {
+            match self.container_operations_for_node(Some(node_id)).await {
+                Ok(operations) => match operations.runtime_health_remote() {
+                    Some(remote) => daemons.push(WorkerImageDaemon {
+                        node_id,
+                        node_name: node_name.clone(),
+                        daemon: Arc::new(RemoteImageDaemon { node_name, remote }),
+                    }),
+                    None => debug!(node_id, "Node has no remote agent; not sweeping its images"),
+                },
+                Err(error) => warn!(
+                    node_id,
+                    node = %node_name,
+                    %error,
+                    "Could not reach a worker node to sweep images of deleted projects; it is swept on a later run"
+                ),
+            }
+        }
+        Ok(daemons)
     }
 }
 
@@ -939,5 +1041,126 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("project 7"), "{message}");
         assert!(message.contains("connection reset"), "{message}");
+    }
+
+    /// A worker's images are listed and removed through its agent, and the
+    /// node's own usage report is what keeps an in-use image.
+    #[tokio::test]
+    async fn a_worker_node_is_swept_through_its_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("read");
+            let body = r#"{"success":true,"data":{"images":[{"image_id":"sha256:aa","tags":["app-1:latest"],"labels":{},"created":1,"in_use_by":"c0ffee"}],"unlisted":0},"error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+        let daemon = RemoteImageDaemon {
+            node_name: "worker-1".to_string(),
+            remote: Arc::new(
+                temps_deployer::remote::RemoteNodeDeployer::new(
+                    format!("http://{address}"),
+                    "token".to_string(),
+                    "worker-1".to_string(),
+                )
+                .expect("remote"),
+            ),
+        };
+        let images = daemon
+            .list_instance_images("install-a.marker-b")
+            .await
+            .expect("listing");
+        server.await.expect("mock agent");
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            daemon
+                .container_using_image(&images[0])
+                .await
+                .expect("usage"),
+            Some("c0ffee".to_string())
+        );
+    }
+
+    /// An unreachable node fails as a worker error naming it, so the sweep
+    /// logs it and goes on with the others.
+    #[tokio::test]
+    async fn an_unreachable_worker_names_itself_in_the_error() {
+        let daemon = RemoteImageDaemon {
+            node_name: "worker-9".to_string(),
+            remote: Arc::new(
+                temps_deployer::remote::RemoteNodeDeployer::new(
+                    "http://127.0.0.1:9".to_string(),
+                    "token".to_string(),
+                    "worker-9".to_string(),
+                )
+                .expect("remote"),
+            ),
+        };
+        let error = daemon
+            .list_instance_images("install-a.marker-b")
+            .await
+            .expect_err("nothing answers");
+        assert!(error.to_string().contains("worker-9"), "{error}");
+    }
+
+    /// Nodes are read in one query; one that cannot be reached is left out
+    /// instead of failing the whole sweep.
+    #[tokio::test]
+    async fn worker_nodes_that_cannot_be_reached_are_left_out() {
+        use sea_orm::Value;
+        use std::collections::BTreeMap;
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![BTreeMap::from([
+                    ("id".to_string(), Value::from(3_i32)),
+                    ("name".to_string(), Value::from("gone-node".to_string())),
+                ])]])
+                // The node's own row has vanished since: not reachable.
+                .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+                .into_connection(),
+        );
+        let runtime: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".to_string(),
+                "unused".to_string(),
+                "unused".to_string(),
+            )
+            .expect("remote"),
+        );
+        let service = super::super::tests::create_cleanup_service_for_test(db, runtime);
+        let daemons = service
+            .worker_image_daemons()
+            .await
+            .expect("the node list is read");
+        assert!(daemons.is_empty());
+
+        let failing = super::super::tests::create_cleanup_service_for_test(
+            Arc::new(
+                sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("connection reset".to_string())])
+                    .into_connection(),
+            ),
+            Arc::new(
+                temps_deployer::remote::RemoteNodeDeployer::new(
+                    "http://127.0.0.1:9".to_string(),
+                    "unused".to_string(),
+                    "unused".to_string(),
+                )
+                .expect("remote"),
+            ),
+        );
+        assert!(matches!(
+            failing.worker_image_daemons().await,
+            Err(OrphanSweepError::Workers { .. })
+        ));
     }
 }

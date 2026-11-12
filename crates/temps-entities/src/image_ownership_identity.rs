@@ -4,9 +4,9 @@
 //! Image ownership instance identity.
 //!
 //! Single-row table holding the random, install-scoped ID this Temps install
-//! stamps on the images it builds (`sh.temps.instance`), so housekeeping can
-//! tell its own orphaned images from another install's on a shared Docker
-//! host. Created on first use and never rotated: rotating it would make every
+//! stamps on the images it builds (`sh.temps.image.instance`, joined with an
+//! ID kept in its data directory), so housekeeping can tell its own orphaned
+//! images from another install's on a shared Docker host. Created on first use and never rotated: rotating it would make every
 //! image built before unrecognisable, which leaves them on disk rather than
 //! removing anything wrongly. Separate from `dns_instance_identity`, which is
 //! published in DNS ownership markers.
