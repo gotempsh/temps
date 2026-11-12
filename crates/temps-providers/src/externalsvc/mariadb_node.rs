@@ -40,7 +40,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::mariadb::{MariaDbConfig, MariaDbInPlaceRestore, MariaDbService};
+use super::mariadb::{
+    binary_logging_off_reason, MariaDbConfig, MariaDbInPlaceRestore, MariaDbService,
+};
 use super::postgres_walg_backup::{
     refuse_overlapping_backup_push, run_walg_exec, walg_identity_env, WalgBaseBackupError,
 };
@@ -822,7 +824,7 @@ pub async fn binlog_archive_on_node(
         destination,
         bucket_path,
     } = request;
-    let (_container, config) =
+    let (container, config) =
         match node_service(service_id, &service_config, "archiving binary logs") {
             Ok(target) => target,
             Err(error) => {
@@ -831,10 +833,30 @@ pub async fn binlog_archive_on_node(
                 }
             }
         };
+    let service = MariaDbService::new(service_config.name.clone(), docker);
+    // A server started without `--log-bin` has nothing to ship, and stays
+    // so until its container is created again: refused, with what to do,
+    // instead of failing on a bare SQL error every run.
+    match service.binary_logging_enabled(&config).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return MariadbBinlogArchiveResult::Refused {
+                reason: worker_binary_logging_off(service_id, &service_config.name, &container),
+            }
+        }
+        Err(error) => {
+            return MariadbBinlogArchiveResult::Failed {
+                reason: format!(
+                    "could not check binary logging of MariaDB service {service_id} ('{}'): \
+                     {error}",
+                    service_config.name
+                ),
+            }
+        }
+    }
     let s3 = node_s3(destination, bucket_path);
     let client = s3.build_s3_client().await;
     let source = archive_source_row(&s3);
-    let service = MariaDbService::new(service_config.name.clone(), docker);
     match service.archive_binlogs(&client, &source, &config).await {
         Ok(shipped) => MariadbBinlogArchiveResult::Completed { shipped },
         Err(error) => MariadbBinlogArchiveResult::Failed {
@@ -844,6 +866,19 @@ pub async fn binlog_archive_on_node(
             ),
         },
     }
+}
+
+/// Why a worker's MariaDB has no binary logs to ship, and what turns them
+/// on there: a worker's container is not created again in place (an image
+/// change is refused for it), so the way is a new service on the node,
+/// which starts with binary logging, restored from a backup of this one.
+fn worker_binary_logging_off(service_id: i32, service: &str, container: &str) -> String {
+    format!(
+        "MariaDB service {service_id} ('{service}'): {}. On a worker node the container is not \
+         created again in place: back the service up, create a MariaDB service on the node (it \
+         starts with binary logging on) and restore the backup into it",
+        binary_logging_off_reason(container)
+    )
 }
 
 /// The S3 source row the archiver reads: bucket and base path, with the
@@ -1139,5 +1174,160 @@ mod docker_tests {
         assert!(error.to_string().contains("still running"), "{error}");
         assert!(!error.is_refusal(), "a retry can succeed once it ends");
         assert!(!error.is_cancelled());
+    }
+
+    const MARIADB_IMAGE: &str = "mariadb:11.4";
+    const ROOT_PASSWORD: &str = "binlog-test-root-password";
+
+    /// A MariaDB started with `args`, named as the node names a service's
+    /// container (`mariadb-<service>`), the service's name unique to this
+    /// test process. Returns the service name once the server answers on
+    /// TCP (the entrypoint's temporary server does not listen), or `None`
+    /// without the image.
+    async fn mariadb(docker: &Docker, args: &[&str]) -> Option<String> {
+        use bollard::models::ContainerCreateBody;
+        use bollard::query_parameters::{CreateContainerOptionsBuilder, CreateImageOptionsBuilder};
+
+        let mut pull = docker.create_image(
+            Some(
+                CreateImageOptionsBuilder::new()
+                    .from_image(MARIADB_IMAGE)
+                    .build(),
+            ),
+            None,
+            None,
+        );
+        while let Some(item) = pull.next().await {
+            if let Err(error) = item {
+                eprintln!("could not pull {MARIADB_IMAGE}, skipping: {error}");
+                return None;
+            }
+        }
+        let service = format!(
+            "temps-test-binlog-{}-{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        );
+        let name = super::super::naming::mariadb_container_name(&service);
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                ContainerCreateBody {
+                    image: Some(MARIADB_IMAGE.to_string()),
+                    env: Some(vec![format!("MARIADB_ROOT_PASSWORD={ROOT_PASSWORD}")]),
+                    cmd: Some(args.iter().map(|arg| arg.to_string()).collect()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create MariaDB container");
+        docker
+            .start_container(
+                &name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("start MariaDB container");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let ready = run_walg_exec(
+                docker,
+                &name,
+                "mariadb -h127.0.0.1 -uroot -e 'SELECT 1'",
+                &[format!("MYSQL_PWD={ROOT_PASSWORD}")],
+                &CancellationToken::new(),
+            )
+            .await
+            .is_ok_and(|output| output.exit_code == 0);
+            if ready {
+                return Some(service);
+            }
+            if std::time::Instant::now() > deadline {
+                remove(docker, &name).await;
+                panic!("MariaDB in '{name}' did not answer within 120s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    fn archive_request(service: &str) -> MariadbBinlogArchiveRequest {
+        MariadbBinlogArchiveRequest {
+            service_id: 45,
+            node_id: 3,
+            service_config: ServiceConfig {
+                name: service.to_string(),
+                service_type: ServiceType::Mariadb,
+                version: None,
+                parameters: serde_json::json!({
+                    "root_password": ROOT_PASSWORD,
+                    "container_name": super::super::naming::mariadb_container_name(service),
+                }),
+            },
+            destination: WorkerS3Destination {
+                bucket: "backups".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some("http://127.0.0.1:1".to_string()),
+                force_path_style: true,
+                access_key_id: "AKID".to_string(),
+                secret_access_key: "SECRET".to_string(),
+                session_token: None,
+            },
+            bucket_path: String::new(),
+        }
+    }
+
+    /// The reported failure: a worker's MariaDB created before binary
+    /// logging was part of the server command. Archiving it is refused with
+    /// why and what turns it on, not failed on a bare SQL error every run,
+    /// and nothing is flushed or uploaded.
+    #[tokio::test]
+    async fn archiving_a_server_without_binary_logging_is_refused_with_the_way_to_turn_it_on() {
+        let Some(docker) = docker_or_skip().await else {
+            return;
+        };
+        let Some(service) = mariadb(&docker, &[]).await else {
+            return;
+        };
+        let name = super::super::naming::mariadb_container_name(&service);
+        let result = binlog_archive_on_node(archive_request(&service), docker.clone(), None).await;
+        remove(&docker, &name).await;
+        match result {
+            MariadbBinlogArchiveResult::Refused { reason } => {
+                assert!(reason.contains("binary logging is off"), "{reason}");
+                assert!(reason.contains(&format!("'{name}'")), "{reason}");
+                assert!(reason.contains("restore the backup into it"), "{reason}");
+                assert!(!reason.contains(ROOT_PASSWORD), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// With `--log-bin` the check lets the archiver run (its upload to the
+    /// unreachable S3 source then fails): only a server without binary
+    /// logging is refused.
+    #[tokio::test]
+    async fn a_server_with_binary_logging_is_not_refused() {
+        let Some(docker) = docker_or_skip().await else {
+            return;
+        };
+        let Some(service) = mariadb(&docker, &["--log-bin=mysql-bin", "--server-id=7"]).await
+        else {
+            return;
+        };
+        let name = super::super::naming::mariadb_container_name(&service);
+        let enabled = MariaDbService::new(service.clone(), docker.clone())
+            .binary_logging_enabled(
+                &node_service(45, &archive_request(&service).service_config, "checked")
+                    .expect("a managed MariaDB")
+                    .1,
+            )
+            .await;
+        let result = binlog_archive_on_node(archive_request(&service), docker.clone(), None).await;
+        remove(&docker, &name).await;
+        assert!(enabled.expect("log_bin is readable"), "--log-bin is on");
+        assert!(
+            !matches!(&result, MariadbBinlogArchiveResult::Refused { .. }),
+            "{result:?}"
+        );
     }
 }
