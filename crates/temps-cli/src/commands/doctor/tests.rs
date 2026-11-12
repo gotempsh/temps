@@ -270,7 +270,7 @@ fn test_parse_pg_url_invalid_scheme() {
 #[test]
 fn initial_admin_does_not_treat_a_failed_query_as_an_empty_database() {
     assert!(matches!(
-        initial_admin_result(&UserCount::QueryFailed("relation \"users\" does not exist".into())),
+        initial_admin_result(&UserCount::QueryFailed("relation \"users\" does not exist".into()), None),
         CheckResult::Warn(message)
             if message.contains("Could not count users") && message.contains("temps migrate")
     ));
@@ -279,11 +279,11 @@ fn initial_admin_does_not_treat_a_failed_query_as_an_empty_database() {
 #[test]
 fn initial_admin_says_why_it_was_not_checked() {
     assert!(matches!(
-        initial_admin_result(&UserCount::NoDatabaseUrl),
+        initial_admin_result(&UserCount::NoDatabaseUrl, None),
         CheckResult::Warn(message) if message.contains("no database URL was found")
     ));
     assert!(matches!(
-        initial_admin_result(&UserCount::Unreachable),
+        initial_admin_result(&UserCount::Unreachable, None),
         CheckResult::Warn(message) if message.contains("could not be reached")
     ));
 }
@@ -291,18 +291,110 @@ fn initial_admin_says_why_it_was_not_checked() {
 #[test]
 fn initial_admin_reports_completed_bootstrap_from_persisted_users() {
     assert!(matches!(
-        initial_admin_result(&UserCount::Count(2)),
+        initial_admin_result(&UserCount::Count(2), None),
         CheckResult::Pass(message) if message.contains("bootstrap has completed")
     ));
 }
 
+fn unit_service(home: &Path, service_section: &str) -> ServiceDefinition {
+    let unit = home.join("temps.service");
+    crate::service_definition::test_support::write_trusted(
+        &unit,
+        format!(
+            "[Service]\n{service_section}ExecStart=/usr/bin/temps serve --data-dir=/srv/temps\n"
+        ),
+    )
+    .unwrap();
+    match service_definition::probe(&ServiceLocations {
+        systemd_unit: Some(unit),
+        launchd_agent: None,
+    })
+    .pop()
+    {
+        Some(ServiceProbe::Found(service)) => *service,
+        other => panic!("expected the unit to parse, got {other:?}"),
+    }
+}
+
+fn no_admin(serving: Option<&ServiceDefinition>) -> String {
+    match initial_admin_result(&UserCount::Count(0), serving) {
+        CheckResult::Warn(message) => message,
+        other => panic!("no users warns, got {other:?}"),
+    }
+}
+
 #[test]
-fn initial_admin_reports_the_required_first_boot_step() {
-    assert!(matches!(
-        initial_admin_result(&UserCount::Count(0)),
-        CheckResult::Warn(message)
-            if message.contains("temps serve") && message.contains("unattended first boot")
-    ));
+fn initial_admin_says_how_serve_creates_it_without_a_service() {
+    let message = no_admin(None);
+    assert!(
+        message.contains("asks for the admin's email")
+            && message.contains("TEMPS_ADMIN_EMAIL")
+            && message.contains("TEMPS_ADMIN_PASSWORD_FILE")
+            && message.contains("console does not start without them"),
+        "{message}"
+    );
+}
+
+#[test]
+fn initial_admin_says_the_service_cannot_create_it_without_its_inputs() {
+    let home = tempfile::tempdir().unwrap();
+    // Neither set: no terminal to ask on, so the console does not start.
+    let message = no_admin(Some(&unit_service(home.path(), "")));
+    assert!(
+        message.contains("sets neither")
+            && message.contains("does not start its console")
+            && message.contains("run `temps serve` once in a terminal"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("Run `temps serve` to complete"),
+        "{message}"
+    );
+
+    // Only one set: serve refuses both halves.
+    let message = no_admin(Some(&unit_service(
+        home.path(),
+        "Environment=TEMPS_ADMIN_EMAIL=admin@example.test\n",
+    )));
+    assert!(
+        message.contains("sets TEMPS_ADMIN_EMAIL but not TEMPS_ADMIN_PASSWORD_FILE"),
+        "{message}"
+    );
+
+    // Both set: the server creates it once its console starts.
+    let message = no_admin(Some(&unit_service(
+        home.path(),
+        "Environment=TEMPS_ADMIN_EMAIL=admin@example.test \
+         TEMPS_ADMIN_PASSWORD_FILE=/etc/temps/admin-password\n",
+    )));
+    assert!(
+        message.contains("so `temps serve` creates the first admin")
+            && message.contains("its console has not started"),
+        "{message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn initial_admin_says_when_the_services_environment_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let env_file = home.path().join("temps.env");
+    std::fs::write(&env_file, "TEMPS_ADMIN_EMAIL=admin@example.test\n").unwrap();
+    std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&env_file).is_ok() {
+        // Running as root: every file is readable.
+        return;
+    }
+    let service = unit_service(
+        home.path(),
+        &format!("EnvironmentFile={}\n", env_file.display()),
+    );
+    let message = no_admin(Some(&service));
+    assert!(
+        message.contains("sets them is unknown") && !message.contains("sets neither"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -751,8 +843,11 @@ fn the_logs_directory_matches_what_serve_creates_at_startup() {
     let CheckResult::Warn(message) = logs_dir_result(dir.path()) else {
         panic!("a missing logs dir warns");
     };
+    // serve creates it only once its console gets past the Docker check,
+    // so a server that is running can still lack it.
     assert!(
-        message.contains("creates it every time it starts"),
+        message.contains("each time its console starts")
+            && message.contains("its console failed to start"),
         "{message}"
     );
     assert!(!message.contains("first deployment"), "{message}");

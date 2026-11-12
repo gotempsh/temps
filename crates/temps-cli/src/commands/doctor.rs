@@ -233,7 +233,11 @@ impl DoctorCommand {
         // -- Application Settings (requires DB) --
         println!();
         println!("{}", "  Initial admin".bright_yellow().bold());
-        self.check_initial_admin(&db, &mut report).await;
+        let serving = database
+            .as_ref()
+            .ok()
+            .and_then(ResolvedDatabaseUrl::serving_service);
+        self.check_initial_admin(&db, serving, &mut report).await;
         report.print();
         report.checks.clear();
 
@@ -802,8 +806,15 @@ impl DoctorCommand {
 
     /// `temps serve` creates the first admin from TEMPS_ADMIN_EMAIL and
     /// TEMPS_ADMIN_PASSWORD_FILE when no users exist. Doctor checks persisted
-    /// bootstrap state without rereading these one-shot input secrets.
-    async fn check_initial_admin(&self, db: &DatabaseState, report: &mut DiagnosticReport) {
+    /// bootstrap state without rereading these one-shot input secrets;
+    /// `serving` is the installed service whose database this is, whose
+    /// environment says whether its server can create the admin.
+    async fn check_initial_admin(
+        &self,
+        db: &DatabaseState,
+        serving: Option<&ServiceDefinition>,
+        report: &mut DiagnosticReport,
+    ) {
         let users = match db {
             DatabaseState::NoUrl => UserCount::NoDatabaseUrl,
             DatabaseState::Unreachable => UserCount::Unreachable,
@@ -826,7 +837,7 @@ impl DoctorCommand {
                 }
             }
         };
-        report.add("Initial admin", initial_admin_result(&users));
+        report.add("Initial admin", initial_admin_result(&users, serving));
     }
 
     // ── App settings checks ─────────────────────────────────────────
@@ -1318,16 +1329,12 @@ enum UserCount {
 }
 
 /// Assess persisted bootstrap state without reading first-boot inputs.
-fn initial_admin_result(users: &UserCount) -> CheckResult {
+fn initial_admin_result(users: &UserCount, serving: Option<&ServiceDefinition>) -> CheckResult {
     match users {
         UserCount::Count(count) if *count > 0 => CheckResult::Pass(format!(
             "{count} user(s) exist; initial user bootstrap has completed"
         )),
-        UserCount::Count(_) => CheckResult::Warn(
-            "No users exist yet. Run `temps serve` to complete initial admin setup; \
-             unattended first boot requires TEMPS_ADMIN_EMAIL and TEMPS_ADMIN_PASSWORD_FILE"
-                .to_string(),
-        ),
+        UserCount::Count(_) => CheckResult::Warn(no_admin_message(serving)),
         UserCount::NoDatabaseUrl => CheckResult::Warn(
             "Not checked: no database URL was found (see Database above)".to_string(),
         ),
@@ -1337,6 +1344,63 @@ fn initial_admin_result(users: &UserCount) -> CheckResult {
         UserCount::QueryFailed(error) => CheckResult::Warn(format!(
             "Could not count users: {error}. If the schema is not migrated yet, run `temps migrate`"
         )),
+    }
+}
+
+const ADMIN_EMAIL_ENV: &str = "TEMPS_ADMIN_EMAIL";
+const ADMIN_PASSWORD_FILE_ENV: &str = "TEMPS_ADMIN_PASSWORD_FILE";
+
+/// What creates the first admin when there is none. `temps serve` does it
+/// as its console starts: from TEMPS_ADMIN_EMAIL and
+/// TEMPS_ADMIN_PASSWORD_FILE, else by asking on its terminal. A service has
+/// no terminal, so without both its console does not start; the installed
+/// service's environment says which case the server is in.
+fn no_admin_message(serving: Option<&ServiceDefinition>) -> String {
+    let general = format!(
+        "No users exist yet. `temps serve` creates the first admin when its console starts: \
+         in a terminal it asks for the admin's email; run as a service it needs \
+         {ADMIN_EMAIL_ENV} and {ADMIN_PASSWORD_FILE_ENV} (a file holding the password) in its \
+         environment, and its console does not start without them"
+    );
+    let Some(service) = serving else {
+        return general;
+    };
+    if let Some(gap) = service.incomplete_environment() {
+        return format!(
+            "{general}. Whether the installed service {} sets them is unknown: {gap}",
+            service.path.display()
+        );
+    }
+    let path = service.path.display();
+    match (
+        service.env(ADMIN_EMAIL_ENV).is_some(),
+        service.env(ADMIN_PASSWORD_FILE_ENV).is_some(),
+    ) {
+        (true, true) => format!(
+            "No users exist yet. The installed service {path} sets {ADMIN_EMAIL_ENV} and \
+             {ADMIN_PASSWORD_FILE_ENV}, so `temps serve` creates the first admin when its \
+             console starts. If the server is running, its console has not started: see the \
+             server's log"
+        ),
+        (false, false) => format!(
+            "No users exist yet, and the installed service {path} sets neither \
+             {ADMIN_EMAIL_ENV} nor {ADMIN_PASSWORD_FILE_ENV}. With no terminal to ask for the \
+             admin's email, `temps serve` does not start its console: set both in the \
+             service's environment ({ADMIN_PASSWORD_FILE_ENV} is a file holding the password), \
+             or stop the service and run `temps serve` once in a terminal"
+        ),
+        (email, _) => {
+            let (set, missing) = if email {
+                (ADMIN_EMAIL_ENV, ADMIN_PASSWORD_FILE_ENV)
+            } else {
+                (ADMIN_PASSWORD_FILE_ENV, ADMIN_EMAIL_ENV)
+            };
+            format!(
+                "No users exist yet, and the installed service {path} sets {set} but not \
+                 {missing}. `temps serve` needs both to create the first admin, and does not \
+                 start its console without them: set {missing} in the service's environment"
+            )
+        }
     }
 }
 
@@ -1653,9 +1717,10 @@ fn logs_dir_result(data_dir: &Path) -> CheckResult {
         ));
     }
     CheckResult::Warn(format!(
-        "{} does not exist. `temps serve` creates it every time it starts, so either the \
-         server has not started with this data directory yet, or it runs with a different one \
-         (pass --data-dir)",
+        "{} does not exist. `temps serve` creates it each time its console starts, after \
+         checking Docker, so the server has not started with this data directory yet, its \
+         console failed to start (see Docker above, and the server's log), or it runs with a \
+         different data directory (pass --data-dir)",
         logs.display()
     ))
 }
