@@ -9,6 +9,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
+  acceptsSourceArchive,
   redeployAvailability,
   environmentsToRedeploy,
   redeployCurrentDeployments,
@@ -17,7 +18,7 @@ import {
   type ServiceLinkChange,
 } from '@/lib/service-link-redeploy'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Info, Loader2, RefreshCw, Upload, X } from 'lucide-react'
+import { Info, Loader2, RefreshCw, Settings2, Upload, X } from 'lucide-react'
 import { Link } from 'react-router'
 import {
   defaultDeployEnvironment,
@@ -50,7 +51,10 @@ export function ServiceLinkRedeployPrompt({
   change,
   onDismiss,
 }: {
-  project: Pick<ProjectResponse, 'id' | 'slug' | 'source_type'>
+  project: Pick<
+    ProjectResponse,
+    'id' | 'slug' | 'source_type' | 'allow_alternate_sources'
+  >
   change: ServiceLinkChange | null
   onDismiss: () => void
 }) {
@@ -131,10 +135,15 @@ export function ServiceLinkRedeployPrompt({
   // instead of saying so, so these go straight to the redeploy, which reports
   // that there is no reusable source to rebuild from.
   const useDeployDialog = deployDialog != null && availability !== 'no-source'
+  // The upload page would be refused for a project that takes uploaded source
+  // only while Other sources is on and has it off (a Git project whose
+  // archive deployment outlived the setting): send the user to the setting.
+  const uploadAccepted = acceptsSourceArchive(project)
   const { title, description } = serviceLinkRedeployMessage(
     change,
     targets,
-    redeployable
+    redeployable,
+    uploadAccepted
   )
   const firstTarget = defaultDeployEnvironment(targets)
   const uploadAgainPath = (environmentId: number | undefined) =>
@@ -186,7 +195,16 @@ export function ServiceLinkRedeployPrompt({
             </p>
           ))}
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          {!redeployable ? (
+          {!redeployable && !uploadAccepted ? (
+            <Button size="sm" asChild>
+              <Link
+                to={`/projects/${project.slug}/settings/delivery?section=source#setting-alternate-sources`}
+              >
+                <Settings2 className="size-3.5" />
+                Open Other sources settings
+              </Link>
+            </Button>
+          ) : !redeployable ? (
             // Straight to the upload page, whatever the project's own source
             // type is: the deploy dialog follows the project, not the running
             // deployment, so for a Git project it would open the Git form.

@@ -27,7 +27,14 @@ afterEach(() => {
   spyOn(toast, 'warning').mockRestore()
 })
 
-const project = { id: 7, slug: 'synthetic-api', source_type: 'git' } as const
+// Other sources on: a Git project that took an uploaded archive can take it
+// again. The tests that turn it off say so.
+const project = {
+  id: 7,
+  slug: 'synthetic-api',
+  source_type: 'git',
+  allow_alternate_sources: true,
+} as const
 const environment = (id: number, slug: string, deployment: number) => ({
   id,
   slug,
@@ -111,7 +118,8 @@ async function enabledButton(
 
 function renderPrompt(
   wrap: (children: ReactNode) => ReactNode = (c) => c,
-  sourceType: 'git' | 'uploaded_source' | 'manual' = project.source_type
+  sourceType: 'git' | 'uploaded_source' | 'manual' = project.source_type,
+  allowAlternateSources: boolean = project.allow_alternate_sources
 ) {
   return render(
     <QueryClientProvider
@@ -127,7 +135,11 @@ function renderPrompt(
       <MemoryRouter>
         {wrap(
           <ServiceLinkRedeployPrompt
-            project={{ ...project, source_type: sourceType }}
+            project={{
+              ...project,
+              source_type: sourceType,
+              allow_alternate_sources: allowAlternateSources,
+            }}
             change={{ kind: 'linked', serviceName: 'synthetic-db' }}
             onDismiss={() => {}}
           />
@@ -344,6 +356,48 @@ test('a Git project whose live deployments are uploaded archives is sent to the 
   // The Git deploy dialog is never opened for it.
   fireEvent.click(staging)
   expect(opened).toEqual([])
+})
+
+// The upload page would be refused: the server takes an archive into a Git
+// project only while Other sources is on.
+test('a Git project with Other sources off is sent to that setting, not to an upload it would refuse', async () => {
+  serveEnvironments('archive')
+  const opened: OpenDeployOptions[] = []
+  const view = renderPrompt(
+    (children) => (
+      <ProjectDeployContext.Provider
+        value={{ openDeploy: (options) => opened.push(options ?? {}) }}
+      >
+        {children}
+      </ProjectDeployContext.Provider>
+    ),
+    'git',
+    false
+  )
+
+  const setting = await view.findByRole('link', {
+    name: /Open Other sources settings/,
+  })
+  expect(setting.getAttribute('href')).toBe(
+    '/projects/synthetic-api/settings/delivery?section=source#setting-alternate-sources'
+  )
+  expect(view.getByText(/accepts only while Other sources is on/)).toBeTruthy()
+  expect(view.queryByRole('link', { name: /Upload source again/ })).toBeNull()
+  expect(view.queryByRole('button', { name: /Redeploy/ })).toBeNull()
+  fireEvent.click(setting)
+  expect(opened).toEqual([])
+})
+
+test('an uploaded-source project keeps its upload link whatever Other sources says', async () => {
+  serveEnvironments('archive')
+  const view = renderPrompt(undefined, 'uploaded_source', false)
+
+  expect(
+    await view.findByRole('link', { name: /Upload source again for staging/ })
+  ).toBeTruthy()
+  expect(
+    view.queryByRole('link', { name: /Open Other sources settings/ })
+  ).toBeNull()
 })
 
 test('an uploaded-source project gets the same upload link', async () => {

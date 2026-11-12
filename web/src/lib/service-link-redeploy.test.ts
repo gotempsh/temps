@@ -6,6 +6,7 @@ import type { DeploymentResponse, EnvironmentResponse } from '@/api/client'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { installBrowserWindow } from '@/test/dom'
 import {
+  acceptsSourceArchive,
   canRedeployAnyInPlace,
   redeployAvailability,
   environmentsToRedeploy,
@@ -434,6 +435,62 @@ describe('serviceLinkRedeployMessage for a source that cannot be redeployed', ()
   })
 })
 
+describe('acceptsSourceArchive', () => {
+  // Mirrors the server's `accepts_source_archive`, which refuses the upload.
+  test('an uploaded-source project always takes an archive', () => {
+    expect(
+      acceptsSourceArchive({
+        source_type: 'uploaded_source',
+        allow_alternate_sources: false,
+      })
+    ).toBe(true)
+  })
+
+  test('any other project takes one only while Other sources is on', () => {
+    for (const source_type of [
+      'git',
+      'docker_image',
+      'static_files',
+      'manual',
+    ] as const) {
+      expect(
+        acceptsSourceArchive({ source_type, allow_alternate_sources: true })
+      ).toBe(true)
+      expect(
+        acceptsSourceArchive({ source_type, allow_alternate_sources: false })
+      ).toBe(false)
+      // A project that predates the setting reads as off, as on the server.
+      expect(
+        acceptsSourceArchive({ source_type, allow_alternate_sources: null })
+      ).toBe(false)
+      expect(acceptsSourceArchive({ source_type })).toBe(false)
+    }
+  })
+
+  test('a monitoring-only project never takes one', () => {
+    expect(
+      acceptsSourceArchive({
+        source_type: 'external',
+        allow_alternate_sources: true,
+      })
+    ).toBe(false)
+  })
+})
+
+describe('serviceLinkRedeployMessage for an upload the project would refuse', () => {
+  test('says to turn on Other sources before uploading again', () => {
+    const { description } = serviceLinkRedeployMessage(
+      { kind: 'linked', serviceName: 'synthetic-db' },
+      [{ name: 'production' }],
+      false,
+      false
+    )
+    expect(description).toContain('Other sources')
+    expect(description).toContain('ask an administrator')
+    expect(description).not.toContain('Redeploy production')
+  })
+})
+
 describe('toastRedeployAfterLinkChange', () => {
   const change = { kind: 'linked', serviceName: 'synthetic-db' } as const
   const notifier = () => {
@@ -466,6 +523,35 @@ describe('toastRedeployAfterLinkChange', () => {
     expect(info).toHaveLength(1)
     expect(info[0].options.action).toBeUndefined()
     expect(info[0].options.description).toContain('Upload the source again')
+    api.restore()
+  })
+
+  test('a Git project with Other sources off is told to turn it on, not to upload', async () => {
+    const api = mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([env(3, 'production', 31)]),
+      'GET /projects/7/deployments/31': () =>
+        jsonResponse(
+          deployment(31, 3, {
+            metadata: { deploymentSourceType: 'uploaded_source' },
+          })
+        ),
+    })
+    const { info, notify } = notifier()
+    await toastRedeployAfterLinkChange(
+      {
+        id: 7,
+        name: 'synthetic-api',
+        source_type: 'git',
+        allow_alternate_sources: false,
+      },
+      change,
+      notify as never
+    )
+    expect(info).toHaveLength(1)
+    expect(info[0].title).toBe('synthetic-api: turn on Other sources to apply')
+    expect(info[0].options.action).toBeUndefined()
+    expect(info[0].options.description).toContain('Other sources')
     api.restore()
   })
 

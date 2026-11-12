@@ -46,14 +46,36 @@ export function environmentsToRedeploy(
 }
 
 /**
+ * Whether the project takes an uploaded source archive, decided the way the
+ * server decides it (`accepts_source_archive`): a project whose own source is
+ * an upload always does, any other one only while its Other sources setting
+ * is on. A deployment made from an archive outlives that setting, so turning
+ * it off leaves a live archive that cannot be uploaded again until it is
+ * turned back on.
+ */
+export function acceptsSourceArchive(project: {
+  source_type: SourceType
+  allow_alternate_sources?: boolean | null
+}): boolean {
+  return (
+    project.source_type !== 'external' &&
+    (project.source_type === 'uploaded_source' ||
+      project.allow_alternate_sources === true)
+  )
+}
+
+/**
  * The prompt shown after a link change, e.g. "Postgres was linked. …". When
  * the project cannot be redeployed in place, it says to upload the source
- * again instead of offering a redeploy that would be declined.
+ * again instead of offering a redeploy that would be declined, and when the
+ * project would refuse that upload too, that Other sources must be turned on
+ * first.
  */
 export function serviceLinkRedeployMessage(
   change: ServiceLinkChange,
   environments: Pick<EnvironmentResponse, 'name'>[],
-  redeployable = true
+  redeployable = true,
+  uploadAccepted = true
 ): { title: string; description: string } {
   const verb = change.kind === 'linked' ? 'linked' : 'unlinked'
   const effect =
@@ -65,7 +87,9 @@ export function serviceLinkRedeployMessage(
     names.length === 0
       ? ''
       : !redeployable
-        ? ' Upload the source again to apply the change now.'
+        ? uploadAccepted
+          ? ' Upload the source again to apply the change now.'
+          : ' It runs an uploaded archive, which this service accepts only while Other sources is on in its settings. Turn it on (or ask an administrator to), then upload the source again to apply the change now.'
         : names.length === 1
           ? ` Redeploy ${names[0]} to apply the change now.`
           : ` Redeploy ${names.length} environments (${names.join(', ')}) to apply the change now.`
@@ -345,7 +369,12 @@ export function redeploySummary(outcomes: RedeployOutcome[]): {
  * extra when the project has nothing deployed yet.
  */
 export async function toastRedeployAfterLinkChange(
-  project: { id: number; name: string; source_type: SourceType },
+  project: {
+    id: number
+    name: string
+    source_type: SourceType
+    allow_alternate_sources?: boolean | null
+  },
   change: ServiceLinkChange,
   notify: {
     info: (
@@ -377,15 +406,20 @@ export async function toastRedeployAfterLinkChange(
     project.source_type,
     targets
   )
+  const uploadAccepted = acceptsSourceArchive(project)
   const { description } = serviceLinkRedeployMessage(
     change,
     targets,
-    redeployable
+    redeployable,
+    uploadAccepted
   )
   if (!redeployable) {
     // Nothing the toast could start: the source has to be uploaded again from
-    // the project, so it only says so.
-    notify.info(`${project.name}: upload the source to apply`, {
+    // the project (once Other sources is on, if it is off), so it only says so.
+    const next = uploadAccepted
+      ? 'upload the source to apply'
+      : 'turn on Other sources to apply'
+    notify.info(`${project.name}: ${next}`, {
       description,
       duration: 20_000,
     })
