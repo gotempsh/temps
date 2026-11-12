@@ -163,47 +163,51 @@ async fn existing_postgres_services_with_metrics_get_the_archiving_alarms() -> a
         "the operator's own rule on a metric is kept as it is"
     );
 
-    // The operator disables one seeded rule on one service and downgrades
-    // the other on another: both are theirs now.
-    let disabled = insert_service(&txn, "disabled-db", "postgres", true).await?;
-    let downgraded = insert_service(&txn, "downgraded-db", "postgres", true).await?;
-    SeedPostgresWalArchivingAlertRulesMigration
-        .up(&manager)
-        .await?;
+    // Rollback deletes nothing: the same rules also come from the seeding
+    // path for newer services and from operators, so nothing tells this
+    // migration's rows apart. An operator's look-alike, made by hand with
+    // the seeded values on a service the backfill skipped, is the case a
+    // delete by value would get wrong.
+    let lookalike = insert_service(&txn, "lookalike-db", "postgres", false).await?;
     txn.execute(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "UPDATE monitoring_alert_rules SET enabled = false
-         WHERE service_id = $1 AND metric_name = 'pg.archiver_failing'",
-        [disabled.into()],
+        "INSERT INTO monitoring_alert_rules
+            (service_id, deployment_id, name, metric_name, threshold, comparator, severity,
+             for_duration_secs, enabled)
+         VALUES ($1, NULL, 'WAL archiving failing', 'pg.archiver_failing', 0.5, '>',
+                 'critical', 600, true)",
+        [lookalike.into()],
     ))
     .await?;
-    txn.execute(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE monitoring_alert_rules SET severity = 'warning'
-         WHERE service_id = $1 AND metric_name = 'pg.wal_dir_to_max_wal_size_ratio'",
-        [downgraded.into()],
-    ))
-    .await?;
-
     SeedPostgresWalArchivingAlertRulesMigration
         .down(&manager)
         .await?;
-    assert!(archiving_rules(&txn, watched).await?.is_empty());
     assert_eq!(
-        archiving_rules(&txn, disabled).await?,
+        archiving_rules(&txn, lookalike).await?,
         vec![("pg.archiver_failing".to_string(), 0.5, 600)],
-        "a rule the operator disabled is theirs and stays"
+        "an operator's rule with the seeded values survives a rollback"
     );
     assert_eq!(
-        archiving_rules(&txn, downgraded).await?,
-        vec![("pg.wal_dir_to_max_wal_size_ratio".to_string(), 4.0, 900)],
-        "a rule whose severity the operator changed is theirs and stays"
+        archiving_rules(&txn, watched).await?,
+        vec![
+            ("pg.archiver_failing".to_string(), 0.5, 600),
+            ("pg.wal_dir_to_max_wal_size_ratio".to_string(), 4.0, 900),
+        ],
+        "down deletes nothing"
     );
     assert_eq!(
         archiving_rules(&txn, tuned).await?,
-        vec![("pg.archiver_failing".to_string(), 0.0, 60)],
-        "down removes only the rules it added"
+        vec![
+            ("pg.archiver_failing".to_string(), 0.0, 60),
+            ("pg.wal_dir_to_max_wal_size_ratio".to_string(), 4.0, 900),
+        ]
     );
+    // Rolling forward again adds nothing.
+    SeedPostgresWalArchivingAlertRulesMigration
+        .up(&manager)
+        .await?;
+    assert_eq!(archiving_rules(&txn, watched).await?.len(), 2);
+    assert_eq!(archiving_rules(&txn, lookalike).await?.len(), 1);
 
     txn.rollback().await?;
     Ok(())

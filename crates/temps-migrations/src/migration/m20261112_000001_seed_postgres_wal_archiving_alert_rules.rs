@@ -14,6 +14,14 @@
 //! operator already made for either metric is kept as it is), and the same
 //! per-service budget of 100 rules: a service without room for both is left
 //! alone rather than given half the set.
+//!
+//! `down` leaves the rules in place. Nothing records which rows this
+//! migration inserted, and rules with the same values also come from the
+//! seeding path for services created after it ran, or from an operator, so
+//! deleting by value would remove rules that were never this migration's.
+//! A rule left behind after a rollback is idle: no older Temps reports
+//! these metrics, and a rule without data never fires. Running `up` again
+//! adds nothing (`ON CONFLICT DO NOTHING`).
 
 use sea_orm_migration::prelude::*;
 
@@ -39,19 +47,6 @@ WHERE lower(s.service_type) = 'postgres'
 ON CONFLICT (service_id, metric_name) WHERE service_id IS NOT NULL DO NOTHING
 "#;
 
-pub(crate) const UNSEED_SQL: &str = r#"
-DELETE FROM monitoring_alert_rules
-WHERE service_id IS NOT NULL
-  AND deployment_id IS NULL
-  AND severity = 'critical'
-  AND enabled = true
-  AND ((name = 'WAL archiving failing' AND metric_name = 'pg.archiver_failing'
-        AND threshold = 0.5 AND comparator = '>' AND for_duration_secs = 600)
-    OR (name = 'WAL backlog: pg_wal above 4x max_wal_size'
-        AND metric_name = 'pg.wal_dir_to_max_wal_size_ratio'
-        AND threshold = 4.0 AND comparator = '>' AND for_duration_secs = 900))
-"#;
-
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -66,15 +61,9 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 
-    /// Remove the rules this migration added and the operator left as they
-    /// were; a rule edited in any field the API lets the operator change
-    /// (threshold, comparator, duration, severity, enabled) is the
-    /// operator's and stays.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .get_connection()
-            .execute_unprepared(UNSEED_SQL)
-            .await?;
+    /// Keeps every rule: see the module documentation for why deleting
+    /// them could remove rules that are not this migration's.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         Ok(())
     }
 }
