@@ -103,12 +103,15 @@ impl S3Endpoint {
         if trimmed.is_empty() {
             return Err(S3EndpointError::Empty);
         }
+        // Every error below names the endpoint; none may echo a credential
+        // typed into it, whichever check fails first.
+        let (has_userinfo, shown) = redact_userinfo(trimmed);
         let (candidate, scheme_was_explicit) = match trimmed.split_once("://") {
             Some((scheme, _)) => {
                 let scheme = scheme.to_ascii_lowercase();
                 if scheme != "http" && scheme != "https" {
                     return Err(S3EndpointError::UnsupportedScheme {
-                        endpoint: trimmed.to_string(),
+                        endpoint: shown,
                         scheme,
                     });
                 }
@@ -119,13 +122,20 @@ impl S3Endpoint {
                 (format!("{scheme}://{trimmed}"), false)
             }
         };
+        // Refused before parsing, so `key:secret@host:bad-port` reports the
+        // credential rather than the port.
+        if has_userinfo {
+            return Err(S3EndpointError::EmbeddedCredentials { endpoint: shown });
+        }
+        // `url`'s parse errors describe the problem ("invalid port number")
+        // without quoting the input.
         let url = url::Url::parse(&candidate).map_err(|error| S3EndpointError::Malformed {
-            endpoint: trimmed.to_string(),
+            endpoint: mask_through_last_at(&shown),
             reason: error.to_string(),
         })?;
         if !url.username().is_empty() || url.password().is_some() {
             return Err(S3EndpointError::EmbeddedCredentials {
-                endpoint: redact_userinfo(trimmed),
+                endpoint: mask_through_last_at(&shown),
             });
         }
         let scheme = match url.scheme() {
@@ -136,7 +146,7 @@ impl S3Endpoint {
             if let Some(use_tls) = use_tls {
                 if use_tls != (scheme == S3Scheme::Https) {
                     return Err(S3EndpointError::SchemeConflictsWithTls {
-                        endpoint: trimmed.to_string(),
+                        endpoint: shown,
                         scheme,
                         use_tls,
                     });
@@ -146,16 +156,10 @@ impl S3Endpoint {
         let host = match url.host() {
             Some(url::Host::Ipv6(address)) => address.to_string(),
             Some(host) => host.to_string(),
-            None => {
-                return Err(S3EndpointError::MissingHost {
-                    endpoint: trimmed.to_string(),
-                })
-            }
+            None => return Err(S3EndpointError::MissingHost { endpoint: shown }),
         };
         if host.is_empty() {
-            return Err(S3EndpointError::MissingHost {
-                endpoint: trimmed.to_string(),
-            });
+            return Err(S3EndpointError::MissingHost { endpoint: shown });
         }
         Ok(Self {
             scheme,
@@ -307,22 +311,142 @@ pub fn normalize_endpoint_input(
     }
 }
 
-fn redact_userinfo(raw: &str) -> String {
-    match raw.split_once("://") {
-        Some((scheme, rest)) => match rest.rsplit_once('@') {
-            Some((_, host)) => format!("{scheme}://***@{host}"),
-            None => raw.to_string(),
-        },
-        None => match raw.rsplit_once('@') {
-            Some((_, host)) => format!("***@{host}"),
-            None => raw.to_string(),
-        },
+/// Whether `raw` carries userinfo (`user:password@`) in its authority, and
+/// `raw` with that userinfo replaced by `***`, for error messages.
+///
+/// It reads the authority the way the URL parser does for `http`/`https`:
+/// after `scheme:` it skips any run of `/` and `\` (so `https:////k:s@host`
+/// and `https:/\k:s@host` have userinfo), and it ends at the first `/`,
+/// `\`, `?` or `#`. Userinfo is everything in it up to the last `@`. A
+/// bare endpoint's authority starts at the beginning. An `@` in a path is
+/// not userinfo and is left alone. [`S3Endpoint::parse`] still masks
+/// through the last `@` whenever the parser finds a credential this scan
+/// missed, or the input fails to parse.
+fn redact_userinfo(raw: &str) -> (bool, String) {
+    // `scheme:` counts only when a slash or backslash follows, so the
+    // `key:` of a bare `key:secret@host` is masked with the rest.
+    let after_scheme = raw
+        .find(':')
+        .filter(|&colon| {
+            let scheme = &raw[..colon];
+            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && matches!(raw.as_bytes().get(colon + 1), Some(b'/' | b'\\'))
+        })
+        .map_or(0, |colon| colon + 1);
+    // The parser also drops tabs and newlines anywhere in the input.
+    let authority_start = raw[after_scheme..]
+        .find(|c: char| !matches!(c, '/' | '\\' | '\t' | '\n' | '\r'))
+        .map_or(raw.len(), |offset| after_scheme + offset);
+    let rest = &raw[authority_start..];
+    let authority_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => (
+            true,
+            format!("{}***@{}", &raw[..authority_start], &rest[at + 1..]),
+        ),
+        None => (false, raw.to_string()),
+    }
+}
+
+/// `raw` with everything up to its last `@` replaced by `***`: the
+/// conservative mask for an input whose authority the scan could not place.
+fn mask_through_last_at(raw: &str) -> String {
+    match raw.rfind('@') {
+        Some(at) => format!("***@{}", &raw[at + 1..]),
+        None => raw.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No error, whichever check fails, may echo a credential typed into
+    /// the endpoint.
+    #[test]
+    fn no_endpoint_error_echoes_embedded_credentials() {
+        for raw in [
+            // Invalid port: URL parsing would fail first.
+            "http://access:hunter2@objects.example:bad",
+            // Unsupported scheme.
+            "ftp://access:hunter2@objects.example",
+            // Bare endpoint with userinfo.
+            "access:hunter2@10.0.0.5:9000",
+            // Valid URL with userinfo.
+            "https://access:hunter2@objects.example/path@x",
+            // Extra slashes and backslashes, which the URL parser skips
+            // before the authority of an http(s) URL.
+            "https:////access:hunter2@objects.example",
+            "https:///access:hunter2@objects.example/a",
+            "https:/\\access:hunter2@objects.example",
+            "https:\\\\access:hunter2@objects.example",
+            "http:access:hunter2@objects.example",
+            "//access:hunter2@objects.example",
+            // Tabs and newlines, which the parser drops.
+            "https://acc\tess:hun\nter2@objects.example",
+            "https:/\t/access:hunter2@objects.example",
+        ] {
+            for use_tls in [None, Some(false), Some(true)] {
+                let error = S3Endpoint::parse(raw, use_tls).unwrap_err();
+                let text = error.to_string();
+                assert!(!text.contains("hunter2"), "{raw}: {text}");
+                assert!(!text.contains("access:"), "{raw}: {text}");
+                assert!(text.contains("***@"), "{raw}: {text}");
+            }
+        }
+        assert!(matches!(
+            S3Endpoint::parse("http://access:hunter2@objects.example:bad", None),
+            Err(S3EndpointError::EmbeddedCredentials { .. })
+        ));
+        assert!(matches!(
+            S3Endpoint::parse("ftp://access:hunter2@objects.example", None),
+            Err(S3EndpointError::UnsupportedScheme { .. })
+        ));
+    }
+
+    /// Belt and braces: whatever the parser takes for a credential, the
+    /// error never shows it.
+    #[test]
+    fn a_credential_the_parser_finds_is_masked_even_if_the_scan_missed_it() {
+        for raw in [
+            "https:////access:hunter2@objects.example",
+            "https:/\\/access:hunter2@objects.example",
+        ] {
+            let candidate = url::Url::parse(raw).unwrap();
+            assert_eq!(candidate.password(), Some("hunter2"), "{raw}");
+            let text = S3Endpoint::parse(raw, None).unwrap_err().to_string();
+            assert!(!text.contains("hunter2"), "{raw}: {text}");
+            assert!(!text.contains("access:"), "{raw}: {text}");
+            assert!(text.contains("***@objects.example"), "{raw}: {text}");
+        }
+        assert_eq!(
+            mask_through_last_at("https:/x/k:s@objects.example"),
+            "***@objects.example"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_in_the_path_is_not_userinfo() {
+        assert_eq!(
+            redact_userinfo("https://objects.example/a@b"),
+            (false, "https://objects.example/a@b".to_string())
+        );
+        assert_eq!(
+            redact_userinfo("https://k:s@objects.example/a@b"),
+            (true, "https://***@objects.example/a@b".to_string())
+        );
+        assert_eq!(
+            redact_userinfo("https:////k:s@objects.example/a@b"),
+            (true, "https:////***@objects.example/a@b".to_string())
+        );
+        assert_eq!(
+            redact_userinfo("k:s@10.0.0.5:9000"),
+            (true, "***@10.0.0.5:9000".to_string())
+        );
+    }
 
     #[test]
     fn a_bare_ip_and_port_is_plain_http() {
